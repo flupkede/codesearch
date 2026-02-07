@@ -1,0 +1,41 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Cargo config (local build settings)
+.cargo/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ignore all hidden folders at any level
+.*/ 
+**/.*/
+
+# Project specific
+/data/
+*.log
+
+# Benchmarks
+/benches/results/
+criterion/
+
+# Testing
+/test-repos/
+
+# Hidden folders (except .docs, .github, .git)
+*/
+!*/
+!.docs/
+!.github/
+.git/
