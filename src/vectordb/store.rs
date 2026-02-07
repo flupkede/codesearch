@@ -116,7 +116,7 @@ impl VectorStore {
         // Open LMDB environment
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(10 * 1024 * 1024 * 1024) // 10GB max
+                .map_size(2 * 1024 * 1024 * 1024) // 2GB max
                 .max_dbs(10)
                 .open(db_path)?
         };
@@ -183,7 +183,7 @@ impl VectorStore {
         // Open LMDB environment in read-only mode
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(10 * 1024 * 1024 * 1024) // 10GB max
+                .map_size(2 * 1024 * 1024 * 1024) // 2GB max
                 .max_dbs(10)
                 .flags(EnvFlags::READ_ONLY)
                 .open(db_path)?
@@ -282,8 +282,6 @@ impl VectorStore {
     ///
     /// Must be called after inserting chunks and before searching
     pub fn build_index(&mut self) -> Result<()> {
-        crate::output::print_info(format_args!("🔨 Building vector index..."));
-
         let mut wtxn = self.env.write_txn()?;
         let writer = Writer::new(self.vectors, 0, self.dimensions);
 
@@ -294,7 +292,6 @@ impl VectorStore {
 
         self.indexed = true;
 
-        crate::output::print_info(format_args!("✅ Index built successfully"));
         Ok(())
     }
 
