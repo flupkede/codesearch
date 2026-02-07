@@ -776,7 +776,7 @@ impl IndexManager {
 
         // Call the index function from the parent module
         // Parameters: path, dry_run, force, global, model
-        super::index(Some(path.to_path_buf()), false, false, false, None).await?;
+        super::index(Some(path.to_path_buf()), false, false, false, None, CancellationToken::new()).await?;
 
         let elapsed = start.elapsed();
         info!(
@@ -794,7 +794,7 @@ impl IndexManager {
 
         // Call the quiet index function from the parent module (no CLI output)
         // For incremental refresh, we use force=false which enables incremental mode
-        super::index_quiet(Some(path.to_path_buf()), false).await?;
+        super::index_quiet(Some(path.to_path_buf()), false, CancellationToken::new()).await?;
 
         let elapsed = start.elapsed();
         info!(

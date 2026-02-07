@@ -157,7 +157,9 @@ impl FtsStore {
                 std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
             }
 
-            match index.writer(50_000_000) {
+            // 15MB writer heap - sufficient for code chunks (typically 500B-5KB)
+            // Reduced from default 50MB to lower memory footprint
+            match index.writer(15_000_000) {
                 Ok(writer) => return Ok(writer),
                 Err(e) => {
                     last_error = Some(e.to_string());
