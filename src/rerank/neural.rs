@@ -32,7 +32,7 @@ impl NeuralReranker {
 
         let mut options = RerankInitOptions::default();
         options.model_name = model;
-        options.show_download_progress = true;
+        options.show_download_progress = false;
 
         let reranker = TextRerank::try_new(options)?;
 

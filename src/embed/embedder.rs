@@ -224,7 +224,6 @@ impl FastEmbedder {
             "📦 Loading embedding model: {}",
             model_type.name()
         ));
-        output::print_info(format_args!("   Dimensions: {}", model_type.dimensions()));
 
         // Set cache directory via environment variable if provided
         // Note: fastembed library uses FASTEMBED_CACHE_DIR (not FASTEMBED_CACHE_PATH)
@@ -242,7 +241,7 @@ impl FastEmbedder {
 
         let model = TextEmbedding::try_new(
             InitOptions::new(model_type.to_fastembed_model())
-                .with_show_download_progress(true)
+                .with_show_download_progress(false)
                 .with_execution_providers(vec![cpu_ep]),
         )
         .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
