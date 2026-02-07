@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
         _ = ctrl_c => {
             if !is_quiet && !is_json {
                 println!("\n🛑 Interrupted by user");
+                println!("⚠️  Warning: Database may need recovery if interrupted during write operation");
             }
             std::process::exit(130); // Standard exit code for SIGINT
         }
