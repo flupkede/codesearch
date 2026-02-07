@@ -88,27 +88,11 @@ impl BatchEmbedder {
         }
 
         let total = chunks.len();
-        output::print_info(format_args!(
-            "📊 Embedding {} chunks (batch size: {})...",
-            total, self.batch_size
-        ));
-
         let start = std::time::Instant::now();
         let mut embedded_chunks = Vec::with_capacity(total);
 
         // Process in batches
-        for (batch_idx, chunk_batch) in chunks.chunks(self.batch_size).enumerate() {
-            let batch_start = batch_idx * self.batch_size;
-            let batch_end = (batch_start + chunk_batch.len()).min(total);
-
-            output::print_info(format_args!(
-                "   Batch {}/{}: chunks {}-{}",
-                batch_idx + 1,
-                total.div_ceil(self.batch_size),
-                batch_start + 1,
-                batch_end
-            ));
-
+        for chunk_batch in chunks.chunks(self.batch_size) {
             // Prepare texts for embedding
             let texts: Vec<String> = chunk_batch
                 .iter()
@@ -127,14 +111,6 @@ impl BatchEmbedder {
                 embedded_chunks.push(EmbeddedChunk::new(chunk.clone(), embedding));
             }
         }
-
-        let elapsed = start.elapsed();
-        output::print_info(format_args!(
-            "✅ Embedded {} chunks in {:.2}s ({:.1} chunks/sec)",
-            total,
-            elapsed.as_secs_f32(),
-            total as f32 / elapsed.as_secs_f32()
-        ));
 
         Ok(embedded_chunks)
     }

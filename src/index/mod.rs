@@ -479,20 +479,12 @@ async fn index_with_options(
     );
 
     // Initialize embedding model
-    log_print!("🔄 Initializing embedding model...");
     let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
     let mut embedding_service =
         EmbeddingService::with_cache_dir(model_type, Some(cache_dir.as_path()))?;
-    log_print!(
-        "✅ Model loaded: {} ({} dims)",
-        embedding_service.model_name(),
-        embedding_service.dimensions()
-    );
 
     // Initialize vector store
-    log_print!("🔄 Creating vector database...");
     let mut store = VectorStore::new(&db_path, embedding_service.dimensions())?;
-    log_print!("✅ Database created");
 
     // Initialize FTS store
     let mut fts_store = FtsStore::new_with_writer(&db_path)?;
@@ -584,15 +576,11 @@ async fn index_with_options(
     }
 
     // Build vector index (now that all chunks are inserted)
-    log_print!("\n🔄 Building vector index...");
     let storage_start = Instant::now();
     store.build_index()?;
 
     let fts_stats = fts_store.stats()?;
-    log_print!("✅ Vector index and FTS index built ({} documents)", fts_stats.num_documents);
-
     let storage_duration = storage_start.elapsed();
-    log_print!("✅ Storage completed in {:?}", storage_duration);
 
     // Save model metadata
     let metadata = serde_json::json!({
@@ -605,11 +593,9 @@ async fn index_with_options(
         db_path.join("metadata.json"),
         serde_json::to_string_pretty(&metadata)?,
     )?;
-    log_print!("✅ Metadata saved");
 
     // Update FileMetaStore with new chunk IDs (incremental mode)
     if is_incremental {
-        log_print!("\n🔄 Updating file metadata...");
         // IMPORTANT: Reuse the existing file_meta_store that already contains unchanged files!
         // Don't create a new one - that would lose all unchanged file metadata
         let mut file_meta_store = file_meta_store.take().unwrap();
@@ -657,7 +643,6 @@ async fn index_with_options(
             "❌ No"
         }
     );
-    log_print!("   Dimensions: {}", db_stats.dimensions);
 
     // Calculate database size
     let mut total_size = 0u64;
@@ -670,20 +655,7 @@ async fn index_with_options(
         total_size as f64 / (1024.0 * 1024.0)
     );
 
-    // Total time
-    let total_duration =
-        discovery_duration + chunking_duration + storage_duration;
-    log_print!("\n{}", "⏱️  Timing Breakdown".bright_green());
-    log_print!("{}", "-".repeat(60));
-    log_print!("   File discovery:      {:?}", discovery_duration);
-    log_print!("   Semantic chunking:   {:?}", chunking_duration);
-    log_print!("   Embedding + storage:{:?}", storage_duration);
-    log_print!(
-        "   {}",
-        format!("Total:               {:?}", total_duration).bold()
-    );
-
-    log_print!("\n{}", "✨ Indexing complete!".bright_green().bold());
+    log_print!("\n{}", "✨ Indexing complete".bright_green().bold());
     log_print!(
         "   Run {} to search your codebase",
         "codesearch search <query>".bright_cyan()

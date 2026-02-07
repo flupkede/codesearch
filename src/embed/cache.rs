@@ -190,11 +190,7 @@ impl CachedBatchEmbedder {
         let mut chunks_to_embed = Vec::new();
         let mut cache_indices = Vec::new();
 
-        // Check cache first
-        output::print_info(format_args!(
-            "🔍 Checking cache for {} chunks (max memory: {} MB)...",
-            total, self.cache.max_memory_mb
-        ));
+        // Check cache first (silent - no verbose output)
         for (idx, chunk) in chunks.iter().enumerate() {
             if let Some(embedding) = self.cache.get(chunk) {
                 embedded_chunks.push(EmbeddedChunk::new(chunk.clone(), embedding));
@@ -203,14 +199,6 @@ impl CachedBatchEmbedder {
                 cache_indices.push(idx);
             }
         }
-
-        let cached_count = embedded_chunks.len();
-        let to_embed_count = chunks_to_embed.len();
-
-        output::print_info(format_args!(
-            "   ✅ Found {} in cache, embedding {} new chunks",
-            cached_count, to_embed_count
-        ));
 
         // Embed remaining chunks
         if !chunks_to_embed.is_empty() {
@@ -223,19 +211,6 @@ impl CachedBatchEmbedder {
 
             embedded_chunks.extend(newly_embedded);
         }
-
-        // Sort by original order if needed
-        // (Note: Current implementation maintains order naturally due to how we build vec)
-
-        let stats = self.cache().stats();
-        output::print_info(format_args!(
-            "📊 Cache stats: {} / {} entries, {:.1}% hit rate, {:.1} MB used / {} MB max",
-            stats.size,
-            stats.max_entries,
-            stats.hit_rate() * 100.0,
-            self.cache.memory_usage_mb(),
-            stats.max_memory_mb
-        ));
 
         Ok(embedded_chunks)
     }
