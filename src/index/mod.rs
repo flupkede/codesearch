@@ -4,6 +4,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::cache::FileMetaStore;
@@ -265,13 +266,14 @@ pub async fn index(
     force: bool,
     global: bool,
     model: Option<ModelType>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
-    index_with_options(path, dry_run, force, global, model, false).await
+    index_with_options(path, dry_run, force, global, model, false, cancel_token).await
 }
 
 /// Index a repository with quiet mode option (for server/MCP use)
-pub async fn index_quiet(path: Option<PathBuf>, force: bool) -> Result<()> {
-    index_with_options(path, false, force, false, None, true).await
+pub async fn index_quiet(path: Option<PathBuf>, force: bool, cancel_token: CancellationToken) -> Result<()> {
+    index_with_options(path, false, force, false, None, true, cancel_token).await
 }
 
 /// Internal index function with all options
@@ -282,6 +284,7 @@ async fn index_with_options(
     global: bool,
     model: Option<ModelType>,
     quiet: bool,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     let (db_path, project_path) = get_db_path_smart(path, global, force)?;
     let model_type = model.unwrap_or_default();
@@ -447,6 +450,10 @@ async fn index_with_options(
             store.build_index()?;
 
             log_print!("✅ Deleted {} chunks", total_chunks_to_delete);
+
+            // Explicitly drop stores to release LMDB memory map before Phase 2
+            drop(store);
+            drop(fts_store);
         }
 
         // Only process changed files
@@ -493,7 +500,14 @@ async fn index_with_options(
         std::collections::HashMap::new();
 
     let mut skipped_files = 0;
+    let mut cancelled = false;
     for file in &files {
+        // Check for cancellation before processing each file
+        if cancel_token.is_cancelled() {
+            cancelled = true;
+            break;
+        }
+
         pb.set_message(format!(
             "{}",
             file.path.file_name().unwrap().to_string_lossy()
@@ -529,6 +543,12 @@ async fn index_with_options(
         // Phase 2b: Embed chunks for this file only (batched internally)
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
 
+        // Check cancellation after embedding (most CPU-intensive step)
+        if cancel_token.is_cancelled() {
+            cancelled = true;
+            break;
+        }
+
         // Phase 2c: Insert into vector store immediately
         let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
 
@@ -552,6 +572,54 @@ async fn index_with_options(
 
         // Memory is freed here - chunks/embeddings dropped before next file
     }
+
+    // Handle cancellation: save partial progress and exit cleanly
+    if cancelled {
+        pb.finish_with_message("Cancelled!");
+        log_print!("\n{}", "⚠️  Indexing cancelled by user".yellow());
+
+        // Free ONNX model + arena allocator memory before index operations
+        drop(embedding_service);
+        drop(chunker);
+
+        if total_chunks > 0 {
+            fts_store.commit()?;
+            store.build_index()?;
+            log_print!(
+                "   Saved {} chunks indexed before cancellation",
+                total_chunks
+            );
+
+            // Save file metadata for already-processed files
+            if is_incremental {
+                if let Some(ref mut fms) = file_meta_store {
+                    for (file_path, chunk_ids) in &file_chunks {
+                        fms.update_file(Path::new(file_path), chunk_ids.clone())?;
+                    }
+                    fms.save(&db_path)?;
+                }
+            } else {
+                let mut fms =
+                    FileMetaStore::new(model_type.name().to_string(), model_type.dimensions());
+                for (file_path, chunk_ids) in &file_chunks {
+                    fms.update_file(Path::new(file_path), chunk_ids.clone())?;
+                }
+                fms.save(&db_path)?;
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Capture model info before dropping the ONNX model
+    let model_short_name = embedding_service.model_short_name().to_string();
+    let model_name = embedding_service.model_name().to_string();
+    let model_dimensions = embedding_service.dimensions();
+
+    // Free ONNX model + arena allocator memory before final index operations
+    // This releases hundreds of MB of inference buffers
+    drop(embedding_service);
+    drop(chunker);
 
     // Commit FTS store
     fts_store.commit()?;
@@ -583,9 +651,9 @@ async fn index_with_options(
 
     // Save model metadata
     let metadata = serde_json::json!({
-        "model_short_name": embedding_service.model_short_name(),
-        "model_name": embedding_service.model_name(),
-        "dimensions": embedding_service.dimensions(),
+        "model_short_name": model_short_name,
+        "model_name": model_name,
+        "dimensions": model_dimensions,
         "indexed_at": chrono::Utc::now().to_rfc3339(),
     });
     std::fs::write(
@@ -798,7 +866,7 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
 }
 
 /// Add a repository to the index (creates local or global)
-pub async fn add_to_index(path: Option<PathBuf>, global: bool) -> Result<()> {
+pub async fn add_to_index(path: Option<PathBuf>, global: bool, cancel_token: CancellationToken) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
     let canonical_path = project_path.canonicalize()?;
 
@@ -888,11 +956,11 @@ pub async fn add_to_index(path: Option<PathBuf>, global: bool) -> Result<()> {
     // Create the index
     if global {
         println!("\n{}", "Creating global index...".cyan());
-        index(Some(canonical_path.clone()), false, false, true, None).await?;
+        index(Some(canonical_path.clone()), false, false, true, None, cancel_token.clone()).await?;
         println!("\n{}", "✅ Global index created!".green());
     } else {
         println!("\n{}", "Creating local index...".cyan());
-        index(Some(canonical_path.clone()), false, false, false, None).await?;
+        index(Some(canonical_path.clone()), false, false, false, None, cancel_token).await?;
         println!("\n{}", "✅ Local index created!".green());
     }
 

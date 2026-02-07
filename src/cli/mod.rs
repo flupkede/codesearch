@@ -279,7 +279,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             if add || is_add_cmd {
                 // Clear path if it's "add" to avoid treating it as a directory
                 let effective_path = if is_add_cmd { None } else { path };
-                crate::index::add_to_index(effective_path, global).await
+                crate::index::add_to_index(effective_path, global, cancel_token.clone()).await
             } else if remove || is_rm_cmd {
                 // Clear path if it's "rm"/"remove" to avoid treating it as a directory
                 let effective_path = if is_rm_cmd { None } else { path };
@@ -289,7 +289,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             } else {
                 // For 'codesearch index .' or 'codesearch index <path>', just run indexing
                 // The index() function will handle checking for existing indexes
-                crate::index::index(path, dry_run, force, false, model_type).await
+                crate::index::index(path, dry_run, force, false, model_type, cancel_token.clone()).await
             }
         }
         Commands::Stats { path } => crate::index::stats(path).await,
