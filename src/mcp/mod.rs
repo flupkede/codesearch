@@ -14,8 +14,8 @@ use rmcp::{
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
-use crate::constants::FASTEMBED_CACHE_DIR;
 use crate::db_discovery::{find_best_database, find_databases};
 use crate::embed::{EmbeddingService, ModelType};
 use crate::fts::FtsStore;
@@ -112,7 +112,7 @@ impl CodesearchService {
     fn get_embedding_service(&self) -> Result<std::sync::MutexGuard<'_, Option<EmbeddingService>>> {
         let mut guard = self.embedding_service.lock().unwrap();
         if guard.is_none() {
-            let cache_dir = self.db_path.join(FASTEMBED_CACHE_DIR);
+            let cache_dir = crate::constants::get_global_models_cache_dir()?;
             *guard = Some(EmbeddingService::with_cache_dir(
                 self.model_type,
                 Some(&cache_dir),
@@ -866,7 +866,7 @@ Dimensions: {dims}
 /// - No incremental refresh
 ///
 /// This allows multiple terminal windows to use codesearch simultaneously.
-pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
+pub async fn run_mcp_server(path: Option<PathBuf>, cancel_token: CancellationToken) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
 
     tracing::info!("🚀 Starting codesearch MCP server");
@@ -942,6 +942,7 @@ pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
         let db_path_clone = db_path.clone();
         let shared_stores_clone = shared_stores.clone();
         let index_manager_arc = Arc::new(index_manager);
+        let bg_cancel_token = cancel_token.clone();
         tokio::spawn(async move {
             // Step 1: Run initial refresh (writes to stores)
             tracing::info!("🔄 Starting background incremental refresh...");
@@ -955,9 +956,18 @@ pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
                 Ok(_) => {
                     tracing::info!("✅ Background incremental refresh completed");
 
+                    // Check if shutdown was requested during refresh
+                    if bg_cancel_token.is_cancelled() {
+                        tracing::info!("🛑 Shutdown requested, skipping file watcher startup");
+                        return;
+                    }
+
                     // Step 2: AFTER refresh completes, start file watcher (also writes to stores)
                     tracing::info!("👀 Starting file watcher...");
-                    if let Err(e) = index_manager_arc.start_file_watcher().await {
+                    if let Err(e) = index_manager_arc
+                        .start_file_watcher(bg_cancel_token)
+                        .await
+                    {
                         tracing::error!("❌ Failed to start file watcher: {}", e);
                     } else {
                         tracing::info!(
@@ -974,8 +984,17 @@ pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
         tracing::info!("📖 Readonly mode: skipping background refresh and file watcher");
     }
 
-    // Wait for shutdown
-    server.waiting().await?;
+    // Wait for shutdown: either MCP transport closes or cancellation token fires
+    tokio::select! {
+        result = server.waiting() => {
+            tracing::info!("MCP server transport closed");
+            result?;
+        }
+        _ = cancel_token.cancelled() => {
+            tracing::info!("🛑 Shutdown signal received, stopping MCP server...");
+        }
+    }
 
+    tracing::info!("✅ MCP server shut down cleanly");
     Ok(())
 }
