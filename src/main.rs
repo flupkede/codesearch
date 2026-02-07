@@ -28,7 +28,21 @@ async fn main() -> Result<()> {
     let is_quiet = args.iter().any(|a| a == "-q" || a == "--quiet");
     let is_json = args.iter().any(|a| a == "--json");
     let is_verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
-
+    
+    // Set up CTRL-C handler (platform-specific)
+    let ctrl_c = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{self, SignalKind};
+            let mut sig = unix::signal(SignalKind::interrupt()).unwrap();
+            sig.recv().await;
+        }
+        #[cfg(windows)]
+        {
+            tokio::signal::ctrl_c().await.unwrap();
+        }
+    };
+    
     // Skip tracing in quiet mode or JSON output
     if !is_quiet && !is_json {
         // Set up file logging for verbose mode
@@ -75,7 +89,17 @@ async fn main() -> Result<()> {
             info!("Starting codesearch v{}", env!("CARGO_PKG_VERSION_FULL"));
         }
     }
-
-    // Parse CLI and execute command
-    cli::run().await
+    
+    // Handle CTRL-C gracefully with tokio::select!
+    tokio::select! {
+        _ = ctrl_c => {
+            if !is_quiet && !is_json {
+                println!("\n🛑 Interrupted by user");
+            }
+            std::process::exit(130); // Standard exit code for SIGINT
+        }
+        result = cli::run() => {
+            result
+        }
+    }
 }
