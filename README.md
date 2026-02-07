@@ -201,7 +201,9 @@ OpenCode is the primary target for codesearch's MCP integration. Add the followi
 }
 ```
 
-That's it — no project path required. When OpenCode starts, codesearch will auto-detect the database for the current working directory. Make sure `codesearch` is in your `PATH`.
+No project path required — codesearch auto-detects the database for the current working directory.
+
+> **⚠️ `codesearch` must be on your system `PATH`** for OpenCode to find it. If you built from source, copy the binary to a directory that's in your `PATH` (e.g., `~/.local/bin/` on Linux/macOS or `C:\Users\<you>\.local\bin\` on Windows). Verify with: `codesearch --version`
 
 ### Claude Code
 
@@ -330,11 +332,11 @@ codesearch index list            # Show which index is active
 
 ### Full AST Chunking (Tree-sitter)
 
-Rust (`.rs`), Python (`.py`, `.pyw`, `.pyi`), JavaScript (`.js`, `.mjs`, `.cjs`), TypeScript (`.ts`, `.mts`, `.cts`, `.tsx`, `.jsx`)
+Rust (`.rs`), Python (`.py`, `.pyw`, `.pyi`), JavaScript (`.js`, `.mjs`, `.cjs`), TypeScript (`.ts`, `.mts`, `.cts`, `.tsx`, `.jsx`), C (`.c`, `.h`), C++ (`.cpp`, `.cc`, `.cxx`, `.hpp`), C# (`.cs`), Go (`.go`), Java (`.java`)
 
 ### Line-based Chunking
 
-Go, Java, C, C++, C#, Ruby, PHP, Swift, Kotlin, Shell, Markdown, JSON, YAML, TOML, SQL, HTML, CSS/SCSS/SASS/LESS
+Ruby, PHP, Swift, Kotlin, Shell, Markdown, JSON, YAML, TOML, SQL, HTML, CSS/SCSS/SASS/LESS
 
 ---
 
@@ -364,7 +366,7 @@ The model used for indexing is stored in metadata. Always search with the same m
 | Variable | Description | Default |
 |---|---|---|
 | `CODESEARCH_CACHE_MAX_MEMORY` | Max embedding cache in MB | 500 |
-| `DEMONGREP_BATCH_SIZE` | Embedding batch size | Auto |
+| `CODESEARCH_BATCH_SIZE` | Embedding batch size | Auto |
 | `RUST_LOG` | Logging level | `codesearch=info` |
 
 ### Ignore Files
@@ -400,7 +402,7 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 | "No database found" | Run `codesearch index` first |
 | Poor search results | Try `--sync` to update, `--rerank` for accuracy, or `--force` to rebuild |
 | Model mismatch warning | Re-index: `codesearch index --force --model <model>` |
-| Out of memory | `DEMONGREP_BATCH_SIZE=32 codesearch index` |
+| Out of memory | `CODESEARCH_BATCH_SIZE=32 codesearch index` |
 | Port in use (serve) | `codesearch serve --port 5555` |
 
 ### Debug Logging

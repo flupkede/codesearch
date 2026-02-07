@@ -99,7 +99,6 @@ impl Default for EmbeddingService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunker::{Chunk, ChunkKind};
 
     #[test]
     fn test_model_type_default() {
