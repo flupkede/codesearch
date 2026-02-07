@@ -116,7 +116,7 @@ impl VectorStore {
         // Open LMDB environment
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(2 * 1024 * 1024 * 1024) // 2GB max
+                .map_size(4 * 1024 * 1024 * 1024) // 2GB max
                 .max_dbs(10)
                 .open(db_path)?
         };
@@ -183,7 +183,7 @@ impl VectorStore {
         // Open LMDB environment in read-only mode
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(2 * 1024 * 1024 * 1024) // 2GB max
+                .map_size(4 * 1024 * 1024 * 1024) // 2GB max
                 .max_dbs(10)
                 .flags(EnvFlags::READ_ONLY)
                 .open(db_path)?
