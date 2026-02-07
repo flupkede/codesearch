@@ -1,0 +1,3 @@
+[build]
+# Place target directory outside the repository to keep source tree clean
+target-dir = "../target"

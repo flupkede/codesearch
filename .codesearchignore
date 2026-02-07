@@ -1,0 +1,34 @@
+# Codesearch-specific ignore patterns
+# These patterns are in addition to .gitignore
+
+# Common development directories (even if not in .gitignore)
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts (beyond what .gitignore covers)
+dist/
+build/
+out/
+*.min.js
+*.min.css
+
+# Test fixtures and mocks
+test-data/
+mocks/
+fixtures/
+*.mock.*
+
+# Large generated files
+*.generated.*
+*.bundle.*
+
+# Documentation (optional - remove if you want to search docs)
+*.md
+!README.md
+
+# Lock files (already in .gitignore but explicit here)
+*.lock

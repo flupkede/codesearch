@@ -1,0 +1,111 @@
+[package]
+name = "codesearch"
+version = "0.1.45"
+edition = "2021"
+authors = ["codesearch contributors"]
+license = "Apache-2.0"
+description = "Fast, local semantic code search powered by Rust"
+repository = "https://github.com/flupkede/codesearch"
+readme = "README.md"
+keywords = ["search", "semantic", "grep", "embeddings", "code"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "codesearch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codesearch"
+path = "src/main.rs"
+
+[dependencies]
+# CLI & I/O
+clap = { version = "4.5", features = ["derive", "cargo"] }
+tokio = { version = "1.40", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+# ML & Embeddings
+fastembed = "5.0"
+ort = { version = "2.0.0-rc.10", features = ["download-binaries", "copy-dylibs"] }
+ndarray = "0.16"
+hf-hub = "0.3"
+
+# Vector DB (temporarily commented due to dep conflicts)
+# lancedb = "0.5"
+
+# Text processing & Parsing
+tree-sitter = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+
+# File handling
+ignore = "0.4"
+notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
+notify-debouncer-full = "0.3"
+walkdir = "2.5"
+fs2 = "0.4"  # Cross-platform file locking
+
+# Caching
+moka = { version = "0.12", features = ["sync"] }
+
+# Search & Ranking
+tantivy = "0.22"
+
+# Server
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Utilities
+rayon = "1.10"
+dashmap = "6.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+colored = "2.1"
+indicatif = "0.17"
+dirs = "5.0"
+num_cpus = "1.16"
+async-trait = "0.1"
+# Vector database
+arroy = "0.5"
+heed = "0.20"
+bincode = "1.3"
+rand = "0.8"
+rmcp = { version = "0.9.1", features = ["server", "transport-io", "macros"] }
+schemars = { version = "1.1.0", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.13"
+pretty_assertions = "1.4"
+
+# Benchmarks will be added later
+# [[bench]]
+# name = "embedding_bench"
+# harness = false
+#
+# [[bench]]
+# name = "chunking_bench"
+# harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+
+[features]
+default = []
+cuda = ["ort/cuda"]        # Enable CUDA GPU acceleration (requires cuDNN)
+tensorrt = ["ort/tensorrt"] # Enable TensorRT acceleration (NVIDIA only)
