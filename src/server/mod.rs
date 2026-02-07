@@ -119,7 +119,7 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
 
     // STEP 1: Perform incremental index refresh
     println!("\n🔍 Performing incremental index refresh...");
-    crate::index::index_quiet(Some(root.clone()), false).await?;
+    crate::index::index_quiet(Some(root.clone()), false, tokio_util::sync::CancellationToken::new()).await?;
     println!("✅ Index refresh completed");
 
     // Initialize embedding service

@@ -46,20 +46,22 @@ pub fn get_global_models_cache_dir() -> anyhow::Result<PathBuf> {
 /// Name of the repos configuration file
 pub const REPOS_CONFIG_FILE: &str = "repos.json";
 
-/// Default LMDB map size in bytes (2GB).
+/// Default LMDB map size in megabytes (256MB).
 ///
 /// This is the maximum virtual address space reserved for the memory-mapped database.
 /// On Linux/macOS this is just an address space reservation (no physical RAM until data is written).
-/// On Windows the file may be pre-allocated to this size.
+/// On Windows the file may be pre-allocated to this size, so keeping it small matters.
+/// 256MB is sufficient for most codebases (64k chunks × ~4KB = ~256MB).
 /// Override with `CODESEARCH_LMDB_MAP_SIZE_MB` environment variable.
-pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 2048;
+pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 256;
 
 /// Default embedding cache memory limit in MB.
 ///
 /// The embedding cache stores recently computed embeddings in memory (Moka LRU cache)
 /// to avoid re-computing them during incremental indexing. This is real physical memory.
+/// 100MB is sufficient since files are processed sequentially during indexing.
 /// Override with `CODESEARCH_CACHE_MAX_MEMORY` environment variable.
-pub const DEFAULT_CACHE_MAX_MEMORY_MB: usize = 200;
+pub const DEFAULT_CACHE_MAX_MEMORY_MB: usize = 100;
 
 /// File watcher debounce time in milliseconds
 pub const DEFAULT_FSW_DEBOUNCE_MS: u64 = 2000;
