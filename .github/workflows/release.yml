@@ -52,6 +52,8 @@ jobs:
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_DIR: target
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
