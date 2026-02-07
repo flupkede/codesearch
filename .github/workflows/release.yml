@@ -49,6 +49,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
