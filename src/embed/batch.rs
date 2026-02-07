@@ -300,6 +300,14 @@ mod tests {
 
     #[test]
     fn test_prepare_text() {
+        // Set a temporary cache directory to avoid creating .fastembed_cache in project root
+        let temp_dir = std::env::temp_dir().join("codesearch_test_cache");
+        std::fs::create_dir_all(&temp_dir).ok();
+        std::env::set_var(
+            "FASTEMBED_CACHE_DIR",
+            temp_dir.to_string_lossy().to_string(),
+        );
+
         let embedder = Arc::new(Mutex::new(FastEmbedder::new().unwrap_or_else(|_| {
             // For tests, create a mock if real embedder fails
             panic!("Cannot create embedder in test");
@@ -324,6 +332,10 @@ mod tests {
         assert!(text.contains("Signature: fn test()"));
         assert!(text.contains("Documentation: Test function"));
         assert!(text.contains("Code:"));
+
+        // Clean up temp cache
+        let _ = std::fs::remove_dir_all(temp_dir);
+        std::env::remove_var("FASTEMBED_CACHE_DIR");
     }
 
     fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
