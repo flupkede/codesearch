@@ -244,10 +244,10 @@ impl LanguageExtractor for RustExtractor {
         // For now, we'll look at the previous siblings
         let parent = node.parent()?;
         let node_index = (0..parent.named_child_count())
-            .find(|&i| parent.named_child(i).map(|c| c.id()) == Some(node.id()))?;
+            .find(|&i| parent.named_child(i as u32).map(|c| c.id()) == Some(node.id()))?;
 
         if node_index > 0 {
-            if let Some(prev) = parent.named_child(node_index - 1) {
+            if let Some(prev) = parent.named_child((node_index - 1) as u32) {
                 if prev.kind() == "line_comment" || prev.kind() == "block_comment" {
                     if let Ok(text) = prev.utf8_text(source) {
                         // Check if it's a doc comment (/// or /**)
@@ -489,10 +489,10 @@ impl LanguageExtractor for TypeScriptExtractor {
         // Similar to Rust approach
         let parent = node.parent()?;
         let node_index = (0..parent.named_child_count())
-            .find(|&i| parent.named_child(i).map(|c| c.id()) == Some(node.id()))?;
+            .find(|&i| parent.named_child(i as u32).map(|c| c.id()) == Some(node.id()))?;
 
         if node_index > 0 {
-            if let Some(prev) = parent.named_child(node_index - 1) {
+            if let Some(prev) = parent.named_child((node_index - 1) as u32) {
                 if prev.kind() == "comment" {
                     if let Ok(text) = prev.utf8_text(source) {
                         if text.trim_start().starts_with("/**") {
@@ -769,10 +769,10 @@ impl LanguageExtractor for CSharpExtractor {
         // C# uses /// XML doc comments
         let parent = node.parent()?;
         let node_index = (0..parent.named_child_count())
-            .find(|&i| parent.named_child(i).map(|c| c.id()) == Some(node.id()))?;
+            .find(|&i| parent.named_child(i as u32).map(|c| c.id()) == Some(node.id()))?;
 
         if node_index > 0 {
-            if let Some(prev) = parent.named_child(node_index - 1) {
+            if let Some(prev) = parent.named_child((node_index - 1) as u32) {
                 if prev.kind() == "comment" {
                     if let Ok(text) = prev.utf8_text(source) {
                         if text.trim_start().starts_with("///") {
