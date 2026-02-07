@@ -55,12 +55,14 @@ Search your codebase using natural language queries like *"where do we handle au
 
 Download the latest release for your platform from [Releases](https://github.com/flupkede/codesearch/releases):
 
-| Platform | Binary |
+| Platform | Download |
 |---|---|
-| **Windows x86_64** | `codesearch-x86_64-pc-windows-msvc.zip` |
-| **Linux x86_64** | `codesearch-x86_64-unknown-linux-gnu.tar.gz` |
-| **macOS (Apple Silicon)** | `codesearch-aarch64-apple-darwin.tar.gz` |
-| **macOS (Intel)** | `codesearch-x86_64-apple-darwin.tar.gz` |
+| **Windows x86_64** | `codesearch-windows-x86_64.zip` |
+| **Linux x86_64** | `codesearch-linux-x86_64.tar.gz` |
+| **macOS (Apple Silicon)** | `codesearch-macos-arm64.tar.gz` |
+| **macOS (Intel)** | `codesearch-macos-x86_64.tar.gz` |
+
+Extract and place the binary somewhere on your `PATH`.
 
 ### Building from Source
 
@@ -82,12 +84,6 @@ sudo cp target/release/codesearch /usr/local/bin/
 Copy-Item target\release\codesearch.exe "$env:LOCALAPPDATA\Microsoft\WindowsApps\"
 ```
 
-#### Cross-compile for Windows (from Linux)
-
-```bash
-rustup target add x86_64-pc-windows-msvc
-cargo build --release --target x86_64-pc-windows-msvc
-```
 
 ### Verify Installation
 
