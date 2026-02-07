@@ -60,7 +60,6 @@ Download the latest release for your platform from [Releases](https://github.com
 | **Windows x86_64** | `codesearch-windows-x86_64.zip` |
 | **Linux x86_64** | `codesearch-linux-x86_64.tar.gz` |
 | **macOS (Apple Silicon)** | `codesearch-macos-arm64.tar.gz` |
-| **macOS (Intel)** | `codesearch-macos-x86_64.tar.gz` |
 
 Extract and place the binary somewhere on your `PATH`.
 
@@ -318,6 +317,22 @@ codesearch supports two index locations per project. Only one can be active at a
 3. `~/.codesearch.dbs/` (global)
 
 This means you can `cd` into any subfolder and codesearch will still find the project index.
+
+### Git Worktrees
+
+codesearch works naturally with [git worktrees](https://git-scm.com/docs/git-worktree). Each worktree lives in its own directory, so each one gets its own independent database and MCP server instance. This means you can have separate indexes for different branches — when OpenCode or Claude Code starts in a worktree folder, codesearch auto-detects the database for that specific worktree.
+
+```bash
+# Main repo
+cd /projects/myapp
+codesearch index
+
+# Worktree for a feature branch
+cd /projects/myapp-feature
+codesearch index
+
+# Each directory has its own .codesearch.db/ and MCP instance
+```
 
 ```bash
 codesearch index                 # Create local index (default)
