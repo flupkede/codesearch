@@ -80,6 +80,11 @@ pub fn get_extractor(language: Language) -> Option<Box<dyn LanguageExtractor>> {
         Language::Rust => Some(Box::new(RustExtractor)),
         Language::Python => Some(Box::new(PythonExtractor)),
         Language::JavaScript | Language::TypeScript => Some(Box::new(TypeScriptExtractor)),
+        Language::C => Some(Box::new(CExtractor)),
+        Language::Cpp => Some(Box::new(CppExtractor)),
+        Language::CSharp => Some(Box::new(CSharpExtractor)),
+        Language::Go => Some(Box::new(GoExtractor)),
+        Language::Java => Some(Box::new(JavaExtractor)),
         _ => None,
     }
 }
@@ -519,6 +524,504 @@ impl LanguageExtractor for TypeScriptExtractor {
     }
 }
 
+/// C language extractor
+pub struct CExtractor;
+
+impl LanguageExtractor for CExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        &[
+            "function_definition",
+            "struct_specifier",
+            "enum_specifier",
+            "type_definition",
+        ]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        // For function_definition, name is in the declarator
+        if node.kind() == "function_definition" {
+            let declarator = node.child_by_field_name("declarator")?;
+            // Navigate through pointer_declarator or function_declarator
+            return find_identifier(declarator, source);
+        }
+        // For struct/enum, look for name field or type_identifier child
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok().map(String::from))
+            .or_else(|| {
+                let mut cursor = node.walk();
+                let result = node
+                    .named_children(&mut cursor)
+                    .find(|c| c.kind() == "type_identifier")
+                    .and_then(|n| n.utf8_text(source).ok().map(String::from));
+                result
+            })
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "function_definition" => {
+                // Get everything up to the body
+                let body = node.child_by_field_name("body")?;
+                let sig_end = body.start_byte();
+                let sig_text = std::str::from_utf8(&source[node.start_byte()..sig_end]).ok()?;
+                Some(sig_text.trim().to_string())
+            }
+            "struct_specifier" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("struct {}", name))
+            }
+            "enum_specifier" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("enum {}", name))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        extract_c_style_doc(node, source)
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        match node.kind() {
+            "function_definition" => ChunkKind::Function,
+            "struct_specifier" => ChunkKind::Struct,
+            "enum_specifier" => ChunkKind::Enum,
+            "type_definition" => ChunkKind::TypeAlias,
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
+/// C++ language extractor
+pub struct CppExtractor;
+
+impl LanguageExtractor for CppExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        &[
+            "function_definition",
+            "class_specifier",
+            "struct_specifier",
+            "enum_specifier",
+            "namespace_definition",
+            "template_declaration",
+            "type_definition",
+        ]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "function_definition" => {
+                let declarator = node.child_by_field_name("declarator")?;
+                find_identifier(declarator, source)
+            }
+            "namespace_definition" => node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok().map(String::from)),
+            "template_declaration" => {
+                // Look inside the template for the actual declaration
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if let Some(name) = self.extract_name(child, source) {
+                        return Some(name);
+                    }
+                }
+                None
+            }
+            _ => node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok().map(String::from))
+                .or_else(|| {
+                    let mut cursor = node.walk();
+                    let result = node
+                        .named_children(&mut cursor)
+                        .find(|c| c.kind() == "type_identifier")
+                        .and_then(|n| n.utf8_text(source).ok().map(String::from));
+                    result
+                }),
+        }
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "function_definition" => {
+                let body = node.child_by_field_name("body")?;
+                let sig_end = body.start_byte();
+                let sig_text = std::str::from_utf8(&source[node.start_byte()..sig_end]).ok()?;
+                Some(sig_text.trim().to_string())
+            }
+            "class_specifier" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("class {}", name))
+            }
+            "struct_specifier" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("struct {}", name))
+            }
+            "namespace_definition" => {
+                let name = self.extract_name(node, source).unwrap_or_default();
+                Some(format!("namespace {}", name))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        extract_c_style_doc(node, source)
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        match node.kind() {
+            "function_definition" => {
+                // Check if inside a class
+                if let Some(parent) = node.parent() {
+                    if parent.kind() == "declaration_list"
+                        || parent.kind() == "field_declaration_list"
+                    {
+                        return ChunkKind::Method;
+                    }
+                }
+                ChunkKind::Function
+            }
+            "class_specifier" => ChunkKind::Class,
+            "struct_specifier" => ChunkKind::Struct,
+            "enum_specifier" => ChunkKind::Enum,
+            "namespace_definition" => ChunkKind::Mod,
+            "template_declaration" => ChunkKind::Other,
+            "type_definition" => ChunkKind::TypeAlias,
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
+/// C# language extractor
+pub struct CSharpExtractor;
+
+impl LanguageExtractor for CSharpExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        &[
+            "class_declaration",
+            "struct_declaration",
+            "interface_declaration",
+            "method_declaration",
+            "constructor_declaration",
+            "property_declaration",
+            "enum_declaration",
+            "namespace_declaration",
+            "record_declaration",
+        ]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok().map(String::from))
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "method_declaration" | "constructor_declaration" => {
+                // Get everything up to the body
+                let body = node.child_by_field_name("body");
+                let sig_end = body.map(|b| b.start_byte()).unwrap_or(node.end_byte());
+                let sig_text = std::str::from_utf8(&source[node.start_byte()..sig_end]).ok()?;
+                Some(sig_text.trim().to_string())
+            }
+            "class_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("class {}", name))
+            }
+            "struct_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("struct {}", name))
+            }
+            "interface_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("interface {}", name))
+            }
+            "enum_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("enum {}", name))
+            }
+            "namespace_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("namespace {}", name))
+            }
+            "record_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("record {}", name))
+            }
+            "property_declaration" => {
+                let name = self.extract_name(node, source)?;
+                // Try to get the type
+                let type_node = node.child_by_field_name("type");
+                if let Some(t) = type_node {
+                    if let Ok(type_text) = t.utf8_text(source) {
+                        return Some(format!("{} {}", type_text, name));
+                    }
+                }
+                Some(name)
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        // C# uses /// XML doc comments
+        let parent = node.parent()?;
+        let node_index = (0..parent.named_child_count())
+            .find(|&i| parent.named_child(i).map(|c| c.id()) == Some(node.id()))?;
+
+        if node_index > 0 {
+            if let Some(prev) = parent.named_child(node_index - 1) {
+                if prev.kind() == "comment" {
+                    if let Ok(text) = prev.utf8_text(source) {
+                        if text.trim_start().starts_with("///") {
+                            return Some(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        match node.kind() {
+            "method_declaration" | "constructor_declaration" => ChunkKind::Method,
+            "class_declaration" | "record_declaration" => ChunkKind::Class,
+            "struct_declaration" => ChunkKind::Struct,
+            "interface_declaration" => ChunkKind::Interface,
+            "enum_declaration" => ChunkKind::Enum,
+            "namespace_declaration" => ChunkKind::Mod,
+            "property_declaration" => ChunkKind::Other,
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
+/// Go language extractor
+pub struct GoExtractor;
+
+impl LanguageExtractor for GoExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        &[
+            "function_declaration",
+            "method_declaration",
+            "type_declaration",
+            "type_spec",
+        ]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok().map(String::from))
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "function_declaration" => {
+                // func name(params) returnType
+                let body = node.child_by_field_name("body")?;
+                let sig_end = body.start_byte();
+                let sig_text = std::str::from_utf8(&source[node.start_byte()..sig_end]).ok()?;
+                Some(sig_text.trim().to_string())
+            }
+            "method_declaration" => {
+                let body = node.child_by_field_name("body")?;
+                let sig_end = body.start_byte();
+                let sig_text = std::str::from_utf8(&source[node.start_byte()..sig_end]).ok()?;
+                Some(sig_text.trim().to_string())
+            }
+            "type_spec" => {
+                let name = self.extract_name(node, source)?;
+                // Check what type it is (struct_type, interface_type, etc.)
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    match child.kind() {
+                        "struct_type" => return Some(format!("type {} struct", name)),
+                        "interface_type" => return Some(format!("type {} interface", name)),
+                        _ => {}
+                    }
+                }
+                Some(format!("type {}", name))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        // Go uses // comments before declarations
+        let parent = node.parent()?;
+        let node_index = (0..parent.named_child_count())
+            .find(|&i| parent.named_child(i).map(|c| c.id()) == Some(node.id()))?;
+
+        if node_index > 0 {
+            if let Some(prev) = parent.named_child(node_index - 1) {
+                if prev.kind() == "comment" {
+                    return prev.utf8_text(source).ok().map(String::from);
+                }
+            }
+        }
+        None
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        match node.kind() {
+            "function_declaration" => ChunkKind::Function,
+            "method_declaration" => ChunkKind::Method,
+            "type_spec" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    match child.kind() {
+                        "struct_type" => return ChunkKind::Struct,
+                        "interface_type" => return ChunkKind::Interface,
+                        _ => {}
+                    }
+                }
+                ChunkKind::TypeAlias
+            }
+            "type_declaration" => ChunkKind::TypeAlias,
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
+/// Java language extractor
+pub struct JavaExtractor;
+
+impl LanguageExtractor for JavaExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "method_declaration",
+            "constructor_declaration",
+            "enum_declaration",
+            "annotation_type_declaration",
+            "record_declaration",
+        ]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok().map(String::from))
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "method_declaration" | "constructor_declaration" => {
+                let body = node.child_by_field_name("body");
+                let sig_end = body.map(|b| b.start_byte()).unwrap_or(node.end_byte());
+                let sig_text = std::str::from_utf8(&source[node.start_byte()..sig_end]).ok()?;
+                Some(sig_text.trim().to_string())
+            }
+            "class_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("class {}", name))
+            }
+            "interface_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("interface {}", name))
+            }
+            "enum_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("enum {}", name))
+            }
+            "record_declaration" => {
+                let name = self.extract_name(node, source)?;
+                Some(format!("record {}", name))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        // Java uses /** */ Javadoc comments
+        let parent = node.parent()?;
+        let node_index = (0..parent.named_child_count())
+            .find(|&i| parent.named_child(i).map(|c| c.id()) == Some(node.id()))?;
+
+        if node_index > 0 {
+            if let Some(prev) = parent.named_child(node_index - 1) {
+                if prev.kind() == "block_comment" || prev.kind() == "comment" {
+                    if let Ok(text) = prev.utf8_text(source) {
+                        if text.trim_start().starts_with("/**") {
+                            return Some(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        match node.kind() {
+            "method_declaration" | "constructor_declaration" => {
+                // Check if inside a class/interface
+                if let Some(parent) = node.parent() {
+                    if parent.kind() == "class_body" || parent.kind() == "interface_body" {
+                        return ChunkKind::Method;
+                    }
+                }
+                ChunkKind::Function
+            }
+            "class_declaration" | "record_declaration" => ChunkKind::Class,
+            "interface_declaration" => ChunkKind::Interface,
+            "enum_declaration" => ChunkKind::Enum,
+            "annotation_type_declaration" => ChunkKind::Interface,
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
+/// Helper: recursively find the first identifier in a declarator chain (for C/C++)
+fn find_identifier(node: Node, source: &[u8]) -> Option<String> {
+    if node.kind() == "identifier"
+        || node.kind() == "field_identifier"
+        || node.kind() == "destructor_name"
+    {
+        return node.utf8_text(source).ok().map(String::from);
+    }
+    // For qualified identifiers like ClassName::method
+    if node.kind() == "qualified_identifier" || node.kind() == "scoped_identifier" {
+        return node.utf8_text(source).ok().map(String::from);
+    }
+    // Recurse into declarator children
+    if let Some(declarator) = node.child_by_field_name("declarator") {
+        return find_identifier(declarator, source);
+    }
+    // Try named children
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(name) = find_identifier(child, source) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Helper: extract C-style doc comments (/** */ or ///) before a node
+fn extract_c_style_doc(node: Node, source: &[u8]) -> Option<String> {
+    let parent = node.parent()?;
+    let node_index = (0..parent.named_child_count())
+        .find(|&i| parent.named_child(i).map(|c| c.id()) == Some(node.id()))?;
+
+    if node_index > 0 {
+        if let Some(prev) = parent.named_child(node_index - 1) {
+            if prev.kind() == "comment" || prev.kind() == "block_comment" {
+                if let Ok(text) = prev.utf8_text(source) {
+                    let trimmed = text.trim_start();
+                    if trimmed.starts_with("///") || trimmed.starts_with("/**") {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +1032,11 @@ mod tests {
         assert!(get_extractor(Language::Python).is_some());
         assert!(get_extractor(Language::JavaScript).is_some());
         assert!(get_extractor(Language::TypeScript).is_some());
+        assert!(get_extractor(Language::C).is_some());
+        assert!(get_extractor(Language::Cpp).is_some());
+        assert!(get_extractor(Language::CSharp).is_some());
+        assert!(get_extractor(Language::Go).is_some());
+        assert!(get_extractor(Language::Java).is_some());
         assert!(get_extractor(Language::Markdown).is_none());
     }
 

@@ -253,10 +253,10 @@ impl FastEmbedder {
     }
     /// Embed a batch of texts (processes in mini-batches to avoid OOM)
     /// Uses adaptive batch size based on model dimensions
-    /// Can be overridden with DEMONGREP_BATCH_SIZE environment variable
+    /// Can be overridden with CODESEARCH_BATCH_SIZE environment variable
     pub fn embed_batch(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        // Check for env var override (tune with DEMONGREP_BATCH_SIZE=N)
-        let batch_size = if let Ok(env_size) = std::env::var("DEMONGREP_BATCH_SIZE") {
+        // Check for env var override (tune with CODESEARCH_BATCH_SIZE=N)
+        let batch_size = if let Ok(env_size) = std::env::var("CODESEARCH_BATCH_SIZE") {
             env_size.parse().unwrap_or(256)
         } else {
             // Adaptive batch size: smaller batches for larger models to avoid OOM

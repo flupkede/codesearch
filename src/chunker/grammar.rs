@@ -62,25 +62,13 @@ impl GrammarManager {
             Language::Python => Ok(tree_sitter_python::LANGUAGE.into()),
             Language::JavaScript => Ok(tree_sitter_javascript::LANGUAGE.into()),
             Language::TypeScript => {
-                // TypeScript grammar requires special handling
                 Ok(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
             }
-            Language::Go => {
-                warn!("Go grammar not yet integrated");
-                Err(anyhow!("Go grammar not available"))
-            }
-            Language::Java => {
-                warn!("Java grammar not yet integrated");
-                Err(anyhow!("Java grammar not available"))
-            }
-            Language::C => {
-                warn!("C grammar not yet integrated");
-                Err(anyhow!("C grammar not available"))
-            }
-            Language::Cpp => {
-                warn!("C++ grammar not yet integrated");
-                Err(anyhow!("C++ grammar not available"))
-            }
+            Language::C => Ok(tree_sitter_c::LANGUAGE.into()),
+            Language::Cpp => Ok(tree_sitter_cpp::LANGUAGE.into()),
+            Language::CSharp => Ok(tree_sitter_c_sharp::LANGUAGE.into()),
+            Language::Go => Ok(tree_sitter_go::LANGUAGE.into()),
+            Language::Java => Ok(tree_sitter_java::LANGUAGE.into()),
             _ => Err(anyhow!(
                 "Language {} does not support tree-sitter",
                 language.name()
@@ -95,7 +83,11 @@ impl GrammarManager {
             Language::Python,
             Language::JavaScript,
             Language::TypeScript,
-            // More will be added as we integrate their grammars
+            Language::C,
+            Language::Cpp,
+            Language::CSharp,
+            Language::Go,
+            Language::Java,
         ]
     }
 
@@ -184,6 +176,41 @@ mod tests {
     }
 
     #[test]
+    fn test_load_c_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::C);
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_load_cpp_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::Cpp);
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_load_csharp_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::CSharp);
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_load_go_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::Go);
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_load_java_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::Java);
+        assert!(grammar.is_some());
+    }
+
+    #[test]
     fn test_unsupported_language() {
         let manager = GrammarManager::new();
         let grammar = manager.get_grammar(Language::Markdown);
@@ -227,6 +254,11 @@ mod tests {
         assert!(manager.is_supported(Language::Python));
         assert!(manager.is_supported(Language::JavaScript));
         assert!(manager.is_supported(Language::TypeScript));
+        assert!(manager.is_supported(Language::C));
+        assert!(manager.is_supported(Language::Cpp));
+        assert!(manager.is_supported(Language::CSharp));
+        assert!(manager.is_supported(Language::Go));
+        assert!(manager.is_supported(Language::Java));
         assert!(!manager.is_supported(Language::Markdown));
         assert!(!manager.is_supported(Language::Json));
     }
