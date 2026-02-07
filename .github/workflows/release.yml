@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
+      version:
+        description: 'Release version tag (e.g. v0.1.49)'
+        required: true
+        type: string
       include_macos:
         description: 'Include macOS build (10x minutes cost)'
         required: false
@@ -132,4 +136,4 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.version || github.ref_name }}

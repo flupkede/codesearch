@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use crate::cache::FileMetaStore;
 use crate::chunker::SemanticChunker;
-use crate::constants::FASTEMBED_CACHE_DIR;
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
@@ -269,7 +268,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // Initialize embedding service with the correct model
     let start = Instant::now();
-    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
+    let cache_dir = crate::constants::get_global_models_cache_dir()?;
     let mut embedding_service = EmbeddingService::with_cache_dir(model_type, Some(&cache_dir))?;
     let model_load_duration = start.elapsed();
 
@@ -588,7 +587,7 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
     let (files, _stats) = walker.walk()?;
 
     // Initialize services
-    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
+    let cache_dir = crate::constants::get_global_models_cache_dir()?;
     let mut embedding_service = EmbeddingService::with_cache_dir(model_type, Some(&cache_dir))?;
     let mut chunker = SemanticChunker::new(100, 2000, 10);
     let mut store = VectorStore::new(db_path, model_type.dimensions())?;

@@ -8,7 +8,6 @@ use tracing::{debug, info};
 
 use crate::cache::FileMetaStore;
 use crate::chunker::SemanticChunker;
-use crate::constants::FASTEMBED_CACHE_DIR;
 use crate::db_discovery::{find_best_database, register_repository, unregister_repository};
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
@@ -478,8 +477,8 @@ async fn index_with_options(
             .progress_chars("█▓▒░ "),
     );
 
-    // Initialize embedding model
-    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
+    // Initialize embedding model (uses global models cache)
+    let cache_dir = crate::constants::get_global_models_cache_dir()?;
     let mut embedding_service =
         EmbeddingService::with_cache_dir(model_type, Some(cache_dir.as_path()))?;
 

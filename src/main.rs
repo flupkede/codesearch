@@ -18,8 +18,23 @@ mod watch;
 
 use anyhow::Result;
 use std::fs::OpenOptions;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Wait for a CTRL-C / SIGINT signal (platform-specific).
+async fn wait_for_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{self, SignalKind};
+        let mut sig = unix::signal(SignalKind::interrupt()).unwrap();
+        sig.recv().await;
+    }
+    #[cfg(windows)]
+    {
+        tokio::signal::ctrl_c().await.unwrap();
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,21 +43,28 @@ async fn main() -> Result<()> {
     let is_quiet = args.iter().any(|a| a == "-q" || a == "--quiet");
     let is_json = args.iter().any(|a| a == "--json");
     let is_verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
-    
-    // Set up CTRL-C handler (platform-specific)
-    let ctrl_c = async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{self, SignalKind};
-            let mut sig = unix::signal(SignalKind::interrupt()).unwrap();
-            sig.recv().await;
+
+    // Create cancellation token for graceful shutdown
+    let cancel_token = CancellationToken::new();
+    let cancel_clone = cancel_token.clone();
+
+    // Spawn CTRL-C handler: first signal → graceful, second signal → force exit
+    tokio::spawn(async move {
+        // First CTRL-C: request graceful shutdown
+        wait_for_signal().await;
+        if !is_quiet && !is_json {
+            eprintln!("\n🛑 Shutting down gracefully... (press Ctrl-C again to force)");
         }
-        #[cfg(windows)]
-        {
-            tokio::signal::ctrl_c().await.unwrap();
+        cancel_clone.cancel();
+
+        // Second CTRL-C: force exit
+        wait_for_signal().await;
+        if !is_quiet && !is_json {
+            eprintln!("\n⚠️  Force shutdown!");
         }
-    };
-    
+        std::process::exit(130);
+    });
+
     // Skip tracing in quiet mode or JSON output
     if !is_quiet && !is_json {
         // Set up file logging for verbose mode
@@ -89,18 +111,8 @@ async fn main() -> Result<()> {
             info!("Starting codesearch v{}", env!("CARGO_PKG_VERSION_FULL"));
         }
     }
-    
-    // Handle CTRL-C gracefully with tokio::select!
-    tokio::select! {
-        _ = ctrl_c => {
-            if !is_quiet && !is_json {
-                println!("\n🛑 Interrupted by user");
-                println!("⚠️  Warning: Database may need recovery if interrupted during write operation");
-            }
-            std::process::exit(130); // Standard exit code for SIGINT
-        }
-        result = cli::run() => {
-            result
-        }
-    }
+
+    // Run CLI — for MCP/serve commands, cancel_token enables graceful shutdown.
+    // For short-lived commands, the token is simply unused.
+    cli::run(cancel_token).await
 }

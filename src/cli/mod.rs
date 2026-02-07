@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 
 use crate::embed::ModelType;
 use crate::search::SearchOptions;
@@ -190,7 +191,7 @@ pub enum Commands {
     },
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     let cli = Cli::parse();
 
     // Parse model from CLI flag
@@ -296,7 +297,7 @@ pub async fn run() -> Result<()> {
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
         Commands::Doctor => crate::cli::doctor::run().await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp { path } => crate::mcp::run_mcp_server(path).await,
+        Commands::Mcp { path } => crate::mcp::run_mcp_server(path, cancel_token).await,
     }
 }
 

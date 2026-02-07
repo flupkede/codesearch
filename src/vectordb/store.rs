@@ -114,9 +114,13 @@ impl VectorStore {
         cleanup_stale_del_files(db_path)?;
 
         // Open LMDB environment
+        let map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(4 * 1024 * 1024 * 1024) // 2GB max
+                .map_size(map_size_mb * 1024 * 1024)
                 .max_dbs(10)
                 .open(db_path)?
         };
@@ -181,9 +185,13 @@ impl VectorStore {
         }
 
         // Open LMDB environment in read-only mode
+        let map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(4 * 1024 * 1024 * 1024) // 2GB max
+                .map_size(map_size_mb * 1024 * 1024)
                 .max_dbs(10)
                 .flags(EnvFlags::READ_ONLY)
                 .open(db_path)?
