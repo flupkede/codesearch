@@ -247,8 +247,6 @@ impl FastEmbedder {
         )
         .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
 
-        output::print_info(format_args!("✅ Model loaded successfully!"));
-
         Ok(Self { model, model_type })
     }
     /// Embed a batch of texts (processes in mini-batches to avoid OOM)
