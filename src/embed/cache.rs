@@ -26,13 +26,11 @@ impl EmbeddingCache {
 
     /// Create a new cache with specified memory limit in MB
     pub fn with_memory_limit_mb(max_memory_mb: usize) -> Self {
-        // Calculate max entries based on memory budget
-        // Default: 384-dim f32 vector = 384 * 4 bytes = 1536 bytes per embedding
-        let avg_embedding_size = 384 * std::mem::size_of::<f32>();
-        let max_entries = (max_memory_mb * 1024 * 1024) / avg_embedding_size;
+        // max_capacity is used as MAX WEIGHT when weigher is provided
+        let max_weight = (max_memory_mb * 1024 * 1024) as u64;
 
         let cache = Cache::builder()
-            .max_capacity(max_entries as u64)
+            .max_capacity(max_weight)
             .weigher(|_key: &String, value: &Arc<Vec<f32>>| {
                 (value.len() * std::mem::size_of::<f32>()) as u32
             })

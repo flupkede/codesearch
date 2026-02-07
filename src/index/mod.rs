@@ -461,13 +461,14 @@ async fn index_with_options(
         }
     }
 
-    // Phase 2: Semantic Chunking
-    log_print!("\n{}", "Phase 2: Semantic Chunking".bright_cyan());
+    // Phase 2: Semantic Chunking + Embedding + Storage (Streaming)
+    // We process files one at a time to keep memory usage low
+    log_print!("\n{}", "Phase 2: Semantic Chunking, Embedding & Storage".bright_cyan());
     log_print!("{}", "-".repeat(60));
 
-    let start = Instant::now();
+    let chunking_start = Instant::now();
     let mut chunker = SemanticChunker::new(100, 2000, 10);
-    let mut all_chunks = Vec::new();
+    let mut total_chunks = 0;
 
     let pb = ProgressBar::new(files.len() as u64);
     pb.set_style(
@@ -476,6 +477,29 @@ async fn index_with_options(
             .unwrap()
             .progress_chars("█▓▒░ "),
     );
+
+    // Initialize embedding model
+    log_print!("🔄 Initializing embedding model...");
+    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
+    let mut embedding_service =
+        EmbeddingService::with_cache_dir(model_type, Some(cache_dir.as_path()))?;
+    log_print!(
+        "✅ Model loaded: {} ({} dims)",
+        embedding_service.model_name(),
+        embedding_service.dimensions()
+    );
+
+    // Initialize vector store
+    log_print!("🔄 Creating vector database...");
+    let mut store = VectorStore::new(&db_path, embedding_service.dimensions())?;
+    log_print!("✅ Database created");
+
+    // Initialize FTS store
+    let mut fts_store = FtsStore::new_with_writer(&db_path)?;
+
+    // Track chunk IDs per file for metadata (memory efficient: only file paths, not chunk contents)
+    let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::new();
 
     let mut skipped_files = 0;
     for file in &files {
@@ -497,123 +521,78 @@ async fn index_with_options(
             }
         };
 
+        // Phase 2a: Chunk this file only (memory efficient!)
         let chunks = chunker.chunk_semantic(file.language, &file.path, &source_code)?;
+        let chunk_count = chunks.len();
         debug!(
             "   Created {} chunks for {}",
-            chunks.len(),
+            chunk_count,
             file.path.display()
         );
-        all_chunks.extend(chunks);
 
+        if chunks.is_empty() {
+            pb.inc(1);
+            continue;
+        }
+
+        // Phase 2b: Embed chunks for this file only (batched internally)
+        let embedded_chunks = embedding_service.embed_chunks(chunks)?;
+
+        // Phase 2c: Insert into vector store immediately
+        let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
+
+        // Phase 2d: Insert into FTS store immediately
+        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
+            fts_store.add_chunk(
+                *chunk_id,
+                &chunk.chunk.content,
+                &chunk.chunk.path,
+                chunk.chunk.signature.as_deref(),
+                &format!("{:?}", chunk.chunk.kind),
+            )?;
+        }
+
+        // Track chunk IDs per file for metadata (only paths and IDs, not chunk content)
+        let file_path = file.path.to_string_lossy().to_string();
+        file_chunks.insert(file_path, chunk_ids.clone());
+
+        total_chunks += chunk_count;
         pb.inc(1);
+
+        // Memory is freed here - chunks/embeddings dropped before next file
     }
+
+    // Commit FTS store
+    fts_store.commit()?;
 
     if skipped_files > 0 {
         log_print!("   ⚠️  Skipped {} files (invalid UTF-8)", skipped_files);
     }
 
     pb.finish_with_message("Done!");
-    let chunking_duration = start.elapsed();
+    let chunking_duration = chunking_start.elapsed();
 
     log_print!(
-        "✅ Created {} chunks in {:?}",
-        all_chunks.len(),
+        "✅ Created and indexed {} chunks in {:?}",
+        total_chunks,
         chunking_duration
     );
 
-    if all_chunks.is_empty() {
+    if total_chunks == 0 {
         log_print!("\n{}", "No chunks created!".yellow());
         return Ok(());
     }
 
-    // Phase 3: Embedding Generation
-    log_print!("\n{}", "Phase 3: Embedding Generation".bright_cyan());
-    log_print!("{}", "-".repeat(60));
-
-    let start = Instant::now();
-    log_print!("🔄 Initializing embedding model...");
-
-    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
-    let mut embedding_service =
-        EmbeddingService::with_cache_dir(model_type, Some(cache_dir.as_path()))?;
-    log_print!(
-        "✅ Model loaded: {} ({} dims)",
-        embedding_service.model_name(),
-        embedding_service.dimensions()
-    );
-
-    log_print!(
-        "\n🔄 Generating embeddings for {} chunks...",
-        all_chunks.len()
-    );
-    let embedded_chunks = embedding_service.embed_chunks(all_chunks)?;
-    let embedding_duration = start.elapsed();
-
-    log_print!(
-        "✅ Generated {} embeddings in {:?}",
-        embedded_chunks.len(),
-        embedding_duration
-    );
-    log_print!(
-        "   Average: {:?} per chunk",
-        embedding_duration / embedded_chunks.len() as u32
-    );
-
-    // Show cache stats
-    let cache_stats = embedding_service.cache_stats();
-    log_print!("   Cache hit rate: {:.1}%", cache_stats.hit_rate() * 100.0);
-
-    // Phase 4: Vector Storage
-    log_print!("\n{}", "Phase 4: Vector Storage".bright_cyan());
-    log_print!("{}", "-".repeat(60));
-
-    let start = Instant::now();
-    log_print!("🔄 Creating vector database...");
-
-    let mut store = VectorStore::new(&db_path, embedding_service.dimensions())?;
-    log_print!("✅ Database created");
-
-    log_print!("\n🔄 Inserting {} chunks...", embedded_chunks.len());
-    let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
-    log_print!("✅ Inserted {} chunks into vector store", chunk_ids.len());
-
+    // Build vector index (now that all chunks are inserted)
     log_print!("\n🔄 Building vector index...");
+    let storage_start = Instant::now();
     store.build_index()?;
 
-    // Phase 4b: FTS Index
-    log_print!("\n🔄 Building full-text search index...");
-
-    // Clear FTS directory if doing a full rebuild (not incremental)
-    if !is_incremental {
-        let fts_path = db_path.join("fts");
-        if fts_path.exists() {
-            debug!("🗑️  Clearing existing FTS index for full rebuild...");
-            if let Err(e) = std::fs::remove_dir_all(&fts_path) {
-                // On Windows, files might be locked - try to continue anyway
-                debug!("⚠️  Could not fully clear FTS directory: {}", e);
-            }
-        }
-    }
-
-    let mut fts_store = FtsStore::new_with_writer(&db_path)?;
-
-    for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-        fts_store.add_chunk(
-            *chunk_id,
-            &chunk.chunk.content,
-            &chunk.chunk.path,
-            chunk.chunk.signature.as_deref(),
-            &format!("{:?}", chunk.chunk.kind),
-        )?;
-    }
-    fts_store.commit()?;
-
     let fts_stats = fts_store.stats()?;
-    log_print!("✅ FTS index built ({} documents)", fts_stats.num_documents);
+    log_print!("✅ Vector index and FTS index built ({} documents)", fts_stats.num_documents);
 
-    let storage_duration = start.elapsed();
-
-    log_print!("✅ Index built in {:?}", storage_duration);
+    let storage_duration = storage_start.elapsed();
+    log_print!("✅ Storage completed in {:?}", storage_duration);
 
     // Save model metadata
     let metadata = serde_json::json!({
@@ -635,17 +614,6 @@ async fn index_with_options(
         // Don't create a new one - that would lose all unchanged file metadata
         let mut file_meta_store = file_meta_store.take().unwrap();
 
-        // Group chunks by file
-        let capacity = embedded_chunks.len() / 10; // Estimate: ~10 chunks per file
-        let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
-            std::collections::HashMap::with_capacity(capacity.max(1));
-        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-            file_chunks
-                .entry(chunk.chunk.path.clone())
-                .or_default()
-                .push(*chunk_id);
-        }
-
         // Save FileMetaStore count before moving
         let file_count = file_chunks.len();
 
@@ -665,17 +633,6 @@ async fn index_with_options(
         // In full index mode, create a fresh FileMetaStore
         let mut file_meta_store =
             FileMetaStore::new(model_type.name().to_string(), model_type.dimensions());
-
-        // Group chunks by file
-        let capacity = embedded_chunks.len() / 10; // Estimate: ~10 chunks per file
-        let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
-            std::collections::HashMap::with_capacity(capacity.max(1));
-        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-            file_chunks
-                .entry(chunk.chunk.path.clone())
-                .or_default()
-                .push(*chunk_id);
-        }
 
         // Update FileMetaStore
         for (file_path, chunk_ids) in file_chunks {
@@ -715,13 +672,12 @@ async fn index_with_options(
 
     // Total time
     let total_duration =
-        discovery_duration + chunking_duration + embedding_duration + storage_duration;
+        discovery_duration + chunking_duration + storage_duration;
     log_print!("\n{}", "⏱️  Timing Breakdown".bright_green());
     log_print!("{}", "-".repeat(60));
     log_print!("   File discovery:      {:?}", discovery_duration);
     log_print!("   Semantic chunking:   {:?}", chunking_duration);
-    log_print!("   Embedding generation:{:?}", embedding_duration);
-    log_print!("   Vector storage:      {:?}", storage_duration);
+    log_print!("   Embedding + storage:{:?}", storage_duration);
     log_print!(
         "   {}",
         format!("Total:               {:?}", total_duration).bold()
