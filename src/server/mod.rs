@@ -15,7 +15,6 @@ use tokio::sync::RwLock;
 
 use crate::cache::FileMetaStore;
 use crate::chunker::SemanticChunker;
-use crate::constants::FASTEMBED_CACHE_DIR;
 use crate::db_discovery::find_best_database;
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
@@ -126,7 +125,7 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
     // Initialize embedding service
     let model_type = ModelType::default();
     println!("\n🔄 Loading embedding model...");
-    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
+    let cache_dir = crate::constants::get_global_models_cache_dir()?;
     let embedding_service = EmbeddingService::with_cache_dir(model_type, Some(&cache_dir))?;
     let dimensions = embedding_service.dimensions();
 
@@ -149,7 +148,7 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
             store: RwLock::new(store),
             embedding_service: Mutex::new(EmbeddingService::with_cache_dir(
                 model_type,
-                Some(&db_path.join(FASTEMBED_CACHE_DIR)),
+                Some(&crate::constants::get_global_models_cache_dir()?),
             )?),
             chunker: Mutex::new(SemanticChunker::new(100, 2000, 10)),
             file_meta: RwLock::new(file_meta),
@@ -219,7 +218,7 @@ async fn initial_index(
     println!("  Created {} chunks", all_chunks.len());
 
     // Embedding
-    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
+    let cache_dir = crate::constants::get_global_models_cache_dir()?;
     let mut embedding_service = EmbeddingService::with_cache_dir(model_type, Some(&cache_dir))?;
     let embedded_chunks = embedding_service.embed_chunks(all_chunks)?;
     println!("  Generated {} embeddings", embedded_chunks.len());

@@ -25,6 +25,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 // Import Result from the parent module
@@ -485,7 +486,7 @@ impl IndexManager {
             if !all_chunks.is_empty() {
                 // Embed chunks
                 info!("📦 Embedding {} chunks...", all_chunks.len());
-                let cache_dir = db_path.join(crate::constants::FASTEMBED_CACHE_DIR);
+                let cache_dir = crate::constants::get_global_models_cache_dir()?;
                 let mut embedding_service = EmbeddingService::with_cache_dir(
                     ModelType::default(),
                     Some(cache_dir.as_path()),
@@ -557,6 +558,9 @@ impl IndexManager {
     /// This is the **second method call** - should be called after `new()`.
     /// Spawns a background task that watches for file changes and refreshes the index.
     ///
+    /// # Arguments
+    /// * `cancel_token` - Cancellation token for graceful shutdown
+    ///
     /// # Returns
     /// * `Result<()>` - Success or error
     ///
@@ -567,7 +571,8 @@ impl IndexManager {
     /// - Flushes batch when no new events for FSW_BATCH_FLUSH_MS
     /// - Logs all file system events and refresh operations
     /// - Continues running even if individual refresh operations fail
-    pub async fn start_file_watcher(&self) -> Result<()> {
+    /// - Stops gracefully when the cancellation token is cancelled
+    pub async fn start_file_watcher(&self, cancel_token: CancellationToken) -> Result<()> {
         let path = self.codebase_path.clone();
         let db_path = self.db_path.clone();
         let watcher = self.watcher.clone();
@@ -595,6 +600,12 @@ impl IndexManager {
             let flush_duration = std::time::Duration::from_millis(FSW_BATCH_FLUSH_MS);
 
             loop {
+                // Check if shutdown was requested
+                if cancel_token.is_cancelled() {
+                    info!("🛑 File watcher received shutdown signal, stopping...");
+                    break;
+                }
+
                 // Poll for new events
                 let events = watcher.lock().await.poll_events();
                 let now = std::time::Instant::now();
@@ -669,9 +680,17 @@ impl IndexManager {
                     last_event_time = now;
                 }
 
-                // Sleep to avoid busy-waiting
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                // Sleep to avoid busy-waiting, but wake up immediately on shutdown
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
+                    _ = cancel_token.cancelled() => {
+                        info!("🛑 File watcher received shutdown signal during sleep, stopping...");
+                        break;
+                    }
+                }
             }
+
+            info!("✅ File watcher stopped cleanly");
         });
 
         info!("✅ File watcher background task spawned");
@@ -838,7 +857,7 @@ impl IndexManager {
         );
 
         // Generate embeddings
-        let cache_dir = db_path.join(crate::constants::FASTEMBED_CACHE_DIR);
+        let cache_dir = crate::constants::get_global_models_cache_dir()?;
         let mut embedding_service =
             EmbeddingService::with_cache_dir(ModelType::default(), Some(cache_dir.as_path()))?;
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
@@ -996,7 +1015,7 @@ impl IndexManager {
         );
 
         // Generate embeddings
-        let cache_dir = db_path.join(crate::constants::FASTEMBED_CACHE_DIR);
+        let cache_dir = crate::constants::get_global_models_cache_dir()?;
         let mut embedding_service =
             EmbeddingService::with_cache_dir(ModelType::default(), Some(cache_dir.as_path()))?;
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;

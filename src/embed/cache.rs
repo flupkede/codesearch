@@ -19,9 +19,9 @@ pub struct EmbeddingCache {
 }
 
 impl EmbeddingCache {
-    /// Create a new empty cache with default memory limit (500MB)
+    /// Create a new empty cache with default memory limit
     pub fn new() -> Self {
-        Self::with_memory_limit_mb(500)
+        Self::with_memory_limit_mb(crate::constants::DEFAULT_CACHE_MAX_MEMORY_MB)
     }
 
     /// Create a new cache with specified memory limit in MB
@@ -159,7 +159,7 @@ pub struct CachedBatchEmbedder {
 }
 
 impl CachedBatchEmbedder {
-    /// Create a new cached batch embedder with default memory limit (500MB)
+    /// Create a new cached batch embedder with default memory limit
     #[allow(dead_code)] // Reserved for cached embedding mode
     pub fn new(batch_embedder: super::batch::BatchEmbedder) -> Self {
         Self {
@@ -258,7 +258,10 @@ mod tests {
     #[test]
     fn test_cache_creation() {
         let cache = EmbeddingCache::new();
-        assert_eq!(cache.max_memory_mb, 500);
+        assert_eq!(
+            cache.max_memory_mb,
+            crate::constants::DEFAULT_CACHE_MAX_MEMORY_MB
+        );
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
     }
