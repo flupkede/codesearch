@@ -61,9 +61,7 @@ impl GrammarManager {
             Language::Rust => Ok(tree_sitter_rust::LANGUAGE.into()),
             Language::Python => Ok(tree_sitter_python::LANGUAGE.into()),
             Language::JavaScript => Ok(tree_sitter_javascript::LANGUAGE.into()),
-            Language::TypeScript => {
-                Ok(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            }
+            Language::TypeScript => Ok(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             Language::C => Ok(tree_sitter_c::LANGUAGE.into()),
             Language::Cpp => Ok(tree_sitter_cpp::LANGUAGE.into()),
             Language::CSharp => Ok(tree_sitter_c_sharp::LANGUAGE.into()),

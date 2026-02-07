@@ -526,8 +526,8 @@ impl CodesearchService {
                         project_path: self.project_path.display().to_string(),
                         error_message: Some(format!("Error getting stats: {}", e)),
                     };
-                    let json = serde_json::to_string(&response)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let json =
+                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
                     return Ok(CallToolResult::success(vec![Content::text(json)]));
                 }
             }
@@ -546,8 +546,8 @@ impl CodesearchService {
                         project_path: self.project_path.display().to_string(),
                         error_message: Some(format!("Error opening database: {}", e)),
                     };
-                    let json = serde_json::to_string(&response)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let json =
+                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
                     return Ok(CallToolResult::success(vec![Content::text(json)]));
                 }
             };
@@ -565,8 +565,8 @@ impl CodesearchService {
                         project_path: self.project_path.display().to_string(),
                         error_message: Some(format!("Error getting stats: {}", e)),
                     };
-                    let json = serde_json::to_string(&response)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let json =
+                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
                     return Ok(CallToolResult::success(vec![Content::text(json)]));
                 }
             }
