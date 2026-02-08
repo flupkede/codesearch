@@ -68,9 +68,9 @@ pub const REPOS_CONFIG_FILE: &str = "repos.json";
 /// This is the maximum virtual address space reserved for the memory-mapped database.
 /// On Linux/macOS this is just an address space reservation (no physical RAM until data is written).
 /// On Windows the file may be pre-allocated to this size, so keeping it small matters.
-/// 256MB is sufficient for most codebases (64k chunks × ~4KB = ~256MB).
+/// 512MB is sufficient for most codebases (~100k chunks × ~5KB = ~512MB).
 /// Override with `CODESEARCH_LMDB_MAP_SIZE_MB` environment variable.
-pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 128;
+pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 512;
 
 /// Default embedding cache memory limit in MB.
 ///
