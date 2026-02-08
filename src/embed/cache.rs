@@ -14,6 +14,7 @@ pub struct EmbeddingCache {
     cache: Cache<String, Arc<Vec<f32>>>,
     hits: AtomicU64,
     misses: AtomicU64,
+    #[allow(dead_code)] // Used in stats()
     max_memory_mb: usize,
 }
 
@@ -75,6 +76,7 @@ impl EmbeddingCache {
     }
 
     /// Get cache statistics
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             size: self.cache.entry_count() as usize,
@@ -109,12 +111,14 @@ impl EmbeddingCache {
     }
 
     /// Get current memory usage estimate (in bytes)
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn memory_usage_bytes(&self) -> usize {
         self.cache.run_pending_tasks();
         self.cache.weighted_size() as usize
     }
 
     /// Get current memory usage estimate (in MB)
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn memory_usage_mb(&self) -> f64 {
         self.memory_usage_bytes() as f64 / (1024.0 * 1024.0)
     }
@@ -128,15 +132,20 @@ impl Default for EmbeddingCache {
 
 /// Cache statistics
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Part of public API for debugging/monitoring
 pub struct CacheStats {
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub size: usize,
     pub hits: u64,
     pub misses: u64,
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub max_memory_mb: usize,
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub max_entries: usize,
 }
 
 impl CacheStats {
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn hit_rate(&self) -> f32 {
         let total = self.hits + self.misses;
         if total == 0 {
@@ -154,6 +163,7 @@ impl CacheStats {
 /// Cached batch embedder that uses an embedding cache with memory limits
 pub struct CachedBatchEmbedder {
     pub batch_embedder: super::batch::BatchEmbedder,
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     cache: EmbeddingCache,
 }
 
@@ -228,6 +238,7 @@ impl CachedBatchEmbedder {
     }
 
     /// Get cache statistics
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn cache_stats(&self) -> CacheStats {
         self.cache.stats()
     }
@@ -244,6 +255,7 @@ impl CachedBatchEmbedder {
     }
 
     /// Get cache reference
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn cache(&self) -> &EmbeddingCache {
         &self.cache
     }

@@ -61,6 +61,9 @@ fn get_db_path_smart(
                 .yellow()
             );
             std::fs::remove_dir_all(&db_info.db_path)?;
+            // Wait for Windows to fully release file handles (memory-mapped files
+            // from LMDB/tantivy may not be immediately released after deletion)
+            std::thread::sleep(std::time::Duration::from_millis(300));
             println!("✅ Existing database deleted");
         }
         // After deletion, continue to create new database
@@ -460,11 +463,9 @@ async fn index_with_options(
         log_print!("\n🔄 Processing {} changed files...", changed_files.len());
         files = changed_files;
     } else {
-        // Clear existing database if forcing
-        if db_path.exists() && force {
-            log_print!("\n{}", "🗑️  Clearing existing database...".yellow());
-            std::fs::remove_dir_all(&db_path)?;
-        }
+        // Note: database deletion for --force is handled in get_db_path_smart()
+        // (including the delay for Windows file handle release). This else branch
+        // only runs when not in incremental mode, i.e., fresh index creation.
     }
 
     // Phase 2: Semantic Chunking + Embedding + Storage (Streaming)
@@ -586,6 +587,14 @@ async fn index_with_options(
 
         total_chunks += chunk_count;
         pb.inc(1);
+
+        // Periodic FTS commit to flush the in-memory segment to disk in a controlled
+        // way. Without this, tantivy's background merge thread may trigger an
+        // uncontrolled flush when the writer heap fills, which can fail on Windows
+        // due to file locking / antivirus interference.
+        if total_chunks % 1000 == 0 && total_chunks > 0 {
+            fts_store.commit()?;
+        }
 
         // Memory is freed here - chunks/embeddings dropped before next file
     }

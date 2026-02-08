@@ -157,9 +157,10 @@ impl FtsStore {
                 std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
             }
 
-            // 15MB writer heap - sufficient for code chunks (typically 500B-5KB)
-            // Reduced from default 50MB to lower memory footprint
-            match index.writer(15_000_000) {
+            // 50MB writer heap (tantivy default) - reduced heaps cause frequent
+            // background segment merges that fail intermittently on Windows due to
+            // file locking / antivirus interference, killing the IndexWriter
+            match index.writer(50_000_000) {
                 Ok(writer) => return Ok(writer),
                 Err(e) => {
                     last_error = Some(e.to_string());
@@ -375,7 +376,9 @@ impl FtsStore {
 
 /// Statistics about the FTS index
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Part of public API for debugging/monitoring
 pub struct FtsStats {
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub num_documents: usize,
 }
 
