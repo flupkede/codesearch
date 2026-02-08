@@ -622,13 +622,26 @@ async fn index_with_options(
 
         // Don't call build_index() — it blocks for 10-30 seconds on large datasets.
         // The database is in a partially written state, user can re-run with --force.
-        // Just commit what we have in FTS for consistency.
+        // Commit FTS with retry to avoid index corruption on shutdown.
         if total_chunks > 0 {
-            let _ = fts_store.commit(); // best-effort, don't block on error
-            log_print!(
-                "   Partial progress: {} chunks written (re-run with --force for clean index)",
-                total_chunks
-            );
+            if let Err(e) = fts_store.commit() {
+                // Log the error - best-effort commit failed
+                log_print!(
+                    "{}   FTS commit warning: {} (index may need recovery)",
+                    "⚠️ ".yellow(),
+                    e
+                );
+                log_print!(
+                    "{}   Run {} to rebuild the index cleanly if needed",
+                    "💡 ".cyan(),
+                    "codesearch index -f".bright_cyan()
+                );
+            } else {
+                log_print!(
+                    "   Partial progress: {} chunks written (re-run with --force for clean index)",
+                    total_chunks
+                );
+            }
         }
 
         return Ok(());
