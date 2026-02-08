@@ -229,9 +229,7 @@ impl FastEmbedder {
         }
 
         // Use CPU execution provider WITH arena allocator for speed.
-        // Arena allocator grows but never shrinks, so we periodically recreate
-        // the ONNX session (via EmbeddingService::reset_embedder) to free arena memory.
-        // This gives near-original speed with bounded memory (~300-500MB peak).
+        // Arena allocator provides fast memory reuse during inference.
         let cpu_ep = CPUExecutionProvider::default()
             .with_arena_allocator(true)
             .build();
