@@ -88,6 +88,26 @@ impl EmbeddingService {
     pub fn cache_stats(&self) -> CacheStats {
         self.cached_embedder.cache_stats()
     }
+
+    /// Reset the ONNX session to free arena allocator memory.
+    ///
+    /// The ONNX arena allocator is fast but grows monotonically — memory is
+    /// never returned to the OS until the session is destroyed.  This method
+    /// drops the old `FastEmbedder` (releasing the arena) and creates a fresh
+    /// one with the same model.  The embedding **cache** is preserved so
+    /// previously-computed embeddings are not lost.
+    ///
+    /// Typical overhead: ~1-2 seconds (model file already on disk).
+    pub fn reset_embedder(&mut self, cache_dir: Option<&std::path::Path>) -> Result<()> {
+        let new_embedder = FastEmbedder::with_cache_dir(self.model_type, cache_dir)?;
+        let embedder_arc = &self.cached_embedder.batch_embedder.embedder;
+        let mut guard = embedder_arc
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?;
+        // Drop old embedder (frees ONNX arena), replace with fresh one
+        *guard = new_embedder;
+        Ok(())
+    }
 }
 
 impl Default for EmbeddingService {
