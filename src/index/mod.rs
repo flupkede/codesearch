@@ -571,14 +571,25 @@ async fn index_with_options(
         let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
 
         // Phase 2d: Insert into FTS store immediately
+        // FTS failures are non-fatal: vector search is the primary search method,
+        // FTS (BM25) is supplementary for hybrid search. If tantivy encounters
+        // I/O errors (common on Windows due to antivirus interference), we log
+        // a warning and continue rather than aborting the entire indexing run.
         for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-            fts_store.add_chunk(
+            if let Err(e) = fts_store.add_chunk(
                 *chunk_id,
                 &chunk.chunk.content,
                 &chunk.chunk.path,
                 chunk.chunk.signature.as_deref(),
                 &format!("{:?}", chunk.chunk.kind),
-            )?;
+            ) {
+                tracing::warn!(
+                    "FTS add_chunk failed for chunk {} in {}: {} (continuing without FTS for this chunk)",
+                    chunk_id,
+                    file.path.display(),
+                    e
+                );
+            }
         }
 
         // Track chunk IDs per file for metadata (only paths and IDs, not chunk content)
@@ -589,11 +600,16 @@ async fn index_with_options(
         pb.inc(1);
 
         // Periodic FTS commit to flush the in-memory segment to disk in a controlled
-        // way. Without this, tantivy's background merge thread may trigger an
-        // uncontrolled flush when the writer heap fills, which can fail on Windows
-        // due to file locking / antivirus interference.
+        // way. Non-fatal: if commit fails, we log and continue. Some FTS data may
+        // be lost but vector search (primary) is unaffected.
         if total_chunks % 1000 == 0 && total_chunks > 0 {
-            fts_store.commit()?;
+            if let Err(e) = fts_store.commit() {
+                tracing::warn!(
+                    "Periodic FTS commit failed at {} chunks: {} (continuing, some FTS data may be lost)",
+                    total_chunks,
+                    e
+                );
+            }
         }
 
         // Memory is freed here - chunks/embeddings dropped before next file
@@ -645,8 +661,13 @@ async fn index_with_options(
     drop(embedding_service);
     drop(chunker);
 
-    // Commit FTS store
-    fts_store.commit()?;
+    // Commit FTS store (non-fatal: vector search works without FTS)
+    if let Err(e) = fts_store.commit() {
+        tracing::warn!(
+            "Final FTS commit failed: {} (vector search will work, but hybrid/BM25 search may have gaps)",
+            e
+        );
+    }
 
     if skipped_files > 0 {
         log_print!("   ⚠️  Skipped {} files (invalid UTF-8)", skipped_files);
