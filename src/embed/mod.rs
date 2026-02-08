@@ -85,6 +85,7 @@ impl EmbeddingService {
     }
 
     /// Get cache statistics
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn cache_stats(&self) -> CacheStats {
         self.cached_embedder.cache_stats()
     }
