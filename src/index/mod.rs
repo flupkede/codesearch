@@ -507,13 +507,6 @@ async fn index_with_options(
 
     // Arena reset interval: periodically recreate the ONNX session to free
     // arena allocator memory that grows monotonically. Model is on disk, so
-    // recreation is fast (~1-2s). Cache is preserved across resets.
-    let arena_reset_interval: usize = std::env::var("CODESEARCH_ARENA_RESET_INTERVAL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(crate::constants::DEFAULT_ARENA_RESET_INTERVAL);
-    let mut files_since_reset: usize = 0;
-
     let mut skipped_files = 0;
     let mut cancelled = false;
     for file in &files {
@@ -592,21 +585,7 @@ async fn index_with_options(
         file_chunks.insert(file_path, chunk_ids.clone());
 
         total_chunks += chunk_count;
-        files_since_reset += 1;
         pb.inc(1);
-
-        // Periodically recreate ONNX session to free arena allocator memory.
-        // Arena memory grows monotonically during inference; the only way to
-        // reclaim it is to destroy the session. The embedding cache (Moka)
-        // survives across resets, so cached embeddings are not lost.
-        if arena_reset_interval > 0 && files_since_reset >= arena_reset_interval {
-            debug!(
-                "♻️  Resetting ONNX session after {} files to free arena memory",
-                files_since_reset
-            );
-            embedding_service.reset_embedder(Some(cache_dir.as_path()))?;
-            files_since_reset = 0;
-        }
 
         // Memory is freed here - chunks/embeddings dropped before next file
     }

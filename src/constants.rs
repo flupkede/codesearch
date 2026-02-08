@@ -80,15 +80,6 @@ pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 512;
 /// Override with `CODESEARCH_CACHE_MAX_MEMORY` environment variable.
 pub const DEFAULT_CACHE_MAX_MEMORY_MB: usize = 100;
 
-/// Number of files between ONNX session resets during indexing.
-///
-/// The ONNX arena allocator is fast but grows monotonically (never frees).
-/// By destroying and recreating the session every N files we cap peak memory
-/// at roughly 300-500 MB while keeping close-to-original speed.
-/// Session recreation takes ~1-2 seconds (model already on disk).
-/// Override with `CODESEARCH_ARENA_RESET_INTERVAL` environment variable.
-pub const DEFAULT_ARENA_RESET_INTERVAL: usize = 100;
-
 /// File watcher debounce time in milliseconds
 pub const DEFAULT_FSW_DEBOUNCE_MS: u64 = 2000;
 
