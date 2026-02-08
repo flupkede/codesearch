@@ -4,6 +4,23 @@
 //! to avoid duplication and ensure consistency across the codebase.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global shutdown flag, set by the CTRL-C handler.
+///
+/// This uses a raw `AtomicBool` instead of relying solely on `CancellationToken`
+/// because the indexing pipeline is largely synchronous (ONNX inference, file I/O)
+/// and the flag must be visible from any thread without async polling.
+///
+/// Checked between files and between embedding mini-batches so that CTRL-C
+/// is honoured within a few seconds even during heavy CPU work.
+pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Check whether a graceful shutdown has been requested (CTRL-C).
+#[inline]
+pub fn is_shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
 
 /// Name of the database directory in project roots
 pub const DB_DIR_NAME: &str = ".codesearch.db";
@@ -53,7 +70,7 @@ pub const REPOS_CONFIG_FILE: &str = "repos.json";
 /// On Windows the file may be pre-allocated to this size, so keeping it small matters.
 /// 256MB is sufficient for most codebases (64k chunks × ~4KB = ~256MB).
 /// Override with `CODESEARCH_LMDB_MAP_SIZE_MB` environment variable.
-pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 256;
+pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 128;
 
 /// Default embedding cache memory limit in MB.
 ///
@@ -62,6 +79,15 @@ pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 256;
 /// 100MB is sufficient since files are processed sequentially during indexing.
 /// Override with `CODESEARCH_CACHE_MAX_MEMORY` environment variable.
 pub const DEFAULT_CACHE_MAX_MEMORY_MB: usize = 100;
+
+/// Number of files between ONNX session resets during indexing.
+///
+/// The ONNX arena allocator is fast but grows monotonically (never frees).
+/// By destroying and recreating the session every N files we cap peak memory
+/// at roughly 300-500 MB while keeping close-to-original speed.
+/// Session recreation takes ~1-2 seconds (model already on disk).
+/// Override with `CODESEARCH_ARENA_RESET_INTERVAL` environment variable.
+pub const DEFAULT_ARENA_RESET_INTERVAL: usize = 100;
 
 /// File watcher debounce time in milliseconds
 pub const DEFAULT_FSW_DEBOUNCE_MS: u64 = 2000;

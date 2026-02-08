@@ -1,6 +1,5 @@
 use super::embedder::FastEmbedder;
 use crate::chunker::Chunk;
-use crate::output;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
@@ -88,7 +87,7 @@ impl BatchEmbedder {
         }
 
         let total = chunks.len();
-        let start = std::time::Instant::now();
+        let _start = std::time::Instant::now();
         let mut embedded_chunks = Vec::with_capacity(total);
 
         // Process in batches

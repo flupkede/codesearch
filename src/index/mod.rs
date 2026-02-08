@@ -489,6 +489,12 @@ async fn index_with_options(
     let mut embedding_service =
         EmbeddingService::with_cache_dir(model_type, Some(cache_dir.as_path()))?;
 
+    // Check for shutdown after model loading (can take 5-10 seconds)
+    if crate::constants::is_shutdown_requested() || cancel_token.is_cancelled() {
+        log_print!("\n{}", "⚠️  Indexing cancelled during model loading".yellow());
+        return Ok(());
+    }
+
     // Initialize vector store
     let mut store = VectorStore::new(&db_path, embedding_service.dimensions())?;
 
@@ -499,11 +505,21 @@ async fn index_with_options(
     let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
         std::collections::HashMap::new();
 
+    // Arena reset interval: periodically recreate the ONNX session to free
+    // arena allocator memory that grows monotonically. Model is on disk, so
+    // recreation is fast (~1-2s). Cache is preserved across resets.
+    let arena_reset_interval: usize = std::env::var("CODESEARCH_ARENA_RESET_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(crate::constants::DEFAULT_ARENA_RESET_INTERVAL);
+    let mut files_since_reset: usize = 0;
+
     let mut skipped_files = 0;
     let mut cancelled = false;
     for file in &files {
         // Check for cancellation before processing each file
-        if cancel_token.is_cancelled() {
+        // Uses BOTH global AtomicBool (set by ctrlc OS handler) AND CancellationToken (for programmatic cancel)
+        if crate::constants::is_shutdown_requested() || cancel_token.is_cancelled() {
             cancelled = true;
             break;
         }
@@ -541,10 +557,18 @@ async fn index_with_options(
         }
 
         // Phase 2b: Embed chunks for this file only (batched internally)
-        let embedded_chunks = embedding_service.embed_chunks(chunks)?;
+        // If embedding is interrupted by CTRL-C, catch it as cancellation (not error)
+        let embedded_chunks = match embedding_service.embed_chunks(chunks) {
+            Ok(chunks) => chunks,
+            Err(_) if crate::constants::is_shutdown_requested() => {
+                cancelled = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
 
         // Check cancellation after embedding (most CPU-intensive step)
-        if cancel_token.is_cancelled() {
+        if crate::constants::is_shutdown_requested() || cancel_token.is_cancelled() {
             cancelled = true;
             break;
         }
@@ -568,44 +592,43 @@ async fn index_with_options(
         file_chunks.insert(file_path, chunk_ids.clone());
 
         total_chunks += chunk_count;
+        files_since_reset += 1;
         pb.inc(1);
+
+        // Periodically recreate ONNX session to free arena allocator memory.
+        // Arena memory grows monotonically during inference; the only way to
+        // reclaim it is to destroy the session. The embedding cache (Moka)
+        // survives across resets, so cached embeddings are not lost.
+        if arena_reset_interval > 0 && files_since_reset >= arena_reset_interval {
+            debug!(
+                "♻️  Resetting ONNX session after {} files to free arena memory",
+                files_since_reset
+            );
+            embedding_service.reset_embedder(Some(cache_dir.as_path()))?;
+            files_since_reset = 0;
+        }
 
         // Memory is freed here - chunks/embeddings dropped before next file
     }
 
-    // Handle cancellation: save partial progress and exit cleanly
+    // Handle cancellation: exit quickly without blocking on build_index
     if cancelled {
         pb.finish_with_message("Cancelled!");
         log_print!("\n{}", "⚠️  Indexing cancelled by user".yellow());
 
-        // Free ONNX model + arena allocator memory before index operations
+        // Free ONNX model memory immediately
         drop(embedding_service);
         drop(chunker);
 
+        // Don't call build_index() — it blocks for 10-30 seconds on large datasets.
+        // The database is in a partially written state, user can re-run with --force.
+        // Just commit what we have in FTS for consistency.
         if total_chunks > 0 {
-            fts_store.commit()?;
-            store.build_index()?;
+            let _ = fts_store.commit(); // best-effort, don't block on error
             log_print!(
-                "   Saved {} chunks indexed before cancellation",
+                "   Partial progress: {} chunks written (re-run with --force for clean index)",
                 total_chunks
             );
-
-            // Save file metadata for already-processed files
-            if is_incremental {
-                if let Some(ref mut fms) = file_meta_store {
-                    for (file_path, chunk_ids) in &file_chunks {
-                        fms.update_file(Path::new(file_path), chunk_ids.clone())?;
-                    }
-                    fms.save(&db_path)?;
-                }
-            } else {
-                let mut fms =
-                    FileMetaStore::new(model_type.name().to_string(), model_type.dimensions());
-                for (file_path, chunk_ids) in &file_chunks {
-                    fms.update_file(Path::new(file_path), chunk_ids.clone())?;
-                }
-                fms.save(&db_path)?;
-            }
         }
 
         return Ok(());
@@ -646,8 +669,8 @@ async fn index_with_options(
     let storage_start = Instant::now();
     store.build_index()?;
 
-    let fts_stats = fts_store.stats()?;
-    let storage_duration = storage_start.elapsed();
+    let _fts_stats = fts_store.stats()?;
+    let _storage_duration = storage_start.elapsed();
 
     // Save model metadata
     let metadata = serde_json::json!({

@@ -1,4 +1,3 @@
-use crate::output;
 use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
 use ort::execution_providers::CPUExecutionProvider;
@@ -220,11 +219,6 @@ impl FastEmbedder {
         model_type: ModelType,
         cache_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
-        output::print_info(format_args!(
-            "📦 Loading embedding model: {}",
-            model_type.name()
-        ));
-
         // Set cache directory via environment variable if provided
         // Note: fastembed library uses FASTEMBED_CACHE_DIR (not FASTEMBED_CACHE_PATH)
         if let Some(cache_dir) = cache_dir {
@@ -234,7 +228,10 @@ impl FastEmbedder {
             );
         }
 
-        // Use CPU execution provider with arena allocator for better memory performance
+        // Use CPU execution provider WITH arena allocator for speed.
+        // Arena allocator grows but never shrinks, so we periodically recreate
+        // the ONNX session (via EmbeddingService::reset_embedder) to free arena memory.
+        // This gives near-original speed with bounded memory (~300-500MB peak).
         let cpu_ep = CPUExecutionProvider::default()
             .with_arena_allocator(true)
             .build();
@@ -256,13 +253,12 @@ impl FastEmbedder {
         let batch_size = if let Ok(env_size) = std::env::var("CODESEARCH_BATCH_SIZE") {
             env_size.parse().unwrap_or(256)
         } else {
-            // Adaptive batch size: smaller batches for larger models to avoid OOM
-            // Benchmarked on 12-core/24-thread CPU - batch size has minimal impact
-            // when CPU is saturated, but larger batches slightly more efficient
+            // Adaptive batch size: without arena allocator, ONNX frees buffers after each batch
+            // so larger batches are faster without accumulating memory.
             match self.model_type.dimensions() {
-                d if d <= 384 => 256, // Small models: larger batches OK
-                d if d <= 768 => 128, // Medium models
-                _ => 64,              // Large models: smaller to avoid OOM
+                d if d <= 384 => 256, // Small models (MiniLM etc.)
+                d if d <= 768 => 128, // Medium models (BGE-base, Jina etc.)
+                _ => 64,              // Large models (BGE-large, MxBai etc.)
             }
         };
         self.embed_batch_chunked(texts, batch_size)
@@ -282,6 +278,11 @@ impl FastEmbedder {
 
         // Process in mini-batches to avoid OOM with large models
         for chunk in texts.chunks(batch_size) {
+            // Check for CTRL-C between mini-batches so we don't block for minutes
+            if crate::constants::is_shutdown_requested() {
+                return Err(anyhow!("Embedding interrupted by shutdown request"));
+            }
+
             let text_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
 
             let embeddings = self

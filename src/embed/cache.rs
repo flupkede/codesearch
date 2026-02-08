@@ -1,6 +1,5 @@
 use super::batch::EmbeddedChunk;
 use crate::chunker::Chunk;
-use crate::output;
 use anyhow::Result;
 use moka::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
