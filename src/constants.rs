@@ -40,9 +40,6 @@ pub const LOG_DIR_NAME: &str = "logs";
 /// Default log file name
 pub const LOG_FILE_NAME: &str = "codesearch.log";
 
-/// Default maximum log file size in MB
-pub const DEFAULT_LOG_MAX_SIZE_MB: usize = 10;
-
 /// Default number of log files to retain
 pub const DEFAULT_LOG_MAX_FILES: usize = 5;
 
