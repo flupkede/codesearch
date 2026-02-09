@@ -1,14 +1,17 @@
-//! Logging module with rotation and cleanup
 //!
 //! Provides centralized logging configuration with:
-//! - Log file rotation based on size
+//! - Log file rotation based on size (via background task)
 //! - Periodic cleanup of old logs
 //! - Per-database log storage in .codesearch.db/logs/
 //! - Configurable via environment variables
+//!
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -72,18 +75,8 @@ pub struct LogRotationConfig {
     pub max_size_mb: usize,
     /// Maximum number of log files to retain
     pub max_files: usize,
-    /// Retention period in days (cleanup logs older than this)
-    pub retention_days: u64,
-}
-
-impl Default for LogRotationConfig {
-    fn default() -> Self {
-        Self {
-            max_size_mb: DEFAULT_LOG_MAX_SIZE_MB,
-            max_files: DEFAULT_LOG_MAX_FILES,
-            retention_days: DEFAULT_LOG_RETENTION_DAYS,
-        }
-    }
+    /// Number of days to retain log files
+    pub retention_days: i64,
 }
 
 impl LogRotationConfig {
@@ -101,226 +94,243 @@ impl LogRotationConfig {
             retention_days: std::env::var("CODESEARCH_LOG_RETENTION_DAYS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_LOG_RETENTION_DAYS),
+                .unwrap_or(DEFAULT_LOG_RETENTION_DAYS as i64),
         }
     }
 }
 
-/// Get the log directory for a given database path
-///
-/// Returns `.codesearch.db/logs/` alongside the database
+/// Get the log directory path for a given database path
 pub fn get_log_dir(db_path: &Path) -> PathBuf {
     db_path.join(LOG_DIR_NAME)
 }
 
-/// Get the log file path for a given database
-///
-/// Returns `.codesearch.db/logs/codesearch.log`
+/// Get the log file path
 pub fn get_log_file(db_path: &Path) -> PathBuf {
     get_log_dir(db_path).join(LOG_FILE_NAME)
 }
 
-/// Ensure log directory exists
-pub fn ensure_log_dir(db_path: &Path) -> Result<()> {
-    let log_dir = get_log_dir(db_path);
+/// Ensure the log directory exists
+pub fn ensure_log_dir(log_dir: &Path) -> Result<()> {
     if !log_dir.exists() {
-        std::fs::create_dir_all(&log_dir)?;
+        fs::create_dir_all(log_dir)?;
+        tracing::debug!("Created log directory: {:?}", log_dir);
     }
     Ok(())
 }
 
-/// Initialize the logging system for a database
-///
-/// # Arguments
-/// * `db_path` - Path to the database directory (.codesearch.db)
-/// * `log_level` - Log level to use
-/// * `quiet` - If true, suppress console output (logs to file only)
-///
-/// # Returns
-/// The log file path and log rotation config
-pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<(PathBuf, LogRotationConfig)> {
-    let rotation_config = LogRotationConfig::from_env();
+/// Check if current log file exceeds max size and rotate if needed
+pub fn rotate_if_needed(log_dir: &Path, config: &LogRotationConfig) -> Result<()> {
+    let current_path = log_dir.join(LOG_FILE_NAME);
 
-    // Ensure log directory exists
-    ensure_log_dir(db_path)?;
+    // Check current file size
+    if let Ok(metadata) = fs::metadata(&current_path) {
+        let file_size_mb = metadata.len() / (1024 * 1024) as u64;
+        if file_size_mb >= config.max_size_mb as u64 {
+            tracing::info!(
+                "Log file size limit reached ({} MB >= {} MB), rotating",
+                file_size_mb,
+                config.max_size_mb
+            );
 
-    let log_dir = get_log_dir(db_path);
+            // Rotate existing numbered files
+            for i in (1..config.max_files).rev() {
+                let from = log_dir.join(format!("{}.{}", LOG_FILE_NAME, i));
+                let to = log_dir.join(format!("{}.{}", LOG_FILE_NAME, i + 1));
+                if from.exists() {
+                    fs::rename(&from, &to)?;
+                }
+            }
 
-    // Determine rotation strategy based on max_size_mb
-    // tracing-appender only supports HOURLY, DAILY, NEVER
-    // We'll use DAILY rotation and rely on cleanup for file management
-    let rotation = Rotation::DAILY;
-
-    // Create rolling file appender
-    let file_appender = RollingFileAppender::new(rotation, log_dir.clone(), LOG_FILE_NAME);
-
-    // Build the subscriber layers
-    // Filter out verbose debug logs from external crates
-    let env_filter = EnvFilter::new(format!(
-        "codesearch={},tantivy=info,tantivy::directory::mmap_directory=warn,arroy=info,ort=info",
-        log_level.as_tracing_level()
-    ));
-
-    if quiet {
-        // File logging only
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt::layer().with_ansi(false).with_writer(file_appender))
-            .try_init()?;
-    } else {
-        // Both console (stderr) and file logging
-        // IMPORTANT: Use stderr for console output — stdout is reserved for
-        // program output and MCP/JSON protocol communication
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt::layer().with_writer(std::io::stderr))
-            .with(fmt::layer().with_ansi(false).with_writer(file_appender))
-            .try_init()?;
+            // Rename current file to .1
+            if current_path.exists() {
+                let rotated_path = log_dir.join(format!("{}.1", LOG_FILE_NAME));
+                fs::rename(&current_path, &rotated_path)?;
+                tracing::debug!("Rotated log file to: {:?}", rotated_path);
+            }
+        }
     }
 
-    tracing::info!(
-        "Logger initialized: level={}, dir={:?}, rotation={:?}",
-        log_level.as_str(),
-        log_dir,
-        rotation_config
-    );
-
-    Ok((get_log_file(db_path), rotation_config))
+    Ok(())
 }
 
-/// Cleanup old log files based on retention policy
-///
-/// Removes log files based on:
-/// - Age: removes files older than `retention_days`
-/// - Size: removes files larger than `max_size_mb`
-/// - Count: ensures no more than `max_files` exist
-///
-/// # Arguments
-/// * `db_path` - Path to database directory
-/// * `rotation_config` - Log rotation configuration with retention settings
-pub fn cleanup_old_logs(db_path: &Path, rotation_config: &LogRotationConfig) -> Result<()> {
-    let log_dir = get_log_dir(db_path);
+/// Remove old log files based on retention period
+pub fn cleanup_old_logs(log_dir: &Path, config: &LogRotationConfig) -> Result<()> {
+    let retention_duration = Duration::days(config.retention_days);
+    let cutoff_time = Utc::now() - retention_duration;
 
-    // If log directory doesn't exist, nothing to clean
     if !log_dir.exists() {
         return Ok(());
     }
 
-    let now = Utc::now();
-    let cutoff = now - Duration::days(rotation_config.retention_days as i64);
-    let max_size_bytes = rotation_config.max_size_mb * 1024 * 1024;
+    // Collect all log files
+    let mut log_files: Vec<(usize, PathBuf, std::fs::Metadata, chrono::DateTime<Utc>)> = Vec::new();
 
-    // Collect all log files with metadata
-    let mut log_files: Vec<(std::path::PathBuf, std::fs::Metadata, chrono::DateTime<Utc>)> = Vec::new();
-
-    for entry in std::fs::read_dir(&log_dir)? {
+    for entry in fs::read_dir(log_dir)? {
         let entry = entry?;
         let path = entry.path();
 
-        // Only process files
-        if !path.is_file() {
-            continue;
-        }
-
-        // Skip current log file
-        if path.file_name() == Some(std::ffi::OsStr::new(LOG_FILE_NAME)) {
-            continue;
-        }
-
-        // Get file metadata
-        if let Ok(metadata) = entry.metadata() {
-            if let Ok(modified) = metadata.modified() {
-                let modified_time: chrono::DateTime<Utc> = modified.into();
-                log_files.push((path, metadata, modified_time));
+        // Only process files that look like our log files
+        if let Some(file_name) = path.file_name() {
+            let file_name = file_name.to_string_lossy();
+            if file_name.starts_with(LOG_FILE_NAME) {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        let modified_time: chrono::DateTime<Utc> = modified.into();
+                        // Extract index from filename (e.g., "codesearch.log.1" -> 1, "codesearch.log" -> 0)
+                        let index = if file_name == LOG_FILE_NAME {
+                            0
+                        } else if let Some(suffix) = file_name.strip_prefix(&format!("{}.", LOG_FILE_NAME)) {
+                            suffix.parse().unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        log_files.push((index, path, metadata, modified_time));
+                    }
+                }
             }
         }
     }
 
+    // Sort by modified time (oldest first)
+    log_files.sort_by(|a, b| a.3.cmp(&b.3));
+
     let mut removed_count = 0;
-
-    // Sort by modification time (oldest first)
-    log_files.sort_by(|a, b| a.2.cmp(&b.2));
-
-    // Remove files based on age, size, and count
-    let mut count = log_files.len();
-    for (path, metadata, modified_time) in log_files {
-        let should_remove = if count > rotation_config.max_files {
-            // Too many files, remove oldest
-            tracing::debug!("Removing file due to max_files limit: {:?} (count: {} > {})",
-                          path, count, rotation_config.max_files);
-            true
-        } else if modified_time < cutoff {
-            // Too old
-            tracing::debug!("Removing old file: {:?} (age > {} days)",
-                          path, rotation_config.retention_days);
-            true
-        } else {
-            let file_size = metadata.len();
-            // Too large
-            if file_size > max_size_bytes as u64 {
-                tracing::debug!("Removing large file: {:?} (size: {} MB > {} MB)",
-                              path, file_size / (1024 * 1024), rotation_config.max_size_mb);
-                true
+    for (index, path, _metadata, modified_time) in log_files {
+        // Remove files older than retention period
+        if modified_time < cutoff_time {
+            if let Err(e) = fs::remove_file(&path) {
+                tracing::warn!("Failed to remove old log file {:?}: {}", path, e);
             } else {
-                false
-            }
-        };
-
-        if should_remove {
-            if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!("Failed to remove log file {:?}: {}", path, e);
-            } else {
+                tracing::debug!("Removed old log file {:?} (modified: {})", path, modified_time);
                 removed_count += 1;
-                count -= 1;
             }
         }
     }
 
     if removed_count > 0 {
-        tracing::info!("Cleaned up {} log files from {:?}", removed_count, log_dir);
+        tracing::info!("Removed {} old log files (older than {} days)", removed_count, config.retention_days);
     }
 
     Ok(())
 }
 
+/// Initialize the logger
+///
+/// # Arguments
+/// * `db_path` - Path to the database directory (logs will be stored in db_path/logs/)
+/// * `log_level` - Log level to use
+/// * `quiet` - If true, suppress console output (log only to file)
+///
+/// # Returns
+/// Returns the log directory path and rotation configuration
+pub fn init_logger(
+    db_path: &Path,
+    log_level: LogLevel,
+    quiet: bool,
+) -> Result<(PathBuf, LogRotationConfig)> {
+    let log_dir = get_log_dir(db_path);
+    ensure_log_dir(&log_dir)?;
+
+    let config = LogRotationConfig::from_env();
+
+    // Rotate if needed before creating new appender
+    rotate_if_needed(&log_dir, &config)?;
+
+    // Create file appender with DAILY rotation (size-based is handled by background task)
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, &log_dir, LOG_FILE_NAME);
+
+    // Create subscriber
+    let env_filter = EnvFilter::new(log_level.as_str())
+        // Filter verbose debug logs from dependencies
+        .add_directive(
+            "tantivy=warn,arroy=warn,ort=warn"
+                .parse()
+                .unwrap_or_else(|_| "warn".parse().unwrap()),
+        );
+
+    let subscriber = tracing_subscriber::registry().with(env_filter);
+
+    if quiet {
+        // File-only logging
+        subscriber
+            .with(
+                fmt::layer()
+                    .with_writer(file_appender)
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_ids(false),
+            )
+            .try_init()?;
+    } else {
+        // Console + file logging (both to stderr and file)
+        subscriber
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(true)
+                    .with_target(true)
+                    .with_thread_ids(false),
+            )
+            .with(
+                fmt::layer()
+                    .with_writer(file_appender)
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_ids(false),
+            )
+            .try_init()?;
+    }
+
+    tracing::info!(
+        "Logger initialized: level={}, log_dir={:?}, max_size_mb={}, max_files={}, retention_days={}",
+        log_level.as_str(),
+        log_dir,
+        config.max_size_mb,
+        config.max_files,
+        config.retention_days,
+    );
+
+    Ok((log_dir, config))
+}
 
 /// Start periodic log cleanup task
 ///
-/// Returns a task handle that can be aborted when shutting down.
-/// Cleanup runs every 24 hours by default.
-///
- /// # Arguments
- /// * `db_path` - Path to the database directory
- /// * `rotation_config` - Log rotation configuration
- /// * `shutdown_token` - Cancellation token for graceful shutdown
- pub fn start_cleanup_task(
-     db_path: PathBuf,
-     rotation_config: LogRotationConfig,
-     shutdown_token: CancellationToken,
- ) -> tokio::task::JoinHandle<()> {
-    let cleanup_interval_hours = std::env::var("CODESEARCH_LOG_CLEANUP_INTERVAL_HOURS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24); // Default: every 24 hours
-
+/// This task runs every 24 hours (configurable via CODESEARCH_LOG_CLEANUP_INTERVAL_HOURS)
+/// and removes old log files based on retention_days.
+pub fn start_cleanup_task(
+    log_dir: PathBuf,
+    config: LogRotationConfig,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(cleanup_interval_hours * 3600));
+        let cleanup_interval_hours: u64 = std::env::var("CODESEARCH_LOG_CLEANUP_INTERVAL_HOURS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+
+        let cleanup_interval = Duration::hours(cleanup_interval_hours as i64).to_std().unwrap();
 
         tracing::info!(
-            "Log cleanup task started: interval={}h, retention={}days",
+            "Log cleanup task started: interval={}h, retention_days={}",
             cleanup_interval_hours,
-            rotation_config.retention_days
+            config.retention_days
         );
 
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    if let Err(e) = cleanup_old_logs(&db_path, &rotation_config) {
-                        tracing::error!("Log cleanup failed: {}", e);
+                _ = tokio::time::sleep(cleanup_interval) => {
+                    // Check for rotation
+                    if let Err(e) = rotate_if_needed(&log_dir, &config) {
+                        tracing::error!("Failed to rotate log file: {}", e);
+                    }
+
+                    // Clean up old logs
+                    if let Err(e) = cleanup_old_logs(&log_dir, &config) {
+                        tracing::error!("Failed to cleanup old logs: {}", e);
                     }
                 }
-                _ = shutdown_token.cancelled() => {
-                    tracing::info!("Log cleanup task shutting down");
+                _ = cancel_token.cancelled() => {
+                    tracing::info!("Log cleanup task stopped");
                     break;
                 }
             }
@@ -331,6 +341,7 @@ pub fn cleanup_old_logs(db_path: &Path, rotation_config: &LogRotationConfig) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]
@@ -346,6 +357,15 @@ mod tests {
     }
 
     #[test]
+    fn test_log_level_as_tracing_level() {
+        assert_eq!(LogLevel::Error.as_tracing_level(), Level::ERROR);
+        assert_eq!(LogLevel::Warn.as_tracing_level(), Level::WARN);
+        assert_eq!(LogLevel::Info.as_tracing_level(), Level::INFO);
+        assert_eq!(LogLevel::Debug.as_tracing_level(), Level::DEBUG);
+        assert_eq!(LogLevel::Trace.as_tracing_level(), Level::TRACE);
+    }
+
+    #[test]
     fn test_log_level_as_str() {
         assert_eq!(LogLevel::Error.as_str(), "error");
         assert_eq!(LogLevel::Warn.as_str(), "warn");
@@ -355,38 +375,85 @@ mod tests {
     }
 
     #[test]
+    fn test_log_rotation_config_from_env() {
+        let config = LogRotationConfig::from_env();
+        assert!(config.max_size_mb > 0);
+        assert!(config.max_files > 0);
+        assert!(config.retention_days > 0);
+    }
+
+    #[test]
     fn test_get_log_dir() {
-        let db_path = PathBuf::from("/project/.codesearch.db");
+        let db_path = PathBuf::from("/test/db");
         let log_dir = get_log_dir(&db_path);
-        assert_eq!(log_dir, PathBuf::from("/project/.codesearch.db/logs"));
+        assert_eq!(log_dir, PathBuf::from("/test/db/logs"));
     }
 
     #[test]
-    fn test_get_log_file() {
-        let db_path = PathBuf::from("/project/.codesearch.db");
-        let log_file = get_log_file(&db_path);
-        assert_eq!(
-            log_file,
-            PathBuf::from("/project/.codesearch.db/logs/codesearch.log")
-        );
-    }
-
-    #[test]
-    fn test_log_rotation_config_default() {
-        let config = LogRotationConfig::default();
-        assert_eq!(config.max_size_mb, DEFAULT_LOG_MAX_SIZE_MB);
-        assert_eq!(config.max_files, DEFAULT_LOG_MAX_FILES);
-        assert_eq!(config.retention_days, DEFAULT_LOG_RETENTION_DAYS);
-    }
-
-    #[test]
-    fn test_ensure_log_dir() {
+    fn test_rotate_if_needed() {
         let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join(".codesearch.db");
-        let log_dir = get_log_dir(&db_path);
+        let log_dir = temp_dir.path();
 
-        assert!(!log_dir.exists());
-        ensure_log_dir(&db_path).unwrap();
-        assert!(log_dir.exists());
+        // Create a small log file (should NOT rotate)
+        let current_path = log_dir.join(LOG_FILE_NAME);
+        let mut file = File::create(&current_path).unwrap();
+        write!(file, "small file").unwrap();
+
+        let config = LogRotationConfig {
+            max_size_mb: 10,
+            max_files: 5,
+            retention_days: 5,
+        };
+
+        let result = rotate_if_needed(log_dir, &config);
+        assert!(result.is_ok());
+        assert!(current_path.exists());
+
+        // Create a large log file (should rotate)
+        let large_content = "x".repeat(11 * 1024 * 1024); // 11 MB
+        let mut file = File::create(&current_path).unwrap();
+        write!(file, large_content).unwrap();
+
+        let result = rotate_if_needed(log_dir, &config);
+        assert!(result.is_ok());
+        assert!(!current_path.exists());
+
+        // Check that rotated file exists
+        let rotated_path = log_dir.join(format!("{}.1", LOG_FILE_NAME));
+        assert!(rotated_path.exists());
+    }
+
+    #[test]
+    fn test_cleanup_old_logs() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path();
+
+        // Create test log files
+        let current_path = log_dir.join(LOG_FILE_NAME);
+        let mut file = File::create(&current_path).unwrap();
+        write!(file, "current").unwrap();
+
+        let rotated_path = log_dir.join(format!("{}.1", LOG_FILE_NAME));
+        let mut file = File::create(&rotated_path).unwrap();
+        write!(file, "old").unwrap();
+
+        // Make rotated file old by setting its modified time
+        let old_time = Utc::now() - Duration::days(10);
+        fs::set_file_times(&rotated_path, old_time.into(), old_time.into()).unwrap();
+
+        let config = LogRotationConfig {
+            max_size_mb: 10,
+            max_files: 5,
+            retention_days: 5,
+        };
+
+        let result = cleanup_old_logs(log_dir, &config);
+        assert!(result.is_ok());
+
+        // Current file should still exist
+        assert!(current_path.exists());
+
+        // Old file should be removed
+        assert!(!rotated_path.exists());
     }
 }
