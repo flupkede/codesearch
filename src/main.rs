@@ -8,6 +8,7 @@ mod embed;
 mod file;
 mod fts;
 mod index;
+mod logger;
 mod mcp;
 mod output;
 mod rerank;
@@ -17,7 +18,6 @@ mod vectordb;
 mod watch;
 
 use anyhow::Result;
-use std::fs::OpenOptions;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -25,11 +25,23 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Check for quiet mode early (before tracing init)
+    // Parse CLI to get loglevel (need this before tracing init)
     let args: Vec<String> = std::env::args().collect();
     let is_quiet = args.iter().any(|a| a == "-q" || a == "--quiet");
     let is_json = args.iter().any(|a| a == "--json");
-    let is_verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
+
+    // Parse loglevel from args (default: info)
+    let loglevel = args
+        .iter()
+        .position(|a| a == "-l" || a == "--loglevel")
+        .and_then(|pos| args.get(pos + 1))
+        .map(|s| s.clone())
+        .unwrap_or_else(|| "info".to_string());
+
+    // Validate loglevel
+    let log_level = logger::LogLevel::from_str(&loglevel).unwrap_or(logger::LogLevel::Info);
+    let log_level_str = log_level.as_str();
+
     // Create cancellation token for async shutdown (MCP server, file watcher)
     let cancel_token = CancellationToken::new();
     let cancel_clone = cancel_token.clone();
@@ -52,49 +64,20 @@ async fn main() -> Result<()> {
 
     // Skip tracing in quiet mode or JSON output
     if !is_quiet && !is_json {
-        // Set up file logging for verbose mode
-        if is_verbose {
-            // Open log file in append mode
-            let log_file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("codesearch_debug.log")
-                .expect("Failed to open codesearch_debug.log");
+        // Initialize tracing with console output only (file logging after DB discovery)
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| format!("codesearch={}", log_level_str).into()),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .init();
 
-            // Initialize tracing with both console and file output
-            tracing_subscriber::registry()
-                .with(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "codesearch=debug".into()),
-                )
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(std::io::stdout)
-                        .with_ansi(true),
-                )
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(log_file)
-                        .with_ansi(false),
-                )
-                .init();
-
-            info!(
-                "Starting codesearch v{} (verbose mode - logging to codesearch_debug.log)",
-                env!("CARGO_PKG_VERSION_FULL")
-            );
-        } else {
-            // Normal tracing (console only)
-            tracing_subscriber::registry()
-                .with(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "codesearch=info".into()),
-                )
-                .with(tracing_subscriber::fmt::layer())
-                .init();
-
-            info!("Starting codesearch v{}", env!("CARGO_PKG_VERSION_FULL"));
-        }
+        info!(
+            "Starting codesearch v{} (loglevel: {})",
+            env!("CARGO_PKG_VERSION_FULL"),
+            log_level_str
+        );
     }
 
     // Run CLI — for MCP/serve commands, cancel_token enables graceful shutdown.
