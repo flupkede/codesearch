@@ -148,14 +148,16 @@ impl FtsStore {
     }
 
     /// Create writer with retry logic for Windows file locking issues
+    /// Increased retry count and initial wait to handle slow file handle release
     fn create_writer_with_retry(index: &Index) -> Result<IndexWriter> {
-        let max_retries = 3;
+        let max_retries = 5; // Increased from 3 to handle Windows timing issues
         let mut last_error: Option<String> = None;
 
         for attempt in 0..max_retries {
             if attempt > 0 {
                 // Wait before retry (exponential backoff)
-                std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
+                // Increased initial wait from 100ms to 200ms for better Windows compatibility
+                std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
             }
 
             // 50MB writer heap (tantivy default).
