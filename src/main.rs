@@ -62,15 +62,20 @@ async fn main() -> Result<()> {
     })
     .expect("Failed to set CTRL-C handler");
 
-    // Skip tracing in quiet mode or JSON output
-    if !is_quiet && !is_json {
-        // Initialize tracing with console output only (file logging after DB discovery)
+    // For MCP/serve commands: DON'T initialize tracing here.
+    // init_logger() in cli/mod.rs will set up console+file logging as the FIRST
+    // and ONLY global subscriber (you can only set it once per process).
+    let is_mcp_or_serve = args.iter().any(|a| a == "mcp" || a == "serve");
+
+    if !is_quiet && !is_json && !is_mcp_or_serve {
+        // Console-only tracing for short-lived CLI commands (search, index, stats, etc.)
+        // IMPORTANT: Use stderr — stdout is reserved for program output
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| format!("codesearch={}", log_level_str).into()),
             )
-            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
             .init();
 
         info!(

@@ -377,7 +377,7 @@ pub fn resolve_database_with_message(
             } else {
                 db_info.project_path.display().to_string()
             };
-            println!(
+            eprintln!(
                 "{}",
                 format!(
                     "📂 Using database from: {}\n   ({} from subfolder, project root: {})",

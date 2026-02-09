@@ -298,11 +298,14 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         }
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Serve { port, path } => {
-            // Discover database path and reinitialize logger with file output
+            // Discover database path and initialize logger with file output
+            // NOTE: For Serve, tracing is NOT initialized in main.rs — init_logger
+            // is the first and only call to set the global subscriber
             let effective_path = path.as_ref().cloned().unwrap_or_else(|| std::env::current_dir().unwrap());
             if let Ok(Some(db_info)) = crate::db_discovery::find_best_database(Some(&effective_path)) {
-                // Reinitialize logger with file output
-                let _ = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet);
+                if let Err(e) = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
+                    eprintln!("Warning: Failed to initialize file logger: {}", e);
+                }
             }
             crate::server::serve(port, path).await
         }
@@ -310,11 +313,14 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Doctor => crate::cli::doctor::run().await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
         Commands::Mcp { path } => {
-            // Discover database path and reinitialize logger with file output
+            // Discover database path and initialize logger with file output
+            // NOTE: For MCP, tracing is NOT initialized in main.rs — init_logger
+            // is the first and only call to set the global subscriber
             let effective_path = path.as_ref().cloned().unwrap_or_else(|| std::env::current_dir().unwrap());
             if let Ok(Some(db_info)) = crate::db_discovery::find_best_database(Some(&effective_path)) {
-                // Reinitialize logger with file output
-                let _ = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet);
+                if let Err(e) = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
+                    eprintln!("Warning: Failed to initialize file logger: {}", e);
+                }
             }
             crate::mcp::run_mcp_server(path, cancel_token).await
         }
