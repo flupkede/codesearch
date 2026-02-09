@@ -492,7 +492,7 @@ async fn index_with_options(
         EmbeddingService::with_cache_dir(model_type, Some(cache_dir.as_path()))?;
 
     // Check for shutdown after model loading (can take 5-10 seconds)
-    if crate::constants::is_shutdown_requested() || cancel_token.is_cancelled() {
+    if crate::constants::check_shutdown(&cancel_token) {
         log_print!("\n{}", "⚠️  Indexing cancelled during model loading".yellow());
         return Ok(());
     }
@@ -514,7 +514,7 @@ async fn index_with_options(
     for file in &files {
         // Check for cancellation before processing each file
         // Uses BOTH global AtomicBool (set by ctrlc OS handler) AND CancellationToken (for programmatic cancel)
-        if crate::constants::is_shutdown_requested() || cancel_token.is_cancelled() {
+        if crate::constants::check_shutdown(&cancel_token) {
             cancelled = true;
             break;
         }
@@ -563,30 +563,44 @@ async fn index_with_options(
         };
 
         // Check cancellation after embedding (most CPU-intensive step)
-        if crate::constants::is_shutdown_requested() || cancel_token.is_cancelled() {
+        if crate::constants::check_shutdown(&cancel_token) {
             cancelled = true;
             break;
         }
 
-        // Phase 2c: Insert into vector store immediately
-        let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
+        // Phase 2c: Extract lightweight FTS data before handing ownership to vector store.
+        // We capture just the strings needed for FTS (content, path, signature, kind)
+        // so we can pass full EmbeddedChunks to the vector store without cloning.
+        let fts_data: Vec<(String, String, Option<String>, String)> = embedded_chunks
+            .iter()
+            .map(|ec| {
+                (
+                    ec.chunk.content.clone(),
+                    ec.chunk.path.clone(),
+                    ec.chunk.signature.clone(),
+                    format!("{:?}", ec.chunk.kind),
+                )
+            })
+            .collect();
 
-        // Phase 2d: Insert into FTS store immediately
+        // Phase 2d: Insert into vector store (takes ownership, no clone needed)
+        let chunk_ids = store.insert_chunks_with_ids(embedded_chunks)?;
+
+        // Phase 2e: Insert into FTS with real chunk IDs from vector store.
         // FTS failures are non-fatal: vector search is the primary search method,
         // FTS (BM25) is supplementary for hybrid search. If tantivy encounters
         // I/O errors (common on Windows due to antivirus interference), we log
         // a warning and continue rather than aborting the entire indexing run.
-        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
+        for ((content, path, signature, kind), &chunk_id) in fts_data.iter().zip(chunk_ids.iter()) {
             if let Err(e) = fts_store.add_chunk(
-                *chunk_id,
-                &chunk.chunk.content,
-                &chunk.chunk.path,
-                chunk.chunk.signature.as_deref(),
-                &format!("{:?}", chunk.chunk.kind),
+                chunk_id,
+                content,
+                path,
+                signature.as_deref(),
+                kind,
             ) {
                 tracing::warn!(
-                    "FTS add_chunk failed for chunk {} in {}: {} (continuing without FTS for this chunk)",
-                    chunk_id,
+                    "FTS add_chunk failed in {}: {} (continuing without FTS for this chunk)",
                     file.path.display(),
                     e
                 );
@@ -688,11 +702,17 @@ async fn index_with_options(
         return Ok(());
     }
 
+    // Capture FTS stats before dropping the store to free memory
+    let _fts_stats = fts_store.stats()?;
+
+    // Drop FTS store before build_index() to free tantivy memory.
+    // FTS is already committed above — keeping the store open during
+    // build_index() wastes memory on tantivy's segment readers and buffers.
+    drop(fts_store);
+
     // Build vector index (now that all chunks are inserted)
     let storage_start = Instant::now();
     store.build_index()?;
-
-    let _fts_stats = fts_store.stats()?;
     let _storage_duration = storage_start.elapsed();
 
     // Save model metadata
