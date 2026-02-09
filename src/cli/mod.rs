@@ -303,8 +303,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             // is the first and only call to set the global subscriber
             let effective_path = path.as_ref().cloned().unwrap_or_else(|| std::env::current_dir().unwrap());
             if let Ok(Some(db_info)) = crate::db_discovery::find_best_database(Some(&effective_path)) {
-                if let Err(e) = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
-                    eprintln!("Warning: Failed to initialize file logger: {}", e);
+                match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
+                    Err(e) => {
+                        eprintln!("Warning: Failed to initialize file logger: {}", e);
+                    }
+                    _ => {
+                        // Logger initialized successfully (either FileLogging or ConsoleOnly)
+                    }
                 }
             }
             crate::server::serve(port, path).await
@@ -318,8 +323,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             // is the first and only call to set the global subscriber
             let effective_path = path.as_ref().cloned().unwrap_or_else(|| std::env::current_dir().unwrap());
             if let Ok(Some(db_info)) = crate::db_discovery::find_best_database(Some(&effective_path)) {
-                if let Err(e) = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
-                    eprintln!("Warning: Failed to initialize file logger: {}", e);
+                match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
+                    Err(e) => {
+                        eprintln!("Warning: Failed to initialize file logger: {}", e);
+                    }
+                    _ => {
+                        // Logger initialized successfully (either FileLogging or ConsoleOnly)
+                    }
                 }
             }
             crate::mcp::run_mcp_server(path, cancel_token).await
