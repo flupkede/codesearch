@@ -161,7 +161,7 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<(
         // File logging only
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(fmt::layer().with_writer(file_appender))
+            .with(fmt::layer().with_ansi(false).with_writer(file_appender))
             .try_init()?;
     } else {
         // Both console (stderr) and file logging
@@ -170,7 +170,7 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<(
         tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt::layer().with_writer(std::io::stderr))
-            .with(fmt::layer().with_writer(file_appender))
+            .with(fmt::layer().with_ansi(false).with_writer(file_appender))
             .try_init()?;
     }
 
