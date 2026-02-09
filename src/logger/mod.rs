@@ -164,10 +164,12 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<(
             .with(fmt::layer().with_writer(file_appender))
             .try_init()?;
     } else {
-        // Both console and file logging
+        // Both console (stderr) and file logging
+        // IMPORTANT: Use stderr for console output — stdout is reserved for
+        // program output and MCP/JSON protocol communication
         tracing_subscriber::registry()
             .with(env_filter)
-            .with(fmt::layer().with_writer(std::io::stdout))
+            .with(fmt::layer().with_writer(std::io::stderr))
             .with(fmt::layer().with_writer(file_appender))
             .try_init()?;
     }
