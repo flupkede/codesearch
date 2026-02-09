@@ -155,7 +155,11 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<(
     let file_appender = RollingFileAppender::new(rotation, log_dir.clone(), LOG_FILE_NAME);
 
     // Build the subscriber layers
-    let env_filter = EnvFilter::new(log_level.as_str());
+    // Filter out verbose debug logs from external crates
+    let env_filter = EnvFilter::new(format!(
+        "codesearch={},tantivy=info,tantivy::directory::mmap_directory=warn,arroy=info,ort=info",
+        log_level.as_str()
+    ));
 
     if quiet {
         // File logging only
