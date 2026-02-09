@@ -301,8 +301,17 @@ impl CodesearchService {
             let mut file_chunks: Vec<SearchResultItem> = Vec::new();
             for id in 0..stats.total_chunks as u32 {
                 if let Ok(Some(chunk)) = store.get_chunk(id) {
-                    // Normalize paths for comparison
-                    let chunk_path = chunk.path.trim_start_matches("./");
+                    // Normalize paths for comparison - convert absolute UNC paths to relative
+                    let chunk_path = chunk.path
+                        .trim_start_matches("./")
+                        .trim_start_matches("\\\\?\\"); // Remove UNC prefix on Windows
+
+                    let chunk_path = if let Ok(rel_path) = PathBuf::from(chunk_path).strip_prefix(&self.project_path) {
+                        rel_path.to_string_lossy().to_string()
+                    } else {
+                        chunk_path.to_string()
+                    };
+
                     let req_path = request.path.trim_start_matches("./");
 
                     if chunk_path == req_path || chunk.path == request.path {
@@ -347,8 +356,17 @@ impl CodesearchService {
             let mut file_chunks: Vec<SearchResultItem> = Vec::new();
             for id in 0..stats.total_chunks as u32 {
                 if let Ok(Some(chunk)) = store.get_chunk(id) {
-                    // Normalize paths for comparison
-                    let chunk_path = chunk.path.trim_start_matches("./");
+                    // Normalize paths for comparison - convert absolute UNC paths to relative
+                    let chunk_path = chunk.path
+                        .trim_start_matches("./")
+                        .trim_start_matches("\\\\?\\"); // Remove UNC prefix on Windows
+
+                    let chunk_path = if let Ok(rel_path) = PathBuf::from(chunk_path).strip_prefix(&self.project_path) {
+                        rel_path.to_string_lossy().to_string()
+                    } else {
+                        chunk_path.to_string()
+                    };
+
                     let req_path = request.path.trim_start_matches("./");
 
                     if chunk_path == req_path || chunk.path == request.path {
