@@ -17,6 +17,13 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::db_discovery::{find_best_database, find_databases};
+
+/// Normalize a path for comparison: strip UNC prefix, ./ prefix, convert backslashes to forward slashes
+fn normalize_path_for_compare(path: &str) -> String {
+    path.trim_start_matches("./")
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+}
 use crate::embed::{EmbeddingService, ModelType};
 use crate::fts::FtsStore;
 use crate::index::{IndexManager, SharedStores};
@@ -301,20 +308,24 @@ impl CodesearchService {
             let mut file_chunks: Vec<SearchResultItem> = Vec::new();
             for id in 0..stats.total_chunks as u32 {
                 if let Ok(Some(chunk)) = store.get_chunk(id) {
-                    // Normalize paths for comparison - convert absolute UNC paths to relative
-                    let chunk_path = chunk.path
-                        .trim_start_matches("./")
-                        .trim_start_matches("\\\\?\\"); // Remove UNC prefix on Windows
+                    // Normalize paths for comparison: strip UNC, normalize slashes
+                    let chunk_norm = normalize_path_for_compare(&chunk.path);
+                    let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
+                    let req_norm = normalize_path_for_compare(&request.path);
 
-                    let chunk_path = if let Ok(rel_path) = PathBuf::from(chunk_path).strip_prefix(&self.project_path) {
-                        rel_path.to_string_lossy().to_string()
+                    // Make chunk path relative by stripping project path prefix
+                    let chunk_rel = if chunk_norm.starts_with(&project_norm) {
+                        chunk_norm[project_norm.len()..].trim_start_matches('/').to_string()
                     } else {
-                        chunk_path.to_string()
+                        chunk_norm.clone()
                     };
 
-                    let req_path = request.path.trim_start_matches("./");
-
-                    if chunk_path == req_path || chunk.path == request.path {
+                    // Match: exact, ends_with (for subdirectory repos), or raw paths
+                    if chunk_rel == req_norm
+                        || chunk_rel.ends_with(&format!("/{}", req_norm))
+                        || req_norm.ends_with(&format!("/{}", chunk_rel))
+                        || chunk.path == request.path
+                    {
                         file_chunks.push(SearchResultItem {
                             path: chunk.path,
                             start_line: chunk.start_line,
@@ -356,20 +367,24 @@ impl CodesearchService {
             let mut file_chunks: Vec<SearchResultItem> = Vec::new();
             for id in 0..stats.total_chunks as u32 {
                 if let Ok(Some(chunk)) = store.get_chunk(id) {
-                    // Normalize paths for comparison - convert absolute UNC paths to relative
-                    let chunk_path = chunk.path
-                        .trim_start_matches("./")
-                        .trim_start_matches("\\\\?\\"); // Remove UNC prefix on Windows
+                    // Normalize paths for comparison: strip UNC, normalize slashes
+                    let chunk_norm = normalize_path_for_compare(&chunk.path);
+                    let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
+                    let req_norm = normalize_path_for_compare(&request.path);
 
-                    let chunk_path = if let Ok(rel_path) = PathBuf::from(chunk_path).strip_prefix(&self.project_path) {
-                        rel_path.to_string_lossy().to_string()
+                    // Make chunk path relative by stripping project path prefix
+                    let chunk_rel = if chunk_norm.starts_with(&project_norm) {
+                        chunk_norm[project_norm.len()..].trim_start_matches('/').to_string()
                     } else {
-                        chunk_path.to_string()
+                        chunk_norm.clone()
                     };
 
-                    let req_path = request.path.trim_start_matches("./");
-
-                    if chunk_path == req_path || chunk.path == request.path {
+                    // Match: exact, ends_with (for subdirectory repos), or raw paths
+                    if chunk_rel == req_norm
+                        || chunk_rel.ends_with(&format!("/{}", req_norm))
+                        || req_norm.ends_with(&format!("/{}", chunk_rel))
+                        || chunk.path == request.path
+                    {
                         file_chunks.push(SearchResultItem {
                             path: chunk.path,
                             start_line: chunk.start_line,
