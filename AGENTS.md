@@ -1,6 +1,44 @@
 # OpenCode AGENTS.md
 
-**Build Commands:**
+**Build Commands (CRITICAL - READ CAREFULLY):**
+
+⚠️ **MANDATORY BUILD RULES - NEVER VIOLATE** ⚠️
+
+### Target Directory (STRICT ENFORCEMENT)
+- **Target directory MUST be**: `C:\WorkArea\AI\codesearch\target`
+- **NEVER build to**: `C:\WorkArea\AI\codesearch\codesearch.git\target` or any other location
+- **Reason**: `.cargo/config.toml` sets `target-dir = "../target"` to keep source tree clean
+
+### Build Type (STRICT ENFORCEMENT)
+- **ALWAYS build**: DEBUG builds only
+- **NEVER build**: RELEASE builds (`--release` flag)
+- **Release builds are FORBIDDEN** - they cause version mismatch issues and waste time
+
+### Correct Commands ✅
+```bash
+cd codesearch.git && cargo build              # CORRECT - debug build to ../target
+cd codesearch.git && cargo test               # CORRECT - debug tests
+cd codesearch.git && cargo run -- mcp         # CORRECT - debug run from ../target
+```
+
+### Commands NEVER to Use ❌
+```bash
+cd codesearch.git && cargo build --release    # WRONG - FORBIDDEN
+cd codesearch.git && cargo run --release     # WRONG - FORBIDDEN
+cargo build --release                         # WRONG - FORBIDDEN
+cd codesearch.git && cargo build              # WRONG if target dir is codesearch.git/target
+```
+
+### Verify Correct Location
+```bash
+# Correct location for binary
+ls -la /c/WorkArea/AI/codesearch/target/debug/codesearch.exe
+
+# WRONG location - DO NOT USE
+ls -la /c/WorkArea/AI/codesearch/codesearch.git/target/
+```
+
+### Standard Commands (for reference)
 - `cargo build` - Build debug version (FAST, use for development)
 - `cargo test` - Run all tests
 - `cargo test <test_name>` - Run single test (e.g., `cargo test test_group_chunks_by_path`)
@@ -8,7 +46,6 @@
 - `cargo clippy` - Lint with Clippy
 - `cargo fmt` - Format code
 - `cargo doc --no-deps` - Generate documentation
-- DO NOT !!! `cargo build --release` - Build optimized release (SLOW, only when explicitly requested)
 
 **Code Style Guidelines:**
 
@@ -97,10 +134,11 @@
 - Use `pub use` for convenience re-exports
 
 **Build Artifacts:**
-- Debug builds go to `target/debug/`
-- Release builds go to `target/release/`
-- Use debug builds during development
-- Only build release when explicitly requested by user
+- Debug builds go to `../target/debug/` (C:\WorkArea\AI\codesearch\target\debug\)
+- Release builds FORBIDDEN - never use
+- ALWAYS use debug builds for all work
+- Target directory is configured in `.cargo/config.toml` as `../target`
+- This keeps source tree clean and centralized
 
 ### Gebruik
 
