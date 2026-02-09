@@ -63,7 +63,8 @@ fn get_db_path_smart(
             std::fs::remove_dir_all(&db_info.db_path)?;
             // Wait for Windows to fully release file handles (memory-mapped files
             // from LMDB/tantivy may not be immediately released after deletion)
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // Increased to 1000ms to handle slow file handle release on Windows
+            std::thread::sleep(std::time::Duration::from_millis(1000));
             println!("✅ Existing database deleted");
         }
         // After deletion, continue to create new database

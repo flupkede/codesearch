@@ -34,6 +34,21 @@ pub const FILE_META_DB_NAME: &str = "file_meta.json";
 /// Subdirectory name for embedding models within the global config dir
 const MODELS_SUBDIR: &str = "models";
 
+/// Log directory name within .codesearch.db
+pub const LOG_DIR_NAME: &str = "logs";
+
+/// Default log file name
+pub const LOG_FILE_NAME: &str = "codesearch.log";
+
+/// Default maximum log file size in MB
+pub const DEFAULT_LOG_MAX_SIZE_MB: usize = 10;
+
+/// Default number of log files to retain
+pub const DEFAULT_LOG_MAX_FILES: usize = 5;
+
+/// Default log retention period in days
+pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 5;
+
 /// Get the global models cache directory (~/.codesearch/models/).
 ///
 /// This centralizes embedding model downloads so they are shared across all

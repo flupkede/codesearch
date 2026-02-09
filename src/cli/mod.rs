@@ -38,9 +38,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Enable verbose output
-    #[arg(short, long, global = true)]
-    pub verbose: bool,
+    /// Set log level (error, warn, info, debug, trace)
+    #[arg(short = 'l', long, global = true, default_value = "info")]
+    pub loglevel: String,
 
     /// Suppress informational output (only show results/errors)
     #[arg(short, long, global = true)]
@@ -212,6 +212,10 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         crate::output::set_quiet(true);
     }
 
+    // Parse loglevel from CLI
+    let log_level = crate::logger::LogLevel::from_str(&cli.loglevel)
+        .unwrap_or(crate::logger::LogLevel::Info);
+
     match cli.command {
         Commands::Search {
             query,
@@ -293,11 +297,27 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             }
         }
         Commands::Stats { path } => crate::index::stats(path).await,
-        Commands::Serve { port, path } => crate::server::serve(port, path).await,
+        Commands::Serve { port, path } => {
+            // Discover database path and reinitialize logger with file output
+            let effective_path = path.as_ref().cloned().unwrap_or_else(|| std::env::current_dir().unwrap());
+            if let Ok(Some(db_info)) = crate::db_discovery::find_best_database(Some(&effective_path)) {
+                // Reinitialize logger with file output
+                let _ = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet);
+            }
+            crate::server::serve(port, path).await
+        }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
         Commands::Doctor => crate::cli::doctor::run().await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp { path } => crate::mcp::run_mcp_server(path, cancel_token).await,
+        Commands::Mcp { path } => {
+            // Discover database path and reinitialize logger with file output
+            let effective_path = path.as_ref().cloned().unwrap_or_else(|| std::env::current_dir().unwrap());
+            if let Ok(Some(db_info)) = crate::db_discovery::find_best_database(Some(&effective_path)) {
+                // Reinitialize logger with file output
+                let _ = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet);
+            }
+            crate::mcp::run_mcp_server(path, cancel_token).await
+        }
     }
 }
 

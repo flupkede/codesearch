@@ -980,6 +980,27 @@ pub async fn run_mcp_server(path: Option<PathBuf>, cancel_token: CancellationTok
                 }
             }
         });
+
+        // Start periodic log cleanup task
+        let db_path_for_cleanup = db_path.clone();
+        let cleanup_cancel_token = cancel_token.clone();
+        tokio::spawn(async move {
+            use crate::logger::{cleanup_old_logs, LogRotationConfig};
+
+            // Run initial cleanup on startup
+            let rotation_config = LogRotationConfig::from_env();
+            tracing::info!("🧹 Running initial log cleanup...");
+            if let Err(e) = cleanup_old_logs(&db_path_for_cleanup, &rotation_config) {
+                tracing::warn!("Initial log cleanup failed: {}", e);
+            }
+
+            // Start periodic cleanup task (every 24 hours by default)
+            crate::logger::start_cleanup_task(
+                db_path_for_cleanup.clone(),
+                rotation_config,
+                cleanup_cancel_token,
+            );
+        });
     } else {
         tracing::info!("📖 Readonly mode: skipping background refresh and file watcher");
     }

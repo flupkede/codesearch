@@ -8,6 +8,7 @@ pub mod error;
 pub mod file;
 pub mod fts;
 pub mod index;
+pub mod logger;
 pub mod mcp;
 pub mod output;
 pub mod rerank;
