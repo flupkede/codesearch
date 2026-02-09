@@ -158,7 +158,7 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<(
     // Filter out verbose debug logs from external crates
     let env_filter = EnvFilter::new(format!(
         "codesearch={},tantivy=info,tantivy::directory::mmap_directory=warn,arroy=info,ort=info",
-        log_level.as_str()
+        log_level.as_tracing_level()
     ));
 
     if quiet {
@@ -190,10 +190,13 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<(
 
 /// Cleanup old log files based on retention policy
 ///
-/// Removes log files older than `retention_days` from the log directory.
+/// Removes log files based on:
+/// - Age: removes files older than `retention_days`
+/// - Size: removes files larger than `max_size_mb`
+/// - Count: ensures no more than `max_files` exist
 ///
 /// # Arguments
-/// * `db_path` - Path to the database directory
+/// * `db_path` - Path to database directory
 /// * `rotation_config` - Log rotation configuration with retention settings
 pub fn cleanup_old_logs(db_path: &Path, rotation_config: &LogRotationConfig) -> Result<()> {
     let log_dir = get_log_dir(db_path);
@@ -205,8 +208,10 @@ pub fn cleanup_old_logs(db_path: &Path, rotation_config: &LogRotationConfig) -> 
 
     let now = Utc::now();
     let cutoff = now - Duration::days(rotation_config.retention_days as i64);
+    let max_size_bytes = rotation_config.max_size_mb * 1024 * 1024;
 
-    let mut removed_count = 0;
+    // Collect all log files with metadata
+    let mut log_files: Vec<(std::path::PathBuf, std::fs::Metadata, chrono::DateTime<Utc>)> = Vec::new();
 
     for entry in std::fs::read_dir(&log_dir)? {
         let entry = entry?;
@@ -217,35 +222,67 @@ pub fn cleanup_old_logs(db_path: &Path, rotation_config: &LogRotationConfig) -> 
             continue;
         }
 
-        // Skip the current log file
+        // Skip current log file
         if path.file_name() == Some(std::ffi::OsStr::new(LOG_FILE_NAME)) {
             continue;
         }
 
-        // Get file modification time
+        // Get file metadata
         if let Ok(metadata) = entry.metadata() {
             if let Ok(modified) = metadata.modified() {
                 let modified_time: chrono::DateTime<Utc> = modified.into();
+                log_files.push((path, metadata, modified_time));
+            }
+        }
+    }
 
-                // Remove if older than retention period
-                if modified_time < cutoff {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        tracing::warn!("Failed to remove old log file {:?}: {}", path, e);
-                    } else {
-                        tracing::debug!("Removed old log file: {:?}", path);
-                        removed_count += 1;
-                    }
-                }
+    let mut removed_count = 0;
+
+    // Sort by modification time (oldest first)
+    log_files.sort_by(|a, b| a.2.cmp(&b.2));
+
+    // Remove files based on age, size, and count
+    let mut count = log_files.len();
+    for (path, metadata, modified_time) in log_files {
+        let should_remove = if count > rotation_config.max_files {
+            // Too many files, remove oldest
+            tracing::debug!("Removing file due to max_files limit: {:?} (count: {} > {})",
+                          path, count, rotation_config.max_files);
+            true
+        } else if modified_time < cutoff {
+            // Too old
+            tracing::debug!("Removing old file: {:?} (age > {} days)",
+                          path, rotation_config.retention_days);
+            true
+        } else {
+            let file_size = metadata.len();
+            // Too large
+            if file_size > max_size_bytes as u64 {
+                tracing::debug!("Removing large file: {:?} (size: {} MB > {} MB)",
+                              path, file_size / (1024 * 1024), rotation_config.max_size_mb);
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_remove {
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!("Failed to remove log file {:?}: {}", path, e);
+            } else {
+                removed_count += 1;
+                count -= 1;
             }
         }
     }
 
     if removed_count > 0 {
-        tracing::info!("Cleaned up {} old log files from {:?}", removed_count, log_dir);
+        tracing::info!("Cleaned up {} log files from {:?}", removed_count, log_dir);
     }
 
     Ok(())
 }
+
 
 /// Start periodic log cleanup task
 ///
