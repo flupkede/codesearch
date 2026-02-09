@@ -14,7 +14,6 @@ use chrono::{NaiveDate, Utc};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
-use tracing::Level;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -40,17 +39,6 @@ impl LogLevel {
             "debug" => Some(LogLevel::Debug),
             "trace" => Some(LogLevel::Trace),
             _ => None,
-        }
-    }
-
-    /// Convert to tracing Level
-    pub fn as_tracing_level(&self) -> Level {
-        match self {
-            LogLevel::Error => Level::ERROR,
-            LogLevel::Warn => Level::WARN,
-            LogLevel::Info => Level::INFO,
-            LogLevel::Debug => Level::DEBUG,
-            LogLevel::Trace => Level::TRACE,
         }
     }
 
@@ -334,15 +322,6 @@ mod tests {
         assert_eq!(LogLevel::from_str("debug"), Some(LogLevel::Debug));
         assert_eq!(LogLevel::from_str("trace"), Some(LogLevel::Trace));
         assert_eq!(LogLevel::from_str("invalid"), None);
-    }
-
-    #[test]
-    fn test_log_level_as_tracing_level() {
-        assert_eq!(LogLevel::Error.as_tracing_level(), Level::ERROR);
-        assert_eq!(LogLevel::Warn.as_tracing_level(), Level::WARN);
-        assert_eq!(LogLevel::Info.as_tracing_level(), Level::INFO);
-        assert_eq!(LogLevel::Debug.as_tracing_level(), Level::DEBUG);
-        assert_eq!(LogLevel::Trace.as_tracing_level(), Level::TRACE);
     }
 
     #[test]
