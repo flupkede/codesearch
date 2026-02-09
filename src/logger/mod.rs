@@ -19,6 +19,15 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 use crate::constants::{DEFAULT_LOG_MAX_FILES, DEFAULT_LOG_RETENTION_DAYS, LOG_DIR_NAME, LOG_FILE_NAME};
 
+/// Result of logger initialization, indicating whether file logging is active
+#[derive(Debug)]
+pub enum LoggerInitResult {
+    /// File logging successfully initialized (with optional console output)
+    FileLogging,
+    /// Subscriber already set, only console logging active (fallback)
+    ConsoleOnly,
+}
+
 /// Log level configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -187,15 +196,17 @@ pub fn cleanup_old_logs(log_dir: &Path, config: &LogRotationConfig) -> Result<()
 /// * `quiet` - If true, suppress console output (log only to file)
 ///
 /// # Returns
-/// Returns the log directory path and rotation configuration.
+/// Returns `LoggerInitResult` indicating whether file logging is active:
+/// - `FileLogging`: File logging successfully initialized
+/// - `ConsoleOnly`: Subscriber already set, fallback to console-only
 ///
 /// Uses `try_init()` so it won't panic if a subscriber is already set
-/// (e.g. the early console-only subscriber from main.rs).
+/// (e.g. early console-only subscriber from main.rs).
 pub fn init_logger(
     db_path: &Path,
     log_level: LogLevel,
     quiet: bool,
-) -> Result<(PathBuf, LogRotationConfig)> {
+) -> Result<LoggerInitResult> {
     let log_dir = get_log_dir(db_path);
     ensure_log_dir(&log_dir)?;
 
@@ -229,6 +240,7 @@ pub fn init_logger(
 
         if let Err(e) = result {
             eprintln!("Logger: subscriber already set ({}), file logging not active", e);
+            return Ok(LoggerInitResult::ConsoleOnly);
         }
     } else {
         // Console (stderr) + file logging
@@ -251,6 +263,7 @@ pub fn init_logger(
 
         if let Err(e) = result {
             eprintln!("Logger: subscriber already set ({}), file logging not active", e);
+            return Ok(LoggerInitResult::ConsoleOnly);
         }
     }
 
@@ -262,7 +275,7 @@ pub fn init_logger(
         config.retention_days,
     );
 
-    Ok((log_dir, config))
+    Ok(LoggerInitResult::FileLogging)
 }
 
 /// Start periodic log cleanup task.

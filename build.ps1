@@ -30,9 +30,21 @@ Set-Location $ScriptDir
 
 # Check if code has changed
 Write-Host "Checking for code changes..." -ForegroundColor Cyan
-$ChangedFiles = git diff --name-only HEAD 2>$null
-if (-not $ChangedFiles) {
-    $ChangedFiles = git diff --name-only 2>$null
+$ChangedFiles = git diff --name-only HEAD 2>&1
+
+# Check if git command failed (exit code not 0, and not just "no changes" output)
+if ($LASTEXITCODE -ne 0) {
+    # If it's not just "no changes detected", it's an actual error
+    if ($ChangedFiles -notmatch "^fatal:") {
+        Write-Host "ERROR: git diff failed with exit code $LASTEXITCODE" -ForegroundColor Red
+        Write-Host "Output: $ChangedFiles" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+    # If it's "fatal:" (e.g., not a git repo), exit with error
+    if ($ChangedFiles -match "^fatal:") {
+        Write-Host "ERROR: git diff failed: $ChangedFiles" -ForegroundColor Red
+        exit 1
+    }
 }
 
 if (-not $ChangedFiles) {

@@ -22,6 +22,16 @@ pub fn is_shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
 }
 
+/// Check whether a graceful shutdown has been requested via either
+/// the global AtomicBool (OS signal) or a CancellationToken.
+///
+/// This helper consolidates the two shutdown mechanisms used throughout the codebase
+/// to reduce duplication and improve maintainability.
+#[inline]
+pub fn check_shutdown(cancel_token: &tokio_util::sync::CancellationToken) -> bool {
+    is_shutdown_requested() || cancel_token.is_cancelled()
+}
+
 /// Name of the database directory in project roots
 pub const DB_DIR_NAME: &str = ".codesearch.db";
 
