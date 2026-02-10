@@ -276,7 +276,11 @@ pub async fn index(
 }
 
 /// Index a repository with quiet mode option (for server/MCP use)
-pub async fn index_quiet(path: Option<PathBuf>, force: bool, cancel_token: CancellationToken) -> Result<()> {
+pub async fn index_quiet(
+    path: Option<PathBuf>,
+    force: bool,
+    cancel_token: CancellationToken,
+) -> Result<()> {
     index_with_options(path, false, force, false, None, true, cancel_token).await
 }
 
@@ -471,7 +475,10 @@ async fn index_with_options(
 
     // Phase 2: Semantic Chunking + Embedding + Storage (Streaming)
     // We process files one at a time to keep memory usage low
-    log_print!("\n{}", "Phase 2: Semantic Chunking, Embedding & Storage".bright_cyan());
+    log_print!(
+        "\n{}",
+        "Phase 2: Semantic Chunking, Embedding & Storage".bright_cyan()
+    );
     log_print!("{}", "-".repeat(60));
 
     let chunking_start = Instant::now();
@@ -493,7 +500,10 @@ async fn index_with_options(
 
     // Check for shutdown after model loading (can take 5-10 seconds)
     if crate::constants::check_shutdown(&cancel_token) {
-        log_print!("\n{}", "⚠️  Indexing cancelled during model loading".yellow());
+        log_print!(
+            "\n{}",
+            "⚠️  Indexing cancelled during model loading".yellow()
+        );
         return Ok(());
     }
 
@@ -592,13 +602,8 @@ async fn index_with_options(
         // I/O errors (common on Windows due to antivirus interference), we log
         // a warning and continue rather than aborting the entire indexing run.
         for ((content, path, signature, kind), &chunk_id) in fts_data.iter().zip(chunk_ids.iter()) {
-            if let Err(e) = fts_store.add_chunk(
-                chunk_id,
-                content,
-                path,
-                signature.as_deref(),
-                kind,
-            ) {
+            if let Err(e) = fts_store.add_chunk(chunk_id, content, path, signature.as_deref(), kind)
+            {
                 tracing::warn!(
                     "FTS add_chunk failed in {}: {} (continuing without FTS for this chunk)",
                     file.path.display(),
@@ -932,7 +937,11 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
 }
 
 /// Add a repository to the index (creates local or global)
-pub async fn add_to_index(path: Option<PathBuf>, global: bool, cancel_token: CancellationToken) -> Result<()> {
+pub async fn add_to_index(
+    path: Option<PathBuf>,
+    global: bool,
+    cancel_token: CancellationToken,
+) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
     let canonical_path = project_path.canonicalize()?;
 
@@ -1022,11 +1031,27 @@ pub async fn add_to_index(path: Option<PathBuf>, global: bool, cancel_token: Can
     // Create the index
     if global {
         println!("\n{}", "Creating global index...".cyan());
-        index(Some(canonical_path.clone()), false, false, true, None, cancel_token.clone()).await?;
+        index(
+            Some(canonical_path.clone()),
+            false,
+            false,
+            true,
+            None,
+            cancel_token.clone(),
+        )
+        .await?;
         println!("\n{}", "✅ Global index created!".green());
     } else {
         println!("\n{}", "Creating local index...".cyan());
-        index(Some(canonical_path.clone()), false, false, false, None, cancel_token).await?;
+        index(
+            Some(canonical_path.clone()),
+            false,
+            false,
+            false,
+            None,
+            cancel_token,
+        )
+        .await?;
         println!("\n{}", "✅ Local index created!".green());
     }
 
