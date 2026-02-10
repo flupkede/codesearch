@@ -132,8 +132,13 @@ impl VectorStore {
         let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
             env.create_database(&mut wtxn, Some("chunks"))?;
 
-        // Get the next ID by counting existing chunks
-        let next_id = chunks.len(&wtxn)? as u32;
+        // Get the next ID from the maximum existing key + 1
+        // Using len() is wrong after delete+insert cycles: deleted IDs create gaps
+        // so len() < max_key + 1, causing ID collisions on re-open
+        let next_id = match chunks.last(&wtxn)? {
+            Some((max_key, _)) => max_key + 1,
+            None => 0,
+        };
 
         wtxn.commit()?;
 
@@ -207,8 +212,12 @@ impl VectorStore {
             .open_database(&rtxn, Some("chunks"))?
             .ok_or_else(|| anyhow::anyhow!("chunks database not found"))?;
 
-        // Get the next ID by counting existing chunks
-        let next_id = chunks.len(&rtxn)? as u32;
+        // Get the next ID from the maximum existing key + 1
+        // Using len() is wrong after delete+insert cycles: deleted IDs create gaps
+        let next_id = match chunks.last(&rtxn)? {
+            Some((max_key, _)) => max_key + 1,
+            None => 0,
+        };
 
         // Check if database is already indexed
         let indexed = if next_id > 0 {
@@ -381,11 +390,15 @@ impl VectorStore {
             unique_files.insert(metadata.path.clone());
         }
 
+        // Get max chunk ID from the last key in LMDB (sorted)
+        let max_chunk_id = self.chunks.last(&rtxn)?.map(|(k, _)| k).unwrap_or(0);
+
         Ok(StoreStats {
             total_chunks: total_chunks as usize,
             total_files: unique_files.len(),
             indexed: self.indexed,
             dimensions: self.dimensions,
+            max_chunk_id,
         })
     }
 
@@ -511,6 +524,19 @@ impl VectorStore {
         }
     }
 
+    /// Iterate all chunks in the store via LMDB cursor.
+    /// Returns (id, metadata) pairs for every chunk, regardless of ID gaps.
+    /// This is the correct way to enumerate chunks after delete+insert cycles.
+    pub fn all_chunks(&self) -> Result<Vec<(u32, ChunkMetadata)>> {
+        let rtxn = self.env.read_txn()?;
+        let mut result = Vec::new();
+        for entry in self.chunks.iter(&rtxn)? {
+            let (id, metadata) = entry?;
+            result.push((id, metadata));
+        }
+        Ok(result)
+    }
+
     /// Get the database file size in bytes
     #[allow(dead_code)] // Reserved for stats display
     pub fn db_size(&self) -> Result<u64> {
@@ -553,6 +579,9 @@ pub struct StoreStats {
     pub total_files: usize,
     pub indexed: bool,
     pub dimensions: usize,
+    /// The highest chunk ID in the store (or 0 if empty).
+    /// NOTE: This may be > total_chunks when chunks have been deleted.
+    pub max_chunk_id: u32,
 }
 
 /// Clean up stale .del files from previous crashed runs

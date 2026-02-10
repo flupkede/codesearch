@@ -88,6 +88,7 @@ pub struct IndexStatusResponse {
     pub total_files: usize,
     pub model: String,
     pub dimensions: usize,
+    pub max_chunk_id: u32,
     pub db_path: String,
     pub project_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
