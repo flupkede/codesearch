@@ -36,20 +36,26 @@ Record:
 
 ### Step 2: Make File Changes
 
-Add a unique test string to a tracked file. Use a timestamp or UUID to ensure uniqueness.
+Add a unique test function to a tracked file. Use a timestamp or UUID to ensure uniqueness.
 
-**Example - Add comment to `src/index/mod.rs`:**
+**IMPORTANT:** Always add a proper Rust function, NOT just a comment. Standalone comments at the end of a file may not be captured by the tree-sitter AST chunker since they don't form a recognized AST node. A function creates a `function_item` node that is guaranteed to get its own definition chunk.
+
+**Example - Add function to `src/index/mod.rs`:**
 
 ```rust
-// FSW_TEST - Unique test string for File System Watcher verification: FSW_TEST_20250209_UNIQUE_STRING_ABCD123
+/// FSW_TEST function for file system watcher verification
+fn fsw_test_20250209_unique_verification() -> &'static str {
+    // Unique test string: FSW_TEST_20250209_UNIQUE_STRING_ABCD123
+    "FSW_TEST_VERIFICATION_ACTIVE"
+}
 ```
 
-**Add this line at the end of the file, after the last existing line.**
+**Add this function at the end of the file, after the last existing item.**
 
 **Verify the change exists:**
 - Open the file in your editor
-- Confirm the new line is present
-- Note the exact line number
+- Confirm the new function is present
+- Note the exact line number of the function
 
 ### Step 3: Wait for FSW Detection
 
@@ -71,7 +77,7 @@ Use MCP tools to verify the change is now in the index.
 
 ```javascript
 codesearch_semantic_search({
-  query: "FSW_TEST unique string file system watcher verification",
+  query: "FSW_TEST unique function file system watcher verification",
   limit: 5,
   compact: true
 })
@@ -82,6 +88,7 @@ codesearch_semantic_search({
 - ✅ Path should point to the file you modified
 - ✅ Score should indicate relevance (>0.5 is good)
 - ✅ Result should be within top 5 matches
+- ✅ Kind should be "Function" (not "Block" — the function creates its own definition chunk)
 
 **4b. Get File Chunks**
 
@@ -125,10 +132,10 @@ codesearch_find_references({
 
 ### Step 6: Revert Changes
 
-Remove the test string to verify deletion is also detected by FSW.
+Remove the test function to verify deletion is also detected by FSW.
 
 **Undo the change:**
-- Delete the test line from the file
+- Delete the test function from the file (all 4 lines including the doc comment)
 - Save the file
 - Confirm file is back to original state
 
@@ -154,7 +161,7 @@ Use MCP tools to verify the change is gone.
 
 ```javascript
 codesearch_semantic_search({
-  query: "FSW_TEST unique string file system watcher verification",
+  query: "FSW_TEST unique function file system watcher verification",
   limit: 5,
   compact: true
 })
@@ -163,7 +170,7 @@ codesearch_semantic_search({
 **Expected Result:**
 - ✅ Should NOT find the modified file in results for this query
 - ✅ Results should show different files or fewer results
-- ✅ The previously found result should be gone
+- ✅ The previously found function chunk should be gone
 
 **8b. Get File Chunks**
 
@@ -305,7 +312,15 @@ The test **PASSES** only if ALL of the following are true:
 $ErrorActionPreference = "Stop"
 
 $TestFile = "src\index\mod.rs"
-$TestString = "// FSW_TEST - $(Get-Date -Format 'yyyyMMddHHmmss')_UNIQUE_TEST"
+$Timestamp = Get-Date -Format 'yyyyMMddHHmmss'
+$TestFunction = @"
+
+/// FSW_TEST function for file system watcher verification
+fn fsw_test_${Timestamp}_unique_verification() -> &'static str {
+    // Unique test string: FSW_TEST_${Timestamp}_UNIQUE_STRING
+    "FSW_TEST_VERIFICATION_ACTIVE"
+}
+"@
 
 Write-Host "=== FSW Test Start ===" -ForegroundColor Green
 
@@ -317,9 +332,9 @@ Write-Host ""
 Read-Host "Press Enter when ready to continue"
 
 # Step 2: Add change
-Write-Host "Step 2: Adding test string to file..." -ForegroundColor Yellow
-Add-Content -Path $TestFile -Value $TestString
-Write-Host "  Added: $TestString"
+Write-Host "Step 2: Adding test function to file..." -ForegroundColor Yellow
+Add-Content -Path $TestFile -Value $TestFunction
+Write-Host "  Added test function: fsw_test_${Timestamp}_unique_verification()"
 Write-Host ""
 Read-Host "Press Enter when ready to continue"
 
@@ -329,7 +344,7 @@ Start-Sleep -Seconds 15
 
 # Step 4: Verify using MCP tools
 Write-Host "Step 4: Verify change is indexed using MCP tools:" -ForegroundColor Yellow
-Write-Host "  Run: codesearch_semantic_search({query: 'FSW_TEST', limit: 5, compact: true})"
+Write-Host "  Run: codesearch_semantic_search({query: 'FSW_TEST unique function verification', limit: 5, compact: true})"
 Write-Host "  Run: codesearch_get_file_chunks({path: '$TestFile', compact: true})"
 Write-Host ""
 Read-Host "Press Enter when ready to continue"
@@ -342,9 +357,9 @@ Read-Host "Press Enter when ready to continue"
 
 # Step 6: Revert
 Write-Host "Step 6: Reverting change..." -ForegroundColor Yellow
-$content = Get-Content $TestFile
-$content = $content | Where-Object { $_ -ne $TestString }
-$content | Set-Content $TestFile
+$content = Get-Content $TestFile -Raw
+$content = $content -replace "(?ms)\r?\n/// FSW_TEST function.*?`"FSW_TEST_VERIFICATION_ACTIVE`"\r?\n\}", ""
+$content | Set-Content $TestFile -NoNewline
 Write-Host "  Change reverted"
 Write-Host ""
 Read-Host "Press Enter when ready to continue"
@@ -355,7 +370,7 @@ Start-Sleep -Seconds 15
 
 # Step 8: Verify deletion
 Write-Host "Step 8: Verify change is gone using MCP tools:" -ForegroundColor Yellow
-Write-Host "  Run: codesearch_semantic_search({query: 'FSW_TEST', limit: 5, compact: true})"
+Write-Host "  Run: codesearch_semantic_search({query: 'FSW_TEST unique function verification', limit: 5, compact: true})"
 Write-Host "  Run: codesearch_get_file_chunks({path: '$TestFile', compact: true})"
 Write-Host ""
 Read-Host "Press Enter when ready to continue"

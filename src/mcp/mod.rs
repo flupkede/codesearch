@@ -98,7 +98,7 @@ impl CodesearchService {
                 .get("dimensions")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(384) as usize;
-            let mt = ModelType::from_str(model_name).unwrap_or_default();
+            let mt = ModelType::parse(model_name).unwrap_or_default();
             (mt, dims)
         } else {
             (ModelType::default(), 384)
@@ -983,6 +983,12 @@ pub async fn run_mcp_server(path: Option<PathBuf>, cancel_token: CancellationTok
         let index_manager_arc = Arc::new(index_manager);
         let bg_cancel_token = cancel_token.clone();
         tokio::spawn(async move {
+            // Step 0: Pre-start FSW to collect file change events during refresh
+            // This ensures changes made while the refresh is running are not missed
+            if let Err(e) = index_manager_arc.start_watching().await {
+                tracing::warn!("⚠️ Could not pre-start file watcher: {}", e);
+            }
+
             // Step 1: Run initial refresh (writes to stores)
             tracing::info!("🔄 Starting background incremental refresh...");
             match IndexManager::perform_incremental_refresh_with_stores(

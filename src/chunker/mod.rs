@@ -138,21 +138,24 @@ impl Chunk {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkKind {
-    Function,  // Standalone function
-    Class,     // Class definition (non-Rust languages)
-    Method,    // Method within class/impl
-    Struct,    // Struct definition (Rust)
-    Enum,      // Enum definition
-    Trait,     // Trait definition (Rust)
-    Interface, // Interface (TypeScript, Java)
-    Impl,      // Impl block (Rust)
-    Mod,       // Module definition
-    TypeAlias, // Type alias
-    Const,     // Constant
-    Static,    // Static variable
-    Block,     // Gap/unstructured code
-    Anchor,    // File-level summary chunk
-    Other,     // Catch-all
+    Function,   // Standalone function
+    Class,      // Class definition (non-Rust languages)
+    Method,     // Method within class/impl
+    Struct,     // Struct definition (Rust)
+    Enum,       // Enum definition
+    Trait,      // Trait definition (Rust)
+    Interface,  // Interface (TypeScript, Java)
+    Impl,       // Impl block (Rust)
+    Mod,        // Module definition
+    TypeAlias,  // Type alias
+    Const,      // Constant
+    Static,     // Static variable
+    Block,      // Gap/unstructured code
+    Anchor,     // File-level summary chunk
+    Comment,    // Standalone comment block (gap between definitions)
+    Imports,    // Import/use statements block
+    ModuleDocs, // Module-level documentation (//!, /*!)
+    Other,      // Catch-all
 }
 
 /// Trait for chunking strategies

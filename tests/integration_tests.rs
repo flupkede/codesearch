@@ -92,15 +92,15 @@ fn test_search_options_default() {
     assert_eq!(options.max_results, 10);
     assert_eq!(options.per_file, None);
     assert_eq!(options.content_lines, 3);
-    assert_eq!(options.show_scores, false);
-    assert_eq!(options.compact, false);
-    assert_eq!(options.sync, false);
-    assert_eq!(options.json, false);
+    assert!(!options.show_scores);
+    assert!(!options.compact);
+    assert!(!options.sync);
+    assert!(!options.json);
     assert_eq!(options.filter_path, None);
     assert_eq!(options.model_override, None);
-    assert_eq!(options.vector_only, false);
+    assert!(!options.vector_only);
     assert_eq!(options.rrf_k, None);
-    assert_eq!(options.rerank, false);
+    assert!(!options.rerank);
     assert_eq!(options.rerank_top, None);
 }
 
@@ -127,12 +127,12 @@ fn test_search_options_custom() {
     assert_eq!(options.max_results, 20);
     assert_eq!(options.per_file, Some(5));
     assert_eq!(options.content_lines, 5);
-    assert_eq!(options.show_scores, true);
-    assert_eq!(options.sync, true);
+    assert!(options.show_scores);
+    assert!(options.sync);
     assert_eq!(options.filter_path, Some("src/".to_string()));
     assert_eq!(options.model_override, Some("bge-small".to_string()));
     assert_eq!(options.rrf_k, Some(50));
-    assert_eq!(options.rerank, true);
+    assert!(options.rerank);
     assert_eq!(options.rerank_top, Some(100));
 }
 
@@ -207,22 +207,19 @@ fn test_model_type_from_str() {
 
     // Test model type parsing
     assert_eq!(
-        ModelType::from_str("minilm-l6"),
+        ModelType::parse("minilm-l6"),
         Some(ModelType::AllMiniLML6V2)
     );
     assert_eq!(
-        ModelType::from_str("bge-small"),
+        ModelType::parse("bge-small"),
         Some(ModelType::BGESmallENV15)
     );
+    assert_eq!(ModelType::parse("bge-base"), Some(ModelType::BGEBaseENV15));
     assert_eq!(
-        ModelType::from_str("bge-base"),
-        Some(ModelType::BGEBaseENV15)
-    );
-    assert_eq!(
-        ModelType::from_str("bge-large"),
+        ModelType::parse("bge-large"),
         Some(ModelType::BGELargeENV15)
     );
-    assert_eq!(ModelType::from_str("invalid-model"), None);
+    assert_eq!(ModelType::parse("invalid-model"), None);
 }
 
 #[test]

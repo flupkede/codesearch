@@ -6,6 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
+use crate::cache::normalize_path;
+
+/// Normalize a path from notify events to a consistent format.
+/// Strips UNC prefix (`\\?\`) and converts backslashes to forward slashes
+/// so paths match the format used by FileMetaStore and VectorStore.
+fn normalize_event_path(path: &Path) -> PathBuf {
+    PathBuf::from(normalize_path(path))
+}
+
 /// File extensions that should trigger re-indexing (whitelist approach)
 /// This includes code files and configuration files
 const INDEXABLE_EXTENSIONS: &[&str] = &[
@@ -183,6 +192,11 @@ impl FileWatcher {
         Ok(())
     }
 
+    /// Check if the watcher is currently started (collecting events)
+    pub fn is_started(&self) -> bool {
+        self.debouncer.is_some()
+    }
+
     /// Stop watching
     pub fn stop(&mut self) {
         if let Some(ref mut debouncer) = self.debouncer {
@@ -245,9 +259,12 @@ impl FileWatcher {
             match result {
                 Ok(debounced_events) => {
                     for event in debounced_events {
-                        for path in &event.paths {
+                        for raw_path in &event.paths {
+                            // Normalize path: strip UNC prefix, convert backslashes
+                            let path = normalize_event_path(raw_path);
+
                             // Skip ignored directories
-                            if self.is_in_ignored_dir(path) || seen_paths.contains(path) {
+                            if self.is_in_ignored_dir(&path) || seen_paths.contains(&path) {
                                 continue;
                             }
                             seen_paths.insert(path.clone());
@@ -257,15 +274,15 @@ impl FileWatcher {
                             match event.kind {
                                 EventKind::Create(_) | EventKind::Modify(_) => {
                                     // For creates/modifies, only process indexable files
-                                    if self.is_watchable(path) && path.exists() {
-                                        events.push(FileEvent::Modified(path.clone()));
+                                    if self.is_watchable(&path) && raw_path.exists() {
+                                        events.push(FileEvent::Modified(path));
                                     }
                                 }
                                 EventKind::Remove(_) => {
                                     // For removals, don't filter by extension - directory
                                     // deletions on Windows may only report the directory
                                     // path (no file extension), not individual files
-                                    events.push(FileEvent::Deleted(path.clone()));
+                                    events.push(FileEvent::Deleted(path));
                                 }
                                 _ => {}
                             }
@@ -317,9 +334,12 @@ impl FileWatcher {
         match result {
             Ok(debounced_events) => {
                 for event in debounced_events {
-                    for path in &event.paths {
+                    for raw_path in &event.paths {
+                        // Normalize path: strip UNC prefix, convert backslashes
+                        let path = normalize_event_path(raw_path);
+
                         // Skip ignored directories and duplicates
-                        if self.is_in_ignored_dir(path) || seen_paths.contains(path) {
+                        if self.is_in_ignored_dir(&path) || seen_paths.contains(&path) {
                             continue;
                         }
                         seen_paths.insert(path.clone());
@@ -328,15 +348,15 @@ impl FileWatcher {
                         match event.kind {
                             EventKind::Create(_) | EventKind::Modify(_) => {
                                 // For creates/modifies, only process indexable files
-                                if self.is_watchable(path) && path.exists() {
-                                    events.push(FileEvent::Modified(path.clone()));
+                                if self.is_watchable(&path) && raw_path.exists() {
+                                    events.push(FileEvent::Modified(path));
                                 }
                             }
                             EventKind::Remove(_) => {
                                 // For removals, don't filter by extension - directory
                                 // deletions on Windows may only report the directory
                                 // path (no file extension), not individual files
-                                events.push(FileEvent::Deleted(path.clone()));
+                                events.push(FileEvent::Deleted(path));
                             }
                             _ => {}
                         }

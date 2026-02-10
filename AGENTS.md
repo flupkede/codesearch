@@ -1,5 +1,21 @@
 # OpenCode AGENTS.md
 
+** ONLY USE MCP TOOLS !!! **
+
+### Gebruik bash indien alleen specifiek index operatie (niet met MCP actief !!)
+
+```bash
+
+# NEVER EXECUTE a REINDEX Complete
+NOT! codesearch index
+
+# NEVER EXECUTE a Complete REINDEX
+NOT! codesearch index -f
+
+# If required you can list the index
+codesearch index list 
+```
+
 **Build Commands (CRITICAL - READ CAREFULLY):**
 
 ⚠️ **MANDATORY BUILD RULES - NEVER VIOLATE** ⚠️
@@ -139,30 +155,6 @@ ls -la /c/WorkArea/AI/codesearch/codesearch.git/target/
 - ALWAYS use debug builds for all work
 - Target directory is configured in `.cargo/config.toml` as `../target`
 - This keeps source tree clean and centralized
-
-### Gebruik
-
-```bash
-# Incremental index (standaard als DB bestaat)
-codesearch index
-
-# Volledige re-index
-codesearch index --force
-codesearch index --full
-codesearch index -f
-
-# Index vanuit subfolder (vindt parent database)
-cd src/components
-codesearch index
-
-# Index beheer
-codesearch index                          # Indexeer (auto-detecteert lokaal/globaal)
-codesearch index -f                       # Forceer volledige re-index
-codesearch index add                      # Maak lokale index
-codesearch index add -g                   # Maak globale index
-codesearch index rm                       # Verwijder index (auto-detect)
-codesearch index list                     # Toon index status
-```
 
 ### Voordelen
 

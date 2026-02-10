@@ -42,7 +42,7 @@ pub enum LogLevel {
 
 impl LogLevel {
     /// Parse from string (case-insensitive)
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "error" => Some(LogLevel::Error),
             "warn" | "warning" => Some(LogLevel::Warn),
@@ -331,15 +331,15 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_log_level_from_str() {
-        assert_eq!(LogLevel::from_str("error"), Some(LogLevel::Error));
-        assert_eq!(LogLevel::from_str("ERROR"), Some(LogLevel::Error));
-        assert_eq!(LogLevel::from_str("warn"), Some(LogLevel::Warn));
-        assert_eq!(LogLevel::from_str("warning"), Some(LogLevel::Warn));
-        assert_eq!(LogLevel::from_str("info"), Some(LogLevel::Info));
-        assert_eq!(LogLevel::from_str("debug"), Some(LogLevel::Debug));
-        assert_eq!(LogLevel::from_str("trace"), Some(LogLevel::Trace));
-        assert_eq!(LogLevel::from_str("invalid"), None);
+    fn test_log_level_parse() {
+        assert_eq!(LogLevel::parse("error"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::parse("ERROR"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::parse("warn"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::parse("warning"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::parse("info"), Some(LogLevel::Info));
+        assert_eq!(LogLevel::parse("debug"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse("trace"), Some(LogLevel::Trace));
+        assert_eq!(LogLevel::parse("invalid"), None);
     }
 
     #[test]

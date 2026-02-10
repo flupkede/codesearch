@@ -195,7 +195,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     let cli = Cli::parse();
 
     // Parse model from CLI flag
-    let model_type = cli.model.as_ref().and_then(|m| ModelType::from_str(m));
+    let model_type = cli.model.as_ref().and_then(|m| ModelType::parse(m));
     if cli.model.is_some() && model_type.is_none() {
         eprintln!(
             "Unknown model: '{}'. Available models:",
@@ -214,7 +214,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
     // Parse loglevel from CLI
     let log_level =
-        crate::logger::LogLevel::from_str(&cli.loglevel).unwrap_or(crate::logger::LogLevel::Info);
+        crate::logger::LogLevel::parse(&cli.loglevel).unwrap_or(crate::logger::LogLevel::Info);
 
     match cli.command {
         Commands::Search {
