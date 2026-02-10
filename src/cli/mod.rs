@@ -213,8 +213,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     }
 
     // Parse loglevel from CLI
-    let log_level = crate::logger::LogLevel::from_str(&cli.loglevel)
-        .unwrap_or(crate::logger::LogLevel::Info);
+    let log_level =
+        crate::logger::LogLevel::from_str(&cli.loglevel).unwrap_or(crate::logger::LogLevel::Info);
 
     match cli.command {
         Commands::Search {
@@ -293,7 +293,15 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             } else {
                 // For 'codesearch index .' or 'codesearch index <path>', just run indexing
                 // The index() function will handle checking for existing indexes
-                crate::index::index(path, dry_run, force, false, model_type, cancel_token.clone()).await
+                crate::index::index(
+                    path,
+                    dry_run,
+                    force,
+                    false,
+                    model_type,
+                    cancel_token.clone(),
+                )
+                .await
             }
         }
         Commands::Stats { path } => crate::index::stats(path).await,
@@ -301,8 +309,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             // Discover database path and initialize logger with file output
             // NOTE: For Serve, tracing is NOT initialized in main.rs — init_logger
             // is the first and only call to set the global subscriber
-            let effective_path = path.as_ref().cloned().unwrap_or_else(|| std::env::current_dir().unwrap());
-            if let Ok(Some(db_info)) = crate::db_discovery::find_best_database(Some(&effective_path)) {
+            let effective_path = path
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            if let Ok(Some(db_info)) =
+                crate::db_discovery::find_best_database(Some(&effective_path))
+            {
                 match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
                     Err(e) => {
                         eprintln!("Warning: Failed to initialize file logger: {}", e);
@@ -321,8 +334,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             // Discover database path and initialize logger with file output
             // NOTE: For MCP, tracing is NOT initialized in main.rs — init_logger
             // is the first and only call to set the global subscriber
-            let effective_path = path.as_ref().cloned().unwrap_or_else(|| std::env::current_dir().unwrap());
-            if let Ok(Some(db_info)) = crate::db_discovery::find_best_database(Some(&effective_path)) {
+            let effective_path = path
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            if let Ok(Some(db_info)) =
+                crate::db_discovery::find_best_database(Some(&effective_path))
+            {
                 match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
                     Err(e) => {
                         eprintln!("Warning: Failed to initialize file logger: {}", e);

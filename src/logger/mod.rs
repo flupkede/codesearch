@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::constants::{DEFAULT_LOG_MAX_FILES, DEFAULT_LOG_RETENTION_DAYS, LOG_DIR_NAME, LOG_FILE_NAME};
+use crate::constants::{
+    DEFAULT_LOG_MAX_FILES, DEFAULT_LOG_RETENTION_DAYS, LOG_DIR_NAME, LOG_FILE_NAME,
+};
 
 /// Result of logger initialization, indicating whether file logging is active
 #[derive(Debug)]
@@ -202,11 +204,7 @@ pub fn cleanup_old_logs(log_dir: &Path, config: &LogRotationConfig) -> Result<()
 ///
 /// Uses `try_init()` so it won't panic if a subscriber is already set
 /// (e.g. early console-only subscriber from main.rs).
-pub fn init_logger(
-    db_path: &Path,
-    log_level: LogLevel,
-    quiet: bool,
-) -> Result<LoggerInitResult> {
+pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<LoggerInitResult> {
     let log_dir = get_log_dir(db_path);
     ensure_log_dir(&log_dir)?;
 
@@ -222,7 +220,8 @@ pub fn init_logger(
         "{level},tantivy=warn,arroy=warn,ort=warn,h2=warn,hyper=warn,tower=warn",
         level = log_level.as_str()
     );
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&filter_str));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&filter_str));
 
     let subscriber = tracing_subscriber::registry().with(env_filter);
 
@@ -239,7 +238,10 @@ pub fn init_logger(
             .try_init();
 
         if let Err(e) = result {
-            eprintln!("Logger: subscriber already set ({}), file logging not active", e);
+            eprintln!(
+                "Logger: subscriber already set ({}), file logging not active",
+                e
+            );
             return Ok(LoggerInitResult::ConsoleOnly);
         }
     } else {
@@ -262,7 +264,10 @@ pub fn init_logger(
             .try_init();
 
         if let Err(e) = result {
-            eprintln!("Logger: subscriber already set ({}), file logging not active", e);
+            eprintln!(
+                "Logger: subscriber already set ({}), file logging not active",
+                e
+            );
             return Ok(LoggerInitResult::ConsoleOnly);
         }
     }
