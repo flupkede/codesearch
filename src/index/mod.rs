@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::cache::FileMetaStore;
+use crate::cache::{normalize_path, FileMetaStore};
 use crate::chunker::SemanticChunker;
 use crate::db_discovery::{find_best_database, register_repository, unregister_repository};
 use crate::embed::{EmbeddingService, ModelType};
@@ -41,9 +41,12 @@ fn get_db_path_smart(
     let project_path = path.as_deref().unwrap_or(Path::new("."));
 
     // Try to canonicalize, but fall back to original path if it fails
-    let canonical_path = project_path
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(project_path));
+    // Then normalize: strip UNC prefix (\\?\) and use forward slashes for consistency
+    let canonical_path = PathBuf::from(normalize_path(
+        &project_path
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(project_path)),
+    ));
 
     // Step 1: Check if there's an existing database (local or global)
     let existing_db = find_best_database(target)?;
