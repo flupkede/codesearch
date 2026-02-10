@@ -555,6 +555,38 @@ pub struct StoreStats {
     pub dimensions: usize,
 }
 
+/// Clean up stale .del files from previous crashed runs
+///
+/// LMDB creates .del files when deleting items, but if the process crashes
+/// or is interrupted, these files can be left behind and cause errors on
+/// the next run. This function removes any .del files before opening the DB.
+fn cleanup_stale_del_files(db_path: &Path) -> Result<()> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    let entries = fs::read_dir(db_path)?;
+    let mut cleaned = 0;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        // Check if file ends with .del
+        if path.extension().and_then(|s| s.to_str()) == Some("del") {
+            // Remove the .del file
+            fs::remove_file(&path)?;
+            cleaned += 1;
+        }
+    }
+
+    if cleaned > 0 {
+        tracing::debug!("Cleaned up {} stale .del files", cleaned);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,36 +790,4 @@ mod tests {
             assert!(metadata.is_some());
         }
     }
-}
-
-/// Clean up stale .del files from previous crashed runs
-///
-/// LMDB creates .del files when deleting items, but if the process crashes
-/// or is interrupted, these files can be left behind and cause errors on
-/// the next run. This function removes any .del files before opening the DB.
-fn cleanup_stale_del_files(db_path: &Path) -> Result<()> {
-    if !db_path.exists() {
-        return Ok(());
-    }
-
-    let entries = fs::read_dir(db_path)?;
-    let mut cleaned = 0;
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Check if file ends with .del
-        if path.extension().and_then(|s| s.to_str()) == Some("del") {
-            // Remove the .del file
-            fs::remove_file(&path)?;
-            cleaned += 1;
-        }
-    }
-
-    if cleaned > 0 {
-        tracing::debug!("Cleaned up {} stale .del files", cleaned);
-    }
-
-    Ok(())
 }

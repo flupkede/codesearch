@@ -179,7 +179,7 @@ fn benchmark_model(model_type: ModelType, chunks: &[Chunk]) -> Result<BenchmarkR
             best_chunk
                 .path
                 .split('/')
-                .last()
+                .next_back()
                 .unwrap_or(&best_chunk.path),
             best_score
         );

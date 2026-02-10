@@ -236,11 +236,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // Read model metadata from database FIRST (needed for sync)
     let (model_type, dimensions) = if let Some(ref model_name) = options.model_override {
         // User specified a model - use it (warning: may not match indexed data!)
-        let mt = ModelType::from_str(model_name).unwrap_or_default();
+        let mt = ModelType::parse(model_name).unwrap_or_default();
         (mt, mt.dimensions())
     } else if let Some((model_name, dims)) = read_metadata(&db_path) {
         // Use model from metadata
-        if let Some(mt) = ModelType::from_str(&model_name) {
+        if let Some(mt) = ModelType::parse(&model_name) {
             (mt, dims)
         } else {
             // Model name not recognized, fall back to default

@@ -15,6 +15,7 @@
 //!
 #![allow(dead_code)]
 
+use crate::cache::{normalize_path, normalize_path_str};
 use crate::constants::{DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, WRITER_LOCK_FILE};
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
@@ -520,18 +521,18 @@ impl IndexManager {
                 }
 
                 // Update file metadata
-                // Group chunks by file path
+                // Group chunks by file path (normalize for consistent lookup)
                 let mut chunks_by_file: std::collections::HashMap<String, Vec<u32>> =
                     std::collections::HashMap::new();
                 for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
                     chunks_by_file
-                        .entry(chunk.chunk.path.to_string())
+                        .entry(normalize_path_str(&chunk.chunk.path))
                         .or_default()
                         .push(*chunk_id);
                 }
 
                 for file in &changed_files {
-                    let path_str = file.path.to_string_lossy().to_string();
+                    let path_str = normalize_path(&file.path);
                     if let Some(ids) = chunks_by_file.get(&path_str) {
                         file_meta_store.update_file(&file.path, ids.clone())?;
                     }
@@ -550,6 +551,20 @@ impl IndexManager {
             elapsed.as_secs_f64()
         );
 
+        Ok(())
+    }
+
+    /// Start the file system watcher (begin collecting events) without starting the processing loop.
+    ///
+    /// Call this BEFORE a long-running operation (like incremental refresh) to capture
+    /// file changes that happen during that operation. Then call `start_file_watcher()`
+    /// afterwards to begin processing the buffered events.
+    pub async fn start_watching(&self) -> Result<()> {
+        let mut w = self.watcher.lock().await;
+        if !w.is_started() {
+            w.start(DEFAULT_FSW_DEBOUNCE_MS)?;
+            info!("👀 File watcher pre-started (collecting events)");
+        }
         Ok(())
     }
 
@@ -584,12 +599,16 @@ impl IndexManager {
         tokio::spawn(async move {
             info!("👀 File watcher task started for: {}", path.display());
 
-            // Start the watcher inside the task
+            // Start the watcher inside the task (if not already started by start_watching)
             {
                 let mut w = watcher.lock().await;
-                if let Err(e) = w.start(DEFAULT_FSW_DEBOUNCE_MS) {
-                    error!("❌ Failed to start file watcher: {}", e);
-                    return;
+                if !w.is_started() {
+                    if let Err(e) = w.start(DEFAULT_FSW_DEBOUNCE_MS) {
+                        error!("❌ Failed to start file watcher: {}", e);
+                        return;
+                    }
+                } else {
+                    debug!("👀 File watcher already started (pre-started), skipping init");
                 }
             }
 
@@ -744,16 +763,10 @@ impl IndexManager {
                             if let Ok(file_meta_store) =
                                 FileMetaStore::load_or_create(db_path, model_name, dimensions)
                             {
-                                let dir_prefix = file_path.to_string_lossy().to_string();
-                                // Add trailing separator to avoid partial matches
-                                // (e.g., "foo" matching "foobar").
-                                // Check both separators for cross-platform robustness.
-                                let dir_prefix_backslash = if dir_prefix.ends_with('\\') {
-                                    dir_prefix.clone()
-                                } else {
-                                    format!("{}\\", dir_prefix)
-                                };
-                                let dir_prefix_forward = if dir_prefix.ends_with('/') {
+                                // Normalize the directory prefix for consistent matching
+                                // (tracked files are normalized to forward slashes)
+                                let dir_prefix = normalize_path(file_path);
+                                let dir_prefix_slash = if dir_prefix.ends_with('/') {
                                     dir_prefix.clone()
                                 } else {
                                     format!("{}/", dir_prefix)
@@ -761,10 +774,7 @@ impl IndexManager {
 
                                 let files_under_dir: Vec<String> = file_meta_store
                                     .tracked_files()
-                                    .filter(|f| {
-                                        f.starts_with(&dir_prefix_backslash)
-                                            || f.starts_with(&dir_prefix_forward)
-                                    })
+                                    .filter(|f| f.starts_with(&dir_prefix_slash))
                                     .cloned()
                                     .collect();
 

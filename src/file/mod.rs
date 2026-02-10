@@ -206,7 +206,8 @@ mod tests {
         fs::write(dir.path().join("test.txt"), "hello world").unwrap();
 
         // Create binary file
-        fs::write(dir.path().join("test.bin"), &[0u8, 1, 2, 3, 255]).unwrap();
+        let bin_path = dir.path().join("test.bin");
+        fs::write(&bin_path, [0u8, 1, 2, 3, 255]).unwrap();
 
         let walker = FileWalker::new(dir.path());
         let (files, stats) = walker.walk().unwrap();

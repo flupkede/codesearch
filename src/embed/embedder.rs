@@ -48,7 +48,7 @@ pub enum ModelType {
 }
 
 impl ModelType {
-    pub fn to_fastembed_model(&self) -> FastEmbedModel {
+    pub fn to_fastembed_model(self) -> FastEmbedModel {
         match self {
             // MiniLM Family
             Self::AllMiniLML6V2 => FastEmbedModel::AllMiniLML6V2,
@@ -174,7 +174,7 @@ impl ModelType {
     }
 
     /// Parse model from string (for CLI)
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "minilm-l6" | "allminiml6v2" => Some(Self::AllMiniLML6V2),
             "minilm-l6-q" | "allminiml6v2q" => Some(Self::AllMiniLML6V2Q),
@@ -378,20 +378,53 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str() {
+    fn test_parse() {
         assert_eq!(
-            ModelType::from_str("bge-small"),
+            ModelType::parse("minilm-l6"),
+            Some(ModelType::AllMiniLML6V2)
+        );
+        assert_eq!(
+            ModelType::parse("minilm-l6-q"),
+            Some(ModelType::AllMiniLML6V2Q)
+        );
+        assert_eq!(
+            ModelType::parse("minilm-l12"),
+            Some(ModelType::AllMiniLML12V2)
+        );
+        assert_eq!(
+            ModelType::parse("minilm-l12-q"),
+            Some(ModelType::AllMiniLML12V2Q)
+        );
+        assert_eq!(
+            ModelType::parse("paraphrase-minilm"),
+            Some(ModelType::ParaphraseMLMiniLML12V2)
+        );
+        assert_eq!(
+            ModelType::parse("bge-small"),
             Some(ModelType::BGESmallENV15)
         );
         assert_eq!(
-            ModelType::from_str("jina-code"),
-            Some(ModelType::JinaEmbeddingsV2BaseCode)
+            ModelType::parse("bge-small-q"),
+            Some(ModelType::BGESmallENV15Q)
+        );
+        assert_eq!(ModelType::parse("bge-base"), Some(ModelType::BGEBaseENV15));
+        assert_eq!(
+            ModelType::parse("nomic-v1"),
+            Some(ModelType::NomicEmbedTextV1)
         );
         assert_eq!(
-            ModelType::from_str("minilm-l6-q"),
-            Some(ModelType::AllMiniLML6V2Q)
+            ModelType::parse("nomic-v1.5"),
+            Some(ModelType::NomicEmbedTextV15)
         );
-        assert_eq!(ModelType::from_str("unknown"), None);
+        assert_eq!(
+            ModelType::parse("nomic-v1.5-q"),
+            Some(ModelType::NomicEmbedTextV15Q)
+        );
+        assert_eq!(
+            ModelType::parse("jina-code"),
+            Some(ModelType::JinaEmbeddingsV2BaseCode)
+        );
+        assert_eq!(ModelType::parse("invalid"), None);
     }
 
     #[test]

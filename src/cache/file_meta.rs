@@ -8,6 +8,22 @@ use std::time::SystemTime;
 
 use crate::constants::FILE_META_DB_NAME;
 
+/// Normalize a file path for consistent HashMap lookups.
+///
+/// On Windows, `Path::canonicalize()` and some APIs add a UNC extended-length
+/// prefix (`\\?\C:\...`). Notify (FSW) events may use standard paths (`C:\...`).
+/// This function strips the UNC prefix and converts backslashes to forward slashes
+/// so that paths from different sources all map to the same key.
+pub fn normalize_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    s.trim_start_matches(r"\\?\").replace('\\', "/")
+}
+
+/// Normalize a path string (same logic as `normalize_path` but for `&str` input).
+pub fn normalize_path_str(path: &str) -> String {
+    path.trim_start_matches(r"\\?\").replace('\\', "/")
+}
+
 /// Metadata for a single indexed file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMeta {
@@ -76,6 +92,10 @@ impl FileMetaStore {
                 store = Self::new(model_name.to_string(), dimensions);
             }
 
+            // Migrate stored paths to normalized format (strip UNC prefix, forward slashes).
+            // Existing stores may have Windows backslash paths or \\?\ prefixed paths.
+            store.migrate_paths();
+
             Ok(store)
         } else {
             Ok(Self::new(model_name.to_string(), dimensions))
@@ -88,6 +108,32 @@ impl FileMetaStore {
         let content = serde_json::to_string_pretty(self)?;
         fs::write(meta_path, content)?;
         Ok(())
+    }
+
+    /// Migrate stored paths to normalized format.
+    ///
+    /// Existing stores may have Windows backslash paths (`C:\foo\bar.rs`) or
+    /// UNC prefixed paths (`\\?\C:\foo\bar.rs`). This re-keys the HashMap
+    /// to use the canonical normalized form (forward slashes, no UNC prefix).
+    fn migrate_paths(&mut self) {
+        let old_files = std::mem::take(&mut self.files);
+        let capacity = old_files.len();
+        let mut new_files = HashMap::with_capacity(capacity);
+        let mut migrated = 0;
+
+        for (old_key, meta) in old_files {
+            let new_key = normalize_path_str(&old_key);
+            if new_key != old_key {
+                migrated += 1;
+            }
+            new_files.insert(new_key, meta);
+        }
+
+        self.files = new_files;
+
+        if migrated > 0 {
+            tracing::info!("🔄 Migrated {} file paths to normalized format", migrated);
+        }
     }
 
     /// Compute SHA256 hash of file content
@@ -108,7 +154,7 @@ impl FileMetaStore {
     /// Check if a file needs re-indexing
     /// Returns: (needs_reindex, existing_chunk_ids_to_delete)
     pub fn check_file(&self, path: &Path) -> Result<(bool, Vec<u32>)> {
-        let path_str = path.to_string_lossy().to_string();
+        let path_str = normalize_path(path);
 
         // Get current file stats
         let current_mtime = Self::get_mtime(path)?;
@@ -137,7 +183,7 @@ impl FileMetaStore {
 
     /// Update metadata for a file after indexing
     pub fn update_file(&mut self, path: &Path, chunk_ids: Vec<u32>) -> Result<()> {
-        let path_str = path.to_string_lossy().to_string();
+        let path_str = normalize_path(path);
         let hash = Self::compute_hash(path)?;
         let mtime = Self::get_mtime(path)?;
         let size = fs::metadata(path)?.len();
@@ -158,7 +204,7 @@ impl FileMetaStore {
 
     /// Mark a file as deleted
     pub fn remove_file(&mut self, path: &Path) -> Option<FileMeta> {
-        let path_str = path.to_string_lossy().to_string();
+        let path_str = normalize_path(path);
         self.files.remove(&path_str)
     }
 
@@ -227,6 +273,74 @@ impl FileMetaStats {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_normalize_path_strips_unc_prefix() {
+        let path = Path::new(r"\\?\C:\WorkArea\AI\codesearch\src\main.rs");
+        assert_eq!(
+            normalize_path(path),
+            "C:/WorkArea/AI/codesearch/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn test_normalize_path_converts_backslashes() {
+        let path = Path::new(r"C:\WorkArea\AI\codesearch\src\main.rs");
+        assert_eq!(
+            normalize_path(path),
+            "C:/WorkArea/AI/codesearch/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn test_normalize_path_forward_slashes_unchanged() {
+        let path = Path::new("C:/WorkArea/AI/codesearch/src/main.rs");
+        let result = normalize_path(path);
+        // On Windows, Path::new with forward slashes may or may not convert them
+        // The important thing is the result is consistent
+        assert!(!result.contains('\\'));
+        assert!(!result.starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn test_normalize_path_str_strips_unc() {
+        assert_eq!(normalize_path_str(r"\\?\C:\foo\bar.rs"), "C:/foo/bar.rs");
+    }
+
+    #[test]
+    fn test_migrate_paths_normalizes_keys() {
+        let mut store = FileMetaStore::new("test-model".to_string(), 384);
+        // Insert with non-normalized key (simulating old format)
+        store.files.insert(
+            r"C:\WorkArea\src\main.rs".to_string(),
+            FileMeta {
+                hash: "abc123".to_string(),
+                mtime: 1000,
+                size: 100,
+                chunk_count: 2,
+                chunk_ids: vec![1, 2],
+            },
+        );
+        store.files.insert(
+            r"\\?\C:\WorkArea\src\lib.rs".to_string(),
+            FileMeta {
+                hash: "def456".to_string(),
+                mtime: 2000,
+                size: 200,
+                chunk_count: 3,
+                chunk_ids: vec![3, 4, 5],
+            },
+        );
+
+        store.migrate_paths();
+
+        // Both should be normalized
+        assert!(store.files.contains_key("C:/WorkArea/src/main.rs"));
+        assert!(store.files.contains_key("C:/WorkArea/src/lib.rs"));
+        // Old keys should be gone
+        assert!(!store.files.contains_key(r"C:\WorkArea\src\main.rs"));
+        assert!(!store.files.contains_key(r"\\?\C:\WorkArea\src\lib.rs"));
+    }
 
     #[test]
     fn test_file_meta_store() {
