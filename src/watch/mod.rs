@@ -192,16 +192,24 @@ impl FileWatcher {
         self.receiver = None;
     }
 
+    /// Check if a path is in an ignored directory (.git, node_modules, etc.)
+    fn is_in_ignored_dir(&self, path: &Path) -> bool {
+        for component in path.components() {
+            if let Some(name) = component.as_os_str().to_str() {
+                if IGNORED_DIRS.contains(&name) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Check if a path should be watched (whitelist approach)
     /// Only returns true for indexable code/config files
     fn is_watchable(&self, path: &Path) -> bool {
         // Check if path is in an ignored directory
-        for component in path.components() {
-            if let Some(name) = component.as_os_str().to_str() {
-                if IGNORED_DIRS.contains(&name) {
-                    return false;
-                }
-            }
+        if self.is_in_ignored_dir(path) {
+            return false;
         }
 
         // Must be a file with an indexable extension
@@ -238,13 +246,8 @@ impl FileWatcher {
                 Ok(debounced_events) => {
                     for event in debounced_events {
                         for path in &event.paths {
-                            // Only process indexable files (whitelist)
-                            if !self.is_watchable(path) {
-                                continue;
-                            }
-
-                            // Skip duplicates
-                            if seen_paths.contains(path) {
+                            // Skip ignored directories
+                            if self.is_in_ignored_dir(path) || seen_paths.contains(path) {
                                 continue;
                             }
                             seen_paths.insert(path.clone());
@@ -253,11 +256,15 @@ impl FileWatcher {
                             use notify::EventKind;
                             match event.kind {
                                 EventKind::Create(_) | EventKind::Modify(_) => {
-                                    if path.exists() {
+                                    // For creates/modifies, only process indexable files
+                                    if self.is_watchable(path) && path.exists() {
                                         events.push(FileEvent::Modified(path.clone()));
                                     }
                                 }
                                 EventKind::Remove(_) => {
+                                    // For removals, don't filter by extension - directory
+                                    // deletions on Windows may only report the directory
+                                    // path (no file extension), not individual files
                                     events.push(FileEvent::Deleted(path.clone()));
                                 }
                                 _ => {}
@@ -311,8 +318,8 @@ impl FileWatcher {
             Ok(debounced_events) => {
                 for event in debounced_events {
                     for path in &event.paths {
-                        // Only process indexable files (whitelist)
-                        if !self.is_watchable(path) || seen_paths.contains(path) {
+                        // Skip ignored directories and duplicates
+                        if self.is_in_ignored_dir(path) || seen_paths.contains(path) {
                             continue;
                         }
                         seen_paths.insert(path.clone());
@@ -320,11 +327,15 @@ impl FileWatcher {
                         use notify::EventKind;
                         match event.kind {
                             EventKind::Create(_) | EventKind::Modify(_) => {
-                                if path.exists() {
+                                // For creates/modifies, only process indexable files
+                                if self.is_watchable(path) && path.exists() {
                                     events.push(FileEvent::Modified(path.clone()));
                                 }
                             }
                             EventKind::Remove(_) => {
+                                // For removals, don't filter by extension - directory
+                                // deletions on Windows may only report the directory
+                                // path (no file extension), not individual files
                                 events.push(FileEvent::Deleted(path.clone()));
                             }
                             _ => {}

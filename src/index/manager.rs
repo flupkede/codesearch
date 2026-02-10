@@ -723,6 +723,88 @@ impl IndexManager {
             {
                 warn!("⚠️  Failed to remove {}: {}", file_path.display(), e);
             }
+
+            // Also handle directory deletion: on Windows, rm -rf of a directory may only
+            // produce a Remove event for the directory itself, not for individual files.
+            // Find all tracked files under this path prefix and remove them too.
+            {
+                use crate::cache::FileMetaStore;
+
+                // Load FileMetaStore from disk to query tracked files
+                let metadata_path = db_path.join("metadata.json");
+                if metadata_path.exists() {
+                    if let Ok(metadata_str) = std::fs::read_to_string(&metadata_path) {
+                        if let Ok(metadata) =
+                            serde_json::from_str::<serde_json::Value>(&metadata_str)
+                        {
+                            let dimensions =
+                                metadata["dimensions"].as_u64().unwrap_or(384) as usize;
+                            let model_name = metadata["model"].as_str().unwrap_or("minilm-l6-q");
+
+                            if let Ok(file_meta_store) =
+                                FileMetaStore::load_or_create(db_path, model_name, dimensions)
+                            {
+                                let dir_prefix = file_path.to_string_lossy().to_string();
+                                // Add trailing separator to avoid partial matches
+                                // (e.g., "foo" matching "foobar").
+                                // Check both separators for cross-platform robustness.
+                                let dir_prefix_backslash = if dir_prefix.ends_with('\\') {
+                                    dir_prefix.clone()
+                                } else {
+                                    format!("{}\\", dir_prefix)
+                                };
+                                let dir_prefix_forward = if dir_prefix.ends_with('/') {
+                                    dir_prefix.clone()
+                                } else {
+                                    format!("{}/", dir_prefix)
+                                };
+
+                                let files_under_dir: Vec<String> = file_meta_store
+                                    .tracked_files()
+                                    .filter(|f| {
+                                        f.starts_with(&dir_prefix_backslash)
+                                            || f.starts_with(&dir_prefix_forward)
+                                    })
+                                    .cloned()
+                                    .collect();
+
+                                if !files_under_dir.is_empty() {
+                                    info!(
+                                        "🗑️  Directory deleted: {} ({} files under it)",
+                                        file_path.display(),
+                                        files_under_dir.len()
+                                    );
+                                    for tracked_file in &files_under_dir {
+                                        let tracked_path = PathBuf::from(tracked_file);
+                                        if let Err(e) = Self::remove_file_from_index_with_stores(
+                                            codebase_path,
+                                            db_path,
+                                            stores,
+                                            &tracked_path,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                "⚠️  Failed to remove {}: {}",
+                                                tracked_path.display(),
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rebuild vector index after removals so deleted chunks are excluded from search results.
+        // index_single_file_with_stores already calls build_index() per file, but when a batch
+        // contains ONLY removals (no additions), the index would never be rebuilt without this.
+        if !files_to_remove.is_empty() {
+            let mut store = stores.vector_store.write().await;
+            store.build_index()?;
         }
 
         // Then, index modified/new files
@@ -776,7 +858,15 @@ impl IndexManager {
 
         // Call the index function from the parent module
         // Parameters: path, dry_run, force, global, model
-        super::index(Some(path.to_path_buf()), false, false, false, None, CancellationToken::new()).await?;
+        super::index(
+            Some(path.to_path_buf()),
+            false,
+            false,
+            false,
+            None,
+            CancellationToken::new(),
+        )
+        .await?;
 
         let elapsed = start.elapsed();
         info!(
@@ -924,13 +1014,21 @@ impl IndexManager {
         // Load file metadata to get chunk IDs
         let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
 
-        // Check if file has chunks
-        let (_, chunk_ids) = file_meta_store.check_file(file_path)?;
-
-        if chunk_ids.is_empty() {
-            debug!("No chunks found for file: {}", file_path.display());
-            return Ok(());
-        }
+        // Get chunk IDs from file metadata directly (not check_file which reads from disk)
+        // The file is already deleted, so we can't read mtime/size/hash
+        let meta = file_meta_store.remove_file(file_path);
+        let chunk_ids = match meta {
+            Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
+            Some(_) => {
+                debug!("No chunks to remove for file: {}", file_path.display());
+                file_meta_store.save(&db_path)?;
+                return Ok(());
+            }
+            None => {
+                debug!("No metadata found for file: {}", file_path.display());
+                return Ok(());
+            }
+        };
 
         debug!(
             "Removing {} chunks for file: {}",
@@ -947,10 +1045,12 @@ impl IndexManager {
             store.delete_chunks(&[*chunk_id])?;
             fts_store.delete_chunk(*chunk_id)?;
         }
+
+        // Rebuild vector index so deleted chunks are excluded from search results
+        store.build_index()?;
         fts_store.commit()?;
 
-        // Remove from file metadata
-        file_meta_store.remove_file(file_path);
+        // Save file metadata (remove_file was already called above)
         file_meta_store.save(&db_path)?;
 
         info!(
@@ -1092,13 +1192,21 @@ impl IndexManager {
         // Load file metadata to get chunk IDs
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
 
-        // Check if file has chunks
-        let (_, chunk_ids) = file_meta_store.check_file(file_path)?;
-
-        if chunk_ids.is_empty() {
-            debug!("No chunks found for file: {}", file_path.display());
-            return Ok(());
-        }
+        // Get chunk IDs from file metadata directly (not check_file which reads from disk)
+        // The file is already deleted, so we can't read mtime/size/hash
+        let meta = file_meta_store.remove_file(file_path);
+        let chunk_ids = match meta {
+            Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
+            Some(_) => {
+                debug!("No chunks to remove for file: {}", file_path.display());
+                file_meta_store.save(db_path)?;
+                return Ok(());
+            }
+            None => {
+                debug!("No metadata found for file: {}", file_path.display());
+                return Ok(());
+            }
+        };
 
         debug!(
             "Removing {} chunks for file: {}",
@@ -1123,8 +1231,7 @@ impl IndexManager {
             fts_store.commit()?;
         }
 
-        // Remove from file metadata
-        file_meta_store.remove_file(file_path);
+        // Save file metadata (remove_file was already called above)
         file_meta_store.save(db_path)?;
 
         info!(

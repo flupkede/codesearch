@@ -310,12 +310,15 @@ impl CodesearchService {
                 if let Ok(Some(chunk)) = store.get_chunk(id) {
                     // Normalize paths for comparison: strip UNC, normalize slashes
                     let chunk_norm = normalize_path_for_compare(&chunk.path);
-                    let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
+                    let project_norm =
+                        normalize_path_for_compare(&self.project_path.to_string_lossy());
                     let req_norm = normalize_path_for_compare(&request.path);
 
                     // Make chunk path relative by stripping project path prefix
                     let chunk_rel = if chunk_norm.starts_with(&project_norm) {
-                        chunk_norm[project_norm.len()..].trim_start_matches('/').to_string()
+                        chunk_norm[project_norm.len()..]
+                            .trim_start_matches('/')
+                            .to_string()
                     } else {
                         chunk_norm.clone()
                     };
@@ -369,12 +372,15 @@ impl CodesearchService {
                 if let Ok(Some(chunk)) = store.get_chunk(id) {
                     // Normalize paths for comparison: strip UNC, normalize slashes
                     let chunk_norm = normalize_path_for_compare(&chunk.path);
-                    let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
+                    let project_norm =
+                        normalize_path_for_compare(&self.project_path.to_string_lossy());
                     let req_norm = normalize_path_for_compare(&request.path);
 
                     // Make chunk path relative by stripping project path prefix
                     let chunk_rel = if chunk_norm.starts_with(&project_norm) {
-                        chunk_norm[project_norm.len()..].trim_start_matches('/').to_string()
+                        chunk_norm[project_norm.len()..]
+                            .trim_start_matches('/')
+                            .to_string()
                     } else {
                         chunk_norm.clone()
                     };
@@ -997,10 +1003,7 @@ pub async fn run_mcp_server(path: Option<PathBuf>, cancel_token: CancellationTok
 
                     // Step 2: AFTER refresh completes, start file watcher (also writes to stores)
                     tracing::info!("👀 Starting file watcher...");
-                    if let Err(e) = index_manager_arc
-                        .start_file_watcher(bg_cancel_token)
-                        .await
-                    {
+                    if let Err(e) = index_manager_arc.start_file_watcher(bg_cancel_token).await {
                         tracing::error!("❌ Failed to start file watcher: {}", e);
                     } else {
                         tracing::info!(
