@@ -467,6 +467,7 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<HealthRes
         total_files: 0,
         indexed: false,
         dimensions: 384,
+        max_chunk_id: 0,
     });
 
     let file_meta = state.file_meta.read().await;
@@ -486,6 +487,7 @@ async fn status_handler(State(state): State<Arc<ServerState>>) -> Json<StatusRes
         total_files: 0,
         indexed: false,
         dimensions: 384,
+        max_chunk_id: 0,
     });
 
     let file_meta = state.file_meta.read().await;

@@ -294,20 +294,20 @@ impl CodesearchService {
         // Get chunks using shared stores if available
         let file_chunks = if let Some(ref stores) = self.shared_stores {
             let store = stores.vector_store.read().await;
-            let stats = match store.stats() {
-                Ok(s) => s,
+
+            // Collect chunks for the requested file using LMDB iteration
+            // (avoids missing chunks with high IDs after delete+insert cycles)
+            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
+            let all = match store.all_chunks() {
+                Ok(c) => c,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error getting stats: {}",
+                        "Error reading chunks: {}",
                         e
                     ))]));
                 }
             };
-
-            // Collect chunks for the requested file
-            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
-            for id in 0..stats.total_chunks as u32 {
-                if let Ok(Some(chunk)) = store.get_chunk(id) {
+            for (_id, chunk) in all {
                     // Normalize paths for comparison: strip UNC, normalize slashes
                     let chunk_norm = normalize_path_for_compare(&chunk.path);
                     let project_norm =
@@ -341,7 +341,6 @@ impl CodesearchService {
                             context_next: if compact { None } else { chunk.context_next },
                         });
                     }
-                }
             }
             file_chunks
         } else {
@@ -356,53 +355,51 @@ impl CodesearchService {
                 }
             };
 
-            let stats = match store.stats() {
-                Ok(s) => s,
+            // Collect chunks for the requested file using LMDB iteration
+            // (avoids missing chunks with high IDs after delete+insert cycles)
+            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
+            let all = match store.all_chunks() {
+                Ok(c) => c,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error getting stats: {}",
+                        "Error reading chunks: {}",
                         e
                     ))]));
                 }
             };
+            for (_id, chunk) in all {
+                // Normalize paths for comparison: strip UNC, normalize slashes
+                let chunk_norm = normalize_path_for_compare(&chunk.path);
+                let project_norm =
+                    normalize_path_for_compare(&self.project_path.to_string_lossy());
+                let req_norm = normalize_path_for_compare(&request.path);
 
-            // Collect chunks for the requested file
-            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
-            for id in 0..stats.total_chunks as u32 {
-                if let Ok(Some(chunk)) = store.get_chunk(id) {
-                    // Normalize paths for comparison: strip UNC, normalize slashes
-                    let chunk_norm = normalize_path_for_compare(&chunk.path);
-                    let project_norm =
-                        normalize_path_for_compare(&self.project_path.to_string_lossy());
-                    let req_norm = normalize_path_for_compare(&request.path);
+                // Make chunk path relative by stripping project path prefix
+                let chunk_rel = if chunk_norm.starts_with(&project_norm) {
+                    chunk_norm[project_norm.len()..]
+                        .trim_start_matches('/')
+                        .to_string()
+                } else {
+                    chunk_norm.clone()
+                };
 
-                    // Make chunk path relative by stripping project path prefix
-                    let chunk_rel = if chunk_norm.starts_with(&project_norm) {
-                        chunk_norm[project_norm.len()..]
-                            .trim_start_matches('/')
-                            .to_string()
-                    } else {
-                        chunk_norm.clone()
-                    };
-
-                    // Match: exact, ends_with (for subdirectory repos), or raw paths
-                    if chunk_rel == req_norm
-                        || chunk_rel.ends_with(&format!("/{}", req_norm))
-                        || req_norm.ends_with(&format!("/{}", chunk_rel))
-                        || chunk.path == request.path
-                    {
-                        file_chunks.push(SearchResultItem {
-                            path: chunk.path,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            kind: chunk.kind,
-                            score: 1.0,
-                            signature: chunk.signature,
-                            content: if compact { None } else { Some(chunk.content) },
-                            context_prev: if compact { None } else { chunk.context_prev },
-                            context_next: if compact { None } else { chunk.context_next },
-                        });
-                    }
+                // Match: exact, ends_with (for subdirectory repos), or raw paths
+                if chunk_rel == req_norm
+                    || chunk_rel.ends_with(&format!("/{}", req_norm))
+                    || req_norm.ends_with(&format!("/{}", chunk_rel))
+                    || chunk.path == request.path
+                {
+                    file_chunks.push(SearchResultItem {
+                        path: chunk.path,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        kind: chunk.kind,
+                        score: 1.0,
+                        signature: chunk.signature,
+                        content: if compact { None } else { Some(chunk.content) },
+                        context_prev: if compact { None } else { chunk.context_prev },
+                        context_next: if compact { None } else { chunk.context_next },
+                    });
                 }
             }
             file_chunks
@@ -539,6 +536,7 @@ impl CodesearchService {
                 total_files: 0,
                 model: "none".to_string(),
                 dimensions: 0,
+                max_chunk_id: 0,
                 db_path: self.db_path.display().to_string(),
                 project_path: self.project_path.display().to_string(),
                 error_message: Some(
@@ -561,6 +559,7 @@ impl CodesearchService {
                         total_files: 0,
                         model: self.model_type.short_name().to_string(),
                         dimensions: 0,
+                        max_chunk_id: 0,
                         db_path: self.db_path.display().to_string(),
                         project_path: self.project_path.display().to_string(),
                         error_message: Some(format!("Error getting stats: {}", e)),
@@ -581,9 +580,10 @@ impl CodesearchService {
                         total_files: 0,
                         model: self.model_type.short_name().to_string(),
                         dimensions: 0,
+                        max_chunk_id: 0,
                         db_path: self.db_path.display().to_string(),
                         project_path: self.project_path.display().to_string(),
-                        error_message: Some(format!("Error opening database: {}", e)),
+                        error_message: Some(format!("Error getting stats: {}", e)),
                     };
                     let json =
                         serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -600,6 +600,7 @@ impl CodesearchService {
                         total_files: 0,
                         model: self.model_type.short_name().to_string(),
                         dimensions: 0,
+                        max_chunk_id: 0,
                         db_path: self.db_path.display().to_string(),
                         project_path: self.project_path.display().to_string(),
                         error_message: Some(format!("Error getting stats: {}", e)),
@@ -617,6 +618,7 @@ impl CodesearchService {
             total_files: stats.total_files,
             model: self.model_type.short_name().to_string(),
             dimensions: stats.dimensions,
+            max_chunk_id: stats.max_chunk_id,
             db_path: self.db_path.display().to_string(),
             project_path: self.project_path.display().to_string(),
             error_message: None,
