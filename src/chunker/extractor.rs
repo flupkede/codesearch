@@ -69,6 +69,9 @@ pub trait LanguageExtractor: Send + Sync {
             ChunkKind::TypeAlias => format!("Type: {}", name),
             ChunkKind::Const => format!("Const: {}", name),
             ChunkKind::Static => format!("Static: {}", name),
+            ChunkKind::Imports => format!("Imports: {}", name),
+            ChunkKind::ModuleDocs => format!("ModuleDocs: {}", name),
+            ChunkKind::Comment => format!("Comment: {}", name),
             _ => format!("Symbol: {}", name),
         })
     }

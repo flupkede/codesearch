@@ -40,14 +40,15 @@ pub struct FusedResult {
 ///
 /// This is a proven technique for combining multiple ranking signals
 /// without needing to normalize scores across different systems.
+type ScoreEntry = (f32, Option<f32>, Option<f32>, Option<usize>, Option<usize>);
+
 pub fn rrf_fusion(
     vector_results: &[SearchResult],
     fts_results: &[FtsResult],
     k: f32,
 ) -> Vec<FusedResult> {
     // Maps chunk_id -> (rrf_score, vector_score, fts_score, vector_rank, fts_rank)
-    let mut scores: HashMap<u32, (f32, Option<f32>, Option<f32>, Option<usize>, Option<usize>)> =
-        HashMap::new();
+    let mut scores: HashMap<u32, ScoreEntry> = HashMap::new();
 
     // Process vector results
     for (rank, result) in vector_results.iter().enumerate() {

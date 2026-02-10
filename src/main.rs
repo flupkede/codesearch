@@ -35,11 +35,11 @@ async fn main() -> Result<()> {
         .iter()
         .position(|a| a == "-l" || a == "--loglevel")
         .and_then(|pos| args.get(pos + 1))
-        .map(|s| s.clone())
+            .cloned()
         .unwrap_or_else(|| "info".to_string());
 
     // Validate loglevel
-    let log_level = logger::LogLevel::from_str(&loglevel).unwrap_or(logger::LogLevel::Info);
+    let log_level = logger::LogLevel::parse(&loglevel).unwrap_or(logger::LogLevel::Info);
     let log_level_str = log_level.as_str();
 
     // Create cancellation token for async shutdown (MCP server, file watcher)
