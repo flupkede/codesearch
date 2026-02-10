@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::{Chunk, ChunkKind, Chunker};
+use crate::cache::normalize_path;
 use anyhow::Result;
 use std::path::Path;
 
@@ -46,7 +47,7 @@ fn fallback_chunk(
     let mut chunks = Vec::new();
     let stride = (max_chunk_lines - overlap_lines).max(1);
 
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = normalize_path(path);
     let context = vec![format!("File: {}", path_str)];
 
     let mut i = 0;
