@@ -308,6 +308,55 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_path_unix_style() {
+        // Unix/Linux/macOS paths should remain unchanged
+        let path = Path::new("/home/user/project/src/main.rs");
+        assert_eq!(normalize_path(path), "/home/user/project/src/main.rs");
+    }
+
+    #[test]
+    fn test_normalize_path_mixed_separators() {
+        // Mixed separators should be normalized to forward slashes
+        let path = Path::new(r"C:\Users\project/src/lib.rs");
+        assert_eq!(normalize_path(path), "C:/Users/project/src/lib.rs");
+    }
+
+    #[test]
+    fn test_normalize_path_str_mixed_separators() {
+        assert_eq!(
+            normalize_path_str(r"C:\Users\project/src/lib.rs"),
+            "C:/Users/project/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn test_normalize_path_already_normalized() {
+        // Already normalized paths should remain unchanged
+        let path = Path::new("C:/WorkArea/AI/codesearch/src/main.rs");
+        assert_eq!(
+            normalize_path(path),
+            "C:/WorkArea/AI/codesearch/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn test_normalize_path_deeply_nested() {
+        // Deeply nested paths
+        let path = Path::new(r"\\?\C:\Very\Deep\Nested\Path\To\Some\File.rs");
+        assert_eq!(
+            normalize_path(path),
+            "C:/Very/Deep/Nested/Path/To/Some/File.rs"
+        );
+    }
+
+    #[test]
+    fn test_normalize_path_consecutive_backslashes() {
+        // Consecutive backslashes (edge case from file systems)
+        let path = Path::new(r"C:\\Double\\Backslashes\\file.rs");
+        assert_eq!(normalize_path(path), "C://Double//Backslashes//file.rs");
+    }
+
+    #[test]
     fn test_migrate_paths_normalizes_keys() {
         let mut store = FileMetaStore::new("test-model".to_string(), 384);
         // Insert with non-normalized key (simulating old format)

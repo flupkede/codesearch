@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::{Chunk, ChunkKind, Chunker, DEFAULT_CONTEXT_LINES};
+use crate::cache::normalize_path;
 use crate::chunker::extractor::{get_extractor, LanguageExtractor};
 use crate::chunker::parser::CodeParser;
 use crate::file::Language;
@@ -57,7 +58,7 @@ impl SemanticChunker {
         let mut definition_chunks = Vec::new();
         let mut gap_tracker = GapTracker::new(content);
 
-        let file_context = format!("File: {}", path.display());
+        let file_context = format!("File: {}", normalize_path(path));
         self.visit_node(
             parsed.root_node(),
             parsed.source().as_bytes(),
@@ -235,7 +236,7 @@ impl SemanticChunker {
         let mut chunks = Vec::new();
         let stride = (self.max_chunk_lines - self.overlap_lines).max(1);
 
-        let path_str = path.to_string_lossy().to_string();
+        let path_str = normalize_path(path);
         let context = vec![format!("File: {}", path_str)];
 
         let mut i = 0;
@@ -376,7 +377,7 @@ impl<'a> GapTracker<'a> {
     /// Extract gap chunks (uncovered regions)
     fn extract_gaps(&self, path: &Path) -> Vec<Chunk> {
         let mut gaps = Vec::new();
-        let path_str = path.to_string_lossy().to_string();
+        let path_str = normalize_path(path);
         let context = vec![format!("File: {}", path_str)];
 
         let mut gap_start: Option<usize> = None;
