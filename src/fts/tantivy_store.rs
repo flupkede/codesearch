@@ -18,6 +18,8 @@ use tantivy::{
     Index, IndexReader, IndexSettings, IndexWriter, TantivyDocument, Term,
 };
 
+use crate::chunker::ChunkKind;
+
 /// Result from FTS search
 #[derive(Debug, Clone)]
 pub struct FtsResult {
@@ -387,12 +389,29 @@ impl FtsStore {
     }
 
     /// Search using BM25
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
+    ///
+    /// If `target_kind` is provided, boosts results matching that ChunkKind (e.g., "class", "function").
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        target_kind: Option<ChunkKind>,
+    ) -> Result<Vec<FtsResult>> {
         let searcher = self.reader.searcher();
 
-        // Parse query against content and signature fields
-        let query_parser =
-            QueryParser::for_index(&self.index, vec![self.content_field, self.signature_field]);
+        // Parse query against content, signature, and kind fields
+        let mut query_parser = QueryParser::for_index(
+            &self.index,
+            vec![self.content_field, self.signature_field, self.kind_field],
+        );
+
+        // Boost signature field for better matching of function names, class names, etc.
+        query_parser.set_field_boost(self.signature_field, 2.0);
+
+        // Boost kind field when structural intent is detected
+        if let Some(ref _kind) = target_kind {
+            query_parser.set_field_boost(self.kind_field, 3.0); // High boost for kind field
+        }
 
         // Parse query, fall back to match-all on error
         let parsed_query = match query_parser.parse_query(query) {
@@ -411,6 +430,68 @@ impl FtsStore {
 
         // Execute search
         let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit))?;
+
+        // Convert to results
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+
+            if let Some(chunk_id) = doc.get_first(self.chunk_id_field) {
+                if let Some(id) = chunk_id.as_u64() {
+                    results.push(FtsResult {
+                        chunk_id: id as u32,
+                        score,
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Search for exact identifier matches (boosted)
+    ///
+    /// Searches signature field with exact term (3x boost) and content field.
+    /// Used for improving exact name matching (e.g., "BaseRestClient", "UserService").
+    ///
+    /// If `target_kind` is provided, boosts results matching that ChunkKind.
+    pub fn search_exact(
+        &self,
+        identifier: &str,
+        limit: usize,
+        target_kind: Option<ChunkKind>,
+    ) -> Result<Vec<FtsResult>> {
+        use tantivy::query::{BooleanQuery, BoostQuery, TermQuery};
+        use tantivy::schema::IndexRecordOption;
+
+        let searcher = self.reader.searcher();
+
+        // Search signature field with exact term
+        let term = Term::from_field_text(self.signature_field, identifier);
+        let term_query = TermQuery::new(term, IndexRecordOption::Basic);
+
+        // Also search content field for the identifier as a phrase
+        let content_term = Term::from_field_text(self.content_field, identifier);
+        let content_query = TermQuery::new(content_term, IndexRecordOption::Basic);
+
+        // Boost signature matches 3x over content matches
+        let boosted_sig = BoostQuery::new(Box::new(term_query), 3.0);
+
+        // Add kind field query if structural intent detected
+        let mut queries: Vec<Box<dyn tantivy::query::Query>> =
+            vec![Box::new(boosted_sig), Box::new(content_query)];
+        if let Some(ref kind) = target_kind {
+            // Add term query for kind field with high boost
+            let kind_str = format!("{:?}", kind);
+            let kind_term = Term::from_field_text(self.kind_field, &kind_str);
+            let kind_query = TermQuery::new(kind_term, IndexRecordOption::Basic);
+            let boosted_kind = BoostQuery::new(Box::new(kind_query), 2.5);
+            queries.push(Box::new(boosted_kind));
+        }
+
+        let combined = BooleanQuery::union(queries);
+
+        let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit))?;
 
         // Convert to results
         let mut results = Vec::with_capacity(top_docs.len());
@@ -498,17 +579,17 @@ mod tests {
         store.commit()?;
 
         // Search for hello
-        let results = store.search("hello", 10)?;
+        let results = store.search("hello", 10, None)?;
         assert!(!results.is_empty());
         assert_eq!(results[0].chunk_id, 1);
 
         // Search for UserConfig
-        let results = store.search("UserConfig", 10)?;
+        let results = store.search("UserConfig", 10, None)?;
         assert!(!results.is_empty());
         assert_eq!(results[0].chunk_id, 2);
 
         // Search for process
-        let results = store.search("process data", 10)?;
+        let results = store.search("process data", 10, None)?;
         assert!(!results.is_empty());
         assert_eq!(results[0].chunk_id, 3);
 
@@ -527,7 +608,7 @@ mod tests {
         store.commit()?;
 
         // Should find both
-        let results = store.search("test content", 10)?;
+        let results = store.search("test content", 10, None)?;
         assert_eq!(results.len(), 2);
 
         // Delete one
@@ -535,7 +616,7 @@ mod tests {
         store.commit()?;
 
         // Should find only one
-        let results = store.search("test content", 10)?;
+        let results = store.search("test content", 10, None)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk_id, 2);
 

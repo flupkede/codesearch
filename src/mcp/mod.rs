@@ -450,7 +450,7 @@ impl CodesearchService {
         };
 
         // Search FTS for the symbol — returns chunk_id + score
-        let fts_results = match fts_store.search(&request.symbol, limit * 2) {
+        let fts_results = match fts_store.search(&request.symbol, limit * 2, None) {
             Ok(r) => r,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
