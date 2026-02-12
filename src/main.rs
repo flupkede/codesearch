@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
         .iter()
         .position(|a| a == "-l" || a == "--loglevel")
         .and_then(|pos| args.get(pos + 1))
-            .cloned()
+        .cloned()
         .unwrap_or_else(|| "info".to_string());
 
     // Validate loglevel

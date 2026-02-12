@@ -308,39 +308,38 @@ impl CodesearchService {
                 }
             };
             for (_id, chunk) in all {
-                    // Normalize paths for comparison: strip UNC, normalize slashes
-                    let chunk_norm = normalize_path_for_compare(&chunk.path);
-                    let project_norm =
-                        normalize_path_for_compare(&self.project_path.to_string_lossy());
-                    let req_norm = normalize_path_for_compare(&request.path);
+                // Normalize paths for comparison: strip UNC, normalize slashes
+                let chunk_norm = normalize_path_for_compare(&chunk.path);
+                let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
+                let req_norm = normalize_path_for_compare(&request.path);
 
-                    // Make chunk path relative by stripping project path prefix
-                    let chunk_rel = if chunk_norm.starts_with(&project_norm) {
-                        chunk_norm[project_norm.len()..]
-                            .trim_start_matches('/')
-                            .to_string()
-                    } else {
-                        chunk_norm.clone()
-                    };
+                // Make chunk path relative by stripping project path prefix
+                let chunk_rel = if chunk_norm.starts_with(&project_norm) {
+                    chunk_norm[project_norm.len()..]
+                        .trim_start_matches('/')
+                        .to_string()
+                } else {
+                    chunk_norm.clone()
+                };
 
-                    // Match: exact, ends_with (for subdirectory repos), or raw paths
-                    if chunk_rel == req_norm
-                        || chunk_rel.ends_with(&format!("/{}", req_norm))
-                        || req_norm.ends_with(&format!("/{}", chunk_rel))
-                        || chunk.path == request.path
-                    {
-                        file_chunks.push(SearchResultItem {
-                            path: chunk.path,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            kind: chunk.kind,
-                            score: 1.0,
-                            signature: chunk.signature,
-                            content: if compact { None } else { Some(chunk.content) },
-                            context_prev: if compact { None } else { chunk.context_prev },
-                            context_next: if compact { None } else { chunk.context_next },
-                        });
-                    }
+                // Match: exact, ends_with (for subdirectory repos), or raw paths
+                if chunk_rel == req_norm
+                    || chunk_rel.ends_with(&format!("/{}", req_norm))
+                    || req_norm.ends_with(&format!("/{}", chunk_rel))
+                    || chunk.path == request.path
+                {
+                    file_chunks.push(SearchResultItem {
+                        path: chunk.path,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        kind: chunk.kind,
+                        score: 1.0,
+                        signature: chunk.signature,
+                        content: if compact { None } else { Some(chunk.content) },
+                        context_prev: if compact { None } else { chunk.context_prev },
+                        context_next: if compact { None } else { chunk.context_next },
+                    });
+                }
             }
             file_chunks
         } else {
@@ -370,8 +369,7 @@ impl CodesearchService {
             for (_id, chunk) in all {
                 // Normalize paths for comparison: strip UNC, normalize slashes
                 let chunk_norm = normalize_path_for_compare(&chunk.path);
-                let project_norm =
-                    normalize_path_for_compare(&self.project_path.to_string_lossy());
+                let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
                 let req_norm = normalize_path_for_compare(&request.path);
 
                 // Make chunk path relative by stripping project path prefix
