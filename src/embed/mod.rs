@@ -40,7 +40,7 @@ impl EmbeddingService {
         let cache_limit_mb = env::var("CODESEARCH_CACHE_MAX_MEMORY")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(500);
+            .unwrap_or(crate::constants::DEFAULT_CACHE_MAX_MEMORY_MB);
 
         let cached_embedder =
             CachedBatchEmbedder::with_memory_limit(batch_embedder, cache_limit_mb);
@@ -85,6 +85,7 @@ impl EmbeddingService {
     }
 
     /// Get cache statistics
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn cache_stats(&self) -> CacheStats {
         self.cached_embedder.cache_stats()
     }

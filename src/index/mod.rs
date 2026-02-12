@@ -4,11 +4,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::cache::FileMetaStore;
+use crate::cache::{normalize_path, FileMetaStore};
 use crate::chunker::SemanticChunker;
-use crate::constants::FASTEMBED_CACHE_DIR;
 use crate::db_discovery::{find_best_database, register_repository, unregister_repository};
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
@@ -41,9 +41,12 @@ fn get_db_path_smart(
     let project_path = path.as_deref().unwrap_or(Path::new("."));
 
     // Try to canonicalize, but fall back to original path if it fails
-    let canonical_path = project_path
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(project_path));
+    // Then normalize: strip UNC prefix (\\?\) and use forward slashes for consistency
+    let canonical_path = PathBuf::from(normalize_path(
+        &project_path
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(project_path)),
+    ));
 
     // Step 1: Check if there's an existing database (local or global)
     let existing_db = find_best_database(target)?;
@@ -61,6 +64,10 @@ fn get_db_path_smart(
                 .yellow()
             );
             std::fs::remove_dir_all(&db_info.db_path)?;
+            // Wait for Windows to fully release file handles (memory-mapped files
+            // from LMDB/tantivy may not be immediately released after deletion)
+            // Increased to 1000ms to handle slow file handle release on Windows
+            std::thread::sleep(std::time::Duration::from_millis(1000));
             println!("✅ Existing database deleted");
         }
         // After deletion, continue to create new database
@@ -266,13 +273,18 @@ pub async fn index(
     force: bool,
     global: bool,
     model: Option<ModelType>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
-    index_with_options(path, dry_run, force, global, model, false).await
+    index_with_options(path, dry_run, force, global, model, false, cancel_token).await
 }
 
 /// Index a repository with quiet mode option (for server/MCP use)
-pub async fn index_quiet(path: Option<PathBuf>, force: bool) -> Result<()> {
-    index_with_options(path, false, force, false, None, true).await
+pub async fn index_quiet(
+    path: Option<PathBuf>,
+    force: bool,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    index_with_options(path, false, force, false, None, true, cancel_token).await
 }
 
 /// Internal index function with all options
@@ -283,6 +295,7 @@ async fn index_with_options(
     global: bool,
     model: Option<ModelType>,
     quiet: bool,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     let (db_path, project_path) = get_db_path_smart(path, global, force)?;
     let model_type = model.unwrap_or_default();
@@ -448,26 +461,32 @@ async fn index_with_options(
             store.build_index()?;
 
             log_print!("✅ Deleted {} chunks", total_chunks_to_delete);
+
+            // Explicitly drop stores to release LMDB memory map before Phase 2
+            drop(store);
+            drop(fts_store);
         }
 
         // Only process changed files
         log_print!("\n🔄 Processing {} changed files...", changed_files.len());
         files = changed_files;
     } else {
-        // Clear existing database if forcing
-        if db_path.exists() && force {
-            log_print!("\n{}", "🗑️  Clearing existing database...".yellow());
-            std::fs::remove_dir_all(&db_path)?;
-        }
+        // Note: database deletion for --force is handled in get_db_path_smart()
+        // (including the delay for Windows file handle release). This else branch
+        // only runs when not in incremental mode, i.e., fresh index creation.
     }
 
-    // Phase 2: Semantic Chunking
-    log_print!("\n{}", "Phase 2: Semantic Chunking".bright_cyan());
+    // Phase 2: Semantic Chunking + Embedding + Storage (Streaming)
+    // We process files one at a time to keep memory usage low
+    log_print!(
+        "\n{}",
+        "Phase 2: Semantic Chunking, Embedding & Storage".bright_cyan()
+    );
     log_print!("{}", "-".repeat(60));
 
-    let start = Instant::now();
+    let chunking_start = Instant::now();
     let mut chunker = SemanticChunker::new(100, 2000, 10);
-    let mut all_chunks = Vec::new();
+    let mut total_chunks = 0;
 
     let pb = ProgressBar::new(files.len() as u64);
     pb.set_style(
@@ -477,8 +496,42 @@ async fn index_with_options(
             .progress_chars("█▓▒░ "),
     );
 
+    // Initialize embedding model (uses global models cache)
+    let cache_dir = crate::constants::get_global_models_cache_dir()?;
+    let mut embedding_service =
+        EmbeddingService::with_cache_dir(model_type, Some(cache_dir.as_path()))?;
+
+    // Check for shutdown after model loading (can take 5-10 seconds)
+    if crate::constants::check_shutdown(&cancel_token) {
+        log_print!(
+            "\n{}",
+            "⚠️  Indexing cancelled during model loading".yellow()
+        );
+        return Ok(());
+    }
+
+    // Initialize vector store
+    let mut store = VectorStore::new(&db_path, embedding_service.dimensions())?;
+
+    // Initialize FTS store
+    let mut fts_store = FtsStore::new_with_writer(&db_path)?;
+
+    // Track chunk IDs per file for metadata (memory efficient: only file paths, not chunk contents)
+    let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::new();
+
+    // Arena reset interval: periodically recreate the ONNX session to free
+    // arena allocator memory that grows monotonically. Model is on disk, so
     let mut skipped_files = 0;
+    let mut cancelled = false;
     for file in &files {
+        // Check for cancellation before processing each file
+        // Uses BOTH global AtomicBool (set by ctrlc OS handler) AND CancellationToken (for programmatic cancel)
+        if crate::constants::check_shutdown(&cancel_token) {
+            cancelled = true;
+            break;
+        }
+
         pb.set_message(format!(
             "{}",
             file.path.file_name().unwrap().to_string_lossy()
@@ -497,15 +550,146 @@ async fn index_with_options(
             }
         };
 
+        // Phase 2a: Chunk this file only (memory efficient!)
         let chunks = chunker.chunk_semantic(file.language, &file.path, &source_code)?;
+        let chunk_count = chunks.len();
         debug!(
             "   Created {} chunks for {}",
-            chunks.len(),
+            chunk_count,
             file.path.display()
         );
-        all_chunks.extend(chunks);
 
+        if chunks.is_empty() {
+            pb.inc(1);
+            continue;
+        }
+
+        // Phase 2b: Embed chunks for this file only (batched internally)
+        // If embedding is interrupted by CTRL-C, catch it as cancellation (not error)
+        let embedded_chunks = match embedding_service.embed_chunks(chunks) {
+            Ok(chunks) => chunks,
+            Err(_) if crate::constants::is_shutdown_requested() => {
+                cancelled = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Check cancellation after embedding (most CPU-intensive step)
+        if crate::constants::check_shutdown(&cancel_token) {
+            cancelled = true;
+            break;
+        }
+
+        // Phase 2c: Extract lightweight FTS data before handing ownership to vector store.
+        // We capture just the strings needed for FTS (content, path, signature, kind)
+        // so we can pass full EmbeddedChunks to the vector store without cloning.
+        let fts_data: Vec<(String, String, Option<String>, String)> = embedded_chunks
+            .iter()
+            .map(|ec| {
+                (
+                    ec.chunk.content.clone(),
+                    ec.chunk.path.clone(),
+                    ec.chunk.signature.clone(),
+                    format!("{:?}", ec.chunk.kind),
+                )
+            })
+            .collect();
+
+        // Phase 2d: Insert into vector store (takes ownership, no clone needed)
+        let chunk_ids = store.insert_chunks_with_ids(embedded_chunks)?;
+
+        // Phase 2e: Insert into FTS with real chunk IDs from vector store.
+        // FTS failures are non-fatal: vector search is the primary search method,
+        // FTS (BM25) is supplementary for hybrid search. If tantivy encounters
+        // I/O errors (common on Windows due to antivirus interference), we log
+        // a warning and continue rather than aborting the entire indexing run.
+        for ((content, path, signature, kind), &chunk_id) in fts_data.iter().zip(chunk_ids.iter()) {
+            if let Err(e) = fts_store.add_chunk(chunk_id, content, path, signature.as_deref(), kind)
+            {
+                tracing::warn!(
+                    "FTS add_chunk failed in {}: {} (continuing without FTS for this chunk)",
+                    file.path.display(),
+                    e
+                );
+            }
+        }
+
+        // Track chunk IDs per file for metadata (only paths and IDs, not chunk content)
+        let file_path = file.path.to_string_lossy().to_string();
+        file_chunks.insert(file_path, chunk_ids.clone());
+
+        total_chunks += chunk_count;
         pb.inc(1);
+
+        // Periodic FTS commit to flush the in-memory segment to disk in a controlled
+        // way. Non-fatal: if commit fails, we log and continue. Some FTS data may
+        // be lost but vector search (primary) is unaffected.
+        if total_chunks % 1000 == 0 && total_chunks > 0 {
+            if let Err(e) = fts_store.commit() {
+                tracing::warn!(
+                    "Periodic FTS commit failed at {} chunks: {} (continuing, some FTS data may be lost)",
+                    total_chunks,
+                    e
+                );
+            }
+        }
+
+        // Memory is freed here - chunks/embeddings dropped before next file
+    }
+
+    // Handle cancellation: exit quickly without blocking on build_index
+    if cancelled {
+        pb.finish_with_message("Cancelled!");
+        log_print!("\n{}", "⚠️  Indexing cancelled by user".yellow());
+
+        // Free ONNX model memory immediately
+        drop(embedding_service);
+        drop(chunker);
+
+        // Don't call build_index() — it blocks for 10-30 seconds on large datasets.
+        // The database is in a partially written state, user can re-run with --force.
+        // Commit FTS with retry to avoid index corruption on shutdown.
+        if total_chunks > 0 {
+            if let Err(e) = fts_store.commit() {
+                // Log the error - best-effort commit failed
+                log_print!(
+                    "{}   FTS commit warning: {} (index may need recovery)",
+                    "⚠️ ".yellow(),
+                    e
+                );
+                log_print!(
+                    "{}   Run {} to rebuild the index cleanly if needed",
+                    "💡 ".cyan(),
+                    "codesearch index -f".bright_cyan()
+                );
+            } else {
+                log_print!(
+                    "   Partial progress: {} chunks written (re-run with --force for clean index)",
+                    total_chunks
+                );
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Capture model info before dropping the ONNX model
+    let model_short_name = embedding_service.model_short_name().to_string();
+    let model_name = embedding_service.model_name().to_string();
+    let model_dimensions = embedding_service.dimensions();
+
+    // Free ONNX model + arena allocator memory before final index operations
+    // This releases hundreds of MB of inference buffers
+    drop(embedding_service);
+    drop(chunker);
+
+    // Commit FTS store (non-fatal: vector search works without FTS)
+    if let Err(e) = fts_store.commit() {
+        tracing::warn!(
+            "Final FTS commit failed: {} (vector search will work, but hybrid/BM25 search may have gaps)",
+            e
+        );
     }
 
     if skipped_files > 0 {
@@ -513,138 +697,49 @@ async fn index_with_options(
     }
 
     pb.finish_with_message("Done!");
-    let chunking_duration = start.elapsed();
+    let chunking_duration = chunking_start.elapsed();
 
     log_print!(
-        "✅ Created {} chunks in {:?}",
-        all_chunks.len(),
+        "✅ Created and indexed {} chunks in {:?}",
+        total_chunks,
         chunking_duration
     );
 
-    if all_chunks.is_empty() {
+    if total_chunks == 0 {
         log_print!("\n{}", "No chunks created!".yellow());
         return Ok(());
     }
 
-    // Phase 3: Embedding Generation
-    log_print!("\n{}", "Phase 3: Embedding Generation".bright_cyan());
-    log_print!("{}", "-".repeat(60));
+    // Capture FTS stats before dropping the store to free memory
+    let _fts_stats = fts_store.stats()?;
 
-    let start = Instant::now();
-    log_print!("🔄 Initializing embedding model...");
+    // Drop FTS store before build_index() to free tantivy memory.
+    // FTS is already committed above — keeping the store open during
+    // build_index() wastes memory on tantivy's segment readers and buffers.
+    drop(fts_store);
 
-    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
-    let mut embedding_service =
-        EmbeddingService::with_cache_dir(model_type, Some(cache_dir.as_path()))?;
-    log_print!(
-        "✅ Model loaded: {} ({} dims)",
-        embedding_service.model_name(),
-        embedding_service.dimensions()
-    );
-
-    log_print!(
-        "\n🔄 Generating embeddings for {} chunks...",
-        all_chunks.len()
-    );
-    let embedded_chunks = embedding_service.embed_chunks(all_chunks)?;
-    let embedding_duration = start.elapsed();
-
-    log_print!(
-        "✅ Generated {} embeddings in {:?}",
-        embedded_chunks.len(),
-        embedding_duration
-    );
-    log_print!(
-        "   Average: {:?} per chunk",
-        embedding_duration / embedded_chunks.len() as u32
-    );
-
-    // Show cache stats
-    let cache_stats = embedding_service.cache_stats();
-    log_print!("   Cache hit rate: {:.1}%", cache_stats.hit_rate() * 100.0);
-
-    // Phase 4: Vector Storage
-    log_print!("\n{}", "Phase 4: Vector Storage".bright_cyan());
-    log_print!("{}", "-".repeat(60));
-
-    let start = Instant::now();
-    log_print!("🔄 Creating vector database...");
-
-    let mut store = VectorStore::new(&db_path, embedding_service.dimensions())?;
-    log_print!("✅ Database created");
-
-    log_print!("\n🔄 Inserting {} chunks...", embedded_chunks.len());
-    let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
-    log_print!("✅ Inserted {} chunks into vector store", chunk_ids.len());
-
-    log_print!("\n🔄 Building vector index...");
+    // Build vector index (now that all chunks are inserted)
+    let storage_start = Instant::now();
     store.build_index()?;
-
-    // Phase 4b: FTS Index
-    log_print!("\n🔄 Building full-text search index...");
-
-    // Clear FTS directory if doing a full rebuild (not incremental)
-    if !is_incremental {
-        let fts_path = db_path.join("fts");
-        if fts_path.exists() {
-            debug!("🗑️  Clearing existing FTS index for full rebuild...");
-            if let Err(e) = std::fs::remove_dir_all(&fts_path) {
-                // On Windows, files might be locked - try to continue anyway
-                debug!("⚠️  Could not fully clear FTS directory: {}", e);
-            }
-        }
-    }
-
-    let mut fts_store = FtsStore::new_with_writer(&db_path)?;
-
-    for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-        fts_store.add_chunk(
-            *chunk_id,
-            &chunk.chunk.content,
-            &chunk.chunk.path,
-            chunk.chunk.signature.as_deref(),
-            &format!("{:?}", chunk.chunk.kind),
-        )?;
-    }
-    fts_store.commit()?;
-
-    let fts_stats = fts_store.stats()?;
-    log_print!("✅ FTS index built ({} documents)", fts_stats.num_documents);
-
-    let storage_duration = start.elapsed();
-
-    log_print!("✅ Index built in {:?}", storage_duration);
+    let _storage_duration = storage_start.elapsed();
 
     // Save model metadata
     let metadata = serde_json::json!({
-        "model_short_name": embedding_service.model_short_name(),
-        "model_name": embedding_service.model_name(),
-        "dimensions": embedding_service.dimensions(),
+        "model_short_name": model_short_name,
+        "model_name": model_name,
+        "dimensions": model_dimensions,
         "indexed_at": chrono::Utc::now().to_rfc3339(),
     });
     std::fs::write(
         db_path.join("metadata.json"),
         serde_json::to_string_pretty(&metadata)?,
     )?;
-    log_print!("✅ Metadata saved");
 
     // Update FileMetaStore with new chunk IDs (incremental mode)
     if is_incremental {
-        log_print!("\n🔄 Updating file metadata...");
         // IMPORTANT: Reuse the existing file_meta_store that already contains unchanged files!
         // Don't create a new one - that would lose all unchanged file metadata
         let mut file_meta_store = file_meta_store.take().unwrap();
-
-        // Group chunks by file
-        let capacity = embedded_chunks.len() / 10; // Estimate: ~10 chunks per file
-        let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
-            std::collections::HashMap::with_capacity(capacity.max(1));
-        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-            file_chunks
-                .entry(chunk.chunk.path.clone())
-                .or_default()
-                .push(*chunk_id);
-        }
 
         // Save FileMetaStore count before moving
         let file_count = file_chunks.len();
@@ -665,17 +760,6 @@ async fn index_with_options(
         // In full index mode, create a fresh FileMetaStore
         let mut file_meta_store =
             FileMetaStore::new(model_type.name().to_string(), model_type.dimensions());
-
-        // Group chunks by file
-        let capacity = embedded_chunks.len() / 10; // Estimate: ~10 chunks per file
-        let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
-            std::collections::HashMap::with_capacity(capacity.max(1));
-        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-            file_chunks
-                .entry(chunk.chunk.path.clone())
-                .or_default()
-                .push(*chunk_id);
-        }
 
         // Update FileMetaStore
         for (file_path, chunk_ids) in file_chunks {
@@ -700,7 +784,6 @@ async fn index_with_options(
             "❌ No"
         }
     );
-    log_print!("   Dimensions: {}", db_stats.dimensions);
 
     // Calculate database size
     let mut total_size = 0u64;
@@ -713,21 +796,7 @@ async fn index_with_options(
         total_size as f64 / (1024.0 * 1024.0)
     );
 
-    // Total time
-    let total_duration =
-        discovery_duration + chunking_duration + embedding_duration + storage_duration;
-    log_print!("\n{}", "⏱️  Timing Breakdown".bright_green());
-    log_print!("{}", "-".repeat(60));
-    log_print!("   File discovery:      {:?}", discovery_duration);
-    log_print!("   Semantic chunking:   {:?}", chunking_duration);
-    log_print!("   Embedding generation:{:?}", embedding_duration);
-    log_print!("   Vector storage:      {:?}", storage_duration);
-    log_print!(
-        "   {}",
-        format!("Total:               {:?}", total_duration).bold()
-    );
-
-    log_print!("\n{}", "✨ Indexing complete!".bright_green().bold());
+    log_print!("\n{}", "✨ Indexing complete".bright_green().bold());
     log_print!(
         "   Run {} to search your codebase",
         "codesearch search <query>".bright_cyan()
@@ -871,7 +940,11 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
 }
 
 /// Add a repository to the index (creates local or global)
-pub async fn add_to_index(path: Option<PathBuf>, global: bool) -> Result<()> {
+pub async fn add_to_index(
+    path: Option<PathBuf>,
+    global: bool,
+    cancel_token: CancellationToken,
+) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
     let canonical_path = project_path.canonicalize()?;
 
@@ -961,11 +1034,27 @@ pub async fn add_to_index(path: Option<PathBuf>, global: bool) -> Result<()> {
     // Create the index
     if global {
         println!("\n{}", "Creating global index...".cyan());
-        index(Some(canonical_path.clone()), false, false, true, None).await?;
+        index(
+            Some(canonical_path.clone()),
+            false,
+            false,
+            true,
+            None,
+            cancel_token.clone(),
+        )
+        .await?;
         println!("\n{}", "✅ Global index created!".green());
     } else {
         println!("\n{}", "Creating local index...".cyan());
-        index(Some(canonical_path.clone()), false, false, false, None).await?;
+        index(
+            Some(canonical_path.clone()),
+            false,
+            false,
+            false,
+            None,
+            cancel_token,
+        )
+        .await?;
         println!("\n{}", "✅ Local index created!".green());
     }
 

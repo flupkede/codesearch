@@ -18,9 +18,10 @@ pub fn is_quiet() -> bool {
 }
 
 /// Print a message only if not in quiet mode (non-macro version for better compatibility)
+/// Uses stderr to avoid corrupting stdout-based protocols (MCP, JSON output)
 pub fn print_info(args: std::fmt::Arguments<'_>) {
     if !is_quiet() {
-        println!("{}", args);
+        eprintln!("{}", args);
     }
 }
 

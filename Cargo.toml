@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "0.1.48"
+version = "0.1.139"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -22,6 +22,8 @@ path = "src/main.rs"
 # CLI & I/O
 clap = { version = "4.5", features = ["derive", "cargo"] }
 tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+ctrlc = "3.4"
 anyhow = "1.0"
 thiserror = "1.0"
 
@@ -70,7 +72,8 @@ dashmap = "6.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 sha2 = "0.10"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

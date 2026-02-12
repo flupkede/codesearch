@@ -14,9 +14,16 @@ use rmcp::{
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
-use crate::constants::FASTEMBED_CACHE_DIR;
 use crate::db_discovery::{find_best_database, find_databases};
+
+/// Normalize a path for comparison: strip UNC prefix, ./ prefix, convert backslashes to forward slashes
+fn normalize_path_for_compare(path: &str) -> String {
+    path.trim_start_matches("./")
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+}
 use crate::embed::{EmbeddingService, ModelType};
 use crate::fts::FtsStore;
 use crate::index::{IndexManager, SharedStores};
@@ -91,7 +98,7 @@ impl CodesearchService {
                 .get("dimensions")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(384) as usize;
-            let mt = ModelType::from_str(model_name).unwrap_or_default();
+            let mt = ModelType::parse(model_name).unwrap_or_default();
             (mt, dims)
         } else {
             (ModelType::default(), 384)
@@ -112,7 +119,7 @@ impl CodesearchService {
     fn get_embedding_service(&self) -> Result<std::sync::MutexGuard<'_, Option<EmbeddingService>>> {
         let mut guard = self.embedding_service.lock().unwrap();
         if guard.is_none() {
-            let cache_dir = self.db_path.join(FASTEMBED_CACHE_DIR);
+            let cache_dir = crate::constants::get_global_models_cache_dir()?;
             *guard = Some(EmbeddingService::with_cache_dir(
                 self.model_type,
                 Some(&cache_dir),
@@ -287,37 +294,51 @@ impl CodesearchService {
         // Get chunks using shared stores if available
         let file_chunks = if let Some(ref stores) = self.shared_stores {
             let store = stores.vector_store.read().await;
-            let stats = match store.stats() {
-                Ok(s) => s,
+
+            // Collect chunks for the requested file using LMDB iteration
+            // (avoids missing chunks with high IDs after delete+insert cycles)
+            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
+            let all = match store.all_chunks() {
+                Ok(c) => c,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error getting stats: {}",
+                        "Error reading chunks: {}",
                         e
                     ))]));
                 }
             };
+            for (_id, chunk) in all {
+                // Normalize paths for comparison: strip UNC, normalize slashes
+                let chunk_norm = normalize_path_for_compare(&chunk.path);
+                let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
+                let req_norm = normalize_path_for_compare(&request.path);
 
-            // Collect chunks for the requested file
-            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
-            for id in 0..stats.total_chunks as u32 {
-                if let Ok(Some(chunk)) = store.get_chunk(id) {
-                    // Normalize paths for comparison
-                    let chunk_path = chunk.path.trim_start_matches("./");
-                    let req_path = request.path.trim_start_matches("./");
+                // Make chunk path relative by stripping project path prefix
+                let chunk_rel = if chunk_norm.starts_with(&project_norm) {
+                    chunk_norm[project_norm.len()..]
+                        .trim_start_matches('/')
+                        .to_string()
+                } else {
+                    chunk_norm.clone()
+                };
 
-                    if chunk_path == req_path || chunk.path == request.path {
-                        file_chunks.push(SearchResultItem {
-                            path: chunk.path,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            kind: chunk.kind,
-                            score: 1.0,
-                            signature: chunk.signature,
-                            content: if compact { None } else { Some(chunk.content) },
-                            context_prev: if compact { None } else { chunk.context_prev },
-                            context_next: if compact { None } else { chunk.context_next },
-                        });
-                    }
+                // Match: exact, ends_with (for subdirectory repos), or raw paths
+                if chunk_rel == req_norm
+                    || chunk_rel.ends_with(&format!("/{}", req_norm))
+                    || req_norm.ends_with(&format!("/{}", chunk_rel))
+                    || chunk.path == request.path
+                {
+                    file_chunks.push(SearchResultItem {
+                        path: chunk.path,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        kind: chunk.kind,
+                        score: 1.0,
+                        signature: chunk.signature,
+                        content: if compact { None } else { Some(chunk.content) },
+                        context_prev: if compact { None } else { chunk.context_prev },
+                        context_next: if compact { None } else { chunk.context_next },
+                    });
                 }
             }
             file_chunks
@@ -333,37 +354,50 @@ impl CodesearchService {
                 }
             };
 
-            let stats = match store.stats() {
-                Ok(s) => s,
+            // Collect chunks for the requested file using LMDB iteration
+            // (avoids missing chunks with high IDs after delete+insert cycles)
+            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
+            let all = match store.all_chunks() {
+                Ok(c) => c,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error getting stats: {}",
+                        "Error reading chunks: {}",
                         e
                     ))]));
                 }
             };
+            for (_id, chunk) in all {
+                // Normalize paths for comparison: strip UNC, normalize slashes
+                let chunk_norm = normalize_path_for_compare(&chunk.path);
+                let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
+                let req_norm = normalize_path_for_compare(&request.path);
 
-            // Collect chunks for the requested file
-            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
-            for id in 0..stats.total_chunks as u32 {
-                if let Ok(Some(chunk)) = store.get_chunk(id) {
-                    // Normalize paths for comparison
-                    let chunk_path = chunk.path.trim_start_matches("./");
-                    let req_path = request.path.trim_start_matches("./");
+                // Make chunk path relative by stripping project path prefix
+                let chunk_rel = if chunk_norm.starts_with(&project_norm) {
+                    chunk_norm[project_norm.len()..]
+                        .trim_start_matches('/')
+                        .to_string()
+                } else {
+                    chunk_norm.clone()
+                };
 
-                    if chunk_path == req_path || chunk.path == request.path {
-                        file_chunks.push(SearchResultItem {
-                            path: chunk.path,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            kind: chunk.kind,
-                            score: 1.0,
-                            signature: chunk.signature,
-                            content: if compact { None } else { Some(chunk.content) },
-                            context_prev: if compact { None } else { chunk.context_prev },
-                            context_next: if compact { None } else { chunk.context_next },
-                        });
-                    }
+                // Match: exact, ends_with (for subdirectory repos), or raw paths
+                if chunk_rel == req_norm
+                    || chunk_rel.ends_with(&format!("/{}", req_norm))
+                    || req_norm.ends_with(&format!("/{}", chunk_rel))
+                    || chunk.path == request.path
+                {
+                    file_chunks.push(SearchResultItem {
+                        path: chunk.path,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        kind: chunk.kind,
+                        score: 1.0,
+                        signature: chunk.signature,
+                        content: if compact { None } else { Some(chunk.content) },
+                        context_prev: if compact { None } else { chunk.context_prev },
+                        context_next: if compact { None } else { chunk.context_next },
+                    });
                 }
             }
             file_chunks
@@ -500,6 +534,7 @@ impl CodesearchService {
                 total_files: 0,
                 model: "none".to_string(),
                 dimensions: 0,
+                max_chunk_id: 0,
                 db_path: self.db_path.display().to_string(),
                 project_path: self.project_path.display().to_string(),
                 error_message: Some(
@@ -522,6 +557,7 @@ impl CodesearchService {
                         total_files: 0,
                         model: self.model_type.short_name().to_string(),
                         dimensions: 0,
+                        max_chunk_id: 0,
                         db_path: self.db_path.display().to_string(),
                         project_path: self.project_path.display().to_string(),
                         error_message: Some(format!("Error getting stats: {}", e)),
@@ -542,9 +578,10 @@ impl CodesearchService {
                         total_files: 0,
                         model: self.model_type.short_name().to_string(),
                         dimensions: 0,
+                        max_chunk_id: 0,
                         db_path: self.db_path.display().to_string(),
                         project_path: self.project_path.display().to_string(),
-                        error_message: Some(format!("Error opening database: {}", e)),
+                        error_message: Some(format!("Error getting stats: {}", e)),
                     };
                     let json =
                         serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -561,6 +598,7 @@ impl CodesearchService {
                         total_files: 0,
                         model: self.model_type.short_name().to_string(),
                         dimensions: 0,
+                        max_chunk_id: 0,
                         db_path: self.db_path.display().to_string(),
                         project_path: self.project_path.display().to_string(),
                         error_message: Some(format!("Error getting stats: {}", e)),
@@ -578,6 +616,7 @@ impl CodesearchService {
             total_files: stats.total_files,
             model: self.model_type.short_name().to_string(),
             dimensions: stats.dimensions,
+            max_chunk_id: stats.max_chunk_id,
             db_path: self.db_path.display().to_string(),
             project_path: self.project_path.display().to_string(),
             error_message: None,
@@ -866,7 +905,7 @@ Dimensions: {dims}
 /// - No incremental refresh
 ///
 /// This allows multiple terminal windows to use codesearch simultaneously.
-pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
+pub async fn run_mcp_server(path: Option<PathBuf>, cancel_token: CancellationToken) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
 
     tracing::info!("🚀 Starting codesearch MCP server");
@@ -942,7 +981,14 @@ pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
         let db_path_clone = db_path.clone();
         let shared_stores_clone = shared_stores.clone();
         let index_manager_arc = Arc::new(index_manager);
+        let bg_cancel_token = cancel_token.clone();
         tokio::spawn(async move {
+            // Step 0: Pre-start FSW to collect file change events during refresh
+            // This ensures changes made while the refresh is running are not missed
+            if let Err(e) = index_manager_arc.start_watching().await {
+                tracing::warn!("⚠️ Could not pre-start file watcher: {}", e);
+            }
+
             // Step 1: Run initial refresh (writes to stores)
             tracing::info!("🔄 Starting background incremental refresh...");
             match IndexManager::perform_incremental_refresh_with_stores(
@@ -955,9 +1001,15 @@ pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
                 Ok(_) => {
                     tracing::info!("✅ Background incremental refresh completed");
 
+                    // Check if shutdown was requested during refresh
+                    if bg_cancel_token.is_cancelled() {
+                        tracing::info!("🛑 Shutdown requested, skipping file watcher startup");
+                        return;
+                    }
+
                     // Step 2: AFTER refresh completes, start file watcher (also writes to stores)
                     tracing::info!("👀 Starting file watcher...");
-                    if let Err(e) = index_manager_arc.start_file_watcher().await {
+                    if let Err(e) = index_manager_arc.start_file_watcher(bg_cancel_token).await {
                         tracing::error!("❌ Failed to start file watcher: {}", e);
                     } else {
                         tracing::info!(
@@ -970,12 +1022,42 @@ pub async fn run_mcp_server(path: Option<PathBuf>) -> Result<()> {
                 }
             }
         });
+
+        // Start periodic log cleanup task
+        let db_path_for_cleanup = db_path.clone();
+        let cleanup_cancel_token = cancel_token.clone();
+        tokio::spawn(async move {
+            use crate::logger::{cleanup_old_logs, LogRotationConfig};
+
+            // Run initial cleanup on startup
+            let rotation_config = LogRotationConfig::from_env();
+            tracing::info!("🧹 Running initial log cleanup...");
+            if let Err(e) = cleanup_old_logs(&db_path_for_cleanup, &rotation_config) {
+                tracing::warn!("Initial log cleanup failed: {}", e);
+            }
+
+            // Start periodic cleanup task (every 24 hours by default)
+            crate::logger::start_cleanup_task(
+                db_path_for_cleanup.clone(),
+                rotation_config,
+                cleanup_cancel_token,
+            );
+        });
     } else {
         tracing::info!("📖 Readonly mode: skipping background refresh and file watcher");
     }
 
-    // Wait for shutdown
-    server.waiting().await?;
+    // Wait for shutdown: either MCP transport closes or cancellation token fires
+    tokio::select! {
+        result = server.waiting() => {
+            tracing::info!("MCP server transport closed");
+            result?;
+        }
+        _ = cancel_token.cancelled() => {
+            tracing::info!("🛑 Shutdown signal received, stopping MCP server...");
+        }
+    }
 
+    tracing::info!("✅ MCP server shut down cleanly");
     Ok(())
 }

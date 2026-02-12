@@ -15,6 +15,7 @@
 //!
 #![allow(dead_code)]
 
+use crate::cache::{normalize_path, normalize_path_str};
 use crate::constants::{DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, WRITER_LOCK_FILE};
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
@@ -25,6 +26,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 // Import Result from the parent module
@@ -485,7 +487,7 @@ impl IndexManager {
             if !all_chunks.is_empty() {
                 // Embed chunks
                 info!("📦 Embedding {} chunks...", all_chunks.len());
-                let cache_dir = db_path.join(crate::constants::FASTEMBED_CACHE_DIR);
+                let cache_dir = crate::constants::get_global_models_cache_dir()?;
                 let mut embedding_service = EmbeddingService::with_cache_dir(
                     ModelType::default(),
                     Some(cache_dir.as_path()),
@@ -519,18 +521,18 @@ impl IndexManager {
                 }
 
                 // Update file metadata
-                // Group chunks by file path
+                // Group chunks by file path (normalize for consistent lookup)
                 let mut chunks_by_file: std::collections::HashMap<String, Vec<u32>> =
                     std::collections::HashMap::new();
                 for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
                     chunks_by_file
-                        .entry(chunk.chunk.path.to_string())
+                        .entry(normalize_path_str(&chunk.chunk.path))
                         .or_default()
                         .push(*chunk_id);
                 }
 
                 for file in &changed_files {
-                    let path_str = file.path.to_string_lossy().to_string();
+                    let path_str = normalize_path(&file.path);
                     if let Some(ids) = chunks_by_file.get(&path_str) {
                         file_meta_store.update_file(&file.path, ids.clone())?;
                     }
@@ -552,10 +554,27 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Start the file system watcher (begin collecting events) without starting the processing loop.
+    ///
+    /// Call this BEFORE a long-running operation (like incremental refresh) to capture
+    /// file changes that happen during that operation. Then call `start_file_watcher()`
+    /// afterwards to begin processing the buffered events.
+    pub async fn start_watching(&self) -> Result<()> {
+        let mut w = self.watcher.lock().await;
+        if !w.is_started() {
+            w.start(DEFAULT_FSW_DEBOUNCE_MS)?;
+            info!("👀 File watcher pre-started (collecting events)");
+        }
+        Ok(())
+    }
+
     /// Start the background file watcher.
     ///
     /// This is the **second method call** - should be called after `new()`.
     /// Spawns a background task that watches for file changes and refreshes the index.
+    ///
+    /// # Arguments
+    /// * `cancel_token` - Cancellation token for graceful shutdown
     ///
     /// # Returns
     /// * `Result<()>` - Success or error
@@ -567,7 +586,8 @@ impl IndexManager {
     /// - Flushes batch when no new events for FSW_BATCH_FLUSH_MS
     /// - Logs all file system events and refresh operations
     /// - Continues running even if individual refresh operations fail
-    pub async fn start_file_watcher(&self) -> Result<()> {
+    /// - Stops gracefully when the cancellation token is cancelled
+    pub async fn start_file_watcher(&self, cancel_token: CancellationToken) -> Result<()> {
         let path = self.codebase_path.clone();
         let db_path = self.db_path.clone();
         let watcher = self.watcher.clone();
@@ -579,12 +599,16 @@ impl IndexManager {
         tokio::spawn(async move {
             info!("👀 File watcher task started for: {}", path.display());
 
-            // Start the watcher inside the task
+            // Start the watcher inside the task (if not already started by start_watching)
             {
                 let mut w = watcher.lock().await;
-                if let Err(e) = w.start(DEFAULT_FSW_DEBOUNCE_MS) {
-                    error!("❌ Failed to start file watcher: {}", e);
-                    return;
+                if !w.is_started() {
+                    if let Err(e) = w.start(DEFAULT_FSW_DEBOUNCE_MS) {
+                        error!("❌ Failed to start file watcher: {}", e);
+                        return;
+                    }
+                } else {
+                    debug!("👀 File watcher already started (pre-started), skipping init");
                 }
             }
 
@@ -595,6 +619,12 @@ impl IndexManager {
             let flush_duration = std::time::Duration::from_millis(FSW_BATCH_FLUSH_MS);
 
             loop {
+                // Check if shutdown was requested
+                if cancel_token.is_cancelled() {
+                    info!("🛑 File watcher received shutdown signal, stopping...");
+                    break;
+                }
+
                 // Poll for new events
                 let events = watcher.lock().await.poll_events();
                 let now = std::time::Instant::now();
@@ -669,9 +699,17 @@ impl IndexManager {
                     last_event_time = now;
                 }
 
-                // Sleep to avoid busy-waiting
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                // Sleep to avoid busy-waiting, but wake up immediately on shutdown
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {}
+                    _ = cancel_token.cancelled() => {
+                        info!("🛑 File watcher received shutdown signal during sleep, stopping...");
+                        break;
+                    }
+                }
             }
+
+            info!("✅ File watcher stopped cleanly");
         });
 
         info!("✅ File watcher background task spawned");
@@ -704,6 +742,79 @@ impl IndexManager {
             {
                 warn!("⚠️  Failed to remove {}: {}", file_path.display(), e);
             }
+
+            // Also handle directory deletion: on Windows, rm -rf of a directory may only
+            // produce a Remove event for the directory itself, not for individual files.
+            // Find all tracked files under this path prefix and remove them too.
+            {
+                use crate::cache::FileMetaStore;
+
+                // Load FileMetaStore from disk to query tracked files
+                let metadata_path = db_path.join("metadata.json");
+                if metadata_path.exists() {
+                    if let Ok(metadata_str) = std::fs::read_to_string(&metadata_path) {
+                        if let Ok(metadata) =
+                            serde_json::from_str::<serde_json::Value>(&metadata_str)
+                        {
+                            let dimensions =
+                                metadata["dimensions"].as_u64().unwrap_or(384) as usize;
+                            let model_name = metadata["model"].as_str().unwrap_or("minilm-l6-q");
+
+                            if let Ok(file_meta_store) =
+                                FileMetaStore::load_or_create(db_path, model_name, dimensions)
+                            {
+                                // Normalize the directory prefix for consistent matching
+                                // (tracked files are normalized to forward slashes)
+                                let dir_prefix = normalize_path(file_path);
+                                let dir_prefix_slash = if dir_prefix.ends_with('/') {
+                                    dir_prefix.clone()
+                                } else {
+                                    format!("{}/", dir_prefix)
+                                };
+
+                                let files_under_dir: Vec<String> = file_meta_store
+                                    .tracked_files()
+                                    .filter(|f| f.starts_with(&dir_prefix_slash))
+                                    .cloned()
+                                    .collect();
+
+                                if !files_under_dir.is_empty() {
+                                    info!(
+                                        "🗑️  Directory deleted: {} ({} files under it)",
+                                        file_path.display(),
+                                        files_under_dir.len()
+                                    );
+                                    for tracked_file in &files_under_dir {
+                                        let tracked_path = PathBuf::from(tracked_file);
+                                        if let Err(e) = Self::remove_file_from_index_with_stores(
+                                            codebase_path,
+                                            db_path,
+                                            stores,
+                                            &tracked_path,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                "⚠️  Failed to remove {}: {}",
+                                                tracked_path.display(),
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rebuild vector index after removals so deleted chunks are excluded from search results.
+        // index_single_file_with_stores already calls build_index() per file, but when a batch
+        // contains ONLY removals (no additions), the index would never be rebuilt without this.
+        if !files_to_remove.is_empty() {
+            let mut store = stores.vector_store.write().await;
+            store.build_index()?;
         }
 
         // Then, index modified/new files
@@ -757,7 +868,15 @@ impl IndexManager {
 
         // Call the index function from the parent module
         // Parameters: path, dry_run, force, global, model
-        super::index(Some(path.to_path_buf()), false, false, false, None).await?;
+        super::index(
+            Some(path.to_path_buf()),
+            false,
+            false,
+            false,
+            None,
+            CancellationToken::new(),
+        )
+        .await?;
 
         let elapsed = start.elapsed();
         info!(
@@ -775,7 +894,7 @@ impl IndexManager {
 
         // Call the quiet index function from the parent module (no CLI output)
         // For incremental refresh, we use force=false which enables incremental mode
-        super::index_quiet(Some(path.to_path_buf()), false).await?;
+        super::index_quiet(Some(path.to_path_buf()), false, CancellationToken::new()).await?;
 
         let elapsed = start.elapsed();
         info!(
@@ -838,7 +957,7 @@ impl IndexManager {
         );
 
         // Generate embeddings
-        let cache_dir = db_path.join(crate::constants::FASTEMBED_CACHE_DIR);
+        let cache_dir = crate::constants::get_global_models_cache_dir()?;
         let mut embedding_service =
             EmbeddingService::with_cache_dir(ModelType::default(), Some(cache_dir.as_path()))?;
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
@@ -905,13 +1024,21 @@ impl IndexManager {
         // Load file metadata to get chunk IDs
         let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
 
-        // Check if file has chunks
-        let (_, chunk_ids) = file_meta_store.check_file(file_path)?;
-
-        if chunk_ids.is_empty() {
-            debug!("No chunks found for file: {}", file_path.display());
-            return Ok(());
-        }
+        // Get chunk IDs from file metadata directly (not check_file which reads from disk)
+        // The file is already deleted, so we can't read mtime/size/hash
+        let meta = file_meta_store.remove_file(file_path);
+        let chunk_ids = match meta {
+            Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
+            Some(_) => {
+                debug!("No chunks to remove for file: {}", file_path.display());
+                file_meta_store.save(&db_path)?;
+                return Ok(());
+            }
+            None => {
+                debug!("No metadata found for file: {}", file_path.display());
+                return Ok(());
+            }
+        };
 
         debug!(
             "Removing {} chunks for file: {}",
@@ -928,10 +1055,12 @@ impl IndexManager {
             store.delete_chunks(&[*chunk_id])?;
             fts_store.delete_chunk(*chunk_id)?;
         }
+
+        // Rebuild vector index so deleted chunks are excluded from search results
+        store.build_index()?;
         fts_store.commit()?;
 
-        // Remove from file metadata
-        file_meta_store.remove_file(file_path);
+        // Save file metadata (remove_file was already called above)
         file_meta_store.save(&db_path)?;
 
         info!(
@@ -996,7 +1125,7 @@ impl IndexManager {
         );
 
         // Generate embeddings
-        let cache_dir = db_path.join(crate::constants::FASTEMBED_CACHE_DIR);
+        let cache_dir = crate::constants::get_global_models_cache_dir()?;
         let mut embedding_service =
             EmbeddingService::with_cache_dir(ModelType::default(), Some(cache_dir.as_path()))?;
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
@@ -1073,13 +1202,21 @@ impl IndexManager {
         // Load file metadata to get chunk IDs
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
 
-        // Check if file has chunks
-        let (_, chunk_ids) = file_meta_store.check_file(file_path)?;
-
-        if chunk_ids.is_empty() {
-            debug!("No chunks found for file: {}", file_path.display());
-            return Ok(());
-        }
+        // Get chunk IDs from file metadata directly (not check_file which reads from disk)
+        // The file is already deleted, so we can't read mtime/size/hash
+        let meta = file_meta_store.remove_file(file_path);
+        let chunk_ids = match meta {
+            Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
+            Some(_) => {
+                debug!("No chunks to remove for file: {}", file_path.display());
+                file_meta_store.save(db_path)?;
+                return Ok(());
+            }
+            None => {
+                debug!("No metadata found for file: {}", file_path.display());
+                return Ok(());
+            }
+        };
 
         debug!(
             "Removing {} chunks for file: {}",
@@ -1104,8 +1241,7 @@ impl IndexManager {
             fts_store.commit()?;
         }
 
-        // Remove from file metadata
-        file_meta_store.remove_file(file_path);
+        // Save file metadata (remove_file was already called above)
         file_meta_store.save(db_path)?;
 
         info!(
