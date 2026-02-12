@@ -15,6 +15,9 @@ pub use neural::NeuralReranker;
 /// Default RRF k parameter (per osgrep reference)
 pub const DEFAULT_RRF_K: f32 = 20.0;
 
+/// RRF k parameter for exact matches (lower = stronger boost)
+pub const EXACT_MATCH_RRF_K: f32 = 5.0;
+
 /// Fused search result combining vector and FTS scores
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields used for debugging/diagnostics
@@ -115,6 +118,126 @@ pub fn vector_only(vector_results: &[SearchResult]) -> Vec<FusedResult> {
             fts_rank: None,
         })
         .collect()
+}
+
+/// Reciprocal Rank Fusion with exact match boosting
+///
+/// Three-way RRF fusion: vector, FTS, and exact matches.
+/// Exact matches get a lower k value (stronger boost) because they're more likely
+/// to be what the user wants when searching for specific identifiers.
+///
+/// # Arguments
+/// * `vector_results` - Vector similarity results
+/// * `fts_results` - BM25 full-text search results
+/// * `exact_results` - Exact identifier match results (from signature field)
+/// * `vector_k` - RRF k for vector (default 20)
+/// * `fts_k` - RRF k for FTS (default 20)
+/// * `exact_k` - RRF k for exact matches (default 5, stronger boost)
+pub fn rrf_fusion_with_exact(
+    vector_results: &[SearchResult],
+    fts_results: &[FtsResult],
+    exact_results: &[FtsResult],
+    vector_k: f32,
+    fts_k: f32,
+    exact_k: f32,
+) -> Vec<FusedResult> {
+    // Maps chunk_id -> (rrf_score, vector_score, fts_score, exact_score, vector_rank, fts_rank, exact_rank)
+    let mut scores: HashMap<
+        u32,
+        (
+            f32,
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
+            Option<usize>,
+            Option<usize>,
+            Option<usize>,
+        ),
+    > = HashMap::new();
+
+    // Process vector results
+    for (rank, result) in vector_results.iter().enumerate() {
+        let chunk_id = result.id;
+        let rrf_score = 1.0 / (vector_k + rank as f32 + 1.0);
+
+        let entry = scores
+            .entry(chunk_id)
+            .or_insert((0.0, None, None, None, None, None, None));
+        entry.0 += rrf_score;
+        entry.1 = Some(result.score);
+        entry.4 = Some(rank + 1);
+    }
+
+    // Process FTS results
+    for (rank, result) in fts_results.iter().enumerate() {
+        let chunk_id = result.chunk_id;
+        let rrf_score = 1.0 / (fts_k + rank as f32 + 1.0);
+
+        let entry = scores
+            .entry(chunk_id)
+            .or_insert((0.0, None, None, None, None, None, None));
+        entry.0 += rrf_score;
+        entry.2 = Some(result.score);
+        entry.5 = Some(rank + 1);
+    }
+
+    // Process exact results (stronger boost with lower k)
+    for (rank, result) in exact_results.iter().enumerate() {
+        let chunk_id = result.chunk_id;
+        let rrf_score = 1.0 / (exact_k + rank as f32 + 1.0);
+
+        let entry = scores
+            .entry(chunk_id)
+            .or_insert((0.0, None, None, None, None, None, None));
+        entry.0 += rrf_score;
+        entry.3 = Some(result.score);
+        entry.6 = Some(rank + 1);
+    }
+
+    // Convert to FusedResult and sort by RRF score
+    let mut results: Vec<FusedResult> = scores
+        .into_iter()
+        .map(
+            |(
+                chunk_id,
+                (
+                    rrf_score,
+                    vector_score,
+                    fts_score,
+                    exact_score,
+                    vector_rank,
+                    fts_rank,
+                    exact_rank,
+                ),
+            )| {
+                // Combine FTS and exact scores for fts_score field
+                let combined_fts_score = match (fts_score, exact_score) {
+                    (Some(f), Some(e)) => Some((f + e) / 2.0),
+                    (Some(f), None) => Some(f),
+                    (None, Some(e)) => Some(e),
+                    (None, None) => None,
+                };
+
+                FusedResult {
+                    chunk_id,
+                    rrf_score,
+                    vector_score,
+                    fts_score: combined_fts_score,
+                    vector_rank,
+                    fts_rank: fts_rank.or(exact_rank),
+                }
+            },
+        )
+        .collect();
+
+    // Sort by RRF score descending
+    results.sort_by(|a, b| {
+        b.rrf_score
+            .partial_cmp(&a.rrf_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    results
 }
 
 #[cfg(test)]

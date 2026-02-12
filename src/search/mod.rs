@@ -105,16 +105,81 @@ fn get_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// Read model metadata from database
-fn read_metadata(db_path: &Path) -> Option<(String, usize)> {
+fn read_metadata(db_path: &Path) -> Option<(String, usize, Option<String>)> {
     let metadata_path = db_path.join("metadata.json");
     if let Ok(content) = std::fs::read_to_string(&metadata_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
             let model = json.get("model_short_name")?.as_str()?.to_string();
             let dims = json.get("dimensions")?.as_u64()? as usize;
-            return Some((model, dims));
+            let primary_language = json
+                .get("primary_language")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            return Some((model, dims, primary_language));
         }
     }
     None
+}
+
+/// Detect if query contains likely code identifiers
+///
+/// Returns identifiers that look like:
+/// - PascalCase (Class, Struct, Interface)
+/// - snake_case (function, method)
+/// - camelCase (property, variable)
+fn detect_identifiers(query: &str) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    for token in query.split_whitespace() {
+        let is_pascal = token.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            && token.chars().any(|c| c.is_lowercase())
+            && !["Find", "Show", "Get", "Where", "How", "What", "All"].contains(&token);
+        let is_snake = token.contains('_') && token.chars().all(|c| c.is_alphanumeric() || c == '_');
+        let is_camel = token.chars().next().map(|c| c.is_lowercase()).unwrap_or(false)
+            && token.chars().any(|c| c.is_uppercase());
+
+        if is_pascal || is_snake || is_camel {
+            identifiers.push(token.to_string());
+        }
+    }
+    identifiers
+}
+
+/// Detects structural intent in user queries (e.g., "class X", "function foo")
+/// Returns the ChunkKind that matches the intent, if any
+fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind> {
+    use crate::chunker::ChunkKind;
+
+    let query_lower = query.to_lowercase();
+
+    if query_lower.contains("class ") || query_lower.contains("struct ") {
+        Some(ChunkKind::Class)
+    } else if query_lower.contains("function ") || query_lower.contains("fn ") {
+        Some(ChunkKind::Function)
+    } else if query_lower.contains("method ") {
+        Some(ChunkKind::Method)
+    } else if query_lower.contains("enum ") {
+        Some(ChunkKind::Enum)
+    } else if query_lower.contains("interface ") {
+        Some(ChunkKind::Interface)
+    } else if query_lower.contains("trait ") {
+        Some(ChunkKind::Trait)
+    } else {
+        None
+    }
+}
+
+/// Boosts results that match a specific ChunkKind by a factor
+fn boost_kind(results: &mut Vec<crate::vectordb::SearchResult>, target_kind: crate::chunker::ChunkKind) {
+    let boost_factor = 0.15; // 15% boost for matching kind
+    // Convert ChunkKind to string for comparison
+    let target_kind_str = format!("{:?}", target_kind);
+    for result in results.iter_mut() {
+        if result.kind == target_kind_str {
+            result.score *= 1.0 + boost_factor;
+        }
+    }
+    // Re-sort after boosting
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
 }
 
 /// Expand query with variants for better matching
@@ -218,6 +283,24 @@ fn expand_query(query: &str) -> Vec<String> {
     variants
 }
 
+/// Detect query type and adapt RRF-k accordingly
+/// Returns (vector_k, fts_k) based on query characteristics
+fn adapt_rrf_k(query: &str) -> (f64, f64) {
+    let has_identifiers = !detect_identifiers(query).is_empty();
+    let has_structural_intent = detect_structural_intent(query).is_some();
+
+    match (has_identifiers, has_structural_intent) {
+        // Identifier queries: Prioritize vector search (semantic similarity)
+        (true, _) => (12.0, 28.0), // Lower vector k, higher FTS k
+
+        // Structural queries: Balance both
+        (_, true) => (15.0, 25.0),
+
+        // Semantic queries: Balanced
+        _ => (20.0, 20.0),
+    }
+}
+
 /// Search the codebase
 pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) -> Result<()> {
     let (db_path, _project_path) = get_db_path(path)?;
@@ -234,25 +317,25 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     }
 
     // Read model metadata from database FIRST (needed for sync)
-    let (model_type, dimensions) = if let Some(ref model_name) = options.model_override {
+    let (model_type, dimensions, primary_language) = if let Some(ref model_name) = options.model_override {
         // User specified a model - use it (warning: may not match indexed data!)
         let mt = ModelType::parse(model_name).unwrap_or_default();
-        (mt, mt.dimensions())
-    } else if let Some((model_name, dims)) = read_metadata(&db_path) {
+        (mt, mt.dimensions(), None)
+    } else if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
         // Use model from metadata
         if let Some(mt) = ModelType::parse(&model_name) {
-            (mt, dims)
+            (mt, dims, lang)
         } else {
             // Model name not recognized, fall back to default
             eprintln!(
                 "{}",
                 "⚠️  Unknown model in metadata, using default".yellow()
             );
-            (ModelType::default(), 384)
+            (ModelType::default(), 384, None)
         }
     } else {
         // No metadata, fall back to default
-        (ModelType::default(), 384)
+        (ModelType::default(), 384, None)
     };
 
     // Perform incremental sync if requested (after we know the model)
@@ -329,9 +412,52 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         // Hybrid search with RRF fusion
         match FtsStore::new(&db_path) {
             Ok(fts_store) => {
-                let fts_results = fts_store.search(query, retrieval_limit)?;
-                let k = options.rrf_k.unwrap_or(DEFAULT_RRF_K as usize) as f32;
-                rrf_fusion(&vector_results, &fts_results, k)
+                // Detect identifiers for exact match boosting
+                let identifiers = detect_identifiers(query);
+                // Detect structural intent for kind field boosting
+                let structural_intent = detect_structural_intent(query);
+
+                if identifiers.is_empty() {
+                    // No identifiers - standard hybrid search
+                    let fts_results = fts_store.search(query, retrieval_limit, structural_intent)?;
+                    let k = options.rrf_k.unwrap_or(DEFAULT_RRF_K as usize) as f32;
+                    rrf_fusion(&vector_results, &fts_results, k)
+                } else {
+                    // Has identifiers - use exact match boosting
+                    let fts_results = fts_store.search(query, retrieval_limit, structural_intent)?;
+
+                    // Search for each identifier and combine exact results
+                    let mut all_exact_results = Vec::new();
+                    let mut seen_exact_ids = std::collections::HashSet::new();
+
+                    for identifier in &identifiers {
+                        if let Ok(exact_matches) = fts_store.search_exact(identifier, retrieval_limit, structural_intent) {
+                            for exact_match in exact_matches {
+                                // Deduplicate exact results by chunk ID
+                                if seen_exact_ids.insert(exact_match.chunk_id) {
+                                    all_exact_results.push(exact_match);
+                                }
+                            }
+                        }
+                    }
+
+                    // Use adaptive RRF-k based on query type
+                    let (vector_k, fts_k) = adapt_rrf_k(query);
+                    let k = options.rrf_k.unwrap_or(DEFAULT_RRF_K as usize) as f32;
+                    // Use the smaller of user-specified k and adaptive k (more conservative)
+                    let vector_k_adaptive = vector_k.min(k as f64) as f32;
+                    let fts_k_adaptive = fts_k.min(k as f64) as f32;
+
+                    use crate::rerank::{rrf_fusion_with_exact, EXACT_MATCH_RRF_K};
+                    rrf_fusion_with_exact(
+                        &vector_results,
+                        &fts_results,
+                        &all_exact_results,
+                        vector_k_adaptive,
+                        fts_k_adaptive,
+                        EXACT_MATCH_RRF_K,
+                    )
+                }
             }
             Err(_) => {
                 // FTS not available, fall back to vector-only
@@ -372,6 +498,37 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 results.push(result);
             }
         }
+    }
+
+    // Language awareness: Boost results from primary language
+    // Extract language from file path (since SearchResult doesn't have language field)
+    if let Some(ref lang) = primary_language {
+        use crate::file::Language;
+        let lang_boost = 0.2; // Boost results from primary language by 20%
+        for result in results.iter_mut() {
+            // Detect language from file path
+            let file_lang = format!("{:?}", Language::from_path(std::path::Path::new(&result.path)));
+            if file_lang == *lang {
+                result.score *= 1.0 + lang_boost;
+            }
+        }
+        // Re-sort after boosting
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    }
+
+    // ChunkKind-Aware Ranking: Boost results matching structural intent
+    if let Some(intent) = detect_structural_intent(query) {
+        boost_kind(&mut results, intent);
+    }
+
+    // Negative Result Check: Report when no exact matches found for identifier queries
+    let identifiers = detect_identifiers(query);
+    if !identifiers.is_empty() && results.is_empty() {
+        eprintln!(
+            "{}",
+            format!("❓ No exact matches found for identifiers: {}", identifiers.join(", ")).yellow()
+        );
+        eprintln!("{}", "  Try using broader search terms or running `codesearch index --sync` if the codebase changed.".dimmed());
     }
 
     let search_duration = start.elapsed();
