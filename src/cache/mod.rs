@@ -1,6 +1,6 @@
 mod file_meta;
 
-pub use file_meta::FileMetaStore;
+pub use file_meta::{normalize_path, normalize_path_str, FileMetaStore};
 
 use moka::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};

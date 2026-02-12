@@ -1,4 +1,3 @@
-use crate::output;
 use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
 use ort::execution_providers::CPUExecutionProvider;
@@ -49,7 +48,7 @@ pub enum ModelType {
 }
 
 impl ModelType {
-    pub fn to_fastembed_model(&self) -> FastEmbedModel {
+    pub fn to_fastembed_model(self) -> FastEmbedModel {
         match self {
             // MiniLM Family
             Self::AllMiniLML6V2 => FastEmbedModel::AllMiniLML6V2,
@@ -175,7 +174,7 @@ impl ModelType {
     }
 
     /// Parse model from string (for CLI)
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "minilm-l6" | "allminiml6v2" => Some(Self::AllMiniLML6V2),
             "minilm-l6-q" | "allminiml6v2q" => Some(Self::AllMiniLML6V2Q),
@@ -220,12 +219,6 @@ impl FastEmbedder {
         model_type: ModelType,
         cache_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
-        output::print_info(format_args!(
-            "📦 Loading embedding model: {}",
-            model_type.name()
-        ));
-        output::print_info(format_args!("   Dimensions: {}", model_type.dimensions()));
-
         // Set cache directory via environment variable if provided
         // Note: fastembed library uses FASTEMBED_CACHE_DIR (not FASTEMBED_CACHE_PATH)
         if let Some(cache_dir) = cache_dir {
@@ -235,19 +228,18 @@ impl FastEmbedder {
             );
         }
 
-        // Use CPU execution provider with arena allocator for better memory performance
+        // Use CPU execution provider WITH arena allocator for speed.
+        // Arena allocator provides fast memory reuse during inference.
         let cpu_ep = CPUExecutionProvider::default()
             .with_arena_allocator(true)
             .build();
 
         let model = TextEmbedding::try_new(
             InitOptions::new(model_type.to_fastembed_model())
-                .with_show_download_progress(true)
+                .with_show_download_progress(false)
                 .with_execution_providers(vec![cpu_ep]),
         )
         .map_err(|e| anyhow!("Failed to initialize embedding model: {}", e))?;
-
-        output::print_info(format_args!("✅ Model loaded successfully!"));
 
         Ok(Self { model, model_type })
     }
@@ -259,13 +251,12 @@ impl FastEmbedder {
         let batch_size = if let Ok(env_size) = std::env::var("CODESEARCH_BATCH_SIZE") {
             env_size.parse().unwrap_or(256)
         } else {
-            // Adaptive batch size: smaller batches for larger models to avoid OOM
-            // Benchmarked on 12-core/24-thread CPU - batch size has minimal impact
-            // when CPU is saturated, but larger batches slightly more efficient
+            // Adaptive batch size: without arena allocator, ONNX frees buffers after each batch
+            // so larger batches are faster without accumulating memory.
             match self.model_type.dimensions() {
-                d if d <= 384 => 256, // Small models: larger batches OK
-                d if d <= 768 => 128, // Medium models
-                _ => 64,              // Large models: smaller to avoid OOM
+                d if d <= 384 => 256, // Small models (MiniLM etc.)
+                d if d <= 768 => 128, // Medium models (BGE-base, Jina etc.)
+                _ => 64,              // Large models (BGE-large, MxBai etc.)
             }
         };
         self.embed_batch_chunked(texts, batch_size)
@@ -285,6 +276,11 @@ impl FastEmbedder {
 
         // Process in mini-batches to avoid OOM with large models
         for chunk in texts.chunks(batch_size) {
+            // Check for CTRL-C between mini-batches so we don't block for minutes
+            if crate::constants::is_shutdown_requested() {
+                return Err(anyhow!("Embedding interrupted by shutdown request"));
+            }
+
             let text_refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
 
             let embeddings = self
@@ -382,20 +378,53 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str() {
+    fn test_parse() {
         assert_eq!(
-            ModelType::from_str("bge-small"),
+            ModelType::parse("minilm-l6"),
+            Some(ModelType::AllMiniLML6V2)
+        );
+        assert_eq!(
+            ModelType::parse("minilm-l6-q"),
+            Some(ModelType::AllMiniLML6V2Q)
+        );
+        assert_eq!(
+            ModelType::parse("minilm-l12"),
+            Some(ModelType::AllMiniLML12V2)
+        );
+        assert_eq!(
+            ModelType::parse("minilm-l12-q"),
+            Some(ModelType::AllMiniLML12V2Q)
+        );
+        assert_eq!(
+            ModelType::parse("paraphrase-minilm"),
+            Some(ModelType::ParaphraseMLMiniLML12V2)
+        );
+        assert_eq!(
+            ModelType::parse("bge-small"),
             Some(ModelType::BGESmallENV15)
         );
         assert_eq!(
-            ModelType::from_str("jina-code"),
-            Some(ModelType::JinaEmbeddingsV2BaseCode)
+            ModelType::parse("bge-small-q"),
+            Some(ModelType::BGESmallENV15Q)
+        );
+        assert_eq!(ModelType::parse("bge-base"), Some(ModelType::BGEBaseENV15));
+        assert_eq!(
+            ModelType::parse("nomic-v1"),
+            Some(ModelType::NomicEmbedTextV1)
         );
         assert_eq!(
-            ModelType::from_str("minilm-l6-q"),
-            Some(ModelType::AllMiniLML6V2Q)
+            ModelType::parse("nomic-v1.5"),
+            Some(ModelType::NomicEmbedTextV15)
         );
-        assert_eq!(ModelType::from_str("unknown"), None);
+        assert_eq!(
+            ModelType::parse("nomic-v1.5-q"),
+            Some(ModelType::NomicEmbedTextV15Q)
+        );
+        assert_eq!(
+            ModelType::parse("jina-code"),
+            Some(ModelType::JinaEmbeddingsV2BaseCode)
+        );
+        assert_eq!(ModelType::parse("invalid"), None);
     }
 
     #[test]

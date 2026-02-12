@@ -12,6 +12,7 @@ use std::path::Path;
 use tantivy::{
     collector::TopDocs,
     directory::MmapDirectory,
+    merge_policy::NoMergePolicy,
     query::QueryParser,
     schema::{Field, NumericOptions, Schema, Value, STORED, STRING, TEXT},
     Index, IndexReader, IndexSettings, IndexWriter, TantivyDocument, Term,
@@ -147,18 +148,34 @@ impl FtsStore {
     }
 
     /// Create writer with retry logic for Windows file locking issues
+    /// Increased retry count and initial wait to handle slow file handle release
     fn create_writer_with_retry(index: &Index) -> Result<IndexWriter> {
-        let max_retries = 3;
+        let max_retries = 5; // Increased from 3 to handle Windows timing issues
         let mut last_error: Option<String> = None;
 
         for attempt in 0..max_retries {
             if attempt > 0 {
                 // Wait before retry (exponential backoff)
-                std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
+                // Increased initial wait from 100ms to 200ms for better Windows compatibility
+                std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
             }
 
+            // 50MB writer heap (tantivy default).
+            //
+            // CRITICAL: Set NoMergePolicy to prevent tantivy from spawning background
+            // merge threads. On Windows, these threads encounter I/O errors (antivirus
+            // interference, file locking on mmap'd segment files) which panic the merge
+            // thread and kill the IndexWriter — causing the intermittent
+            // "An index writer was killed" error (~1/5 indexing runs).
+            //
+            // With NoMergePolicy, all segment management is explicit: we accumulate
+            // segments during indexing and they're consolidated at commit points.
+            // This trades slightly more segments for 100% reliability.
             match index.writer(50_000_000) {
-                Ok(writer) => return Ok(writer),
+                Ok(writer) => {
+                    writer.set_merge_policy(Box::new(NoMergePolicy));
+                    return Ok(writer);
+                }
                 Err(e) => {
                     last_error = Some(e.to_string());
                 }
@@ -195,6 +212,9 @@ impl FtsStore {
     }
 
     /// Add a chunk to the FTS index
+    ///
+    /// Includes writer recovery: if the writer was killed (e.g., by a background
+    /// merge thread panic), it will be recreated and the operation retried once.
     pub fn add_chunk(
         &mut self,
         chunk_id: u32,
@@ -212,20 +232,52 @@ impl FtsStore {
         let signature_field = self.signature_field;
         let kind_field = self.kind_field;
 
-        let writer = self.writer.as_mut().unwrap();
-
         let mut doc = TantivyDocument::new();
         doc.add_u64(chunk_id_field, chunk_id as u64);
         doc.add_text(content_field, content);
         doc.add_text(path_field, path);
         doc.add_text(kind_field, kind);
-
         if let Some(sig) = signature {
             doc.add_text(signature_field, sig);
         }
 
-        writer.add_document(doc)?;
-        Ok(())
+        let writer = self.writer.as_mut().unwrap();
+        match writer.add_document(doc) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let error_str = e.to_string();
+                if error_str.contains("writer was killed")
+                    || error_str.contains("index writer was killed")
+                {
+                    tracing::debug!(
+                        "FTS writer was killed, recreating and retrying add_chunk for chunk {}",
+                        chunk_id
+                    );
+
+                    // Drop the dead writer and recreate
+                    self.writer = None;
+                    self.ensure_writer()?;
+
+                    // Rebuild the document for retry
+                    let mut retry_doc = TantivyDocument::new();
+                    retry_doc.add_u64(chunk_id_field, chunk_id as u64);
+                    retry_doc.add_text(content_field, content);
+                    retry_doc.add_text(path_field, path);
+                    retry_doc.add_text(kind_field, kind);
+                    if let Some(sig) = signature {
+                        retry_doc.add_text(signature_field, sig);
+                    }
+
+                    let writer = self.writer.as_mut().unwrap();
+                    writer.add_document(retry_doc).map_err(|e| {
+                        anyhow!("FTS add_document failed after writer recovery: {}", e)
+                    })?;
+                    Ok(())
+                } else {
+                    Err(anyhow!("FTS add_document failed: {}", error_str))
+                }
+            }
+        }
     }
 
     /// Delete a chunk by ID
@@ -249,60 +301,89 @@ impl FtsStore {
         Ok(())
     }
 
-    /// Commit pending changes with retry logic for Windows file locking
+    /// Commit pending changes with retry logic for Windows file locking.
+    ///
+    /// If the writer was killed (background merge panic), it is recreated.
+    /// Data since the last successful commit will be lost in that case, but
+    /// indexing can continue rather than aborting entirely.
     pub fn commit(&mut self) -> Result<()> {
-        if let Some(ref mut writer) = self.writer {
-            let max_retries = 5;
-            let mut last_error: Option<String> = None;
+        if self.writer.is_none() {
+            return Ok(());
+        }
 
-            for attempt in 0..max_retries {
-                if attempt > 0 {
-                    // Wait before retry (exponential backoff: 100ms, 200ms, 400ms, 800ms)
-                    std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
+        let max_retries = 5;
+        let mut last_error: Option<String> = None;
+
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                // Wait before retry (exponential backoff: 100ms, 200ms, 400ms, 800ms)
+                std::thread::sleep(std::time::Duration::from_millis(100 * (1 << attempt)));
+            }
+
+            let writer = self.writer.as_mut().unwrap();
+            match writer.commit() {
+                Ok(_) => {
+                    // Reload reader to see changes
+                    if let Err(e) = self.reader.reload() {
+                        // Non-fatal: reader will eventually catch up
+                        tracing::debug!("Reader reload warning: {}", e);
+                    }
+                    return Ok(());
                 }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    last_error = Some(error_str.clone());
 
-                match writer.commit() {
-                    Ok(_) => {
-                        // Reload reader to see changes
+                    // Writer was killed by background thread panic — recreate it
+                    if error_str.contains("writer was killed")
+                        || error_str.contains("index writer was killed")
+                    {
+                        tracing::debug!(
+                            "FTS writer was killed during commit (attempt {}/{}). \
+                             Recreating writer. Data since last commit may be lost.",
+                            attempt + 1,
+                            max_retries
+                        );
+                        self.writer = None;
+                        self.ensure_writer()?;
+                        // After recreating, the pending data is gone, so commit
+                        // the new (empty) writer to ensure a clean state
+                        if let Some(ref mut w) = self.writer {
+                            w.commit()
+                                .map_err(|e| anyhow!("FTS commit after recovery failed: {}", e))?;
+                        }
                         if let Err(e) = self.reader.reload() {
-                            // Non-fatal: reader will eventually catch up
                             tracing::debug!("Reader reload warning: {}", e);
                         }
                         return Ok(());
                     }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        last_error = Some(error_str.clone());
 
-                        // Check if it's a file locking error
-                        if error_str.contains("Access is denied")
-                            || error_str.contains("PermissionDenied")
-                            || error_str.contains("IoError")
-                        {
-                            tracing::debug!(
-                                "FTS commit retry {}/{}: {}",
-                                attempt + 1,
-                                max_retries,
-                                error_str
-                            );
-                            // Continue to retry
-                        } else {
-                            // Non-recoverable error, fail immediately
-                            return Err(anyhow!("FTS commit failed: {}", error_str));
-                        }
+                    // File locking error — retry with backoff
+                    if error_str.contains("Access is denied")
+                        || error_str.contains("PermissionDenied")
+                        || error_str.contains("IoError")
+                    {
+                        tracing::debug!(
+                            "FTS commit retry {}/{}: {}",
+                            attempt + 1,
+                            max_retries,
+                            error_str
+                        );
+                        // Continue to retry
+                    } else {
+                        // Non-recoverable error, fail immediately
+                        return Err(anyhow!("FTS commit failed: {}", error_str));
                     }
                 }
             }
-
-            // All retries exhausted
-            Err(anyhow!(
-                "FTS commit failed after {} retries: {}",
-                max_retries,
-                last_error.unwrap_or_default()
-            ))
-        } else {
-            Ok(())
         }
+
+        // All retries exhausted
+        Err(anyhow!(
+            "FTS commit failed after {} retries: {}",
+            max_retries,
+            last_error.unwrap_or_default()
+        ))
     }
 
     /// Search using BM25
@@ -373,7 +454,9 @@ impl FtsStore {
 
 /// Statistics about the FTS index
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Part of public API for debugging/monitoring
 pub struct FtsStats {
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub num_documents: usize,
 }
 

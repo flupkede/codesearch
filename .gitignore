@@ -32,9 +32,5 @@ criterion/
 # Testing
 /test-repos/
 
-# Hidden folders (except .docs, .github, .git)
-*/
-!*/
-!.docs/
-!.github/
-.git/
+# codesearch database (local index, binary files)
+.codesearch.db/

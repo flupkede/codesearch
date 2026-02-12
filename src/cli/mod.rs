@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 
 use crate::embed::ModelType;
 use crate::search::SearchOptions;
@@ -37,9 +38,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Enable verbose output
-    #[arg(short, long, global = true)]
-    pub verbose: bool,
+    /// Set log level (error, warn, info, debug, trace)
+    #[arg(short = 'l', long, global = true, default_value = "info")]
+    pub loglevel: String,
 
     /// Suppress informational output (only show results/errors)
     #[arg(short, long, global = true)]
@@ -190,11 +191,11 @@ pub enum Commands {
     },
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     let cli = Cli::parse();
 
     // Parse model from CLI flag
-    let model_type = cli.model.as_ref().and_then(|m| ModelType::from_str(m));
+    let model_type = cli.model.as_ref().and_then(|m| ModelType::parse(m));
     if cli.model.is_some() && model_type.is_none() {
         eprintln!(
             "Unknown model: '{}'. Available models:",
@@ -210,6 +211,10 @@ pub async fn run() -> Result<()> {
     if cli.quiet {
         crate::output::set_quiet(true);
     }
+
+    // Parse loglevel from CLI
+    let log_level =
+        crate::logger::LogLevel::parse(&cli.loglevel).unwrap_or(crate::logger::LogLevel::Info);
 
     match cli.command {
         Commands::Search {
@@ -278,7 +283,7 @@ pub async fn run() -> Result<()> {
             if add || is_add_cmd {
                 // Clear path if it's "add" to avoid treating it as a directory
                 let effective_path = if is_add_cmd { None } else { path };
-                crate::index::add_to_index(effective_path, global).await
+                crate::index::add_to_index(effective_path, global, cancel_token.clone()).await
             } else if remove || is_rm_cmd {
                 // Clear path if it's "rm"/"remove" to avoid treating it as a directory
                 let effective_path = if is_rm_cmd { None } else { path };
@@ -288,15 +293,65 @@ pub async fn run() -> Result<()> {
             } else {
                 // For 'codesearch index .' or 'codesearch index <path>', just run indexing
                 // The index() function will handle checking for existing indexes
-                crate::index::index(path, dry_run, force, false, model_type).await
+                crate::index::index(
+                    path,
+                    dry_run,
+                    force,
+                    false,
+                    model_type,
+                    cancel_token.clone(),
+                )
+                .await
             }
         }
         Commands::Stats { path } => crate::index::stats(path).await,
-        Commands::Serve { port, path } => crate::server::serve(port, path).await,
+        Commands::Serve { port, path } => {
+            // Discover database path and initialize logger with file output
+            // NOTE: For Serve, tracing is NOT initialized in main.rs — init_logger
+            // is the first and only call to set the global subscriber
+            let effective_path = path
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            if let Ok(Some(db_info)) =
+                crate::db_discovery::find_best_database(Some(&effective_path))
+            {
+                match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
+                    Err(e) => {
+                        eprintln!("Warning: Failed to initialize file logger: {}", e);
+                    }
+                    _ => {
+                        // Logger initialized successfully (either FileLogging or ConsoleOnly)
+                    }
+                }
+            }
+            crate::server::serve(port, path).await
+        }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
         Commands::Doctor => crate::cli::doctor::run().await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp { path } => crate::mcp::run_mcp_server(path).await,
+        Commands::Mcp { path } => {
+            // Discover database path and initialize logger with file output
+            // NOTE: For MCP, tracing is NOT initialized in main.rs — init_logger
+            // is the first and only call to set the global subscriber
+            let effective_path = path
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            if let Ok(Some(db_info)) =
+                crate::db_discovery::find_best_database(Some(&effective_path))
+            {
+                match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
+                    Err(e) => {
+                        eprintln!("Warning: Failed to initialize file logger: {}", e);
+                    }
+                    _ => {
+                        // Logger initialized successfully (either FileLogging or ConsoleOnly)
+                    }
+                }
+            }
+            crate::mcp::run_mcp_server(path, cancel_token).await
+        }
     }
 }
 

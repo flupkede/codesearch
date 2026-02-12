@@ -114,9 +114,13 @@ impl VectorStore {
         cleanup_stale_del_files(db_path)?;
 
         // Open LMDB environment
+        let map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(10 * 1024 * 1024 * 1024) // 10GB max
+                .map_size(map_size_mb * 1024 * 1024)
                 .max_dbs(10)
                 .open(db_path)?
         };
@@ -128,8 +132,13 @@ impl VectorStore {
         let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
             env.create_database(&mut wtxn, Some("chunks"))?;
 
-        // Get the next ID by counting existing chunks
-        let next_id = chunks.len(&wtxn)? as u32;
+        // Get the next ID from the maximum existing key + 1
+        // Using len() is wrong after delete+insert cycles: deleted IDs create gaps
+        // so len() < max_key + 1, causing ID collisions on re-open
+        let next_id = match chunks.last(&wtxn)? {
+            Some((max_key, _)) => max_key + 1,
+            None => 0,
+        };
 
         wtxn.commit()?;
 
@@ -181,9 +190,13 @@ impl VectorStore {
         }
 
         // Open LMDB environment in read-only mode
+        let map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(10 * 1024 * 1024 * 1024) // 10GB max
+                .map_size(map_size_mb * 1024 * 1024)
                 .max_dbs(10)
                 .flags(EnvFlags::READ_ONLY)
                 .open(db_path)?
@@ -199,8 +212,12 @@ impl VectorStore {
             .open_database(&rtxn, Some("chunks"))?
             .ok_or_else(|| anyhow::anyhow!("chunks database not found"))?;
 
-        // Get the next ID by counting existing chunks
-        let next_id = chunks.len(&rtxn)? as u32;
+        // Get the next ID from the maximum existing key + 1
+        // Using len() is wrong after delete+insert cycles: deleted IDs create gaps
+        let next_id = match chunks.last(&rtxn)? {
+            Some((max_key, _)) => max_key + 1,
+            None => 0,
+        };
 
         // Check if database is already indexed
         let indexed = if next_id > 0 {
@@ -236,7 +253,7 @@ impl VectorStore {
             return Ok(0);
         }
 
-        println!("📊 Inserting {} chunks...", chunks.len());
+        eprintln!("📊 Inserting {} chunks...", chunks.len());
 
         let mut wtxn = self.env.write_txn()?;
         let writer = Writer::new(self.vectors, 0, self.dimensions);
@@ -268,7 +285,7 @@ impl VectorStore {
         // Mark as not indexed (need to rebuild index after inserts)
         self.indexed = false;
 
-        println!(
+        eprintln!(
             "✅ Inserted {} chunks (IDs: {}-{})",
             chunks.len(),
             self.next_id - chunks.len() as u32,
@@ -282,8 +299,6 @@ impl VectorStore {
     ///
     /// Must be called after inserting chunks and before searching
     pub fn build_index(&mut self) -> Result<()> {
-        crate::output::print_info(format_args!("🔨 Building vector index..."));
-
         let mut wtxn = self.env.write_txn()?;
         let writer = Writer::new(self.vectors, 0, self.dimensions);
 
@@ -294,7 +309,6 @@ impl VectorStore {
 
         self.indexed = true;
 
-        crate::output::print_info(format_args!("✅ Index built successfully"));
         Ok(())
     }
 
@@ -376,11 +390,15 @@ impl VectorStore {
             unique_files.insert(metadata.path.clone());
         }
 
+        // Get max chunk ID from the last key in LMDB (sorted)
+        let max_chunk_id = self.chunks.last(&rtxn)?.map(|(k, _)| k).unwrap_or(0);
+
         Ok(StoreStats {
             total_chunks: total_chunks as usize,
             total_files: unique_files.len(),
             indexed: self.indexed,
             dimensions: self.dimensions,
+            max_chunk_id,
         })
     }
 
@@ -458,7 +476,7 @@ impl VectorStore {
     /// Clear all data from the database
     #[allow(dead_code)] // Reserved for database reset operations
     pub fn clear(&mut self) -> Result<()> {
-        println!("🗑️  Clearing database...");
+        eprintln!("🗑️  Clearing database...");
 
         let mut wtxn = self.env.write_txn()?;
 
@@ -471,7 +489,7 @@ impl VectorStore {
         self.next_id = 0;
         self.indexed = false;
 
-        println!("✅ Database cleared");
+        eprintln!("✅ Database cleared");
         Ok(())
     }
 
@@ -504,6 +522,19 @@ impl VectorStore {
         } else {
             Ok(None)
         }
+    }
+
+    /// Iterate all chunks in the store via LMDB cursor.
+    /// Returns (id, metadata) pairs for every chunk, regardless of ID gaps.
+    /// This is the correct way to enumerate chunks after delete+insert cycles.
+    pub fn all_chunks(&self) -> Result<Vec<(u32, ChunkMetadata)>> {
+        let rtxn = self.env.read_txn()?;
+        let mut result = Vec::new();
+        for entry in self.chunks.iter(&rtxn)? {
+            let (id, metadata) = entry?;
+            result.push((id, metadata));
+        }
+        Ok(result)
     }
 
     /// Get the database file size in bytes
@@ -548,6 +579,41 @@ pub struct StoreStats {
     pub total_files: usize,
     pub indexed: bool,
     pub dimensions: usize,
+    /// The highest chunk ID in the store (or 0 if empty).
+    /// NOTE: This may be > total_chunks when chunks have been deleted.
+    pub max_chunk_id: u32,
+}
+
+/// Clean up stale .del files from previous crashed runs
+///
+/// LMDB creates .del files when deleting items, but if the process crashes
+/// or is interrupted, these files can be left behind and cause errors on
+/// the next run. This function removes any .del files before opening the DB.
+fn cleanup_stale_del_files(db_path: &Path) -> Result<()> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    let entries = fs::read_dir(db_path)?;
+    let mut cleaned = 0;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        // Check if file ends with .del
+        if path.extension().and_then(|s| s.to_str()) == Some("del") {
+            // Remove the .del file
+            fs::remove_file(&path)?;
+            cleaned += 1;
+        }
+    }
+
+    if cleaned > 0 {
+        tracing::debug!("Cleaned up {} stale .del files", cleaned);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -753,36 +819,4 @@ mod tests {
             assert!(metadata.is_some());
         }
     }
-}
-
-/// Clean up stale .del files from previous crashed runs
-///
-/// LMDB creates .del files when deleting items, but if the process crashes
-/// or is interrupted, these files can be left behind and cause errors on
-/// the next run. This function removes any .del files before opening the DB.
-fn cleanup_stale_del_files(db_path: &Path) -> Result<()> {
-    if !db_path.exists() {
-        return Ok(());
-    }
-
-    let entries = fs::read_dir(db_path)?;
-    let mut cleaned = 0;
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-
-        // Check if file ends with .del
-        if path.extension().and_then(|s| s.to_str()) == Some("del") {
-            // Remove the .del file
-            fs::remove_file(&path)?;
-            cleaned += 1;
-        }
-    }
-
-    if cleaned > 0 {
-        tracing::debug!("Cleaned up {} stale .del files", cleaned);
-    }
-
-    Ok(())
 }

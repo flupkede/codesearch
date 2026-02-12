@@ -15,7 +15,6 @@ use tokio::sync::RwLock;
 
 use crate::cache::FileMetaStore;
 use crate::chunker::SemanticChunker;
-use crate::constants::FASTEMBED_CACHE_DIR;
 use crate::db_discovery::find_best_database;
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
@@ -120,13 +119,18 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
 
     // STEP 1: Perform incremental index refresh
     println!("\n🔍 Performing incremental index refresh...");
-    crate::index::index_quiet(Some(root.clone()), false).await?;
+    crate::index::index_quiet(
+        Some(root.clone()),
+        false,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await?;
     println!("✅ Index refresh completed");
 
     // Initialize embedding service
     let model_type = ModelType::default();
     println!("\n🔄 Loading embedding model...");
-    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
+    let cache_dir = crate::constants::get_global_models_cache_dir()?;
     let embedding_service = EmbeddingService::with_cache_dir(model_type, Some(&cache_dir))?;
     let dimensions = embedding_service.dimensions();
 
@@ -149,7 +153,7 @@ pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
             store: RwLock::new(store),
             embedding_service: Mutex::new(EmbeddingService::with_cache_dir(
                 model_type,
-                Some(&db_path.join(FASTEMBED_CACHE_DIR)),
+                Some(&crate::constants::get_global_models_cache_dir()?),
             )?),
             chunker: Mutex::new(SemanticChunker::new(100, 2000, 10)),
             file_meta: RwLock::new(file_meta),
@@ -219,7 +223,7 @@ async fn initial_index(
     println!("  Created {} chunks", all_chunks.len());
 
     // Embedding
-    let cache_dir = db_path.join(FASTEMBED_CACHE_DIR);
+    let cache_dir = crate::constants::get_global_models_cache_dir()?;
     let mut embedding_service = EmbeddingService::with_cache_dir(model_type, Some(&cache_dir))?;
     let embedded_chunks = embedding_service.embed_chunks(all_chunks)?;
     println!("  Generated {} embeddings", embedded_chunks.len());
@@ -392,6 +396,7 @@ async fn handle_file_deleted(state: &ServerState, path: &Path) -> Result<()> {
     let mut file_meta = state.file_meta.write().await;
 
     if let Some(meta) = file_meta.remove_file(path) {
+        // Single file deletion
         if !meta.chunk_ids.is_empty() {
             println!(
                 "  🗑️  Removing: {} ({} chunks)",
@@ -400,6 +405,53 @@ async fn handle_file_deleted(state: &ServerState, path: &Path) -> Result<()> {
             );
             let mut store = state.store.write().await;
             store.delete_chunks(&meta.chunk_ids)?;
+        }
+    } else {
+        // Path not found as a tracked file — might be a directory deletion.
+        // On Windows, rm -rf of a directory may only produce a Remove event
+        // for the directory itself, not for individual files within it.
+        let path_prefix = path.to_string_lossy().to_string();
+
+        // DEBUG: Log path prefix and first few tracked files
+        println!("  🐛 DEBUG: Deleted path prefix = {:?}", path_prefix);
+        let tracked_count = file_meta.tracked_files().count();
+        println!("  🐛 DEBUG: Total tracked files = {}", tracked_count);
+        let first_files: Vec<_> = file_meta.tracked_files().take(3).cloned().collect();
+        for (i, f) in first_files.iter().enumerate() {
+            println!("  🐛 DEBUG: Tracked file[{}] = {}", i, f);
+        }
+
+        let files_to_remove: Vec<String> = file_meta
+            .tracked_files()
+            .filter(|f| {
+                let starts = f.starts_with(&path_prefix);
+                if !starts && f.contains("test_fsw_project") {
+                    println!("  🐛 DEBUG: '{}' does NOT start with '{}'", f, path_prefix);
+                }
+                starts
+            })
+            .cloned()
+            .collect();
+
+        if !files_to_remove.is_empty() {
+            println!(
+                "  🗑️  Directory deleted: {} ({} files)",
+                path.display(),
+                files_to_remove.len()
+            );
+            let mut store = state.store.write().await;
+            for file_path in files_to_remove {
+                if let Some(meta) = file_meta.remove_file(Path::new(&file_path)) {
+                    if !meta.chunk_ids.is_empty() {
+                        println!(
+                            "    🗑️  {}: {} chunks removed",
+                            file_path,
+                            meta.chunk_ids.len()
+                        );
+                        store.delete_chunks(&meta.chunk_ids)?;
+                    }
+                }
+            }
         }
     }
 
@@ -415,6 +467,7 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<HealthRes
         total_files: 0,
         indexed: false,
         dimensions: 384,
+        max_chunk_id: 0,
     });
 
     let file_meta = state.file_meta.read().await;
@@ -434,6 +487,7 @@ async fn status_handler(State(state): State<Arc<ServerState>>) -> Json<StatusRes
         total_files: 0,
         indexed: false,
         dimensions: 384,
+        max_chunk_id: 0,
     });
 
     let file_meta = state.file_meta.read().await;

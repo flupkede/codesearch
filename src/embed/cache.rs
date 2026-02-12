@@ -1,6 +1,5 @@
 use super::batch::EmbeddedChunk;
 use crate::chunker::Chunk;
-use crate::output;
 use anyhow::Result;
 use moka::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,24 +14,23 @@ pub struct EmbeddingCache {
     cache: Cache<String, Arc<Vec<f32>>>,
     hits: AtomicU64,
     misses: AtomicU64,
+    #[allow(dead_code)] // Used in stats()
     max_memory_mb: usize,
 }
 
 impl EmbeddingCache {
-    /// Create a new empty cache with default memory limit (500MB)
+    /// Create a new empty cache with default memory limit
     pub fn new() -> Self {
-        Self::with_memory_limit_mb(500)
+        Self::with_memory_limit_mb(crate::constants::DEFAULT_CACHE_MAX_MEMORY_MB)
     }
 
     /// Create a new cache with specified memory limit in MB
     pub fn with_memory_limit_mb(max_memory_mb: usize) -> Self {
-        // Calculate max entries based on memory budget
-        // Default: 384-dim f32 vector = 384 * 4 bytes = 1536 bytes per embedding
-        let avg_embedding_size = 384 * std::mem::size_of::<f32>();
-        let max_entries = (max_memory_mb * 1024 * 1024) / avg_embedding_size;
+        // max_capacity is used as MAX WEIGHT when weigher is provided
+        let max_weight = (max_memory_mb * 1024 * 1024) as u64;
 
         let cache = Cache::builder()
-            .max_capacity(max_entries as u64)
+            .max_capacity(max_weight)
             .weigher(|_key: &String, value: &Arc<Vec<f32>>| {
                 (value.len() * std::mem::size_of::<f32>()) as u32
             })
@@ -78,6 +76,7 @@ impl EmbeddingCache {
     }
 
     /// Get cache statistics
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn stats(&self) -> CacheStats {
         CacheStats {
             size: self.cache.entry_count() as usize,
@@ -112,12 +111,14 @@ impl EmbeddingCache {
     }
 
     /// Get current memory usage estimate (in bytes)
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn memory_usage_bytes(&self) -> usize {
         self.cache.run_pending_tasks();
         self.cache.weighted_size() as usize
     }
 
     /// Get current memory usage estimate (in MB)
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn memory_usage_mb(&self) -> f64 {
         self.memory_usage_bytes() as f64 / (1024.0 * 1024.0)
     }
@@ -131,15 +132,20 @@ impl Default for EmbeddingCache {
 
 /// Cache statistics
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Part of public API for debugging/monitoring
 pub struct CacheStats {
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub size: usize,
     pub hits: u64,
     pub misses: u64,
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub max_memory_mb: usize,
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub max_entries: usize,
 }
 
 impl CacheStats {
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn hit_rate(&self) -> f32 {
         let total = self.hits + self.misses;
         if total == 0 {
@@ -157,11 +163,12 @@ impl CacheStats {
 /// Cached batch embedder that uses an embedding cache with memory limits
 pub struct CachedBatchEmbedder {
     pub batch_embedder: super::batch::BatchEmbedder,
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     cache: EmbeddingCache,
 }
 
 impl CachedBatchEmbedder {
-    /// Create a new cached batch embedder with default memory limit (500MB)
+    /// Create a new cached batch embedder with default memory limit
     #[allow(dead_code)] // Reserved for cached embedding mode
     pub fn new(batch_embedder: super::batch::BatchEmbedder) -> Self {
         Self {
@@ -192,11 +199,7 @@ impl CachedBatchEmbedder {
         let mut chunks_to_embed = Vec::new();
         let mut cache_indices = Vec::new();
 
-        // Check cache first
-        output::print_info(format_args!(
-            "🔍 Checking cache for {} chunks (max memory: {} MB)...",
-            total, self.cache.max_memory_mb
-        ));
+        // Check cache first (silent - no verbose output)
         for (idx, chunk) in chunks.iter().enumerate() {
             if let Some(embedding) = self.cache.get(chunk) {
                 embedded_chunks.push(EmbeddedChunk::new(chunk.clone(), embedding));
@@ -205,14 +208,6 @@ impl CachedBatchEmbedder {
                 cache_indices.push(idx);
             }
         }
-
-        let cached_count = embedded_chunks.len();
-        let to_embed_count = chunks_to_embed.len();
-
-        output::print_info(format_args!(
-            "   ✅ Found {} in cache, embedding {} new chunks",
-            cached_count, to_embed_count
-        ));
 
         // Embed remaining chunks
         if !chunks_to_embed.is_empty() {
@@ -225,19 +220,6 @@ impl CachedBatchEmbedder {
 
             embedded_chunks.extend(newly_embedded);
         }
-
-        // Sort by original order if needed
-        // (Note: Current implementation maintains order naturally due to how we build vec)
-
-        let stats = self.cache().stats();
-        output::print_info(format_args!(
-            "📊 Cache stats: {} / {} entries, {:.1}% hit rate, {:.1} MB used / {} MB max",
-            stats.size,
-            stats.max_entries,
-            stats.hit_rate() * 100.0,
-            self.cache.memory_usage_mb(),
-            stats.max_memory_mb
-        ));
 
         Ok(embedded_chunks)
     }
@@ -256,6 +238,7 @@ impl CachedBatchEmbedder {
     }
 
     /// Get cache statistics
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn cache_stats(&self) -> CacheStats {
         self.cache.stats()
     }
@@ -272,6 +255,7 @@ impl CachedBatchEmbedder {
     }
 
     /// Get cache reference
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn cache(&self) -> &EmbeddingCache {
         &self.cache
     }
@@ -285,7 +269,10 @@ mod tests {
     #[test]
     fn test_cache_creation() {
         let cache = EmbeddingCache::new();
-        assert_eq!(cache.max_memory_mb, 500);
+        assert_eq!(
+            cache.max_memory_mb,
+            crate::constants::DEFAULT_CACHE_MAX_MEMORY_MB
+        );
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
     }

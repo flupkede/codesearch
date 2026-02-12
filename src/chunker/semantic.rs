@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::{Chunk, ChunkKind, Chunker, DEFAULT_CONTEXT_LINES};
+use crate::cache::normalize_path;
 use crate::chunker::extractor::{get_extractor, LanguageExtractor};
 use crate::chunker::parser::CodeParser;
 use crate::file::Language;
@@ -57,7 +58,7 @@ impl SemanticChunker {
         let mut definition_chunks = Vec::new();
         let mut gap_tracker = GapTracker::new(content);
 
-        let file_context = format!("File: {}", path.display());
+        let file_context = format!("File: {}", normalize_path(path));
         self.visit_node(
             parsed.root_node(),
             parsed.source().as_bytes(),
@@ -138,6 +139,41 @@ impl SemanticChunker {
             // Mark this range as covered (not a gap)
             gap_tracker.mark_covered(node.start_position().row, node.end_position().row);
 
+            // Also mark preceding doc comments and attributes as covered
+            // (they belong to this definition, not to a gap)
+            let mut prev = node.prev_named_sibling();
+            while let Some(sibling) = prev {
+                let sib_kind = sibling.kind();
+                if sib_kind == "line_comment"
+                    || sib_kind == "block_comment"
+                    || sib_kind == "attribute_item"
+                    || sib_kind == "attribute"
+                    || sib_kind == "decorator"
+                {
+                    if let Ok(text) = sibling.utf8_text(source) {
+                        let text = text.trim();
+                        // Only mark doc comments (///, //!, /**, /*!), attributes (#[...]),
+                        // and decorators (@...) as covered — not regular comments
+                        if text.starts_with("///")
+                            || text.starts_with("//!")
+                            || text.starts_with("/**")
+                            || text.starts_with("/*!")
+                            || text.starts_with("#[")
+                            || text.starts_with("@")
+                        {
+                            gap_tracker.mark_covered(
+                                sibling.start_position().row,
+                                sibling.end_position().row,
+                            );
+                            prev = sibling.prev_named_sibling();
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                break;
+            }
+
             // Extract metadata using the language extractor
             let kind = extractor.classify(node);
             let name = extractor.extract_name(node, source);
@@ -200,7 +236,7 @@ impl SemanticChunker {
         let mut chunks = Vec::new();
         let stride = (self.max_chunk_lines - self.overlap_lines).max(1);
 
-        let path_str = path.to_string_lossy().to_string();
+        let path_str = normalize_path(path);
         let context = vec![format!("File: {}", path_str)];
 
         let mut i = 0;
@@ -341,7 +377,7 @@ impl<'a> GapTracker<'a> {
     /// Extract gap chunks (uncovered regions)
     fn extract_gaps(&self, path: &Path) -> Vec<Chunk> {
         let mut gaps = Vec::new();
-        let path_str = path.to_string_lossy().to_string();
+        let path_str = normalize_path(path);
         let context = vec![format!("File: {}", path_str)];
 
         let mut gap_start: Option<usize> = None;
@@ -362,8 +398,10 @@ impl<'a> GapTracker<'a> {
                     // Only create chunk if gap is not empty/whitespace
                     if !gap_content.trim().is_empty() {
                         let kind = Self::classify_gap(&gap_content);
+                        let line_count = i - start;
                         let mut chunk = Chunk::new(gap_content, start, i, kind, path_str.clone());
                         chunk.context = context.clone();
+                        chunk.signature = Some(Self::gap_signature(kind, line_count));
                         gaps.push(chunk);
                     }
 
@@ -379,9 +417,11 @@ impl<'a> GapTracker<'a> {
 
             if !gap_content.trim().is_empty() {
                 let kind = Self::classify_gap(&gap_content);
+                let line_count = self.lines.len() - start;
                 let mut chunk =
                     Chunk::new(gap_content, start, self.lines.len(), kind, path_str.clone());
                 chunk.context = context.clone();
+                chunk.signature = Some(Self::gap_signature(kind, line_count));
                 gaps.push(chunk);
             }
         }
@@ -389,9 +429,20 @@ impl<'a> GapTracker<'a> {
         gaps
     }
 
+    /// Generate a descriptive signature for a gap chunk
+    fn gap_signature(kind: ChunkKind, line_count: usize) -> String {
+        match kind {
+            ChunkKind::Imports => format!("imports ({} lines)", line_count),
+            ChunkKind::ModuleDocs => format!("module docs ({} lines)", line_count),
+            ChunkKind::Comment => format!("comment block ({} lines)", line_count),
+            _ => format!("block ({} lines)", line_count),
+        }
+    }
+
     /// Classify what kind of gap this is
     fn classify_gap(content: &str) -> ChunkKind {
         let trimmed = content.trim();
+        let total_lines = trimmed.lines().count();
 
         // Check if it's mostly imports
         let import_count = trimmed
@@ -405,13 +456,30 @@ impl<'a> GapTracker<'a> {
             })
             .count();
 
-        if import_count > trimmed.lines().count() / 2 {
-            return ChunkKind::Block; // Could add ChunkKind::Imports later
+        if total_lines > 0 && import_count > total_lines / 2 {
+            return ChunkKind::Imports;
         }
 
         // Check if it's module-level docs
         if trimmed.starts_with("//!") || trimmed.starts_with("/*!") {
-            return ChunkKind::Block; // Could add ChunkKind::ModuleDocs later
+            return ChunkKind::ModuleDocs;
+        }
+
+        // Check if it's mostly comments (single-line or block)
+        let comment_count = trimmed
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                line.starts_with("//")
+                    || line.starts_with("/*")
+                    || line.starts_with("*")
+                    || line.starts_with("#")  // Python/Shell comments
+                    || line.is_empty() // Blank lines within comment blocks
+            })
+            .count();
+
+        if total_lines > 0 && comment_count > total_lines / 2 {
+            return ChunkKind::Comment;
         }
 
         ChunkKind::Block

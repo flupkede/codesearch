@@ -173,7 +173,7 @@ mod tests {
 
         // Invalid UTF-8
         let invalid_path = dir.path().join("invalid.txt");
-        fs::write(&invalid_path, &[0xFF, 0xFE, 0xFD]).unwrap();
+        fs::write(&invalid_path, [0xFF, 0xFE, 0xFD]).unwrap();
         assert!(is_binary_by_content(&invalid_path));
     }
 

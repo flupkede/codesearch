@@ -1,19 +1,21 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-    Build script with automatic version incrementing.
+    Build script for codesearch with auto-versioning.
 
 .DESCRIPTION
-    This script builds the codesearch project and automatically increments
-    the version number in Cargo.toml after each successful build.
+    This script:
+    1. Checks if code has changed (via git diff)
+    2. Increments version in Cargo.toml only if code changed
+    3. Builds only if code changed
 
 .EXAMPLE
     .\build.ps1
-    Builds in debug mode and bumps version
+    Builds in debug mode
 
 .EXAMPLE
     .\build.ps1 -Release
-    Builds in release mode and bumps version
+    Builds in release mode
 #>
 
 param(
@@ -26,75 +28,70 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = $PSScriptRoot
 Set-Location $ScriptDir
 
-# Set build mode
-$BuildMode = if ($Release) { "release" } else { "debug" }
+# Check if code has changed
+Write-Host "Checking for code changes..." -ForegroundColor Cyan
+$ChangedFiles = git diff --name-only HEAD 2>&1
 
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "CodeSearch Build Script (Auto-Version)" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
-
-# Step 1: Get current version
-Write-Host "Step 1: Reading current version..." -ForegroundColor Yellow
-$cargoToml = Get-Content "Cargo.toml" -Raw
-if ($cargoToml -match 'version\s*=\s*"([^"]+)"') {
-    $currentVersion = $matches[1]
-    Write-Host "  Current version: $currentVersion" -ForegroundColor Green
-} else {
-    Write-Host "  ERROR: Could not find version in Cargo.toml" -ForegroundColor Red
-    exit 1
-}
-
-# Step 2: Build the project
-Write-Host ""
-Write-Host "Step 2: Building codesearch..." -ForegroundColor Yellow
-Write-Host "  Mode: $BuildMode" -ForegroundColor Gray
-
-$buildArgs = @("build", "--no-emit-missing-deps")
-if ($Release) {
-    $buildArgs += "--release"
-}
-
-$buildResult = & cargo @buildArgs 2>&1
-# Cargo returns 0 even with warnings, only fail on actual errors
-if ($LASTEXITCODE -ne 0 -and $buildResult -match "error\[") {
-    Write-Host ""
-    Write-Host "  ✗ Build failed!" -ForegroundColor Red
-    Write-Host ""
-    Write-Host $buildResult
-    exit $LASTEXITCODE
-}
-
-Write-Host "  ✓ Build successful!" -ForegroundColor Green
-
-# Step 3: Bump version
-Write-Host ""
-Write-Host "Step 3: Bumping version..." -ForegroundColor Yellow
-
-# Determine version bump level (patch for builds)
-$bumpArgs = @("bump", "patch")
-
-$bumpOutput = & cargo @bumpArgs 2>&1
+# Check if git command failed (exit code not 0, and not just "no changes" output)
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "  WARNING: Version bump failed: $bumpOutput" -ForegroundColor Yellow
-    Write-Host "  Continuing with current version..." -ForegroundColor Yellow
-} else {
-    # Read new version
-    $newCargoToml = Get-Content "Cargo.toml" -Raw
-    if ($newCargoToml -match 'version\s*=\s*"([^"]+)"') {
-        $newVersion = $matches[1]
-        Write-Host "  ✓ Version bumped: $currentVersion → $newVersion" -ForegroundColor Green
+    # If it's not just "no changes detected", it's an actual error
+    if ($ChangedFiles -notmatch "^fatal:") {
+        Write-Host "ERROR: git diff failed with exit code $LASTEXITCODE" -ForegroundColor Red
+        Write-Host "Output: $ChangedFiles" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+    # If it's "fatal:" (e.g., not a git repo), exit with error
+    if ($ChangedFiles -match "^fatal:") {
+        Write-Host "ERROR: git diff failed: $ChangedFiles" -ForegroundColor Red
+        exit 1
     }
 }
 
-# Step 4: Summary
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Build Summary" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Mode: $BuildMode" -ForegroundColor Gray
-Write-Host "  Version: $currentVersion" -ForegroundColor Gray
-Write-Host "  Executable: target/$BuildMode/codesearch.exe" -ForegroundColor Gray
-Write-Host ""
-Write-Host "✓ Build completed successfully!" -ForegroundColor Green
-Write-Host ""
+if (-not $ChangedFiles) {
+    Write-Host "No changes detected, skipping build" -ForegroundColor Green
+    exit 0
+}
+
+Write-Host "Changes detected" -ForegroundColor Yellow
+
+# Increment version in Cargo.toml FIRST
+$CargoToml = Join-Path $ScriptDir "Cargo.toml"
+if (Test-Path $CargoToml) {
+    $Lines = Get-Content $CargoToml
+    $NewLines = @()
+    $VersionUpdated = $false
+    
+    foreach ($Line in $Lines) {
+        if (-not $VersionUpdated -and $Line -match '^version\s*=\s*"(\d+\.\d+)\.(\d+)"') {
+            $Major = $Matches[1]
+            $Patch = [int]$Matches[2]
+            $NewPatch = $Patch + 1
+            $NewVersion = "$Major.$NewPatch"
+            $Line = "version = `"$NewVersion`""
+            $VersionUpdated = $true
+            Write-Host "Version incremented to $NewVersion" -ForegroundColor Green
+        }
+        $NewLines += $Line
+    }
+    
+    if ($VersionUpdated) {
+        $NewLines | Out-File -FilePath $CargoToml -Encoding utf8
+    }
+}
+
+# Build
+$BuildMode = if ($Release) { "release" } else { "debug" }
+Write-Host "Building in $BuildMode mode..." -ForegroundColor Yellow
+
+if ($Release) {
+    & cargo build --release
+} else {
+    & cargo build
+}
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Build failed!" -ForegroundColor Red
+    exit $LASTEXITCODE
+}
+
+Write-Host "✓ Build completed: target/$BuildMode/codesearch.exe" -ForegroundColor Green
