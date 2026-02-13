@@ -130,11 +130,20 @@ pub fn read_metadata(db_path: &Path) -> Option<(String, usize, Option<String>)> 
 pub fn detect_identifiers(query: &str) -> Vec<String> {
     let mut identifiers = Vec::new();
     for token in query.split_whitespace() {
-        let is_pascal = token.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+        let is_pascal = token
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false)
             && token.chars().any(|c| c.is_lowercase())
             && !["Find", "Show", "Get", "Where", "How", "What", "All"].contains(&token);
-        let is_snake = token.contains('_') && token.chars().all(|c| c.is_alphanumeric() || c == '_');
-        let is_camel = token.chars().next().map(|c| c.is_lowercase()).unwrap_or(false)
+        let is_snake =
+            token.contains('_') && token.chars().all(|c| c.is_alphanumeric() || c == '_');
+        let is_camel = token
+            .chars()
+            .next()
+            .map(|c| c.is_lowercase())
+            .unwrap_or(false)
             && token.chars().any(|c| c.is_uppercase());
 
         if is_pascal || is_snake || is_camel {
@@ -146,13 +155,34 @@ pub fn detect_identifiers(query: &str) -> Vec<String> {
 
 /// Detects structural intent in user queries (e.g., "class X", "function foo")
 /// Returns the ChunkKind that matches the intent, if any
+///
+/// This function now only returns a kind when the query contains BOTH:
+/// 1. A structural keyword (class, struct, function, method, enum, interface, trait)
+/// 2. A PascalCase or snake_case identifier suggesting a specific type/function
+///
+/// This prevents excessive noise where "enum" would boost ALL enums in results
 pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind> {
     use crate::chunker::ChunkKind;
 
     let query_lower = query.to_lowercase();
 
-    if query_lower.contains("class ") || query_lower.contains("struct ") {
+    // Check if query contains a PascalCase or snake_case identifier
+    // This indicates the user is looking for a specific type/function, not just any of that kind
+    let has_identifier = contains_identifier(query);
+
+    eprintln!(
+        "🔍 detect_structural_intent: query='{}', has_identifier={}",
+        query, has_identifier
+    );
+
+    if !has_identifier {
+        return None; // No specific identifier - don't apply kind boost
+    }
+
+    let kind = if query_lower.contains("class ") {
         Some(ChunkKind::Class)
+    } else if query_lower.contains("struct ") {
+        Some(ChunkKind::Struct)
     } else if query_lower.contains("function ") || query_lower.contains("fn ") {
         Some(ChunkKind::Function)
     } else if query_lower.contains("method ") {
@@ -165,13 +195,54 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
         Some(ChunkKind::Trait)
     } else {
         None
+    };
+
+    eprintln!("🔍 detect_structural_intent: kind={:?}", kind);
+    kind
+}
+
+/// Checks if query contains a PascalCase or snake_case identifier
+/// indicating a specific type/function name is being searched for
+///
+/// Simple heuristic without regex dependency:
+/// - PascalCase: contains uppercase letter followed by lowercase/digit
+/// - snake_case: contains underscore with lowercase letters around it
+/// - camelCase: contains lowercase letter followed by uppercase letter
+fn contains_identifier(query: &str) -> bool {
+    let chars: Vec<char> = query.chars().collect();
+
+    // Look for PascalCase: uppercase letter followed by lowercase letter or digit
+    for i in 0..chars.len().saturating_sub(1) {
+        if chars[i].is_uppercase() && (chars[i + 1].is_lowercase() || chars[i + 1].is_ascii_digit())
+        {
+            return true;
+        }
     }
+
+    // Look for snake_case: underscore surrounded by lowercase letters
+    for i in 1..chars.len().saturating_sub(1) {
+        if chars[i] == '_' && chars[i - 1].is_lowercase() && chars[i + 1].is_lowercase() {
+            return true;
+        }
+    }
+
+    // Look for camelCase: lowercase letter followed by uppercase letter
+    for i in 0..chars.len().saturating_sub(1) {
+        if chars[i].is_lowercase() && chars[i + 1].is_uppercase() {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Boosts results that match a specific ChunkKind by a factor
-pub fn boost_kind(results: &mut Vec<crate::vectordb::SearchResult>, target_kind: crate::chunker::ChunkKind) {
+pub fn boost_kind(
+    results: &mut Vec<crate::vectordb::SearchResult>,
+    target_kind: crate::chunker::ChunkKind,
+) {
     let boost_factor = 0.15; // 15% boost for matching kind
-    // Convert ChunkKind to string for comparison
+                             // Convert ChunkKind to string for comparison
     let target_kind_str = format!("{:?}", target_kind);
     for result in results.iter_mut() {
         if result.kind == target_kind_str {
@@ -317,26 +388,27 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     }
 
     // Read model metadata from database FIRST (needed for sync)
-    let (model_type, dimensions, primary_language) = if let Some(ref model_name) = options.model_override {
-        // User specified a model - use it (warning: may not match indexed data!)
-        let mt = ModelType::parse(model_name).unwrap_or_default();
-        (mt, mt.dimensions(), None)
-    } else if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
-        // Use model from metadata
-        if let Some(mt) = ModelType::parse(&model_name) {
-            (mt, dims, lang)
+    let (model_type, dimensions, primary_language) =
+        if let Some(ref model_name) = options.model_override {
+            // User specified a model - use it (warning: may not match indexed data!)
+            let mt = ModelType::parse(model_name).unwrap_or_default();
+            (mt, mt.dimensions(), None)
+        } else if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
+            // Use model from metadata
+            if let Some(mt) = ModelType::parse(&model_name) {
+                (mt, dims, lang)
+            } else {
+                // Model name not recognized, fall back to default
+                eprintln!(
+                    "{}",
+                    "⚠️  Unknown model in metadata, using default".yellow()
+                );
+                (ModelType::default(), 384, None)
+            }
         } else {
-            // Model name not recognized, fall back to default
-            eprintln!(
-                "{}",
-                "⚠️  Unknown model in metadata, using default".yellow()
-            );
+            // No metadata, fall back to default
             (ModelType::default(), 384, None)
-        }
-    } else {
-        // No metadata, fall back to default
-        (ModelType::default(), 384, None)
-    };
+        };
 
     // Perform incremental sync if requested (after we know the model)
     if options.sync {
@@ -419,19 +491,23 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
                 if identifiers.is_empty() {
                     // No identifiers - standard hybrid search
-                    let fts_results = fts_store.search(query, retrieval_limit, structural_intent)?;
+                    let fts_results =
+                        fts_store.search(query, retrieval_limit, structural_intent)?;
                     let k = options.rrf_k.unwrap_or(DEFAULT_RRF_K as usize) as f32;
                     rrf_fusion(&vector_results, &fts_results, k)
                 } else {
                     // Has identifiers - use exact match boosting
-                    let fts_results = fts_store.search(query, retrieval_limit, structural_intent)?;
+                    let fts_results =
+                        fts_store.search(query, retrieval_limit, structural_intent)?;
 
                     // Search for each identifier and combine exact results
                     let mut all_exact_results = Vec::new();
                     let mut seen_exact_ids = std::collections::HashSet::new();
 
                     for identifier in &identifiers {
-                        if let Ok(exact_matches) = fts_store.search_exact(identifier, retrieval_limit, structural_intent) {
+                        if let Ok(exact_matches) =
+                            fts_store.search_exact(identifier, retrieval_limit, structural_intent)
+                        {
                             for exact_match in exact_matches {
                                 // Deduplicate exact results by chunk ID
                                 if seen_exact_ids.insert(exact_match.chunk_id) {
@@ -507,7 +583,10 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         let lang_boost = 0.2; // Boost results from primary language by 20%
         for result in results.iter_mut() {
             // Detect language from file path
-            let file_lang = format!("{:?}", Language::from_path(std::path::Path::new(&result.path)));
+            let file_lang = format!(
+                "{:?}",
+                Language::from_path(std::path::Path::new(&result.path))
+            );
             if file_lang == *lang {
                 result.score *= 1.0 + lang_boost;
             }
@@ -526,7 +605,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     if !identifiers.is_empty() && results.is_empty() {
         eprintln!(
             "{}",
-            format!("❓ No exact matches found for identifiers: {}", identifiers.join(", ")).yellow()
+            format!(
+                "❓ No exact matches found for identifiers: {}",
+                identifiers.join(", ")
+            )
+            .yellow()
         );
         eprintln!("{}", "  Try using broader search terms or running `codesearch index --sync` if the codebase changed.".dimmed());
     }

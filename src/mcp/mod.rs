@@ -254,7 +254,10 @@ impl CodesearchService {
 
         tracing::debug!(
             "MCP: Query analysis - identifiers: {:?}, structural_intent: {:?}, rrf_k: ({}, {})",
-            identifiers, structural_intent, vector_k, fts_k
+            identifiers,
+            structural_intent,
+            vector_k,
+            fts_k
         );
 
         // Perform FTS search and fusion
@@ -272,7 +275,9 @@ impl CodesearchService {
                     // Has identifiers: also do exact search per identifier
                     let mut all_exact: Vec<crate::fts::FtsResult> = Vec::new();
                     for ident in &identifiers {
-                        if let Ok(exact) = fts_store.search_exact(ident, limit * 2, structural_intent.clone()) {
+                        if let Ok(exact) =
+                            fts_store.search_exact(ident, limit * 2, structural_intent.clone())
+                        {
                             for r in exact {
                                 if !all_exact.iter().any(|e| e.chunk_id == r.chunk_id) {
                                     all_exact.push(r);
@@ -298,8 +303,10 @@ impl CodesearchService {
                 };
 
                 // Map FusedResult back to SearchResult
-                let chunk_to_result: std::collections::HashMap<u32, &crate::vectordb::SearchResult> =
-                    vector_results.iter().map(|r| (r.id, r)).collect();
+                let chunk_to_result: std::collections::HashMap<
+                    u32,
+                    &crate::vectordb::SearchResult,
+                > = vector_results.iter().map(|r| (r.id, r)).collect();
 
                 let mut mapped: Vec<crate::vectordb::SearchResult> = Vec::new();
                 for f in fused.into_iter().take(limit) {
@@ -321,12 +328,19 @@ impl CodesearchService {
         // Apply language boost (improvement 2)
         if let Some((_, _, Some(primary_lang))) = crate::search::read_metadata(&self.db_path) {
             for result in &mut results {
-                let file_lang = format!("{:?}", Language::from_path(std::path::Path::new(&result.path)));
+                let file_lang = format!(
+                    "{:?}",
+                    Language::from_path(std::path::Path::new(&result.path))
+                );
                 if file_lang.to_lowercase() == primary_lang.to_lowercase() {
                     result.score *= 1.2;
                 }
             }
-            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
 
         // Apply kind boost (improvement 3)

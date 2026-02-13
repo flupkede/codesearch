@@ -451,17 +451,19 @@ impl FtsStore {
 
     /// Search for exact identifier matches (boosted)
     ///
-    /// Searches signature field with exact term (3x boost) and content field.
     /// Used for improving exact name matching (e.g., "BaseRestClient", "UserService").
     ///
-    /// If `target_kind` is provided, boosts results matching that ChunkKind.
+    /// If `target_kind` is provided, uses selective boosting:
+    /// - When both identifier AND kind are present, applies MUST constraint: items must match
+    ///   the identifier in the signature field AND the kind (prevents boosting ALL items of that kind)
+    /// - Otherwise, uses standard boost on the kind field
     pub fn search_exact(
         &self,
         identifier: &str,
         limit: usize,
         target_kind: Option<ChunkKind>,
     ) -> Result<Vec<FtsResult>> {
-        use tantivy::query::{BooleanQuery, BoostQuery, TermQuery};
+        use tantivy::query::{BooleanQuery, BoostQuery, Occur, TermQuery};
         use tantivy::schema::IndexRecordOption;
 
         let searcher = self.reader.searcher();
@@ -477,19 +479,27 @@ impl FtsStore {
         // Boost signature matches 3x over content matches
         let boosted_sig = BoostQuery::new(Box::new(term_query), 3.0);
 
-        // Add kind field query if structural intent detected
-        let mut queries: Vec<Box<dyn tantivy::query::Query>> =
-            vec![Box::new(boosted_sig), Box::new(content_query)];
-        if let Some(ref kind) = target_kind {
-            // Add term query for kind field with high boost
+        // Build query based on whether we have both identifier and kind
+        let combined = if let Some(ref kind) = target_kind {
+            // SELECTIVE MODE: When both identifier AND kind are detected,
+            // create a MUST query that requires BOTH conditions.
+            // This prevents boosting ALL items of that kind (e.g., all enums when searching for "ChunkKind enum")
             let kind_str = format!("{:?}", kind);
             let kind_term = Term::from_field_text(self.kind_field, &kind_str);
             let kind_query = TermQuery::new(kind_term, IndexRecordOption::Basic);
-            let boosted_kind = BoostQuery::new(Box::new(kind_query), 2.5);
-            queries.push(Box::new(boosted_kind));
-        }
 
-        let combined = BooleanQuery::union(queries);
+            // Combine: (signature OR content) AND kind
+            // This means: only items that match the identifier AND are of the target kind get boosted
+            let sig_or_content =
+                BooleanQuery::union(vec![Box::new(boosted_sig), Box::new(content_query)]);
+            let mut and_queries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![];
+            and_queries.push((Occur::Must, Box::new(sig_or_content)));
+            and_queries.push((Occur::Must, Box::new(kind_query)));
+            BooleanQuery::new(and_queries)
+        } else {
+            // STANDARD MODE: Just search for the identifier in signature and content
+            BooleanQuery::union(vec![Box::new(boosted_sig), Box::new(content_query)])
+        };
 
         let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit))?;
 
