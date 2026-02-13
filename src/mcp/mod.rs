@@ -25,8 +25,11 @@ fn normalize_path_for_compare(path: &str) -> String {
         .replace('\\', "/")
 }
 use crate::embed::{EmbeddingService, ModelType};
+use crate::file::Language;
 use crate::fts::FtsStore;
 use crate::index::{IndexManager, SharedStores};
+use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, EXACT_MATCH_RRF_K};
+use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
 use crate::vectordb::VectorStore;
 
 // Re-export types
@@ -202,10 +205,10 @@ impl CodesearchService {
             "MCP: Searching with {} dimensions...",
             query_embedding.len()
         );
-        let results = if let Some(ref stores) = self.shared_stores {
+        let vector_results = if let Some(ref stores) = self.shared_stores {
             // Use shared store with read lock
             let store = stores.vector_store.read().await;
-            match store.search(&query_embedding, limit) {
+            match store.search(&query_embedding, limit * 3) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("MCP: Search failed (shared store): {:?}", e);
@@ -228,7 +231,7 @@ impl CodesearchService {
                     ))]));
                 }
             };
-            match store.search(&query_embedding, limit) {
+            match store.search(&query_embedding, limit * 3) {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("MCP: Search failed: {:?}", e);
@@ -240,7 +243,98 @@ impl CodesearchService {
             }
         };
 
-        tracing::debug!("MCP: Found {} results", results.len());
+        tracing::debug!("MCP: Found {} vector results", vector_results.len());
+
+        // --- Hybrid search with all improvements ---
+
+        // Detect identifiers and structural intent from query
+        let identifiers = detect_identifiers(&request.query);
+        let structural_intent = detect_structural_intent(&request.query);
+        let (vector_k, fts_k) = adapt_rrf_k(&request.query);
+
+        tracing::debug!(
+            "MCP: Query analysis - identifiers: {:?}, structural_intent: {:?}, rrf_k: ({}, {})",
+            identifiers, structural_intent, vector_k, fts_k
+        );
+
+        // Perform FTS search and fusion
+        let mut results = match FtsStore::new(&self.db_path) {
+            Ok(fts_store) => {
+                // FTS search
+                let fts_results = fts_store
+                    .search(&request.query, limit * 3, structural_intent.clone())
+                    .unwrap_or_default();
+
+                let fused = if identifiers.is_empty() {
+                    // No identifiers: standard RRF fusion
+                    rrf_fusion(&vector_results, &fts_results, vector_k as f32)
+                } else {
+                    // Has identifiers: also do exact search per identifier
+                    let mut all_exact: Vec<crate::fts::FtsResult> = Vec::new();
+                    for ident in &identifiers {
+                        if let Ok(exact) = fts_store.search_exact(ident, limit * 2, structural_intent.clone()) {
+                            for r in exact {
+                                if !all_exact.iter().any(|e| e.chunk_id == r.chunk_id) {
+                                    all_exact.push(r);
+                                }
+                            }
+                        }
+                    }
+
+                    tracing::debug!(
+                        "MCP: FTS found {} results, exact found {} results",
+                        fts_results.len(),
+                        all_exact.len()
+                    );
+
+                    rrf_fusion_with_exact(
+                        &vector_results,
+                        &fts_results,
+                        &all_exact,
+                        vector_k as f32,
+                        fts_k as f32,
+                        EXACT_MATCH_RRF_K,
+                    )
+                };
+
+                // Map FusedResult back to SearchResult
+                let chunk_to_result: std::collections::HashMap<u32, &crate::vectordb::SearchResult> =
+                    vector_results.iter().map(|r| (r.id, r)).collect();
+
+                let mut mapped: Vec<crate::vectordb::SearchResult> = Vec::new();
+                for f in fused.into_iter().take(limit) {
+                    if let Some(result) = chunk_to_result.get(&f.chunk_id) {
+                        let mut r = (*result).clone();
+                        r.score = f.rrf_score;
+                        mapped.push(r);
+                    }
+                }
+                mapped
+            }
+            Err(e) => {
+                // FTS unavailable, fall back to vector-only results
+                tracing::warn!("MCP: FTS store unavailable, using vector-only: {:?}", e);
+                vector_results.into_iter().take(limit).collect()
+            }
+        };
+
+        // Apply language boost (improvement 2)
+        if let Some((_, _, Some(primary_lang))) = crate::search::read_metadata(&self.db_path) {
+            for result in &mut results {
+                let file_lang = format!("{:?}", Language::from_path(std::path::Path::new(&result.path)));
+                if file_lang.to_lowercase() == primary_lang.to_lowercase() {
+                    result.score *= 1.2;
+                }
+            }
+            results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // Apply kind boost (improvement 3)
+        if let Some(target_kind) = structural_intent {
+            boost_kind(&mut results, target_kind);
+        }
+
+        tracing::debug!("MCP: Final {} results after hybrid search", results.len());
 
         if results.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
