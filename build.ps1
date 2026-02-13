@@ -28,6 +28,10 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = $PSScriptRoot
 Set-Location $ScriptDir
 
+# Determine build mode and target exe path
+$BuildMode = if ($Release) { "release" } else { "debug" }
+$TargetExe = Join-Path $ScriptDir ".." "target" $BuildMode "codesearch.exe"
+
 # Check if code has changed
 Write-Host "Checking for code changes..." -ForegroundColor Cyan
 $ChangedFiles = git diff --name-only HEAD 2>&1
@@ -47,9 +51,14 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
+# Only skip build if: 1) no changes AND 2) target exe exists
 if (-not $ChangedFiles) {
-    Write-Host "No changes detected, skipping build" -ForegroundColor Green
-    exit 0
+    if (Test-Path $TargetExe) {
+        Write-Host "No changes detected and build exists ($($TargetExe.Name)), skipping build" -ForegroundColor Green
+        exit 0
+    } else {
+        Write-Host "No changes detected but build artifact not found, building..." -ForegroundColor Yellow
+    }
 }
 
 Write-Host "Changes detected" -ForegroundColor Yellow
@@ -80,7 +89,6 @@ if (Test-Path $CargoToml) {
 }
 
 # Build
-$BuildMode = if ($Release) { "release" } else { "debug" }
 Write-Host "Building in $BuildMode mode..." -ForegroundColor Yellow
 
 if ($Release) {
