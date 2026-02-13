@@ -105,7 +105,7 @@ fn get_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
 }
 
 /// Read model metadata from database
-fn read_metadata(db_path: &Path) -> Option<(String, usize, Option<String>)> {
+pub fn read_metadata(db_path: &Path) -> Option<(String, usize, Option<String>)> {
     let metadata_path = db_path.join("metadata.json");
     if let Ok(content) = std::fs::read_to_string(&metadata_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -127,7 +127,7 @@ fn read_metadata(db_path: &Path) -> Option<(String, usize, Option<String>)> {
 /// - PascalCase (Class, Struct, Interface)
 /// - snake_case (function, method)
 /// - camelCase (property, variable)
-fn detect_identifiers(query: &str) -> Vec<String> {
+pub fn detect_identifiers(query: &str) -> Vec<String> {
     let mut identifiers = Vec::new();
     for token in query.split_whitespace() {
         let is_pascal = token.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
@@ -146,7 +146,7 @@ fn detect_identifiers(query: &str) -> Vec<String> {
 
 /// Detects structural intent in user queries (e.g., "class X", "function foo")
 /// Returns the ChunkKind that matches the intent, if any
-fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind> {
+pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind> {
     use crate::chunker::ChunkKind;
 
     let query_lower = query.to_lowercase();
@@ -169,7 +169,7 @@ fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind> {
 }
 
 /// Boosts results that match a specific ChunkKind by a factor
-fn boost_kind(results: &mut Vec<crate::vectordb::SearchResult>, target_kind: crate::chunker::ChunkKind) {
+pub fn boost_kind(results: &mut Vec<crate::vectordb::SearchResult>, target_kind: crate::chunker::ChunkKind) {
     let boost_factor = 0.15; // 15% boost for matching kind
     // Convert ChunkKind to string for comparison
     let target_kind_str = format!("{:?}", target_kind);
@@ -285,7 +285,7 @@ fn expand_query(query: &str) -> Vec<String> {
 
 /// Detect query type and adapt RRF-k accordingly
 /// Returns (vector_k, fts_k) based on query characteristics
-fn adapt_rrf_k(query: &str) -> (f64, f64) {
+pub fn adapt_rrf_k(query: &str) -> (f64, f64) {
     let has_identifiers = !detect_identifiers(query).is_empty();
     let has_structural_intent = detect_structural_intent(query).is_some();
 
