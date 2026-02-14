@@ -241,6 +241,7 @@ impl Default for QueryCache {
 
 /// Query cache statistics
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Reserved for debugging/monitoring API
 pub struct QueryCacheStats {
     pub size: usize,
     pub hits: u64,
@@ -248,6 +249,7 @@ pub struct QueryCacheStats {
 }
 
 impl QueryCacheStats {
+    #[allow(dead_code)] // Part of debugging/monitoring API
     pub fn hit_rate(&self) -> f32 {
         let total = self.hits + self.misses;
         if total == 0 {
@@ -256,6 +258,7 @@ impl QueryCacheStats {
         self.hits as f32 / total as f32
     }
 
+    #[allow(dead_code)] // Part of debugging/monitoring API
     pub fn total_requests(&self) -> u64 {
         self.hits + self.misses
     }
