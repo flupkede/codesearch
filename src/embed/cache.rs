@@ -130,6 +130,137 @@ impl Default for EmbeddingCache {
     }
 }
 
+/// Query embedding cache for fast repeated searches
+///
+/// Caches query embeddings to avoid re-embedding the same queries.
+/// Query reuse is very high in interactive sessions (e.g., "authentication",
+/// "handle_file_modified"). Uses Moka LRU cache with automatic eviction.
+pub struct QueryCache {
+    cache: Cache<String, Arc<Vec<f32>>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl QueryCache {
+    /// Create a new query cache with default limit (50MB)
+    pub fn new() -> Self {
+        Self::with_memory_limit_mb(50)
+    }
+
+    /// Create a query cache with specified memory limit in MB
+    pub fn with_memory_limit_mb(max_memory_mb: usize) -> Self {
+        let max_weight = (max_memory_mb * 1024 * 1024) as u64;
+
+        let cache = Cache::builder()
+            .max_capacity(max_weight)
+            .weigher(|_key: &String, value: &Arc<Vec<f32>>| {
+                (value.len() * std::mem::size_of::<f32>()) as u32
+            })
+            .build();
+
+        Self {
+            cache,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// Get query embedding from cache
+    pub fn get(&self, query: &str) -> Option<Vec<f32>> {
+        if let Some(embedding) = self.cache.get(query) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            Some(embedding.as_ref().clone())
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Store query embedding in cache
+    pub fn put(&self, query: &str, embedding: Vec<f32>) {
+        self.cache.insert(query.to_string(), Arc::new(embedding));
+    }
+
+    /// Check if cache contains query embedding
+    #[allow(dead_code)]
+    pub fn contains(&self, query: &str) -> bool {
+        self.cache.contains_key(query)
+    }
+
+    /// Get cache statistics
+    pub fn stats(&self) -> QueryCacheStats {
+        QueryCacheStats {
+            size: self.cache.entry_count() as usize,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Clear cache
+    #[allow(dead_code)]
+    pub fn clear(&self) {
+        self.cache.invalidate_all();
+        self.cache.run_pending_tasks();
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+    }
+
+    /// Get cache size
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.cache.run_pending_tasks();
+        self.cache.entry_count() as usize
+    }
+
+    /// Check if cache is empty
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.cache.run_pending_tasks();
+        self.cache.entry_count() == 0
+    }
+
+    /// Get memory usage in bytes
+    #[allow(dead_code)]
+    pub fn memory_usage_bytes(&self) -> usize {
+        self.cache.run_pending_tasks();
+        self.cache.weighted_size() as usize
+    }
+
+    /// Get memory usage in MB
+    #[allow(dead_code)]
+    pub fn memory_usage_mb(&self) -> f64 {
+        self.memory_usage_bytes() as f64 / (1024.0 * 1024.0)
+    }
+}
+
+impl Default for QueryCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Query cache statistics
+#[derive(Debug, Clone)]
+pub struct QueryCacheStats {
+    pub size: usize,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl QueryCacheStats {
+    pub fn hit_rate(&self) -> f32 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            return 0.0;
+        }
+        self.hits as f32 / total as f32
+    }
+
+    pub fn total_requests(&self) -> u64 {
+        self.hits + self.misses
+    }
+}
+
 /// Cache statistics
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Part of public API for debugging/monitoring

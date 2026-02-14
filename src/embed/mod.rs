@@ -3,7 +3,7 @@ mod cache;
 mod embedder;
 
 pub use batch::{BatchEmbedder, EmbeddedChunk};
-pub use cache::{CacheStats, CachedBatchEmbedder};
+pub use cache::{CacheStats, CachedBatchEmbedder, QueryCache, QueryCacheStats};
 pub use embedder::{FastEmbedder, ModelType};
 
 use anyhow::Result;
@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 pub struct EmbeddingService {
     cached_embedder: CachedBatchEmbedder,
     model_type: ModelType,
+    query_cache: QueryCache,
 }
 
 impl EmbeddingService {
@@ -45,9 +46,13 @@ impl EmbeddingService {
         let cached_embedder =
             CachedBatchEmbedder::with_memory_limit(batch_embedder, cache_limit_mb);
 
+        // Initialize query cache (separate from chunk cache)
+        let query_cache = QueryCache::new();
+
         Ok(Self {
             cached_embedder,
             model_type,
+            query_cache,
         })
     }
 
@@ -59,14 +64,69 @@ impl EmbeddingService {
         self.cached_embedder.embed_chunks(chunks)
     }
 
-    /// Embed query text
+    /// Embed query text (with caching)
     pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
-        // Access the batch embedder's embedder via mutex
+        // Check query cache first
+        if let Some(cached) = self.query_cache.get(query) {
+            return Ok(cached);
+        }
+
+        // Cache miss - embed the query
         let embedder_arc = &self.cached_embedder.batch_embedder.embedder;
-        embedder_arc
+        let embedding = embedder_arc
             .lock()
             .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?
-            .embed_one(query)
+            .embed_one(query)?;
+
+        // Store in cache
+        self.query_cache.put(query, embedding.clone());
+
+        Ok(embedding)
+    }
+
+    /// Batch embed multiple query texts with caching (single ONNX call for misses)
+    pub fn embed_queries_batch(&mut self, queries: &[String]) -> Result<Vec<Vec<f32>>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total = queries.len();
+        let mut results = Vec::with_capacity(total);
+        let mut queries_to_embed = Vec::new();
+        let mut cache_indices = Vec::new();
+
+        // Check cache first
+        for (idx, query) in queries.iter().enumerate() {
+            if let Some(cached) = self.query_cache.get(query) {
+                results.push(cached);
+            } else {
+                queries_to_embed.push(query.clone());
+                cache_indices.push(idx);
+            }
+        }
+
+        // Batch embed remaining queries (single ONNX call)
+        if !queries_to_embed.is_empty() {
+            // Clone once before passing to embed_batch (which takes ownership)
+            let queries_for_caching = queries_to_embed.clone();
+            let embedder_arc = &self.cached_embedder.batch_embedder.embedder;
+            let mut embedder = embedder_arc
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?;
+
+            let new_embeddings = embedder.embed_batch(queries_to_embed)?;
+
+            // Store in cache and add to results
+            for (i, embedding) in new_embeddings.into_iter().enumerate() {
+                self.query_cache
+                    .put(&queries_for_caching[i], embedding.clone());
+
+                // Place at correct position
+                results.insert(cache_indices[i], embedding);
+            }
+        }
+
+        Ok(results)
     }
 
     /// Get embedding dimensions
@@ -88,6 +148,12 @@ impl EmbeddingService {
     #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn cache_stats(&self) -> CacheStats {
         self.cached_embedder.cache_stats()
+    }
+
+    /// Get query cache statistics
+    #[allow(dead_code)] // Part of public API for debugging/monitoring
+    pub fn query_cache_stats(&self) -> QueryCacheStats {
+        self.query_cache.stats()
     }
 }
 
