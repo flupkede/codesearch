@@ -1,7 +1,11 @@
 use super::batch::EmbeddedChunk;
 use crate::chunker::Chunk;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use heed::types::*;
+use heed::{Database, Env, EnvOpenOptions};
 use moka::sync::Cache;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -246,6 +250,204 @@ pub struct QueryCacheStats {
     pub size: usize,
     pub hits: u64,
     pub misses: u64,
+}
+
+impl QueryCacheStats {
+    #[allow(dead_code)] // Part of debugging/monitoring API
+    pub fn query_hit_rate(&self) -> f32 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            return 0.0;
+        }
+        self.hits as f32 / total as f32
+    }
+
+    #[allow(dead_code)] // Reserved for stats display
+    pub fn query_total_requests(&self) -> u64 {
+        self.hits + self.misses
+    }
+}
+
+/// Persistent embedding cache for fast branch switches
+///
+/// Stores embeddings on disk keyed by content hash, allowing embeddings to survive
+/// across MCP restarts and be reused when switching between branches. When a file
+/// changes, we check if we've already computed embeddings for that content before
+/// re-running ONNX inference.
+///
+/// Cache location: ~/.codesearch/embedding_cache/<model_short_name>/
+/// Key: content_hash (SHA256) → Vec<f32> (embedding vector)
+///
+/// This is separate from the in-memory EmbeddingCache which uses Moka for
+/// automatic memory management. The persistent cache provides long-term storage.
+pub struct PersistentEmbeddingCache {
+    env: Env,
+    db: Database<Str, SerdeBincode<Vec<f32>>>,
+    cache_dir: PathBuf,
+}
+
+impl PersistentEmbeddingCache {
+    /// Open persistent cache for a specific model
+    ///
+    /// Creates the cache directory if it doesn't exist and opens an LMDB
+    /// environment for storing embeddings. Each model has its own cache to avoid
+    /// mixing incompatible embeddings.
+    pub fn open(model_name: &str) -> Result<Self> {
+        let models_dir = crate::constants::get_global_models_cache_dir()?;
+        let cache_dir = models_dir
+            .parent() // ~/.codesearch/
+            .ok_or_else(|| anyhow::anyhow!("Could not get parent directory of models cache"))?
+            .join("embedding_cache")
+            .join(model_name);
+
+        std::fs::create_dir_all(&cache_dir).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create embedding cache directory {}: {}",
+                cache_dir.display(),
+                e
+            )
+        })?;
+
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(512 * 1024 * 1024) // 512MB — plenty for cache
+                .max_dbs(1)
+                .open(&cache_dir)?
+        };
+
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database(&mut wtxn, Some("embeddings"))?;
+        wtxn.commit()?;
+
+        Ok(Self { env, db, cache_dir })
+    }
+
+    /// Get embedding from cache by content hash
+    pub fn get(&self, content_hash: &str) -> Result<Option<Vec<f32>>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.db.get(&rtxn, content_hash)?)
+    }
+
+    /// Store embedding in cache
+    pub fn put(&self, content_hash: &str, embedding: &[f32]) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.db.put(&mut wtxn, content_hash, &embedding.to_vec())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Batch insert for efficiency (single transaction)
+    pub fn put_batch(&self, entries: &[(&str, &[f32])]) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        for (hash, embedding) in entries {
+            self.db.put(&mut wtxn, hash, &embedding.to_vec())?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Get cache statistics
+    pub fn stats(&self) -> Result<PersistentCacheStats> {
+        let rtxn = self.env.read_txn()?;
+        let count = self.db.len(&rtxn)?;
+        let file_size = std::fs::metadata(self.cache_dir.join("data.mdb"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let last_access = std::fs::metadata(self.cache_dir.join("data.mdb"))
+            .and_then(|m| m.modified())
+            .ok()
+            .map(|dt| DateTime::from(dt));
+        Ok(PersistentCacheStats {
+            entries: count as usize,
+            file_size_bytes: file_size,
+            last_access,
+        })
+    }
+
+    /// Evict oldest entries when cache exceeds max size
+    ///
+    /// Deletes first N entries to get back under limit. Returns number of
+    /// entries deleted. LMDB iteration order for string keys is insertion order.
+    pub fn evict_if_needed(&self, max_entries: usize) -> Result<usize> {
+        let rtxn = self.env.read_txn()?;
+        let count = self.db.len(&rtxn)? as usize;
+        drop(rtxn);
+
+        if count <= max_entries {
+            return Ok(0);
+        }
+
+        // Delete oldest entries (LMDB iteration order = insertion order for Str keys)
+        let to_delete = count - max_entries;
+
+        // Collect keys first to avoid borrow checker issues with iterator
+        let rtxn = self.env.read_txn()?;
+        let keys_to_delete: Vec<String> = self
+            .db
+            .iter(&rtxn)?
+            .take(to_delete)
+            .map(|result| {
+                result
+                    .map(|(key, _)| key.to_string())
+                    .map_err(|e| anyhow::anyhow!("Failed to collect key: {}", e))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        drop(rtxn);
+
+        // Now delete the collected keys
+        let mut wtxn = self.env.write_txn()?;
+        for key in &keys_to_delete {
+            self.db.delete(&mut wtxn, key)?;
+        }
+
+        wtxn.commit()?;
+        Ok(keys_to_delete.len())
+    }
+
+    /// Clear all cached embeddings
+    pub fn clear(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.db.clear(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Get number of entries in cache
+    pub fn len(&self) -> Result<usize> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.db.len(&rtxn)? as usize)
+    }
+
+    /// Check if cache is empty
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// Get cache directory path
+    #[allow(dead_code)] // Reserved for debugging
+    pub fn cache_dir(&self) -> &PathBuf {
+        &self.cache_dir
+    }
+}
+
+/// Persistent cache statistics
+#[derive(Debug, Clone)]
+pub struct PersistentCacheStats {
+    pub entries: usize,
+    pub file_size_bytes: u64,
+    pub last_access: Option<DateTime<Utc>>,
+}
+
+impl PersistentCacheStats {
+    /// Get file size in MB
+    pub fn file_size_mb(&self) -> f64 {
+        self.file_size_bytes as f64 / (1024.0 * 1024.0)
+    }
+
+    /// Get estimated memory size in MB (entries × 1.5KB)
+    pub fn estimated_memory_mb(&self) -> f64 {
+        self.entries as f64 * 1.536 / 1024.0
+    }
 }
 
 impl QueryCacheStats {

@@ -3,7 +3,10 @@ mod cache;
 mod embedder;
 
 pub use batch::{BatchEmbedder, EmbeddedChunk};
-pub use cache::{CacheStats, CachedBatchEmbedder, QueryCache, QueryCacheStats};
+pub use cache::{
+    CacheStats, CachedBatchEmbedder, PersistentCacheStats, PersistentEmbeddingCache, QueryCache,
+    QueryCacheStats,
+};
 pub use embedder::{FastEmbedder, ModelType};
 
 use anyhow::Result;
@@ -15,6 +18,7 @@ pub struct EmbeddingService {
     cached_embedder: CachedBatchEmbedder,
     model_type: ModelType,
     query_cache: QueryCache,
+    persistent_cache: Option<PersistentEmbeddingCache>,
 }
 
 impl EmbeddingService {
@@ -53,6 +57,7 @@ impl EmbeddingService {
             cached_embedder,
             model_type,
             query_cache,
+            persistent_cache: None,
         })
     }
 
@@ -154,6 +159,41 @@ impl EmbeddingService {
     #[allow(dead_code)] // Part of public API for debugging/monitoring
     pub fn query_cache_stats(&self) -> QueryCacheStats {
         self.query_cache.stats()
+    }
+
+    /// Initialize persistent cache for the current model
+    pub fn with_persistent_cache(&mut self) -> Result<()> {
+        if self.persistent_cache.is_none() {
+            let cache = PersistentEmbeddingCache::open(self.model_short_name())?;
+            self.persistent_cache = Some(cache);
+        }
+        Ok(())
+    }
+
+    /// Get persistent cache statistics
+    pub fn persistent_cache_stats(&self) -> Option<PersistentCacheStats> {
+        self.persistent_cache
+            .as_ref()
+            .map(|c| c.stats().ok())
+            .flatten()
+    }
+
+    /// Clear the persistent cache
+    pub fn clear_persistent_cache(&mut self) -> Result<()> {
+        if let Some(cache) = &mut self.persistent_cache {
+            cache.clear()?;
+        }
+        Ok(())
+    }
+
+    /// Get reference to persistent cache (if initialized)
+    pub fn persistent_cache(&self) -> Option<&PersistentEmbeddingCache> {
+        self.persistent_cache.as_ref()
+    }
+
+    /// Get mutable reference to persistent cache (if initialized)
+    pub fn persistent_cache_mut(&mut self) -> Option<&mut PersistentEmbeddingCache> {
+        self.persistent_cache.as_mut()
     }
 }
 

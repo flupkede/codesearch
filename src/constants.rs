@@ -100,6 +100,16 @@ pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 1024;
 /// Prevents unbounded growth and potential disk exhaustion.
 pub const MAX_LMDB_MAP_SIZE_MB: usize = 8192;
 
+/// Default maximum number of entries in persistent embedding cache.
+///
+/// The persistent embedding cache stores computed embeddings on disk keyed by
+/// content hash (SHA256), allowing fast branch switches by reusing embeddings
+/// across branches. Each entry is ~1.5KB (384 dims × 4 bytes), so:
+/// - 200,000 entries ≈ 300MB on disk
+/// - Sufficient for 10+ branches worth of embeddings
+/// Override with `CODESEARCH_EMBEDDING_CACHE_MAX_ENTRIES` environment variable.
+pub const DEFAULT_EMBEDDING_CACHE_MAX_ENTRIES: usize = 200_000;
+
 /// Default embedding cache memory limit in MB.
 ///
 /// The embedding cache stores recently computed embeddings in memory (Moka LRU cache)

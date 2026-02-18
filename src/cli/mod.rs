@@ -1,9 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::Read;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
-use crate::embed::ModelType;
+use crate::embed::{ModelType, PersistentCacheStats};
 use crate::search::SearchOptions;
 
 /// Index subcommands
@@ -28,6 +29,26 @@ pub enum IndexCommands {
 
     /// Show index status (local or global)
     List,
+}
+
+/// Cache subcommands
+#[derive(Subcommand, Debug)]
+pub enum CacheCommands {
+    /// Show persistent cache statistics
+    Stats {
+        /// Model name (e.g., minilm-l6-q, bge-small)
+        model: Option<String>,
+    },
+
+    /// Clear persistent cache
+    Clear {
+        /// Model name (e.g., minilm-l6-q, bge-small)
+        model: Option<String>,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 /// Fast, local semantic code search powered by Rust
@@ -188,6 +209,12 @@ pub enum Commands {
     Mcp {
         /// Path to project (defaults to current directory)
         path: Option<PathBuf>,
+    },
+
+    /// Manage persistent embedding cache
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
     },
 }
 
@@ -352,7 +379,148 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             }
             crate::mcp::run_mcp_server(path, cancel_token).await
         }
+        Commands::Cache { command } => {
+            match command {
+                CacheCommands::Stats { model } => run_cache_stats(model).await,
+                CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
+            }
+        }
     }
+}
+
+/// Show persistent cache statistics
+async fn run_cache_stats(model: Option<String>) -> Result<()> {
+    // Parse model name
+    let model_name = model.as_deref()
+        .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
+        .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
+
+    if model_name.is_none() {
+        eprintln!("Cache statistics for all models:");
+    }
+
+    // Get cache directory
+    let cache_dir = crate::constants::get_global_models_cache_dir()
+        .unwrap_or_default()
+        .join("embedding_cache");
+
+    if !cache_dir.exists() {
+        if let Some(name) = model_name {
+            eprintln!("No cache found for model: {}", name);
+        } else {
+            eprintln!("No cache directory found: {}", cache_dir.display());
+        }
+        return Ok(());
+    }
+
+    // Show stats for specific model or all models
+    if let Some(name) = model_name {
+        let model_cache_dir = cache_dir.join(name);
+        if !model_cache_dir.exists() {
+            eprintln!("No cache found for model: {}", name);
+            return Ok(());
+        }
+
+        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
+        let stats = cache.stats()?;
+
+        println!("Persistent Cache Statistics ({})", name);
+        println!("  Cache Directory: {}", model_cache_dir.display());
+        println!("  Total Entries: {}", stats.entries);
+        println!("  Database Size: {} bytes", stats.file_size_bytes);
+        println!("    Last Access: {}", stats.last_access.map(|dt| dt.to_rfc3339()).unwrap_or_else(|| "N/A".to_string()));
+    } else {
+        // Show stats for all models
+        let dir_entries = std::fs::read_dir(&cache_dir)?;
+        let mut model_count = 0;
+        let mut total_size = 0;
+
+        println!("Persistent Cache Statistics (All Models)");
+        for entry in dir_entries {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                let model_name = entry.file_name().to_string_lossy().to_string();
+                let cache = crate::embed::PersistentEmbeddingCache::open(&model_name)?;
+                let stats = cache.stats()?;
+                model_count += stats.entries;
+                total_size += stats.file_size_bytes;
+
+                println!("  {}:", model_name);
+                println!("    Entries: {}", stats.entries);
+                println!("    Size: {} bytes", stats.file_size_bytes);
+                println!("    Last Access: {}", stats.last_access.map(|dt| dt.to_rfc3339()).unwrap_or_else(|| "N/A".to_string()));
+            }
+        }
+        println!("Total: {} models, {} bytes", model_count, total_size);
+    }
+
+    Ok(())
+}
+
+/// Clear persistent cache
+async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
+    // Parse model name
+    let model_name = model.as_deref()
+        .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
+        .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
+
+    // Get cache directory
+    let cache_dir = crate::constants::get_global_models_cache_dir()
+        .unwrap_or_default()
+        .join("embedding_cache");
+
+    if !cache_dir.exists() {
+        eprintln!("No cache directory found: {}", cache_dir.display());
+        return Ok(());
+    }
+
+    // Confirm unless --yes flag is set
+    if !yes {
+        if let Some(name) = &model_name {
+            eprint!("Are you sure you want to clear the cache for model '{}'? [y/N]: ", name);
+        } else {
+            eprint!("Are you sure you want to clear the cache for ALL models? [y/N]: ");
+        }
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().to_lowercase().starts_with('y') {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // Clear cache for specific model or all models
+    if let Some(name) = model_name {
+        let model_cache_dir = cache_dir.join(&name);
+        if !model_cache_dir.exists() {
+            eprintln!("No cache found for model: {}", name);
+            return Ok(());
+        }
+
+        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
+        let stats_before = cache.stats()?;
+        cache.clear()?;
+        eprintln!("Cleared {} entries from cache for model '{}'", stats_before.entries, name);
+    } else {
+        // Clear all caches
+        let entries = std::fs::read_dir(&cache_dir)?;
+        let mut total_cleared = 0;
+
+        for entry in entries {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                let model_name = entry.file_name().to_string_lossy().to_string();
+                let cache = crate::embed::PersistentEmbeddingCache::open(&model_name)?;
+                let stats_before = cache.stats()?;
+                cache.clear()?;
+                total_cleared += stats_before.entries;
+                eprintln!("Cleared {} entries from cache for model '{}'", stats_before.entries, model_name);
+            }
+        }
+        eprintln!("Total: {} entries cleared", total_cleared);
+    }
+
+    Ok(())
 }
 
 mod doctor;
