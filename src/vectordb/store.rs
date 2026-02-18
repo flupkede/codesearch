@@ -307,19 +307,22 @@ impl VectorStore {
             false
         };
 
-        tracing::info!(
-            "✅ Environment resized to {}MB (next_id: {}, indexed: {})",
-            new_size_mb,
-            next_id,
-            indexed
-        );
-
-        // Update self with the new environment
+        // Replace the old environment with the new one
         self.env = env;
         self.vectors = vectors;
         self.chunks = chunks;
         self.next_id = next_id;
         self.indexed = indexed;
+
+        // Update the map size tracking
+        self.map_size_mb = new_size_mb;
+
+        tracing::info!(
+            "✅ LMDB environment resized to {}MB (next_id: {}, indexed: {})",
+            new_size_mb,
+            next_id,
+            indexed
+        );
 
         Ok(())
     }

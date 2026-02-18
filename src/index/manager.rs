@@ -20,7 +20,7 @@ use crate::constants::{DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, 
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
 use crate::vectordb::VectorStore;
-use crate::watch::{FileEvent, FileWatcher};
+use crate::watch::{FileEvent, FileWatcher, GitHeadWatcher};
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -220,6 +220,8 @@ pub struct IndexManager {
     db_path: PathBuf,
     /// File watcher instance
     watcher: Arc<Mutex<FileWatcher>>,
+    /// Git HEAD watcher for branch change detection
+    git_head_watcher: Option<GitHeadWatcher>,
     /// Shared stores for concurrent access
     stores: Arc<SharedStores>,
 }
@@ -275,12 +277,17 @@ impl IndexManager {
         let watcher = FileWatcher::new(path_buf.clone());
         let watcher = Arc::new(Mutex::new(watcher));
 
+        // Create Git HEAD watcher for branch change detection
+        debug!("🔀 Creating Git HEAD watcher...");
+        let git_head_watcher = Self::find_and_create_git_head_watcher(&path_buf)?;
+
         info!("✅ Index manager initialized successfully");
 
         Ok(Self {
             codebase_path: path_buf,
             db_path,
             watcher,
+            git_head_watcher: Some(git_head_watcher),
             stores,
         })
     }
@@ -288,6 +295,39 @@ impl IndexManager {
     /// Get a reference to the shared stores (for CodesearchService)
     pub fn stores(&self) -> Arc<SharedStores> {
         self.stores.clone()
+    }
+
+    /// Find and create Git HEAD watcher for branch change detection.
+    ///
+    /// This method attempts to find the git repository root and creates
+    /// a GitHeadWatcher to monitor for branch changes. If not in a git
+    /// repository, returns a disabled watcher.
+    ///
+    /// # Arguments
+    ///
+    /// * `codebase_path` - Path to the codebase
+    ///
+    /// # Returns
+    ///
+    /// * `Result<GitHeadWatcher>` - Git HEAD watcher or error
+    fn find_and_create_git_head_watcher(codebase_path: &Path) -> Result<GitHeadWatcher> {
+        // Try to find git root using the index module's find_git_root function
+        let git_root = match crate::index::find_git_root(codebase_path) {
+            Ok(Some(root)) => root,
+            Ok(None) => {
+                // Not in a git repository, return a disabled watcher
+                debug!("Not in a git repository, Git HEAD watcher disabled");
+                return Ok(GitHeadWatcher::new(codebase_path.to_path_buf()));
+            }
+            Err(e) => {
+                // Error finding git root, but continue with current directory
+                debug!("Error finding git root ({}), Git HEAD watcher disabled", e);
+                return Ok(GitHeadWatcher::new(codebase_path.to_path_buf()));
+            }
+        };
+
+        debug!("Git repository root: {}", git_root.display());
+        Ok(GitHeadWatcher::new(git_root))
     }
 
     /// Create a new index manager WITHOUT performing incremental refresh.
@@ -332,12 +372,17 @@ impl IndexManager {
         let watcher = FileWatcher::new(path_buf.clone());
         let watcher = Arc::new(Mutex::new(watcher));
 
+        // Create Git HEAD watcher for branch change detection
+        debug!("🔀 Creating Git HEAD watcher...");
+        let git_head_watcher = Self::find_and_create_git_head_watcher(&path_buf)?;
+
         info!("✅ Index manager initialized successfully (refresh skipped)");
 
         Ok(Self {
             codebase_path: path_buf,
             db_path,
             watcher,
+            git_head_watcher: Some(git_head_watcher),
             stores,
         })
     }
@@ -592,6 +637,7 @@ impl IndexManager {
         let db_path = self.db_path.clone();
         let watcher = self.watcher.clone();
         let stores = self.stores.clone();
+        let git_head_watcher = self.git_head_watcher.clone();
 
         info!("🚀 Starting background file watcher...");
 
@@ -623,6 +669,23 @@ impl IndexManager {
                 if cancel_token.is_cancelled() {
                     info!("🛑 File watcher received shutdown signal, stopping...");
                     break;
+                }
+
+                // Check for branch changes using GitHeadWatcher
+                if let Some(watcher) = &git_head_watcher {
+                    if let Ok(branch_changed) = watcher.check().await {
+                        if branch_changed {
+                            info!("🔀 Git branch changed, triggering full incremental refresh...");
+                            // Trigger a full incremental refresh on branch change
+                            if let Err(e) = Self::process_batch_with_stores(
+                                &path, &db_path, &stores, Vec::new(), Vec::new(),
+                            )
+                            .await
+                            {
+                                error!("❌ Branch change refresh failed: {}", e);
+                            }
+                        }
+                    }
                 }
 
                 // Poll for new events
@@ -753,12 +816,14 @@ impl IndexManager {
                 let metadata_path = db_path.join("metadata.json");
                 if metadata_path.exists() {
                     if let Ok(metadata_str) = std::fs::read_to_string(&metadata_path) {
-                            if let Ok(metadata) =
-                                serde_json::from_str::<serde_json::Value>(&metadata_str)
-                            {
-                                let dimensions =
-                                    metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-                                let model_name = metadata["model_short_name"].as_str().unwrap_or("minilm-l6-q");
+                        if let Ok(metadata) =
+                            serde_json::from_str::<serde_json::Value>(&metadata_str)
+                        {
+                            let dimensions =
+                                metadata["dimensions"].as_u64().unwrap_or(384) as usize;
+                            let model_name = metadata["model_short_name"]
+                                .as_str()
+                                .unwrap_or("minilm-l6-q");
 
                             if let Ok(file_meta_store) =
                                 FileMetaStore::load_or_create(db_path, model_name, dimensions)
@@ -820,8 +885,7 @@ impl IndexManager {
         // Then, index modified/new files
         for file_path in &files_to_index {
             debug!("📄 Indexing: {}", file_path.display());
-            if let Err(e) =
-                Self::index_single_file(codebase_path, file_path, db_path, stores).await
+            if let Err(e) = Self::index_single_file(codebase_path, file_path, db_path, stores).await
             {
                 warn!("⚠️  Failed to index {}: {}", file_path.display(), e);
             }
@@ -907,7 +971,12 @@ impl IndexManager {
 
     /// Index a single file (for FSW events).
     /// This is much faster than a full incremental refresh.
-    async fn index_single_file(codebase_path: &Path, file_path: &Path, db_path: &Path, stores: &SharedStores) -> Result<()> {
+    async fn index_single_file(
+        codebase_path: &Path,
+        file_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+    ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::{Chunker, SemanticChunker};
         use crate::embed::EmbeddingService;
@@ -938,7 +1007,6 @@ impl IndexManager {
             }
         };
 
-
         // Chunk the file
         let chunker = SemanticChunker::new(100, 4000, 2);
         let chunks = chunker.chunk_file(file_path, &content)?;
@@ -965,7 +1033,9 @@ impl IndexManager {
         let metadata: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
         let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-        let model_name = metadata["model_short_name"].as_str().unwrap_or("minilm-l6-q");
+        let model_name = metadata["model_short_name"]
+            .as_str()
+            .unwrap_or("minilm-l6-q");
 
         // Use shared stores with write lock
         let chunk_ids = {
@@ -1027,7 +1097,9 @@ impl IndexManager {
         let metadata: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
         let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-        let model_name = metadata["model_short_name"].as_str().unwrap_or("minilm-l6-q");
+        let model_name = metadata["model_short_name"]
+            .as_str()
+            .unwrap_or("minilm-l6-q");
 
         // Load file metadata to get chunk IDs
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;

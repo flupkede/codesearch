@@ -134,7 +134,7 @@ fn get_db_path_smart(
     // Detect if we're in a subdirectory of a git repository
     let git_root = find_git_root(&canonical_path);
 
-    if let Ok(root) = git_root {
+    if let Ok(Some(root)) = git_root {
         if root != canonical_path {
             // We're in a subdirectory of a git repository!
             println!(
@@ -153,12 +153,9 @@ fn get_db_path_smart(
             let db_path = root.join(".codesearch.db");
             return Ok((db_path, root));
         }
-    } else {
-        // Not in a git repository - error out
-        return Err(anyhow::anyhow!(
-            "No git repository found. Please run this command from within a git repository."
-        ));
+        // We're at the git root, so fall through to create local database
     }
+    // Not in a git repository or at git root - create local database
 
     // Step 6: Create local database in current directory
     let db_path = canonical_path.join(".codesearch.db");
@@ -167,8 +164,9 @@ fn get_db_path_smart(
 
 /// Find the git repository root by looking for .git directory
 /// Returns the directory containing .git
-fn find_git_root(start_path: &Path) -> Result<PathBuf> {
-    let mut current = start_path.canonicalize()
+fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
+    let mut current = start_path
+        .canonicalize()
         .map_err(|e| anyhow::anyhow!("Failed to canonicalize path: {}", e))?;
 
     // Search up the directory tree (unlimited levels)
@@ -185,56 +183,35 @@ fn find_git_root(start_path: &Path) -> Result<PathBuf> {
                     .map_err(|e| anyhow::anyhow!("Failed to read worktree git file: {}", e))?;
 
                 // Parse "gitdir: <path>" or direct path
-                let gitdir_line = content.lines().next()
+                let gitdir_line = content
+                    .lines()
+                    .next()
                     .ok_or_else(|| anyhow::anyhow!("Empty worktree git file"))?;
 
                 let gitdir_path = if gitdir_line.starts_with("gitdir: ") {
-                    gitdir_line.strip_prefix("gitdir: ")
+                    gitdir_line
+                        .strip_prefix("gitdir: ")
                         .ok_or_else(|| anyhow::anyhow!("Invalid gitdir format"))?
                 } else {
                     gitdir_line
                 };
 
                 // Resolve relative path (relative to the directory containing the .git file, not .git itself)
-                let parent_dir = git_path.parent()
+                let parent_dir = git_path
+                    .parent()
                     .ok_or_else(|| anyhow::anyhow!("No parent directory for .git file"))?;
 
                 let absolute_gitdir = parent_dir.join(gitdir_path.trim());
 
                 // Extract the repo root (parent of .git directory)
-                let repo_root = absolute_gitdir.parent()
+                let repo_root = absolute_gitdir
+                    .parent()
                     .ok_or_else(|| anyhow::anyhow!("No parent directory for .git directory"))?;
 
-                return Ok(repo_root.to_path_buf());
+                return Ok(Some(repo_root.to_path_buf()));
             } else {
-                // Normal git repository
-                // Search down one level to check for multiple child .git dirs
-                if let Ok(entries) = std::fs::read_dir(&current) {
-                    let mut child_git_dirs = Vec::new();
-
-                    for entry in entries.flatten() {
-                        let entry_path = entry.path();
-                        if entry_path.is_dir() {
-                            let child_git = entry_path.join(".git");
-                            if child_git.exists() {
-                                child_git_dirs.push(entry_path);
-                            }
-                        }
-                    }
-
-                    if !child_git_dirs.is_empty() {
-                        return Err(anyhow::anyhow!(
-                            "Multiple child .git directories found under {}:\n  {}\n  Run 'codesearch index' from the desired subdirectory.",
-                            current.display(),
-                            child_git_dirs.iter()
-                                .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n  ")
-                        ));
-                    }
-                }
-
-                return Ok(current);
+                // Normal git repository - return immediately
+                return Ok(Some(current.to_path_buf()));
             }
         }
 
@@ -246,7 +223,35 @@ fn find_git_root(start_path: &Path) -> Result<PathBuf> {
         }
     }
 
-    Err(anyhow::anyhow!("No git repository found from {}", start_path.display()))
+    // Search down one level to check for multiple child .git dirs
+    // Only do this if we didn't find any .git directory in the upward search
+    if let Ok(entries) = std::fs::read_dir(start_path) {
+        let mut child_git_dirs = Vec::new();
+
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                let child_git = entry_path.join(".git");
+                if child_git.exists() {
+                    child_git_dirs.push(entry_path);
+                }
+            }
+        }
+
+        if !child_git_dirs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Multiple child .git directories found under {}:\n  {}\n  Run 'codesearch index' from the desired subdirectory.",
+                start_path.display(),
+                child_git_dirs.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            ));
+        }
+    }
+
+    // Not in a git repository - return None
+    Ok(None)
 }
 
 /// Find the project root by looking for version control directories
@@ -430,7 +435,7 @@ async fn index_with_options(
     let is_incremental = db_path.exists() && !force;
 
     // Load FileMetaStore for incremental indexing (will be used later to update metadata)
-        let mut file_meta_store = if is_incremental {
+    let mut file_meta_store = if is_incremental {
         log_print!("\n{}", "📊 Incremental Indexing".bright_cyan());
         log_print!("{}", "-".repeat(60));
 
