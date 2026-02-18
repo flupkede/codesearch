@@ -6,7 +6,7 @@ use arroy::distances::Cosine;
 use arroy::{Database as ArroyDatabase, ItemId, Reader, Writer};
 use heed::byteorder::BigEndian;
 use heed::types::*;
-use heed::{Database, EnvFlags, EnvOpenOptions, Error};
+use heed::{Database, EnvFlags, EnvOpenOptions};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
@@ -380,8 +380,44 @@ impl VectorStore {
 
     /// Build the vector index with auto-resize on MDB_MAP_FULL
     ///
-    /// Must be called after inserting chunks and before searching
+    /// Must be called after inserting chunks and before searching.
+    /// This is the heaviest LMDB write operation (arroy tree build),
+    /// so it includes retry logic for MDB_MAP_FULL errors.
     pub fn build_index(&mut self) -> Result<()> {
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+
+            let result = self.build_index_impl();
+
+            match &result {
+                Ok(_) => return result,
+                Err(e) => {
+                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+
+                    let new_size = self.map_size_mb * 2;
+                    if new_size <= MAX_LMDB_MAP_SIZE_MB {
+                        warn!("MDB_MAP_FULL error in build_index(), resizing to {}MB (attempt {}/{})",
+                              new_size, attempts, max_attempts);
+                        self.resize_environment(new_size)?;
+                    } else {
+                        warn!(
+                            "MDB_MAP_FULL error in build_index(), already at max size {}MB",
+                            self.map_size_mb
+                        );
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Implementation of build_index without retry logic
+    fn build_index_impl(&mut self) -> Result<()> {
         let mut wtxn = self.env.write_txn()?;
         let writer = Writer::new(self.vectors, 0, self.dimensions);
         let mut rng = StdRng::seed_from_u64(rand::random());

@@ -1,10 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::io::Read;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
-use crate::embed::{ModelType, PersistentCacheStats};
+use crate::embed::ModelType;
 use crate::search::SearchOptions;
 
 /// Index subcommands

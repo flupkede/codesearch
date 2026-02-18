@@ -53,20 +53,104 @@ impl EmbeddingService {
         // Initialize query cache (separate from chunk cache)
         let query_cache = QueryCache::new();
 
+        // Initialize persistent embedding cache (disk-backed, survives restarts)
+        // This is critical for fast branch switches: embeddings for previously-seen
+        // content are looked up by content hash instead of recomputed via ONNX.
+        let persistent_cache = match PersistentEmbeddingCache::open(model_type.short_name()) {
+            Ok(cache) => {
+                tracing::debug!("📦 Persistent embedding cache opened");
+                Some(cache)
+            }
+            Err(e) => {
+                tracing::warn!("⚠️  Failed to open persistent embedding cache: {} (continuing without)", e);
+                None
+            }
+        };
+
         Ok(Self {
             cached_embedder,
             model_type,
             query_cache,
-            persistent_cache: None,
+            persistent_cache,
         })
     }
 
-    /// Embed a batch of chunks with caching
+    /// Embed a batch of chunks with caching.
+    ///
+    /// When persistent cache is available, checks it first by content hash.
+    /// Only chunks not found in the persistent cache go through ONNX inference.
+    /// Newly computed embeddings are stored back in the persistent cache.
     pub fn embed_chunks(
         &mut self,
         chunks: Vec<crate::chunker::Chunk>,
     ) -> Result<Vec<EmbeddedChunk>> {
-        self.cached_embedder.embed_chunks(chunks)
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let persistent_cache = self.persistent_cache.as_ref();
+        if persistent_cache.is_none() {
+            // No persistent cache — use in-memory only path
+            return self.cached_embedder.embed_chunks(chunks);
+        }
+        let cache = persistent_cache.unwrap();
+
+        // Phase 1: Check persistent cache for each chunk by content hash
+        let mut results: Vec<(usize, EmbeddedChunk)> = Vec::with_capacity(chunks.len());
+        let mut misses: Vec<(usize, crate::chunker::Chunk)> = Vec::new();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            match cache.get(&chunk.hash) {
+                Ok(Some(embedding)) => {
+                    results.push((i, EmbeddedChunk::new(chunk.clone(), embedding)));
+                }
+                _ => {
+                    misses.push((i, chunk.clone()));
+                }
+            }
+        }
+
+        let cache_hits = results.len();
+        let cache_misses = misses.len();
+
+        // Phase 2: Embed cache misses via the normal pipeline (ONNX inference)
+        if !misses.is_empty() {
+            let miss_chunks: Vec<crate::chunker::Chunk> = misses.iter().map(|(_, c)| c.clone()).collect();
+            let embedded = self.cached_embedder.embed_chunks(miss_chunks)?;
+
+            // Phase 3: Store newly computed embeddings in persistent cache
+            let entries: Vec<(&str, &[f32])> = embedded.iter()
+                .map(|ec| (ec.chunk.hash.as_str(), ec.embedding.as_slice()))
+                .collect();
+            if let Err(e) = cache.put_batch(&entries) {
+                tracing::warn!("⚠️  Failed to write to persistent embedding cache: {}", e);
+            }
+
+            // Evict old entries if cache exceeds size limit
+            let max_entries = std::env::var("CODESEARCH_EMBEDDING_CACHE_MAX_ENTRIES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(crate::constants::DEFAULT_EMBEDDING_CACHE_MAX_ENTRIES);
+            if let Err(e) = cache.evict_if_needed(max_entries) {
+                tracing::warn!("⚠️  Embedding cache eviction failed: {}", e);
+            }
+
+            // Merge with cache hits, preserving original order
+            for ((original_idx, _), embedded_chunk) in misses.iter().zip(embedded.into_iter()) {
+                results.push((*original_idx, embedded_chunk));
+            }
+        }
+
+        if cache_hits > 0 {
+            tracing::debug!(
+                "📦 Embedded {} chunks ({} cache hits, {} computed)",
+                results.len(), cache_hits, cache_misses
+            );
+        }
+
+        // Sort by original index to maintain order
+        results.sort_by_key(|(i, _)| *i);
+        Ok(results.into_iter().map(|(_, ec)| ec).collect())
     }
 
     /// Embed query text (with caching)
@@ -161,7 +245,12 @@ impl EmbeddingService {
         self.query_cache.stats()
     }
 
-    /// Initialize persistent cache for the current model
+    /// Re-initialize persistent cache for the current model.
+    ///
+    /// The persistent cache is auto-initialized in the constructor.
+    /// This method is only needed if the cache was explicitly cleared
+    /// or failed to open during construction.
+#[allow(dead_code)]
     pub fn with_persistent_cache(&mut self) -> Result<()> {
         if self.persistent_cache.is_none() {
             let cache = PersistentEmbeddingCache::open(self.model_short_name())?;
@@ -170,6 +259,7 @@ impl EmbeddingService {
         Ok(())
     }
 
+#[allow(dead_code)]
     /// Get persistent cache statistics
     pub fn persistent_cache_stats(&self) -> Option<PersistentCacheStats> {
         self.persistent_cache
@@ -177,6 +267,7 @@ impl EmbeddingService {
             .map(|c| c.stats().ok())
             .flatten()
     }
+#[allow(dead_code)]
 
     /// Clear the persistent cache
     pub fn clear_persistent_cache(&mut self) -> Result<()> {
@@ -185,11 +276,13 @@ impl EmbeddingService {
         }
         Ok(())
     }
+#[allow(dead_code)]
 
     /// Get reference to persistent cache (if initialized)
     pub fn persistent_cache(&self) -> Option<&PersistentEmbeddingCache> {
         self.persistent_cache.as_ref()
     }
+#[allow(dead_code)]
 
     /// Get mutable reference to persistent cache (if initialized)
     pub fn persistent_cache_mut(&mut self) -> Option<&mut PersistentEmbeddingCache> {

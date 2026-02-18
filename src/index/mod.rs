@@ -108,7 +108,10 @@ fn get_db_path_smart(
     }
 
     // Step 4: Use automatic discovery (default behavior)
-    if let Some(ref db_info) = existing_db {
+    // Skip when --force: the old location may be wrong (e.g. not at git root).
+    // Let Step 5 (find_git_root) determine the correct location.
+    if !force && existing_db.is_some() {
+        let db_info = existing_db.as_ref().unwrap();
         // Use existing database (local or global)
         if !db_info.is_current {
             let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -132,9 +135,10 @@ fn get_db_path_smart(
 
     // Step 5: No existing database - SAFETY CHECK before creating
     // Detect if we're in a subdirectory of a git repository
-    let git_root = find_git_root(&canonical_path);
+    // Propagate errors (e.g. multiple child .git dirs found)
+    let git_root = find_git_root(&canonical_path)?;
 
-    if let Ok(Some(root)) = git_root {
+    if let Some(root) = git_root {
         if root != canonical_path {
             // We're in a subdirectory of a git repository!
             println!(
@@ -162,9 +166,10 @@ fn get_db_path_smart(
     Ok((db_path, canonical_path))
 }
 
-/// Find the git repository root by looking for .git directory
-/// Returns the directory containing .git
-fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
+/// Find the git repository root by looking for .git directory.
+/// Searches upward (unlimited), then one level down if nothing found upward.
+/// Returns `Ok(None)` if not in a git repo. Returns `Err` if multiple child repos found.
+pub(crate) fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
     let mut current = start_path
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("Failed to canonicalize path: {}", e))?;
@@ -238,15 +243,20 @@ fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
             }
         }
 
-        if !child_git_dirs.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Multiple child .git directories found under {}:\n  {}\n  Run 'codesearch index' from the desired subdirectory.",
-                start_path.display(),
-                child_git_dirs.iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n  ")
-            ));
+        match child_git_dirs.len() {
+            0 => {}
+            1 => return Ok(Some(child_git_dirs.into_iter().next().unwrap())),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "❌ Multiple git repositories found in subdirectories:\n  {}\n\n\
+                     Cannot create a single index spanning multiple repos.\n\
+                     Run 'codesearch index' inside each repository separately.",
+                    child_git_dirs.iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n  ")
+                ));
+            }
         }
     }
 

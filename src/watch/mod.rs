@@ -3,8 +3,8 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -15,6 +15,17 @@ use crate::cache::normalize_path;
 /// so paths match the format used by FileMetaStore and VectorStore.
 fn normalize_event_path(path: &Path) -> PathBuf {
     PathBuf::from(normalize_path(path))
+}
+
+/// Change information from git HEAD file.
+///
+/// Contains both the old and new HEAD content when a branch switch is detected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadChange {
+    /// Previous HEAD content (e.g., "ref: refs/heads/main\n")
+    pub old_head: String,
+    /// New HEAD content (e.g., "ref: refs/heads/feature\n")
+    pub new_head: String,
 }
 
 /// File extensions that should trigger re-indexing (whitelist approach)
@@ -380,140 +391,105 @@ impl Drop for FileWatcher {
     }
 }
 
-/// Git HEAD watcher for detecting branch changes
+/// Git HEAD watcher for detecting branch changes.
 ///
-/// Polls the .git/HEAD file to detect when the git branch changes.
-/// When a branch change is detected, it triggers a full incremental refresh.
+/// Resolves the `.git/HEAD` path once at construction (including worktree indirection),
+/// then polls cheaply by reading a single file and comparing content.
 #[derive(Clone)]
 pub struct GitHeadWatcher {
-    /// Path to the git repository root
-    git_root: PathBuf,
+    /// Resolved path to the HEAD file (e.g. /repo/.git/HEAD or worktree target)
+    head_path: PathBuf,
     /// Cached last HEAD content for change detection (thread-safe)
     last_head_content: Arc<Mutex<Option<String>>>,
 }
 
 impl GitHeadWatcher {
-    /// Create a new Git HEAD watcher
+    /// Create a new Git HEAD watcher.
+    ///
+    /// Resolves the actual HEAD file path at construction time, handling
+    /// git worktrees where `.git` is a file containing `gitdir: ...`.
     ///
     /// # Arguments
-    ///
     /// * `git_root` - Path to the git repository root directory
     pub fn new(git_root: PathBuf) -> Self {
+        let head_path = Self::resolve_head_path(&git_root);
+        tracing::debug!("👀 Git HEAD watcher: {}", head_path.display());
         Self {
-            git_root,
+            head_path,
             last_head_content: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Check if the HEAD file has changed since the last check
-    ///
-    /// Returns `Ok(true)` if a change was detected (branch switch or HEAD moved),
-    /// `Ok(false)` if no change, or `Err` if the file cannot be read.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(true)` - HEAD changed (branch switch or commit move)
-    /// * `Ok(false)` - No change detected
-    /// * `Err(_)` - Failed to read HEAD file
-    pub async fn check(&self) -> Result<bool> {
-        // Check if .git is a directory or a worktree file
-        let git_path = self.git_root.join(".git");
+    /// Resolve the actual HEAD file path, handling worktrees.
+    fn resolve_head_path(git_root: &Path) -> PathBuf {
+        let git_entry = git_root.join(".git");
 
-        let head_path = if git_path.is_file() {
-            // Git worktree: read the gitdir: reference
-            let content = std::fs::read_to_string(&git_path)
-                .map_err(|e| anyhow!("Failed to read worktree git file: {}", e))?;
-
-            // Parse "gitdir: <path>" or direct path
-            let gitdir_line = content
-                .lines()
-                .next()
-                .ok_or_else(|| anyhow!("Empty worktree git file"))?;
-
-            let gitdir_path = if gitdir_line.starts_with("gitdir: ") {
-                gitdir_line
-                    .strip_prefix("gitdir: ")
-                    .ok_or_else(|| anyhow!("Invalid gitdir format"))?
-            } else {
-                gitdir_line
-            };
-
-            // Resolve relative path (relative to the directory containing the .git file)
-            let parent_dir = git_path
-                .parent()
-                .ok_or_else(|| anyhow!("No parent directory for .git file"))?;
-
-            let absolute_gitdir = parent_dir.join(gitdir_path.trim());
-            absolute_gitdir.join("HEAD")
-        } else {
-            // Normal git repository
-            git_path.join("HEAD")
-        };
-
-        // Read the HEAD file content
-        let current_content = std::fs::read_to_string(&head_path)
-            .map_err(|e| anyhow!("Failed to read HEAD file: {}", e))?;
-
-        // Lock the mutex to access/modify the cached content
-        let mut last_content_guard = self.last_head_content.lock().await;
-
-        // Check for changes
-        let changed = match &*last_content_guard {
-            Some(last_content) => {
-                // Compare with cached content
-                last_content != &current_content
+        if git_entry.is_file() {
+            // Git worktree: .git is a file containing "gitdir: ..."
+            if let Ok(content) = std::fs::read_to_string(&git_entry) {
+                if let Some(first_line) = content.lines().next() {
+                    let gitdir_str = first_line
+                        .strip_prefix("gitdir: ")
+                        .unwrap_or(first_line)
+                        .trim();
+                    let resolved = PathBuf::from(gitdir_str);
+                    let resolved = if resolved.is_relative() {
+                        git_root.join(&resolved)
+                    } else {
+                        resolved
+                    };
+                    return resolved.join("HEAD");
+                }
             }
-            None => {
-                // First check, initialize and report no change
-                *last_content_guard = Some(current_content.clone());
-                false
-            }
-        };
-
-        if changed {
-            tracing::info!("🔀 Git HEAD changed (branch switch or HEAD moved)");
-            *last_content_guard = Some(current_content);
         }
 
-        Ok(changed)
+        // Normal git repository
+        git_entry.join("HEAD")
     }
 
-    /// Get the current HEAD reference (branch name or commit hash)
-    pub fn get_current_head(&self) -> Result<String> {
-        let git_path = self.git_root.join(".git");
+    /// Check if the HEAD file has changed since the last check.
+    ///
+    /// This is called every ~100ms from the event loop, so it must be cheap.
+    /// Only reads a single small file and compares a string.
+    ///
+    /// Returns:
+    /// - `Ok(Some(HeadChange))` when a branch switch is detected
+    /// - `Ok(None)` when HEAD is unchanged or on first check
+    /// - `Err` if the HEAD file cannot be read
+    pub async fn check(&self) -> Result<Option<HeadChange>> {
+        let current_content = std::fs::read_to_string(&self.head_path)
+            .map_err(|e| anyhow!("Failed to read HEAD file {}: {}", self.head_path.display(), e))?;
 
-        let head_path = if git_path.is_file() {
-            // Git worktree
-            let content = std::fs::read_to_string(&git_path)
-                .map_err(|e| anyhow!("Failed to read worktree git file: {}", e))?;
+        let mut last = self.last_head_content.lock().await;
 
-            let gitdir_line = content
-                .lines()
-                .next()
-                .ok_or_else(|| anyhow!("Empty worktree git file"))?;
-
-            let gitdir_path = if gitdir_line.starts_with("gitdir: ") {
-                gitdir_line
-                    .strip_prefix("gitdir: ")
-                    .ok_or_else(|| anyhow!("Invalid gitdir format"))?
-            } else {
-                gitdir_line
-            };
-
-            let parent_dir = git_path
-                .parent()
-                .ok_or_else(|| anyhow!("No parent directory for .git file"))?;
-
-            let absolute_gitdir = parent_dir.join(gitdir_path.trim());
-            absolute_gitdir.join("HEAD")
-        } else {
-            // Normal git repository
-            git_path.join("HEAD")
+        let result = match &*last {
+            Some(prev) if prev != &current_content => {
+                Some(HeadChange {
+                    old_head: prev.clone(),
+                    new_head: current_content.clone(),
+                })
+            }
+            None => {
+                // First check — initialize, report no change
+                *last = Some(current_content);
+                return Ok(None);
+            }
+            _ => None,
         };
 
-        let content = std::fs::read_to_string(&head_path)
-            .map_err(|e| anyhow!("Failed to read HEAD file: {}", e))?;
+        if result.is_some() {
+            tracing::info!("🔀 Git HEAD changed (branch switch or HEAD moved)");
+            *last = Some(current_content);
+        }
 
+        Ok(result)
+    }
+
+    /// Get the current HEAD reference (branch name or commit hash).
+    #[allow(dead_code)]
+    pub fn get_current_head(&self) -> Result<String> {
+        let content = std::fs::read_to_string(&self.head_path)
+            .map_err(|e| anyhow!("Failed to read HEAD file: {}", e))?;
         Ok(content.trim().to_string())
     }
 }

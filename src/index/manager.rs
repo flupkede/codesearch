@@ -674,7 +674,7 @@ impl IndexManager {
                 // Check for branch changes using GitHeadWatcher
                 if let Some(watcher) = &git_head_watcher {
                     if let Ok(branch_changed) = watcher.check().await {
-                        if branch_changed {
+                        if branch_changed.is_some() {
                             info!("🔀 Git branch changed, triggering full incremental refresh...");
                             // Trigger a full incremental refresh on branch change
                             if let Err(e) = Self::process_batch_with_stores(

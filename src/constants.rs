@@ -100,6 +100,7 @@ pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 1024;
 /// Prevents unbounded growth and potential disk exhaustion.
 pub const MAX_LMDB_MAP_SIZE_MB: usize = 8192;
 
+#[allow(dead_code)]
 /// Default maximum number of entries in persistent embedding cache.
 ///
 /// The persistent embedding cache stores computed embeddings on disk keyed by

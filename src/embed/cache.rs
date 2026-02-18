@@ -327,6 +327,7 @@ impl PersistentEmbeddingCache {
         let rtxn = self.env.read_txn()?;
         Ok(self.db.get(&rtxn, content_hash)?)
     }
+#[allow(dead_code)]
 
     /// Store embedding in cache
     pub fn put(&self, content_hash: &str, embedding: &[f32]) -> Result<()> {
@@ -364,10 +365,13 @@ impl PersistentEmbeddingCache {
         })
     }
 
-    /// Evict oldest entries when cache exceeds max size
+    /// Evict entries when cache exceeds max size
     ///
-    /// Deletes first N entries to get back under limit. Returns number of
-    /// entries deleted. LMDB iteration order for string keys is insertion order.
+#[allow(dead_code)]
+    /// Deletes first N entries (by lexicographic key order) to get back under limit.
+    /// Returns number of entries deleted. Note: LMDB `Str` keys iterate in
+    /// lexicographic order, not insertion order. For SHA256 hashes this means
+    /// eviction is effectively random, not LRU — but still correctly bounds size.
     pub fn evict_if_needed(&self, max_entries: usize) -> Result<usize> {
         let rtxn = self.env.read_txn()?;
         let count = self.db.len(&rtxn)? as usize;
@@ -411,12 +415,14 @@ impl PersistentEmbeddingCache {
         wtxn.commit()?;
         Ok(())
     }
+#[allow(dead_code)]
 
     /// Get number of entries in cache
     pub fn len(&self) -> Result<usize> {
         let rtxn = self.env.read_txn()?;
         Ok(self.db.len(&rtxn)? as usize)
     }
+#[allow(dead_code)]
 
     /// Check if cache is empty
     pub fn is_empty(&self) -> Result<bool> {
@@ -437,6 +443,7 @@ pub struct PersistentCacheStats {
     pub file_size_bytes: u64,
     pub last_access: Option<DateTime<Utc>>,
 }
+#[allow(dead_code)]
 
 impl PersistentCacheStats {
     /// Get file size in MB
