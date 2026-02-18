@@ -365,7 +365,7 @@ impl IndexManager {
             let content = std::fs::read_to_string(&metadata_path)?;
             let json: serde_json::Value = serde_json::from_str(&content)?;
             let model = json
-                .get("model")
+                .get("model_short_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("minilm-l6-q");
             let dims = json
@@ -753,12 +753,12 @@ impl IndexManager {
                 let metadata_path = db_path.join("metadata.json");
                 if metadata_path.exists() {
                     if let Ok(metadata_str) = std::fs::read_to_string(&metadata_path) {
-                        if let Ok(metadata) =
-                            serde_json::from_str::<serde_json::Value>(&metadata_str)
-                        {
-                            let dimensions =
-                                metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-                            let model_name = metadata["model"].as_str().unwrap_or("minilm-l6-q");
+                            if let Ok(metadata) =
+                                serde_json::from_str::<serde_json::Value>(&metadata_str)
+                            {
+                                let dimensions =
+                                    metadata["dimensions"].as_u64().unwrap_or(384) as usize;
+                                let model_name = metadata["model_short_name"].as_str().unwrap_or("minilm-l6-q");
 
                             if let Ok(file_meta_store) =
                                 FileMetaStore::load_or_create(db_path, model_name, dimensions)
@@ -821,7 +821,7 @@ impl IndexManager {
         for file_path in &files_to_index {
             debug!("📄 Indexing: {}", file_path.display());
             if let Err(e) =
-                Self::index_single_file_with_stores(codebase_path, db_path, stores, file_path).await
+                Self::index_single_file(codebase_path, file_path, db_path, stores).await
             {
                 warn!("⚠️  Failed to index {}: {}", file_path.display(), e);
             }
@@ -907,7 +907,7 @@ impl IndexManager {
 
     /// Index a single file (for FSW events).
     /// This is much faster than a full incremental refresh.
-    async fn index_single_file(codebase_path: &Path, file_path: &Path) -> Result<()> {
+    async fn index_single_file(codebase_path: &Path, file_path: &Path, db_path: &Path, stores: &SharedStores) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::{Chunker, SemanticChunker};
         use crate::embed::EmbeddingService;
@@ -938,8 +938,6 @@ impl IndexManager {
             }
         };
 
-        // First, remove old chunks for this file
-        Self::remove_file_from_index(codebase_path, file_path).await?;
 
         // Chunk the file
         let chunker = SemanticChunker::new(100, 4000, 2);
@@ -967,175 +965,7 @@ impl IndexManager {
         let metadata: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
         let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-
-        // Open stores
-        let mut store = VectorStore::new(&db_path, dimensions)?;
-        let mut fts_store = FtsStore::new_with_writer(&db_path)?;
-
-        // Insert chunks
-        let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
-
-        // Rebuild the vector index after inserting new chunks
-        store.build_index()?;
-
-        // Add to FTS
-        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-            let path_str = chunk.chunk.path.to_string();
-            let signature = chunk.chunk.signature.as_deref();
-            let kind = format!("{:?}", chunk.chunk.kind);
-            fts_store.add_chunk(*chunk_id, &chunk.chunk.content, &path_str, signature, &kind)?;
-        }
-        fts_store.commit()?;
-
-        // Update file metadata
-        let model_name = metadata["model"].as_str().unwrap_or("minilm-l6-q");
-        let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
-        file_meta_store.update_file(file_path, chunk_ids)?;
-        file_meta_store.save(&db_path)?;
-
-        info!(
-            "✅ Indexed {} ({} chunks)",
-            file_path.display(),
-            embedded_chunks.len()
-        );
-
-        Ok(())
-    }
-
-    /// Remove a file from the index (for FSW delete events).
-    async fn remove_file_from_index(codebase_path: &Path, file_path: &Path) -> Result<()> {
-        use crate::cache::FileMetaStore;
-        use crate::fts::FtsStore;
-        use crate::vectordb::VectorStore;
-
-        let db_path = codebase_path.join(DB_DIR_NAME);
-
-        // Load metadata to get dimensions and model
-        let metadata_path = db_path.join("metadata.json");
-        if !metadata_path.exists() {
-            debug!("No metadata found, skipping removal");
-            return Ok(());
-        }
-        let metadata: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
-        let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-        let model_name = metadata["model"].as_str().unwrap_or("minilm-l6-q");
-
-        // Load file metadata to get chunk IDs
-        let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
-
-        // Get chunk IDs from file metadata directly (not check_file which reads from disk)
-        // The file is already deleted, so we can't read mtime/size/hash
-        let meta = file_meta_store.remove_file(file_path);
-        let chunk_ids = match meta {
-            Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
-            Some(_) => {
-                debug!("No chunks to remove for file: {}", file_path.display());
-                file_meta_store.save(&db_path)?;
-                return Ok(());
-            }
-            None => {
-                debug!("No metadata found for file: {}", file_path.display());
-                return Ok(());
-            }
-        };
-
-        debug!(
-            "Removing {} chunks for file: {}",
-            chunk_ids.len(),
-            file_path.display()
-        );
-
-        // Open stores
-        let mut store = VectorStore::new(&db_path, dimensions)?;
-        let mut fts_store = FtsStore::new_with_writer(&db_path)?;
-
-        // Delete chunks from vector store and FTS
-        for chunk_id in &chunk_ids {
-            store.delete_chunks(&[*chunk_id])?;
-            fts_store.delete_chunk(*chunk_id)?;
-        }
-
-        // Rebuild vector index so deleted chunks are excluded from search results
-        store.build_index()?;
-        fts_store.commit()?;
-
-        // Save file metadata (remove_file was already called above)
-        file_meta_store.save(&db_path)?;
-
-        info!(
-            "✅ Removed {} chunks for {}",
-            chunk_ids.len(),
-            file_path.display()
-        );
-
-        Ok(())
-    }
-
-    /// Index a single file using shared stores (for FSW events).
-    /// This version uses the shared stores to avoid LMDB conflicts.
-    async fn index_single_file_with_stores(
-        codebase_path: &Path,
-        db_path: &Path,
-        stores: &SharedStores,
-        file_path: &Path,
-    ) -> Result<()> {
-        use crate::cache::FileMetaStore;
-        use crate::chunker::{Chunker, SemanticChunker};
-        use crate::embed::EmbeddingService;
-        use crate::file::Language;
-
-        // Check if file exists and is indexable
-        if !file_path.exists() {
-            debug!("File no longer exists, skipping: {}", file_path.display());
-            return Ok(());
-        }
-
-        let language = Language::from_path(file_path);
-        if !language.is_indexable() {
-            debug!("File not indexable, skipping: {}", file_path.display());
-            return Ok(());
-        }
-
-        // Read file content
-        let content = match std::fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to read file {}: {}", file_path.display(), e);
-                return Ok(());
-            }
-        };
-
-        // First, remove old chunks for this file
-        Self::remove_file_from_index_with_stores(codebase_path, db_path, stores, file_path).await?;
-
-        // Chunk the file
-        let chunker = SemanticChunker::new(100, 4000, 2);
-        let chunks = chunker.chunk_file(file_path, &content)?;
-
-        if chunks.is_empty() {
-            debug!("No chunks created for file: {}", file_path.display());
-            return Ok(());
-        }
-
-        debug!(
-            "Created {} chunks for file: {}",
-            chunks.len(),
-            file_path.display()
-        );
-
-        // Generate embeddings
-        let cache_dir = crate::constants::get_global_models_cache_dir()?;
-        let mut embedding_service =
-            EmbeddingService::with_cache_dir(ModelType::default(), Some(cache_dir.as_path()))?;
-        let embedded_chunks = embedding_service.embed_chunks(chunks)?;
-
-        // Load metadata to get model name
-        let metadata_path = db_path.join("metadata.json");
-        let metadata: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
-        let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-        let model_name = metadata["model"].as_str().unwrap_or("minilm-l6-q");
+        let model_name = metadata["model_short_name"].as_str().unwrap_or("minilm-l6-q");
 
         // Use shared stores with write lock
         let chunk_ids = {
@@ -1165,9 +995,9 @@ impl IndexManager {
         }
 
         // Update file metadata (separate store, not shared)
-        let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
+        let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
         file_meta_store.update_file(file_path, chunk_ids)?;
-        file_meta_store.save(db_path)?;
+        file_meta_store.save(&db_path)?;
 
         info!(
             "✅ Indexed {} ({} chunks)",
@@ -1197,7 +1027,7 @@ impl IndexManager {
         let metadata: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
         let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-        let model_name = metadata["model"].as_str().unwrap_or("minilm-l6-q");
+        let model_name = metadata["model_short_name"].as_str().unwrap_or("minilm-l6-q");
 
         // Load file metadata to get chunk IDs
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;

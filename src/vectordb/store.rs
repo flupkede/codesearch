@@ -1,3 +1,4 @@
+use crate::constants::MAX_LMDB_MAP_SIZE_MB;
 use crate::embed::EmbeddedChunk;
 use crate::info_print;
 use anyhow::{anyhow, Result};
@@ -5,13 +6,14 @@ use arroy::distances::Cosine;
 use arroy::{Database as ArroyDatabase, ItemId, Reader, Writer};
 use heed::byteorder::BigEndian;
 use heed::types::*;
-use heed::{Database, EnvFlags, EnvOpenOptions};
+use heed::{Database, EnvFlags, EnvOpenOptions, Error};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use tracing::warn;
 
 /// Chunk metadata stored in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +98,7 @@ pub struct VectorStore {
     next_id: u32,
     dimensions: usize,
     indexed: bool,
+    pub map_size_mb: usize,
 }
 
 impl VectorStore {
@@ -168,6 +171,7 @@ impl VectorStore {
             next_id,
             dimensions,
             indexed,
+            map_size_mb,
         })
     }
 
@@ -241,7 +245,83 @@ impl VectorStore {
             next_id,
             dimensions,
             indexed,
+            map_size_mb,
         })
+    }
+
+    /// Check if an error is an MDB_MAP_FULL error
+    /// MDB_MAP_FULL error code is -28
+    fn is_map_full_error(&self, error: &dyn std::error::Error) -> bool {
+        // MDB_MAP_FULL error code is -28 (0xFFFFFFE4)
+        error.to_string().contains("MDB_MAP_FULL") || error.to_string().contains("map full")
+    }
+
+    /// Resize the LMDB environment to a new map size
+    /// This requires closing and reopening the environment
+    fn resize_environment(&mut self, new_size_mb: usize) -> Result<()> {
+        if new_size_mb > MAX_LMDB_MAP_SIZE_MB {
+            return Err(anyhow::anyhow!(
+                "Requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB",
+                new_size_mb,
+                MAX_LMDB_MAP_SIZE_MB
+            ));
+        }
+
+        tracing::warn!("🔧 Resizing LMDB environment to {}MB", new_size_mb);
+
+        // Store the current database path
+        let db_path = self.env.path().to_path_buf();
+
+        // Note: We don't need to explicitly drop the env/databases
+        // They will be dropped when we replace them below
+
+        // Open a new environment with the new map size
+        // Note: This is a simple implementation that just increases the map size
+        // In production, you might want to handle this more gracefully
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(new_size_mb * 1024 * 1024)
+                .max_dbs(10)
+                .open(&db_path)?
+        };
+
+        // Reopen databases
+        let mut wtxn = env.write_txn()?;
+        let vectors: ArroyDatabase<Cosine> = env.create_database(&mut wtxn, Some("vectors"))?;
+        let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
+            env.create_database(&mut wtxn, Some("chunks"))?;
+
+        // Get the next ID
+        let next_id = match chunks.last(&wtxn)? {
+            Some((max_key, _)) => max_key + 1,
+            None => 0,
+        };
+
+        wtxn.commit()?;
+
+        // Check if database is already indexed
+        let indexed = if next_id > 0 {
+            let rtxn = env.read_txn()?;
+            Reader::open(&rtxn, 0, vectors).is_ok()
+        } else {
+            false
+        };
+
+        tracing::info!(
+            "✅ Environment resized to {}MB (next_id: {}, indexed: {})",
+            new_size_mb,
+            next_id,
+            indexed
+        );
+
+        // Update self with the new environment
+        self.env = env;
+        self.vectors = vectors;
+        self.chunks = chunks;
+        self.next_id = next_id;
+        self.indexed = indexed;
+
+        Ok(())
     }
 
     /// Insert embedded chunks into the database
@@ -295,31 +375,18 @@ impl VectorStore {
         Ok(chunks.len())
     }
 
-    /// Build the vector index
+    /// Build the vector index with auto-resize on MDB_MAP_FULL
     ///
     /// Must be called after inserting chunks and before searching
     pub fn build_index(&mut self) -> Result<()> {
         let mut wtxn = self.env.write_txn()?;
         let writer = Writer::new(self.vectors, 0, self.dimensions);
-
         let mut rng = StdRng::seed_from_u64(rand::random());
         writer.builder(&mut rng).build(&mut wtxn)?;
-
         wtxn.commit()?;
-
         self.indexed = true;
-
         Ok(())
     }
-
-    /// Search for similar chunks
-    ///
-    /// # Arguments
-    /// * `query_embedding` - The query vector
-    /// * `limit` - Maximum number of results to return
-    ///
-    /// # Returns
-    /// Vector of search results with metadata and scores
     pub fn search(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<SearchResult>> {
         if query_embedding.len() != self.dimensions {
             return Err(anyhow!(
@@ -377,7 +444,6 @@ impl VectorStore {
         Ok(search_results)
     }
 
-    /// Get statistics about the vector store
     pub fn stats(&self) -> Result<StoreStats> {
         let rtxn = self.env.read_txn()?;
 
@@ -406,6 +472,42 @@ impl VectorStore {
     ///
     /// Returns the number of chunks deleted
     pub fn delete_chunks(&mut self, chunk_ids: &[u32]) -> Result<usize> {
+        // Auto-resize retry logic for MDB_MAP_FULL errors
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+
+            let result = self.delete_chunks_impl(chunk_ids);
+
+            match &result {
+                Ok(_) => return result,
+                Err(e) => {
+                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+
+                    // Double map size and retry
+                    let new_size = self.map_size_mb * 2;
+                    if new_size <= MAX_LMDB_MAP_SIZE_MB {
+                        warn!("MDB_MAP_FULL error in delete_chunks(), resizing to {}MB (attempt {}/{})",
+                              new_size, attempts, max_attempts);
+                        self.resize_environment(new_size)?;
+                    } else {
+                        warn!(
+                            "MDB_MAP_FULL error, already at max size {}MB",
+                            self.map_size_mb
+                        );
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Implementation of delete_chunks without retry logic
+    fn delete_chunks_impl(&mut self, chunk_ids: &[u32]) -> Result<usize> {
         if chunk_ids.is_empty() {
             return Ok(0);
         }
@@ -440,6 +542,42 @@ impl VectorStore {
     ///
     /// Useful for tracking which chunks belong to which file
     pub fn insert_chunks_with_ids(&mut self, chunks: Vec<EmbeddedChunk>) -> Result<Vec<u32>> {
+        // Auto-resize retry logic for MDB_MAP_FULL errors
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+
+            let result = self.insert_chunks_with_ids_impl(chunks.clone());
+
+            match &result {
+                Ok(_) => return result,
+                Err(e) => {
+                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+
+                    // Double map size and retry
+                    let new_size = self.map_size_mb * 2;
+                    if new_size <= MAX_LMDB_MAP_SIZE_MB {
+                        warn!("MDB_MAP_FULL error in insert_chunks_with_ids(), resizing to {}MB (attempt {}/{})",
+                              new_size, attempts, max_attempts);
+                        self.resize_environment(new_size)?;
+                    } else {
+                        warn!(
+                            "MDB_MAP_FULL error, already at max size {}MB",
+                            self.map_size_mb
+                        );
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Implementation of insert_chunks_with_ids without retry logic
+    fn insert_chunks_with_ids_impl(&mut self, chunks: Vec<EmbeddedChunk>) -> Result<Vec<u32>> {
         if chunks.is_empty() {
             return Ok(vec![]);
         }

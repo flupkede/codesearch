@@ -85,14 +85,20 @@ pub fn get_global_models_cache_dir() -> anyhow::Result<PathBuf> {
 /// Name of the repos configuration file
 pub const REPOS_CONFIG_FILE: &str = "repos.json";
 
-/// Default LMDB map size in megabytes (256MB).
+/// Default LMDB map size in megabytes (1024MB).
 ///
 /// This is the maximum virtual address space reserved for the memory-mapped database.
 /// On Linux/macOS this is just an address space reservation (no physical RAM until data is written).
 /// On Windows the file may be pre-allocated to this size, so keeping it small matters.
-/// 512MB is sufficient for most codebases (~100k chunks × ~5KB = ~512MB).
+/// 1024MB is sufficient for most codebases (~200k chunks × ~5KB = ~1024MB).
 /// Override with `CODESEARCH_LMDB_MAP_SIZE_MB` environment variable.
-pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 512;
+pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 1024;
+
+/// Maximum LMDB map size in megabytes (8192MB = 8GB).
+///
+/// This is the hard upper limit for auto-resizing when MDB_MAP_FULL errors occur.
+/// Prevents unbounded growth and potential disk exhaustion.
+pub const MAX_LMDB_MAP_SIZE_MB: usize = 8192;
 
 /// Default embedding cache memory limit in MB.
 ///

@@ -131,16 +131,16 @@ fn get_db_path_smart(
     }
 
     // Step 5: No existing database - SAFETY CHECK before creating
-    // Detect if we're in a subdirectory of a project (git/hg/svn root detection)
-    let project_root = find_project_root(&canonical_path);
+    // Detect if we're in a subdirectory of a git repository
+    let git_root = find_git_root(&canonical_path);
 
-    if let Some(root) = project_root {
+    if let Ok(root) = git_root {
         if root != canonical_path {
-            // We're in a subdirectory of a project!
+            // We're in a subdirectory of a git repository!
             println!(
                 "{}",
                 format!(
-                    "⚠️  You are in a subdirectory: {}\n   Project root detected at: {}",
+                    "⚠️  You are in a subdirectory: {}\n   Git repository root detected at: {}",
                     canonical_path.display(),
                     root.display()
                 )
@@ -148,25 +148,16 @@ fn get_db_path_smart(
             );
             println!(
                 "{}",
-                "   Creating database at project root to avoid duplicate indexes.".yellow()
+                "   Creating database at repository root to avoid duplicate indexes.".yellow()
             );
             let db_path = root.join(".codesearch.db");
             return Ok((db_path, root));
         }
     } else {
-        // No project markers found - warn the user
-        println!(
-            "{}",
-            format!(
-                "ℹ️  No project root detected (no .git, Cargo.toml, package.json, etc.)\n   Creating database in: {}",
-                canonical_path.display()
-            ).dimmed()
-        );
-        println!(
-            "{}",
-            "   Tip: If this is a subdirectory, run 'codesearch index' from the project root."
-                .dimmed()
-        );
+        // Not in a git repository - error out
+        return Err(anyhow::anyhow!(
+            "No git repository found. Please run this command from within a git repository."
+        ));
     }
 
     // Step 6: Create local database in current directory
@@ -174,8 +165,93 @@ fn get_db_path_smart(
     Ok((db_path, canonical_path))
 }
 
+/// Find the git repository root by looking for .git directory
+/// Returns the directory containing .git
+fn find_git_root(start_path: &Path) -> Result<PathBuf> {
+    let mut current = start_path.canonicalize()
+        .map_err(|e| anyhow::anyhow!("Failed to canonicalize path: {}", e))?;
+
+    // Search up the directory tree (unlimited levels)
+    loop {
+        let git_path = current.join(".git");
+
+        if git_path.exists() {
+            // Found a .git directory
+
+            // Check if it's a git worktree file or a directory
+            if git_path.is_file() {
+                // Git worktree: read the gitdir: reference
+                let content = std::fs::read_to_string(&git_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read worktree git file: {}", e))?;
+
+                // Parse "gitdir: <path>" or direct path
+                let gitdir_line = content.lines().next()
+                    .ok_or_else(|| anyhow::anyhow!("Empty worktree git file"))?;
+
+                let gitdir_path = if gitdir_line.starts_with("gitdir: ") {
+                    gitdir_line.strip_prefix("gitdir: ")
+                        .ok_or_else(|| anyhow::anyhow!("Invalid gitdir format"))?
+                } else {
+                    gitdir_line
+                };
+
+                // Resolve relative path (relative to the directory containing the .git file, not .git itself)
+                let parent_dir = git_path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("No parent directory for .git file"))?;
+
+                let absolute_gitdir = parent_dir.join(gitdir_path.trim());
+
+                // Extract the repo root (parent of .git directory)
+                let repo_root = absolute_gitdir.parent()
+                    .ok_or_else(|| anyhow::anyhow!("No parent directory for .git directory"))?;
+
+                return Ok(repo_root.to_path_buf());
+            } else {
+                // Normal git repository
+                // Search down one level to check for multiple child .git dirs
+                if let Ok(entries) = std::fs::read_dir(&current) {
+                    let mut child_git_dirs = Vec::new();
+
+                    for entry in entries.flatten() {
+                        let entry_path = entry.path();
+                        if entry_path.is_dir() {
+                            let child_git = entry_path.join(".git");
+                            if child_git.exists() {
+                                child_git_dirs.push(entry_path);
+                            }
+                        }
+                    }
+
+                    if !child_git_dirs.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Multiple child .git directories found under {}:\n  {}\n  Run 'codesearch index' from the desired subdirectory.",
+                            current.display(),
+                            child_git_dirs.iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n  ")
+                        ));
+                    }
+                }
+
+                return Ok(current);
+            }
+        }
+
+        // Move to parent directory
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
+    Err(anyhow::anyhow!("No git repository found from {}", start_path.display()))
+}
+
 /// Find the project root by looking for version control directories
 /// Returns the directory containing .git, .hg, .svn, or Cargo.toml/package.json
+#[allow(dead_code)]
 fn find_project_root(start_path: &Path) -> Option<PathBuf> {
     // Project markers in order of priority
     let markers = [
@@ -354,13 +430,13 @@ async fn index_with_options(
     let is_incremental = db_path.exists() && !force;
 
     // Load FileMetaStore for incremental indexing (will be used later to update metadata)
-    let mut file_meta_store = if is_incremental {
+        let mut file_meta_store = if is_incremental {
         log_print!("\n{}", "📊 Incremental Indexing".bright_cyan());
         log_print!("{}", "-".repeat(60));
 
         Some(FileMetaStore::load_or_create(
             &db_path,
-            model_type.name(),
+            model_type.short_name(),
             model_type.dimensions(),
         )?)
     } else {
@@ -759,7 +835,7 @@ async fn index_with_options(
     } else {
         // In full index mode, create a fresh FileMetaStore
         let mut file_meta_store =
-            FileMetaStore::new(model_type.name().to_string(), model_type.dimensions());
+            FileMetaStore::new(model_type.short_name().to_string(), model_type.dimensions());
 
         // Update FileMetaStore
         for (file_path, chunk_ids) in file_chunks {
@@ -1153,6 +1229,9 @@ pub async fn list_index_status() -> Result<()> {
             println!("   Status: {}", "✅ Indexed".green());
             println!("   Chunks: {}", stats.chunk_count);
             println!("   Size: {:.2} MB", stats.size_mb);
+            if stats.bloat_ratio.map(|r| r > 0.0).unwrap_or(false) {
+                println!("   Bloat Ratio: {:.2}%", stats.bloat_ratio.unwrap_or(0.0));
+            }
         } else {
             println!("   Status: {}", "⚠️  Could not read database".yellow());
         }
@@ -1173,6 +1252,7 @@ async fn get_db_stats(db_path: &Path) -> Result<DbStats> {
         return Ok(DbStats {
             chunk_count: 0,
             size_mb: 0.0,
+            bloat_ratio: None,
         });
     }
 
@@ -1187,13 +1267,23 @@ async fn get_db_stats(db_path: &Path) -> Result<DbStats> {
         total_size += entry.metadata()?.len();
     }
 
+    // Calculate bloat ratio from database file size and chunk count
+    // Bloat ratio = (total_size / chunk_count) * 100 - indicates storage efficiency
+    let bloat_ratio = if stats.total_chunks > 0 {
+        Some((total_size as f64 / stats.total_chunks as f64) * 100.0)
+    } else {
+        None
+    };
+
     Ok(DbStats {
         chunk_count: stats.total_chunks,
         size_mb: total_size as f64 / (1024.0 * 1024.0),
+        bloat_ratio: Some(bloat_ratio.unwrap_or(0.0)),
     })
 }
 
 struct DbStats {
     chunk_count: usize,
     size_mb: f64,
+    bloat_ratio: Option<f64>,
 }
