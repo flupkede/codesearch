@@ -885,7 +885,7 @@ impl IndexManager {
         // Then, index modified/new files
         for file_path in &files_to_index {
             debug!("📄 Indexing: {}", file_path.display());
-            if let Err(e) = Self::index_single_file(codebase_path, file_path, db_path, stores).await
+            if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await
             {
                 warn!("⚠️  Failed to index {}: {}", file_path.display(), e);
             }
@@ -974,15 +974,12 @@ impl IndexManager {
     async fn index_single_file(
         codebase_path: &Path,
         file_path: &Path,
-        db_path: &Path,
         stores: &SharedStores,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::{Chunker, SemanticChunker};
         use crate::embed::EmbeddingService;
         use crate::file::Language;
-        use crate::fts::FtsStore;
-        use crate::vectordb::VectorStore;
 
         let db_path = codebase_path.join(DB_DIR_NAME);
 
