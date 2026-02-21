@@ -15,6 +15,7 @@ Search your codebase using natural language queries like *"where do we handle au
 - **Neural Reranking** — Optional cross-encoder reranking for higher accuracy
 - **Smart Chunking** — Tree-sitter AST-aware chunking that preserves functions, classes, methods
 - **Incremental Indexing** — Only re-indexes changed files (10–100× faster updates)
+- **Embedding Cache** — Three-layer caching system for dramatically faster subsequent indexes
 - **Git-Aware Index Placement** — Automatically places indexes at git repository roots
 - **Automatic Branch Detection** — Detects git branch changes and refreshes the index
 - **Global & Local Indexes** — Per-project local indexes or a shared global index
@@ -29,6 +30,8 @@ Search your codebase using natural language queries like *"where do we handle au
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Indexing](#indexing)
+- [Git Integration](#git-integration)
+- [Embedding Cache](#embedding-cache)
 - [Searching](#searching)
 - [MCP Server (OpenCode / Claude Code)](#mcp-server-opencode--claude-code)
 - [Other Commands](#other-commands)
@@ -167,6 +170,8 @@ codesearch index  # Creates .codesearch.db/ at /projects/myapp/
 
 This ensures a **single, authoritative index per git repository**, avoiding confusion from multiple indexes in subdirectories.
 
+---
+
 ### Automatic Branch Change Detection
 
 codesearch monitors `.git/HEAD` in real-time and automatically refreshes the index when you switch branches.
@@ -204,6 +209,83 @@ Bloat ratio: 1.2  # 1.2x size indicates 20% free space available
 - **Bloat ratio > 2.0**: Consider compacting (future feature)
 
 The bloat ratio is calculated from LMDB's internal statistics and helps monitor database health over time.
+
+---
+
+## Embedding Cache
+
+codesearch uses a sophisticated caching system to dramatically speed up indexing, especially for the first index and subsequent updates.
+
+### How Caching Works
+
+When you index your codebase, codesearch computes **embeddings** (vector representations) for each code chunk. This is the most time-consuming part of indexing. The cache system stores these embeddings so they don't need to be recomputed.
+
+```bash
+# First time: slow (all embeddings computed)
+codesearch index
+# Takes ~2-5 minutes for 10k files (depends on CPU)
+
+# Second time: fast (embeddings loaded from cache)
+codesearch index
+# Takes ~10-30 seconds (only changed files processed)
+
+# Switching branches: very fast (embeddings reused from cache)
+git checkout feature-branch
+# Index auto-refreshes in ~5-10 seconds (only new/changed files)
+```
+
+### Cache Types
+
+codesearch uses **three cache layers** for optimal performance:
+
+#### 1. In-Memory Cache (Moka LRU Cache)
+- **Location**: RAM during indexing process
+- **Size**: 100MB (configurable via `CODESEARCH_CACHE_MAX_MEMORY`)
+- **Purpose**: Cache embeddings during a single indexing session
+- **Benefit**: Avoids recomputing embeddings for duplicate chunks within the same index run
+
+#### 2. Persistent Cache (Disk-Based)
+- **Location**: `~/.codesearch/embedding_cache/<model_short_name>/`
+- **Size**: Up to 200,000 entries (~300MB)
+- **Purpose**: Long-term storage keyed by content hash (SHA256)
+- **Benefit**: Embeddings survive MCP restarts and branch switches
+- **Key Benefit**: Files with identical content across different branches share the same embedding
+
+#### 3. Query Cache (Optional)
+- **Location**: In-memory during search operations
+- **Purpose**: Cache query embeddings for repeated searches
+- **Benefit**: Repeated searches with the same query are nearly instant
+
+### Cache Benefits
+
+| Scenario | Without Cache | With Cache |
+|---|---|---|
+| First index (10k files) | ~2-5 min | ~2-5 min (cache empty) |
+| Incremental index (1% changed) | ~30 sec | ~10 sec |
+| Branch switch (50% overlap) | ~1-2 min | ~10 sec |
+| Repeated queries | ~500ms | ~50ms |
+
+### Cache Management
+
+```bash
+# Clear persistent cache for current model
+codesearch cache clear --model bge-small-en-v1.5
+
+# Show cache statistics
+codesearch cache stats
+
+# Clear all caches (use carefully!)
+codesearch cache clear --all
+```
+
+### Cache Size Monitoring
+
+The persistent cache automatically manages disk usage:
+- Default limit: 200,000 entries (~300MB)
+- Older entries are evicted when limit is reached (LRU policy)
+- Per-model isolation: Each embedding model has its own cache
+
+**Note:** The persistent cache is separate from the index database (`.codesearch.db/`). Clearing the cache does NOT delete your search index — it only deletes cached embeddings, which will be recomputed on the next index.
 
 ---
 
@@ -469,7 +551,7 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 1. **File Discovery** — Walks the directory respecting ignore files, detects language, skips binaries.
 2. **Git Root Detection** — Automatically finds the git repository root and places `.codesearch.db/` there, ensuring a single index per repository.
 3. **Semantic Chunking** — Tree-sitter AST parsing extracts functions, classes, methods with metadata. Falls back to line-based chunking for unsupported languages.
-4. **Embedding Generation** — fastembed + ONNX Runtime (CPU), batched, with SHA-256 change detection.
+4. **Embedding Generation** — fastembed + ONNX Runtime (CPU), batched, with SHA-256 change detection and **caching**.
 5. **Vector Storage** — arroy (ANN search) + LMDB (ACID persistence) in a single `.codesearch.db/` directory at git root.
 6. **Incremental Updates** — FileMetaStore tracks hash/mtime/size; only changed files are re-processed.
 7. **Git Branch Detection** — Monitors `.git/HEAD` for branch switches and automatically refreshes the index.
@@ -488,6 +570,8 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 | Port in use (serve) | `codesearch serve --port 5555` |
 | Wrong database found | Check where `.codesearch.db/` is located with `codesearch list` |
 | Index not updating after branch switch | The Git HEAD watcher refreshes automatically; check `codesearch stats` to verify |
+| First index very slow | Normal! First time indexes compute all embeddings (2-5 min). Subsequent indexes use cache (10-30 sec) |
+| Cache too large | Clear cache: `codesearch cache clear --model <model>` |
 
 ### Git-Specific Troubleshooting
 
