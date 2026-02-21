@@ -1,14 +1,26 @@
 # codesearch
 
-**Fast, local semantic code search powered by Rust.**
+**Token-efficient MCP server for AI agents — local semantic code search powered by Rust.**
 
-Search your codebase using natural language queries like *"where do we handle authentication?"* — all running locally with no API calls.
+codesearch is designed as the primary bridge between AI agents and your codebase. It provides a Model Context Protocol (MCP) server that enables OpenCode, Claude Code, and other AI assistants to perform intelligent, semantic code searches with minimal token usage — all running locally with no API calls.
+
+**Use AI to understand your code:** Query your codebase with natural language like *"where do we handle authentication?"* or *"show me all API endpoints"* and get instant, accurate results.
 
 > **Fork notice:** This project is a fork of [demongrep](https://github.com/yxanul/demongrep) by [yxanul](https://github.com/yxanul). Huge thanks to yxanul for creating the original project — it's an excellent piece of work and the foundation everything here builds on. Some features (like global database support) were contributed back to demongrep via PR. codesearch extends it further with incremental indexing, MCP token optimizations, AI agent integration, and more.
 
 ---
 
 ## Features
+
+### 🤖 MCP Server (Primary Use Case)
+
+- **Token-Efficient AI Integration** — Compact responses minimize token usage in AI conversations
+- **OpenCode Compatible** — Seamless integration with OpenCode and other MCP-compatible agents
+- **Automatic Index Discovery** — Finds your codebase index automatically from any directory
+- **Real-Time Updates** — File watcher and git branch detection keep index current during AI sessions
+- **Privacy-First** — All processing local, no code leaves your machine, no external API calls
+
+### 🔍 Core Search Capabilities
 
 - **Semantic Search** — Natural language queries that understand code meaning
 - **Hybrid Search** — Vector similarity + BM25 full-text search with RRF fusion
@@ -19,8 +31,6 @@ Search your codebase using natural language queries like *"where do we handle au
 - **Git-Aware Index Placement** — Automatically places indexes at git repository roots
 - **Automatic Branch Detection** — Detects git branch changes and refreshes the index
 - **Global & Local Indexes** — Per-project local indexes or a shared global index
-- **MCP Server** — Token-efficient integration with OpenCode, Claude Code, and any MCP-compatible agent
-- **Local & Private** — All processing via ONNX models, no data leaves your machine
 - **Fast** — Sub-second search after initial model load
 
 ---
@@ -28,12 +38,12 @@ Search your codebase using natural language queries like *"where do we handle au
 ## Table of Contents
 
 - [Installation](#installation)
-- [Quick Start](#quick-start)
+- [Quick Start for MCP](#quick-start-for-mcp)
 - [Indexing](#indexing)
 - [Git Integration](#git-integration)
 - [Embedding Cache](#embedding-cache)
 - [Searching](#searching)
-- [MCP Server (OpenCode / Claude Code)](#mcp-server-opencode--claude-code)
+- [MCP Server Configuration](#mcp-server-configuration)
 - [Other Commands](#other-commands)
 - [Search Modes](#search-modes)
 - [Global vs Local Indexes](#global-vs-local-indexes)
@@ -123,7 +133,65 @@ codesearch doctor
 
 ---
 
-## Quick Start
+## Quick Start for MCP
+
+Get up and running with AI agents in under 2 minutes.
+
+### 1️⃣ Install codesearch
+
+Download the pre-built binary for your platform from [Releases](https://github.com/flupkede/codesearch/releases) and extract it to your PATH, or build from source (see [Installation](#installation)).
+
+### 2️⃣ Index your codebase
+
+```bash
+cd /path/to/your/project
+
+# First time: creates index at git root (~2-5 min, depends on codebase size)
+codesearch index
+```
+
+The index is automatically placed at the git repository root, so it works from any subdirectory.
+
+### 3️⃣ Configure your AI agent
+
+**For OpenCode:**
+```json
+{
+  "mcp": {
+    "codesearch": {
+      "type": "local",
+      "command": ["codesearch", "mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+**For Claude Code Desktop:**
+Add to `claude_desktop_config.json` (Windows) or `claude_desktop_config.json` (macOS/Linux):
+```json
+{
+  "mcpServers": {
+    "codesearch": {
+      "command": "codesearch",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### 4️⃣ Start using AI to understand your code
+
+Restart your AI agent and start asking questions:
+- *"Where is the authentication logic?"*
+- *"Show me all API endpoints"*
+- *"How do we handle errors in this project?"*
+
+The AI agent will use codesearch to find relevant code and provide accurate answers with minimal token usage.
+
+---
+
+## Quick Start for CLI
 
 ```bash
 # 1. Navigate to your project
@@ -347,7 +415,7 @@ codesearch search "new feature" --sync
 
 ---
 
-## MCP Server (OpenCode / Claude Code)
+## MCP Server Configuration
 
 The MCP server is codesearch's primary integration point for AI coding agents. It exposes token-efficient tools for semantic code search. The MCP server **auto-detects** the nearest database (local or global) — no project path argument is needed. If no database is found, the server will **not start**. This is intentional: codesearch never creates a database automatically to avoid polluting your projects.
 
