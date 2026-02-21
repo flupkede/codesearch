@@ -15,6 +15,8 @@ Search your codebase using natural language queries like *"where do we handle au
 - **Neural Reranking** — Optional cross-encoder reranking for higher accuracy
 - **Smart Chunking** — Tree-sitter AST-aware chunking that preserves functions, classes, methods
 - **Incremental Indexing** — Only re-indexes changed files (10–100× faster updates)
+- **Git-Aware Index Placement** — Automatically places indexes at git repository roots
+- **Automatic Branch Detection** — Detects git branch changes and refreshes the index
 - **Global & Local Indexes** — Per-project local indexes or a shared global index
 - **MCP Server** — Token-efficient integration with OpenCode, Claude Code, and any MCP-compatible agent
 - **Local & Private** — All processing via ONNX models, no data leaves your machine
@@ -144,6 +146,67 @@ See [Global vs Local Indexes](#global-vs-local-indexes) for where the index is s
 
 ---
 
+## Git Integration
+
+codesearch is deeply integrated with git for intelligent index management and automatic updates.
+
+### Automatic Git Root Detection
+
+When you run `codesearch index`, the index is automatically placed at the **git repository root** (where `.git/` is located), regardless of your current working directory within the project.
+
+```bash
+cd /projects/myapp/src/api/
+codesearch index  # Creates .codesearch.db/ at /projects/myapp/
+```
+
+**How it works:**
+- Searches upward from the current directory to find `.git/` or `.git` (worktree) file
+- Places `.codesearch.db/` at the same level as the git repository
+- Detects nested git worktrees and errors on multiple child `.git` directories
+- Falls back to current directory if no git repository is found
+
+This ensures a **single, authoritative index per git repository**, avoiding confusion from multiple indexes in subdirectories.
+
+### Automatic Branch Change Detection
+
+codesearch monitors `.git/HEAD` in real-time and automatically refreshes the index when you switch branches.
+
+```bash
+# Currently on main branch
+codesearch index
+
+# Switch branches
+git checkout feature/new-auth
+
+# Index is automatically refreshed to reflect the new branch files
+```
+
+**Behavior:**
+- The MCP server (and `codesearch serve`) polls `.git/HEAD` every 100ms
+- Detects HEAD changes (branch switches) and triggers an incremental re-index
+- Updates happen automatically in the background — no manual intervention needed
+
+This is especially useful when working with different branches in AI coding sessions — the search results always reflect your current branch state.
+
+### Database Bloat Monitoring
+
+`codesearch stats` now shows a **bloat ratio** that indicates how much free space exists in the LMDB database:
+
+```bash
+$ codesearch stats
+Database: .codesearch.db/
+Files: 1,234
+Chunks: 45,678
+Bloat ratio: 1.2  # 1.2x size indicates 20% free space available
+```
+
+- **Bloat ratio < 1.5**: Healthy, no action needed
+- **Bloat ratio > 2.0**: Consider compacting (future feature)
+
+The bloat ratio is calculated from LMDB's internal statistics and helps monitor database health over time.
+
+---
+
 ## Searching
 
 ```bash
@@ -225,11 +288,12 @@ On Windows, use the full path to `codesearch.exe` if it's not in your `PATH`. Re
 
 When the MCP server starts, it goes through this sequence:
 
-1. **Database discovery** — Searches for a `.codesearch.db/` in the current directory, then walks up parent directories (up to 10 levels), and finally checks the global location (`~/.codesearch.dbs/`). The first database found is used. If none is found, the server exits — it will never create a database on its own.
+1. **Database discovery** — Searches for `.codesearch.db/` at the git root (by detecting `.git/` from the current directory), then walks up parent directories (up to 10 levels for non-git projects), and finally checks the global location (`~/.codesearch.dbs/`). The first database found is used. If none is found, the server exits — it will never create a database on its own.
 2. **Incremental index** — Automatically runs an incremental re-index against the detected database, so the index is up-to-date before the agent starts working.
 3. **File system watcher (FSW)** — Starts watching the project directory for changes. Any file modifications, additions, or deletions are picked up and the index is updated in the background (with debouncing), keeping the database current throughout the session.
+4. **Git HEAD watcher** — Monitors `.git/HEAD` for branch changes. When a branch switch is detected, an automatic incremental re-index is triggered to update the database with files from the new branch.
 
-> **Important:** Databases are discovered in *parent* folders only. Do not place `.codesearch.db/` directories inside subfolders of an already-indexed project — this will cause confusion. One database per project, at the project root (or global).
+> **Important:** Databases are discovered at the *git repository root*, not in subdirectories. Do not manually create `.codesearch.db/` directories inside subfolders — this will cause confusion. One database per git repository, at the git root (or global).
 
 ### MCP Tools
 
@@ -306,32 +370,34 @@ codesearch supports two index locations per project. Only one can be active at a
 
 | | Local Index | Global Index |
 |---|---|---|
-| **Location** | `<project>/.codesearch.db/` | `~/.codesearch.dbs/<project>/` |
+| **Location** | `<git-root>/.codesearch.db/` | `~/.codesearch.dbs/<project>/` |
 | **Created with** | `codesearch index` (default) | `codesearch index --add -g` |
 | **Visible to** | Only when inside the project tree | From any directory |
 | **Use case** | Per-project, self-contained | Shared/central index, searchable from anywhere |
 
 **How discovery works:** when you run a command, codesearch looks for a database in this order:
-1. `.codesearch.db/` in the current directory
-2. `.codesearch.db/` in parent directories (up to 10 levels)
+1. `.codesearch.db/` at the git root (automatically detected from current directory)
+2. `.codesearch.db/` in parent directories (up to 10 levels, for non-git projects)
 3. `~/.codesearch.dbs/` (global)
 
-This means you can `cd` into any subfolder and codesearch will still find the project index.
+This means you can `cd` into any subfolder and codesearch will still find the project index at the git root.
 
 ### Git Worktrees
 
-codesearch works naturally with [git worktrees](https://git-scm.com/docs/git-worktree). Each worktree lives in its own directory, so each one gets its own independent database and MCP server instance. This means you can have separate indexes for different branches — when OpenCode or Claude Code starts in a worktree folder, codesearch auto-detects the database for that specific worktree.
+codesearch works naturally with [git worktrees](https://git-scm.com/docs/git-worktree). Each worktree lives in its own directory and points to a different branch of the same git repository, so each worktree can have its own independent database and MCP server instance. This means you can have separate indexes for different branches — when OpenCode or Claude Code starts in a worktree folder, codesearch auto-detects the database for that specific worktree.
 
 ```bash
-# Main repo
+# Main repo on main branch
 cd /projects/myapp
 codesearch index
 
 # Worktree for a feature branch
+git worktree add /projects/myapp-feature feature/new-auth
 cd /projects/myapp-feature
 codesearch index
 
-# Each directory has its own .codesearch.db/ and MCP instance
+# Each worktree has its own .codesearch.db/ and MCP instance
+# Branch switching within a worktree triggers automatic index refresh
 ```
 
 ```bash
@@ -402,11 +468,13 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 ## How It Works
 
 1. **File Discovery** — Walks the directory respecting ignore files, detects language, skips binaries.
-2. **Semantic Chunking** — Tree-sitter AST parsing extracts functions, classes, methods with metadata. Falls back to line-based chunking for unsupported languages.
-3. **Embedding Generation** — fastembed + ONNX Runtime (CPU), batched, with SHA-256 change detection.
-4. **Vector Storage** — arroy (ANN search) + LMDB (ACID persistence) in a single `.codesearch.db/` directory.
-5. **Incremental Updates** — FileMetaStore tracks hash/mtime/size; only changed files are re-processed.
-6. **Search** — Query → embed → vector search → BM25 → RRF fusion → (optional) reranking.
+2. **Git Root Detection** — Automatically finds the git repository root and places `.codesearch.db/` there, ensuring a single index per repository.
+3. **Semantic Chunking** — Tree-sitter AST parsing extracts functions, classes, methods with metadata. Falls back to line-based chunking for unsupported languages.
+4. **Embedding Generation** — fastembed + ONNX Runtime (CPU), batched, with SHA-256 change detection.
+5. **Vector Storage** — arroy (ANN search) + LMDB (ACID persistence) in a single `.codesearch.db/` directory at git root.
+6. **Incremental Updates** — FileMetaStore tracks hash/mtime/size; only changed files are re-processed.
+7. **Git Branch Detection** — Monitors `.git/HEAD` for branch switches and automatically refreshes the index.
+8. **Search** — Query → embed → vector search → BM25 → RRF fusion → (optional) reranking.
 
 ---
 
@@ -414,11 +482,23 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 
 | Problem | Solution |
 |---|---|
-| "No database found" | Run `codesearch index` first |
+| "No database found" | Run `codesearch index` first (creates index at git root) |
 | Poor search results | Try `--sync` to update, `--rerank` for accuracy, or `--force` to rebuild |
 | Model mismatch warning | Re-index: `codesearch index --force --model <model>` |
 | Out of memory | `CODESEARCH_BATCH_SIZE=32 codesearch index` |
 | Port in use (serve) | `codesearch serve --port 5555` |
+| Wrong database found | Check where `.codesearch.db/` is located with `codesearch list` |
+| Index not updating after branch switch | The Git HEAD watcher refreshes automatically; check `codesearch stats` to verify |
+
+### Git-Specific Troubleshooting
+
+**"Multiple .git directories detected"**
+- This error occurs when codesearch finds nested git repositories
+- Solution: Remove the nested `.git` directory or index from the outer repository only
+
+**"Database not at git root"**
+- Old versions of codesearch created databases in the current directory
+- Solution: Delete the old `.codesearch.db/` directory and run `codesearch index` — it will be recreated at the git root
 
 ### Debug Logging
 
