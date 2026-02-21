@@ -362,13 +362,15 @@ impl GitHeadWatcher {
     /// - `Ok(None)` when HEAD is unchanged or on first check
     /// - `Err` if the HEAD file cannot be read
     pub async fn check(&self) -> Result<Option<HeadChange>> {
-        let current_content = std::fs::read_to_string(&self.head_path).map_err(|e| {
-            anyhow!(
-                "Failed to read HEAD file {}: {}",
-                self.head_path.display(),
-                e
-            )
-        })?;
+        let current_content = tokio::fs::read_to_string(&self.head_path)
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to read HEAD file {}: {}",
+                    self.head_path.display(),
+                    e
+                )
+            })?;
 
         let mut last = self.last_head_content.lock().await;
 

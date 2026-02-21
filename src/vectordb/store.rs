@@ -603,7 +603,7 @@ impl VectorStore {
         loop {
             attempts += 1;
 
-            let result = self.insert_chunks_with_ids_impl(chunks.clone());
+            let result = self.insert_chunks_with_ids_impl(&chunks);
 
             match &result {
                 Ok(_) => return result,
@@ -631,7 +631,7 @@ impl VectorStore {
     }
 
     /// Implementation of insert_chunks_with_ids without retry logic
-    fn insert_chunks_with_ids_impl(&mut self, chunks: Vec<EmbeddedChunk>) -> Result<Vec<u32>> {
+    fn insert_chunks_with_ids_impl(&mut self, chunks: &[EmbeddedChunk]) -> Result<Vec<u32>> {
         if chunks.is_empty() {
             return Ok(vec![]);
         }
@@ -640,7 +640,7 @@ impl VectorStore {
         let mut wtxn = self.env.write_txn()?;
         let writer = Writer::new(self.vectors, 0, self.dimensions);
 
-        for chunk in &chunks {
+        for chunk in chunks {
             let id = self.next_id;
 
             if chunk.embedding.len() != self.dimensions {

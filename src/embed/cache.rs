@@ -381,7 +381,7 @@ impl PersistentEmbeddingCache {
             return Ok(0);
         }
 
-        // Delete oldest entries (LMDB iteration order = insertion order for Str keys)
+        // Delete first entries (LMDB iterates in lexicographic b-tree order, not insertion order)
         let to_delete = count - max_entries;
 
         // Collect keys first to avoid borrow checker issues with iterator
