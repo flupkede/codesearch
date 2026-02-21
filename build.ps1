@@ -51,11 +51,34 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
-# Only skip build if: 1) no changes AND 2) target exe exists
+# Only skip build if: 1) no uncommitted changes AND 2) target exe exists AND 3) versions match
 if (-not $ChangedFiles) {
     if (Test-Path $TargetExe) {
-        Write-Host "No changes detected and build exists ($(Split-Path $TargetExe -Leaf)), skipping build" -ForegroundColor Green
-        exit 0
+        # Check if the binary version matches Cargo.toml version
+        $CargoVersion = $null
+        $CargoTomlPath = Join-Path $ScriptDir "Cargo.toml"
+        if (Test-Path $CargoTomlPath) {
+            $CargoContent = Get-Content $CargoTomlPath -Raw
+            if ($CargoContent -match 'version\s*=\s*"(\d+\.\d+\.\d+)"') {
+                $CargoVersion = $Matches[1]
+            }
+        }
+        $BinaryVersion = $null
+        try {
+            $BinaryOutput = & $TargetExe --version 2>&1
+            if ($BinaryOutput -match '(\d+\.\d+\.\d+)') {
+                $BinaryVersion = $Matches[1]
+            }
+        } catch { }
+
+        if ($CargoVersion -and $BinaryVersion -and ($CargoVersion -eq $BinaryVersion)) {
+            Write-Host "No changes detected and build exists ($(Split-Path $TargetExe -Leaf) v$BinaryVersion), skipping build" -ForegroundColor Green
+            exit 0
+        } elseif ($CargoVersion -and $BinaryVersion) {
+            Write-Host "Binary version ($BinaryVersion) differs from Cargo.toml ($CargoVersion), rebuilding..." -ForegroundColor Yellow
+        } else {
+            Write-Host "No changes detected but could not verify version, rebuilding..." -ForegroundColor Yellow
+        }
     } else {
         Write-Host "No changes detected but build artifact not found, building..." -ForegroundColor Yellow
     }

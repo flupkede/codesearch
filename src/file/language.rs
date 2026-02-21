@@ -24,15 +24,36 @@ pub enum Language {
     Sql,
     Html,
     Css,
+    Xml,
     Unknown,
 }
 
 impl Language {
-    /// Detect language from file extension
+    /// Detect language from file path (extension + known extensionless filenames)
     pub fn from_path(path: &Path) -> Self {
         let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-        Self::from_extension(extension)
+        // Try extension first
+        let by_ext = Self::from_extension(extension);
+        if by_ext != Self::Unknown {
+            return by_ext;
+        }
+
+        // Fallback: match on exact filename for extensionless files
+        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        Self::from_filename(filename)
+    }
+
+    /// Detect language from extensionless filename
+    pub fn from_filename(name: &str) -> Self {
+        match name {
+            "Dockerfile" | "Containerfile" => Self::Shell,
+            "Makefile" | "GNUmakefile" | "makefile" => Self::Shell,
+            "Jenkinsfile" | "Vagrantfile" | "Fastfile" | "Appfile" | "Podfile" => Self::Ruby,
+            ".env" | ".envrc" => Self::Shell,
+            "CMakeLists" => Self::Shell,
+            _ => Self::Unknown,
+        }
     }
 
     /// Detect language from extension string
@@ -60,6 +81,7 @@ impl Language {
             "sql" => Self::Sql,
             "html" | "htm" => Self::Html,
             "css" | "scss" | "sass" | "less" => Self::Css,
+            "xml" | "csproj" | "props" | "targets" | "resx" | "config" => Self::Xml,
             _ => Self::Unknown,
         }
     }
@@ -110,6 +132,7 @@ impl Language {
             Self::Sql => "SQL",
             Self::Html => "HTML",
             Self::Css => "CSS",
+            Self::Xml => "XML",
             Self::Unknown => "Unknown",
         }
     }
