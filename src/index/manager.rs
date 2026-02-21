@@ -689,7 +689,11 @@ impl IndexManager {
                             info!("🔀 Git branch changed, triggering full incremental refresh...");
                             // Trigger a full incremental refresh on branch change
                             if let Err(e) = Self::process_batch_with_stores(
-                                &path, &db_path, &stores, Vec::new(), Vec::new(),
+                                &path,
+                                &db_path,
+                                &stores,
+                                Vec::new(),
+                                Vec::new(),
                             )
                             .await
                             {
@@ -896,8 +900,7 @@ impl IndexManager {
         // Then, index modified/new files
         for file_path in &files_to_index {
             debug!("📄 Indexing: {}", file_path.display());
-            if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await
-            {
+            if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
                 warn!("⚠️  Failed to index {}: {}", file_path.display(), e);
             }
         }

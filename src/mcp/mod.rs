@@ -366,7 +366,9 @@ impl CodesearchService {
                     let normalized_path = crate::cache::normalize_path_str(&r.path);
                     let normalized_path = normalized_path.trim_start_matches("./");
                     let normalized_filter = crate::cache::normalize_path_str(fp);
-                    let normalized_filter = normalized_filter.trim_start_matches("./").trim_end_matches('/');
+                    let normalized_filter = normalized_filter
+                        .trim_start_matches("./")
+                        .trim_end_matches('/');
                     normalized_path.starts_with(normalized_filter)
                 } else {
                     true

@@ -251,7 +251,8 @@ pub(crate) fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
                     "❌ Multiple git repositories found in subdirectories:\n  {}\n\n\
                      Cannot create a single index spanning multiple repos.\n\
                      Run 'codesearch index' inside each repository separately.",
-                    child_git_dirs.iter()
+                    child_git_dirs
+                        .iter()
                         .map(|p| p.display().to_string())
                         .collect::<Vec<_>>()
                         .join("\n  ")
@@ -635,20 +636,22 @@ async fn index_with_options(
             Ok(content) => {
                 // UTF-8 succeeded
                 content
-            },
+            }
             Err(utf8_err) if utf8_err.kind() == std::io::ErrorKind::InvalidData => {
                 // UTF-8 failed — try lossy decode (handles ISO-8859-1, Windows-1252, etc.)
                 match std::fs::read(&file.path) {
-                    Ok(bytes) => {
-                        String::from_utf8_lossy(&bytes).to_string()
-                    },
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
                     Err(read_err) => {
-                        skipped_files.push(format!("{} (read failed: {})", file.path.display(), read_err));
+                        skipped_files.push(format!(
+                            "{} (read failed: {})",
+                            file.path.display(),
+                            read_err
+                        ));
                         pb.inc(1);
                         continue;
                     }
                 }
-            },
+            }
             Err(e) => {
                 // Other error (permission denied, file not found, etc.)
                 skipped_files.push(format!("{} ({})", file.path.display(), e));
@@ -806,7 +809,10 @@ async fn index_with_options(
     }
 
     if !skipped_files.is_empty() {
-        log_print!("   ⚠️  Skipped {} files (failed to read):", skipped_files.len());
+        log_print!(
+            "   ⚠️  Skipped {} files (failed to read):",
+            skipped_files.len()
+        );
         for path in &skipped_files {
             log_print!("      - {}", path);
         }

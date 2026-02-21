@@ -80,17 +80,15 @@ impl CheckResult {
 /// Check 1: Find database
 fn check_find_database(project_path: &Path) -> CheckResult {
     match find_best_database(Some(project_path)) {
-        Ok(Some(db_info)) => {
-            CheckResult::pass(
-                "Database found",
-                format!("Database at {}", db_info.db_path.display()),
-            )
-            .with_details(format!(
-                "Project: {} (depth {})",
-                db_info.project_path.display(),
-                db_info.depth
-            ))
-        }
+        Ok(Some(db_info)) => CheckResult::pass(
+            "Database found",
+            format!("Database at {}", db_info.db_path.display()),
+        )
+        .with_details(format!(
+            "Project: {} (depth {})",
+            db_info.project_path.display(),
+            db_info.depth
+        )),
         Ok(None) => CheckResult::fail(
             "No database found",
             "No .codesearch.db found in current or parent directories",
@@ -152,34 +150,43 @@ fn check_model_consistency(db_path: &Path) -> CheckResult {
     let metadata_model: Option<String> = fs::read_to_string(&metadata_path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("model_short_name").and_then(|v| v.as_str()).map(|s| s.to_string()));
+        .and_then(|v| {
+            v.get("model_short_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
 
     // Read model from file_meta.json
     let file_meta_model: Option<String> = fs::read_to_string(&file_meta_path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("model_name").and_then(|v| v.as_str()).map(|s| s.to_string()));
+        .and_then(|v| {
+            v.get("model_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
 
     match (metadata_model, file_meta_model) {
         (Some(meta), Some(file)) if meta == file => {
             CheckResult::pass("Model consistency", format!("Model: {}", meta))
         }
-        (Some(meta), Some(file)) => {
-            CheckResult::warn(
-                "Model consistency",
-                format!("Model name mismatch: metadata.json='{}', file_meta.json='{}'", meta, file),
-            )
-            .with_hint("This may cause issues; consider re-indexing")
-        }
-        (Some(meta), None) => {
-            CheckResult::pass("Model consistency", format!("Model: {} (no file_meta.json yet)", meta))
-        }
-        (None, Some(file)) => {
-            CheckResult::warn("Model consistency", format!("Model in file_meta only: {}", file))
-        }
-        (None, None) => {
-            CheckResult::warn("Model consistency", "No model information found")
-        }
+        (Some(meta), Some(file)) => CheckResult::warn(
+            "Model consistency",
+            format!(
+                "Model name mismatch: metadata.json='{}', file_meta.json='{}'",
+                meta, file
+            ),
+        )
+        .with_hint("This may cause issues; consider re-indexing"),
+        (Some(meta), None) => CheckResult::pass(
+            "Model consistency",
+            format!("Model: {} (no file_meta.json yet)", meta),
+        ),
+        (None, Some(file)) => CheckResult::warn(
+            "Model consistency",
+            format!("Model in file_meta only: {}", file),
+        ),
+        (None, None) => CheckResult::warn("Model consistency", "No model information found"),
     }
 }
 
@@ -189,8 +196,8 @@ fn check_git_root_placement(db_path: &Path, project_path: &Path) -> CheckResult 
         Ok(Some(git_root)) => {
             let db_canonical = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
             let expected_db_path = git_root.join(DB_DIR_NAME);
-            let expected_canonical = fs::canonicalize(&expected_db_path)
-                .unwrap_or_else(|_| expected_db_path);
+            let expected_canonical =
+                fs::canonicalize(&expected_db_path).unwrap_or_else(|_| expected_db_path);
 
             if db_canonical == expected_canonical {
                 CheckResult::pass(
@@ -210,13 +217,9 @@ fn check_git_root_placement(db_path: &Path, project_path: &Path) -> CheckResult 
                 .with_hint("Move .codesearch.db to git root and re-index")
             }
         }
-        Ok(None) => {
-            CheckResult::warn("Git root placement", "No .git directory found")
-                .with_details("Index may not be in optimal location")
-        }
-        Err(e) => {
-            CheckResult::warn("Git root placement", format!("Could not find .git: {}", e))
-        }
+        Ok(None) => CheckResult::warn("Git root placement", "No .git directory found")
+            .with_details("Index may not be in optimal location"),
+        Err(e) => CheckResult::warn("Git root placement", format!("Could not find .git: {}", e)),
     }
 }
 
@@ -349,13 +352,15 @@ fn read_dimensions(db_path: &Path) -> usize {
 
 /// Check 6: Chunk integrity - vector store health
 fn check_chunk_integrity(store: &VectorStore) -> CheckResult {
-    let stats = store.stats().unwrap_or_else(|_| crate::vectordb::StoreStats {
-        total_chunks: 0,
-        total_files: 0,
-        indexed: false,
-        dimensions: 0,
-        max_chunk_id: 0,
-    });
+    let stats = store
+        .stats()
+        .unwrap_or_else(|_| crate::vectordb::StoreStats {
+            total_chunks: 0,
+            total_files: 0,
+            indexed: false,
+            dimensions: 0,
+            max_chunk_id: 0,
+        });
     if stats.indexed {
         CheckResult::pass(
             "Chunk integrity",
@@ -375,10 +380,8 @@ fn check_chunk_integrity(store: &VectorStore) -> CheckResult {
 fn check_fts_health(db_path: &Path) -> CheckResult {
     match FtsStore::new(db_path) {
         Ok(_store) => CheckResult::pass("FTS health", "Full-text search index readable"),
-        Err(e) => {
-            CheckResult::fail("FTS health", format!("Failed to open FTS index: {}", e))
-                .with_hint("Run 'codesearch index' to rebuild FTS index")
-        }
+        Err(e) => CheckResult::fail("FTS health", format!("Failed to open FTS index: {}", e))
+            .with_hint("Run 'codesearch index' to rebuild FTS index"),
     }
 }
 
@@ -389,7 +392,10 @@ fn check_lmdb_bloat(_db_path: &Path, store: &VectorStore) -> CheckResult {
     let page_stats = match store.lmdb_page_stats() {
         Ok(s) => s,
         Err(e) => {
-            return CheckResult::fail("LMDB bloat", format!("Failed to read LMDB page stats: {}", e));
+            return CheckResult::fail(
+                "LMDB bloat",
+                format!("Failed to read LMDB page stats: {}", e),
+            );
         }
     };
 
@@ -405,33 +411,38 @@ fn check_lmdb_bloat(_db_path: &Path, store: &VectorStore) -> CheckResult {
     if bloat_ratio < 1.3 {
         CheckResult::pass(
             "LMDB bloat",
-            format!("Bloat ratio: {:.2}x ({} used, {} file, {} free)",
+            format!(
+                "Bloat ratio: {:.2}x ({} used, {} file, {} free)",
                 bloat_ratio,
                 format_bytes(page_stats.used_bytes as usize),
                 format_bytes(page_stats.disk_size as usize),
                 format_bytes(free_bytes as usize),
-            )
+            ),
         )
     } else if bloat_ratio < 3.0 {
         CheckResult::warn(
             "LMDB bloat",
-            format!("Bloat ratio: {:.2}x ({} used, {} file, {} free pages)",
+            format!(
+                "Bloat ratio: {:.2}x ({} used, {} file, {} free pages)",
                 bloat_ratio,
                 format_bytes(page_stats.used_bytes as usize),
                 format_bytes(page_stats.disk_size as usize),
                 format_bytes(free_bytes as usize),
-            )
-        ).with_hint("Consider re-indexing with `codesearch index -f` to reclaim free pages")
+            ),
+        )
+        .with_hint("Consider re-indexing with `codesearch index -f` to reclaim free pages")
     } else {
         CheckResult::warn(
             "LMDB bloat",
-            format!("High bloat ratio: {:.2}x ({} used, {} file, {} free pages)",
+            format!(
+                "High bloat ratio: {:.2}x ({} used, {} file, {} free pages)",
                 bloat_ratio,
                 format_bytes(page_stats.used_bytes as usize),
                 format_bytes(page_stats.disk_size as usize),
                 format_bytes(free_bytes as usize),
-            )
-        ).with_hint("Run 'codesearch index -f' to rebuild and compact the database")
+            ),
+        )
+        .with_hint("Run 'codesearch index -f' to rebuild and compact the database")
     }
 }
 
@@ -452,29 +463,27 @@ fn format_bytes(bytes: usize) -> String {
 fn check_embedding_cache(_db_path: &Path, model_name: &str) -> CheckResult {
     // PersistentEmbeddingCache::open takes model_name as &str
     match PersistentEmbeddingCache::open(model_name) {
-        Ok(cache) => {
-            match cache.stats() {
-                Ok(stats) => {
-                    if stats.entries > 0 {
-                        CheckResult::pass(
-                            "Embedding cache",
-                            format!("{} entries ({})", stats.entries, format_bytes(stats.file_size_bytes as usize))
-                        )
-                    } else {
-                        CheckResult::pass(
-                            "Embedding cache",
-                            format!("Cache empty but functional ({} entries)", stats.entries)
-                        )
-                    }
-                }
-        Err(_e) => {
-                    CheckResult::warn("Embedding cache", "Could not get cache stats")
+        Ok(cache) => match cache.stats() {
+            Ok(stats) => {
+                if stats.entries > 0 {
+                    CheckResult::pass(
+                        "Embedding cache",
+                        format!(
+                            "{} entries ({})",
+                            stats.entries,
+                            format_bytes(stats.file_size_bytes as usize)
+                        ),
+                    )
+                } else {
+                    CheckResult::pass(
+                        "Embedding cache",
+                        format!("Cache empty but functional ({} entries)", stats.entries),
+                    )
                 }
             }
-        }
-        Err(e) => {
-            CheckResult::warn("Embedding cache", format!("Could not open cache: {}", e))
-        }
+            Err(_e) => CheckResult::warn("Embedding cache", "Could not get cache stats"),
+        },
+        Err(e) => CheckResult::warn("Embedding cache", format!("Could not open cache: {}", e)),
     }
 }
 
@@ -509,7 +518,11 @@ pub async fn run(fix: bool, json: bool) -> Result<()> {
     let model_name = fs::read_to_string(db_path.join("metadata.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("model_short_name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("model_short_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
     // Open VectorStore once for checks that need it
@@ -551,8 +564,14 @@ pub async fn run(fix: bool, json: bool) -> Result<()> {
     print_results(&results, json);
 
     // Count warnings and errors
-    let warnings = results.iter().filter(|r| r.status == CheckStatus::Warn).count();
-    let errors = results.iter().filter(|r| r.status == CheckStatus::Fail).count();
+    let warnings = results
+        .iter()
+        .filter(|r| r.status == CheckStatus::Warn)
+        .count();
+    let errors = results
+        .iter()
+        .filter(|r| r.status == CheckStatus::Fail)
+        .count();
 
     if json {
         // JSON mode: single root object with checks + summary
@@ -573,16 +592,22 @@ pub async fn run(fix: bool, json: bool) -> Result<()> {
 
         // Add hints based on issues found
         if warnings > 0 || errors > 0 {
-            if results.iter().any(|r| {
-                r.status == CheckStatus::Warn || r.status == CheckStatus::Fail
-            }) {
+            if results
+                .iter()
+                .any(|r| r.status == CheckStatus::Warn || r.status == CheckStatus::Fail)
+            {
                 println!();
-                println!("{}", "💡 Run 'codesearch index' to fix stale/missing files".bright_yellow());
+                println!(
+                    "{}",
+                    "💡 Run 'codesearch index' to fix stale/missing files".bright_yellow()
+                );
             }
             if fix {
                 println!();
                 println!("Running incremental refresh...");
-                if let Err(e) = crate::index::index_quiet(None, false, CancellationToken::new()).await {
+                if let Err(e) =
+                    crate::index::index_quiet(None, false, CancellationToken::new()).await
+                {
                     eprintln!("{} Failed to run index: {}", "❌".red(), e);
                 } else {
                     println!("{}", "✅ Index refresh completed".green());
@@ -815,10 +840,19 @@ mod tests {
         let result = check_file_integrity(&db_dir, project_path);
 
         // Should warn about stale files
-        assert_eq!(result.status, CheckStatus::Warn, "Expected Warn, got {:?}: {}", result.status, result.message);
+        assert_eq!(
+            result.status,
+            CheckStatus::Warn,
+            "Expected Warn, got {:?}: {}",
+            result.status,
+            result.message
+        );
         assert_eq!(result.name, "File integrity");
-        assert!(result.details.as_ref().unwrap().contains("stale"),
-            "Expected 'stale' in details, got: {:?}", result.details);
+        assert!(
+            result.details.as_ref().unwrap().contains("stale"),
+            "Expected 'stale' in details, got: {:?}",
+            result.details
+        );
     }
 
     #[test]
@@ -846,7 +880,10 @@ mod tests {
         if let Ok(ref s) = store {
             let result = check_lmdb_bloat(&db_dir, s);
             // With a fresh empty store, either pass (empty) or report bloat
-            assert!(matches!(result.status, CheckStatus::Pass | CheckStatus::Warn));
+            assert!(matches!(
+                result.status,
+                CheckStatus::Pass | CheckStatus::Warn
+            ));
         }
         // If store fails to open, that's fine — check_chunk_integrity handles it in run()
     }

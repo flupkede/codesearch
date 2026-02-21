@@ -686,12 +686,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // OPTIMIZATION: Apply path filter BEFORE expensive operations (reranking, boosting)
     // This avoids processing results that will be filtered out anyway
     let should_filter_by_path = options.filter_path.is_some();
-    let filter_path_normalized = options
-        .filter_path
-        .as_ref()
-        .map(|f| crate::cache::normalize_path_str(f)
+    let filter_path_normalized = options.filter_path.as_ref().map(|f| {
+        crate::cache::normalize_path_str(f)
             .trim_start_matches("./")
-            .to_string());
+            .to_string()
+    });
 
     // Take top rerank_top results for reranking (or max_results if not reranking)
     // OPTIMIZATION: Take extra results when path filtering is active to ensure we have enough after filtering

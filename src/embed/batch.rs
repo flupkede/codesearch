@@ -347,7 +347,11 @@ mod tests {
     #[ignore] // Requires model
     fn test_batch_embedder() {
         let embedder = Arc::new(Mutex::new(
-            FastEmbedder::with_cache_dir(crate::embed::ModelType::default(), Some(&test_cache_dir())).unwrap()
+            FastEmbedder::with_cache_dir(
+                crate::embed::ModelType::default(),
+                Some(&test_cache_dir()),
+            )
+            .unwrap(),
         ));
         let mut batch = BatchEmbedder::new(embedder);
 

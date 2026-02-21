@@ -30,8 +30,6 @@ pub struct HeadChange {
     pub new_head: String,
 }
 
-
-
 /// Types of file system events we care about
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // Renamed variant reserved for future rename detection
@@ -156,11 +154,7 @@ impl FileWatcher {
         }
 
         // Skip 0-byte files (empty build artifacts)
-        if path
-            .metadata()
-            .map(|m| m.len() == 0)
-            .unwrap_or(false)
-        {
+        if path.metadata().map(|m| m.len() == 0).unwrap_or(false) {
             return false;
         }
 
@@ -368,18 +362,21 @@ impl GitHeadWatcher {
     /// - `Ok(None)` when HEAD is unchanged or on first check
     /// - `Err` if the HEAD file cannot be read
     pub async fn check(&self) -> Result<Option<HeadChange>> {
-        let current_content = std::fs::read_to_string(&self.head_path)
-            .map_err(|e| anyhow!("Failed to read HEAD file {}: {}", self.head_path.display(), e))?;
+        let current_content = std::fs::read_to_string(&self.head_path).map_err(|e| {
+            anyhow!(
+                "Failed to read HEAD file {}: {}",
+                self.head_path.display(),
+                e
+            )
+        })?;
 
         let mut last = self.last_head_content.lock().await;
 
         let result = match &*last {
-            Some(prev) if prev != &current_content => {
-                Some(HeadChange {
-                    old_head: prev.clone(),
-                    new_head: current_content.clone(),
-                })
-            }
+            Some(prev) if prev != &current_content => Some(HeadChange {
+                old_head: prev.clone(),
+                new_head: current_content.clone(),
+            }),
             None => {
                 // First check — initialize, report no change
                 *last = Some(current_content);

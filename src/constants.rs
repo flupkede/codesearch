@@ -130,10 +130,10 @@ pub const WRITER_LOCK_FILE: &str = ".writer.lock";
 /// These are generated/compiled/binary-adjacent files with no semantic code value.
 pub const ALWAYS_SKIP_EXTENSIONS: &[&str] = &[
     // Temporary / scratch files
-    "tmp", "temp", "bak", "swp", "swo", // Source maps (large, machine-generated)
-    "map", // Lock files
+    "tmp", "temp", "bak", "swp", "swo",  // Source maps (large, machine-generated)
+    "map",  // Lock files
     "lock", // Package manifest locks
-    "sum", // go.sum
+    "sum",  // go.sum
     // Compiled / bytecode output
     "pyc", "pyo", "pyd", "class", "o", "obj", "a", "lib", "so", "dll", "exe", "pdb", "ilk",
     // Archives

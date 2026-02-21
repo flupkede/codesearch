@@ -223,7 +223,9 @@ pub fn find_best_database(target_dir: Option<&Path>) -> Result<Option<DatabaseIn
     if let Ok(entries) = std::fs::read_dir(&canonical) {
         for entry in entries.flatten() {
             let child = entry.path();
-            if !child.is_dir() { continue; }
+            if !child.is_dir() {
+                continue;
+            }
             // Skip hidden dirs (except the target itself) and known non-project dirs
             let name = child.file_name().unwrap_or_default().to_string_lossy();
             if name.starts_with('.') || name == "node_modules" || name == "target" {
@@ -502,7 +504,10 @@ mod tests {
         create_fake_db(&hidden.join(DB_DIR_NAME));
 
         let result = find_best_database(Some(dir.path())).unwrap();
-        assert!(result.is_none(), "Should not find DB in hidden child directory");
+        assert!(
+            result.is_none(),
+            "Should not find DB in hidden child directory"
+        );
     }
 
     #[test]

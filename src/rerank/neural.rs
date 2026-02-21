@@ -142,10 +142,17 @@ mod tests {
     fn test_reranker_creation() {
         // Set cache dir so fastembed finds the model
         if let Ok(cache_dir) = crate::constants::get_global_models_cache_dir() {
-            std::env::set_var("FASTEMBED_CACHE_DIR", cache_dir.to_string_lossy().to_string());
+            std::env::set_var(
+                "FASTEMBED_CACHE_DIR",
+                cache_dir.to_string_lossy().to_string(),
+            );
         }
         let reranker = NeuralReranker::new();
-        assert!(reranker.is_ok(), "Failed to create reranker: {:?}", reranker.err());
+        assert!(
+            reranker.is_ok(),
+            "Failed to create reranker: {:?}",
+            reranker.err()
+        );
     }
 
     #[test]

@@ -62,7 +62,10 @@ impl EmbeddingService {
                 Some(cache)
             }
             Err(e) => {
-                tracing::warn!("⚠️  Failed to open persistent embedding cache: {} (continuing without)", e);
+                tracing::warn!(
+                    "⚠️  Failed to open persistent embedding cache: {} (continuing without)",
+                    e
+                );
                 None
             }
         };
@@ -115,11 +118,13 @@ impl EmbeddingService {
 
         // Phase 2: Embed cache misses via the normal pipeline (ONNX inference)
         if !misses.is_empty() {
-            let miss_chunks: Vec<crate::chunker::Chunk> = misses.iter().map(|(_, c)| c.clone()).collect();
+            let miss_chunks: Vec<crate::chunker::Chunk> =
+                misses.iter().map(|(_, c)| c.clone()).collect();
             let embedded = self.cached_embedder.embed_chunks(miss_chunks)?;
 
             // Phase 3: Store newly computed embeddings in persistent cache
-            let entries: Vec<(&str, &[f32])> = embedded.iter()
+            let entries: Vec<(&str, &[f32])> = embedded
+                .iter()
                 .map(|ec| (ec.chunk.hash.as_str(), ec.embedding.as_slice()))
                 .collect();
             if let Err(e) = cache.put_batch(&entries) {
@@ -144,7 +149,9 @@ impl EmbeddingService {
         if cache_hits > 0 {
             tracing::debug!(
                 "📦 Embedded {} chunks ({} cache hits, {} computed)",
-                results.len(), cache_hits, cache_misses
+                results.len(),
+                cache_hits,
+                cache_misses
             );
         }
 
@@ -250,7 +257,7 @@ impl EmbeddingService {
     /// The persistent cache is auto-initialized in the constructor.
     /// This method is only needed if the cache was explicitly cleared
     /// or failed to open during construction.
-#[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn with_persistent_cache(&mut self) -> Result<()> {
         if self.persistent_cache.is_none() {
             let cache = PersistentEmbeddingCache::open(self.model_short_name())?;
@@ -259,7 +266,7 @@ impl EmbeddingService {
         Ok(())
     }
 
-#[allow(dead_code)]
+    #[allow(dead_code)]
     /// Get persistent cache statistics
     pub fn persistent_cache_stats(&self) -> Option<PersistentCacheStats> {
         self.persistent_cache
@@ -267,7 +274,7 @@ impl EmbeddingService {
             .map(|c| c.stats().ok())
             .flatten()
     }
-#[allow(dead_code)]
+    #[allow(dead_code)]
 
     /// Clear the persistent cache
     pub fn clear_persistent_cache(&mut self) -> Result<()> {
@@ -276,13 +283,13 @@ impl EmbeddingService {
         }
         Ok(())
     }
-#[allow(dead_code)]
+    #[allow(dead_code)]
 
     /// Get reference to persistent cache (if initialized)
     pub fn persistent_cache(&self) -> Option<&PersistentEmbeddingCache> {
         self.persistent_cache.as_ref()
     }
-#[allow(dead_code)]
+    #[allow(dead_code)]
 
     /// Get mutable reference to persistent cache (if initialized)
     pub fn persistent_cache_mut(&mut self) -> Option<&mut PersistentEmbeddingCache> {
@@ -323,7 +330,9 @@ mod tests {
     #[test]
     #[ignore] // Requires model
     fn test_embed_query() {
-        let mut service = EmbeddingService::with_cache_dir(ModelType::default(), Some(&test_cache_dir())).unwrap();
+        let mut service =
+            EmbeddingService::with_cache_dir(ModelType::default(), Some(&test_cache_dir()))
+                .unwrap();
         let query_embedding = service.embed_query("find authentication code").unwrap();
 
         assert_eq!(query_embedding.len(), 384);

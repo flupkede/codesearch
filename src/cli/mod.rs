@@ -386,19 +386,18 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             }
             crate::mcp::run_mcp_server(path, cancel_token).await
         }
-        Commands::Cache { command } => {
-            match command {
-                CacheCommands::Stats { model } => run_cache_stats(model).await,
-                CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
-            }
-        }
+        Commands::Cache { command } => match command {
+            CacheCommands::Stats { model } => run_cache_stats(model).await,
+            CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
+        },
     }
 }
 
 /// Show persistent cache statistics
 async fn run_cache_stats(model: Option<String>) -> Result<()> {
     // Parse model name
-    let model_name = model.as_deref()
+    let model_name = model
+        .as_deref()
         .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
 
@@ -435,7 +434,13 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
         println!("  Cache Directory: {}", model_cache_dir.display());
         println!("  Total Entries: {}", stats.entries);
         println!("  Database Size: {} bytes", stats.file_size_bytes);
-        println!("    Last Access: {}", stats.last_access.map(|dt| dt.to_rfc3339()).unwrap_or_else(|| "N/A".to_string()));
+        println!(
+            "    Last Access: {}",
+            stats
+                .last_access
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| "N/A".to_string())
+        );
     } else {
         // Show stats for all models
         let dir_entries = std::fs::read_dir(&cache_dir)?;
@@ -455,7 +460,13 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
                 println!("  {}:", model_name);
                 println!("    Entries: {}", stats.entries);
                 println!("    Size: {} bytes", stats.file_size_bytes);
-                println!("    Last Access: {}", stats.last_access.map(|dt| dt.to_rfc3339()).unwrap_or_else(|| "N/A".to_string()));
+                println!(
+                    "    Last Access: {}",
+                    stats
+                        .last_access
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_else(|| "N/A".to_string())
+                );
             }
         }
         println!("Total: {} models, {} bytes", model_count, total_size);
@@ -467,7 +478,8 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
 /// Clear persistent cache
 async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
     // Parse model name
-    let model_name = model.as_deref()
+    let model_name = model
+        .as_deref()
         .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
 
@@ -484,7 +496,10 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
     // Confirm unless --yes flag is set
     if !yes {
         if let Some(name) = &model_name {
-            eprint!("Are you sure you want to clear the cache for model '{}'? [y/N]: ", name);
+            eprint!(
+                "Are you sure you want to clear the cache for model '{}'? [y/N]: ",
+                name
+            );
         } else {
             eprint!("Are you sure you want to clear the cache for ALL models? [y/N]: ");
         }
@@ -507,7 +522,10 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
         let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
         let stats_before = cache.stats()?;
         cache.clear()?;
-        eprintln!("Cleared {} entries from cache for model '{}'", stats_before.entries, name);
+        eprintln!(
+            "Cleared {} entries from cache for model '{}'",
+            stats_before.entries, name
+        );
     } else {
         // Clear all caches
         let entries = std::fs::read_dir(&cache_dir)?;
@@ -521,7 +539,10 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
                 let stats_before = cache.stats()?;
                 cache.clear()?;
                 total_cleared += stats_before.entries;
-                eprintln!("Cleared {} entries from cache for model '{}'", stats_before.entries, model_name);
+                eprintln!(
+                    "Cleared {} entries from cache for model '{}'",
+                    stats_before.entries, model_name
+                );
             }
         }
         eprintln!("Total: {} entries cleared", total_cleared);
