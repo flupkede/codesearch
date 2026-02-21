@@ -689,7 +689,9 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     let filter_path_normalized = options
         .filter_path
         .as_ref()
-        .map(|f| f.trim_start_matches("./").to_string());
+        .map(|f| crate::cache::normalize_path_str(f)
+            .trim_start_matches("./")
+            .to_string());
 
     // Take top rerank_top results for reranking (or max_results if not reranking)
     // OPTIMIZATION: Take extra results when path filtering is active to ensure we have enough after filtering
@@ -708,7 +710,8 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             // OPTIMIZATION: Skip early if path filter doesn't match
             if should_filter_by_path {
                 if let Some(ref filter) = filter_path_normalized {
-                    let path_normalized = result.path.trim_start_matches("./");
+                    let path_normalized = crate::cache::normalize_path_str(&result.path);
+                    let path_normalized = path_normalized.trim_start_matches("./");
                     if !path_normalized.starts_with(filter) {
                         continue;
                     }
@@ -725,7 +728,8 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 // OPTIMIZATION: Skip early if path filter doesn't match
                 if should_filter_by_path {
                     if let Some(ref filter) = filter_path_normalized {
-                        let path_normalized = result.path.trim_start_matches("./");
+                        let path_normalized = crate::cache::normalize_path_str(&result.path);
+                        let path_normalized = path_normalized.trim_start_matches("./");
                         if !path_normalized.starts_with(filter) {
                             continue;
                         }
@@ -835,11 +839,13 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         rerank_duration = start.elapsed();
     }
 
-    // Filter by path if specified
+    // Filter by path if specified (post-reranking pass)
     if let Some(ref filter) = options.filter_path {
-        let filter_normalized = filter.trim_start_matches("./");
+        let filter_normalized = crate::cache::normalize_path_str(filter);
+        let filter_normalized = filter_normalized.trim_start_matches("./");
         results.retain(|r| {
-            let path_normalized = r.path.trim_start_matches("./");
+            let path_normalized = crate::cache::normalize_path_str(&r.path);
+            let path_normalized = path_normalized.trim_start_matches("./");
             path_normalized.starts_with(filter_normalized)
         });
     }

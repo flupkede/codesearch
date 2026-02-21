@@ -152,6 +152,13 @@ impl FileMetaStore {
     }
 
     /// Check if a file needs re-indexing
+    /// Check whether a path is already tracked (regardless of chunk count).
+    /// Used by doctor to distinguish "never indexed" from "indexed but unchunkable".
+    pub fn is_tracked(&self, path: &Path) -> bool {
+        let path_str = normalize_path(path);
+        self.files.contains_key(&path_str)
+    }
+
     /// Returns: (needs_reindex, existing_chunk_ids_to_delete)
     pub fn check_file(&self, path: &Path) -> Result<(bool, Vec<u32>)> {
         let path_str = normalize_path(path);
@@ -426,5 +433,83 @@ mod tests {
         store.save(db_path).unwrap();
         let loaded = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
         assert_eq!(loaded.files.len(), 1);
+    }
+
+    // =========================================================================
+    // Path comparison tests — verify that different path formats match correctly
+    // These test the exact bug patterns that have caused issues in production.
+    // =========================================================================
+
+    #[test]
+    fn test_path_comparison_unc_vs_normal() {
+        // UNC prefix (from Windows canonicalize) must match normal path
+        let unc = normalize_path(Path::new(r"\\?\C:\WorkArea\src\main.rs"));
+        let normal = normalize_path(Path::new(r"C:\WorkArea\src\main.rs"));
+        assert_eq!(unc, normal);
+    }
+
+    #[test]
+    fn test_path_comparison_backslash_vs_forward() {
+        let backslash = normalize_path(Path::new(r"C:\WorkArea\src\main.rs"));
+        let forward = normalize_path(Path::new("C:/WorkArea/src/main.rs"));
+        assert_eq!(backslash, forward);
+    }
+
+    #[test]
+    fn test_path_str_comparison_unc_vs_normal() {
+        let unc = normalize_path_str(r"\\?\C:\WorkArea\src\main.rs");
+        let normal = normalize_path_str(r"C:\WorkArea\src\main.rs");
+        assert_eq!(unc, normal);
+    }
+
+    #[test]
+    fn test_path_comparison_stored_vs_walker() {
+        // Simulates: FileMetaStore stored path vs FileWalker discovered path
+        // FileMetaStore stores via normalize_path(&file.path)
+        // FileWalker returns paths via canonicalize() which adds UNC on Windows
+        let stored = normalize_path(Path::new("C:/WorkArea/AI/codesearch/src/main.rs"));
+        let walked = normalize_path(Path::new(r"\\?\C:\WorkArea\AI\codesearch\src\main.rs"));
+        assert_eq!(
+            stored, walked,
+            "Stored path must match walked path after normalization"
+        );
+    }
+
+    #[test]
+    fn test_path_filter_starts_with() {
+        // Simulates: --filter-path src/ matching against stored paths
+        let filter = normalize_path_str("src/");
+        let stored = normalize_path_str("src/main.rs");
+        assert!(stored.starts_with(&filter));
+
+        // Backslash filter should also work
+        let filter_bs = normalize_path_str(r"src\");
+        assert!(stored.starts_with(&filter_bs));
+    }
+
+    #[test]
+    fn test_path_filter_with_unc_prefix() {
+        // Agent sends UNC path as filter, stored paths are normalized
+        let filter = normalize_path_str(r"\\?\C:\WorkArea\src");
+        let stored = normalize_path_str("C:/WorkArea/src/main.rs");
+        assert!(stored.starts_with(&filter));
+    }
+
+    #[test]
+    fn test_normalize_idempotent() {
+        // Normalizing an already-normalized path should produce the same result
+        let original = "C:/WorkArea/AI/codesearch/src/main.rs";
+        let once = normalize_path_str(original);
+        let twice = normalize_path_str(&once);
+        assert_eq!(once, twice, "normalize_path_str must be idempotent");
+    }
+
+    #[test]
+    fn test_normalize_path_equals_normalize_path_str() {
+        // Both functions must produce identical output for the same input
+        let input = r"\\?\C:\WorkArea\AI\src\main.rs";
+        let from_path = normalize_path(Path::new(input));
+        let from_str = normalize_path_str(input);
+        assert_eq!(from_path, from_str);
     }
 }

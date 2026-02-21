@@ -126,6 +126,60 @@ pub const DEFAULT_FSW_DEBOUNCE_MS: u64 = 2000;
 /// This prevents multiple processes from writing to the same database
 pub const WRITER_LOCK_FILE: &str = ".writer.lock";
 
+/// File extensions that should never be indexed, regardless of content.
+/// These are generated/compiled/binary-adjacent files with no semantic code value.
+pub const ALWAYS_SKIP_EXTENSIONS: &[&str] = &[
+    // Temporary / scratch files
+    "tmp", "temp", "bak", "swp", "swo", // Source maps (large, machine-generated)
+    "map", // Lock files
+    "lock", // Package manifest locks
+    "sum", // go.sum
+    // Compiled / bytecode output
+    "pyc", "pyo", "pyd", "class", "o", "obj", "a", "lib", "so", "dll", "exe", "pdb", "ilk",
+    // Archives
+    "zip", "tar", "gz", "bz2", "xz", "7z", "rar", // Images / media
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "webp", "tiff", "mp3", "mp4", "wav", "ogg",
+    "avi", "mov", "mkv", // Fonts
+    "woff", "woff2", "ttf", "otf", "eot", // Database / binary data
+    "db", "sqlite", "sqlite3", "mdb", "ldb", // Document formats (not source code)
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", // Certificates / keys
+    "pem", "crt", "cer", "key", "p12", "pfx", // Generated protobuf / IDL
+    "pb",
+];
+
+/// Filename suffix patterns that should never be indexed.
+/// Matched against the full filename (case-insensitive).
+/// Handles compound extensions like `.min.js` that the extension check cannot catch.
+pub const ALWAYS_SKIP_FILENAME_SUFFIXES: &[&str] = &[
+    // Minified web assets
+    ".min.js",
+    ".min.css",
+    ".min.mjs",
+    // Bundled / compiled JS
+    ".bundle.js",
+    ".chunk.js",
+    ".esm.js",
+    // TypeScript declaration files (generated, not source)
+    ".d.ts",
+    ".d.mts",
+    ".d.cts",
+    // Generated protobuf
+    ".pb.go",
+    ".pb.cc",
+    ".pb.h",
+    "_pb2.py",
+    // Generated gRPC
+    "_grpc.pb.go",
+    "_grpc_pb.js",
+    // Generated GraphQL
+    ".generated.ts",
+    ".generated.graphql",
+    // Snapshot test output
+    ".snap",
+    // Editor swap / backup
+    ".orig",
+];
+
 /// Directories and files that should always be excluded from indexing
 /// These are added to both .gitignore and .codesearchignore automatically
 pub const ALWAYS_EXCLUDED: &[&str] = &[

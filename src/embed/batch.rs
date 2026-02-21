@@ -339,10 +339,16 @@ mod tests {
         assert!(sim > 0.7 && sim < 0.72); // Should be ~1/sqrt(2)
     }
 
+    fn test_cache_dir() -> std::path::PathBuf {
+        crate::constants::get_global_models_cache_dir().unwrap()
+    }
+
     #[test]
     #[ignore] // Requires model
     fn test_batch_embedder() {
-        let embedder = Arc::new(Mutex::new(FastEmbedder::new().unwrap()));
+        let embedder = Arc::new(Mutex::new(
+            FastEmbedder::with_cache_dir(crate::embed::ModelType::default(), Some(&test_cache_dir())).unwrap()
+        ));
         let mut batch = BatchEmbedder::new(embedder);
 
         let chunks = vec![

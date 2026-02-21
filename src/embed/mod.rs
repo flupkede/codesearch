@@ -316,10 +316,14 @@ mod tests {
         assert_eq!(service.dimensions(), 384);
     }
 
+    fn test_cache_dir() -> std::path::PathBuf {
+        crate::constants::get_global_models_cache_dir().unwrap()
+    }
+
     #[test]
     #[ignore] // Requires model
     fn test_embed_query() {
-        let mut service = EmbeddingService::new().unwrap();
+        let mut service = EmbeddingService::with_cache_dir(ModelType::default(), Some(&test_cache_dir())).unwrap();
         let query_embedding = service.embed_query("find authentication code").unwrap();
 
         assert_eq!(query_embedding.len(), 384);

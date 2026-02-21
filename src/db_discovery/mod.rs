@@ -168,8 +168,9 @@ pub fn find_databases() -> Result<Vec<DatabaseInfo>> {
 ///
 /// Priority order:
 /// 1. Valid database in current directory
-/// 2. Valid database in nearest parent directory
-/// 3. First valid global database
+/// 2. Valid database in a direct child directory (1 level down — matches repo-anchored index)
+/// 3. Valid database in nearest parent directory (up to 5 levels)
+/// 4. First valid global database
 ///
 /// Incomplete/corrupt databases are skipped with a warning.
 pub fn find_best_database(target_dir: Option<&Path>) -> Result<Option<DatabaseInfo>> {
@@ -216,7 +217,32 @@ pub fn find_best_database(target_dir: Option<&Path>) -> Result<Option<DatabaseIn
         }
     }
 
-    // 2. Check parent directories
+    // 2. Check direct child directories (1 level down)
+    //    Matches find_git_root Phase 2: index may be at git root inside a child dir
+    //    e.g. /workspace/.codesearch.db doesn't exist, but /workspace/frontend/.codesearch.db does
+    if let Ok(entries) = std::fs::read_dir(&canonical) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if !child.is_dir() { continue; }
+            // Skip hidden dirs (except the target itself) and known non-project dirs
+            let name = child.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+            let child_db = child.join(DB_DIR_NAME);
+            if child_db.exists() && is_valid_database(&child_db) {
+                return Ok(Some(DatabaseInfo {
+                    project_path: child,
+                    db_path: child_db,
+                    is_current: false,
+                    depth: 1,
+                    is_global: false,
+                }));
+            }
+        }
+    }
+
+    // 3. Check parent directories
     let mut parent_dir = canonical.clone();
     for depth in 1..=5 {
         if let Some(parent) = parent_dir.parent() {
@@ -249,7 +275,7 @@ pub fn find_best_database(target_dir: Option<&Path>) -> Result<Option<DatabaseIn
         }
     }
 
-    // 3. Check global databases
+    // 4. Check global databases
     let global_dbs = find_global_databases()?;
     if !global_dbs.is_empty() {
         return Ok(Some(global_dbs.into_iter().next().unwrap()));
@@ -407,6 +433,15 @@ pub fn resolve_database_with_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    /// Create a fake valid database at the given path
+    fn create_fake_db(db_path: &Path) {
+        fs::create_dir_all(db_path).unwrap();
+        fs::write(db_path.join("metadata.json"), "{}").unwrap();
+        fs::write(db_path.join("data.mdb"), "fake").unwrap();
+        fs::create_dir_all(db_path.join("fts")).unwrap();
+    }
 
     #[test]
     fn test_find_databases() {
@@ -414,5 +449,107 @@ mod tests {
         assert!(databases.is_ok());
         let dbs = databases.unwrap();
         println!("Found {} databases", dbs.len());
+    }
+
+    #[test]
+    fn test_is_valid_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join(DB_DIR_NAME);
+
+        // Empty dir is not valid
+        fs::create_dir_all(&db_path).unwrap();
+        assert!(!is_valid_database(&db_path));
+
+        // Add all required files
+        create_fake_db(&db_path);
+        assert!(is_valid_database(&db_path));
+    }
+
+    #[test]
+    fn test_find_best_database_current_dir() {
+        let dir = tempdir().unwrap();
+        create_fake_db(&dir.path().join(DB_DIR_NAME));
+
+        let result = find_best_database(Some(dir.path())).unwrap();
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert!(info.is_current);
+        assert_eq!(info.depth, 0);
+    }
+
+    #[test]
+    fn test_find_best_database_child_dir() {
+        let dir = tempdir().unwrap();
+        // No DB at root, but DB in a child directory (repo-anchored index)
+        let child = dir.path().join("frontend");
+        fs::create_dir_all(&child).unwrap();
+        create_fake_db(&child.join(DB_DIR_NAME));
+
+        let result = find_best_database(Some(dir.path())).unwrap();
+        assert!(result.is_some(), "Should find DB in child directory");
+        let info = result.unwrap();
+        assert!(!info.is_current);
+        assert_eq!(info.depth, 1);
+        assert!(info.project_path.ends_with("frontend"));
+    }
+
+    #[test]
+    fn test_find_best_database_child_skips_hidden_dirs() {
+        let dir = tempdir().unwrap();
+        // DB inside a hidden child dir should be skipped
+        let hidden = dir.path().join(".hidden_repo");
+        fs::create_dir_all(&hidden).unwrap();
+        create_fake_db(&hidden.join(DB_DIR_NAME));
+
+        let result = find_best_database(Some(dir.path())).unwrap();
+        assert!(result.is_none(), "Should not find DB in hidden child directory");
+    }
+
+    #[test]
+    fn test_find_best_database_child_skips_target_dir() {
+        let dir = tempdir().unwrap();
+        // DB inside target/ should be skipped
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        create_fake_db(&target.join(DB_DIR_NAME));
+
+        let result = find_best_database(Some(dir.path())).unwrap();
+        assert!(result.is_none(), "Should not find DB in target/ directory");
+    }
+
+    #[test]
+    fn test_find_best_database_prefers_current_over_child() {
+        let dir = tempdir().unwrap();
+        // DB at both root and child — root should win
+        create_fake_db(&dir.path().join(DB_DIR_NAME));
+        let child = dir.path().join("frontend");
+        fs::create_dir_all(&child).unwrap();
+        create_fake_db(&child.join(DB_DIR_NAME));
+
+        let result = find_best_database(Some(dir.path())).unwrap();
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert!(info.is_current, "Should prefer current dir over child");
+    }
+
+    #[test]
+    fn test_find_best_database_none_when_empty() {
+        let dir = tempdir().unwrap();
+        let result = find_best_database(Some(dir.path())).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_best_database_invalid_child_db_skipped() {
+        let dir = tempdir().unwrap();
+        // Incomplete DB in child (missing data.mdb)
+        let child = dir.path().join("myrepo");
+        let db_path = child.join(DB_DIR_NAME);
+        fs::create_dir_all(&db_path).unwrap();
+        fs::write(db_path.join("metadata.json"), "{}").unwrap();
+        // No data.mdb, no fts/ → invalid
+
+        let result = find_best_database(Some(dir.path())).unwrap();
+        assert!(result.is_none(), "Should not find incomplete DB");
     }
 }

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
-use crate::constants::ALWAYS_EXCLUDED;
+use crate::constants::{ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS, ALWAYS_SKIP_FILENAME_SUFFIXES};
 
 mod binary;
 mod language;
@@ -130,6 +130,39 @@ impl FileWalker {
 
                     let path = entry.path();
 
+                    // Skip 0-byte files — nothing to index
+                    let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                    if size == 0 {
+                        stats.add_skipped_binary();
+                        debug!("Skipping empty file: {}", path.display());
+                        continue;
+                    }
+
+                    // Skip always-excluded file extensions (e.g. .tmp, .map, .lock, .min.js)
+                    if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                        let fname_lower = fname.to_ascii_lowercase();
+                        // Check compound suffix patterns first (.min.js, .d.ts, etc.)
+                        if ALWAYS_SKIP_FILENAME_SUFFIXES
+                            .iter()
+                            .any(|s| fname_lower.ends_with(s))
+                        {
+                            stats.add_skipped_binary();
+                            debug!("Skipping generated/minified file: {}", path.display());
+                            continue;
+                        }
+                        // Check single extensions (.tmp, .map, .lock, etc.)
+                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                            if ALWAYS_SKIP_EXTENSIONS
+                                .iter()
+                                .any(|s| s.eq_ignore_ascii_case(ext))
+                            {
+                                stats.add_skipped_binary();
+                                debug!("Skipping excluded extension .{}: {}", ext, path.display());
+                                continue;
+                            }
+                        }
+                    }
+
                     // Check if file is binary
                     if is_binary_file(path) {
                         stats.add_skipped_binary();
@@ -145,8 +178,6 @@ impl FileWalker {
                         stats.add_skipped_binary();
                         continue;
                     }
-
-                    let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
 
                     let file_info = FileInfo {
                         path: path.to_path_buf(),

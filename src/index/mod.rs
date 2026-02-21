@@ -651,6 +651,12 @@ async fn index_with_options(
         );
 
         if chunks.is_empty() {
+            // Still track this file so we don't re-process it every run.
+            // A file with 0 chunks (e.g. minified JS, empty file) is "processed
+            // but unchunkable" — record it with an empty chunk list so check_file()
+            // returns (unchanged) on future runs and doctor doesn't flag it.
+            let path_str = file.path.to_string_lossy().to_string();
+            file_chunks.insert(path_str, vec![]);
             pb.inc(1);
             continue;
         }
@@ -797,6 +803,32 @@ async fn index_with_options(
     );
 
     if total_chunks == 0 {
+        // Still save file metadata for files that were processed but produced 0 chunks
+        // (e.g. minified JS, binary-like files). Without this, those files would be
+        // detected as "changed" on every subsequent run and never stabilise.
+        if !file_chunks.is_empty() {
+            if is_incremental {
+                let mut store = file_meta_store.take().unwrap();
+                let file_count = file_chunks.len();
+                for (file_path, chunk_ids) in file_chunks {
+                    store.update_file(Path::new(&file_path), chunk_ids)?;
+                }
+                store.save(&db_path)?;
+                log_print!(
+                    "✅ Updated metadata for {} unchunkable files (0 chunks produced)",
+                    file_count
+                );
+            } else {
+                let mut store = FileMetaStore::new(
+                    model_type.short_name().to_string(),
+                    model_type.dimensions(),
+                );
+                for (file_path, chunk_ids) in file_chunks {
+                    store.update_file(Path::new(&file_path), chunk_ids)?;
+                }
+                store.save(&db_path)?;
+            }
+        }
         log_print!("\n{}", "No chunks created!".yellow());
         return Ok(());
     }

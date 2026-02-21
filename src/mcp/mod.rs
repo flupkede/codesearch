@@ -18,11 +18,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db_discovery::{find_best_database, find_databases};
 
-/// Normalize a path for comparison: strip UNC prefix, ./ prefix, convert backslashes to forward slashes
+/// Normalize a path string for comparison.
+/// Delegates to `cache::normalize_path_str` for consistency, then strips "./" prefix.
 fn normalize_path_for_compare(path: &str) -> String {
-    path.trim_start_matches("./")
-        .trim_start_matches(r"\\?\")
-        .replace('\\', "/")
+    crate::cache::normalize_path_str(path)
+        .trim_start_matches("./")
+        .to_string()
 }
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::Language;
@@ -362,8 +363,10 @@ impl CodesearchService {
             .filter(|r| {
                 // Apply filter_path if specified
                 if let Some(ref fp) = request.filter_path {
-                    let normalized_path = r.path.trim_start_matches("./");
-                    let normalized_filter = fp.trim_start_matches("./").trim_end_matches('/');
+                    let normalized_path = crate::cache::normalize_path_str(&r.path);
+                    let normalized_path = normalized_path.trim_start_matches("./");
+                    let normalized_filter = crate::cache::normalize_path_str(fp);
+                    let normalized_filter = normalized_filter.trim_start_matches("./").trim_end_matches('/');
                     normalized_path.starts_with(normalized_filter)
                 } else {
                     true
@@ -430,11 +433,10 @@ impl CodesearchService {
                     chunk_norm.clone()
                 };
 
-                // Match: exact, ends_with (for subdirectory repos), or raw paths
+                // Match: exact normalized, or ends_with for subdirectory repos
                 if chunk_rel == req_norm
                     || chunk_rel.ends_with(&format!("/{}", req_norm))
                     || req_norm.ends_with(&format!("/{}", chunk_rel))
-                    || chunk.path == request.path
                 {
                     file_chunks.push(SearchResultItem {
                         path: chunk.path,
@@ -489,11 +491,10 @@ impl CodesearchService {
                     chunk_norm.clone()
                 };
 
-                // Match: exact, ends_with (for subdirectory repos), or raw paths
+                // Match: exact normalized, or ends_with for subdirectory repos
                 if chunk_rel == req_norm
                     || chunk_rel.ends_with(&format!("/{}", req_norm))
                     || req_norm.ends_with(&format!("/{}", chunk_rel))
-                    || chunk.path == request.path
                 {
                     file_chunks.push(SearchResultItem {
                         path: chunk.path,

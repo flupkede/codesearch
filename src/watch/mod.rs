@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::cache::normalize_path;
+use crate::constants::{ALWAYS_EXCLUDED, ALWAYS_SKIP_EXTENSIONS, ALWAYS_SKIP_FILENAME_SUFFIXES};
+use crate::file::Language;
 
 /// Normalize a path from notify events to a consistent format.
 /// Strips UNC prefix (`\\?\`) and converts backslashes to forward slashes
@@ -28,117 +30,7 @@ pub struct HeadChange {
     pub new_head: String,
 }
 
-/// File extensions that should trigger re-indexing (whitelist approach)
-/// This includes code files and configuration files
-const INDEXABLE_EXTENSIONS: &[&str] = &[
-    // Rust
-    "rs",
-    // JavaScript/TypeScript
-    "js",
-    "mjs",
-    "cjs",
-    "jsx",
-    "ts",
-    "mts",
-    "cts",
-    "tsx",
-    // Python
-    "py",
-    "pyw",
-    "pyi",
-    // C/C++
-    "c",
-    "h",
-    "cpp",
-    "cc",
-    "cxx",
-    "hpp",
-    "hxx",
-    // C#
-    "cs",
-    "csx",
-    // Java/Kotlin
-    "java",
-    "kt",
-    "kts",
-    // Go
-    "go",
-    // Ruby
-    "rb",
-    "rake",
-    // PHP
-    "php",
-    // Swift
-    "swift",
-    // Shell/Scripts
-    "sh",
-    "bash",
-    "zsh",
-    "fish",
-    "ps1",
-    "psm1",
-    "psd1",
-    // Web
-    "html",
-    "htm",
-    "css",
-    "scss",
-    "sass",
-    "less",
-    "vue",
-    "svelte",
-    // Config/Data
-    "json",
-    "jsonc",
-    "json5",
-    "yaml",
-    "yml",
-    "toml",
-    "xml",
-    "ini",
-    "conf",
-    "config",
-    // .NET
-    "csproj",
-    "sln",
-    "props",
-    "targets",
-    "razor",
-    "cshtml",
-    // SQL
-    "sql",
-    // Markdown/Docs
-    "md",
-    "markdown",
-    "rst",
-    // Other
-    "graphql",
-    "gql",
-    "proto",
-    "dockerfile",
-];
 
-/// Directories that should always be ignored
-const IGNORED_DIRS: &[&str] = &[
-    ".git",
-    ".codesearch.db",
-    "node_modules",
-    "target",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".cache",
-    "dist",
-    "build",
-    "out",
-    "bin",
-    "obj",
-    ".vs",
-    ".idea",
-    ".vscode",
-    "packages",
-    ".nuget",
-];
 
 /// Types of file system events we care about
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,10 +112,11 @@ impl FileWatcher {
     }
 
     /// Check if a path is in an ignored directory (.git, node_modules, etc.)
+    /// Uses the shared ALWAYS_EXCLUDED constant so FSW and FileWalker agree.
     fn is_in_ignored_dir(&self, path: &Path) -> bool {
         for component in path.components() {
             if let Some(name) = component.as_os_str().to_str() {
-                if IGNORED_DIRS.contains(&name) {
+                if ALWAYS_EXCLUDED.contains(&name) {
                     return true;
                 }
             }
@@ -231,30 +124,48 @@ impl FileWatcher {
         false
     }
 
-    /// Check if a path should be watched (whitelist approach)
-    /// Only returns true for indexable code/config files
+    /// Check if a path should be watched.
+    /// Uses the same logic as FileWalker so FSW and index agree on what is indexable:
+    /// - Not in an ignored directory (ALWAYS_EXCLUDED)
+    /// - Not a skip extension (ALWAYS_SKIP_EXTENSIONS)
+    /// - Not a skip filename suffix (ALWAYS_SKIP_FILENAME_SUFFIXES)
+    /// - Not 0 bytes
+    /// - Language is indexable (Language::from_path)
     fn is_watchable(&self, path: &Path) -> bool {
-        // Check if path is in an ignored directory
         if self.is_in_ignored_dir(path) {
             return false;
         }
 
-        // Must be a file with an indexable extension
-        if let Some(ext) = path.extension() {
-            if let Some(ext_str) = ext.to_str() {
-                return INDEXABLE_EXTENSIONS.contains(&ext_str.to_lowercase().as_str());
+        // Skip hardcoded extensions (e.g. .tmp, .map, .lock)
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_lowercase();
+            if ALWAYS_SKIP_EXTENSIONS.contains(&ext_lower.as_str()) {
+                return false;
             }
         }
 
-        // Special case: Dockerfile (no extension)
-        if let Some(name) = path.file_name() {
-            let name_str = name.to_string_lossy().to_lowercase();
-            if name_str == "dockerfile" || name_str == "makefile" || name_str == "cmakelists.txt" {
-                return true;
+        // Skip hardcoded filename suffixes (e.g. .min.js, .d.ts, .designer.cs)
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            let lower = name.to_lowercase();
+            if ALWAYS_SKIP_FILENAME_SUFFIXES
+                .iter()
+                .any(|&s| lower.ends_with(s))
+            {
+                return false;
             }
         }
 
-        false
+        // Skip 0-byte files (empty build artifacts)
+        if path
+            .metadata()
+            .map(|m| m.len() == 0)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+
+        // Language must be indexable
+        Language::from_path(path).is_indexable()
     }
 
     /// Poll for file events (non-blocking)

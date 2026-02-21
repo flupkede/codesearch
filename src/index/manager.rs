@@ -580,10 +580,21 @@ impl IndexManager {
                     let path_str = normalize_path(&file.path);
                     if let Some(ids) = chunks_by_file.get(&path_str) {
                         file_meta_store.update_file(&file.path, ids.clone())?;
+                    } else {
+                        // File was processed but produced 0 chunks (e.g. minified JS,
+                        // empty file). Track it with empty chunk list so it is not
+                        // re-processed on every run and doctor doesn't flag it.
+                        file_meta_store.update_file(&file.path, vec![])?;
                     }
                 }
 
                 info!("✅ Indexed {} chunks", embedded_chunks.len());
+            } else {
+                // ALL changed files produced 0 chunks — still track them so they
+                // are not flagged as unindexed on every subsequent run.
+                for file in &changed_files {
+                    file_meta_store.update_file(&file.path, vec![])?;
+                }
             }
         }
 

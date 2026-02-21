@@ -195,7 +195,15 @@ pub enum Commands {
     },
 
     /// Check installation health
-    Doctor,
+    Doctor {
+        /// Auto-repair stale/missing files by running incremental refresh
+        #[arg(long)]
+        fix: bool,
+
+        /// Output as JSON for scripting/CI
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Download embedding models
     Setup {
@@ -354,7 +362,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             crate::server::serve(port, path).await
         }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
-        Commands::Doctor => crate::cli::doctor::run().await,
+        Commands::Doctor { fix, json } => crate::cli::doctor::run(fix, json).await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
         Commands::Mcp { path } => {
             // Discover database path and initialize logger with file output
