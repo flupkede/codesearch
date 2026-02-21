@@ -254,7 +254,6 @@ OpenCode is the primary target for codesearch's MCP integration. Add the followi
       "type": "local",
       "command": [
         "codesearch",
-        "--verbose",
         "mcp"
       ],
       "enabled": true
@@ -458,7 +457,7 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 
 | Option | Short | Description |
 |---|---|---|
-| `--verbose` | `-v` | Debug output |
+| `--loglevel` | | Set log level (error, warn, info, debug, trace) |
 | `--quiet` | `-q` | Suppress info, only results/errors |
 | `--model` | | Override embedding model |
 | `--store` | | Override store name |
