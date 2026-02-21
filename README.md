@@ -293,14 +293,17 @@ codesearch uses **three cache layers** for optimal performance:
 ### Cache Management
 
 ```bash
-# Clear persistent cache for current model
-codesearch cache clear --model bge-small-en-v1.5
-
-# Show cache statistics
+# Show cache statistics (all models)
 codesearch cache stats
 
-# Clear all caches (use carefully!)
-codesearch cache clear --all
+# Show cache statistics for specific model
+codesearch cache stats bge-small
+
+# Clear persistent cache for specific model
+codesearch cache clear bge-small
+
+# Clear cache without confirmation
+codesearch cache clear bge-small --yes
 ```
 
 ### Cache Size Monitoring
@@ -596,7 +599,7 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 | Wrong database found | Check where `.codesearch.db/` is located with `codesearch list` |
 | Index not updating after branch switch | The Git HEAD watcher refreshes automatically; check `codesearch stats` to verify |
 | First index very slow | Normal! First time indexes compute all embeddings (2-5 min). Subsequent indexes use cache (10-30 sec) |
-| Cache too large | Clear cache: `codesearch cache clear --model <model>` |
+| Cache too large | Clear cache: `codesearch cache clear <model>` |
 
 ### Git-Specific Troubleshooting
 
