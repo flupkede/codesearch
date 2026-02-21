@@ -84,31 +84,34 @@ if (-not $ChangedFiles) {
     }
 }
 
-Write-Host "Changes detected" -ForegroundColor Yellow
-
-# Increment version in Cargo.toml FIRST
-$CargoToml = Join-Path $ScriptDir "Cargo.toml"
-if (Test-Path $CargoToml) {
-    $Lines = Get-Content $CargoToml
-    $NewLines = @()
-    $VersionUpdated = $false
-    
-    foreach ($Line in $Lines) {
-        if (-not $VersionUpdated -and $Line -match '^version\s*=\s*"(\d+\.\d+)\.(\d+)"') {
-            $Major = $Matches[1]
-            $Patch = [int]$Matches[2]
-            $NewPatch = $Patch + 1
-            $NewVersion = "$Major.$NewPatch"
-            $Line = "version = `"$NewVersion`""
-            $VersionUpdated = $true
-            Write-Host "Version incremented to $NewVersion" -ForegroundColor Green
+# Increment version in Cargo.toml ONLY when there are actual code changes
+if ($ChangedFiles) {
+    Write-Host "Changes detected - incrementing version..." -ForegroundColor Yellow
+    $CargoToml = Join-Path $ScriptDir "Cargo.toml"
+    if (Test-Path $CargoToml) {
+        $Lines = Get-Content $CargoToml
+        $NewLines = @()
+        $VersionUpdated = $false
+        
+        foreach ($Line in $Lines) {
+            if (-not $VersionUpdated -and $Line -match '^version\s*=\s*"(\d+\.\d+)\.(\d+)"') {
+                $Major = $Matches[1]
+                $Patch = [int]$Matches[2]
+                $NewPatch = $Patch + 1
+                $NewVersion = "$Major.$NewPatch"
+                $Line = "version = `"$NewVersion`""
+                $VersionUpdated = $true
+                Write-Host "Version incremented to $NewVersion" -ForegroundColor Green
+            }
+            $NewLines += $Line
         }
-        $NewLines += $Line
+        
+        if ($VersionUpdated) {
+            $NewLines | Out-File -FilePath $CargoToml -Encoding utf8
+        }
     }
-    
-    if ($VersionUpdated) {
-        $NewLines | Out-File -FilePath $CargoToml -Encoding utf8
-    }
+} else {
+    Write-Host "No code changes - rebuilding stale binary at current version..." -ForegroundColor Yellow
 }
 
 # Build
