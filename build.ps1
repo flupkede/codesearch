@@ -65,11 +65,24 @@ if (-not $ChangedFiles) {
         }
         $BinaryVersion = $null
         try {
+            # Run version command and capture output
             $BinaryOutput = & $TargetExe --version 2>&1
-            if ($BinaryOutput -match '(\d+\.\d+\.\d+)') {
-                $BinaryVersion = $Matches[1]
+
+            # Debug: show what we got
+            Write-Host "  DEBUG: Checking $TargetExe" -ForegroundColor DarkGray
+            Write-Host "  DEBUG: Binary output: $BinaryOutput" -ForegroundColor DarkGray
+
+            # Use [regex]::Match() to avoid global $Matches variable pollution
+            $match = [regex]::Match($BinaryOutput, '(\d+\.\d+\.\d+)')
+            if ($match.Success) {
+                $BinaryVersion = $match.Groups[1].Value
+                Write-Host "  DEBUG: Matched version: $BinaryVersion" -ForegroundColor DarkGray
+            } else {
+                Write-Host "  DEBUG: No version match in binary output" -ForegroundColor DarkGray
             }
-        } catch { }
+        } catch {
+            Write-Host "  DEBUG: Exception checking version: $_" -ForegroundColor DarkGray
+        }
 
         if ($CargoVersion -and $BinaryVersion -and ($CargoVersion -eq $BinaryVersion)) {
             Write-Host "No changes detected and build exists ($(Split-Path $TargetExe -Leaf) v$BinaryVersion), skipping build" -ForegroundColor Green
