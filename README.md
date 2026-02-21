@@ -239,7 +239,7 @@ The bloat ratio is calculated from LMDB's internal statistics and helps monitor 
 
 ## Embedding Cache
 
-codesearch uses a sophisticated caching system to dramatically speed up indexing, especially for the first index and subsequent updates.
+codesearch uses a sophisticated caching system to dramatically speed up subsequent indexing after the initial index is created.
 
 ### How Caching Works
 
