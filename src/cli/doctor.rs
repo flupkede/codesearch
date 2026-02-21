@@ -383,57 +383,55 @@ fn check_fts_health(db_path: &Path) -> CheckResult {
 }
 
 /// Check 8: LMDB bloat
-fn check_lmdb_bloat(db_path: &Path, store: &VectorStore) -> CheckResult {
-    let data_path = db_path.join("data.mdb");
-
-    if !data_path.exists() {
-        return CheckResult::fail("LMDB bloat", "data.mdb file does not exist");
-    }
-
-    let file_size = match fs::metadata(&data_path) {
-        Ok(meta) => meta.len(),
+fn check_lmdb_bloat(_db_path: &Path, store: &VectorStore) -> CheckResult {
+    // Use real LMDB page stats: env.non_free_pages_size() vs env.real_disk_size()
+    // No guessing, no bytes/chunk estimate needed
+    let page_stats = match store.lmdb_page_stats() {
+        Ok(s) => s,
         Err(e) => {
-            return CheckResult::fail("LMDB bloat", format!("Failed to read data.mdb: {}", e));
+            return CheckResult::fail("LMDB bloat", format!("Failed to read LMDB page stats: {}", e));
         }
     };
 
-    let total_chunks = store.stats().map(|s| s.total_chunks).unwrap_or(0);
-
-    if total_chunks == 0 {
+    if page_stats.used_bytes == 0 {
         return CheckResult::pass("LMDB bloat", "Empty database - no bloat concern");
     }
 
-    // Estimate actual data size (5500 bytes per chunk is approximate)
-    let estimated_data_size = total_chunks * 5500;
-    let bloat_ratio = file_size as f64 / estimated_data_size as f64;
+    // bloat_ratio = disk_size / used_bytes
+    // 1.0x = zero free pages (perfect), >1.3x = noticeable waste, >3.0x = serious
+    let bloat_ratio = page_stats.disk_size as f64 / page_stats.used_bytes as f64;
+    let free_bytes = page_stats.disk_size.saturating_sub(page_stats.used_bytes);
 
-    if bloat_ratio < 2.0 {
+    if bloat_ratio < 1.3 {
         CheckResult::pass(
             "LMDB bloat",
-            format!("Bloat ratio: {:.1}x ({} data in {} file)",
+            format!("Bloat ratio: {:.2}x ({} used, {} file, {} free)",
                 bloat_ratio,
-                format_bytes(estimated_data_size),
-                format_bytes(file_size as usize)
+                format_bytes(page_stats.used_bytes as usize),
+                format_bytes(page_stats.disk_size as usize),
+                format_bytes(free_bytes as usize),
             )
         )
-    } else if bloat_ratio < 5.0 {
+    } else if bloat_ratio < 3.0 {
         CheckResult::warn(
             "LMDB bloat",
-            format!("Bloat ratio: {:.1}x ({} data in {} file)",
+            format!("Bloat ratio: {:.2}x ({} used, {} file, {} free pages)",
                 bloat_ratio,
-                format_bytes(estimated_data_size),
-                format_bytes(file_size as usize)
+                format_bytes(page_stats.used_bytes as usize),
+                format_bytes(page_stats.disk_size as usize),
+                format_bytes(free_bytes as usize),
             )
-        ).with_hint("Consider re-indexing to reduce bloat")
+        ).with_hint("Consider re-indexing with `codesearch index -f` to reclaim free pages")
     } else {
         CheckResult::warn(
             "LMDB bloat",
-            format!("High bloat ratio: {:.1}x ({} data in {} file)",
+            format!("High bloat ratio: {:.2}x ({} used, {} file, {} free pages)",
                 bloat_ratio,
-                format_bytes(estimated_data_size),
-                format_bytes(file_size as usize)
+                format_bytes(page_stats.used_bytes as usize),
+                format_bytes(page_stats.disk_size as usize),
+                format_bytes(free_bytes as usize),
             )
-        ).with_hint("Run 'codesearch index' to rebuild and compact the database")
+        ).with_hint("Run 'codesearch index -f' to rebuild and compact the database")
     }
 }
 

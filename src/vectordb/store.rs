@@ -401,8 +401,10 @@ impl VectorStore {
 
                     let new_size = self.map_size_mb * 2;
                     if new_size <= MAX_LMDB_MAP_SIZE_MB {
-                        warn!("MDB_MAP_FULL error in build_index(), resizing to {}MB (attempt {}/{})",
-                              new_size, attempts, max_attempts);
+                        warn!(
+                            "MDB_MAP_FULL error in build_index(), resizing to {}MB (attempt {}/{})",
+                            new_size, attempts, max_attempts
+                        );
                         self.resize_environment(new_size)?;
                     } else {
                         warn!(
@@ -481,6 +483,19 @@ impl VectorStore {
         }
 
         Ok(search_results)
+    }
+
+    /// Returns real LMDB page-level stats for accurate bloat detection.
+    ///
+    /// Uses `env.non_free_pages_size()` (bytes in use) vs `env.real_disk_size()`
+    /// (actual file size on disk) to compute the bloat ratio. No guessing needed.
+    pub fn lmdb_page_stats(&self) -> Result<LmdbPageStats> {
+        let used_bytes = self.env.non_free_pages_size()?;
+        let disk_size = self.env.real_disk_size()?;
+        Ok(LmdbPageStats {
+            used_bytes,
+            disk_size,
+        })
     }
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -751,6 +766,14 @@ pub struct SearchResult {
 
 /// Statistics about the vector store
 #[derive(Debug, Clone)]
+/// Real LMDB page-level statistics for accurate bloat detection.
+pub struct LmdbPageStats {
+    /// Bytes occupied by non-free (live) pages — from `env.non_free_pages_size()`.
+    pub used_bytes: u64,
+    /// Actual file size on disk — from `env.real_disk_size()`.
+    pub disk_size: u64,
+}
+
 pub struct StoreStats {
     pub total_chunks: usize,
     pub total_files: usize,
