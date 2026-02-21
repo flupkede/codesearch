@@ -54,7 +54,7 @@ if ($LASTEXITCODE -ne 0) {
 # Only skip build if: 1) no changes AND 2) target exe exists
 if (-not $ChangedFiles) {
     if (Test-Path $TargetExe) {
-        Write-Host "No changes detected and build exists ($($TargetExe.Name)), skipping build" -ForegroundColor Green
+        Write-Host "No changes detected and build exists ($(Split-Path $TargetExe -Leaf)), skipping build" -ForegroundColor Green
         exit 0
     } else {
         Write-Host "No changes detected but build artifact not found, building..." -ForegroundColor Yellow
