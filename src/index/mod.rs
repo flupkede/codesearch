@@ -613,7 +613,7 @@ async fn index_with_options(
 
     // Arena reset interval: periodically recreate the ONNX session to free
     // arena allocator memory that grows monotonically. Model is on disk, so
-    let mut skipped_files = 0;
+    let mut skipped_files: Vec<String> = Vec::new();
     let mut cancelled = false;
     for file in &files {
         // Check for cancellation before processing each file
@@ -630,12 +630,28 @@ async fn index_with_options(
 
         debug!("📄 Processing file: {}", file.path.display());
 
-        // Skip files that aren't valid UTF-8
+        // Read file content with encoding fallback (UTF-8 → lossy)
         let source_code = match std::fs::read_to_string(&file.path) {
-            Ok(content) => content,
-            Err(_) => {
-                debug!("⚠️  Skipping file (invalid UTF-8): {}", file.path.display());
-                skipped_files += 1;
+            Ok(content) => {
+                // UTF-8 succeeded
+                content
+            },
+            Err(utf8_err) if utf8_err.kind() == std::io::ErrorKind::InvalidData => {
+                // UTF-8 failed — try lossy decode (handles ISO-8859-1, Windows-1252, etc.)
+                match std::fs::read(&file.path) {
+                    Ok(bytes) => {
+                        String::from_utf8_lossy(&bytes).to_string()
+                    },
+                    Err(read_err) => {
+                        skipped_files.push(format!("{} (read failed: {})", file.path.display(), read_err));
+                        pb.inc(1);
+                        continue;
+                    }
+                }
+            },
+            Err(e) => {
+                // Other error (permission denied, file not found, etc.)
+                skipped_files.push(format!("{} ({})", file.path.display(), e));
                 pb.inc(1);
                 continue;
             }
@@ -789,8 +805,11 @@ async fn index_with_options(
         );
     }
 
-    if skipped_files > 0 {
-        log_print!("   ⚠️  Skipped {} files (invalid UTF-8)", skipped_files);
+    if !skipped_files.is_empty() {
+        log_print!("   ⚠️  Skipped {} files (failed to read):", skipped_files.len());
+        for path in &skipped_files {
+            log_print!("      - {}", path);
+        }
     }
 
     pb.finish_with_message("Done!");
