@@ -10,6 +10,7 @@ use crate::chunker::SemanticChunker;
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
+use crate::{info_print, warn_print};
 use crate::rerank::{rrf_fusion, vector_only, FusedResult, NeuralReranker, DEFAULT_RRF_K};
 use crate::vectordb::VectorStore;
 
@@ -171,9 +172,10 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
     // This indicates the user is looking for a specific type/function, not just any of that kind
     let has_identifier = contains_identifier(query);
 
-    eprintln!(
+    info_print!(
         "🔍 detect_structural_intent: query='{}', has_identifier={}",
-        query, has_identifier
+        query,
+        has_identifier
     );
 
     if !has_identifier {
@@ -198,7 +200,7 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
         None
     };
 
-    eprintln!("🔍 detect_structural_intent: kind={:?}", kind);
+    info_print!("🔍 detect_structural_intent: kind={:?}", kind);
     kind
 }
 
@@ -435,7 +437,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 (mt, dims, lang)
             } else {
                 // Model name not recognized, fall back to default
-                eprintln!(
+                warn_print!(
                     "{}",
                     "⚠️  Unknown model in metadata, using default".yellow()
                 );
@@ -603,7 +605,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // OPTIMIZATION: Log early termination for monitoring
     if should_use_vector_only && !options.vector_only {
-        eprintln!(
+        info_print!(
             "{}",
             "⚡ Early termination: High-confidence results found, skipping FTS search".green()
         );
@@ -669,7 +671,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             }
             Err(_) => {
                 // FTS not available, fall back to vector-only
-                eprintln!(
+                warn_print!(
                     "{}",
                     "⚠️  FTS index not found, using vector-only search".yellow()
                 );
@@ -746,7 +748,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         let candidates_processed = take_count;
         let results_after_filtering = results.len();
         let filtered_out = candidates_processed.saturating_sub(results_after_filtering);
-        eprintln!(
+        info_print!(
             "{}",
             format!(
                 "🔍 Path filter '{}': {} candidates → {} results ({} filtered out)",
@@ -786,7 +788,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // Negative Result Check: Report when no exact matches found for identifier queries
     let identifiers = detect_identifiers(query);
     if !identifiers.is_empty() && results.is_empty() {
-        eprintln!(
+        warn_print!(
             "{}",
             format!(
                 "❓ No exact matches found for identifiers: {}",
@@ -794,7 +796,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             )
             .yellow()
         );
-        eprintln!("{}", "  Try using broader search terms or running `codesearch index --sync` if the codebase changed.".dimmed());
+        warn_print!("{}", "  Try using broader search terms or running `codesearch index --sync` if the codebase changed.".dimmed());
     }
 
     let search_duration = start.elapsed();
@@ -826,12 +828,12 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                         println!("{}", "✅ Neural reranking applied".green());
                     }
                     Err(e) => {
-                        eprintln!("{}", format!("⚠️  Reranking failed: {}", e).yellow());
+                        warn_print!("{}", format!("⚠️  Reranking failed: {}", e).yellow());
                     }
                 }
             }
             Err(e) => {
-                eprintln!("{}", format!("⚠️  Could not load reranker: {}", e).yellow());
+                warn_print!("{}", format!("⚠️  Could not load reranker: {}", e).yellow());
             }
         }
 
