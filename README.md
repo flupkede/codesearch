@@ -47,16 +47,9 @@ Search your codebase using natural language queries like *"where do we handle au
 
 ## Installation
 
-### Prerequisites
+### 📥 Download Pre-built Binary (Recommended)
 
-| Platform | Command |
-|---|---|
-| **Ubuntu/Debian** | `sudo apt-get install -y build-essential protobuf-compiler libssl-dev pkg-config` |
-| **Fedora/RHEL** | `sudo dnf install -y gcc protobuf-compiler openssl-devel pkg-config` |
-| **macOS** | `brew install protobuf openssl pkg-config` |
-| **Windows** | `winget install -e --id Google.Protobuf` or `choco install protoc` |
-
-### Pre-built Binaries
+The fastest way to get started - download a single executable ready to use. No dependencies, no build process, just extract and run.
 
 Download the latest release for your platform from [Releases](https://github.com/flupkede/codesearch/releases):
 
@@ -66,9 +59,41 @@ Download the latest release for your platform from [Releases](https://github.com
 | **Linux x86_64** | `codesearch-linux-x86_64.tar.gz` |
 | **macOS (Apple Silicon)** | `codesearch-macos-arm64.tar.gz` |
 
-Extract and place the binary somewhere on your `PATH`.
+Extract and place the binary somewhere on your `PATH`:
 
-### Building from Source
+**Windows (PowerShell):**
+```powershell
+# Extract zip
+Expand-Archive codesearch-windows-x86_64.zip
+# Add to PATH or move to directory on PATH
+$env:Path += ";$PWD"
+```
+
+**Linux/macOS:**
+```bash
+# Extract tar.gz
+tar -xzf codesearch-linux-x86_64.tar.gz  # or codesearch-macos-arm64.tar.gz
+# Move to PATH
+sudo mv codesearch /usr/local/bin/
+# Verify installation
+codesearch --version
+```
+
+### 🔨 Building from Source
+
+If you prefer to build from source or need a custom build, you'll need Rust and a few dependencies.
+
+#### Prerequisites
+
+| Platform | Command |
+|---|---|
+| **Rust** | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| **Ubuntu/Debian** | `sudo apt-get install -y build-essential protobuf-compiler libssl-dev pkg-config` |
+| **Fedora/RHEL** | `sudo dnf install -y gcc protobuf-compiler openssl-devel pkg-config` |
+| **macOS** | `brew install protobuf openssl pkg-config` |
+| **Windows** | `winget install -e --id Google.Protobuf` or `choco install protoc` |
+
+#### Build Steps
 
 ```bash
 git clone https://github.com/flupkede/codesearch.git
