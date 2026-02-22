@@ -43,6 +43,8 @@ pub struct SearchOptions {
     pub rerank: bool,
     /// Number of results to rerank
     pub rerank_top: Option<usize>,
+    /// Automatically create index if it doesn't exist
+    pub create_index: bool,
 }
 
 impl Default for SearchOptions {
@@ -61,6 +63,7 @@ impl Default for SearchOptions {
             rrf_k: None,
             rerank: false,
             rerank_top: None,
+            create_index: false,
         }
     }
 }
@@ -406,17 +409,29 @@ pub fn adapt_rrf_k(query: &str) -> (f64, f64) {
 
 /// Search the codebase
 pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) -> Result<()> {
-    let (db_path, _project_path) = get_db_path(path)?;
+    let (db_path, _project_path) = get_db_path(path.clone())?;
 
     if !db_path.exists() {
-        println!("{}", "❌ No database found!".red());
-        println!("   Run {} first", "codesearch index".bright_cyan());
-        println!();
-        println!(
-            "{}",
-            "💡 Tip: codesearch can find databases in parent directories. Use 'codesearch list' to see all indexed projects.".dimmed()
-        );
-        return Ok(());
+        if options.create_index {
+            // Automatically create index
+            println!("{}", "🚀 No index found, creating one...".bright_cyan());
+            let cancel_token = tokio_util::sync::CancellationToken::new();
+            crate::index::index_quiet(path, false, cancel_token).await?;
+            println!("{}", "✅ Index created successfully!".green());
+        } else {
+            println!("{}", "❌ No database found!".red());
+            println!("   Run {} first", "codesearch index".bright_cyan());
+            println!();
+            println!(
+                "{}",
+                "💡 Tip: Use --create-index=true to automatically create the index.".dimmed()
+            );
+            println!(
+                "{}",
+                "💡 Tip: codesearch can find databases in parent directories. Use 'codesearch list' to see all indexed projects.".dimmed()
+            );
+            return Ok(());
+        }
     }
 
     // Read model metadata from database FIRST (needed for sync)
@@ -1175,7 +1190,7 @@ fn print_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ChunkKind;
+    use crate::chunker::ChunkKind;
 
     // ── detect_identifiers ───────────────────────────────────────────────────
 

@@ -141,7 +141,7 @@ Get up and running with AI agents in under 2 minutes.
 
 Download the pre-built binary for your platform from [Releases](https://github.com/flupkede/codesearch/releases) and extract it to your PATH, or build from source (see [Installation](#installation)).
 
-### 2️⃣ Index your codebase
+### 2️⃣ Index your codebase (optional!)
 
 ```bash
 cd /path/to/your/project
@@ -149,6 +149,8 @@ cd /path/to/your/project
 # First time: creates index at git root (~2-5 min, depends on codebase size)
 codesearch index
 ```
+
+**Or skip this step!** — codesearch can now automatically create the index when you first search or start the MCP server with the `--create-index` flag (default: `true`).
 
 The index is automatically placed at the git repository root, so it works from any subdirectory.
 
@@ -197,12 +199,14 @@ The AI agent will use codesearch to find relevant code and provide accurate answ
 # 1. Navigate to your project
 cd /path/to/your/project
 
-# 2. Index the codebase (first time ~30–60s, incremental afterwards)
-codesearch index
-
-# 3. Search with natural language
+# 2. Search (index will be auto-created if it doesn't exist!)
 codesearch search "where do we handle authentication?"
+
+# Or manually index first (optional, ~30–60s)
+codesearch index
 ```
+
+**Auto-index is enabled by default!** The first search, serve, or mcp command will automatically create the index if it doesn't exist. No need to manually run `codesearch index` first.
 
 ---
 
@@ -223,6 +227,37 @@ codesearch index [PATH] [OPTIONS]
 | `--rm` | | Remove the index (alias: `--remove`) |
 | `--list` | | Show index status |
 | `--model` | | Override embedding model |
+
+### Auto-Index Feature
+
+codesearch now supports **automatic index creation** on first use! When using `search`, `serve`, or `mcp` commands, if no index exists, codesearch can create it automatically.
+
+**Default Behavior:** `--create-index=true` (auto-index enabled)
+
+**How it works:**
+
+| Command | Behavior |
+|---|---|
+| `search` | Creates index synchronously before searching (~30-60s) |
+| `serve` | Creates index synchronously before starting server (~30-60s) |
+| `mcp` | Creates minimal placeholder immediately, then indexes in background via incremental refresh |
+
+**Example usage:**
+
+```bash
+# Auto-index enabled (default)
+codesearch search "authentication logic"           # Creates index if missing, then searches
+codesearch serve --port 4444                      # Creates index if missing, then starts server
+codesearch mcp                                    # Starts server immediately, indexes in background
+
+# Disable auto-index (fail if no index exists)
+codesearch search "query" --create-index=false
+codesearch mcp --create-index=false
+codesearch serve --create-index=false
+```
+
+**MCP Server Behavior (Important):**
+The MCP server starts **immediately** (within 5 seconds) even when no index exists, meeting OpenCode's startup timeout requirements. It creates a minimal placeholder database to allow startup, then runs full indexing in the background via the existing incremental refresh mechanism. Tool calls will work once indexing completes.
 
 ### Incremental Indexing
 
@@ -405,6 +440,7 @@ codesearch search <QUERY> [OPTIONS]
 | `--rerank` | | | Enable neural reranking (~1.7s extra) |
 | `--rerank-top` | | 50 | Candidates to rerank |
 | `--rrf-k` | | 20 | RRF fusion parameter |
+| `--create-index` | `-c` | `true` | Automatically create index if it doesn't exist |
 
 ```bash
 codesearch search "database connection pooling"
@@ -465,10 +501,12 @@ On Windows, use the full path to `codesearch.exe` if it's not in your `PATH`. Re
 
 When the MCP server starts, it goes through this sequence:
 
-1. **Database discovery** — Searches for `.codesearch.db/` at the git root (by detecting `.git/` from the current directory), then walks up parent directories (up to 10 levels for non-git projects), and finally checks the global location (`~/.codesearch.dbs/`). The first database found is used. If none is found, the server exits — it will never create a database on its own.
-2. **Incremental index** — Automatically runs an incremental re-index against the detected database, so the index is up-to-date before the agent starts working.
+1. **Database discovery** — Searches for `.codesearch.db/` at the git root (by detecting `.git/` from the current directory), then walks up parent directories (up to 10 levels for non-git projects), and finally checks the global location (`~/.codesearch.dbs/`). The first database found is used. If none is found and `--create-index=true` (default), a minimal placeholder database is created to allow immediate startup.
+2. **Incremental index** — Automatically runs an incremental re-index against the detected database (or full index if placeholder was created), so the index is up-to-date before the agent starts working. This happens in the background for placeholder databases.
 3. **File system watcher (FSW)** — Starts watching the project directory for changes. Any file modifications, additions, or deletions are picked up and the index is updated in the background (with debouncing), keeping the database current throughout the session.
 4. **Git HEAD watcher** — Monitors `.git/HEAD` for branch changes. When a branch switch is detected, an automatic incremental re-index is triggered to update the database with files from the new branch.
+
+**Important:** The MCP server starts in **under 5 seconds** even when no index exists (when `--create-index=true`). It creates a minimal database structure immediately and runs full indexing in the background via the incremental refresh mechanism. This ensures the server meets OpenCode's startup timeout requirements while still providing full indexing capabilities.
 
 > **Important:** Databases are discovered at the *git repository root*, not in subdirectories. Do not manually create `.codesearch.db/` directories inside subfolders — this will cause confusion. One database per git repository, at the git root (or global).
 
@@ -480,7 +518,38 @@ When the MCP server starts, it goes through this sequence:
 | `find_references` | `symbol`, `limit` (default: 50) | Find all usages/call sites of a symbol across the codebase. |
 | `get_file_chunks` | `path`, `compact` (default: true) | Get all indexed chunks from a file. |
 | `find_databases` | | Discover available codesearch databases. |
-| `index_status` | | Check index existence and statistics. |
+| `index_status` | | Check index existence, status, and statistics. |
+
+### `index_status` Tool Response
+
+The `index_status` tool returns current index state including availability status:
+
+```json
+{
+  "indexed": true,
+  "status": "ready",
+  "status_message": "Index is ready for searching.",
+  "total_chunks": 1278,
+  "total_files": 42,
+  "model": "jina-embeddings-v3",
+  "dimensions": 1024,
+  "max_chunk_id": 1278,
+  "db_path": "/path/to/project/.codesearch.db",
+  "project_path": "/path/to/project",
+  "error_message": null
+}
+```
+
+#### Status Values
+
+| Status | Meaning | Search Availability |
+|---|---|---|
+| `not_indexed` | No index database exists | ❌ Not available |
+| `building` | Index exists but has 0 chunks (placeholder, indexing in progress) | ⚠️ May fail, wait until ready |
+| `ready` | Index has chunks and is fully indexed | ✅ Available |
+| `error` | Error accessing or reading index | ❌ Not available |
+
+**Agent Best Practice:** Before searching, check `index_status`. If `status === "building"`, inform the user that indexing is in progress and suggest they try again in a few minutes.
 
 ### How AI Agents Use the Tools
 
@@ -514,12 +583,17 @@ This workflow typically saves **90%+ tokens** compared to returning full code co
 
 | Command | Description |
 |---|---|
-| `codesearch serve [PATH] -p <PORT>` | HTTP server with live file watching (default port 4444) |
+| `codesearch serve [PATH] -p <PORT> [-c]` | HTTP server with live file watching (default port 4444) |
 | `codesearch stats [PATH]` | Show database statistics |
 | `codesearch clear [PATH] [-y]` | Delete the index |
 | `codesearch list` | List all indexed repositories |
 | `codesearch doctor` | Check installation health |
 | `codesearch setup [--model <MODEL>]` | Pre-download embedding models |
+
+**Server Options:**
+| Option | Short | Default | Description |
+|---|---|---|---|
+| `--create-index` | `-c` | `true` | Automatically create index if it doesn't exist |
 
 ### HTTP Server API
 
@@ -659,7 +733,8 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 
 | Problem | Solution |
 |---|---|
-| "No database found" | Run `codesearch index` first (creates index at git root) |
+| "No database found" | Run `codesearch index` first OR use `--create-index=true` (default) |
+| Index taking too long to create | First time is normal (2-5 min). Subsequent indexes use cache (10-30 sec) |
 | Poor search results | Try `--sync` to update, `--rerank` for accuracy, or `--force` to rebuild |
 | Model mismatch warning | Re-index: `codesearch index --force --model <model>` |
 | Out of memory | `CODESEARCH_BATCH_SIZE=32 codesearch index` |
@@ -668,6 +743,8 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 | Index not updating after branch switch | The Git HEAD watcher refreshes automatically; check `codesearch stats` to verify |
 | First index very slow | Normal! First time indexes compute all embeddings (2-5 min). Subsequent indexes use cache (10-30 sec) |
 | Cache too large | Clear cache: `codesearch cache clear <model>` |
+| MCP server starts but searches fail | Index is still being created in background. Check logs for progress. |
+| Want to disable auto-index | Use `--create-index=false` flag with search/serve/mcp commands |
 
 ### Git-Specific Troubleshooting
 

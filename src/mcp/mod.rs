@@ -690,6 +690,8 @@ impl CodesearchService {
         if !indexed {
             let response = IndexStatusResponse {
                 indexed: false,
+                status: "not_indexed".to_string(),
+                status_message: "No index found. Run 'codesearch index' or start with --create-index=true to automatically create one.".to_string(),
                 total_chunks: 0,
                 total_files: 0,
                 model: "none".to_string(),
@@ -697,9 +699,7 @@ impl CodesearchService {
                 max_chunk_id: 0,
                 db_path: self.db_path.display().to_string(),
                 project_path: self.project_path.display().to_string(),
-                error_message: Some(
-                    "No index found. Run 'codesearch index' first to create the index.".to_string(),
-                ),
+                error_message: None,
             };
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
             return Ok(CallToolResult::success(vec![Content::text(json)]));
@@ -713,6 +713,8 @@ impl CodesearchService {
                 Err(e) => {
                     let response = IndexStatusResponse {
                         indexed: false,
+                        status: "error".to_string(),
+                        status_message: format!("Error getting index stats: {}", e),
                         total_chunks: 0,
                         total_files: 0,
                         model: self.model_type.short_name().to_string(),
@@ -734,6 +736,8 @@ impl CodesearchService {
                 Err(e) => {
                     let response = IndexStatusResponse {
                         indexed: false,
+                        status: "error".to_string(),
+                        status_message: format!("Error opening database: {}", e),
                         total_chunks: 0,
                         total_files: 0,
                         model: self.model_type.short_name().to_string(),
@@ -741,7 +745,7 @@ impl CodesearchService {
                         max_chunk_id: 0,
                         db_path: self.db_path.display().to_string(),
                         project_path: self.project_path.display().to_string(),
-                        error_message: Some(format!("Error getting stats: {}", e)),
+                        error_message: Some(format!("Error opening database: {}", e)),
                     };
                     let json =
                         serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -754,6 +758,8 @@ impl CodesearchService {
                 Err(e) => {
                     let response = IndexStatusResponse {
                         indexed: false,
+                        status: "error".to_string(),
+                        status_message: format!("Error getting index stats: {}", e),
                         total_chunks: 0,
                         total_files: 0,
                         model: self.model_type.short_name().to_string(),
@@ -770,8 +776,23 @@ impl CodesearchService {
             }
         };
 
+        // Determine status based on database state
+        let (status, status_message) = if stats.total_chunks == 0 {
+            (
+                "building".to_string(),
+                "Index is being built in the background. Searches may fail until indexing completes. Please check back in a few minutes.".to_string(),
+            )
+        } else {
+            (
+                "ready".to_string(),
+                "Index is ready for searching.".to_string(),
+            )
+        };
+
         let response = IndexStatusResponse {
             indexed: stats.indexed,
+            status,
+            status_message,
             total_chunks: stats.total_chunks,
             total_files: stats.total_files,
             model: self.model_type.short_name().to_string(),
@@ -787,7 +808,7 @@ impl CodesearchService {
     }
 
     #[tool(
-        description = "Find all available codesearch databases in the current directory, parent directories, and globally tracked repositories. Use this to discover which databases are available for searching."
+        description = "Find all available codesearch databases in current directory, parent directories, and globally tracked repositories. Use this to discover which databases are available for searching."
     )]
     async fn find_databases(&self) -> Result<CallToolResult, McpError> {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1065,7 +1086,11 @@ Dimensions: {dims}
 /// - No incremental refresh
 ///
 /// This allows multiple terminal windows to use codesearch simultaneously.
-pub async fn run_mcp_server(path: Option<PathBuf>, cancel_token: CancellationToken) -> Result<()> {
+pub async fn run_mcp_server(
+    path: Option<PathBuf>,
+    create_index: bool,
+    cancel_token: CancellationToken,
+) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
 
     tracing::info!("🚀 Starting codesearch MCP server");
@@ -1073,31 +1098,76 @@ pub async fn run_mcp_server(path: Option<PathBuf>, cancel_token: CancellationTok
     // Use database discovery to find the best database
     let db_info = find_best_database(path.as_deref())?;
 
-    if db_info.is_none() {
-        return Err(anyhow::anyhow!(
-            "No database found in current directory, parent directories, or globally tracked repositories. \
-             Run 'codesearch index' first to index the codebase."
-        ));
-    }
+    let (project_path, db_path) = if let Some(info) = db_info {
+        (info.project_path, info.db_path)
+    } else {
+        // No database found
+        if !create_index {
+            return Err(anyhow::anyhow!(
+                "No database found in current directory, parent directories, or globally tracked repositories. \
+                 Run 'codesearch index' first to index the codebase, or use --create-index=true flag to automatically create it."
+            ));
+        }
 
-    let db_info = db_info.unwrap();
-    let project_path = db_info.project_path.clone();
-    let db_path = db_info.db_path.clone();
+        // Create minimal database structure to allow server to start immediately
+        let effective_path = path
+            .as_ref()
+            .cloned()
+            .unwrap_or(std::env::current_dir()?);
+
+        // Use git root detection to place database in the correct location
+        let db_root = crate::index::find_git_root(&effective_path)?
+            .unwrap_or_else(|| effective_path.clone());
+        let db_path = db_root.join(".codesearch.db");
+
+        tracing::info!("📁 Creating minimal database structure at {}", db_path.display());
+
+        // Create directory
+        std::fs::create_dir_all(&db_path)?;
+
+        // Get model info
+        let model_type = ModelType::default();
+        let model_short_name = model_type.short_name().to_string();
+        let model_name = format!("{:?}", model_type);
+        let dimensions = model_type.dimensions();
+
+        // Create minimal metadata.json (matching format used by build_index)
+        let metadata_path = db_path.join("metadata.json");
+        let metadata = serde_json::json!({
+            "model_short_name": model_short_name,
+            "model_name": model_name,
+            "dimensions": dimensions,
+            "indexed_at": chrono::Utc::now().to_rfc3339()
+        });
+        tokio::fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?).await?;
+
+        // Create minimal file_meta.json (matching FileMetaStore format)
+        let file_meta = crate::cache::FileMetaStore::new(model_short_name.clone(), dimensions);
+        file_meta.save(&db_path)?;
+
+        // Create FTS directory
+        let fts_path = db_path.join("fts");
+        std::fs::create_dir_all(&fts_path)?;
+
+        // Create LMDB file by opening VectorStore (creates minimal structure)
+        let _store = crate::vectordb::VectorStore::new(&db_path, dimensions)?;
+
+        tracing::info!("✅ Minimal database created successfully");
+        tracing::info!("🔄 Background indexing will begin shortly via incremental refresh");
+
+        (effective_path, db_path)
+    };
 
     tracing::info!("📂 Project: {}", project_path.display());
     tracing::info!("💾 Database: {}", db_path.display());
 
     // Read model metadata to get dimensions
     let metadata_path = db_path.join("metadata.json");
-    let dimensions = if metadata_path.exists() {
-        let content = std::fs::read_to_string(&metadata_path)?;
-        let json: serde_json::Value = serde_json::from_str(&content)?;
-        json.get("dimensions")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(384) as usize
-    } else {
-        384
-    };
+    let content = std::fs::read_to_string(&metadata_path)?;
+    let json: serde_json::Value = serde_json::from_str(&content)?;
+    let dimensions = json.get("dimensions")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(384) as usize;
 
     // Create shared stores - try write mode first, fall back to readonly if locked
     // This enables multiple terminal windows to use the same database
