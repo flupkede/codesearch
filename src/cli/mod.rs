@@ -386,26 +386,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             path,
             create_index,
         } => {
-            // Discover database path and initialize logger with file output
-            // NOTE: For MCP, tracing is NOT initialized in main.rs — init_logger
-            // is the first and only call to set the global subscriber
-            let effective_path = path
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| std::env::current_dir().unwrap());
-            if let Ok(Some(db_info)) =
-                crate::db_discovery::find_best_database(Some(&effective_path))
-            {
-                match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
-                    Err(e) => {
-                        eprintln!("Warning: Failed to initialize file logger: {}", e);
-                    }
-                    _ => {
-                        // Logger initialized successfully (either FileLogging or ConsoleOnly)
-                    }
-                }
-            }
-            crate::mcp::run_mcp_server(path, create_index, cancel_token).await
+            // Logger is initialized inside run_mcp_server() once db_path is known.
+            // This handles both the "DB already exists" and "auto-create DB" paths correctly.
+            crate::mcp::run_mcp_server(path, create_index, log_level, cli.quiet, cancel_token).await
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
@@ -448,7 +431,7 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
             return Ok(());
         }
 
-        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
+        let cache = crate::embed::PersistentEmbeddingCache::open(name)?;
         let stats = cache.stats()?;
 
         println!("Persistent Cache Statistics ({})", name);
@@ -534,13 +517,13 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
 
     // Clear cache for specific model or all models
     if let Some(name) = model_name {
-        let model_cache_dir = cache_dir.join(&name);
+        let model_cache_dir = cache_dir.join(name);
         if !model_cache_dir.exists() {
             eprintln!("No cache found for model: {}", name);
             return Ok(());
         }
 
-        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
+        let cache = crate::embed::PersistentEmbeddingCache::open(name)?;
         let stats_before = cache.stats()?;
         cache.clear()?;
         eprintln!(

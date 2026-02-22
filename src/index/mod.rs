@@ -108,29 +108,30 @@ fn get_db_path_smart(
     }
 
     // Step 4: Use automatic discovery (default behavior)
-    // Skip when --force: the old location may be wrong (e.g. not at git root).
+    // Skip when --force: old location may be wrong (e.g. not at git root).
     // Let Step 5 (find_git_root) determine the correct location.
-    if !force && existing_db.is_some() {
-        let db_info = existing_db.as_ref().unwrap();
-        // Use existing database (local or global)
-        if !db_info.is_current {
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let relative_path = if let Ok(rel) = current_dir.strip_prefix(&db_info.project_path) {
-                format!("./{}", rel.display())
-            } else {
-                db_info.project_path.display().to_string()
-            };
-            println!(
-                "{}",
-                format!(
-                    "📂 Using database from: {}\n   (indexing from subfolder, project root: {})",
-                    db_info.db_path.display(),
-                    relative_path
-                )
-                .dimmed()
-            );
+    if !force {
+        if let Some(db_info) = existing_db.as_ref() {
+            // Use existing database (local or global)
+            if !db_info.is_current {
+                let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let relative_path = if let Ok(rel) = current_dir.strip_prefix(&db_info.project_path) {
+                    format!("./{}", rel.display())
+                } else {
+                    db_info.project_path.display().to_string()
+                };
+                println!(
+                    "{}",
+                    format!(
+                        "📂 Using database from: {}\n   (indexing from subfolder, project root: {})",
+                        db_info.db_path.display(),
+                        relative_path
+                    )
+                    .dimmed()
+                );
+            }
+            return Ok((db_info.db_path.clone(), db_info.project_path.clone()));
         }
-        return Ok((db_info.db_path.clone(), db_info.project_path.clone()));
     }
 
     // Step 5: No existing database - SAFETY CHECK before creating
@@ -141,7 +142,7 @@ fn get_db_path_smart(
     if let Some(root) = git_root {
         if root != canonical_path {
             // We're in a subdirectory of a git repository!
-            println!(
+            crate::output::print_info(format_args!(
                 "{}",
                 format!(
                     "⚠️  You are in a subdirectory: {}\n   Git repository root detected at: {}",
@@ -149,11 +150,11 @@ fn get_db_path_smart(
                     root.display()
                 )
                 .yellow()
-            );
-            println!(
+            ));
+            crate::output::print_info(format_args!(
                 "{}",
                 "   Creating database at repository root to avoid duplicate indexes.".yellow()
-            );
+            ));
             let db_path = root.join(".codesearch.db");
             return Ok((db_path, root));
         }
@@ -580,13 +581,18 @@ async fn index_with_options(
     let mut chunker = SemanticChunker::new(100, 2000, 10);
     let mut total_chunks = 0;
 
-    let pb = ProgressBar::new(files.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("█▓▒░ "),
-    );
+    let pb = if quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(files.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("█▓▒░ "),
+        );
+        pb
+    };
 
     // Initialize embedding model (uses global models cache)
     let cache_dir = crate::constants::get_global_models_cache_dir()?;

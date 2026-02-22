@@ -22,18 +22,6 @@ pub struct SemanticSearchRequest {
     pub filter_path: Option<String>,
 }
 
-/// Request to get file chunks
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetFileChunksRequest {
-    /// Path to the file (relative to project root)
-    pub path: String,
-
-    /// Return compact results (metadata only) to save tokens (default: true).
-    /// When true: returns only path, start_line, end_line, kind, signature.
-    /// When false: also includes full code content.
-    pub compact: Option<bool>,
-}
-
 /// Request to find references/call sites of a symbol.
 /// Use this AFTER semantic_search to find where a function/class/variable is used.
 /// Use this INSTEAD OF grep for finding symbol usages in the codebase.
@@ -46,7 +34,7 @@ pub struct FindReferencesRequest {
     pub limit: Option<usize>,
 }
 
-/// Search result item - returned by semantic_search and get_file_chunks
+/// Search result item - returned by semantic_search
 #[derive(Debug, Serialize)]
 pub struct SearchResultItem {
     pub path: String,

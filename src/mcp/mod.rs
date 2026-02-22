@@ -66,14 +66,6 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::db_discovery::{find_best_database, find_databases};
-
-/// Normalize a path string for comparison.
-/// Delegates to `cache::normalize_path_str` for consistency, then strips "./" prefix.
-fn normalize_path_for_compare(path: &str) -> String {
-    crate::cache::normalize_path_str(path)
-        .trim_start_matches("./")
-        .to_string()
-}
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::Language;
 use crate::fts::FtsStore;
@@ -315,7 +307,7 @@ impl CodesearchService {
             Ok(fts_store) => {
                 // FTS search
                 let fts_results = fts_store
-                    .search(&request.query, limit * 3, structural_intent.clone())
+                    .search(&request.query, limit * 3, structural_intent)
                     .unwrap_or_default();
 
                 let fused = if identifiers.is_empty() {
@@ -326,7 +318,7 @@ impl CodesearchService {
                     let mut all_exact: Vec<crate::fts::FtsResult> = Vec::new();
                     for ident in &identifiers {
                         if let Ok(exact) =
-                            fts_store.search_exact(ident, limit * 2, structural_intent.clone())
+                            fts_store.search_exact(ident, limit * 2, structural_intent)
                         {
                             for r in exact {
                                 if !all_exact.iter().any(|e| e.chunk_id == r.chunk_id) {
@@ -440,143 +432,7 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "Get all indexed chunks from a specific file. Returns compact metadata by default (path, line numbers, kind, signature). Useful for understanding file structure before using the read tool for specific sections."
-    )]
-    async fn get_file_chunks(
-        &self,
-        Parameters(request): Parameters<GetFileChunksRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let compact = request.compact.unwrap_or(true);
-        // Ensure database exists
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
-        }
 
-        // Get chunks using shared stores if available
-        let file_chunks = if let Some(ref stores) = self.shared_stores {
-            let store = stores.vector_store.read().await;
-
-            // Collect chunks for the requested file using LMDB iteration
-            // (avoids missing chunks with high IDs after delete+insert cycles)
-            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
-            let all = match store.all_chunks() {
-                Ok(c) => c,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error reading chunks: {}",
-                        e
-                    ))]));
-                }
-            };
-            for (_id, chunk) in all {
-                // Normalize paths for comparison: strip UNC, normalize slashes
-                let chunk_norm = normalize_path_for_compare(&chunk.path);
-                let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
-                let req_norm = normalize_path_for_compare(&request.path);
-
-                // Make chunk path relative by stripping project path prefix
-                let chunk_rel = if chunk_norm.starts_with(&project_norm) {
-                    chunk_norm[project_norm.len()..]
-                        .trim_start_matches('/')
-                        .to_string()
-                } else {
-                    chunk_norm.clone()
-                };
-
-                // Match: exact normalized, or ends_with for subdirectory repos
-                if chunk_rel == req_norm
-                    || chunk_rel.ends_with(&format!("/{}", req_norm))
-                    || req_norm.ends_with(&format!("/{}", chunk_rel))
-                {
-                    file_chunks.push(SearchResultItem {
-                        path: chunk.path,
-                        start_line: chunk.start_line,
-                        end_line: chunk.end_line,
-                        kind: chunk.kind,
-                        score: 1.0,
-                        signature: chunk.signature,
-                        content: if compact { None } else { Some(chunk.content) },
-                        context_prev: if compact { None } else { chunk.context_prev },
-                        context_next: if compact { None } else { chunk.context_next },
-                    });
-                }
-            }
-            file_chunks
-        } else {
-            // Fallback: open a new store (standalone mode)
-            let store = match VectorStore::new(&self.db_path, self.dimensions) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error opening database: {}",
-                        e
-                    ))]));
-                }
-            };
-
-            // Collect chunks for the requested file using LMDB iteration
-            // (avoids missing chunks with high IDs after delete+insert cycles)
-            let mut file_chunks: Vec<SearchResultItem> = Vec::new();
-            let all = match store.all_chunks() {
-                Ok(c) => c,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error reading chunks: {}",
-                        e
-                    ))]));
-                }
-            };
-            for (_id, chunk) in all {
-                // Normalize paths for comparison: strip UNC, normalize slashes
-                let chunk_norm = normalize_path_for_compare(&chunk.path);
-                let project_norm = normalize_path_for_compare(&self.project_path.to_string_lossy());
-                let req_norm = normalize_path_for_compare(&request.path);
-
-                // Make chunk path relative by stripping project path prefix
-                let chunk_rel = if chunk_norm.starts_with(&project_norm) {
-                    chunk_norm[project_norm.len()..]
-                        .trim_start_matches('/')
-                        .to_string()
-                } else {
-                    chunk_norm.clone()
-                };
-
-                // Match: exact normalized, or ends_with for subdirectory repos
-                if chunk_rel == req_norm
-                    || chunk_rel.ends_with(&format!("/{}", req_norm))
-                    || req_norm.ends_with(&format!("/{}", chunk_rel))
-                {
-                    file_chunks.push(SearchResultItem {
-                        path: chunk.path,
-                        start_line: chunk.start_line,
-                        end_line: chunk.end_line,
-                        kind: chunk.kind,
-                        score: 1.0,
-                        signature: chunk.signature,
-                        content: if compact { None } else { Some(chunk.content) },
-                        context_prev: if compact { None } else { chunk.context_prev },
-                        context_next: if compact { None } else { chunk.context_next },
-                    });
-                }
-            }
-            file_chunks
-        };
-
-        // Sort by start line
-        let mut file_chunks = file_chunks;
-        file_chunks.sort_by_key(|c| c.start_line);
-
-        if file_chunks.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No chunks found for file: {}. The file may not be indexed or the path may be incorrect.",
-                request.path
-            ))]));
-        }
-
-        let json = serde_json::to_string(&file_chunks).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
 
     #[tool(
         description = "Find all references/usages of a symbol (function, class, method, variable) across the codebase. USE THIS INSTEAD OF GREP when you need to find where a symbol is used — for refactoring, impact analysis, or understanding call sites. Returns compact list of file paths, line numbers, and containing function signatures."
@@ -954,12 +810,6 @@ AVAILABLE TOOLS:
      - find_references("handleRequest") - Find all call sites
    Returns: Compact list of file paths, line numbers, kind, and score.
 
-5. get_file_chunks(path, compact=true)
-   Get all indexed chunks from a specific file.
-   Useful for understanding the structure of a file (functions, classes, methods).
-   By default returns COMPACT metadata only. Set compact=false for full content.
-   Returns: Chunks with metadata. Use read tool to fetch actual code.
-
 TOKEN-EFFICIENT WORKFLOW (IMPORTANT):
 
 All tools return compact metadata by default to minimize token usage.
@@ -997,12 +847,10 @@ Understanding a New Codebase:
   1. find_databases() → index_status()
   2. semantic_search("main application entry point")
   3. semantic_search("error handling strategy")
-  4. get_file_chunks("src/main.rs") → see file structure
 
 Finding Implementation Patterns:
   - semantic_search("how are API endpoints defined?")
   - semantic_search("database model definitions")
-  - get_file_chunks("src/models/user.rs") → see structure, read for details
 
 Debugging and Analysis:
   - semantic_search("error handling for database operations")
@@ -1089,9 +937,23 @@ Dimensions: {dims}
 pub async fn run_mcp_server(
     path: Option<PathBuf>,
     create_index: bool,
+    log_level: crate::logger::LogLevel,
+    quiet: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
+
+    // Set FASTEMBED_CACHE_DIR early (before any embedding work) to ensure fastembed
+    // downloads and caches models to ~/.codesearch/models instead of creating
+    // .fastembed_cache in the current working directory.
+    match crate::constants::get_global_models_cache_dir() {
+        Ok(models_dir) => {
+            std::env::set_var("FASTEMBED_CACHE_DIR", &models_dir);
+        }
+        Err(e) => {
+            tracing::warn!("Could not set FASTEMBED_CACHE_DIR: {}", e);
+        }
+    }
 
     tracing::info!("🚀 Starting codesearch MCP server");
 
@@ -1158,16 +1020,33 @@ pub async fn run_mcp_server(
         (effective_path, db_path)
     };
 
+    // Initialize file logger now that db_path is known (works for both existing and auto-created DB)
+    // NOTE: For MCP, tracing is NOT initialized in main.rs — this is the only init call
+    if let Err(e) = crate::logger::init_logger(&db_path, log_level, quiet) {
+        tracing::warn!("Failed to initialize file logger: {}", e);
+    }
+
     tracing::info!("📂 Project: {}", project_path.display());
     tracing::info!("💾 Database: {}", db_path.display());
 
-    // Read model metadata to get dimensions
+    // Read model metadata to get dimensions (fallback to 384 if missing/corrupt)
     let metadata_path = db_path.join("metadata.json");
-    let content = std::fs::read_to_string(&metadata_path)?;
-    let json: serde_json::Value = serde_json::from_str(&content)?;
-    let dimensions = json.get("dimensions")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(384) as usize;
+    let dimensions = if metadata_path.exists() {
+        match std::fs::read_to_string(&metadata_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|j| j.get("dimensions").and_then(|v| v.as_u64()))
+        {
+            Some(d) => d as usize,
+            None => {
+                tracing::warn!("⚠️  Could not parse dimensions from metadata.json, using default 384");
+                384
+            }
+        }
+    } else {
+        tracing::warn!("⚠️  metadata.json not found, using default dimensions 384");
+        384
+    };
 
     // Create shared stores - try write mode first, fall back to readonly if locked
     // This enables multiple terminal windows to use the same database

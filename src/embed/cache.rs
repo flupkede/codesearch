@@ -328,7 +328,6 @@ impl PersistentEmbeddingCache {
         Ok(self.db.get(&rtxn, content_hash)?)
     }
     #[allow(dead_code)]
-
     /// Store embedding in cache
     pub fn put(&self, content_hash: &str, embedding: &[f32]) -> Result<()> {
         let mut wtxn = self.env.write_txn()?;
@@ -357,7 +356,7 @@ impl PersistentEmbeddingCache {
         let last_access = std::fs::metadata(self.cache_dir.join("data.mdb"))
             .and_then(|m| m.modified())
             .ok()
-            .map(|dt| DateTime::from(dt));
+            .map(DateTime::from);
         Ok(PersistentCacheStats {
             entries: count as usize,
             file_size_bytes: file_size,
@@ -416,14 +415,12 @@ impl PersistentEmbeddingCache {
         Ok(())
     }
     #[allow(dead_code)]
-
     /// Get number of entries in cache
     pub fn len(&self) -> Result<usize> {
         let rtxn = self.env.read_txn()?;
         Ok(self.db.len(&rtxn)? as usize)
     }
     #[allow(dead_code)]
-
     /// Check if cache is empty
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
@@ -444,7 +441,6 @@ pub struct PersistentCacheStats {
     pub last_access: Option<DateTime<Utc>>,
 }
 #[allow(dead_code)]
-
 impl PersistentCacheStats {
     /// Get file size in MB
     pub fn file_size_mb(&self) -> f64 {

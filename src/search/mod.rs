@@ -180,7 +180,9 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
         return None; // No specific identifier - don't apply kind boost
     }
 
-    let kind = if query_lower.contains("class ") {
+    
+
+    if query_lower.contains("class ") {
         Some(ChunkKind::Class)
     } else if query_lower.contains("struct ") {
         Some(ChunkKind::Struct)
@@ -196,9 +198,7 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
         Some(ChunkKind::Trait)
     } else {
         None
-    };
-
-    kind
+    }
 }
 
 /// Checks if query contains a PascalCase or snake_case identifier
@@ -238,7 +238,7 @@ fn contains_identifier(query: &str) -> bool {
 
 /// Boosts results that match a specific ChunkKind by a factor
 pub fn boost_kind(
-    results: &mut Vec<crate::vectordb::SearchResult>,
+    results: &mut [crate::vectordb::SearchResult],
     target_kind: crate::chunker::ChunkKind,
 ) {
     let boost_factor = 0.15; // 15% boost for matching kind
@@ -413,11 +413,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     if !db_path.exists() {
         if options.create_index {
-            // Automatically create index
-            println!("{}", "🚀 No index found, creating one...".bright_cyan());
+            // Automatically create index — use print_info which goes to stderr and respects quiet mode
+            crate::output::print_info(format_args!("{}", "🚀 No index found, creating one...".bright_cyan()));
             let cancel_token = tokio_util::sync::CancellationToken::new();
             crate::index::index_quiet(path, false, cancel_token).await?;
-            println!("{}", "✅ Index created successfully!".green());
+            crate::output::print_info(format_args!("{}", "✅ Index created successfully!".green()));
         } else {
             println!("{}", "❌ No database found!".red());
             println!("   Run {} first", "codesearch index".bright_cyan());

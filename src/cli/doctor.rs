@@ -197,7 +197,7 @@ fn check_git_root_placement(db_path: &Path, project_path: &Path) -> CheckResult 
             let db_canonical = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
             let expected_db_path = git_root.join(DB_DIR_NAME);
             let expected_canonical =
-                fs::canonicalize(&expected_db_path).unwrap_or_else(|_| expected_db_path);
+                fs::canonicalize(&expected_db_path).unwrap_or(expected_db_path);
 
             if db_canonical == expected_canonical {
                 CheckResult::pass(
@@ -354,7 +354,7 @@ fn read_dimensions(db_path: &Path) -> usize {
 fn check_chunk_integrity(store: &VectorStore) -> CheckResult {
     let stats = store
         .stats()
-        .unwrap_or_else(|_| crate::vectordb::StoreStats {
+        .unwrap_or(crate::vectordb::StoreStats {
             total_chunks: 0,
             total_files: 0,
             indexed: false,

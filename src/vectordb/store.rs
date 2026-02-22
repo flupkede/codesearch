@@ -716,19 +716,6 @@ impl VectorStore {
         }
     }
 
-    /// Iterate all chunks in the store via LMDB cursor.
-    /// Returns (id, metadata) pairs for every chunk, regardless of ID gaps.
-    /// This is the correct way to enumerate chunks after delete+insert cycles.
-    pub fn all_chunks(&self) -> Result<Vec<(u32, ChunkMetadata)>> {
-        let rtxn = self.env.read_txn()?;
-        let mut result = Vec::new();
-        for entry in self.chunks.iter(&rtxn)? {
-            let (id, metadata) = entry?;
-            result.push((id, metadata));
-        }
-        Ok(result)
-    }
-
     /// Get the database file size in bytes
     #[allow(dead_code)] // Reserved for stats display
     pub fn db_size(&self) -> Result<u64> {
