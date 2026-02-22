@@ -1037,13 +1037,24 @@ pub async fn run_mcp_server(
     tracing::info!("📂 Project: {}", project_path.display());
     tracing::info!("💾 Database: {}", db_path.display());
 
-    // Read model metadata to get dimensions
+    // Read model metadata to get dimensions (fallback to 384 if missing/corrupt)
     let metadata_path = db_path.join("metadata.json");
-    let content = std::fs::read_to_string(&metadata_path)?;
-    let json: serde_json::Value = serde_json::from_str(&content)?;
-    let dimensions = json.get("dimensions")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(384) as usize;
+    let dimensions = if metadata_path.exists() {
+        match std::fs::read_to_string(&metadata_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|j| j.get("dimensions").and_then(|v| v.as_u64()))
+        {
+            Some(d) => d as usize,
+            None => {
+                tracing::warn!("⚠️  Could not parse dimensions from metadata.json, using default 384");
+                384
+            }
+        }
+    } else {
+        tracing::warn!("⚠️  metadata.json not found, using default dimensions 384");
+        384
+    };
 
     // Create shared stores - try write mode first, fall back to readonly if locked
     // This enables multiple terminal windows to use the same database
