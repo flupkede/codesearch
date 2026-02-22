@@ -141,16 +141,18 @@ Get up and running with AI agents in under 2 minutes.
 
 Download the pre-built binary for your platform from [Releases](https://github.com/flupkede/codesearch/releases) and extract it to your PATH, or build from source (see [Installation](#installation)).
 
-### 2️⃣ Index your codebase (optional!)
+### 2️⃣ Index your codebase (recommended for large codebases!)
 
 ```bash
 cd /path/to/your/project
 
-# First time: creates index at git root (~2-5 min, depends on codebase size)
+# First time: creates index at git root (~2-10 min, depends on codebase size)
 codesearch index
 ```
 
-**Or skip this step!** — codesearch can now automatically create the index when you first search or start the MCP server with the `--create-index` flag (default: `true`).
+> **⚠️ Performance Warning for Large Codebases:** If you're working with a very large codebase (100k+ files), the first full index creation via MCP can take up to 10 minutes. For large projects, **we strongly recommend creating the index manually via the command line first** using `codesearch index` as shown above. This ensures the index is ready before you start your AI agent, avoiding delays during your coding session.
+
+**Auto-Index Feature:** For smaller projects, you can skip this step — codesearch can automatically create the index when you first use it via `search`, `serve`, or `mcp` commands with `--create-index=true` (the default).
 
 The index is automatically placed at the git repository root, so it works from any subdirectory.
 
@@ -206,7 +208,7 @@ codesearch search "where do we handle authentication?"
 codesearch index
 ```
 
-**Auto-index is enabled by default!** The first search, serve, or mcp command will automatically create the index if it doesn't exist. No need to manually run `codesearch index` first.
+> **⚠️ For large codebases:** If indexing takes too long (>2 minutes), create the index manually first with `codesearch index` before searching.
 
 ---
 
@@ -230,7 +232,7 @@ codesearch index [PATH] [OPTIONS]
 
 ### Auto-Index Feature
 
-codesearch now supports **automatic index creation** on first use! When using `search`, `serve`, or `mcp` commands, if no index exists, codesearch can create it automatically.
+codesearch can automatically create the index when you first use `search`, `serve`, or `mcp` commands if it doesn't exist.
 
 **Default Behavior:** `--create-index=true` (auto-index enabled)
 
@@ -453,9 +455,9 @@ codesearch search "new feature" --sync
 
 ## MCP Server Configuration
 
-The MCP server is codesearch's primary integration point for AI coding agents. It exposes token-efficient tools for semantic code search. The MCP server **auto-detects** the nearest database (local or global) — no project path argument is needed. If no database is found, the server will **not start**. This is intentional: codesearch never creates a database automatically to avoid polluting your projects.
+The MCP server is codesearch's primary integration point for AI coding agents. It exposes token-efficient tools for semantic code search. The MCP server **auto-detects** the nearest database (local or global) — no project path argument is needed.
 
-> **Important:** Always `codesearch index` your project first before using the MCP server.
+> **⚠️ For large codebases:** If you have a very large codebase (100k+ files), the auto-index feature can take up to 10 minutes to create the first full index. **We strongly recommend creating the index manually first** with `codesearch index` before starting the MCP server. This ensures the index is ready when you begin your AI coding session.
 
 ### OpenCode (recommended)
 
@@ -734,14 +736,13 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 | Problem | Solution |
 |---|---|
 | "No database found" | Run `codesearch index` first OR use `--create-index=true` (default) |
-| Index taking too long to create | First time is normal (2-5 min). Subsequent indexes use cache (10-30 sec) |
+| Index taking too long to create | First time is normal (2-5 min for typical projects, up to 10 min for very large codebases). For large projects, index manually first. Subsequent indexes use cache (10-30 sec) |
 | Poor search results | Try `--sync` to update, `--rerank` for accuracy, or `--force` to rebuild |
 | Model mismatch warning | Re-index: `codesearch index --force --model <model>` |
 | Out of memory | `CODESEARCH_BATCH_SIZE=32 codesearch index` |
 | Port in use (serve) | `codesearch serve --port 5555` |
 | Wrong database found | Check where `.codesearch.db/` is located with `codesearch list` |
 | Index not updating after branch switch | The Git HEAD watcher refreshes automatically; check `codesearch stats` to verify |
-| First index very slow | Normal! First time indexes compute all embeddings (2-5 min). Subsequent indexes use cache (10-30 sec) |
 | Cache too large | Clear cache: `codesearch cache clear <model>` |
 | MCP server starts but searches fail | Index is still being created in background. Check logs for progress. |
 | Want to disable auto-index | Use `--create-index=false` flag with search/serve/mcp commands |
