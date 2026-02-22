@@ -150,7 +150,12 @@ cd /path/to/your/project
 codesearch index
 ```
 
-> **⚠️ Performance Warning for Large Codebases:** If you're working with a very large codebase (10k+ files), the first full index creation via MCP can take up to 10 minutes. For large projects, **we strongly recommend creating the index manually via the command line first** using `codesearch index` as shown above. This ensures the index is ready before you start your AI agent, avoiding delays during your coding session.
+> **⚠️ Performance Note for Large Codebases:** If you're working with a very large codebase (10k+ files), the **initial full index creation** can take up to 10 minutes. This only happens once — subsequent updates are fast (typically <30 seconds) thanks to:
+> - **Incremental refresh** for changed files
+> - **Git branch tracking** that automatically detects and updates when you switch branches
+> - **Smart caching** that reuses existing embeddings
+>
+> For large projects, you may want to create the index manually first with `codesearch index` before starting your AI agent. However, the auto-index feature works well for most projects.
 
 **Auto-Index Feature:** For smaller projects, you can skip this step — codesearch can automatically create the index when you first use it via `search`, `serve`, or `mcp` commands with `--create-index=true` (the default).
 
@@ -457,8 +462,6 @@ codesearch search "new feature" --sync
 
 The MCP server is codesearch's primary integration point for AI coding agents. It exposes token-efficient tools for semantic code search. The MCP server **auto-detects** the nearest database (local or global) — no project path argument is needed.
 
-> **⚠️ For large codebases:** If you have a very large codebase (10k+ files), the auto-index feature can take up to 10 minutes to create the first full index. **We strongly recommend creating the index manually first** with `codesearch index` before starting the MCP server. This ensures the index is ready when you begin your AI coding session.
-
 ### OpenCode (recommended)
 
 OpenCode is the primary target for codesearch's MCP integration. Add the following to your OpenCode config at `~/.config/opencode/opencode.json`:
@@ -736,7 +739,7 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 | Problem | Solution |
 |---|---|
 | "No database found" | Run `codesearch index` first OR use `--create-index=true` (default) |
-| Index taking too long to create | First time is normal (2-5 min for typical projects, up to 10 min for very large codebases). For large projects, index manually first. Subsequent indexes use cache (10-30 sec) |
+| Index taking too long to create | First time is normal (2-5 min for typical projects). For large codebases (10k+ files), see the "Performance Note" above. Subsequent updates use cache and are fast (<30 sec) |
 | Poor search results | Try `--sync` to update, `--rerank` for accuracy, or `--force` to rebuild |
 | Model mismatch warning | Re-index: `codesearch index --force --model <model>` |
 | Out of memory | `CODESEARCH_BATCH_SIZE=32 codesearch index` |
