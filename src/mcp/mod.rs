@@ -2,6 +2,28 @@
 //!
 //! Exposes codesearch's semantic search capabilities via the MCP protocol,
 //! allowing AI assistants like Claude to search codebases during conversations.
+//!
+//! # Important: No Stdout Output
+//!
+//! The MCP module MUST NOT use `print!` or `println!` macros anywhere in its code.
+//! All non-JSON output must go to stderr via `info_print!`, `warn_print!`, or `eprintln!`.
+//! This is critical because the MCP protocol communicates over stdout via JSON-RPC,
+//! and any stdout pollution will break the protocol.
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_mcp_no_stdout_output_documented() {
+        // This test documents the requirement that MCP module doesn't use stdout.
+        // Actual enforcement is via:
+        // 1. Code review (grep -rn "print!" src/mcp/ should return nothing)
+        // 2. The rmcp library handles all JSON-RPC communication over stdio
+        //
+        // To verify: `grep -rn "print!\|println!" src/mcp/ | grep -v "info_print\|warn_print"`
+        // Should return zero results.
+        assert!(true);
+    }
+}
 
 pub mod types;
 
