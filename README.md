@@ -213,8 +213,6 @@ codesearch search "where do we handle authentication?"
 codesearch index
 ```
 
-> **⚠️ For large codebases:** If indexing takes too long (>2 minutes), create the index manually first with `codesearch index` before searching.
-
 ---
 
 ## Indexing
@@ -447,7 +445,7 @@ codesearch search <QUERY> [OPTIONS]
 | `--rerank` | | | Enable neural reranking (~1.7s extra) |
 | `--rerank-top` | | 50 | Candidates to rerank |
 | `--rrf-k` | | 20 | RRF fusion parameter |
-| `--create-index` | `-c` | `true` | Automatically create index if it doesn't exist |
+| `--create-index` | | `true` | Automatically create index if it doesn't exist |
 
 ```bash
 codesearch search "database connection pooling"
