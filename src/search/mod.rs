@@ -80,7 +80,8 @@ struct JsonResult {
     start_line: usize,
     end_line: usize,
     kind: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
     score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
@@ -856,6 +857,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // Output results
     if options.json {
+        let compact = options.compact;
         let json_results: Vec<JsonResult> = results
             .iter()
             .map(|r| JsonResult {
@@ -863,11 +865,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 start_line: r.start_line,
                 end_line: r.end_line,
                 kind: r.kind.clone(),
-                content: r.content.clone(),
+                content: if compact { None } else { Some(r.content.clone()) },
                 score: r.score,
                 signature: r.signature.clone(),
-                context_prev: r.context_prev.clone(),
-                context_next: r.context_next.clone(),
+                context_prev: if compact { None } else { r.context_prev.clone() },
+                context_next: if compact { None } else { r.context_next.clone() },
             })
             .collect();
 
