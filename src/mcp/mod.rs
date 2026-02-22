@@ -953,13 +953,13 @@ pub async fn run_mcp_server(
 
     // Set FASTEMBED_CACHE_DIR early (before any embedding work) to ensure fastembed
     // downloads and caches models to ~/.codesearch/models instead of creating
-    // .fastembed_cache in the current working directory.
+     // .fastembed_cache in the current working directory.
     match crate::constants::get_global_models_cache_dir() {
         Ok(models_dir) => {
             std::env::set_var("FASTEMBED_CACHE_DIR", &models_dir);
         }
         Err(e) => {
-            eprintln!("Warning: Could not set FASTEMBED_CACHE_DIR: {}", e);
+            tracing::warn!("Could not set FASTEMBED_CACHE_DIR: {}", e);
         }
     }
 
@@ -1031,7 +1031,7 @@ pub async fn run_mcp_server(
     // Initialize file logger now that db_path is known (works for both existing and auto-created DB)
     // NOTE: For MCP, tracing is NOT initialized in main.rs — this is the only init call
     if let Err(e) = crate::logger::init_logger(&db_path, log_level, quiet) {
-        eprintln!("Warning: Failed to initialize file logger: {}", e);
+        tracing::warn!("Failed to initialize file logger: {}", e);
     }
 
     tracing::info!("📂 Project: {}", project_path.display());
