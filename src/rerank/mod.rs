@@ -141,19 +141,19 @@ pub fn rrf_fusion_with_exact(
     fts_k: f32,
     exact_k: f32,
 ) -> Vec<FusedResult> {
+    // Type alias for complex score tuple to improve readability
+    type ScoreTuple = (
+        f32,
+        Option<f32>,
+        Option<f32>,
+        Option<f32>,
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+    );
+
     // Maps chunk_id -> (rrf_score, vector_score, fts_score, exact_score, vector_rank, fts_rank, exact_rank)
-    let mut scores: HashMap<
-        u32,
-        (
-            f32,
-            Option<f32>,
-            Option<f32>,
-            Option<f32>,
-            Option<usize>,
-            Option<usize>,
-            Option<usize>,
-        ),
-    > = HashMap::new();
+    let mut scores: HashMap<u32, ScoreTuple> = HashMap::new();
 
     // Process vector results
     for (rank, result) in vector_results.iter().enumerate() {

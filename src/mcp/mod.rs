@@ -66,14 +66,6 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::db_discovery::{find_best_database, find_databases};
-
-/// Normalize a path string for comparison.
-/// Delegates to `cache::normalize_path_str` for consistency, then strips "./" prefix.
-fn normalize_path_for_compare(path: &str) -> String {
-    crate::cache::normalize_path_str(path)
-        .trim_start_matches("./")
-        .to_string()
-}
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::Language;
 use crate::fts::FtsStore;
@@ -315,7 +307,7 @@ impl CodesearchService {
             Ok(fts_store) => {
                 // FTS search
                 let fts_results = fts_store
-                    .search(&request.query, limit * 3, structural_intent.clone())
+                    .search(&request.query, limit * 3, structural_intent)
                     .unwrap_or_default();
 
                 let fused = if identifiers.is_empty() {
@@ -326,7 +318,7 @@ impl CodesearchService {
                     let mut all_exact: Vec<crate::fts::FtsResult> = Vec::new();
                     for ident in &identifiers {
                         if let Ok(exact) =
-                            fts_store.search_exact(ident, limit * 2, structural_intent.clone())
+                            fts_store.search_exact(ident, limit * 2, structural_intent)
                         {
                             for r in exact {
                                 if !all_exact.iter().any(|e| e.chunk_id == r.chunk_id) {

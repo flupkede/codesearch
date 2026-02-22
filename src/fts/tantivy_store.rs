@@ -492,9 +492,10 @@ impl FtsStore {
             // This means: only items that match the identifier AND are of the target kind get boosted
             let sig_or_content =
                 BooleanQuery::union(vec![Box::new(boosted_sig), Box::new(content_query)]);
-            let mut and_queries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![];
-            and_queries.push((Occur::Must, Box::new(sig_or_content)));
-            and_queries.push((Occur::Must, Box::new(kind_query)));
+            let and_queries: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
+                (Occur::Must, Box::new(sig_or_content)),
+                (Occur::Must, Box::new(kind_query)),
+            ];
             BooleanQuery::new(and_queries)
         } else {
             // STANDARD MODE: Just search for the identifier in signature and content
