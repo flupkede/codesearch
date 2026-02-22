@@ -1174,3 +1174,231 @@ fn print_result(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ChunkKind;
+
+    // ── detect_identifiers ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_identifiers_pascal_case() {
+        let ids = detect_identifiers("find the VectorStore struct");
+        assert!(ids.contains(&"VectorStore".to_string()));
+    }
+
+    #[test]
+    fn test_detect_identifiers_snake_case() {
+        let ids = detect_identifiers("where is find_git_root defined");
+        assert!(ids.contains(&"find_git_root".to_string()));
+    }
+
+    #[test]
+    fn test_detect_identifiers_camel_case() {
+        let ids = detect_identifiers("show me insertChunksWithIds");
+        assert!(ids.contains(&"insertChunksWithIds".to_string()));
+    }
+
+    #[test]
+    fn test_detect_identifiers_plain_words_ignored() {
+        // Plain lowercase words that are not identifiers
+        let ids = detect_identifiers("what does this function do");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_detect_identifiers_mixed_query() {
+        let ids = detect_identifiers("how does VectorStore handle find_git_root");
+        assert!(ids.contains(&"VectorStore".to_string()));
+        assert!(ids.contains(&"find_git_root".to_string()));
+    }
+
+    // ── detect_structural_intent ─────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_structural_intent_struct_keyword() {
+        let kind = detect_structural_intent("struct VectorStore definition");
+        assert_eq!(kind, Some(ChunkKind::Struct));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_fn_keyword() {
+        let kind = detect_structural_intent("fn find_git_root implementation");
+        assert!(matches!(kind, Some(ChunkKind::Function)));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_class_keyword() {
+        let kind = detect_structural_intent("class IndexManager definition");
+        assert_eq!(kind, Some(ChunkKind::Class));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_enum_keyword() {
+        let kind = detect_structural_intent("enum ChunkKind variants");
+        assert_eq!(kind, Some(ChunkKind::Enum));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_trait_keyword() {
+        let kind = detect_structural_intent("trait Searchable implementation");
+        assert_eq!(kind, Some(ChunkKind::Trait));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_no_identifier_returns_none() {
+        // Structural keyword present but no identifier → None
+        let kind = detect_structural_intent("how does a struct work");
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn test_detect_structural_intent_no_keyword_returns_none() {
+        // Identifier present but no structural keyword → None
+        let kind = detect_structural_intent("show me VectorStore");
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn test_detect_structural_intent_plain_query_returns_none() {
+        let kind = detect_structural_intent("how does error handling work");
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn test_detect_structural_intent_respects_quiet_mode() {
+        // With quiet=true, info_print! calls inside detect_structural_intent
+        // must not panic — they should silently be suppressed.
+        crate::output::set_quiet(true);
+        let kind = detect_structural_intent("struct VectorStore");
+        assert_eq!(kind, Some(ChunkKind::Struct));
+        crate::output::set_quiet(false);
+    }
+
+    // ── JsonResult compact serialization ─────────────────────────────────────
+
+    #[test]
+    fn test_json_result_full_includes_content() {
+        let r = JsonResult {
+            path: "src/foo.rs".to_string(),
+            start_line: 1,
+            end_line: 10,
+            kind: "Function".to_string(),
+            content: Some("fn foo() {}".to_string()),
+            score: 0.9,
+            signature: None,
+            context_prev: None,
+            context_next: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"content\""));
+        assert!(json.contains("fn foo()"));
+    }
+
+    #[test]
+    fn test_json_result_compact_omits_content() {
+        let r = JsonResult {
+            path: "src/foo.rs".to_string(),
+            start_line: 1,
+            end_line: 10,
+            kind: "Function".to_string(),
+            content: None,
+            score: 0.9,
+            signature: None,
+            context_prev: None,
+            context_next: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("\"content\""));
+        assert!(!json.contains("\"context_prev\""));
+        assert!(!json.contains("\"context_next\""));
+    }
+
+    #[test]
+    fn test_json_result_compact_retains_required_fields() {
+        let r = JsonResult {
+            path: "src/vectordb/store.rs".to_string(),
+            start_line: 42,
+            end_line: 80,
+            kind: "Struct".to_string(),
+            content: None,
+            score: 0.75,
+            signature: Some("VectorStore".to_string()),
+            context_prev: None,
+            context_next: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["path"], "src/vectordb/store.rs");
+        assert_eq!(v["start_line"], 42);
+        assert_eq!(v["end_line"], 80);
+        assert_eq!(v["kind"], "Struct");
+        assert_eq!(v["score"], 0.75);
+        assert_eq!(v["signature"], "VectorStore");
+        assert!(v.get("content").is_none());
+    }
+
+    #[test]
+    fn test_json_result_context_omitted_when_none() {
+        let r = JsonResult {
+            path: "src/foo.rs".to_string(),
+            start_line: 1,
+            end_line: 5,
+            kind: "Block".to_string(),
+            content: Some("let x = 1;".to_string()),
+            score: 0.5,
+            signature: None,
+            context_prev: None,
+            context_next: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("\"context_prev\""));
+        assert!(!json.contains("\"context_next\""));
+        assert!(!json.contains("\"signature\""));
+    }
+
+    // ── No stdout in search module ────────────────────────────────────────────
+
+    #[test]
+    fn test_no_raw_eprintln_in_search_module() {
+        // Verify the search module contains no bare eprintln! macro *calls*
+        // (calls that bypass quiet mode). All output must go through info_print!
+        // or warn_print!. This test scans source text and skips comment lines
+        // and lines where the token appears only inside a quoted string.
+        let src = include_str!("mod.rs");
+        let needle = concat!("eprint", "ln!("); // split so this literal doesn't self-trigger
+
+        let violations: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    return false;
+                }
+                if !trimmed.contains(needle) {
+                    return false;
+                }
+                // Allow only if the needle appears exclusively inside a string literal
+                // (i.e. every occurrence is preceded by a quote character).
+                // Simple heuristic: reject if needle appears at a non-quoted position.
+                !trimmed
+                    .split(needle)
+                    .skip(1) // parts after each occurrence
+                    .zip(trimmed.split(needle)) // parts before each occurrence
+                    .all(|(_, before)| before.ends_with('"') || before.ends_with("concat!("))
+            })
+            .collect();
+
+        assert!(
+            violations.is_empty(),
+            "Found bare eprintln! calls in search/mod.rs (bypasses quiet mode):\n{}",
+            violations
+                .iter()
+                .map(|(i, l)| format!("  line {}: {}", i + 1, l.trim()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
