@@ -619,11 +619,37 @@ RUST_LOG=codesearch::vectordb=debug codesearch mcp
 
 **Log levels:** `error`, `warn`, `info` (default), `debug`, `trace` (most verbose)
 
-**Where to find logs:**
+**Log file location:**
 
-- **OpenCode:** Logs appear in the OpenCode terminal/console window where the agent is running
-- **Command line:** Logs print to stdout/stderr in your terminal
-- **Claude Code:** Logs appear in the Claude Code desktop application's debug console
+Codesearch stores logs in the `.codesearch.db/logs/` directory within your project's git repository root. Logs are automatically rotated daily.
+
+```
+/path/to/your/project/.codesearch.db/logs/
+├── codesearch.log              # Current day's log
+├── codesearch.log.2026-02-22   # Yesterday's log (example)
+├── codesearch.log.2026-02-21   # 2 days ago
+└── codesearch.log.2026-02-20   # 3 days ago
+```
+
+**Log rotation and retention (automatic):**
+
+- **Rotation:** Daily at midnight (creates new file: `codesearch.log.YYYY-MM-DD`)
+- **Retention:** 5 days by default (older files automatically deleted)
+- **Max files:** 5 log files retained by default
+- **Cleanup:** Automatic cleanup runs every 24 hours
+
+**Configure retention via environment variables:**
+
+```bash
+# Keep logs for 10 days instead of 5
+export CODESEARCH_LOG_RETENTION_DAYS=10
+
+# Keep up to 10 log files instead of 5
+export CODESEARCH_LOG_MAX_FILES=10
+
+# Set cleanup interval to 12 hours instead of 24
+export CODESEARCH_LOG_CLEANUP_INTERVAL_HOURS=12
+```
 
 **Common log patterns to look for:**
 
