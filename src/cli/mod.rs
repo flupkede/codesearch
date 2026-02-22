@@ -431,7 +431,7 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
             return Ok(());
         }
 
-        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
+        let cache = crate::embed::PersistentEmbeddingCache::open(name)?;
         let stats = cache.stats()?;
 
         println!("Persistent Cache Statistics ({})", name);
@@ -517,13 +517,13 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
 
     // Clear cache for specific model or all models
     if let Some(name) = model_name {
-        let model_cache_dir = cache_dir.join(&name);
+        let model_cache_dir = cache_dir.join(name);
         if !model_cache_dir.exists() {
             eprintln!("No cache found for model: {}", name);
             return Ok(());
         }
 
-        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
+        let cache = crate::embed::PersistentEmbeddingCache::open(name)?;
         let stats_before = cache.stats()?;
         cache.clear()?;
         eprintln!(

@@ -108,29 +108,30 @@ fn get_db_path_smart(
     }
 
     // Step 4: Use automatic discovery (default behavior)
-    // Skip when --force: the old location may be wrong (e.g. not at git root).
+    // Skip when --force: old location may be wrong (e.g. not at git root).
     // Let Step 5 (find_git_root) determine the correct location.
-    if !force && existing_db.is_some() {
-        let db_info = existing_db.as_ref().unwrap();
-        // Use existing database (local or global)
-        if !db_info.is_current {
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let relative_path = if let Ok(rel) = current_dir.strip_prefix(&db_info.project_path) {
-                format!("./{}", rel.display())
-            } else {
-                db_info.project_path.display().to_string()
-            };
-            println!(
-                "{}",
-                format!(
-                    "📂 Using database from: {}\n   (indexing from subfolder, project root: {})",
-                    db_info.db_path.display(),
-                    relative_path
-                )
-                .dimmed()
-            );
+    if !force {
+        if let Some(db_info) = existing_db.as_ref() {
+            // Use existing database (local or global)
+            if !db_info.is_current {
+                let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let relative_path = if let Ok(rel) = current_dir.strip_prefix(&db_info.project_path) {
+                    format!("./{}", rel.display())
+                } else {
+                    db_info.project_path.display().to_string()
+                };
+                println!(
+                    "{}",
+                    format!(
+                        "📂 Using database from: {}\n   (indexing from subfolder, project root: {})",
+                        db_info.db_path.display(),
+                        relative_path
+                    )
+                    .dimmed()
+                );
+            }
+            return Ok((db_info.db_path.clone(), db_info.project_path.clone()));
         }
-        return Ok((db_info.db_path.clone(), db_info.project_path.clone()));
     }
 
     // Step 5: No existing database - SAFETY CHECK before creating

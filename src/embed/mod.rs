@@ -271,11 +271,9 @@ impl EmbeddingService {
     pub fn persistent_cache_stats(&self) -> Option<PersistentCacheStats> {
         self.persistent_cache
             .as_ref()
-            .map(|c| c.stats().ok())
-            .flatten()
+            .and_then(|c| c.stats().ok())
     }
     #[allow(dead_code)]
-
     /// Clear the persistent cache
     pub fn clear_persistent_cache(&mut self) -> Result<()> {
         if let Some(cache) = &mut self.persistent_cache {
@@ -284,13 +282,11 @@ impl EmbeddingService {
         Ok(())
     }
     #[allow(dead_code)]
-
     /// Get reference to persistent cache (if initialized)
     pub fn persistent_cache(&self) -> Option<&PersistentEmbeddingCache> {
         self.persistent_cache.as_ref()
     }
     #[allow(dead_code)]
-
     /// Get mutable reference to persistent cache (if initialized)
     pub fn persistent_cache_mut(&mut self) -> Option<&mut PersistentEmbeddingCache> {
         self.persistent_cache.as_mut()

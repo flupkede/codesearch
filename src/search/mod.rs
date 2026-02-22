@@ -180,7 +180,9 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
         return None; // No specific identifier - don't apply kind boost
     }
 
-    let kind = if query_lower.contains("class ") {
+    
+
+    if query_lower.contains("class ") {
         Some(ChunkKind::Class)
     } else if query_lower.contains("struct ") {
         Some(ChunkKind::Struct)
@@ -196,9 +198,7 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
         Some(ChunkKind::Trait)
     } else {
         None
-    };
-
-    kind
+    }
 }
 
 /// Checks if query contains a PascalCase or snake_case identifier
@@ -238,7 +238,7 @@ fn contains_identifier(query: &str) -> bool {
 
 /// Boosts results that match a specific ChunkKind by a factor
 pub fn boost_kind(
-    results: &mut Vec<crate::vectordb::SearchResult>,
+    results: &mut [crate::vectordb::SearchResult],
     target_kind: crate::chunker::ChunkKind,
 ) {
     let boost_factor = 0.15; // 15% boost for matching kind
