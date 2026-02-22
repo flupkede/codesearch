@@ -10,6 +10,7 @@ use crate::chunker::SemanticChunker;
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
+use crate::{info_print, warn_print};
 use crate::rerank::{rrf_fusion, vector_only, FusedResult, NeuralReranker, DEFAULT_RRF_K};
 use crate::vectordb::VectorStore;
 
@@ -79,7 +80,8 @@ struct JsonResult {
     start_line: usize,
     end_line: usize,
     kind: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
     score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
@@ -171,11 +173,6 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
     // This indicates the user is looking for a specific type/function, not just any of that kind
     let has_identifier = contains_identifier(query);
 
-    eprintln!(
-        "🔍 detect_structural_intent: query='{}', has_identifier={}",
-        query, has_identifier
-    );
-
     if !has_identifier {
         return None; // No specific identifier - don't apply kind boost
     }
@@ -198,7 +195,6 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
         None
     };
 
-    eprintln!("🔍 detect_structural_intent: kind={:?}", kind);
     kind
 }
 
@@ -379,7 +375,7 @@ fn expand_query(query: &str) -> Vec<String> {
     // OPTIMIZATION: Log variant count for monitoring (when verbose)
     // This helps track the effectiveness of query variant reduction
     if std::env::var("CODESEARCH_VERBOSE").is_ok() && variants.len() > 1 {
-        eprintln!(
+        info_print!(
             "[optimization] Query expansion: {} -> {} variants (original + {} expansions)",
             original_query,
             variants.len(),
@@ -435,7 +431,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 (mt, dims, lang)
             } else {
                 // Model name not recognized, fall back to default
-                eprintln!(
+                warn_print!(
                     "{}",
                     "⚠️  Unknown model in metadata, using default".yellow()
                 );
@@ -448,7 +444,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // Perform incremental sync if requested (after we know the model)
     if options.sync {
-        println!("{}", "🔄 Syncing database...".yellow());
+        info_print!("{}", "🔄 Syncing database...".yellow());
         sync_database(&db_path, model_type)?;
     }
 
@@ -603,7 +599,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // OPTIMIZATION: Log early termination for monitoring
     if should_use_vector_only && !options.vector_only {
-        eprintln!(
+        info_print!(
             "{}",
             "⚡ Early termination: High-confidence results found, skipping FTS search".green()
         );
@@ -669,7 +665,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             }
             Err(_) => {
                 // FTS not available, fall back to vector-only
-                eprintln!(
+                warn_print!(
                     "{}",
                     "⚠️  FTS index not found, using vector-only search".yellow()
                 );
@@ -746,7 +742,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         let candidates_processed = take_count;
         let results_after_filtering = results.len();
         let filtered_out = candidates_processed.saturating_sub(results_after_filtering);
-        eprintln!(
+        info_print!(
             "{}",
             format!(
                 "🔍 Path filter '{}': {} candidates → {} results ({} filtered out)",
@@ -786,7 +782,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // Negative Result Check: Report when no exact matches found for identifier queries
     let identifiers = detect_identifiers(query);
     if !identifiers.is_empty() && results.is_empty() {
-        eprintln!(
+        warn_print!(
             "{}",
             format!(
                 "❓ No exact matches found for identifiers: {}",
@@ -794,7 +790,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             )
             .yellow()
         );
-        eprintln!("{}", "  Try using broader search terms or running `codesearch index --sync` if the codebase changed.".dimmed());
+        warn_print!("{}", "  Try using broader search terms or running `codesearch index --sync` if the codebase changed.".dimmed());
     }
 
     let search_duration = start.elapsed();
@@ -823,15 +819,15 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                             reordered.push(result);
                         }
                         results = reordered;
-                        println!("{}", "✅ Neural reranking applied".green());
+                        info_print!("{}", "✅ Neural reranking applied".green());
                     }
                     Err(e) => {
-                        eprintln!("{}", format!("⚠️  Reranking failed: {}", e).yellow());
+                        warn_print!("{}", format!("⚠️  Reranking failed: {}", e).yellow());
                     }
                 }
             }
             Err(e) => {
-                eprintln!("{}", format!("⚠️  Could not load reranker: {}", e).yellow());
+                warn_print!("{}", format!("⚠️  Could not load reranker: {}", e).yellow());
             }
         }
 
@@ -854,6 +850,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // Output results
     if options.json {
+        let compact = options.compact;
         let json_results: Vec<JsonResult> = results
             .iter()
             .map(|r| JsonResult {
@@ -861,11 +858,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 start_line: r.start_line,
                 end_line: r.end_line,
                 kind: r.kind.clone(),
-                content: r.content.clone(),
+                content: if compact { None } else { Some(r.content.clone()) },
                 score: r.score,
                 signature: r.signature.clone(),
-                context_prev: r.context_prev.clone(),
-                context_next: r.context_next.clone(),
+                context_prev: if compact { None } else { r.context_prev.clone() },
+                context_next: if compact { None } else { r.context_next.clone() },
             })
             .collect();
 
@@ -915,7 +912,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     println!("{}", "🔍 Search Results".bright_cyan().bold());
     println!("{}", "=".repeat(60));
     println!("Query: \"{}\"", query.bright_yellow());
-    println!("Found {} results", results.len());
+    if let Some(pf) = options.per_file {
+        println!("Found {} results (showing up to {} per file)", results.len(), pf);
+    } else {
+        println!("Found {} results", results.len());
+    }
     println!();
 
     if options.show_scores {
@@ -1169,4 +1170,232 @@ fn print_result(
     println!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ChunkKind;
+
+    // ── detect_identifiers ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_identifiers_pascal_case() {
+        let ids = detect_identifiers("find the VectorStore struct");
+        assert!(ids.contains(&"VectorStore".to_string()));
+    }
+
+    #[test]
+    fn test_detect_identifiers_snake_case() {
+        let ids = detect_identifiers("where is find_git_root defined");
+        assert!(ids.contains(&"find_git_root".to_string()));
+    }
+
+    #[test]
+    fn test_detect_identifiers_camel_case() {
+        let ids = detect_identifiers("show me insertChunksWithIds");
+        assert!(ids.contains(&"insertChunksWithIds".to_string()));
+    }
+
+    #[test]
+    fn test_detect_identifiers_plain_words_ignored() {
+        // Plain lowercase words that are not identifiers
+        let ids = detect_identifiers("what does this function do");
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_detect_identifiers_mixed_query() {
+        let ids = detect_identifiers("how does VectorStore handle find_git_root");
+        assert!(ids.contains(&"VectorStore".to_string()));
+        assert!(ids.contains(&"find_git_root".to_string()));
+    }
+
+    // ── detect_structural_intent ─────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_structural_intent_struct_keyword() {
+        let kind = detect_structural_intent("struct VectorStore definition");
+        assert_eq!(kind, Some(ChunkKind::Struct));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_fn_keyword() {
+        let kind = detect_structural_intent("fn find_git_root implementation");
+        assert!(matches!(kind, Some(ChunkKind::Function)));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_class_keyword() {
+        let kind = detect_structural_intent("class IndexManager definition");
+        assert_eq!(kind, Some(ChunkKind::Class));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_enum_keyword() {
+        let kind = detect_structural_intent("enum ChunkKind variants");
+        assert_eq!(kind, Some(ChunkKind::Enum));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_trait_keyword() {
+        let kind = detect_structural_intent("trait Searchable implementation");
+        assert_eq!(kind, Some(ChunkKind::Trait));
+    }
+
+    #[test]
+    fn test_detect_structural_intent_no_identifier_returns_none() {
+        // Structural keyword present but no identifier → None
+        let kind = detect_structural_intent("how does a struct work");
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn test_detect_structural_intent_no_keyword_returns_none() {
+        // Identifier present but no structural keyword → None
+        let kind = detect_structural_intent("show me VectorStore");
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn test_detect_structural_intent_plain_query_returns_none() {
+        let kind = detect_structural_intent("how does error handling work");
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn test_detect_structural_intent_respects_quiet_mode() {
+        // With quiet=true, info_print! calls inside detect_structural_intent
+        // must not panic — they should silently be suppressed.
+        crate::output::set_quiet(true);
+        let kind = detect_structural_intent("struct VectorStore");
+        assert_eq!(kind, Some(ChunkKind::Struct));
+        crate::output::set_quiet(false);
+    }
+
+    // ── JsonResult compact serialization ─────────────────────────────────────
+
+    #[test]
+    fn test_json_result_full_includes_content() {
+        let r = JsonResult {
+            path: "src/foo.rs".to_string(),
+            start_line: 1,
+            end_line: 10,
+            kind: "Function".to_string(),
+            content: Some("fn foo() {}".to_string()),
+            score: 0.9,
+            signature: None,
+            context_prev: None,
+            context_next: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"content\""));
+        assert!(json.contains("fn foo()"));
+    }
+
+    #[test]
+    fn test_json_result_compact_omits_content() {
+        let r = JsonResult {
+            path: "src/foo.rs".to_string(),
+            start_line: 1,
+            end_line: 10,
+            kind: "Function".to_string(),
+            content: None,
+            score: 0.9,
+            signature: None,
+            context_prev: None,
+            context_next: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("\"content\""));
+        assert!(!json.contains("\"context_prev\""));
+        assert!(!json.contains("\"context_next\""));
+    }
+
+    #[test]
+    fn test_json_result_compact_retains_required_fields() {
+        let r = JsonResult {
+            path: "src/vectordb/store.rs".to_string(),
+            start_line: 42,
+            end_line: 80,
+            kind: "Struct".to_string(),
+            content: None,
+            score: 0.75,
+            signature: Some("VectorStore".to_string()),
+            context_prev: None,
+            context_next: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["path"], "src/vectordb/store.rs");
+        assert_eq!(v["start_line"], 42);
+        assert_eq!(v["end_line"], 80);
+        assert_eq!(v["kind"], "Struct");
+        assert_eq!(v["score"], 0.75);
+        assert_eq!(v["signature"], "VectorStore");
+        assert!(v.get("content").is_none());
+    }
+
+    #[test]
+    fn test_json_result_context_omitted_when_none() {
+        let r = JsonResult {
+            path: "src/foo.rs".to_string(),
+            start_line: 1,
+            end_line: 5,
+            kind: "Block".to_string(),
+            content: Some("let x = 1;".to_string()),
+            score: 0.5,
+            signature: None,
+            context_prev: None,
+            context_next: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("\"context_prev\""));
+        assert!(!json.contains("\"context_next\""));
+        assert!(!json.contains("\"signature\""));
+    }
+
+    // ── No stdout in search module ────────────────────────────────────────────
+
+    #[test]
+    fn test_no_raw_eprintln_in_search_module() {
+        // Verify the search module contains no bare eprintln! macro *calls*
+        // (calls that bypass quiet mode). All output must go through info_print!
+        // or warn_print!. This test scans source text and skips comment lines
+        // and lines where the token appears only inside a quoted string.
+        let src = include_str!("mod.rs");
+        let needle = concat!("eprint", "ln!("); // split so this literal doesn't self-trigger
+
+        let violations: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    return false;
+                }
+                if !trimmed.contains(needle) {
+                    return false;
+                }
+                // Allow only if the needle appears exclusively inside a string literal
+                // (i.e. every occurrence is preceded by a quote character).
+                // Simple heuristic: reject if needle appears at a non-quoted position.
+                !trimmed
+                    .split(needle)
+                    .skip(1) // parts after each occurrence
+                    .zip(trimmed.split(needle)) // parts before each occurrence
+                    .all(|(_, before)| before.ends_with('"') || before.ends_with("concat!("))
+            })
+            .collect();
+
+        assert!(
+            violations.is_empty(),
+            "Found bare eprintln! calls in search/mod.rs (bypasses quiet mode):\n{}",
+            violations
+                .iter()
+                .map(|(i, l)| format!("  line {}: {}", i + 1, l.trim()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }
