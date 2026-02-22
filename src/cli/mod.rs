@@ -386,26 +386,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             path,
             create_index,
         } => {
-            // Discover database path and initialize logger with file output
-            // NOTE: For MCP, tracing is NOT initialized in main.rs — init_logger
-            // is the first and only call to set the global subscriber
-            let effective_path = path
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| std::env::current_dir().unwrap());
-            if let Ok(Some(db_info)) =
-                crate::db_discovery::find_best_database(Some(&effective_path))
-            {
-                match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
-                    Err(e) => {
-                        eprintln!("Warning: Failed to initialize file logger: {}", e);
-                    }
-                    _ => {
-                        // Logger initialized successfully (either FileLogging or ConsoleOnly)
-                    }
-                }
-            }
-            crate::mcp::run_mcp_server(path, create_index, cancel_token).await
+            // Logger is initialized inside run_mcp_server() once db_path is known.
+            // This handles both the "DB already exists" and "auto-create DB" paths correctly.
+            crate::mcp::run_mcp_server(path, create_index, log_level, cli.quiet, cancel_token).await
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
