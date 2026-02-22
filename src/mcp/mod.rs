@@ -13,15 +13,42 @@
 #[cfg(test)]
 mod tests {
     #[test]
-    fn test_mcp_no_stdout_output_documented() {
-        // This test documents the requirement that MCP module doesn't use stdout.
-        // Actual enforcement is via:
-        // 1. Code review (grep -rn "print!" src/mcp/ should return nothing)
-        // 2. The rmcp library handles all JSON-RPC communication over stdio
-        //
-        // To verify: `grep -rn "print!\|println!" src/mcp/ | grep -v "info_print\|warn_print"`
-        // Should return zero results.
-        assert!(true);
+    fn test_mcp_no_raw_stdout_calls() {
+        // Verify that no raw print!/println! calls exist in the MCP module sources.
+        // MCP communicates over stdout (JSON-RPC), so any stdout pollution breaks the protocol.
+        // All informational output must go through info_print!/warn_print!/eprintln! (stderr).
+        let src = include_str!("mod.rs");
+        let violations: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim_start();
+                // Skip comments and lines that are part of the detection logic itself
+                if trimmed.starts_with("//") || trimmed.starts_with("\"") {
+                    return false;
+                }
+                // Only flag lines that actually invoke print! or println! as a macro call
+                // (i.e. the identifier immediately followed by '!'), not lines discussing them
+                let call_println = line.contains("println!(");
+                let call_print = trimmed.starts_with("print!(")
+                    || line.contains(" print!(")
+                    || line.contains("\tprint!(");
+                let is_prefixed =
+                    line.contains("info_print!(") || line.contains("warn_print!(");
+                let is_detection_code = line.contains("line.contains(");
+                (call_println || call_print) && !is_prefixed && !is_detection_code
+            })
+            .collect();
+
+        assert!(
+            violations.is_empty(),
+            "MCP module has raw stdout calls that break the JSON-RPC protocol:\n{}",
+            violations
+                .iter()
+                .map(|(i, l)| format!("  line {}: {}", i + 1, l.trim()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 }
 

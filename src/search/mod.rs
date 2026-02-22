@@ -381,7 +381,7 @@ fn expand_query(query: &str) -> Vec<String> {
     // OPTIMIZATION: Log variant count for monitoring (when verbose)
     // This helps track the effectiveness of query variant reduction
     if std::env::var("CODESEARCH_VERBOSE").is_ok() && variants.len() > 1 {
-        eprintln!(
+        info_print!(
             "[optimization] Query expansion: {} -> {} variants (original + {} expansions)",
             original_query,
             variants.len(),
@@ -450,7 +450,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // Perform incremental sync if requested (after we know the model)
     if options.sync {
-        println!("{}", "🔄 Syncing database...".yellow());
+        info_print!("{}", "🔄 Syncing database...".yellow());
         sync_database(&db_path, model_type)?;
     }
 
@@ -825,7 +825,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                             reordered.push(result);
                         }
                         results = reordered;
-                        println!("{}", "✅ Neural reranking applied".green());
+                        info_print!("{}", "✅ Neural reranking applied".green());
                     }
                     Err(e) => {
                         warn_print!("{}", format!("⚠️  Reranking failed: {}", e).yellow());

@@ -7,9 +7,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialise all quiet-mode tests: they share a single global AtomicBool,
+    /// so running them in parallel would cause races on the flag.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_quiet_mode_toggle() {
+        let _guard = TEST_LOCK.lock().unwrap();
         // Initial state
         set_quiet(false);
         assert!(!is_quiet());
@@ -25,6 +31,7 @@ mod tests {
 
     #[test]
     fn test_print_info_not_quiet() {
+        let _guard = TEST_LOCK.lock().unwrap();
         set_quiet(false);
         assert!(!is_quiet());
 
@@ -37,6 +44,7 @@ mod tests {
 
     #[test]
     fn test_print_info_quiet() {
+        let _guard = TEST_LOCK.lock().unwrap();
         set_quiet(true);
         assert!(is_quiet());
 
@@ -49,6 +57,7 @@ mod tests {
 
     #[test]
     fn test_print_warn_not_quiet() {
+        let _guard = TEST_LOCK.lock().unwrap();
         set_quiet(false);
         assert!(!is_quiet());
 
@@ -61,6 +70,7 @@ mod tests {
 
     #[test]
     fn test_print_warn_quiet() {
+        let _guard = TEST_LOCK.lock().unwrap();
         set_quiet(true);
         assert!(is_quiet());
 
