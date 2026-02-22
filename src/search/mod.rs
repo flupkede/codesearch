@@ -912,7 +912,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     println!("{}", "🔍 Search Results".bright_cyan().bold());
     println!("{}", "=".repeat(60));
     println!("Query: \"{}\"", query.bright_yellow());
-    println!("Found {} results", results.len());
+    if let Some(pf) = options.per_file {
+        println!("Found {} results (showing up to {} per file)", results.len(), pf);
+    } else {
+        println!("Found {} results", results.len());
+    }
     println!();
 
     if options.show_scores {

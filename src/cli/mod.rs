@@ -89,8 +89,8 @@ pub enum Commands {
         #[arg(short = 'm', long, default_value = "25")]
         max_results: usize,
 
-        /// Maximum matches to show per file
-        #[arg(long, default_value = "1")]
+        /// Maximum matches to show per file (0 = no limit)
+        #[arg(long, default_value = "0")]
         per_file: usize,
 
         /// Show full chunk content instead of snippets
