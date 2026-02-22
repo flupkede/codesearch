@@ -2,7 +2,7 @@
 
 ** ONLY USE MCP TOOLS !!! **
 
-### Gebruik bash indien alleen specifiek index operatie (niet met MCP actief !!)
+### Use bash only for specific index operations (not with MCP active !!)
 
 ```bash
 
@@ -156,18 +156,18 @@ ls -la /c/WorkArea/AI/codesearch/codesearch.git/target/
 - Target directory is configured in `.cargo/config.toml` as `../target`
 - This keeps source tree clean and centralized
 
-### Voordelen
+### Benefits
 
-- ✅ Versiebeheer: Automatische versienummers per commit
-- ✅ Schone repository: Build artifacts buiten source tree
-- ✅ Sneller indexeren: Alleen gewijzigde bestanden verwerken
-- ✅ Handig: Werkt vanuit elke subfolder
-- ✅ Flexibel: Lokale of globale indexes naar keuze
-- ✅ Slim: Automatische detectie van index type
-- ✅ Veilig: Gaat correct om met verwijderde bestanden
-- ✅ AI-vriendelijk: Smart grep wrapper voor OpenAgents/OpenCoder
-- ✅ Documentatie: Help tekst altijd up-to-date
-- ✅ Eenvoudig: Geen subcommando's, alles via flags
+- ✅ Version Control: Automatic version numbers per commit
+- ✅ Clean Repository: Build artifacts outside source tree
+- ✅ Faster Indexing: Process only changed files
+- ✅ Convenient: Works from any subfolder
+- ✅ Flexible: Local or global indexes at your choice
+- ✅ Smart: Automatic index type detection
+- ✅ Safe: Correctly handles deleted files
+- ✅ AI-Friendly: Smart grep wrapper for OpenAgents/OpenCoder
+- ✅ Documentation: Help text always up-to-date
+- ✅ Simple: No subcommands, everything via flags
 
 ---
 
