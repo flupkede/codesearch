@@ -136,6 +136,10 @@ pub enum Commands {
         /// Filter results to files under this path (e.g., "src/")
         #[arg(long)]
         filter_path: Option<String>,
+
+        /// Automatically create index if it doesn't exist (default: true)
+        #[arg(long, default_value = "true")]
+        create_index: bool,
     },
 
     /// Index the repository or manage global index registry
@@ -176,6 +180,10 @@ pub enum Commands {
 
         /// Path to serve (defaults to current directory)
         path: Option<PathBuf>,
+
+        /// Automatically create index if it doesn't exist (default: true)
+        #[arg(short = 'c', long, default_value = "true")]
+        create_index: bool,
     },
 
     /// Show statistics about the vector database
@@ -216,6 +224,10 @@ pub enum Commands {
     Mcp {
         /// Path to project (defaults to current directory)
         path: Option<PathBuf>,
+
+        /// Automatically create index if it doesn't exist (default: true)
+        #[arg(short = 'c', long, default_value = "true")]
+        create_index: bool,
     },
 
     /// Manage persistent embedding cache
@@ -266,6 +278,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             rerank,
             rerank_top,
             filter_path,
+            create_index,
         } => {
             // Auto-enable quiet mode for JSON output
             if json {
@@ -293,6 +306,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 } else {
                     Some(rerank_top)
                 },
+                create_index,
             };
 
             crate::search::search(&query, path, options).await
@@ -339,7 +353,11 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             }
         }
         Commands::Stats { path } => crate::index::stats(path).await,
-        Commands::Serve { port, path } => {
+        Commands::Serve {
+            port,
+            path,
+            create_index,
+        } => {
             // Discover database path and initialize logger with file output
             // NOTE: For Serve, tracing is NOT initialized in main.rs — init_logger
             // is the first and only call to set the global subscriber
@@ -359,12 +377,15 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     }
                 }
             }
-            crate::server::serve(port, path).await
+            crate::server::serve(port, path, create_index, cancel_token.clone()).await
         }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
         Commands::Doctor { fix, json } => crate::cli::doctor::run(fix, json).await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp { path } => {
+        Commands::Mcp {
+            path,
+            create_index,
+        } => {
             // Discover database path and initialize logger with file output
             // NOTE: For MCP, tracing is NOT initialized in main.rs — init_logger
             // is the first and only call to set the global subscriber
@@ -384,7 +405,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     }
                 }
             }
-            crate::mcp::run_mcp_server(path, cancel_token).await
+            crate::mcp::run_mcp_server(path, create_index, cancel_token).await
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,

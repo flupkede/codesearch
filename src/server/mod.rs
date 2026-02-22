@@ -90,15 +90,36 @@ struct StatusResponse {
 /// 2. Built-in file watching with native notify crate
 /// 3. Two-level change detection (mtime + hash)
 /// 4. Tracks chunk IDs for efficient incremental updates
-pub async fn serve(port: u16, path: Option<PathBuf>) -> Result<()> {
+pub async fn serve(
+    port: u16,
+    path: Option<PathBuf>,
+    create_index: bool,
+    _cancel_token: tokio_util::sync::CancellationToken,
+) -> Result<()> {
     // Find the best database to use
-    let db_info = find_best_database(path.as_deref())?;
+    let mut db_info = find_best_database(path.as_deref())?;
 
     if db_info.is_none() {
-        return Err(anyhow::anyhow!(
-            "No database found in current directory, parent directories, or globally tracked repositories. \
-             Run 'codesearch index' first to index the codebase."
-        ));
+        if create_index {
+            // Automatically create index
+            println!("{}", "🚀 No index found, creating one...".bright_cyan());
+            let cancel_token_index = tokio_util::sync::CancellationToken::new();
+            crate::index::index_quiet(path.clone(), false, cancel_token_index).await?;
+            println!("{}", "✅ Index created successfully!".green());
+
+            // Re-discover database after indexing
+            db_info = find_best_database(path.as_deref())?;
+            if db_info.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Failed to create database. Please check the error messages above."
+                ));
+            }
+        } else {
+            return Err(anyhow::anyhow!(
+                "No database found in current directory, parent directories, or globally tracked repositories. \
+                 Run 'codesearch index' first to index the codebase, or use --create-index flag to automatically create it."
+            ));
+        }
     }
 
     let db_info = db_info.unwrap();

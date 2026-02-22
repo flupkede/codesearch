@@ -84,6 +84,10 @@ pub struct ReferenceItem {
 #[derive(Debug, Serialize)]
 pub struct IndexStatusResponse {
     pub indexed: bool,
+    /// Index status: "not_indexed", "building", "ready", "error"
+    pub status: String,
+    /// Human-readable status message
+    pub status_message: String,
     pub total_chunks: usize,
     pub total_files: usize,
     pub model: String,
