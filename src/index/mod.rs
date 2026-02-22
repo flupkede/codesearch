@@ -138,7 +138,7 @@ fn get_db_path_smart(
     // Propagate errors (e.g. multiple child .git dirs found)
     let git_root = find_git_root(&canonical_path)?;
 
-     if let Some(root) = git_root {
+    if let Some(root) = git_root {
         if root != canonical_path {
             // We're in a subdirectory of a git repository!
             crate::output::print_info(format_args!(
