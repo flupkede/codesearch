@@ -173,12 +173,6 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
     // This indicates the user is looking for a specific type/function, not just any of that kind
     let has_identifier = contains_identifier(query);
 
-    info_print!(
-        "🔍 detect_structural_intent: query='{}', has_identifier={}",
-        query,
-        has_identifier
-    );
-
     if !has_identifier {
         return None; // No specific identifier - don't apply kind boost
     }
@@ -201,7 +195,6 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
         None
     };
 
-    info_print!("🔍 detect_structural_intent: kind={:?}", kind);
     kind
 }
 
