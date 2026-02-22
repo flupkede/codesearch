@@ -519,7 +519,6 @@ When the MCP server starts, it goes through this sequence:
 |---|---|---|
 | `semantic_search` | `query`, `limit`, `compact` (default: true), `filter_path` | Semantic code search. Compact mode returns metadata only (~93% fewer tokens). |
 | `find_references` | `symbol`, `limit` (default: 50) | Find all usages/call sites of a symbol across the codebase. |
-| `get_file_chunks` | `path`, `compact` (default: true) | Get all indexed chunks from a file. |
 | `find_databases` | | Discover available codesearch databases. |
 | `index_status` | | Check index existence, status, and statistics. |
 
@@ -562,9 +561,9 @@ The MCP tools are designed to work together in a **search → narrow → read** 
 
 2. **`find_references`** — Once the agent identifies a relevant function or symbol, it can ask for all usages and call sites across the codebase. This is much more efficient than grep-based searching and stays within the codesearch ecosystem. Example: `find_references("authenticate")` returns every location that calls or references that symbol.
 
-3. **`get_file_chunks`** — To get a broader view of a specific file's structure, the agent can retrieve all indexed chunks. With `compact=true` this gives an outline (functions, classes, methods with signatures); with `compact=false` it includes full source code.
+3. **Targeted file reads** — Once the agent identifies a relevant function or symbol, it reads only the specific lines it needs using its built-in file read tools (e.g., `read("src/auth/handler.rs", offset=45, limit=30)`). The compact search results include exact line numbers, making targeted reads precise and efficient.
 
-4. **Targeted file reads** — Finally, the agent reads only the specific lines it needs using its built-in file read tools.
+4. **Iterate** — The agent continues narrowing down with additional `semantic_search` or `find_references` calls as needed.
 
 **Example session:**
 ```
