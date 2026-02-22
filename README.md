@@ -150,7 +150,7 @@ cd /path/to/your/project
 codesearch index
 ```
 
-> **⚠️ Performance Warning for Large Codebases:** If you're working with a very large codebase (100k+ files), the first full index creation via MCP can take up to 10 minutes. For large projects, **we strongly recommend creating the index manually via the command line first** using `codesearch index` as shown above. This ensures the index is ready before you start your AI agent, avoiding delays during your coding session.
+> **⚠️ Performance Warning for Large Codebases:** If you're working with a very large codebase (10k+ files), the first full index creation via MCP can take up to 10 minutes. For large projects, **we strongly recommend creating the index manually via the command line first** using `codesearch index` as shown above. This ensures the index is ready before you start your AI agent, avoiding delays during your coding session.
 
 **Auto-Index Feature:** For smaller projects, you can skip this step — codesearch can automatically create the index when you first use it via `search`, `serve`, or `mcp` commands with `--create-index=true` (the default).
 
@@ -457,7 +457,7 @@ codesearch search "new feature" --sync
 
 The MCP server is codesearch's primary integration point for AI coding agents. It exposes token-efficient tools for semantic code search. The MCP server **auto-detects** the nearest database (local or global) — no project path argument is needed.
 
-> **⚠️ For large codebases:** If you have a very large codebase (100k+ files), the auto-index feature can take up to 10 minutes to create the first full index. **We strongly recommend creating the index manually first** with `codesearch index` before starting the MCP server. This ensures the index is ready when you begin your AI coding session.
+> **⚠️ For large codebases:** If you have a very large codebase (10k+ files), the auto-index feature can take up to 10 minutes to create the first full index. **We strongly recommend creating the index manually first** with `codesearch index` before starting the MCP server. This ensures the index is ready when you begin your AI coding session.
 
 ### OpenCode (recommended)
 
