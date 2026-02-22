@@ -413,11 +413,19 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     if !db_path.exists() {
         if options.create_index {
-            // Automatically create index
-            println!("{}", "🚀 No index found, creating one...".bright_cyan());
+            // Automatically create index — print to stderr when in JSON mode to avoid corrupting output
+            if !options.json {
+                println!("{}", "🚀 No index found, creating one...".bright_cyan());
+            } else {
+                eprintln!("{}", "🚀 No index found, creating one...".bright_cyan());
+            }
             let cancel_token = tokio_util::sync::CancellationToken::new();
             crate::index::index_quiet(path, false, cancel_token).await?;
-            println!("{}", "✅ Index created successfully!".green());
+            if !options.json {
+                println!("{}", "✅ Index created successfully!".green());
+            } else {
+                eprintln!("{}", "✅ Index created successfully!".green());
+            }
         } else {
             println!("{}", "❌ No database found!".red());
             println!("   Run {} first", "codesearch index".bright_cyan());

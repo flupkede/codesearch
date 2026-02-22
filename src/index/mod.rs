@@ -141,7 +141,7 @@ fn get_db_path_smart(
     if let Some(root) = git_root {
         if root != canonical_path {
             // We're in a subdirectory of a git repository!
-            println!(
+            eprintln!(
                 "{}",
                 format!(
                     "⚠️  You are in a subdirectory: {}\n   Git repository root detected at: {}",
@@ -150,7 +150,7 @@ fn get_db_path_smart(
                 )
                 .yellow()
             );
-            println!(
+            eprintln!(
                 "{}",
                 "   Creating database at repository root to avoid duplicate indexes.".yellow()
             );
@@ -580,13 +580,18 @@ async fn index_with_options(
     let mut chunker = SemanticChunker::new(100, 2000, 10);
     let mut total_chunks = 0;
 
-    let pb = ProgressBar::new(files.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("█▓▒░ "),
-    );
+    let pb = if quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(files.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("█▓▒░ "),
+        );
+        pb
+    };
 
     // Initialize embedding model (uses global models cache)
     let cache_dir = crate::constants::get_global_models_cache_dir()?;
