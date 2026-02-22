@@ -582,6 +582,57 @@ Agent: read("src/auth/handler.rs", lines 45-75)
 
 This workflow typically saves **90%+ tokens** compared to returning full code content for every search result.
 
+### Debugging Indexing Issues
+
+If indexing seems stuck, slow, or you want to see detailed progress, you can enable debug logging:
+
+**Setting log level for OpenCode MCP:**
+
+```json
+{
+  "mcp": {
+    "codesearch": {
+      "type": "local",
+      "command": [
+        "codesearch",
+        "mcp",
+        "--loglevel=debug"
+      ],
+      "enabled": true
+    }
+  }
+}
+```
+
+**Setting log level for command line:**
+
+```bash
+# Debug level (general information)
+RUST_LOG=codesearch=debug codesearch search "query"
+
+# Trace level for embedding operations (verbose)
+RUST_LOG=codesearch::embed=trace codesearch index
+
+# Debug level for specific component (e.g., vectordb operations)
+RUST_LOG=codesearch::vectordb=debug codesearch mcp
+```
+
+**Log levels:** `error`, `warn`, `info` (default), `debug`, `trace` (most verbose)
+
+**Where to find logs:**
+
+- **OpenCode:** Logs appear in the OpenCode terminal/console window where the agent is running
+- **Command line:** Logs print to stdout/stderr in your terminal
+- **Claude Code:** Logs appear in the Claude Code desktop application's debug console
+
+**Common log patterns to look for:**
+
+- `"Building index for X files..."` — Index in progress
+- `"Incremental refresh: Y files changed"` — Background updates
+- `"Embedding cache hit"` — Cache working efficiently
+- `"Git branch switch detected"` — Auto-refresh triggered
+- `"MDB_MAP_FULL"` — Database size issue (auto-resizes, but slows indexing)
+
 ---
 
 ## Other Commands
