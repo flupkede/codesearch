@@ -687,18 +687,21 @@ impl IndexManager {
                     if let Ok(branch_changed) = watcher.check().await {
                         if branch_changed.is_some() {
                             info!("🔀 Git branch changed, triggering full incremental refresh...");
-                            // Trigger a full incremental refresh on branch change
-                            if let Err(e) = Self::process_batch_with_stores(
+                            // Perform a real incremental refresh: walk filesystem,
+                            // detect changed/deleted files, clean stale chunks, re-index
+                            if let Err(e) = Self::refresh_index_with_stores(
                                 &path,
                                 &db_path,
                                 &stores,
-                                Vec::new(),
-                                Vec::new(),
                             )
                             .await
                             {
                                 error!("❌ Branch change refresh failed: {}", e);
                             }
+                            // Clear any buffered file events that arrived during the
+                            // branch switch — the full refresh already handled everything
+                            files_to_index.clear();
+                            files_to_remove.clear();
                         }
                     }
                 }
@@ -913,6 +916,141 @@ impl IndexManager {
             "✅ Batch complete: {} indexed, {} removed in {:.2}s",
             files_to_index.len(),
             files_to_remove.len(),
+            elapsed.as_secs_f64()
+        );
+
+        Ok(())
+    }
+
+    /// Perform a full incremental refresh using shared stores.
+    ///
+    /// This is called on git branch changes to ensure the index reflects the
+    /// current state of the working tree. Unlike `process_batch_with_stores`
+    /// which operates on a known list of changed files, this function:
+    ///
+    /// 1. Walks the filesystem to discover all current files
+    /// 2. Compares each against FileMetaStore to find changed/new files
+    /// 3. Uses find_deleted_files() to detect stale entries (ghost files)
+    /// 4. Deletes stale chunks from VectorStore + FtsStore
+    /// 5. Rebuilds the vector index
+    /// 6. Re-indexes changed/new files
+    async fn refresh_index_with_stores(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+    ) -> Result<()> {
+        use crate::cache::FileMetaStore;
+        use crate::file::FileWalker;
+        use crate::output::set_quiet;
+
+        let start = std::time::Instant::now();
+        set_quiet(true);
+
+        // Phase 1: Discover current files on disk
+        let walker = FileWalker::new(codebase_path.to_path_buf());
+        let (files, stats) = walker.walk()?;
+        info!(
+            "🔍 Branch refresh: discovered {} indexable files ({} skipped)",
+            files.len(),
+            stats.total_files - stats.indexable_files
+        );
+
+        // Phase 2: Load file metadata and analyze changes
+        let metadata_path = db_path.join("metadata.json");
+        if !metadata_path.exists() {
+            info!("⚠️ No metadata.json found, skipping branch refresh");
+            set_quiet(false);
+            return Ok(());
+        }
+        let metadata_str = std::fs::read_to_string(&metadata_path)?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_str)?;
+        let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
+        let model_name = metadata["model_short_name"]
+            .as_str()
+            .unwrap_or("minilm-l6-q");
+
+        let mut file_meta_store =
+            FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
+
+        // Find files that need re-indexing (new or content changed)
+        let mut files_to_reindex: Vec<PathBuf> = Vec::new();
+        let mut chunks_to_delete: Vec<u32> = Vec::new();
+
+        for file_info in &files {
+            let (needs_reindex, old_chunk_ids) = file_meta_store.check_file(&file_info.path)?;
+            if needs_reindex {
+                chunks_to_delete.extend(old_chunk_ids);
+                files_to_reindex.push(file_info.path.clone());
+            }
+        }
+
+        // Find files that were deleted (tracked in metadata but not on disk)
+        let deleted_files = file_meta_store.find_deleted_files();
+
+        if files_to_reindex.is_empty() && deleted_files.is_empty() {
+            info!("✅ Branch refresh: index is up to date, no changes needed");
+            set_quiet(false);
+            return Ok(());
+        }
+
+        info!(
+            "🔍 Branch refresh analysis: {} to re-index, {} stale to remove, {} old chunks to clean",
+            files_to_reindex.len(),
+            deleted_files.len(),
+            chunks_to_delete.len()
+        );
+
+        // Phase 3: Collect ALL chunk IDs to delete (changed + deleted files)
+        for (_file_path, chunk_ids) in &deleted_files {
+            chunks_to_delete.extend(chunk_ids);
+        }
+
+        // Batch-delete all stale chunks from both stores
+        if !chunks_to_delete.is_empty() {
+            {
+                let mut vstore = stores.vector_store.write().await;
+                vstore.delete_chunks(&chunks_to_delete)?;
+            }
+            {
+                let mut fstore = stores.fts_store.write().await;
+                for &chunk_id in &chunks_to_delete {
+                    fstore.delete_chunk(chunk_id)?;
+                }
+                fstore.commit()?;
+            }
+        }
+
+        // Remove deleted files from FileMetaStore
+        let deleted_count = deleted_files.len();
+        for (file_path, _chunk_ids) in &deleted_files {
+            file_meta_store.remove_file(std::path::Path::new(file_path));
+        }
+
+        // Save metadata after deletions (before re-indexing, since
+        // index_single_file loads its own fresh copy per file)
+        file_meta_store.save(db_path)?;
+
+        // Rebuild vector index after all chunk deletions
+        {
+            let mut vstore = stores.vector_store.write().await;
+            vstore.build_index()?;
+        }
+
+        // Phase 4: Re-index changed/new files
+        let reindex_count = files_to_reindex.len();
+        for file_path in &files_to_reindex {
+            if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
+                warn!("⚠️  Failed to re-index {}: {}", file_path.display(), e);
+            }
+        }
+
+        set_quiet(false);
+
+        let elapsed = start.elapsed();
+        info!(
+            "✅ Branch refresh complete: {} re-indexed, {} stale removed in {:.2}s",
+            reindex_count,
+            deleted_count,
             elapsed.as_secs_f64()
         );
 
@@ -1169,20 +1307,323 @@ impl IndexManager {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
+    use crate::cache::FileMetaStore;
+    use tempfile::tempdir;
+
+    /// Helper: create metadata.json in db_path with given dimensions
+    fn create_metadata_json(db_path: &Path, dimensions: usize) {
+        let metadata = serde_json::json!({
+            "dimensions": dimensions,
+            "model_short_name": "test-model"
+        });
+        std::fs::write(
+            db_path.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Helper: create writable SharedStores for testing (no writer lock)
+    async fn create_test_stores(db_path: &Path, dimensions: usize) -> SharedStores {
+        use crate::fts::FtsStore;
+        use crate::vectordb::VectorStore;
+
+        SharedStores {
+            vector_store: Arc::new(RwLock::new(
+                VectorStore::new(db_path, dimensions).unwrap(),
+            )),
+            fts_store: Arc::new(RwLock::new(
+                FtsStore::new_with_writer(db_path).unwrap(),
+            )),
+            writer_lock: None,
+            readonly: false,
+        }
+    }
 
     #[tokio::test]
-    async fn test_index_manager_creation() {
-        // This test would require a test codebase with an existing index
-        // For now, we just verify the struct can be created
-        let temp_dir = std::env::temp_dir();
-        let test_path = temp_dir.join("test_codesearch");
+    async fn test_refresh_no_metadata_early_return() {
+        // When metadata.json doesn't exist, refresh should return Ok early
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
 
-        // Note: This will fail if test_path doesn't exist or isn't a valid codebase
-        // In a real test, you'd set up a temporary directory with test files and index
-        // The test expects to fail since we haven't set up a proper test codebase
-        println!("Test path: {}", test_path.display());
-        println!("Expected: Index manager creation will fail (no test codebase)");
+        // Don't create metadata.json
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Should return Ok when no metadata.json exists");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_removes_ghost_file_entries() {
+        // Ghost files (tracked in FileMetaStore but not on disk) should be cleaned up
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        create_metadata_json(&db_path, 4);
+
+        // Create a ghost file temporarily so update_file can read its metadata
+        let ghost_file = codebase_path.join("ghost.rs");
+        std::fs::write(&ghost_file, "fn ghost() {}").unwrap();
+
+        // Track the ghost file in FileMetaStore
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta
+            .update_file(&ghost_file, vec![100, 101])
+            .unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        // Now delete the ghost file from disk — simulates branch switch
+        std::fs::remove_file(&ghost_file).unwrap();
+
+        // Verify precondition: ghost file IS tracked but NOT on disk
+        let deleted_before = file_meta.find_deleted_files();
+        assert_eq!(
+            deleted_before.len(),
+            1,
+            "Should find one ghost file before refresh"
+        );
+        assert_eq!(
+            deleted_before[0].1,
+            vec![100, 101],
+            "Ghost file should have chunk_ids [100, 101]"
+        );
+
+        // Create SharedStores (empty — ghost chunk IDs won't exist in store,
+        // but delete_chunks handles missing IDs gracefully)
+        let stores = create_test_stores(&db_path, 4).await;
+
+        // Run the refresh
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
+
+        // Verify: reload FileMetaStore and confirm ghost entry is gone
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        let deleted_after = reloaded.find_deleted_files();
+        assert!(
+            deleted_after.is_empty(),
+            "Ghost file should have been removed from FileMetaStore after refresh, found: {:?}",
+            deleted_after
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_removes_multiple_ghost_files() {
+        // Multiple ghost files should all be cleaned up in one refresh
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        create_metadata_json(&db_path, 4);
+
+        // Create ghost files temporarily
+        let ghost1 = codebase_path.join("ghost1.rs");
+        let ghost2 = codebase_path.join("ghost2.rs");
+        let ghost3 = codebase_path.join("ghost3.rs");
+        std::fs::write(&ghost1, "fn g1() {}").unwrap();
+        std::fs::write(&ghost2, "fn g2() {}").unwrap();
+        std::fs::write(&ghost3, "fn g3() {}").unwrap();
+
+        // Track all ghost files
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta.update_file(&ghost1, vec![10, 11]).unwrap();
+        file_meta.update_file(&ghost2, vec![20, 21, 22]).unwrap();
+        file_meta.update_file(&ghost3, vec![30]).unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        // Delete all ghost files
+        std::fs::remove_file(&ghost1).unwrap();
+        std::fs::remove_file(&ghost2).unwrap();
+        std::fs::remove_file(&ghost3).unwrap();
+
+        // Verify precondition
+        let deleted_before = file_meta.find_deleted_files();
+        assert_eq!(
+            deleted_before.len(),
+            3,
+            "Should find 3 ghost files before refresh"
+        );
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
+
+        // All ghost entries should be removed
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        let deleted_after = reloaded.find_deleted_files();
+        assert!(
+            deleted_after.is_empty(),
+            "All 3 ghost files should be removed, found: {:?}",
+            deleted_after
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_preserves_valid_entries() {
+        // Files that exist on disk and match metadata should NOT be touched
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        create_metadata_json(&db_path, 4);
+
+        // Create a real file on disk
+        let real_file = codebase_path.join("main.rs");
+        std::fs::write(&real_file, "fn main() { println!(\"hello\"); }").unwrap();
+
+        // Track it in FileMetaStore (update_file reads mtime/size/hash)
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta.update_file(&real_file, vec![1, 2]).unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
+
+        // Verify: real file entry should still be in FileMetaStore
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        let deleted = reloaded.find_deleted_files();
+        assert!(
+            deleted.is_empty(),
+            "Real file should NOT be removed from FileMetaStore"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_mixed_ghost_and_real_files() {
+        // Ghost files should be removed while real files are preserved
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        create_metadata_json(&db_path, 4);
+
+        // Create both real and ghost files
+        let real_file = codebase_path.join("real.rs");
+        let ghost_file = codebase_path.join("ghost.rs");
+        std::fs::write(&real_file, "fn real() { 42 }").unwrap();
+        std::fs::write(&ghost_file, "fn ghost() { 99 }").unwrap();
+
+        // Track both files
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta.update_file(&real_file, vec![1, 2]).unwrap();
+        file_meta
+            .update_file(&ghost_file, vec![3, 4, 5])
+            .unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        // Delete ghost file — simulates branch switch removing it
+        std::fs::remove_file(&ghost_file).unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
+
+        // Verify: ghost is removed, real is preserved
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        let deleted = reloaded.find_deleted_files();
+        assert!(
+            deleted.is_empty(),
+            "Ghost entry should be removed, real should remain. Found deleted: {:?}",
+            deleted
+        );
+
+        // Verify the real file is still tracked by checking it doesn't need reindex
+        let (needs_reindex, _chunk_ids) = reloaded.check_file(&real_file).unwrap();
+        assert!(
+            !needs_reindex,
+            "Real file should still be tracked and up-to-date in FileMetaStore"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_empty_codebase_cleans_all_stale() {
+        // If codebase is empty (all files deleted), ALL tracked entries become ghosts
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        create_metadata_json(&db_path, 4);
+
+        // Create files temporarily to get them tracked
+        let file1 = codebase_path.join("lib.rs");
+        let file2 = codebase_path.join("util.rs");
+        std::fs::write(&file1, "pub fn lib_fn() {}").unwrap();
+        std::fs::write(&file2, "pub fn util_fn() {}").unwrap();
+
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta.update_file(&file1, vec![1, 2, 3]).unwrap();
+        file_meta.update_file(&file2, vec![4, 5]).unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        // Delete ALL files — simulates switching to a branch with no source
+        std::fs::remove_file(&file1).unwrap();
+        std::fs::remove_file(&file2).unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
+
+        // All entries should be cleaned
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        let deleted = reloaded.find_deleted_files();
+        assert!(
+            deleted.is_empty(),
+            "All stale entries should be removed"
+        );
     }
 }

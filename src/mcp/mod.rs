@@ -399,13 +399,26 @@ impl CodesearchService {
         }
 
         // Convert to response format, applying compact mode and filter_path
+        // Pre-compute normalized project root for stripping absolute paths
+        let project_root_normalized = {
+            let root = crate::cache::normalize_path_str(
+                self.project_path.to_str().unwrap_or(""),
+            );
+            root.trim_end_matches('/').to_string()
+        };
+
         let items: Vec<SearchResultItem> = results
             .into_iter()
             .filter(|r| {
                 // Apply filter_path if specified
                 if let Some(ref fp) = request.filter_path {
                     let normalized_path = crate::cache::normalize_path_str(&r.path);
-                    let normalized_path = normalized_path.trim_start_matches("./");
+                    // Strip project root to convert absolute → relative path
+                    let normalized_path = normalized_path
+                        .strip_prefix(&project_root_normalized)
+                        .unwrap_or(&normalized_path)
+                        .trim_start_matches('/')
+                        .trim_start_matches("./");
                     let normalized_filter = crate::cache::normalize_path_str(fp);
                     let normalized_filter = normalized_filter
                         .trim_start_matches("./")
