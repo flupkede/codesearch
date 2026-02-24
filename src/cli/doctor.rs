@@ -352,15 +352,13 @@ fn read_dimensions(db_path: &Path) -> usize {
 
 /// Check 6: Chunk integrity - vector store health
 fn check_chunk_integrity(store: &VectorStore) -> CheckResult {
-    let stats = store
-        .stats()
-        .unwrap_or(crate::vectordb::StoreStats {
-            total_chunks: 0,
-            total_files: 0,
-            indexed: false,
-            dimensions: 0,
-            max_chunk_id: 0,
-        });
+    let stats = store.stats().unwrap_or(crate::vectordb::StoreStats {
+        total_chunks: 0,
+        total_files: 0,
+        indexed: false,
+        dimensions: 0,
+        max_chunk_id: 0,
+    });
     if stats.indexed {
         CheckResult::pass(
             "Chunk integrity",

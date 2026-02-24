@@ -522,6 +522,26 @@ impl VectorStore {
         })
     }
 
+    /// Get all chunks grouped by file path
+    ///
+    /// Returns a map of file_path -> Vec<chunk_id> for every chunk in the store.
+    /// Used by branch refresh to find orphaned chunks not tracked by FileMetaStore.
+    pub fn get_chunks_by_file(&self) -> Result<std::collections::HashMap<String, Vec<u32>>> {
+        let rtxn = self.env.read_txn()?;
+        let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
+            std::collections::HashMap::new();
+
+        for result in self.chunks.iter(&rtxn)? {
+            let (chunk_id, metadata) = result?;
+            file_chunks
+                .entry(metadata.path.clone())
+                .or_default()
+                .push(chunk_id);
+        }
+
+        Ok(file_chunks)
+    }
+
     /// Delete chunks by their IDs
     ///
     /// Returns the number of chunks deleted

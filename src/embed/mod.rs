@@ -269,9 +269,7 @@ impl EmbeddingService {
     #[allow(dead_code)]
     /// Get persistent cache statistics
     pub fn persistent_cache_stats(&self) -> Option<PersistentCacheStats> {
-        self.persistent_cache
-            .as_ref()
-            .and_then(|c| c.stats().ok())
+        self.persistent_cache.as_ref().and_then(|c| c.stats().ok())
     }
     #[allow(dead_code)]
     /// Clear the persistent cache

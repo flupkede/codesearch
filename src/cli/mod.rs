@@ -382,10 +382,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
         Commands::Doctor { fix, json } => crate::cli::doctor::run(fix, json).await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp {
-            path,
-            create_index,
-        } => {
+        Commands::Mcp { path, create_index } => {
             // Logger is initialized inside run_mcp_server() once db_path is known.
             // This handles both the "DB already exists" and "auto-create DB" paths correctly.
             crate::mcp::run_mcp_server(path, create_index, log_level, cli.quiet, cancel_token).await

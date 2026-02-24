@@ -10,9 +10,9 @@ use crate::chunker::SemanticChunker;
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
-use crate::{info_print, warn_print};
 use crate::rerank::{rrf_fusion, vector_only, FusedResult, NeuralReranker, DEFAULT_RRF_K};
 use crate::vectordb::VectorStore;
+use crate::{info_print, warn_print};
 
 /// Configuration options for search operations
 #[derive(Debug, Clone)]
@@ -179,8 +179,6 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
     if !has_identifier {
         return None; // No specific identifier - don't apply kind boost
     }
-
-    
 
     if query_lower.contains("class ") {
         Some(ChunkKind::Class)
@@ -409,12 +407,15 @@ pub fn adapt_rrf_k(query: &str) -> (f64, f64) {
 
 /// Search the codebase
 pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) -> Result<()> {
-    let (db_path, _project_path) = get_db_path(path.clone())?;
+    let (db_path, project_path) = get_db_path(path.clone())?;
 
     if !db_path.exists() {
         if options.create_index {
             // Automatically create index — use print_info which goes to stderr and respects quiet mode
-            crate::output::print_info(format_args!("{}", "🚀 No index found, creating one...".bright_cyan()));
+            crate::output::print_info(format_args!(
+                "{}",
+                "🚀 No index found, creating one...".bright_cyan()
+            ));
             let cancel_token = tokio_util::sync::CancellationToken::new();
             crate::index::index_quiet(path, false, cancel_token).await?;
             crate::output::print_info(format_args!("{}", "✅ Index created successfully!".green()));
@@ -703,6 +704,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             .to_string()
     });
 
+    // Normalize project root for stripping absolute paths to relative
+    let project_root_normalized = {
+        let root = crate::cache::normalize_path_str(project_path.to_str().unwrap_or(""));
+        root.trim_end_matches('/').to_string()
+    };
     // Take top rerank_top results for reranking (or max_results if not reranking)
     // OPTIMIZATION: Take extra results when path filtering is active to ensure we have enough after filtering
     let take_multiplier = if should_filter_by_path { 3 } else { 1 };
@@ -721,8 +727,13 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             if should_filter_by_path {
                 if let Some(ref filter) = filter_path_normalized {
                     let path_normalized = crate::cache::normalize_path_str(&result.path);
-                    let path_normalized = path_normalized.trim_start_matches("./");
-                    if !path_normalized.starts_with(filter) {
+                    // Strip project root to convert absolute → relative path
+                    let path_relative = path_normalized
+                        .strip_prefix(&project_root_normalized)
+                        .unwrap_or(&path_normalized)
+                        .trim_start_matches('/')
+                        .trim_start_matches("./");
+                    if !path_relative.starts_with(filter.as_str()) {
                         continue;
                     }
                 }
@@ -739,8 +750,13 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 if should_filter_by_path {
                     if let Some(ref filter) = filter_path_normalized {
                         let path_normalized = crate::cache::normalize_path_str(&result.path);
-                        let path_normalized = path_normalized.trim_start_matches("./");
-                        if !path_normalized.starts_with(filter) {
+                        // Strip project root to convert absolute → relative path
+                        let path_normalized = path_normalized
+                            .strip_prefix(&project_root_normalized)
+                            .unwrap_or(&path_normalized)
+                            .trim_start_matches('/')
+                            .trim_start_matches("./");
+                        if !path_normalized.starts_with(filter.as_str()) {
                             continue;
                         }
                     }
@@ -855,8 +871,13 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         let filter_normalized = filter_normalized.trim_start_matches("./");
         results.retain(|r| {
             let path_normalized = crate::cache::normalize_path_str(&r.path);
-            let path_normalized = path_normalized.trim_start_matches("./");
-            path_normalized.starts_with(filter_normalized)
+            // Strip project root to convert absolute → relative path
+            let path_relative = path_normalized
+                .strip_prefix(&project_root_normalized)
+                .unwrap_or(&path_normalized)
+                .trim_start_matches('/')
+                .trim_start_matches("./");
+            path_relative.starts_with(filter_normalized)
         });
     }
 
@@ -873,11 +894,23 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 start_line: r.start_line,
                 end_line: r.end_line,
                 kind: r.kind.clone(),
-                content: if compact { None } else { Some(r.content.clone()) },
+                content: if compact {
+                    None
+                } else {
+                    Some(r.content.clone())
+                },
                 score: r.score,
                 signature: r.signature.clone(),
-                context_prev: if compact { None } else { r.context_prev.clone() },
-                context_next: if compact { None } else { r.context_next.clone() },
+                context_prev: if compact {
+                    None
+                } else {
+                    r.context_prev.clone()
+                },
+                context_next: if compact {
+                    None
+                } else {
+                    r.context_next.clone()
+                },
             })
             .collect();
 
@@ -928,7 +961,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     println!("{}", "=".repeat(60));
     println!("Query: \"{}\"", query.bright_yellow());
     if let Some(pf) = options.per_file {
-        println!("Found {} results (showing up to {} per file)", results.len(), pf);
+        println!(
+            "Found {} results (showing up to {} per file)",
+            results.len(),
+            pf
+        );
     } else {
         println!("Found {} results", results.len());
     }
