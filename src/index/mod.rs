@@ -115,7 +115,8 @@ fn get_db_path_smart(
             // Use existing database (local or global)
             if !db_info.is_current {
                 let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let relative_path = if let Ok(rel) = current_dir.strip_prefix(&db_info.project_path) {
+                let relative_path = if let Ok(rel) = current_dir.strip_prefix(&db_info.project_path)
+                {
                     format!("./{}", rel.display())
                 } else {
                     db_info.project_path.display().to_string()

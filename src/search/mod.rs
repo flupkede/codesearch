@@ -10,9 +10,9 @@ use crate::chunker::SemanticChunker;
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
-use crate::{info_print, warn_print};
 use crate::rerank::{rrf_fusion, vector_only, FusedResult, NeuralReranker, DEFAULT_RRF_K};
 use crate::vectordb::VectorStore;
+use crate::{info_print, warn_print};
 
 /// Configuration options for search operations
 #[derive(Debug, Clone)]
@@ -179,8 +179,6 @@ pub fn detect_structural_intent(query: &str) -> Option<crate::chunker::ChunkKind
     if !has_identifier {
         return None; // No specific identifier - don't apply kind boost
     }
-
-    
 
     if query_lower.contains("class ") {
         Some(ChunkKind::Class)
@@ -414,7 +412,10 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     if !db_path.exists() {
         if options.create_index {
             // Automatically create index — use print_info which goes to stderr and respects quiet mode
-            crate::output::print_info(format_args!("{}", "🚀 No index found, creating one...".bright_cyan()));
+            crate::output::print_info(format_args!(
+                "{}",
+                "🚀 No index found, creating one...".bright_cyan()
+            ));
             let cancel_token = tokio_util::sync::CancellationToken::new();
             crate::index::index_quiet(path, false, cancel_token).await?;
             crate::output::print_info(format_args!("{}", "✅ Index created successfully!".green()));
@@ -893,11 +894,23 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 start_line: r.start_line,
                 end_line: r.end_line,
                 kind: r.kind.clone(),
-                content: if compact { None } else { Some(r.content.clone()) },
+                content: if compact {
+                    None
+                } else {
+                    Some(r.content.clone())
+                },
                 score: r.score,
                 signature: r.signature.clone(),
-                context_prev: if compact { None } else { r.context_prev.clone() },
-                context_next: if compact { None } else { r.context_next.clone() },
+                context_prev: if compact {
+                    None
+                } else {
+                    r.context_prev.clone()
+                },
+                context_next: if compact {
+                    None
+                } else {
+                    r.context_next.clone()
+                },
             })
             .collect();
 
@@ -948,7 +961,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     println!("{}", "=".repeat(60));
     println!("Query: \"{}\"", query.bright_yellow());
     if let Some(pf) = options.per_file {
-        println!("Found {} results (showing up to {} per file)", results.len(), pf);
+        println!(
+            "Found {} results (showing up to {} per file)",
+            results.len(),
+            pf
+        );
     } else {
         println!("Found {} results", results.len());
     }

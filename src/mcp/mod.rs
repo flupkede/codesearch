@@ -33,8 +33,7 @@ mod tests {
                 let call_print = trimmed.starts_with("print!(")
                     || line.contains(" print!(")
                     || line.contains("\tprint!(");
-                let is_prefixed =
-                    line.contains("info_print!(") || line.contains("warn_print!(");
+                let is_prefixed = line.contains("info_print!(") || line.contains("warn_print!(");
                 let is_detection_code = line.contains("line.contains(");
                 (call_println || call_print) && !is_prefixed && !is_detection_code
             })
@@ -401,9 +400,7 @@ impl CodesearchService {
         // Convert to response format, applying compact mode and filter_path
         // Pre-compute normalized project root for stripping absolute paths
         let project_root_normalized = {
-            let root = crate::cache::normalize_path_str(
-                self.project_path.to_str().unwrap_or(""),
-            );
+            let root = crate::cache::normalize_path_str(self.project_path.to_str().unwrap_or(""));
             root.trim_end_matches('/').to_string()
         };
 
@@ -444,8 +441,6 @@ impl CodesearchService {
         let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
-
-
 
     #[tool(
         description = "Find all references/usages of a symbol (function, class, method, variable) across the codebase. USE THIS INSTEAD OF GREP when you need to find where a symbol is used — for refactoring, impact analysis, or understanding call sites. Returns compact list of file paths, line numbers, and containing function signatures."
@@ -985,17 +980,17 @@ pub async fn run_mcp_server(
         }
 
         // Create minimal database structure to allow server to start immediately
-        let effective_path = path
-            .as_ref()
-            .cloned()
-            .unwrap_or(std::env::current_dir()?);
+        let effective_path = path.as_ref().cloned().unwrap_or(std::env::current_dir()?);
 
         // Use git root detection to place database in the correct location
-        let db_root = crate::index::find_git_root(&effective_path)?
-            .unwrap_or_else(|| effective_path.clone());
+        let db_root =
+            crate::index::find_git_root(&effective_path)?.unwrap_or_else(|| effective_path.clone());
         let db_path = db_root.join(".codesearch.db");
 
-        tracing::info!("📁 Creating minimal database structure at {}", db_path.display());
+        tracing::info!(
+            "📁 Creating minimal database structure at {}",
+            db_path.display()
+        );
 
         // Create directory
         std::fs::create_dir_all(&db_path)?;
@@ -1052,7 +1047,9 @@ pub async fn run_mcp_server(
         {
             Some(d) => d as usize,
             None => {
-                tracing::warn!("⚠️  Could not parse dimensions from metadata.json, using default 384");
+                tracing::warn!(
+                    "⚠️  Could not parse dimensions from metadata.json, using default 384"
+                );
                 384
             }
         }

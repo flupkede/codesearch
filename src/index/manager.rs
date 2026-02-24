@@ -689,12 +689,8 @@ impl IndexManager {
                             info!("🔀 Git branch changed, triggering full incremental refresh...");
                             // Perform a real incremental refresh: walk filesystem,
                             // detect changed/deleted files, clean stale chunks, re-index
-                            if let Err(e) = Self::refresh_index_with_stores(
-                                &path,
-                                &db_path,
-                                &stores,
-                            )
-                            .await
+                            if let Err(e) =
+                                Self::refresh_index_with_stores(&path, &db_path, &stores).await
                             {
                                 error!("❌ Branch change refresh failed: {}", e);
                             }
@@ -946,6 +942,7 @@ impl IndexManager {
         let start = std::time::Instant::now();
         set_quiet(true);
 
+        let result: Result<()> = async {
         // Phase 1: Discover current files on disk
         let walker = FileWalker::new(codebase_path.to_path_buf());
         let (files, stats) = walker.walk()?;
@@ -959,7 +956,6 @@ impl IndexManager {
         let metadata_path = db_path.join("metadata.json");
         if !metadata_path.exists() {
             info!("⚠️ No metadata.json found, skipping branch refresh");
-            set_quiet(false);
             return Ok(());
         }
         let metadata_str = std::fs::read_to_string(&metadata_path)?;
@@ -969,8 +965,7 @@ impl IndexManager {
             .as_str()
             .unwrap_or("minilm-l6-q");
 
-        let mut file_meta_store =
-            FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
+        let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
 
         // Find files that need re-indexing (new or content changed)
         let mut files_to_reindex: Vec<PathBuf> = Vec::new();
@@ -989,7 +984,6 @@ impl IndexManager {
 
         if files_to_reindex.is_empty() && deleted_files.is_empty() {
             info!("✅ Branch refresh: index is up to date, no changes needed");
-            set_quiet(false);
             return Ok(());
         }
 
@@ -1021,7 +1015,7 @@ impl IndexManager {
         }
 
         // Remove deleted files from FileMetaStore
-        let deleted_count = deleted_files.len();
+        let mut deleted_count = deleted_files.len();
         for (file_path, _chunk_ids) in &deleted_files {
             file_meta_store.remove_file(std::path::Path::new(file_path));
         }
@@ -1030,10 +1024,61 @@ impl IndexManager {
         // index_single_file loads its own fresh copy per file)
         file_meta_store.save(db_path)?;
 
-        // Rebuild vector index after all chunk deletions
+        // Rebuild vector index after FileMetaStore-based deletions
         {
             let mut vstore = stores.vector_store.write().await;
             vstore.build_index()?;
+        }
+
+        // Phase 3.5: VectorStore-direct orphan cleanup
+        // FileMetaStore may not track all ghost chunks (from pre-fix indexing runs).
+        // Directly scan the VectorStore for chunks referencing files not on disk.
+        {
+            let vstore = stores.vector_store.read().await;
+            let vs_file_chunks = vstore.get_chunks_by_file()?;
+            drop(vstore); // Release read lock before potential write
+
+            let mut orphan_chunk_ids: Vec<u32> = Vec::new();
+            let mut orphan_file_count = 0usize;
+
+            for (vs_path, chunk_ids) in &vs_file_chunks {
+                if !std::path::Path::new(vs_path).exists() {
+                    orphan_chunk_ids.extend(chunk_ids);
+                    orphan_file_count += 1;
+                }
+            }
+
+            if !orphan_chunk_ids.is_empty() {
+                info!(
+                    "🧹 Found {} orphan chunks across {} ghost files in VectorStore (not tracked by FileMetaStore)",
+                    orphan_chunk_ids.len(),
+                    orphan_file_count
+                );
+
+                // Delete orphan chunks from VectorStore
+                {
+                    let mut vstore = stores.vector_store.write().await;
+                    vstore.delete_chunks(&orphan_chunk_ids)?;
+                    vstore.build_index()?;
+                }
+
+                // Delete orphan chunks from FtsStore
+                {
+                    let mut fstore = stores.fts_store.write().await;
+                    for &cid in &orphan_chunk_ids {
+                        let _ = fstore.delete_chunk(cid);
+                    }
+                    fstore.commit()?;
+                }
+
+                info!(
+                    "✅ Cleaned {} orphan chunks from {} ghost files in VectorStore",
+                    orphan_chunk_ids.len(),
+                    orphan_file_count
+                );
+
+                deleted_count += orphan_file_count;
+            }
         }
 
         // Phase 4: Re-index changed/new files
@@ -1044,8 +1089,6 @@ impl IndexManager {
             }
         }
 
-        set_quiet(false);
-
         let elapsed = start.elapsed();
         info!(
             "✅ Branch refresh complete: {} re-indexed, {} stale removed in {:.2}s",
@@ -1055,6 +1098,10 @@ impl IndexManager {
         );
 
         Ok(())
+        }
+        .await;
+        set_quiet(false);
+        result
     }
 
     /// Check if initial indexing is needed.
@@ -1330,12 +1377,8 @@ mod tests {
         use crate::vectordb::VectorStore;
 
         SharedStores {
-            vector_store: Arc::new(RwLock::new(
-                VectorStore::new(db_path, dimensions).unwrap(),
-            )),
-            fts_store: Arc::new(RwLock::new(
-                FtsStore::new_with_writer(db_path).unwrap(),
-            )),
+            vector_store: Arc::new(RwLock::new(VectorStore::new(db_path, dimensions).unwrap())),
+            fts_store: Arc::new(RwLock::new(FtsStore::new_with_writer(db_path).unwrap())),
             writer_lock: None,
             readonly: false,
         }
@@ -1353,14 +1396,13 @@ mod tests {
         // Don't create metadata.json
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result = IndexManager::refresh_index_with_stores(
-            &codebase_path,
-            &db_path,
-            &stores,
-        )
-        .await;
+        let result =
+            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
 
-        assert!(result.is_ok(), "Should return Ok when no metadata.json exists");
+        assert!(
+            result.is_ok(),
+            "Should return Ok when no metadata.json exists"
+        );
     }
 
     #[tokio::test]
@@ -1380,9 +1422,7 @@ mod tests {
 
         // Track the ghost file in FileMetaStore
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta
-            .update_file(&ghost_file, vec![100, 101])
-            .unwrap();
+        file_meta.update_file(&ghost_file, vec![100, 101]).unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Now delete the ghost file from disk — simulates branch switch
@@ -1406,12 +1446,8 @@ mod tests {
         let stores = create_test_stores(&db_path, 4).await;
 
         // Run the refresh
-        let result = IndexManager::refresh_index_with_stores(
-            &codebase_path,
-            &db_path,
-            &stores,
-        )
-        .await;
+        let result =
+            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -1466,12 +1502,8 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result = IndexManager::refresh_index_with_stores(
-            &codebase_path,
-            &db_path,
-            &stores,
-        )
-        .await;
+        let result =
+            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -1507,12 +1539,8 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result = IndexManager::refresh_index_with_stores(
-            &codebase_path,
-            &db_path,
-            &stores,
-        )
-        .await;
+        let result =
+            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -1545,9 +1573,7 @@ mod tests {
         // Track both files
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
         file_meta.update_file(&real_file, vec![1, 2]).unwrap();
-        file_meta
-            .update_file(&ghost_file, vec![3, 4, 5])
-            .unwrap();
+        file_meta.update_file(&ghost_file, vec![3, 4, 5]).unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Delete ghost file — simulates branch switch removing it
@@ -1555,12 +1581,8 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result = IndexManager::refresh_index_with_stores(
-            &codebase_path,
-            &db_path,
-            &stores,
-        )
-        .await;
+        let result =
+            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -1609,21 +1631,14 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result = IndexManager::refresh_index_with_stores(
-            &codebase_path,
-            &db_path,
-            &stores,
-        )
-        .await;
+        let result =
+            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
         // All entries should be cleaned
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
         let deleted = reloaded.find_deleted_files();
-        assert!(
-            deleted.is_empty(),
-            "All stale entries should be removed"
-        );
+        assert!(deleted.is_empty(), "All stale entries should be removed");
     }
 }

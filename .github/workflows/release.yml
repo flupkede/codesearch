@@ -14,7 +14,7 @@ on:
         description: 'Include macOS build (10x minutes cost)'
         required: false
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
@@ -80,7 +80,7 @@ jobs:
           path: ${{ matrix.artifact }}
 
   build-macos:
-    if: github.event_name == 'workflow_dispatch' && inputs.include_macos
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.include_macos)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
