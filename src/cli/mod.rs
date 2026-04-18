@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{builder::BoolishValueParser, ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -138,7 +138,15 @@ pub enum Commands {
         filter_path: Option<String>,
 
         /// Automatically create index if it doesn't exist (default: true)
-        #[arg(long, default_value = "true")]
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            value_parser = BoolishValueParser::new(),
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
         create_index: bool,
     },
 
@@ -182,7 +190,16 @@ pub enum Commands {
         path: Option<PathBuf>,
 
         /// Automatically create index if it doesn't exist (default: true)
-        #[arg(short = 'c', long, default_value = "true")]
+        #[arg(
+            short = 'c',
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            value_parser = BoolishValueParser::new(),
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
         create_index: bool,
     },
 
@@ -226,7 +243,16 @@ pub enum Commands {
         path: Option<PathBuf>,
 
         /// Automatically create index if it doesn't exist (default: true)
-        #[arg(short = 'c', long, default_value = "true")]
+        #[arg(
+            short = 'c',
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            value_parser = BoolishValueParser::new(),
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
         create_index: bool,
     },
 
@@ -554,3 +580,37 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
 
 mod doctor;
 mod setup;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mcp_create_index_defaults_to_true() {
+        let cli = Cli::try_parse_from(["codesearch", "mcp"]).expect("cli parse should succeed");
+        match cli.command {
+            Commands::Mcp { create_index, .. } => assert!(create_index),
+            _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_create_index_false_via_equals() {
+        let cli = Cli::try_parse_from(["codesearch", "mcp", "--create-index=false"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Mcp { create_index, .. } => assert!(!create_index),
+            _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_create_index_true_via_flag() {
+        let cli = Cli::try_parse_from(["codesearch", "mcp", "--create-index"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Mcp { create_index, .. } => assert!(create_index),
+            _ => panic!("expected Mcp command"),
+        }
+    }
+}

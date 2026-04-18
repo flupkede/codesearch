@@ -24,6 +24,68 @@ pub fn normalize_path_str(path: &str) -> String {
     path.trim_start_matches(r"\\?\").replace('\\', "/")
 }
 
+/// Normalize a filter path for prefix matching.
+///
+/// - Converts backslashes to forward slashes
+/// - Removes leading `./`
+/// - Removes trailing `/`
+pub fn normalize_filter_path(filter: &str) -> String {
+    normalize_path_str(filter)
+        .trim_start_matches("./")
+        .to_string()
+}
+
+/// Normalize a path and convert it to a project-relative path when possible.
+///
+/// `project_root_normalized` should be pre-normalized with `normalize_path_str`
+/// (to avoid re-normalizing the same root in hot loops).
+pub fn normalize_path_relative(path: &str, project_root_normalized: &str) -> String {
+    let normalized_path = normalize_path_str(path);
+    let project_root = project_root_normalized.trim_end_matches('/');
+
+    let (relative, stripped_project_root) = if project_root.is_empty() {
+        (normalized_path.as_str(), false)
+    } else if let Some(stripped) = normalized_path.strip_prefix(project_root) {
+        (stripped, true)
+    } else {
+        (normalized_path.as_str(), false)
+    };
+
+    if stripped_project_root {
+        relative
+            .trim_start_matches('/')
+            .trim_start_matches("./")
+            .to_string()
+    } else {
+        relative.trim_start_matches("./").to_string()
+    }
+}
+
+/// Check whether a path matches a normalized filter prefix.
+///
+/// `project_root_normalized` should be pre-normalized with `normalize_path_str`.
+pub fn path_matches_filter(
+    path: &str,
+    filter_normalized: &str,
+    project_root_normalized: &str,
+) -> bool {
+    let path_relative = normalize_path_relative(path, project_root_normalized);
+    let filter = filter_normalized.trim_end_matches('/');
+
+    if filter.is_empty() {
+        return true;
+    }
+
+    if path_relative == filter {
+        return true;
+    }
+
+    let mut prefix = String::with_capacity(filter.len() + 1);
+    prefix.push_str(filter);
+    prefix.push('/');
+    path_relative.starts_with(&prefix)
+}
+
 /// Metadata for a single indexed file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMeta {
@@ -511,5 +573,63 @@ mod tests {
         let from_path = normalize_path(Path::new(input));
         let from_str = normalize_path_str(input);
         assert_eq!(from_path, from_str);
+    }
+
+    #[test]
+    fn test_normalize_path_relative_strips_project_root() {
+        let root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
+        let relative = normalize_path_relative(r"\\?\C:\WorkArea\AI\codesearch\src\main.rs", &root);
+        assert_eq!(relative, "src/main.rs");
+    }
+
+    #[test]
+    fn test_normalize_path_relative_keeps_path_when_root_not_matching() {
+        let root = normalize_path_str("/repo");
+        let relative = normalize_path_relative("/other/place/src/main.rs", &root);
+        assert_eq!(relative, "/other/place/src/main.rs");
+    }
+
+    #[test]
+    fn test_normalize_path_relative_trims_dot_slash_for_relative_input() {
+        let root = normalize_path_str("C:/WorkArea/AI/codesearch");
+        let relative = normalize_path_relative("./src/lib.rs", &root);
+        assert_eq!(relative, "src/lib.rs");
+    }
+
+    #[test]
+    fn test_normalize_filter_path_trims_prefix_and_suffix() {
+        assert_eq!(normalize_filter_path("./src/"), "src/");
+    }
+
+    #[test]
+    fn test_path_matches_filter_with_absolute_windows_path() {
+        let root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
+        let filter = normalize_filter_path("src/");
+        assert!(path_matches_filter(
+            r"\\?\C:\WorkArea\AI\codesearch\src\main.rs",
+            &filter,
+            &root,
+        ));
+    }
+
+    #[test]
+    fn test_path_matches_filter_with_non_matching_prefix() {
+        let root = normalize_path_str("/repo");
+        let filter = normalize_filter_path("src/");
+        assert!(!path_matches_filter("/repo/tests/main.rs", &filter, &root));
+    }
+
+    #[test]
+    fn test_path_matches_filter_does_not_match_partial_directory_name() {
+        let root = normalize_path_str("/repo");
+        let filter = normalize_filter_path("src/");
+        assert!(!path_matches_filter("/repo/src2/main.rs", &filter, &root));
+    }
+
+    #[test]
+    fn test_path_matches_filter_matches_exact_directory_name() {
+        let root = normalize_path_str("/repo");
+        let filter = normalize_filter_path("src");
+        assert!(path_matches_filter("/repo/src/main.rs", &filter, &root));
     }
 }
