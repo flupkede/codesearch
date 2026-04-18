@@ -185,37 +185,14 @@ pub(crate) fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
 
             // Check if it's a git worktree file or a directory
             if git_path.is_file() {
-                // Git worktree: read the gitdir: reference
-                let content = std::fs::read_to_string(&git_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read worktree git file: {}", e))?;
-
-                // Parse "gitdir: <path>" or direct path
-                let gitdir_line = content
-                    .lines()
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Empty worktree git file"))?;
-
-                let gitdir_path = if gitdir_line.starts_with("gitdir: ") {
-                    gitdir_line
-                        .strip_prefix("gitdir: ")
-                        .ok_or_else(|| anyhow::anyhow!("Invalid gitdir format"))?
-                } else {
-                    gitdir_line
-                };
-
-                // Resolve relative path (relative to the directory containing the .git file, not .git itself)
-                let parent_dir = git_path
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("No parent directory for .git file"))?;
-
-                let absolute_gitdir = parent_dir.join(gitdir_path.trim());
-
-                // Extract the repo root (parent of .git directory)
-                let repo_root = absolute_gitdir
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("No parent directory for .git directory"))?;
-
-                return Ok(Some(repo_root.to_path_buf()));
+                // Git worktree: the .git file points into the main repo's
+                // .git/worktrees/<n> directory, but the worktree checkout
+                // is its own independent working tree and deserves its own
+                // codesearch index.  Return the directory that contains the
+                // .git file (i.e. the worktree root) as the project root so
+                // codesearch never confuses it with the main repo or resolves
+                // to .git/worktrees (the old, buggy behaviour).
+                return Ok(Some(current.to_path_buf()));
             } else {
                 // Normal git repository - return immediately
                 return Ok(Some(current.to_path_buf()));
