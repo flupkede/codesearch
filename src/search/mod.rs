@@ -698,11 +698,10 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // OPTIMIZATION: Apply path filter BEFORE expensive operations (reranking, boosting)
     // This avoids processing results that will be filtered out anyway
     let should_filter_by_path = options.filter_path.is_some();
-    let filter_path_normalized = options.filter_path.as_ref().map(|f| {
-        crate::cache::normalize_path_str(f)
-            .trim_start_matches("./")
-            .to_string()
-    });
+    let filter_path_normalized = options
+        .filter_path
+        .as_ref()
+        .map(|f| crate::cache::normalize_filter_path(f));
 
     // Normalize project root for stripping absolute paths to relative
     let project_root_normalized = {
@@ -726,14 +725,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             // OPTIMIZATION: Skip early if path filter doesn't match
             if should_filter_by_path {
                 if let Some(ref filter) = filter_path_normalized {
-                    let path_normalized = crate::cache::normalize_path_str(&result.path);
-                    // Strip project root to convert absolute → relative path
-                    let path_relative = path_normalized
-                        .strip_prefix(&project_root_normalized)
-                        .unwrap_or(&path_normalized)
-                        .trim_start_matches('/')
-                        .trim_start_matches("./");
-                    if !path_relative.starts_with(filter.as_str()) {
+                    if !crate::cache::path_matches_filter(
+                        &result.path,
+                        filter,
+                        &project_root_normalized,
+                    ) {
                         continue;
                     }
                 }
@@ -749,14 +745,11 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 // OPTIMIZATION: Skip early if path filter doesn't match
                 if should_filter_by_path {
                     if let Some(ref filter) = filter_path_normalized {
-                        let path_normalized = crate::cache::normalize_path_str(&result.path);
-                        // Strip project root to convert absolute → relative path
-                        let path_normalized = path_normalized
-                            .strip_prefix(&project_root_normalized)
-                            .unwrap_or(&path_normalized)
-                            .trim_start_matches('/')
-                            .trim_start_matches("./");
-                        if !path_normalized.starts_with(filter.as_str()) {
+                        if !crate::cache::path_matches_filter(
+                            &result.path,
+                            filter,
+                            &project_root_normalized,
+                        ) {
                             continue;
                         }
                     }
@@ -866,18 +859,9 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     }
 
     // Filter by path if specified (post-reranking pass)
-    if let Some(ref filter) = options.filter_path {
-        let filter_normalized = crate::cache::normalize_path_str(filter);
-        let filter_normalized = filter_normalized.trim_start_matches("./");
+    if let Some(ref filter) = filter_path_normalized {
         results.retain(|r| {
-            let path_normalized = crate::cache::normalize_path_str(&r.path);
-            // Strip project root to convert absolute → relative path
-            let path_relative = path_normalized
-                .strip_prefix(&project_root_normalized)
-                .unwrap_or(&path_normalized)
-                .trim_start_matches('/')
-                .trim_start_matches("./");
-            path_relative.starts_with(filter_normalized)
+            crate::cache::path_matches_filter(&r.path, filter, &project_root_normalized)
         });
     }
 
@@ -1227,6 +1211,7 @@ fn print_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{normalize_filter_path, normalize_path_str, path_matches_filter};
     use crate::chunker::ChunkKind;
 
     // ── detect_identifiers ───────────────────────────────────────────────────
@@ -1449,5 +1434,34 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    #[test]
+    fn test_path_filter_matches_absolute_windows_path_under_root() {
+        let project_root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
+        let filter = normalize_filter_path("src/");
+        assert!(path_matches_filter(
+            r"\\?\C:\WorkArea\AI\codesearch\src\index\mod.rs",
+            &filter,
+            &project_root,
+        ));
+    }
+
+    #[test]
+    fn test_path_filter_rejects_non_matching_absolute_path_under_root() {
+        let project_root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
+        let filter = normalize_filter_path("src/");
+        assert!(!path_matches_filter(
+            r"C:\WorkArea\AI\codesearch\tests\index_test.rs",
+            &filter,
+            &project_root,
+        ));
+    }
+
+    #[test]
+    fn test_path_filter_matches_relative_dot_slash_input() {
+        let project_root = normalize_path_str("C:/WorkArea/AI/codesearch");
+        let filter = normalize_filter_path("src/");
+        assert!(path_matches_filter("./src/lib.rs", &filter, &project_root));
     }
 }

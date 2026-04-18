@@ -943,161 +943,162 @@ impl IndexManager {
         set_quiet(true);
 
         let result: Result<()> = async {
-        // Phase 1: Discover current files on disk
-        let walker = FileWalker::new(codebase_path.to_path_buf());
-        let (files, stats) = walker.walk()?;
-        info!(
-            "🔍 Branch refresh: discovered {} indexable files ({} skipped)",
-            files.len(),
-            stats.total_files - stats.indexable_files
-        );
+            // Phase 1: Discover current files on disk
+            let walker = FileWalker::new(codebase_path.to_path_buf());
+            let (files, stats) = walker.walk()?;
+            info!(
+                "🔍 Branch refresh: discovered {} indexable files ({} skipped)",
+                files.len(),
+                stats.total_files - stats.indexable_files
+            );
 
-        // Phase 2: Load file metadata and analyze changes
-        let metadata_path = db_path.join("metadata.json");
-        if !metadata_path.exists() {
-            info!("⚠️ No metadata.json found, skipping branch refresh");
-            return Ok(());
-        }
-        let metadata_str = std::fs::read_to_string(&metadata_path)?;
-        let metadata: serde_json::Value = serde_json::from_str(&metadata_str)?;
-        let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-        let model_name = metadata["model_short_name"]
-            .as_str()
-            .unwrap_or("minilm-l6-q");
-
-        let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
-
-        // Find files that need re-indexing (new or content changed)
-        let mut files_to_reindex: Vec<PathBuf> = Vec::new();
-        let mut chunks_to_delete: Vec<u32> = Vec::new();
-
-        for file_info in &files {
-            let (needs_reindex, old_chunk_ids) = file_meta_store.check_file(&file_info.path)?;
-            if needs_reindex {
-                chunks_to_delete.extend(old_chunk_ids);
-                files_to_reindex.push(file_info.path.clone());
+            // Phase 2: Load file metadata and analyze changes
+            let metadata_path = db_path.join("metadata.json");
+            if !metadata_path.exists() {
+                info!("⚠️ No metadata.json found, skipping branch refresh");
+                return Ok(());
             }
-        }
+            let metadata_str = std::fs::read_to_string(&metadata_path)?;
+            let metadata: serde_json::Value = serde_json::from_str(&metadata_str)?;
+            let dimensions = metadata["dimensions"].as_u64().unwrap_or(384) as usize;
+            let model_name = metadata["model_short_name"]
+                .as_str()
+                .unwrap_or("minilm-l6-q");
 
-        // Find files that were deleted (tracked in metadata but not on disk)
-        let deleted_files = file_meta_store.find_deleted_files();
+            let mut file_meta_store =
+                FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
 
-        if files_to_reindex.is_empty() && deleted_files.is_empty() {
-            info!("✅ Branch refresh: index is up to date, no changes needed");
-            return Ok(());
-        }
+            // Find files that need re-indexing (new or content changed)
+            let mut files_to_reindex: Vec<PathBuf> = Vec::new();
+            let mut chunks_to_delete: Vec<u32> = Vec::new();
 
-        info!(
-            "🔍 Branch refresh analysis: {} to re-index, {} stale to remove, {} old chunks to clean",
-            files_to_reindex.len(),
-            deleted_files.len(),
-            chunks_to_delete.len()
-        );
-
-        // Phase 3: Collect ALL chunk IDs to delete (changed + deleted files)
-        for (_file_path, chunk_ids) in &deleted_files {
-            chunks_to_delete.extend(chunk_ids);
-        }
-
-        // Batch-delete all stale chunks from both stores
-        if !chunks_to_delete.is_empty() {
-            {
-                let mut vstore = stores.vector_store.write().await;
-                vstore.delete_chunks(&chunks_to_delete)?;
-            }
-            {
-                let mut fstore = stores.fts_store.write().await;
-                for &chunk_id in &chunks_to_delete {
-                    fstore.delete_chunk(chunk_id)?;
-                }
-                fstore.commit()?;
-            }
-        }
-
-        // Remove deleted files from FileMetaStore
-        let mut deleted_count = deleted_files.len();
-        for (file_path, _chunk_ids) in &deleted_files {
-            file_meta_store.remove_file(std::path::Path::new(file_path));
-        }
-
-        // Save metadata after deletions (before re-indexing, since
-        // index_single_file loads its own fresh copy per file)
-        file_meta_store.save(db_path)?;
-
-        // Rebuild vector index after FileMetaStore-based deletions
-        {
-            let mut vstore = stores.vector_store.write().await;
-            vstore.build_index()?;
-        }
-
-        // Phase 3.5: VectorStore-direct orphan cleanup
-        // FileMetaStore may not track all ghost chunks (from pre-fix indexing runs).
-        // Directly scan the VectorStore for chunks referencing files not on disk.
-        {
-            let vstore = stores.vector_store.read().await;
-            let vs_file_chunks = vstore.get_chunks_by_file()?;
-            drop(vstore); // Release read lock before potential write
-
-            let mut orphan_chunk_ids: Vec<u32> = Vec::new();
-            let mut orphan_file_count = 0usize;
-
-            for (vs_path, chunk_ids) in &vs_file_chunks {
-                if !std::path::Path::new(vs_path).exists() {
-                    orphan_chunk_ids.extend(chunk_ids);
-                    orphan_file_count += 1;
+            for file_info in &files {
+                let (needs_reindex, old_chunk_ids) = file_meta_store.check_file(&file_info.path)?;
+                if needs_reindex {
+                    chunks_to_delete.extend(old_chunk_ids);
+                    files_to_reindex.push(file_info.path.clone());
                 }
             }
 
-            if !orphan_chunk_ids.is_empty() {
-                info!(
-                    "🧹 Found {} orphan chunks across {} ghost files in VectorStore (not tracked by FileMetaStore)",
-                    orphan_chunk_ids.len(),
-                    orphan_file_count
-                );
+            // Find files that were deleted (tracked in metadata but not on disk)
+            let deleted_files = file_meta_store.find_deleted_files();
 
-                // Delete orphan chunks from VectorStore
+            if files_to_reindex.is_empty() && deleted_files.is_empty() {
+                info!("✅ Branch refresh: index is up to date, no changes needed");
+                return Ok(());
+            }
+
+            info!(
+                "🔍 Branch refresh analysis: {} to re-index, {} stale to remove, {} old chunks to clean",
+                files_to_reindex.len(),
+                deleted_files.len(),
+                chunks_to_delete.len()
+            );
+
+            // Phase 3: Collect ALL chunk IDs to delete (changed + deleted files)
+            for (_file_path, chunk_ids) in &deleted_files {
+                chunks_to_delete.extend(chunk_ids);
+            }
+
+            // Batch-delete all stale chunks from both stores
+            if !chunks_to_delete.is_empty() {
                 {
                     let mut vstore = stores.vector_store.write().await;
-                    vstore.delete_chunks(&orphan_chunk_ids)?;
-                    vstore.build_index()?;
+                    vstore.delete_chunks(&chunks_to_delete)?;
                 }
-
-                // Delete orphan chunks from FtsStore
                 {
                     let mut fstore = stores.fts_store.write().await;
-                    for &cid in &orphan_chunk_ids {
-                        let _ = fstore.delete_chunk(cid);
+                    for &chunk_id in &chunks_to_delete {
+                        fstore.delete_chunk(chunk_id)?;
                     }
                     fstore.commit()?;
                 }
-
-                info!(
-                    "✅ Cleaned {} orphan chunks from {} ghost files in VectorStore",
-                    orphan_chunk_ids.len(),
-                    orphan_file_count
-                );
-
-                deleted_count += orphan_file_count;
             }
-        }
 
-        // Phase 4: Re-index changed/new files
-        let reindex_count = files_to_reindex.len();
-        for file_path in &files_to_reindex {
-            if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
-                warn!("⚠️  Failed to re-index {}: {}", file_path.display(), e);
+            // Remove deleted files from FileMetaStore
+            let mut deleted_count = deleted_files.len();
+            for (file_path, _chunk_ids) in &deleted_files {
+                file_meta_store.remove_file(std::path::Path::new(file_path));
             }
-        }
 
-        let elapsed = start.elapsed();
-        info!(
-            "✅ Branch refresh complete: {} re-indexed, {} stale removed in {:.2}s",
-            reindex_count,
-            deleted_count,
-            elapsed.as_secs_f64()
-        );
+            // Save metadata after deletions (before re-indexing, since
+            // index_single_file loads its own fresh copy per file)
+            file_meta_store.save(db_path)?;
 
-        Ok(())
+            // Rebuild vector index after FileMetaStore-based deletions
+            {
+                let mut vstore = stores.vector_store.write().await;
+                vstore.build_index()?;
+            }
+
+            // Phase 3.5: VectorStore-direct orphan cleanup
+            // FileMetaStore may not track all ghost chunks (from pre-fix indexing runs).
+            // Directly scan the VectorStore for chunks referencing files not on disk.
+            {
+                let vstore = stores.vector_store.read().await;
+                let vs_file_chunks = vstore.get_chunks_by_file()?;
+                drop(vstore); // Release read lock before potential write
+
+                let mut orphan_chunk_ids: Vec<u32> = Vec::new();
+                let mut orphan_file_count = 0usize;
+
+                for (vs_path, chunk_ids) in &vs_file_chunks {
+                    if !std::path::Path::new(vs_path).exists() {
+                        orphan_chunk_ids.extend(chunk_ids);
+                        orphan_file_count += 1;
+                    }
+                }
+
+                if !orphan_chunk_ids.is_empty() {
+                    info!(
+                        "🧹 Found {} orphan chunks across {} ghost files in VectorStore (not tracked by FileMetaStore)",
+                        orphan_chunk_ids.len(),
+                        orphan_file_count
+                    );
+
+                    // Delete orphan chunks from VectorStore
+                    {
+                        let mut vstore = stores.vector_store.write().await;
+                        vstore.delete_chunks(&orphan_chunk_ids)?;
+                        vstore.build_index()?;
+                    }
+
+                    // Delete orphan chunks from FtsStore
+                    {
+                        let mut fstore = stores.fts_store.write().await;
+                        for &cid in &orphan_chunk_ids {
+                            let _ = fstore.delete_chunk(cid);
+                        }
+                        fstore.commit()?;
+                    }
+
+                    info!(
+                        "✅ Cleaned {} orphan chunks from {} ghost files in VectorStore",
+                        orphan_chunk_ids.len(),
+                        orphan_file_count
+                    );
+
+                    deleted_count += orphan_file_count;
+                }
+            }
+
+            // Phase 4: Re-index changed/new files
+            let reindex_count = files_to_reindex.len();
+            for file_path in &files_to_reindex {
+                if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
+                    warn!("⚠️  Failed to re-index {}: {}", file_path.display(), e);
+                }
+            }
+
+            let elapsed = start.elapsed();
+            info!(
+                "✅ Branch refresh complete: {} re-indexed, {} stale removed in {:.2}s",
+                reindex_count,
+                deleted_count,
+                elapsed.as_secs_f64()
+            );
+
+            Ok(())
         }
         .await;
         set_quiet(false);
