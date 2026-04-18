@@ -12,6 +12,8 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::cache::{normalize_filter_path, normalize_path_str, path_matches_filter};
+
     #[test]
     fn test_mcp_no_raw_stdout_calls() {
         // Verify that no raw print!/println! calls exist in the MCP module sources.
@@ -48,6 +50,28 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    #[test]
+    fn test_mcp_filter_matches_absolute_path_under_project_root() {
+        let project_root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
+        let filter = normalize_filter_path("src/");
+        assert!(path_matches_filter(
+            r"\\?\C:\WorkArea\AI\codesearch\src\mcp\mod.rs",
+            &filter,
+            &project_root,
+        ));
+    }
+
+    #[test]
+    fn test_mcp_filter_rejects_non_matching_path_under_project_root() {
+        let project_root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
+        let filter = normalize_filter_path("src/");
+        assert!(!path_matches_filter(
+            r"C:\WorkArea\AI\codesearch\README.md",
+            &filter,
+            &project_root,
+        ));
     }
 }
 
@@ -409,18 +433,12 @@ impl CodesearchService {
             .filter(|r| {
                 // Apply filter_path if specified
                 if let Some(ref fp) = request.filter_path {
-                    let normalized_path = crate::cache::normalize_path_str(&r.path);
-                    // Strip project root to convert absolute → relative path
-                    let normalized_path = normalized_path
-                        .strip_prefix(&project_root_normalized)
-                        .unwrap_or(&normalized_path)
-                        .trim_start_matches('/')
-                        .trim_start_matches("./");
-                    let normalized_filter = crate::cache::normalize_path_str(fp);
-                    let normalized_filter = normalized_filter
-                        .trim_start_matches("./")
-                        .trim_end_matches('/');
-                    normalized_path.starts_with(normalized_filter)
+                    let normalized_filter = crate::cache::normalize_filter_path(fp);
+                    crate::cache::path_matches_filter(
+                        &r.path,
+                        &normalized_filter,
+                        &project_root_normalized,
+                    )
                 } else {
                     true
                 }
