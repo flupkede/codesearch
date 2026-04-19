@@ -3,7 +3,7 @@
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Request for semantic search
+/// Request for semantic/hybrid search
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SemanticSearchRequest {
     /// The search query (natural language or code snippet)
@@ -20,6 +20,13 @@ pub struct SemanticSearchRequest {
 
     /// Only return results from files under this path prefix (e.g., "src/api/")
     pub filter_path: Option<String>,
+
+    /// Override auto-detection of query intent.
+    /// "auto" (default) | "semantic" | "lexical" | "hybrid"
+    /// - "semantic": skip FTS fusion, use vector results only
+    /// - "lexical":  skip embedding, use FTS path only
+    /// - "hybrid":   force full hybrid even if auto would choose a single path
+    pub mode: Option<String>,
 }
 
 /// Request to find references/call sites of a symbol.
@@ -99,10 +106,98 @@ pub struct DatabaseInfoResponse {
     pub model: String,
 }
 
+/// Request for literal/FTS-only search.
+///
+/// Three mutually exclusive modes (first match wins):
+/// - `regex=true` → regex search on indexed content
+/// - `phrase=true` → phrase query (tokens must appear in sequence)
+/// - default → exact term search (BM25)
+///
+/// No embedding service is used — this tool is fast and works without a model.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LiteralSearchRequest {
+    /// The search query (exact terms, regex pattern, or phrase depending on mode flags)
+    pub query: String,
+
+    /// Treat `query` as a regex pattern (e.g., "fn \\w+_handler")
+    pub regex: Option<bool>,
+
+    /// Treat `query` as a phrase (tokens must appear in sequence, e.g., "fn new")
+    pub phrase: Option<bool>,
+
+    /// Maximum number of results to return (default: 20)
+    pub limit: Option<usize>,
+
+    /// Only return results from files matching this glob pattern.
+    /// v1 supports prefix/suffix patterns with `*` and `**` (e.g., "src/mcp/**", "**/*.rs")
+    pub file_glob: Option<String>,
+
+    /// Only return results from files of this language (e.g., "Rust", "Python", "TypeScript")
+    pub language: Option<String>,
+
+    /// Output format: "json" (structured) or "grep" (file:line:snippet). Default: "json"
+    pub format: Option<String>,
+}
+
+/// Search result item - returned by literal_search
+#[derive(Debug, Serialize)]
+pub struct LiteralSearchResultItem {
+    /// File path (relative to project root)
+    pub path: String,
+    /// Start line number
+    pub start_line: usize,
+    /// End line number
+    pub end_line: usize,
+    /// Code snippet (content of the matching chunk)
+    pub snippet: String,
+    /// BM25 relevance score
+    pub score: f32,
+    /// Kind of chunk (e.g., "function", "struct", "class")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Signature (e.g., function signature) if available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
 /// Find databases response
 #[derive(Debug, Serialize)]
 pub struct FindDatabasesResponse {
     pub databases: Vec<DatabaseInfoResponse>,
     pub message: String,
     pub current_directory: String,
+}
+
+/// Semantic search response wrapper with low-confidence signaling
+#[derive(Debug, Serialize)]
+pub struct SemanticSearchResponse {
+    /// Search results
+    pub results: Vec<SearchResultItem>,
+    /// Set when the top RRF score is below the confidence threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_confidence: Option<bool>,
+    /// Populated alongside `low_confidence`. Suggests a better-suited tool for this query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_tool: Option<String>,
+}
+
+/// Request to find the definition of a symbol
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindDefinitionRequest {
+    /// Symbol name (function, class, method, struct, trait, enum, type)
+    pub symbol: String,
+    /// Optional filter to a specific kind. If omitted, all definition kinds are searched.
+    /// Accepted: "Function" | "Class" | "Method" | "Struct" | "Trait" | "Enum" | "TypeAlias" | "Interface"
+    pub kind: Option<String>,
+    /// Maximum number of results to return (default: 20)
+    pub limit: Option<usize>,
+}
+
+/// Request to find usages/call-sites of a symbol
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindUsagesRequest {
+    /// Symbol name to find usages for
+    pub symbol: String,
+    /// Maximum number of results to return (default: 20)
+    pub limit: Option<usize>,
 }

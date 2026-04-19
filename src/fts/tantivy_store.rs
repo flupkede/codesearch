@@ -15,7 +15,7 @@ use tantivy::{
     merge_policy::NoMergePolicy,
     query::QueryParser,
     schema::{Field, NumericOptions, Schema, Value, STORED, STRING, TEXT},
-    Index, IndexReader, IndexSettings, IndexWriter, TantivyDocument, Term,
+    DocAddress, Index, IndexReader, IndexSettings, IndexWriter, TantivyDocument, Term,
 };
 
 use crate::chunker::ChunkKind;
@@ -48,6 +48,27 @@ pub struct FtsStore {
 }
 
 impl FtsStore {
+    /// Collect FTS results from top_docs by extracting chunk_id and score.
+    ///
+    /// This helper eliminates the duplicated result-collection loop found in
+    /// `search`, `search_exact`, `search_regex`, and `search_phrase`.
+    fn collect_fts_results(&self, top_docs: Vec<(f32, DocAddress)>) -> Result<Vec<FtsResult>> {
+        let searcher = self.reader.searcher();
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            if let Some(chunk_id) = doc.get_first(self.chunk_id_field) {
+                if let Some(id) = chunk_id.as_u64() {
+                    results.push(FtsResult {
+                        chunk_id: id as u32,
+                        score,
+                    });
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// Create or open an FTS index at the given path.
     ///
     /// Opens in a mode that supports both reading and writing.
@@ -431,22 +452,7 @@ impl FtsStore {
         // Execute search
         let top_docs = searcher.search(&parsed_query, &TopDocs::with_limit(limit))?;
 
-        // Convert to results
-        let mut results = Vec::with_capacity(top_docs.len());
-        for (score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher.doc(doc_address)?;
-
-            if let Some(chunk_id) = doc.get_first(self.chunk_id_field) {
-                if let Some(id) = chunk_id.as_u64() {
-                    results.push(FtsResult {
-                        chunk_id: id as u32,
-                        score,
-                    });
-                }
-            }
-        }
-
-        Ok(results)
+        self.collect_fts_results(top_docs)
     }
 
     /// Search for exact identifier matches (boosted)
@@ -504,22 +510,74 @@ impl FtsStore {
 
         let top_docs = searcher.search(&combined, &TopDocs::with_limit(limit))?;
 
-        // Convert to results
-        let mut results = Vec::with_capacity(top_docs.len());
-        for (score, doc_address) in top_docs {
-            let doc: TantivyDocument = searcher.doc(doc_address)?;
+        self.collect_fts_results(top_docs)
+    }
 
-            if let Some(chunk_id) = doc.get_first(self.chunk_id_field) {
-                if let Some(id) = chunk_id.as_u64() {
-                    results.push(FtsResult {
-                        chunk_id: id as u32,
-                        score,
-                    });
-                }
+    /// Search using a regex pattern against the content field.
+    ///
+    /// Uses Tantivy's `RegexQuery` for efficient regex matching on the indexed content.
+    /// The pattern syntax follows the `regex` crate conventions.
+    pub fn search_regex(&self, pattern: &str, limit: usize) -> Result<Vec<FtsResult>> {
+        use tantivy::query::RegexQuery;
+
+        let searcher = self.reader.searcher();
+
+        let query = RegexQuery::from_pattern(pattern, self.content_field)
+            .map_err(|e| anyhow!("Invalid regex pattern '{}': {}", pattern, e))?;
+
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+
+        self.collect_fts_results(top_docs)
+    }
+
+    /// Search using a phrase query against the content field.
+    ///
+    /// Tokenizes the phrase using the same analyzer as the indexed content field,
+    /// then builds a `PhraseQuery` requiring terms to appear in sequence.
+    /// If the phrase tokenizes to a single term, falls back to `TermQuery`
+    /// (avoids unnecessary position tracking overhead for single-word queries).
+    pub fn search_phrase(&self, phrase: &str, limit: usize) -> Result<Vec<FtsResult>> {
+        use tantivy::query::{PhraseQuery, TermQuery};
+        use tantivy::schema::IndexRecordOption;
+
+        let searcher = self.reader.searcher();
+
+        // Tokenize the phrase using the same analyzer as the indexed content.
+        // The content field uses TEXT which applies the default tokenizer
+        // (lowercase + split on non-alphanumeric).
+        let terms: Vec<Term> = {
+            let mut analyzer = self
+                .index
+                .tokenizer_for_field(self.content_field)
+                .map_err(|e| anyhow!("Failed to get tokenizer for content field: {}", e))?;
+            let mut stream = analyzer.token_stream(phrase);
+            let mut collected = Vec::new();
+            while stream.advance() {
+                let token = stream.token();
+                collected.push(Term::from_field_text(self.content_field, &token.text));
             }
+            collected
+        };
+
+        if terms.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(results)
+        // If the phrase tokenizes to a single term, fall back to TermQuery.
+        // PhraseQuery requires at least 2 terms; using TermQuery for single terms
+        // avoids unnecessary position tracking overhead.
+        let query: Box<dyn tantivy::query::Query> = if terms.len() == 1 {
+            Box::new(TermQuery::new(
+                terms.into_iter().next().unwrap(),
+                IndexRecordOption::WithFreqs,
+            ))
+        } else {
+            Box::new(PhraseQuery::new(terms))
+        };
+
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+
+        self.collect_fts_results(top_docs)
     }
 
     /// Get statistics about the index
@@ -630,6 +688,120 @@ mod tests {
         let results = store.search("test content", 10, None)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk_id, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts_search_regex() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().to_path_buf();
+
+        let mut store = FtsStore::new(&db_path)?;
+
+        store.add_chunk(
+            1,
+            "fn hello_world() { println!(\"Hello!\"); }",
+            "src/main.rs",
+            Some("hello_world"),
+            "function",
+        )?;
+        store.add_chunk(
+            2,
+            "fn handle_request(req: Request) -> Response",
+            "src/handler.rs",
+            Some("handle_request"),
+            "function",
+        )?;
+        store.add_chunk(
+            3,
+            "struct UserConfig { name: String, age: u32 }",
+            "src/config.rs",
+            Some("UserConfig"),
+            "struct",
+        )?;
+        store.commit()?;
+
+        // Note: Tantivy's SimpleTokenizer splits on non-alphanumeric chars (including _),
+        // and lowercases. The content field uses TEXT which applies this tokenizer.
+        // Tokens for chunk 1: ["fn", "hello", "world", "println", "hello"]
+        // Tokens for chunk 2: ["fn", "handle", "request", "req", "request", "response"]
+        // Tokens for chunk 3: ["struct", "userconfig", "name", "string", "age", "u32"]
+
+        // Regex: match the token "hello"
+        let results = store.search_regex("hello", 10)?;
+        assert!(!results.is_empty(), "Expected results for 'hello'");
+        assert!(results.iter().any(|r| r.chunk_id == 1));
+
+        // Regex: match any token starting with "handle"
+        let results = store.search_regex("handle.*", 10)?;
+        assert!(!results.is_empty(), "Expected results for 'handle.*'");
+        assert!(results.iter().any(|r| r.chunk_id == 2));
+
+        // Regex: match any token starting with "user"
+        // "UserConfig" → tokenized to "userconfig"
+        let results = store.search_regex("user.*", 10)?;
+        assert!(!results.is_empty(), "Expected results for 'user.*'");
+        assert!(results.iter().any(|r| r.chunk_id == 3));
+
+        // Regex with no match
+        let results = store.search_regex("nonexistent_xyz_abc", 10)?;
+        assert!(
+            results.is_empty(),
+            "Expected no results for nonexistent pattern"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_fts_search_phrase() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().to_path_buf();
+
+        let mut store = FtsStore::new(&db_path)?;
+
+        store.add_chunk(
+            1,
+            "fn hello_world() { println!(\"Hello!\"); }",
+            "src/main.rs",
+            Some("hello_world"),
+            "function",
+        )?;
+        store.add_chunk(
+            2,
+            "pub async fn process_data(data: Vec<u8>) -> Result<()>",
+            "src/processor.rs",
+            Some("process_data"),
+            "function",
+        )?;
+        store.add_chunk(
+            3,
+            "let hello = world + 1;", // "hello" and "world" but NOT in sequence
+            "src/other.rs",
+            None,
+            "block",
+        )?;
+        store.commit()?;
+
+        // Phrase search: "hello world" should match chunk 1 (tokens in sequence)
+        let results = store.search_phrase("hello world", 10)?;
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.chunk_id == 1));
+
+        // Phrase search: "process data" should match chunk 2
+        let results = store.search_phrase("process data", 10)?;
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.chunk_id == 2));
+
+        // Single term phrase: should still work (falls back to TermQuery)
+        let results = store.search_phrase("hello_world", 10)?;
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.chunk_id == 1));
+
+        // Phrase with no match
+        let results = store.search_phrase("nonexistent phrase xyz", 10)?;
+        assert!(results.is_empty());
 
         Ok(())
     }
