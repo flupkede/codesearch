@@ -303,6 +303,515 @@ mod tests {
         assert!(super::simple_glob_match("src/mcp/**", r"src\mcp\mod.rs"));
         assert!(super::simple_glob_match(r"src\mcp\**", "src/mcp/mod.rs"));
     }
+
+    // === merge_exact_into_fts tests ===
+
+    #[test]
+    fn test_merge_exact_empty_base() {
+        let mut fts: Vec<crate::fts::FtsResult> = vec![];
+        let exact = vec![
+            crate::fts::FtsResult {
+                chunk_id: 1,
+                score: 0.5,
+            },
+            crate::fts::FtsResult {
+                chunk_id: 2,
+                score: 0.3,
+            },
+        ];
+        super::merge_exact_into_fts(&mut fts, exact);
+        assert_eq!(fts.len(), 2);
+        assert_eq!(fts[0].chunk_id, 1);
+        assert_eq!(fts[1].chunk_id, 2);
+    }
+
+    #[test]
+    fn test_merge_exact_dedupe_keeps_max_score() {
+        let mut fts = vec![
+            crate::fts::FtsResult {
+                chunk_id: 1,
+                score: 0.8,
+            },
+            crate::fts::FtsResult {
+                chunk_id: 2,
+                score: 0.3,
+            },
+        ];
+        let exact = vec![
+            crate::fts::FtsResult {
+                chunk_id: 1,
+                score: 0.5,
+            }, // lower score → keep 0.8
+            crate::fts::FtsResult {
+                chunk_id: 2,
+                score: 0.9,
+            }, // higher score → upgrade to 0.9
+        ];
+        super::merge_exact_into_fts(&mut fts, exact);
+        assert_eq!(fts.len(), 2);
+        assert!((fts[0].score - 0.8).abs() < 0.001);
+        assert!((fts[1].score - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_merge_exact_adds_new_chunks() {
+        let mut fts = vec![crate::fts::FtsResult {
+            chunk_id: 1,
+            score: 0.5,
+        }];
+        let exact = vec![
+            crate::fts::FtsResult {
+                chunk_id: 2,
+                score: 0.7,
+            },
+            crate::fts::FtsResult {
+                chunk_id: 3,
+                score: 0.4,
+            },
+        ];
+        super::merge_exact_into_fts(&mut fts, exact);
+        assert_eq!(fts.len(), 3);
+        assert_eq!(fts[1].chunk_id, 2);
+        assert_eq!(fts[2].chunk_id, 3);
+    }
+
+    #[test]
+    fn test_merge_exact_empty_exact() {
+        let mut fts = vec![crate::fts::FtsResult {
+            chunk_id: 1,
+            score: 0.5,
+        }];
+        super::merge_exact_into_fts(&mut fts, vec![]);
+        assert_eq!(fts.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_exact_multiple_hits_same_chunk() {
+        // Multiple exact results for the same chunk should still dedupe
+        let mut fts = vec![];
+        let exact = vec![
+            crate::fts::FtsResult {
+                chunk_id: 1,
+                score: 0.3,
+            },
+            crate::fts::FtsResult {
+                chunk_id: 1,
+                score: 0.7,
+            },
+        ];
+        super::merge_exact_into_fts(&mut fts, exact);
+        assert_eq!(fts.len(), 1);
+        // First is added (0.3), second dedupes and upgrades to 0.7
+        assert!((fts[0].score - 0.7).abs() < 0.001);
+    }
+
+    // === compute_low_confidence tests ===
+
+    #[test]
+    fn test_low_confidence_below_threshold_with_identifiers() {
+        let (lc, tool) = super::compute_low_confidence(Some(0.01), true);
+        assert_eq!(lc, Some(true));
+        assert_eq!(tool.as_deref(), Some("find_definition"));
+    }
+
+    #[test]
+    fn test_low_confidence_below_threshold_without_identifiers() {
+        let (lc, tool) = super::compute_low_confidence(Some(0.01), false);
+        assert_eq!(lc, Some(true));
+        assert_eq!(tool.as_deref(), Some("literal_search"));
+    }
+
+    #[test]
+    fn test_low_confidence_above_threshold() {
+        let (lc, tool) = super::compute_low_confidence(Some(0.5), true);
+        assert_eq!(lc, None);
+        assert_eq!(tool, None);
+    }
+
+    #[test]
+    fn test_low_confidence_exactly_at_threshold() {
+        // Exactly at threshold (0.02) should NOT be low confidence (< not <=)
+        let (lc, tool) =
+            super::compute_low_confidence(Some(super::LOW_CONFIDENCE_THRESHOLD), false);
+        assert_eq!(lc, None);
+        assert_eq!(tool, None);
+    }
+
+    #[test]
+    fn test_low_confidence_no_results() {
+        let (lc, tool) = super::compute_low_confidence(None, false);
+        assert_eq!(lc, Some(true));
+        assert_eq!(tool.as_deref(), Some("literal_search"));
+    }
+
+    #[test]
+    fn test_low_confidence_no_results_with_identifiers() {
+        let (lc, tool) = super::compute_low_confidence(None, true);
+        // Even with identifiers, no results → suggest literal_search
+        assert_eq!(lc, Some(true));
+        assert_eq!(tool.as_deref(), Some("literal_search"));
+    }
+
+    // === Extended is_definition_chunk tests ===
+
+    #[test]
+    fn test_is_definition_chunk_impl_block() {
+        // impl blocks should match
+        assert!(super::is_definition_chunk(
+            "Struct",
+            &Some("impl CodesearchService".to_string()),
+            "CodesearchService"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_const() {
+        assert!(super::is_definition_chunk(
+            "Function",
+            &Some("const MAX_SIZE".to_string()),
+            "MAX_SIZE"
+        ));
+        assert!(super::is_definition_chunk(
+            "Function",
+            &Some("static INSTANCE".to_string()),
+            "INSTANCE"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_type_alias() {
+        assert!(super::is_definition_chunk(
+            "TypeAlias",
+            &Some("type Result".to_string()),
+            "Result"
+        ));
+        assert!(super::is_definition_chunk(
+            "TypeAlias",
+            &Some("pub type Error".to_string()),
+            "Error"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_interface() {
+        assert!(super::is_definition_chunk(
+            "Interface",
+            &Some("interface Searchable".to_string()),
+            "Searchable"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_with_generics() {
+        // fn with generics — symbol is just the name before <
+        assert!(super::is_definition_chunk(
+            "Function",
+            &Some("fn parse<T>".to_string()),
+            "parse"
+        ));
+        assert!(super::is_definition_chunk(
+            "Struct",
+            &Some("struct HashMap<K, V>".to_string()),
+            "HashMap"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_with_colon() {
+        // trait with colon (Rust trait bounds)
+        assert!(super::is_definition_chunk(
+            "Trait",
+            &Some("trait AsRef<T>:".to_string()),
+            "AsRef"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_wrong_symbol() {
+        // Correct prefix but symbol name doesn't follow
+        assert!(!super::is_definition_chunk(
+            "Function",
+            &Some("fn authenticate".to_string()),
+            "authorize" // different symbol
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_symbol_as_prefix_of_other() {
+        // Symbol is a prefix of the actual name — should NOT match
+        assert!(!super::is_definition_chunk(
+            "Function",
+            &Some("fn authenticate_user".to_string()),
+            "authenticate" // missing boundary check
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_method() {
+        assert!(super::is_definition_chunk(
+            "Method",
+            &Some("fn search".to_string()),
+            "search"
+        ));
+        assert!(super::is_definition_chunk(
+            "Method",
+            &Some("pub async fn handle".to_string()),
+            "handle"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_all_kinds() {
+        // Verify all DEFINITION_KINDS are recognized
+        let test_cases = [
+            ("Function", "fn foo(", "foo"),
+            ("Class", "class Bar", "Bar"),
+            ("Method", "fn baz(", "baz"),
+            ("Struct", "struct Qux", "Qux"),
+            ("Trait", "trait Quux", "Quux"),
+            ("Enum", "enum Corge", "Corge"),
+            ("TypeAlias", "type Grault", "Grault"),
+            ("Interface", "interface Garply", "Garply"),
+        ];
+        for (kind, sig, symbol) in &test_cases {
+            assert!(
+                super::is_definition_chunk(kind, &Some(sig.to_string()), symbol),
+                "is_definition_chunk({kind}, {sig}, {symbol}) should be true"
+            );
+        }
+    }
+
+    // === Extended simple_glob_match tests ===
+
+    #[test]
+    fn test_glob_exact_match_no_star() {
+        assert!(super::simple_glob_match("src/main.rs", "src/main.rs"));
+        assert!(!super::simple_glob_match("src/main.rs", "src/other.rs"));
+        assert!(!super::simple_glob_match("src/main.rs", "src/main.rs.bak"));
+    }
+
+    #[test]
+    fn test_glob_double_star_prefix_empty() {
+        // ** at start matches any prefix
+        assert!(super::simple_glob_match("**/test.rs", "test.rs"));
+        assert!(super::simple_glob_match("**/test.rs", "src/test.rs"));
+        assert!(super::simple_glob_match("**/test.rs", "a/b/c/test.rs"));
+    }
+
+    #[test]
+    fn test_glob_double_star_suffix_empty() {
+        // ** at end matches any suffix
+        assert!(super::simple_glob_match("src/**", "src/"));
+        assert!(super::simple_glob_match("src/**", "src/foo"));
+        assert!(super::simple_glob_match("src/**", "src/a/b/c"));
+    }
+
+    #[test]
+    fn test_glob_both_double_stars() {
+        assert!(super::simple_glob_match("**/**", "anything"));
+        assert!(super::simple_glob_match("**/**", "a/b/c"));
+    }
+
+    #[test]
+    fn test_glob_nested_double_star() {
+        // src/**/*.rs — must have src/ prefix and .rs extension
+        assert!(super::simple_glob_match("src/**/*.rs", "src/lib.rs"));
+        assert!(super::simple_glob_match("src/**/*.rs", "src/mcp/mod.rs"));
+        assert!(super::simple_glob_match("src/**/*.rs", "src/a/b/c/d.rs"));
+        assert!(!super::simple_glob_match("src/**/*.rs", "test/lib.rs"));
+        assert!(!super::simple_glob_match("src/**/*.rs", "src/lib.ts"));
+    }
+
+    #[test]
+    fn test_glob_single_star_multiple() {
+        // Multiple single stars in pattern
+        assert!(super::simple_glob_match("test_*.rs", "test_foo.rs"));
+        assert!(!super::simple_glob_match("test_*.rs", "test_foo.ts"));
+    }
+
+    #[test]
+    fn test_glob_single_star_stays_in_segment() {
+        // * should NOT cross /
+        assert!(!super::simple_glob_match("*.rs", "src/main.rs"));
+        assert!(!super::simple_glob_match("src/*.rs", "src/sub/main.rs"));
+    }
+
+    #[test]
+    fn test_glob_empty_pattern() {
+        assert!(super::simple_glob_match("", ""));
+        assert!(!super::simple_glob_match("", "foo.rs"));
+    }
+
+    #[test]
+    fn test_glob_trailing_slash_in_prefix() {
+        // src/mcp/** with trailing slash in path
+        assert!(super::simple_glob_match("src/mcp/**", "src/mcp/mod.rs"));
+    }
+
+    #[test]
+    fn test_glob_double_star_middle() {
+        // Pattern: src/**/test.rs
+        assert!(super::simple_glob_match("src/**/test.rs", "src/test.rs"));
+        assert!(super::simple_glob_match("src/**/test.rs", "src/a/test.rs"));
+        assert!(super::simple_glob_match(
+            "src/**/test.rs",
+            "src/a/b/c/test.rs"
+        ));
+        assert!(!super::simple_glob_match(
+            "src/**/test.rs",
+            "src/a/other.rs"
+        ));
+    }
+
+    // === Serde roundtrip tests for new types ===
+
+    #[test]
+    fn test_literal_search_request_serde_roundtrip() {
+        let json = r#"{"query":"fn authenticate","regex":true,"limit":5,"file_glob":"src/**/*.rs","language":"Rust","format":"grep"}"#;
+        let req: super::LiteralSearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "fn authenticate");
+        assert_eq!(req.regex, Some(true));
+        assert_eq!(req.phrase, None);
+        assert_eq!(req.limit, Some(5));
+        assert_eq!(req.file_glob.as_deref(), Some("src/**/*.rs"));
+        assert_eq!(req.language.as_deref(), Some("Rust"));
+        assert_eq!(req.format.as_deref(), Some("grep"));
+    }
+
+    #[test]
+    fn test_literal_search_request_minimal() {
+        let json = r#"{"query":"hello"}"#;
+        let req: super::LiteralSearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "hello");
+        assert_eq!(req.regex, None);
+        assert_eq!(req.phrase, None);
+        assert_eq!(req.limit, None);
+        assert_eq!(req.file_glob, None);
+        assert_eq!(req.language, None);
+        assert_eq!(req.format, None);
+    }
+
+    #[test]
+    fn test_literal_search_request_phrase_mode() {
+        let json = r#"{"query":"fn new","phrase":true}"#;
+        let req: super::LiteralSearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.phrase, Some(true));
+        assert_eq!(req.regex, None);
+    }
+
+    #[test]
+    fn test_find_definition_request_serde() {
+        let json = r#"{"symbol":"authenticate","kind":"Function","limit":10}"#;
+        let req: super::FindDefinitionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.symbol, "authenticate");
+        assert_eq!(req.kind.as_deref(), Some("Function"));
+        assert_eq!(req.limit, Some(10));
+    }
+
+    #[test]
+    fn test_find_definition_request_minimal() {
+        let json = r#"{"symbol":"User"}"#;
+        let req: super::FindDefinitionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.symbol, "User");
+        assert_eq!(req.kind, None);
+        assert_eq!(req.limit, None);
+    }
+
+    #[test]
+    fn test_find_usages_request_serde() {
+        let json = r#"{"symbol":"authenticate","limit":50}"#;
+        let req: super::FindUsagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.symbol, "authenticate");
+        assert_eq!(req.limit, Some(50));
+    }
+
+    #[test]
+    fn test_find_usages_request_minimal() {
+        let json = r#"{"symbol":"Config"}"#;
+        let req: super::FindUsagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.symbol, "Config");
+        assert_eq!(req.limit, None);
+    }
+
+    #[test]
+    fn test_semantic_search_request_mode_serde() {
+        let json = r#"{"query":"auth handler","mode":"lexical","limit":5}"#;
+        let req: super::SemanticSearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.mode.as_deref(), Some("lexical"));
+        assert_eq!(req.limit, Some(5));
+    }
+
+    // === LiteralSearchResultItem serialization tests ===
+
+    #[test]
+    fn test_literal_search_result_item_serialization() {
+        let item = super::LiteralSearchResultItem {
+            path: "src/main.rs".to_string(),
+            start_line: 10,
+            end_line: 20,
+            snippet: "fn main()".to_string(),
+            score: 0.95,
+            kind: Some("Function".to_string()),
+            signature: Some("fn main()".to_string()),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"kind\":\"Function\""));
+        assert!(json.contains("\"signature\":\"fn main()\""));
+    }
+
+    #[test]
+    fn test_literal_search_result_item_omits_none_fields() {
+        let item = super::LiteralSearchResultItem {
+            path: "src/main.rs".to_string(),
+            start_line: 10,
+            end_line: 20,
+            snippet: "code".to_string(),
+            score: 0.5,
+            kind: None,
+            signature: None,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("kind"));
+        assert!(!json.contains("signature"));
+    }
+
+    // === SemanticSearchResponse serialization tests ===
+
+    #[test]
+    fn test_semantic_search_response_with_results() {
+        let response = super::SemanticSearchResponse {
+            results: vec![super::SearchResultItem {
+                path: "test.rs".to_string(),
+                start_line: 1,
+                end_line: 10,
+                kind: "Function".to_string(),
+                score: 0.8,
+                signature: Some("fn test()".to_string()),
+                content: None,
+                context_prev: None,
+                context_next: None,
+            }],
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"results\""));
+        assert!(!json.contains("low_confidence"));
+        assert!(!json.contains("suggested_tool"));
+    }
+
+    #[test]
+    fn test_semantic_search_response_empty_with_low_confidence() {
+        let response = super::SemanticSearchResponse {
+            results: vec![],
+            low_confidence: Some(true),
+            suggested_tool: Some("find_definition".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"low_confidence\":true"));
+        assert!(json.contains("\"suggested_tool\":\"find_definition\""));
+        assert!(json.contains("\"results\":[]"));
+    }
 }
 
 pub mod types;
@@ -372,6 +881,52 @@ impl std::fmt::Debug for CodesearchService {
 
 // === Simple Glob Matcher ===
 // v1: supports prefix/suffix patterns with `*` and `**` only.
+/// Merge exact FTS results into the main result set, deduplicating by chunk_id
+/// and keeping the max score for duplicates.
+///
+/// This is the pure logic extracted from `semantic_search_lexical` for testability.
+fn merge_exact_into_fts(
+    fts_results: &mut Vec<crate::fts::FtsResult>,
+    exact: Vec<crate::fts::FtsResult>,
+) {
+    let mut positions: std::collections::HashMap<u32, usize> = fts_results
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| (r.chunk_id, idx))
+        .collect();
+
+    for r in exact {
+        if let Some(&existing_idx) = positions.get(&r.chunk_id) {
+            fts_results[existing_idx].score = fts_results[existing_idx].score.max(r.score);
+        } else {
+            positions.insert(r.chunk_id, fts_results.len());
+            fts_results.push(r);
+        }
+    }
+}
+
+/// Compute low-confidence signaling based on the top result's score.
+///
+/// Returns `(low_confidence, suggested_tool)` where both are `None` when
+/// confidence is high (score >= threshold).
+fn compute_low_confidence(
+    top_score: Option<f32>,
+    has_identifiers: bool,
+) -> (Option<bool>, Option<String>) {
+    match top_score {
+        Some(score) if score < LOW_CONFIDENCE_THRESHOLD => {
+            let suggestion = if has_identifiers {
+                "find_definition"
+            } else {
+                "literal_search"
+            };
+            (Some(true), Some(suggestion.to_string()))
+        }
+        Some(_) => (None, None),
+        None => (Some(true), Some("literal_search".to_string())),
+    }
+}
+
 // Full glob syntax deferred to avoid adding new dependencies.
 
 /// Match a file path against a simple glob pattern.
@@ -890,12 +1445,6 @@ impl CodesearchService {
             .unwrap_or_default();
 
         // Also do exact search if identifiers detected
-        let mut exact_positions: std::collections::HashMap<u32, usize> = fts_results
-            .iter()
-            .enumerate()
-            .map(|(idx, result)| (result.chunk_id, idx))
-            .collect();
-
         for ident in identifiers {
             let exact = match self
                 .with_fts_store_read(|fts_store| {
@@ -906,14 +1455,7 @@ impl CodesearchService {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            for r in exact {
-                if let Some(existing_idx) = exact_positions.get(&r.chunk_id).copied() {
-                    fts_results[existing_idx].score = fts_results[existing_idx].score.max(r.score);
-                } else {
-                    exact_positions.insert(r.chunk_id, fts_results.len());
-                    fts_results.push(r);
-                }
-            }
+            merge_exact_into_fts(&mut fts_results, exact);
         }
 
         fts_results.sort_by(|a, b| {
@@ -988,20 +1530,7 @@ impl CodesearchService {
 
         // Check low-confidence: top result's RRF score below threshold
         let top_score = items.first().map(|r| r.score);
-        let (low_confidence, suggested_tool) = if let Some(score) = top_score {
-            if score < LOW_CONFIDENCE_THRESHOLD {
-                let suggestion = if has_identifiers {
-                    "find_definition"
-                } else {
-                    "literal_search"
-                };
-                (Some(true), Some(suggestion.to_string()))
-            } else {
-                (None, None)
-            }
-        } else {
-            (Some(true), Some("literal_search".to_string()))
-        };
+        let (low_confidence, suggested_tool) = compute_low_confidence(top_score, has_identifiers);
 
         let response = SemanticSearchResponse {
             results: items,
