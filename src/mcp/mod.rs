@@ -73,11 +73,193 @@ mod tests {
             &project_root,
         ));
     }
+
+    // === is_definition_chunk tests ===
+
+    #[test]
+    fn test_is_definition_chunk_rust_function() {
+        assert!(super::is_definition_chunk(
+            "Function",
+            &Some("fn authenticate(".to_string()),
+            "authenticate"
+        ));
+        assert!(super::is_definition_chunk(
+            "Function",
+            &Some("pub fn CodesearchService".to_string()),
+            "CodesearchService"
+        ));
+        assert!(super::is_definition_chunk(
+            "Function",
+            &Some("pub async fn handle_request".to_string()),
+            "handle_request"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_rust_struct() {
+        assert!(super::is_definition_chunk(
+            "Struct",
+            &Some("pub struct CodesearchService".to_string()),
+            "CodesearchService"
+        ));
+        assert!(super::is_definition_chunk(
+            "Struct",
+            &Some("struct SearchResult".to_string()),
+            "SearchResult"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_rust_trait() {
+        assert!(super::is_definition_chunk(
+            "Trait",
+            &Some("pub trait Searchable".to_string()),
+            "Searchable"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_rust_enum() {
+        assert!(super::is_definition_chunk(
+            "Enum",
+            &Some("pub enum ModelType".to_string()),
+            "ModelType"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_non_definition_kind() {
+        // A Comment or Import kind should never be treated as a definition
+        assert!(!super::is_definition_chunk(
+            "Comment",
+            &Some("fn authenticate(".to_string()),
+            "authenticate"
+        ));
+        assert!(!super::is_definition_chunk(
+            "Import",
+            &Some("use authenticate".to_string()),
+            "authenticate"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_usage_not_definition() {
+        // A function chunk where the signature mentions the symbol but isn't its definition
+        // should NOT be filtered out
+        assert!(!super::is_definition_chunk(
+            "Function",
+            &Some("fn handle_request".to_string()),
+            "authenticate"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_no_signature() {
+        // No signature = can't determine if it's a definition
+        assert!(!super::is_definition_chunk(
+            "Function",
+            &None,
+            "authenticate"
+        ));
+        assert!(!super::is_definition_chunk(
+            "Function",
+            &Some(String::new()),
+            "authenticate"
+        ));
+    }
+
+    #[test]
+    fn test_is_definition_chunk_python() {
+        assert!(super::is_definition_chunk(
+            "Function",
+            &Some("def authenticate(".to_string()),
+            "authenticate"
+        ));
+        assert!(super::is_definition_chunk(
+            "Class",
+            &Some("class UserService".to_string()),
+            "UserService"
+        ));
+    }
+
+    // === SemanticSearchResponse low-confidence tests ===
+
+    #[test]
+    fn test_low_confidence_response_serialization() {
+        let response = super::SemanticSearchResponse {
+            results: vec![],
+            low_confidence: Some(true),
+            suggested_tool: Some("literal_search".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"low_confidence\":true"));
+        assert!(json.contains("\"suggested_tool\":\"literal_search\""));
+    }
+
+    #[test]
+    fn test_normal_response_omits_confidence_fields() {
+        let response = super::SemanticSearchResponse {
+            results: vec![super::SearchResultItem {
+                path: "test.rs".to_string(),
+                start_line: 1,
+                end_line: 10,
+                kind: "Function".to_string(),
+                score: 0.5,
+                signature: Some("fn test()".to_string()),
+                content: None,
+                context_prev: None,
+                context_next: None,
+            }],
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("low_confidence"));
+        assert!(!json.contains("suggested_tool"));
+    }
+
+    // === Instructions length test ===
+
+    #[test]
+    fn test_instructions_max_50_lines() {
+        // Verify that get_info().instructions string is ≤ 50 lines.
+        // This is a compile-time check via include_str to catch regressions.
+        let src = include_str!("mod.rs");
+        // Extract the instructions string content between the raw string delimiters
+        // The instructions are in get_info() method — we can count lines in the
+        // formatted template. Since we can't easily instantiate the service here,
+        // we check the raw string literal line count.
+        //
+        // Look for the compact routing table format — it should be well under 50 lines.
+        // We verify by checking the instructions block has no more than 50 newlines.
+        let instructions_start = src.find("codesearch — semantic + lexical");
+        assert!(
+            instructions_start.is_some(),
+            "Could not find instructions start marker in mod.rs"
+        );
+        let start = instructions_start.unwrap();
+        let remaining = &src[start..];
+        let instructions_end = remaining.find("\"#,");
+        assert!(
+            instructions_end.is_some(),
+            "Could not find instructions end marker in mod.rs"
+        );
+        let instructions_text = &remaining[..instructions_end.unwrap()];
+
+        let line_count = instructions_text.lines().count();
+        assert!(
+            line_count <= 50,
+            "Instructions block is {} lines, must be ≤ 50 lines.\n\
+             Content:\n{}",
+            line_count,
+            instructions_text
+        );
+    }
 }
 
 pub mod types;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
@@ -93,12 +275,29 @@ use crate::embed::{EmbeddingService, ModelType};
 use crate::file::Language;
 use crate::fts::FtsStore;
 use crate::index::{IndexManager, SharedStores};
-use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, EXACT_MATCH_RRF_K};
+use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_RRF_K};
 use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
 use crate::vectordb::VectorStore;
 
 // Re-export types
 pub use types::*;
+
+/// RRF score threshold below which results are considered low-confidence.
+/// When the top result's RRF score falls below this, the response includes
+/// a `low_confidence` flag and a `suggested_tool` hint.
+const LOW_CONFIDENCE_THRESHOLD: f32 = 0.02;
+
+/// Chunk kinds that represent symbol definitions (not usages/comments/etc.)
+const DEFINITION_KINDS: &[&str] = &[
+    "Function",
+    "Class",
+    "Method",
+    "Struct",
+    "Trait",
+    "Enum",
+    "TypeAlias",
+    "Interface",
+];
 
 /// Codesearch MCP service
 pub struct CodesearchService {
@@ -213,8 +412,24 @@ impl CodesearchService {
         Ok(())
     }
 
+    /// Execute a read-only action against the vector store, using shared stores when available
+    /// and falling back to opening a standalone store otherwise.
+    async fn with_vector_store_read<R, F>(&self, mut action: F) -> Result<R>
+    where
+        F: FnMut(&VectorStore) -> anyhow::Result<R>,
+    {
+        if let Some(ref stores) = self.shared_stores {
+            let store = stores.vector_store.read().await;
+            action(&store).context("Error reading from shared vector store")
+        } else {
+            let store = VectorStore::new(&self.db_path, self.dimensions)
+                .context("Error opening database")?;
+            action(&store).context("Error reading from vector store")
+        }
+    }
+
     #[tool(
-        description = "Search code semantically using natural language. Returns compact metadata by default (path, line numbers, kind, signature, score). Use the read tool with the returned line numbers to view actual code. Set compact=false only when you need full content inline. Use filter_path to narrow results to a specific directory."
+        description = "Hybrid code search over tree-sitter AST chunks: vector embeddings + Tantivy FTS + exact-identifier boosting, fused with RRF.\n\nUSE FOR:\n- Conceptual queries (\"where is auth handled\", \"how do we log errors\")\n- Identifier lookups — function/class/variable names are boosted via exact-match FTS\n- Mixed natural-language + symbol queries\n\nDO NOT USE FOR:\n- Finding a symbol's definition specifically — use `find_definition`\n- Finding all call-sites of a symbol — use `find_usages`\n\nOPTIONAL `mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (compact=true). Set compact=false for inline content."
     )]
     async fn semantic_search(
         &self,
@@ -222,12 +437,16 @@ impl CodesearchService {
     ) -> Result<CallToolResult, McpError> {
         let limit = request.limit.unwrap_or(10);
         let compact = request.compact.unwrap_or(true);
+        let mode = request.mode.as_deref().unwrap_or("auto");
+        let identifiers = detect_identifiers(&request.query);
+        let has_identifiers = !identifiers.is_empty();
 
         tracing::debug!(
-            "MCP semantic_search: query='{}', limit={}, compact={}",
+            "MCP semantic_search: query='{}', limit={}, compact={}, mode='{}'",
             request.query,
             limit,
-            compact
+            compact,
+            mode
         );
 
         // Ensure database exists
@@ -235,9 +454,15 @@ impl CodesearchService {
             return Ok(CallToolResult::success(vec![Content::text(e)]));
         }
 
-        // Get embedding service and embed query
-        // Note: We must drop the MutexGuard before any await points
-        tracing::debug!("MCP: Getting embedding service...");
+        // === Mode: "lexical" — FTS only, no embedding ===
+        if mode == "lexical" {
+            tracing::debug!("MCP: mode=lexical — skipping embedding service");
+            return self
+                .semantic_search_lexical(&request, &identifiers, limit, compact)
+                .await;
+        }
+
+        // === Modes: "semantic", "hybrid", "auto" — require embedding ===
         let query_embedding = {
             let mut service_guard = match self.get_embedding_service() {
                 Ok(g) => g,
@@ -262,58 +487,49 @@ impl CodesearchService {
                     ))]));
                 }
             }
-            // service_guard is dropped here, before any await
         };
 
-        // Search using shared stores if available, otherwise open a new store
-        tracing::debug!(
-            "MCP: Searching with {} dimensions...",
-            query_embedding.len()
-        );
-        let vector_results = if let Some(ref stores) = self.shared_stores {
-            // Use shared store with read lock
-            let store = stores.vector_store.read().await;
-            match store.search(&query_embedding, limit * 3) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("MCP: Search failed (shared store): {:?}", e);
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error searching: {}",
-                        e
-                    ))]));
-                }
-            }
-        } else {
-            // Fallback: open a new store (standalone mode)
-            tracing::debug!("MCP: Opening vector store (standalone mode)...");
-            let store = match VectorStore::new(&self.db_path, self.dimensions) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("MCP: Failed to open vector store: {:?}", e);
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error opening database: {}. The database may be corrupted or not indexed yet.",
-                        e
-                    ))]));
-                }
-            };
-            match store.search(&query_embedding, limit * 3) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("MCP: Search failed: {:?}", e);
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error searching: {}",
-                        e
-                    ))]));
-                }
+        // Search vector store
+        let vector_results = match self
+            .with_vector_store_read(|store| {
+                store
+                    .search(&query_embedding, limit * 3)
+                    .context("Error searching vector store")
+            })
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("MCP: Search failed: {:?}", e);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error searching vector store: {}",
+                    e
+                ))]));
             }
         };
 
         tracing::debug!("MCP: Found {} vector results", vector_results.len());
 
-        // --- Hybrid search with all improvements ---
+        // === Mode: "semantic" — vector only, skip FTS fusion ===
+        if mode == "semantic" {
+            tracing::debug!("MCP: mode=semantic — using vector results only");
+            let fused = vector_only(&vector_results);
 
-        // Detect identifiers and structural intent from query
-        let identifiers = detect_identifiers(&request.query);
+            let chunk_to_result: std::collections::HashMap<u32, &crate::vectordb::SearchResult> =
+                vector_results.iter().map(|r| (r.id, r)).collect();
+
+            let mut results: Vec<crate::vectordb::SearchResult> = Vec::new();
+            for f in fused.into_iter().take(limit) {
+                if let Some(result) = chunk_to_result.get(&f.chunk_id) {
+                    let mut r = (*result).clone();
+                    r.score = f.rrf_score;
+                    results.push(r);
+                }
+            }
+            return self.build_semantic_response(results, &request, compact, has_identifiers);
+        }
+
+        // === Modes: "hybrid" | "auto" — full hybrid search ===
         let structural_intent = detect_structural_intent(&request.query);
         let (vector_k, fts_k) = adapt_rrf_k(&request.query);
 
@@ -328,16 +544,13 @@ impl CodesearchService {
         // Perform FTS search and fusion
         let mut results = match FtsStore::new(&self.db_path) {
             Ok(fts_store) => {
-                // FTS search
                 let fts_results = fts_store
                     .search(&request.query, limit * 3, structural_intent)
                     .unwrap_or_default();
 
                 let fused = if identifiers.is_empty() {
-                    // No identifiers: standard RRF fusion
                     rrf_fusion(&vector_results, &fts_results, vector_k as f32)
                 } else {
-                    // Has identifiers: also do exact search per identifier
                     let mut all_exact: Vec<crate::fts::FtsResult> = Vec::new();
                     for ident in &identifiers {
                         if let Ok(exact) =
@@ -384,13 +597,12 @@ impl CodesearchService {
                 mapped
             }
             Err(e) => {
-                // FTS unavailable, fall back to vector-only results
                 tracing::warn!("MCP: FTS store unavailable, using vector-only: {:?}", e);
                 vector_results.into_iter().take(limit).collect()
             }
         };
 
-        // Apply language boost (improvement 2)
+        // Apply language boost
         if let Some((_, _, Some(primary_lang))) = crate::search::read_metadata(&self.db_path) {
             for result in &mut results {
                 let file_lang = format!(
@@ -408,20 +620,99 @@ impl CodesearchService {
             });
         }
 
-        // Apply kind boost (improvement 3)
+        // Apply kind boost
         if let Some(target_kind) = structural_intent {
             boost_kind(&mut results, target_kind);
         }
 
         tracing::debug!("MCP: Final {} results after hybrid search", results.len());
+        self.build_semantic_response(results, &request, compact, has_identifiers)
+    }
 
-        if results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No results found for the query. Try rephrasing your query or using broader terms.",
-            )]));
+    // === Helper methods (not exposed as tools) ===
+
+    /// Lexical-only search: FTS without embedding service.
+    async fn semantic_search_lexical(
+        &self,
+        request: &SemanticSearchRequest,
+        identifiers: &[String],
+        limit: usize,
+        compact: bool,
+    ) -> Result<CallToolResult, McpError> {
+        let structural_intent = detect_structural_intent(&request.query);
+
+        let fts_store = match FtsStore::new(&self.db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error opening FTS store: {}",
+                    e
+                ))]));
+            }
+        };
+
+        let mut fts_results = fts_store
+            .search(&request.query, limit * 3, structural_intent)
+            .unwrap_or_default();
+
+        // Also do exact search if identifiers detected
+        let mut exact_positions: std::collections::HashMap<u32, usize> = fts_results
+            .iter()
+            .enumerate()
+            .map(|(idx, result)| (result.chunk_id, idx))
+            .collect();
+
+        for ident in identifiers {
+            if let Ok(exact) = fts_store.search_exact(ident, limit * 2, structural_intent) {
+                for r in exact {
+                    if let Some(existing_idx) = exact_positions.get(&r.chunk_id).copied() {
+                        fts_results[existing_idx].score =
+                            fts_results[existing_idx].score.max(r.score);
+                    } else {
+                        exact_positions.insert(r.chunk_id, fts_results.len());
+                        fts_results.push(r);
+                    }
+                }
+            }
         }
 
-        // Convert to response format, applying compact mode and filter_path
+        fts_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Resolve FTS results to chunk metadata
+        let mut results = self
+            .resolve_fts_to_search_results(&fts_results, limit)
+            .await;
+
+        // Apply kind boost
+        if let Some(target_kind) = structural_intent {
+            boost_kind(&mut results, target_kind);
+        }
+
+        self.build_semantic_response(results, request, compact, !identifiers.is_empty())
+    }
+
+    /// Build the final SemanticSearchResponse with low-confidence signaling.
+    fn build_semantic_response(
+        &self,
+        results: Vec<crate::vectordb::SearchResult>,
+        request: &SemanticSearchRequest,
+        compact: bool,
+        has_identifiers: bool,
+    ) -> Result<CallToolResult, McpError> {
+        if results.is_empty() {
+            let response = SemanticSearchResponse {
+                results: vec![],
+                low_confidence: Some(true),
+                suggested_tool: Some("literal_search".to_string()),
+            };
+            let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
         // Pre-compute normalized project root for stripping absolute paths
         let project_root_normalized = {
             let root = crate::cache::normalize_path_str(self.project_path.to_str().unwrap_or(""));
@@ -431,7 +722,6 @@ impl CodesearchService {
         let items: Vec<SearchResultItem> = results
             .into_iter()
             .filter(|r| {
-                // Apply filter_path if specified
                 if let Some(ref fp) = request.filter_path {
                     let normalized_filter = crate::cache::normalize_filter_path(fp);
                     crate::cache::path_matches_filter(
@@ -456,47 +746,105 @@ impl CodesearchService {
             })
             .collect();
 
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
+        // Check low-confidence: top result's RRF score below threshold
+        let top_score = items.first().map(|r| r.score);
+        let (low_confidence, suggested_tool) = if let Some(score) = top_score {
+            if score < LOW_CONFIDENCE_THRESHOLD {
+                let suggestion = if has_identifiers {
+                    "find_definition"
+                } else {
+                    "literal_search"
+                };
+                (Some(true), Some(suggestion.to_string()))
+            } else {
+                (None, None)
+            }
+        } else {
+            (Some(true), Some("literal_search".to_string()))
+        };
+
+        let response = SemanticSearchResponse {
+            results: items,
+            low_confidence,
+            suggested_tool,
+        };
+
+        let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "Find all references/usages of a symbol (function, class, method, variable) across the codebase. USE THIS INSTEAD OF GREP when you need to find where a symbol is used — for refactoring, impact analysis, or understanding call sites. Returns compact list of file paths, line numbers, and containing function signatures."
-    )]
-    async fn find_references(
+    /// Resolve FTS results to SearchResult by looking up chunk metadata.
+    async fn resolve_fts_to_search_results(
         &self,
-        Parameters(request): Parameters<FindReferencesRequest>,
+        fts_results: &[crate::fts::FtsResult],
+        limit: usize,
+    ) -> Vec<crate::vectordb::SearchResult> {
+        self.with_vector_store_read(|store| {
+            let mut results = Vec::new();
+            for fts in fts_results.iter().take(limit) {
+                if let Ok(Some(chunk)) = store.get_chunk(fts.chunk_id) {
+                    results.push(crate::vectordb::SearchResult {
+                        id: fts.chunk_id,
+                        content: chunk.content,
+                        path: chunk.path,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        kind: chunk.kind,
+                        signature: chunk.signature,
+                        docstring: chunk.docstring,
+                        context: chunk.context,
+                        hash: chunk.hash,
+                        distance: 0.0,
+                        score: fts.score,
+                        context_prev: chunk.context_prev,
+                        context_next: chunk.context_next,
+                    });
+                }
+            }
+            Ok(results)
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    // === find_definition tool ===
+
+    #[tool(
+        description = "Locate the definition of a symbol (function, class, method, struct, trait, enum, type).\nUses FTS + chunk-kind filter to exclude usages, comments, and string literals.\n\nUSE FOR: \"where is X defined\", \"show me the declaration of X\".\nDO NOT USE FOR: finding all call-sites → use `find_usages`."
+    )]
+    async fn find_definition(
+        &self,
+        Parameters(request): Parameters<FindDefinitionRequest>,
     ) -> Result<CallToolResult, McpError> {
         let limit = request.limit.unwrap_or(20);
 
         tracing::debug!(
-            "MCP find_references: symbol='{}', limit={}",
+            "MCP find_definition: symbol='{}', kind={:?}, limit={}",
             request.symbol,
+            request.kind,
             limit
         );
 
-        // Ensure database exists
         if let Err(e) = self.ensure_database_exists() {
             return Ok(CallToolResult::success(vec![Content::text(e)]));
         }
 
-        // Open FTS store for full-text search on the symbol name
         let fts_store = match FtsStore::new(&self.db_path) {
             Ok(s) => s,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error opening FTS store: {}. Try re-indexing with 'codesearch index --force'.",
+                    "Error opening FTS store: {}",
                     e
                 ))]));
             }
         };
 
-        // Search FTS for the symbol — returns chunk_id + score
-        let fts_results = match fts_store.search(&request.symbol, limit * 2, None) {
+        // Search with extra results — we'll filter down
+        let fts_results = match fts_store.search(&request.symbol, limit * 3, None) {
             Ok(r) => r,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error searching for references: {}",
+                    "Error searching: {}",
                     e
                 ))]));
             }
@@ -504,63 +852,171 @@ impl CodesearchService {
 
         if fts_results.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No references found for '{}'. The symbol may not be indexed or try a different name.",
+                "No definition found for '{}'. The symbol may not be indexed.",
                 request.symbol
             ))]));
         }
 
-        // Resolve chunk metadata from VectorStore using chunk_ids
-        let items: Vec<ReferenceItem> = if let Some(ref stores) = self.shared_stores {
-            let store = stores.vector_store.read().await;
-            fts_results
-                .iter()
-                .filter_map(|fts_result| {
-                    if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
-                        Some(ReferenceItem {
-                            path: chunk.path,
-                            line: chunk.start_line,
-                            kind: chunk.kind,
-                            signature: chunk.signature,
-                            score: fts_result.score,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .take(limit)
-                .collect()
-        } else {
-            // Standalone mode — open a new store
-            let store = match VectorStore::new(&self.db_path, self.dimensions) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error opening database: {}",
-                        e
-                    ))]));
-                }
-            };
-            fts_results
-                .iter()
-                .filter_map(|fts_result| {
-                    if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
-                        Some(ReferenceItem {
-                            path: chunk.path,
-                            line: chunk.start_line,
-                            kind: chunk.kind,
-                            signature: chunk.signature,
-                            score: fts_result.score,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .take(limit)
-                .collect()
+        // Resolve chunk metadata and filter by definition kinds
+        let items: Vec<ReferenceItem> = match self
+            .with_vector_store_read(|store| {
+                let items = fts_results
+                    .iter()
+                    .filter_map(|fts_result| {
+                        if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                            if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
+                                return None;
+                            }
+                            if let Some(ref requested_kind) = request.kind {
+                                if chunk.kind != *requested_kind {
+                                    return None;
+                                }
+                            }
+                            Some(ReferenceItem {
+                                path: chunk.path,
+                                line: chunk.start_line,
+                                kind: chunk.kind,
+                                signature: chunk.signature,
+                                score: fts_result.score,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .take(limit)
+                    .collect();
+                Ok(items)
+            })
+            .await
+        {
+            Ok(items) => items,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error opening database: {}",
+                    e
+                ))]));
+            }
         };
+
+        if items.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No definition found for '{}'. Try find_usages() to find references, or broaden your search.",
+                request.symbol
+            ))]));
+        }
 
         let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    // === find_usages tool ===
+
+    #[tool(
+        description = "Find call-sites and other usages of a symbol across the codebase.\nUses FTS; excludes the chunks that are the symbol's own definition.\n\nUSE FOR: impact analysis, refactoring, \"who calls X\".\nDO NOT USE FOR: finding the definition itself → use `find_definition`."
+    )]
+    async fn find_usages(
+        &self,
+        Parameters(request): Parameters<FindUsagesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.find_usages_impl(request.symbol.clone(), request.limit.unwrap_or(20))
+            .await
+    }
+
+    /// Shared implementation for find_usages and the deprecated find_references alias.
+    async fn find_usages_impl(
+        &self,
+        symbol: String,
+        limit: usize,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::debug!("MCP find_usages: symbol='{}', limit={}", symbol, limit);
+
+        if let Err(e) = self.ensure_database_exists() {
+            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        }
+
+        let fts_store = match FtsStore::new(&self.db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error opening FTS store: {}",
+                    e
+                ))]));
+            }
+        };
+
+        let fts_results = match fts_store.search(&symbol, limit * 2, None) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error searching: {}",
+                    e
+                ))]));
+            }
+        };
+
+        if fts_results.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No usages found for '{}'. The symbol may not be indexed.",
+                symbol
+            ))]));
+        }
+
+        // Resolve chunks and exclude definition chunks
+        let items: Vec<ReferenceItem> = match self
+            .with_vector_store_read(|store| {
+                let items = fts_results
+                    .iter()
+                    .filter_map(|fts_result| {
+                        if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                            if is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
+                                return None;
+                            }
+                            Some(ReferenceItem {
+                                path: chunk.path,
+                                line: chunk.start_line,
+                                kind: chunk.kind,
+                                signature: chunk.signature,
+                                score: fts_result.score,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .take(limit)
+                    .collect();
+                Ok(items)
+            })
+            .await
+        {
+            Ok(items) => items,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error opening database: {}",
+                    e
+                ))]));
+            }
+        };
+
+        if items.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No usages found for '{}' (only definitions were found). Try find_definition() to locate the declaration.",
+                symbol
+            ))]));
+        }
+
+        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "DEPRECATED. Use `find_definition` to locate a symbol's declaration, or `find_usages` to find call-sites.\nThis tool is retained as an alias for `find_usages` and may be removed in a future version."
+    )]
+    async fn find_references(
+        &self,
+        Parameters(request): Parameters<FindReferencesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.find_usages_impl(request.symbol, request.limit.unwrap_or(20))
+            .await
     }
 
     #[tool(
@@ -587,74 +1043,27 @@ impl CodesearchService {
             return Ok(CallToolResult::success(vec![Content::text(json)]));
         }
 
-        // Get stats using shared stores if available
-        let stats = if let Some(ref stores) = self.shared_stores {
-            let store = stores.vector_store.read().await;
-            match store.stats() {
-                Ok(s) => s,
-                Err(e) => {
-                    let response = IndexStatusResponse {
-                        indexed: false,
-                        status: "error".to_string(),
-                        status_message: format!("Error getting index stats: {}", e),
-                        total_chunks: 0,
-                        total_files: 0,
-                        model: self.model_type.short_name().to_string(),
-                        dimensions: 0,
-                        max_chunk_id: 0,
-                        db_path: self.db_path.display().to_string(),
-                        project_path: self.project_path.display().to_string(),
-                        error_message: Some(format!("Error getting stats: {}", e)),
-                    };
-                    let json =
-                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                    return Ok(CallToolResult::success(vec![Content::text(json)]));
-                }
-            }
-        } else {
-            // Fallback: open a new store (standalone mode)
-            let store = match VectorStore::new(&self.db_path, self.dimensions) {
-                Ok(s) => s,
-                Err(e) => {
-                    let response = IndexStatusResponse {
-                        indexed: false,
-                        status: "error".to_string(),
-                        status_message: format!("Error opening database: {}", e),
-                        total_chunks: 0,
-                        total_files: 0,
-                        model: self.model_type.short_name().to_string(),
-                        dimensions: 0,
-                        max_chunk_id: 0,
-                        db_path: self.db_path.display().to_string(),
-                        project_path: self.project_path.display().to_string(),
-                        error_message: Some(format!("Error opening database: {}", e)),
-                    };
-                    let json =
-                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                    return Ok(CallToolResult::success(vec![Content::text(json)]));
-                }
-            };
-
-            match store.stats() {
-                Ok(s) => s,
-                Err(e) => {
-                    let response = IndexStatusResponse {
-                        indexed: false,
-                        status: "error".to_string(),
-                        status_message: format!("Error getting index stats: {}", e),
-                        total_chunks: 0,
-                        total_files: 0,
-                        model: self.model_type.short_name().to_string(),
-                        dimensions: 0,
-                        max_chunk_id: 0,
-                        db_path: self.db_path.display().to_string(),
-                        project_path: self.project_path.display().to_string(),
-                        error_message: Some(format!("Error getting stats: {}", e)),
-                    };
-                    let json =
-                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                    return Ok(CallToolResult::success(vec![Content::text(json)]));
-                }
+        let stats = match self
+            .with_vector_store_read(|store| store.stats().context("Error getting index stats"))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let response = IndexStatusResponse {
+                    indexed: false,
+                    status: "error".to_string(),
+                    status_message: format!("{}", e),
+                    total_chunks: 0,
+                    total_files: 0,
+                    model: self.model_type.short_name().to_string(),
+                    dimensions: 0,
+                    max_chunk_id: 0,
+                    db_path: self.db_path.display().to_string(),
+                    project_path: self.project_path.display().to_string(),
+                    error_message: Some(format!("{}", e)),
+                };
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
             }
         };
 
@@ -779,10 +1188,67 @@ impl CodesearchService {
 
 // === Server Handler Implementation ===
 
+/// Check if a chunk is a definition of the given symbol.
+///
+/// Best-effort heuristic for v1: a chunk is considered a definition if:
+/// 1. Its kind is a definition kind (Function, Struct, Class, etc.)
+/// 2. Its signature starts with a common definition pattern containing the symbol name
+///
+/// Limitation: this uses simple substring matching on the signature field.
+/// False positives/negatives are possible for symbols that appear in signatures
+/// of chunks that are not their definitions.
+fn is_definition_chunk(kind: &str, signature: &Option<String>, symbol: &str) -> bool {
+    // Only check definition kinds
+    if !DEFINITION_KINDS.contains(&kind) {
+        return false;
+    }
+
+    let sig = match signature {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+
+    // Common definition prefixes across languages.
+    // Keep this allocation-free in hot paths by using &str prefixes and boundary checks.
+    const PREFIXES: &[&str] = &[
+        "fn ",
+        "def ",
+        "class ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "type ",
+        "interface ",
+        "impl ",
+        "pub fn ",
+        "pub async fn ",
+        "pub struct ",
+        "pub enum ",
+        "pub trait ",
+        "pub type ",
+        "async fn ",
+        "const ",
+        "static ",
+    ];
+
+    PREFIXES.iter().any(|prefix| {
+        if !sig.starts_with(prefix) {
+            return false;
+        }
+
+        let rest = &sig[prefix.len()..];
+        if !rest.starts_with(symbol) {
+            return false;
+        }
+
+        let next = rest[symbol.len()..].chars().next();
+        matches!(next, None | Some('(' | '<' | ':' | ' ' | '\t'))
+    })
+}
+
 #[tool_handler]
 impl ServerHandler for CodesearchService {
     fn get_info(&self) -> ServerInfo {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let db_exists = self.db_path.exists();
 
         ServerInfo {
@@ -795,150 +1261,27 @@ impl ServerHandler for CodesearchService {
                 website_url: None,
             },
             instructions: Some(format!(
-                r#"codesearch - Semantic Code Search MCP Server
+                r#"codesearch — semantic + lexical code search MCP server.
 
-codesearch provides fast, local semantic code search using natural language queries.
-Search your codebase by meaning, not just by keywords.
+TOOLS:
+| Tool              | Use for                                              |
+|-------------------|------------------------------------------------------|
+| semantic_search   | Conceptual queries, identifier + natural-language mix |
+| find_definition   | Where is symbol X defined                             |
+| find_usages       | Who uses / calls symbol X                             |
+| find_references   | DEPRECATED — alias for find_usages                    |
+| index_status      | Verify the index is ready                             |
+| find_databases    | Discover available indexes                            |
 
-⚠️  IMPORTANT: This MCP server CANNOT index codebases. Indexing must be done manually.
-Indexing takes 30-60 seconds and should be done via the CLI: `codesearch index`
-
-AVAILABLE TOOLS:
-
-1. find_databases()
-   Find all available databases in current directory, parent directories, and globally.
-   Use this FIRST to discover which databases are available.
-   Returns: List of databases with paths, stats, and model info.
-
-2. index_status()
-   Check if the current index is ready for searching.
-   Use this AFTER find_databases() to verify the database is accessible.
-   Returns: Index status, stats, model info, and any error messages.
-
-3. semantic_search(query, limit=10, compact=true, filter_path=null)
-   Search the codebase using natural language queries.
-   By default returns COMPACT results (path, line numbers, kind, signature, score only).
-   Set compact=false to include full code content (use sparingly - high token cost).
-   Use filter_path to narrow results to a specific directory (e.g., "src/api/").
-   Query examples:
-     - "where do we handle user authentication?"
-     - "how is error logging implemented?"
-     - "functions that process payment data"
-   Returns: Array of matches with metadata. Use read tool to fetch actual code.
-
-4. find_references(symbol, limit=50)
-   Find all usages/call sites of a function, method, class, or type across the codebase.
-   ⚠️  USE THIS instead of grep when you need to find where a symbol is used.
-   Essential for refactoring — shows all locations that need to change.
-   Examples:
-     - find_references("authenticate") - Find all calls to authenticate()
-     - find_references("UserService") - Find all usages of UserService
-     - find_references("handleRequest") - Find all call sites
-   Returns: Compact list of file paths, line numbers, kind, and score.
-
-TOKEN-EFFICIENT WORKFLOW (IMPORTANT):
-
-All tools return compact metadata by default to minimize token usage.
-Use the read tool to fetch actual code content only for the specific
-lines you need. NEVER use grep for finding symbol usages — use
-find_references() instead.
-
-RECOMMENDED WORKFLOW:
-
-Step 1: Discover
-  find_databases() → index_status()
-
-Step 2: Search (compact — returns metadata only)
-  semantic_search("authentication handler")
-
-Step 3: Find related code (compact — returns locations only)
-  find_references("authenticate")
-
-Step 4: Read only what you need (targeted)
-  Use read tool with exact file path + line numbers from steps 2-3
-
-REFACTORING WORKFLOW:
-
-1. semantic_search("the function to refactor") → find the definition
-2. find_references("functionName") → find ALL call sites
-3. Read each call site with read tool → understand usage patterns
-4. Make changes to definition + all call sites
-
-⚠️  NEVER use grep to find symbol references. Always use find_references().
-    grep is only for exact string matching in non-indexed files.
-
-USAGE PATTERNS:
-
-Understanding a New Codebase:
-  1. find_databases() → index_status()
-  2. semantic_search("main application entry point")
-  3. semantic_search("error handling strategy")
-
-Finding Implementation Patterns:
-  - semantic_search("how are API endpoints defined?")
-  - semantic_search("database model definitions")
-
-Debugging and Analysis:
-  - semantic_search("error handling for database operations")
-  - find_references("handleError") → find all error handling sites
-
-BEST PRACTICES:
-
-✓ Always call find_databases() first to discover available indexes
-✓ Check index_status() before searching to verify the database is ready
-✓ Use natural language queries describing concepts, not exact terms
-✓ Use find_references() for refactoring — NOT grep
-✓ Use filter_path to narrow searches to specific directories
-✓ Let compact mode save tokens — read specific lines only when needed
-✓ Start with broader queries, then narrow down
-
-✗ Never attempt to index from this MCP server - use CLI instead
-✗ Never use grep to find symbol usages — use find_references() instead
-✗ Avoid short, vague queries like "auth" or "db"
-✗ Don't use compact=false unless you specifically need full code content
-✗ Don't search in subfolders expecting a separate index - indexes are project-wide
-
-DATABASE LOCATIONS:
-
-Priority order for database selection:
-1. Current directory (.codesearch.db/)
-2. Parent directories (up to 5 levels)
-3. Globally tracked repositories (~/.codesearch/repos.json)
+Indexing is done via CLI: `codesearch index`. The MCP server cannot index.
 
 Current project: {project}
-Current database: {db}
-Database exists: {exists}
-Current directory: {cwd}
-
-ERROR HANDLING:
-
-If you get "No index found" errors:
-1. Call find_databases() to see what's available
-2. Check if you're in the right directory
-3. Verify the user has run 'codesearch index'
-
-If search returns poor results:
-1. The index may be stale - ask user to re-run 'codesearch index'
-2. Try different query phrasing
-3. Check index_status() for any errors
-
-SETUP:
-
-To create an index, the USER must run (not the agent):
-  $ cd /path/to/project
-  $ codesearch index
-
-Indexing takes 30-60 seconds and cannot be done from the MCP server.
-
-For detailed documentation, visit: https://github.com/flupkede/codesearch
-
-Model: {model}
-Dimensions: {dims}
+Current database: {db} ({exists})
+Model: {model} ({dims}d)
 "#,
                 project = self.project_path.display(),
                 db = self.db_path.display(),
-                exists = if db_exists { "✅ Yes" } else { "❌ No" },
-                cwd = current_dir.display(),
+                exists = if db_exists { "ready" } else { "not found" },
                 model = self.model_type.short_name(),
                 dims = self.dimensions
             )),

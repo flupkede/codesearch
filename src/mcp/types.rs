@@ -3,7 +3,7 @@
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Request for semantic search
+/// Request for semantic/hybrid search
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SemanticSearchRequest {
     /// The search query (natural language or code snippet)
@@ -20,6 +20,13 @@ pub struct SemanticSearchRequest {
 
     /// Only return results from files under this path prefix (e.g., "src/api/")
     pub filter_path: Option<String>,
+
+    /// Override auto-detection of query intent.
+    /// "auto" (default) | "semantic" | "lexical" | "hybrid"
+    /// - "semantic": skip FTS fusion, use vector results only
+    /// - "lexical":  skip embedding, use FTS path only
+    /// - "hybrid":   force full hybrid even if auto would choose a single path
+    pub mode: Option<String>,
 }
 
 /// Request to find references/call sites of a symbol.
@@ -105,4 +112,38 @@ pub struct FindDatabasesResponse {
     pub databases: Vec<DatabaseInfoResponse>,
     pub message: String,
     pub current_directory: String,
+}
+
+/// Semantic search response wrapper with low-confidence signaling
+#[derive(Debug, Serialize)]
+pub struct SemanticSearchResponse {
+    /// Search results
+    pub results: Vec<SearchResultItem>,
+    /// Set when the top RRF score is below the confidence threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_confidence: Option<bool>,
+    /// Populated alongside `low_confidence`. Suggests a better-suited tool for this query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_tool: Option<String>,
+}
+
+/// Request to find the definition of a symbol
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindDefinitionRequest {
+    /// Symbol name (function, class, method, struct, trait, enum, type)
+    pub symbol: String,
+    /// Optional filter to a specific kind. If omitted, all definition kinds are searched.
+    /// Accepted: "Function" | "Class" | "Method" | "Struct" | "Trait" | "Enum" | "TypeAlias" | "Interface"
+    pub kind: Option<String>,
+    /// Maximum number of results to return (default: 20)
+    pub limit: Option<usize>,
+}
+
+/// Request to find usages/call-sites of a symbol
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindUsagesRequest {
+    /// Symbol name to find usages for
+    pub symbol: String,
+    /// Maximum number of results to return (default: 20)
+    pub limit: Option<usize>,
 }
