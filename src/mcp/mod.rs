@@ -1305,6 +1305,11 @@ impl CodesearchService {
         // Resolve chunk metadata and apply post-filters using shared store helper
         let lang_filter = request.language.clone();
         let glob_filter = request.file_glob.clone();
+        // Pre-compute normalized project root for stripping absolute paths in glob matching
+        let project_root_normalized = {
+            let root = crate::cache::normalize_path_str(self.project_path.to_str().unwrap_or(""));
+            root.trim_end_matches('/').to_string()
+        };
         let items: Vec<LiteralSearchResultItem> = match self
             .with_vector_store_read(|store| {
                 let items: Vec<LiteralSearchResultItem> = fts_results
@@ -1321,9 +1326,14 @@ impl CodesearchService {
                                 return false;
                             }
                         }
-                        // file_glob post-filter
+                        // file_glob post-filter (strip project root to get relative path)
                         if let Some(ref glob) = glob_filter {
-                            if !simple_glob_match(glob, &chunk.path) {
+                            let relative_path = chunk
+                                .path
+                                .strip_prefix(&project_root_normalized)
+                                .unwrap_or(&chunk.path)
+                                .trim_start_matches('/');
+                            if !simple_glob_match(glob, relative_path) {
                                 return false;
                             }
                         }
