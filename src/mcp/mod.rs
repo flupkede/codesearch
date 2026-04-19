@@ -73,6 +73,58 @@ mod tests {
             &project_root,
         ));
     }
+
+    #[test]
+    fn test_simple_glob_match_exact() {
+        assert!(super::simple_glob_match("src/main.rs", "src/main.rs"));
+        assert!(!super::simple_glob_match("src/main.rs", "src/other.rs"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_double_star_prefix() {
+        // src/mcp/** matches any path starting with src/mcp/
+        assert!(super::simple_glob_match("src/mcp/**", "src/mcp/mod.rs"));
+        assert!(super::simple_glob_match("src/mcp/**", "src/mcp/types.rs"));
+        assert!(super::simple_glob_match(
+            "src/mcp/**",
+            "src/mcp/sub/deep.rs"
+        ));
+        assert!(!super::simple_glob_match("src/mcp/**", "src/other/mod.rs"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_double_star_suffix() {
+        // **/*.rs matches any path ending with .rs
+        assert!(super::simple_glob_match("**/*.rs", "src/main.rs"));
+        assert!(super::simple_glob_match("**/*.rs", "deep/nested/file.rs"));
+        assert!(!super::simple_glob_match("**/*.rs", "src/main.ts"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_double_star_both() {
+        // src/**/*.rs → starts with src/ and ends with .rs
+        assert!(super::simple_glob_match("src/**/*.rs", "src/main.rs"));
+        assert!(super::simple_glob_match("src/**/*.rs", "src/mcp/mod.rs"));
+        assert!(!super::simple_glob_match("src/**/*.rs", "tests/main.rs"));
+        assert!(!super::simple_glob_match("src/**/*.rs", "src/main.ts"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_single_star() {
+        // *.rs matches any path ending with .rs
+        assert!(super::simple_glob_match("*.rs", "main.rs"));
+        assert!(!super::simple_glob_match("*.rs", "main.ts"));
+        // src/*.rs matches files directly in src/ ending with .rs
+        assert!(super::simple_glob_match("src/*.rs", "src/main.rs"));
+        assert!(!super::simple_glob_match("src/*.rs", "src/sub/main.rs"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_backslash_normalization() {
+        // Backslashes should be normalized
+        assert!(super::simple_glob_match("src/mcp/**", r"src\mcp\mod.rs"));
+        assert!(super::simple_glob_match(r"src\mcp\**", "src/mcp/mod.rs"));
+    }
 }
 
 pub mod types;
@@ -122,6 +174,160 @@ impl std::fmt::Debug for CodesearchService {
             .field("has_shared_stores", &self.shared_stores.is_some())
             .finish()
     }
+}
+
+// === Simple Glob Matcher ===
+// v1: supports prefix/suffix patterns with `*` and `**` only.
+// Full glob syntax deferred to avoid adding new dependencies.
+
+/// Match a file path against a simple glob pattern.
+///
+/// Supported patterns:
+/// - `src/mcp/**` → any path starting with `src/mcp/`
+/// - `**/*.rs` → any path ending with `.rs`
+/// - `src/**/*.rs` → path starting with `src/` and ending with `.rs`
+/// - `*.rs` → any path ending with `.rs` (single `*` within a segment)
+/// - `foo.rs` → exact match
+fn simple_glob_match(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.replace('\\', "/");
+    let path = path.replace('\\', "/");
+
+    if !pattern.contains('*') {
+        // Exact match
+        return path == pattern;
+    }
+
+    if pattern.contains("**") {
+        // Split on first ** only
+        let parts: Vec<&str> = pattern.splitn(2, "**").collect();
+        let prefix = parts[0];
+        // Strip leading / from suffix since ** already matches the separator
+        let suffix = parts
+            .get(1)
+            .map(|s| s.strip_prefix('/').unwrap_or(s))
+            .unwrap_or("");
+
+        let mut p = path.as_str();
+        if !prefix.is_empty() && !p.starts_with(prefix) {
+            return false;
+        }
+        if !prefix.is_empty() {
+            p = &p[prefix.len()..];
+        }
+        // Strip leading / from remaining path (since ** can match empty + /)
+        if p.starts_with('/') {
+            p = &p[1..];
+        }
+        if suffix.is_empty() {
+            return true;
+        }
+        // The suffix may contain single * — match against the tail of the path.
+        // After **, the suffix describes constraints on the end of the path.
+        // For `**/*.rs`, the `*.rs` should match the last segment.
+        if suffix.contains('*') {
+            // Match suffix against the end of the path using segment-aware logic
+            return match_suffix_with_star(suffix, p);
+        }
+        p.ends_with(suffix)
+    } else {
+        // Pure single-star pattern (no **)
+        simple_glob_match_single_star(&pattern, &path)
+    }
+}
+
+/// Match a suffix pattern (containing `*`) against the end of a path.
+/// The `*` matches within a single segment only.
+///
+/// E.g., suffix `*.rs` matches `src/main.rs` because the last segment `main.rs` ends with `.rs`.
+fn match_suffix_with_star(suffix: &str, path: &str) -> bool {
+    // Find the segments in the suffix (split by /)
+    let suffix_parts: Vec<&str> = suffix.split('/').collect();
+    let path_segments: Vec<&str> = path.split('/').collect();
+
+    // The suffix must match the last N segments of the path
+    if suffix_parts.len() > path_segments.len() {
+        return false;
+    }
+
+    let path_tail = &path_segments[path_segments.len() - suffix_parts.len()..];
+
+    for (sp, pp) in suffix_parts.iter().zip(path_tail.iter()) {
+        if sp.contains('*') {
+            if !single_segment_match(sp, pp) {
+                return false;
+            }
+        } else if *sp != *pp {
+            return false;
+        }
+    }
+    true
+}
+
+/// Match a single segment pattern against a single segment path part.
+/// `*` matches any characters within the segment.
+fn single_segment_match(pattern: &str, segment: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut s = segment;
+
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !s.starts_with(part) {
+                return false;
+            }
+            s = &s[part.len()..];
+        } else if i == parts.len() - 1 {
+            if !s.ends_with(part) {
+                return false;
+            }
+        } else if let Some(pos) = s.find(part) {
+            s = &s[pos + part.len()..];
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Match a single-star glob pattern where `*` matches any characters except `/`.
+fn simple_glob_match_single_star(pattern: &str, path: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut p = path;
+
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // First part must be a prefix
+            if !p.starts_with(part) {
+                return false;
+            }
+            p = &p[part.len()..];
+        } else if i == parts.len() - 1 {
+            // Last part must be a suffix of the CURRENT segment (after *)
+            // * does not cross /, so find the end of the current segment
+            let seg_end = p.find('/').unwrap_or(p.len());
+            let segment = &p[..seg_end];
+            if !segment.ends_with(part) {
+                return false;
+            }
+        } else {
+            // Middle parts: find within remaining path but NOT across /
+            if let Some(pos) = p.find(part) {
+                let before = &p[..pos];
+                if before.contains('/') {
+                    return false;
+                }
+                p = &p[pos + part.len()..];
+            } else {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 // === Tool Router Implementation ===
@@ -564,6 +770,195 @@ impl CodesearchService {
     }
 
     #[tool(
+        description = "Search code using literal/FTS matching without embeddings. Three modes: exact (default), regex (set regex=true), phrase (set phrase=true). Supports file_glob and language post-filters. Use this when you need fast exact text search, pattern matching, or phrase search. Does NOT require an embedding model."
+    )]
+    async fn literal_search(
+        &self,
+        Parameters(request): Parameters<LiteralSearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = request.limit.unwrap_or(20);
+        let output_format = request.format.as_deref().unwrap_or("json");
+
+        tracing::debug!(
+            "MCP literal_search: query='{}', regex={:?}, phrase={:?}, limit={}, file_glob={:?}, language={:?}, format={}",
+            request.query,
+            request.regex,
+            request.phrase,
+            limit,
+            request.file_glob,
+            request.language,
+            output_format
+        );
+
+        // Ensure database exists
+        if let Err(e) = self.ensure_database_exists() {
+            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        }
+
+        // Open FTS store only — no embedding service needed
+        let fts_store = match FtsStore::new(&self.db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error opening FTS store: {}. Try re-indexing with 'codesearch index --force'.",
+                    e
+                ))]));
+            }
+        };
+
+        // Determine search mode and execute
+        let fts_results = if request.regex.unwrap_or(false) {
+            match fts_store.search_regex(&request.query, limit * 3) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error in regex search: {}",
+                        e
+                    ))]));
+                }
+            }
+        } else if request.phrase.unwrap_or(false) {
+            match fts_store.search_phrase(&request.query, limit * 3) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error in phrase search: {}",
+                        e
+                    ))]));
+                }
+            }
+        } else {
+            // Default: BM25 exact term search
+            match fts_store.search(&request.query, limit * 3, None) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error in search: {}",
+                        e
+                    ))]));
+                }
+            }
+        };
+
+        if fts_results.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No results found for '{}'. Try a different query or mode.",
+                request.query
+            ))]));
+        }
+
+        // Resolve chunk metadata and apply post-filters
+        let items: Vec<LiteralSearchResultItem> = if let Some(ref stores) = self.shared_stores {
+            let store = stores.vector_store.read().await;
+            fts_results
+                .iter()
+                .filter_map(|fts_result| {
+                    let chunk = store.get_chunk(fts_result.chunk_id).ok()??;
+                    Some((chunk, fts_result.score))
+                })
+                .filter(|(chunk, _)| {
+                    // Language post-filter
+                    if let Some(ref lang) = request.language {
+                        let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                        if file_lang.name() != lang {
+                            return false;
+                        }
+                    }
+                    // file_glob post-filter
+                    if let Some(ref glob) = request.file_glob {
+                        if !simple_glob_match(glob, &chunk.path) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .take(limit)
+                .map(|(chunk, score)| LiteralSearchResultItem {
+                    path: chunk.path,
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    snippet: chunk.content,
+                    score,
+                    kind: if chunk.kind.is_empty() {
+                        None
+                    } else {
+                        Some(chunk.kind)
+                    },
+                    signature: chunk.signature.filter(|s| !s.is_empty()),
+                })
+                .collect()
+        } else {
+            // Standalone mode — open a new VectorStore
+            let store = match VectorStore::new(&self.db_path, self.dimensions) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error opening database: {}",
+                        e
+                    ))]));
+                }
+            };
+            fts_results
+                .iter()
+                .filter_map(|fts_result| {
+                    let chunk = store.get_chunk(fts_result.chunk_id).ok()??;
+                    Some((chunk, fts_result.score))
+                })
+                .filter(|(chunk, _)| {
+                    // Language post-filter
+                    if let Some(ref lang) = request.language {
+                        let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                        if file_lang.name() != lang {
+                            return false;
+                        }
+                    }
+                    // file_glob post-filter
+                    if let Some(ref glob) = request.file_glob {
+                        if !simple_glob_match(glob, &chunk.path) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .take(limit)
+                .map(|(chunk, score)| LiteralSearchResultItem {
+                    path: chunk.path,
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    snippet: chunk.content,
+                    score,
+                    kind: if chunk.kind.is_empty() {
+                        None
+                    } else {
+                        Some(chunk.kind)
+                    },
+                    signature: chunk.signature.filter(|s| !s.is_empty()),
+                })
+                .collect()
+        };
+
+        if items.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No results found for '{}' after applying filters.",
+                request.query
+            ))]));
+        }
+
+        // Format output
+        let output = if output_format == "grep" {
+            items
+                .iter()
+                .map(|item| format!("{}:{}:{}", item.path, item.start_line, item.snippet))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
         description = "Get the status of the semantic search index including model info and statistics. Check this before searching to verify the index is ready."
     )]
     async fn index_status(&self) -> Result<CallToolResult, McpError> {
@@ -826,15 +1221,25 @@ AVAILABLE TOOLS:
      - "functions that process payment data"
    Returns: Array of matches with metadata. Use read tool to fetch actual code.
 
-4. find_references(symbol, limit=50)
-   Find all usages/call sites of a function, method, class, or type across the codebase.
-   ⚠️  USE THIS instead of grep when you need to find where a symbol is used.
-   Essential for refactoring — shows all locations that need to change.
-   Examples:
-     - find_references("authenticate") - Find all calls to authenticate()
-     - find_references("UserService") - Find all usages of UserService
-     - find_references("handleRequest") - Find all call sites
-   Returns: Compact list of file paths, line numbers, kind, and score.
+ 4. find_references(symbol, limit=50)
+    Find all usages/call sites of a function, method, class, or type across the codebase.
+    ⚠️  USE THIS instead of grep when you need to find where a symbol is used.
+    Essential for refactoring — shows all locations that need to change.
+    Examples:
+      - find_references("authenticate") - Find all calls to authenticate()
+      - find_references("UserService") - Find all usages of UserService
+      - find_references("handleRequest") - Find all call sites
+    Returns: Compact list of file paths, line numbers, kind, and score.
+
+ 5. literal_search(query, regex=false, phrase=false, limit=20, file_glob=null, language=null, format="json")
+    Fast FTS-only search without embeddings. Three mutually exclusive modes:
+    - Default: exact term search (BM25 scoring)
+    - regex=true: regex pattern matching (e.g., "fn \\w+_handler")
+    - phrase=true: phrase query — tokens must appear in sequence (e.g., "fn new")
+    Post-filters: file_glob (e.g., "src/mcp/**") and language (e.g., "Rust").
+    Output: "json" (structured) or "grep" (file:line:snippet).
+    Use when you need fast exact text search without semantic understanding.
+    Returns: Array of matches with path, line numbers, snippet, and score.
 
 TOKEN-EFFICIENT WORKFLOW (IMPORTANT):
 
