@@ -255,10 +255,66 @@ mod tests {
             instructions_text
         );
     }
+
+    // === simple_glob_match tests ===
+
+    #[test]
+    fn test_simple_glob_match_exact() {
+        assert!(super::simple_glob_match("src/main.rs", "src/main.rs"));
+        assert!(!super::simple_glob_match("src/main.rs", "src/other.rs"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_double_star_prefix() {
+        assert!(super::simple_glob_match("src/mcp/**", "src/mcp/mod.rs"));
+        assert!(super::simple_glob_match("src/mcp/**", "src/mcp/types.rs"));
+        assert!(super::simple_glob_match(
+            "src/mcp/**",
+            "src/mcp/sub/deep.rs"
+        ));
+        assert!(!super::simple_glob_match("src/mcp/**", "src/other/mod.rs"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_double_star_suffix() {
+        assert!(super::simple_glob_match("**/*.rs", "src/main.rs"));
+        assert!(super::simple_glob_match("**/*.rs", "deep/nested/file.rs"));
+        assert!(!super::simple_glob_match("**/*.rs", "src/main.ts"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_double_star_both() {
+        assert!(super::simple_glob_match("src/**/*.rs", "src/main.rs"));
+        assert!(super::simple_glob_match("src/**/*.rs", "src/mcp/mod.rs"));
+        assert!(!super::simple_glob_match("src/**/*.rs", "tests/main.rs"));
+        assert!(!super::simple_glob_match("src/**/*.rs", "src/main.ts"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_single_star() {
+        assert!(super::simple_glob_match("*.rs", "main.rs"));
+        assert!(!super::simple_glob_match("*.rs", "main.ts"));
+        assert!(super::simple_glob_match("src/*.rs", "src/main.rs"));
+        assert!(!super::simple_glob_match("src/*.rs", "src/sub/main.rs"));
+    }
+
+    #[test]
+    fn test_simple_glob_match_backslash_normalization() {
+        assert!(super::simple_glob_match("src/mcp/**", r"src\mcp\mod.rs"));
+        assert!(super::simple_glob_match(r"src\mcp\**", "src/mcp/mod.rs"));
+    }
 }
 
 pub mod types;
 
+use crate::db_discovery::{find_best_database, find_databases};
+use crate::embed::{EmbeddingService, ModelType};
+use crate::file::Language;
+use crate::fts::FtsStore;
+use crate::index::{IndexManager, SharedStores};
+use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_RRF_K};
+use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
+use crate::vectordb::VectorStore;
 use anyhow::{Context, Result};
 use rmcp::{
     handler::server::router::tool::ToolRouter,
@@ -269,15 +325,6 @@ use rmcp::{
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
-
-use crate::db_discovery::{find_best_database, find_databases};
-use crate::embed::{EmbeddingService, ModelType};
-use crate::file::Language;
-use crate::fts::FtsStore;
-use crate::index::{IndexManager, SharedStores};
-use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_RRF_K};
-use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
-use crate::vectordb::VectorStore;
 
 // Re-export types
 pub use types::*;
@@ -321,6 +368,160 @@ impl std::fmt::Debug for CodesearchService {
             .field("has_shared_stores", &self.shared_stores.is_some())
             .finish()
     }
+}
+
+// === Simple Glob Matcher ===
+// v1: supports prefix/suffix patterns with `*` and `**` only.
+// Full glob syntax deferred to avoid adding new dependencies.
+
+/// Match a file path against a simple glob pattern.
+///
+/// Supported patterns:
+/// - `src/mcp/**` → any path starting with `src/mcp/`
+/// - `**/*.rs` → any path ending with `.rs`
+/// - `src/**/*.rs` → path starting with `src/` and ending with `.rs`
+/// - `*.rs` → any path ending with `.rs` (single `*` within a segment)
+/// - `foo.rs` → exact match
+fn simple_glob_match(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.replace('\\', "/");
+    let path = path.replace('\\', "/");
+
+    if !pattern.contains('*') {
+        // Exact match
+        return path == pattern;
+    }
+
+    if pattern.contains("**") {
+        // Split on first ** only
+        let parts: Vec<&str> = pattern.splitn(2, "**").collect();
+        let prefix = parts[0];
+        // Strip leading / from suffix since ** already matches the separator
+        let suffix = parts
+            .get(1)
+            .map(|s| s.strip_prefix('/').unwrap_or(s))
+            .unwrap_or("");
+
+        let mut p = path.as_str();
+        if !prefix.is_empty() && !p.starts_with(prefix) {
+            return false;
+        }
+        if !prefix.is_empty() {
+            p = &p[prefix.len()..];
+        }
+        // Strip leading / from remaining path (since ** can match empty + /)
+        if p.starts_with('/') {
+            p = &p[1..];
+        }
+        if suffix.is_empty() {
+            return true;
+        }
+        // The suffix may contain single * — match against the tail of the path.
+        // After **, the suffix describes constraints on the end of the path.
+        // For `**/*.rs`, the `*.rs` should match the last segment.
+        if suffix.contains('*') {
+            // Match suffix against the end of the path using segment-aware logic
+            return match_suffix_with_star(suffix, p);
+        }
+        p.ends_with(suffix)
+    } else {
+        // Pure single-star pattern (no **)
+        simple_glob_match_single_star(&pattern, &path)
+    }
+}
+
+/// Match a suffix pattern (containing `*`) against the end of a path.
+/// The `*` matches within a single segment only.
+///
+/// E.g., suffix `*.rs` matches `src/main.rs` because the last segment `main.rs` ends with `.rs`.
+fn match_suffix_with_star(suffix: &str, path: &str) -> bool {
+    // Find the segments in the suffix (split by /)
+    let suffix_parts: Vec<&str> = suffix.split('/').collect();
+    let path_segments: Vec<&str> = path.split('/').collect();
+
+    // The suffix must match the last N segments of the path
+    if suffix_parts.len() > path_segments.len() {
+        return false;
+    }
+
+    let path_tail = &path_segments[path_segments.len() - suffix_parts.len()..];
+
+    for (sp, pp) in suffix_parts.iter().zip(path_tail.iter()) {
+        if sp.contains('*') {
+            if !single_segment_match(sp, pp) {
+                return false;
+            }
+        } else if *sp != *pp {
+            return false;
+        }
+    }
+    true
+}
+
+/// Match a single segment pattern against a single segment path part.
+/// `*` matches any characters within the segment.
+fn single_segment_match(pattern: &str, segment: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut s = segment;
+
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !s.starts_with(part) {
+                return false;
+            }
+            s = &s[part.len()..];
+        } else if i == parts.len() - 1 {
+            if !s.ends_with(part) {
+                return false;
+            }
+        } else if let Some(pos) = s.find(part) {
+            s = &s[pos + part.len()..];
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Match a single-star glob pattern where `*` matches any characters except `/`.
+fn simple_glob_match_single_star(pattern: &str, path: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut p = path;
+
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // First part must be a prefix
+            if !p.starts_with(part) {
+                return false;
+            }
+            p = &p[part.len()..];
+        } else if i == parts.len() - 1 {
+            // Last part must be a suffix of the CURRENT segment (after *)
+            // * does not cross /, so find the end of the current segment
+            let seg_end = p.find('/').unwrap_or(p.len());
+            let segment = &p[..seg_end];
+            if !segment.ends_with(part) {
+                return false;
+            }
+        } else {
+            // Middle parts: find within remaining path but NOT across /
+            if let Some(pos) = p.find(part) {
+                let before = &p[..pos];
+                if before.contains('/') {
+                    return false;
+                }
+                p = &p[pos + part.len()..];
+            } else {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 // === Tool Router Implementation ===
@@ -420,12 +621,47 @@ impl CodesearchService {
     {
         if let Some(ref stores) = self.shared_stores {
             let store = stores.vector_store.read().await;
-            action(&store).context("Error reading from shared vector store")
-        } else {
-            let store = VectorStore::new(&self.db_path, self.dimensions)
-                .context("Error opening database")?;
-            action(&store).context("Error reading from vector store")
+            match action(&store) {
+                Ok(result) => return Ok(result),
+                Err(shared_err) => {
+                    tracing::error!(
+                        "Shared vector store read failed, falling back to standalone open: {:?}",
+                        shared_err
+                    );
+                }
+            }
+
+            // If MCP is in readonly mode, fallback must also use readonly open.
+            if stores.readonly {
+                let ro_store = VectorStore::open_readonly(&self.db_path, self.dimensions)
+                    .context("Error opening readonly database for read fallback")?;
+                return action(&ro_store)
+                    .context("Error reading from readonly fallback vector store");
+            }
         }
+
+        // Fallback path:
+        // - when shared stores are not available, OR
+        // - when shared read fails (e.g., transient readonly/shared handle issues)
+        let store = VectorStore::new(&self.db_path, self.dimensions)
+            .context("Error opening database for read fallback")?;
+        action(&store).context("Error reading from vector store")
+    }
+
+    /// Execute a read-only action against the FTS store, using shared stores when available
+    /// and falling back to opening a standalone FtsStore otherwise.
+    async fn with_fts_store_read<R, F>(&self, action: F) -> Result<R>
+    where
+        F: Fn(&FtsStore) -> Result<R>,
+    {
+        if let Some(ref stores) = self.shared_stores {
+            let fts = stores.fts_store.read().await;
+            return action(&fts);
+        }
+
+        // Fallback: open a new FtsStore
+        let fts_store = FtsStore::new(&self.db_path).context("Error opening FTS store")?;
+        action(&fts_store)
     }
 
     #[tool(
@@ -542,8 +778,8 @@ impl CodesearchService {
         );
 
         // Perform FTS search and fusion
-        let mut results = match FtsStore::new(&self.db_path) {
-            Ok(fts_store) => {
+        let mut results = match self
+            .with_fts_store_read(|fts_store| {
                 let fts_results = fts_store
                     .search(&request.query, limit * 3, structural_intent)
                     .unwrap_or_default();
@@ -580,6 +816,11 @@ impl CodesearchService {
                     )
                 };
 
+                Ok(fused)
+            })
+            .await
+        {
+            Ok(fused) => {
                 // Map FusedResult back to SearchResult
                 let chunk_to_result: std::collections::HashMap<
                     u32,
@@ -641,18 +882,11 @@ impl CodesearchService {
     ) -> Result<CallToolResult, McpError> {
         let structural_intent = detect_structural_intent(&request.query);
 
-        let fts_store = match FtsStore::new(&self.db_path) {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error opening FTS store: {}",
-                    e
-                ))]));
-            }
-        };
-
-        let mut fts_results = fts_store
-            .search(&request.query, limit * 3, structural_intent)
+        let mut fts_results = self
+            .with_fts_store_read(|fts_store| {
+                fts_store.search(&request.query, limit * 3, structural_intent)
+            })
+            .await
             .unwrap_or_default();
 
         // Also do exact search if identifiers detected
@@ -663,15 +897,21 @@ impl CodesearchService {
             .collect();
 
         for ident in identifiers {
-            if let Ok(exact) = fts_store.search_exact(ident, limit * 2, structural_intent) {
-                for r in exact {
-                    if let Some(existing_idx) = exact_positions.get(&r.chunk_id).copied() {
-                        fts_results[existing_idx].score =
-                            fts_results[existing_idx].score.max(r.score);
-                    } else {
-                        exact_positions.insert(r.chunk_id, fts_results.len());
-                        fts_results.push(r);
-                    }
+            let exact = match self
+                .with_fts_store_read(|fts_store| {
+                    fts_store.search_exact(ident, limit * 2, structural_intent)
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for r in exact {
+                if let Some(existing_idx) = exact_positions.get(&r.chunk_id).copied() {
+                    fts_results[existing_idx].score = fts_results[existing_idx].score.max(r.score);
+                } else {
+                    exact_positions.insert(r.chunk_id, fts_results.len());
+                    fts_results.push(r);
                 }
             }
         }
@@ -829,18 +1069,11 @@ impl CodesearchService {
             return Ok(CallToolResult::success(vec![Content::text(e)]));
         }
 
-        let fts_store = match FtsStore::new(&self.db_path) {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error opening FTS store: {}",
-                    e
-                ))]));
-            }
-        };
-
         // Search with extra results — we'll filter down
-        let fts_results = match fts_store.search(&request.symbol, limit * 3, None) {
+        let fts_results = match self
+            .with_fts_store_read(|fts_store| fts_store.search(&request.symbol, limit * 3, None))
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -934,17 +1167,10 @@ impl CodesearchService {
             return Ok(CallToolResult::success(vec![Content::text(e)]));
         }
 
-        let fts_store = match FtsStore::new(&self.db_path) {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error opening FTS store: {}",
-                    e
-                ))]));
-            }
-        };
-
-        let fts_results = match fts_store.search(&symbol, limit * 2, None) {
+        let fts_results = match self
+            .with_fts_store_read(|fts_store| fts_store.search(&symbol, limit * 2, None))
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1017,6 +1243,139 @@ impl CodesearchService {
     ) -> Result<CallToolResult, McpError> {
         self.find_usages_impl(request.symbol, request.limit.unwrap_or(20))
             .await
+    }
+
+    #[tool(
+        description = "Search code using literal/FTS matching without embeddings. Three modes: exact (default), regex (set regex=true), phrase (set phrase=true). Supports file_glob and language post-filters. Use this when you need fast exact text search, pattern matching, or phrase search. Does NOT require an embedding model."
+    )]
+    async fn literal_search(
+        &self,
+        Parameters(request): Parameters<LiteralSearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = request.limit.unwrap_or(20);
+        let output_format = request.format.as_deref().unwrap_or("json");
+
+        tracing::debug!(
+            "MCP literal_search: query='{}', regex={:?}, phrase={:?}, limit={}, file_glob={:?}, language={:?}, format={}",
+            request.query,
+            request.regex,
+            request.phrase,
+            limit,
+            request.file_glob,
+            request.language,
+            output_format
+        );
+
+        // Ensure database exists
+        if let Err(e) = self.ensure_database_exists() {
+            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        }
+
+        // Use shared FTS store when available, open standalone otherwise
+        let fts_results = match self
+            .with_fts_store_read(|fts_store| {
+                // Determine search mode and execute
+                if request.regex.unwrap_or(false) {
+                    fts_store.search_regex(&request.query, limit * 3)
+                } else if request.phrase.unwrap_or(false) {
+                    fts_store.search_phrase(&request.query, limit * 3)
+                } else {
+                    // Default: BM25 exact term search
+                    fts_store.search(&request.query, limit * 3, None)
+                }
+            })
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error searching: {}",
+                    e
+                ))]));
+            }
+        };
+
+        if fts_results.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No results found for '{}'. Try a different query or mode.",
+                request.query
+            ))]));
+        }
+
+        // Resolve chunk metadata and apply post-filters using shared store helper
+        let lang_filter = request.language.clone();
+        let glob_filter = request.file_glob.clone();
+        let items: Vec<LiteralSearchResultItem> = match self
+            .with_vector_store_read(|store| {
+                let items: Vec<LiteralSearchResultItem> = fts_results
+                    .iter()
+                    .filter_map(|fts_result| {
+                        let chunk = store.get_chunk(fts_result.chunk_id).ok()??;
+                        Some((chunk, fts_result.score))
+                    })
+                    .filter(|(chunk, _)| {
+                        // Language post-filter
+                        if let Some(ref lang) = lang_filter {
+                            let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                            if file_lang.name() != lang {
+                                return false;
+                            }
+                        }
+                        // file_glob post-filter
+                        if let Some(ref glob) = glob_filter {
+                            if !simple_glob_match(glob, &chunk.path) {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .take(limit)
+                    .map(|(chunk, score)| LiteralSearchResultItem {
+                        path: chunk.path,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        snippet: chunk.content,
+                        score,
+                        kind: if chunk.kind.is_empty() {
+                            None
+                        } else {
+                            Some(chunk.kind)
+                        },
+                        signature: chunk.signature.filter(|s| !s.is_empty()),
+                    })
+                    .collect();
+                Ok(items)
+            })
+            .await
+        {
+            Ok(items) => items,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error resolving search results: {}",
+                    e
+                ))]));
+            }
+        };
+
+        if items.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No results found for '{}' after applying filters.",
+                request.query
+            ))]));
+        }
+
+        // Format output
+        let output = if output_format == "grep" {
+            items
+                .iter()
+                .map(|item| format!("{}:{}:{}", item.path, item.start_line, item.snippet))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     #[tool(
@@ -1272,6 +1631,7 @@ TOOLS:
 | find_references   | DEPRECATED — alias for find_usages                    |
 | index_status      | Verify the index is ready                             |
 | find_databases    | Discover available indexes                            |
+| literal_search    | Fast exact text search (regex, phrase, BM25)          |
 
 Indexing is done via CLI: `codesearch index`. The MCP server cannot index.
 

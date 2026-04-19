@@ -106,6 +106,60 @@ pub struct DatabaseInfoResponse {
     pub model: String,
 }
 
+/// Request for literal/FTS-only search.
+///
+/// Three mutually exclusive modes (first match wins):
+/// - `regex=true` → regex search on indexed content
+/// - `phrase=true` → phrase query (tokens must appear in sequence)
+/// - default → exact term search (BM25)
+///
+/// No embedding service is used — this tool is fast and works without a model.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LiteralSearchRequest {
+    /// The search query (exact terms, regex pattern, or phrase depending on mode flags)
+    pub query: String,
+
+    /// Treat `query` as a regex pattern (e.g., "fn \\w+_handler")
+    pub regex: Option<bool>,
+
+    /// Treat `query` as a phrase (tokens must appear in sequence, e.g., "fn new")
+    pub phrase: Option<bool>,
+
+    /// Maximum number of results to return (default: 20)
+    pub limit: Option<usize>,
+
+    /// Only return results from files matching this glob pattern.
+    /// v1 supports prefix/suffix patterns with `*` and `**` (e.g., "src/mcp/**", "**/*.rs")
+    pub file_glob: Option<String>,
+
+    /// Only return results from files of this language (e.g., "Rust", "Python", "TypeScript")
+    pub language: Option<String>,
+
+    /// Output format: "json" (structured) or "grep" (file:line:snippet). Default: "json"
+    pub format: Option<String>,
+}
+
+/// Search result item - returned by literal_search
+#[derive(Debug, Serialize)]
+pub struct LiteralSearchResultItem {
+    /// File path (relative to project root)
+    pub path: String,
+    /// Start line number
+    pub start_line: usize,
+    /// End line number
+    pub end_line: usize,
+    /// Code snippet (content of the matching chunk)
+    pub snippet: String,
+    /// BM25 relevance score
+    pub score: f32,
+    /// Kind of chunk (e.g., "function", "struct", "class")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Signature (e.g., function signature) if available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
 /// Find databases response
 #[derive(Debug, Serialize)]
 pub struct FindDatabasesResponse {
