@@ -101,6 +101,16 @@ pub struct VectorStore {
     pub map_size_mb: usize,
 }
 
+/// Lightweight chunk metadata used for file-outline style navigation.
+#[derive(Debug, Clone)]
+pub struct ChunkMeta {
+    pub id: u32,
+    pub kind: String,
+    pub signature: Option<String>,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
 impl VectorStore {
     /// Create or open a vector store
     ///
@@ -711,6 +721,85 @@ impl VectorStore {
         Ok(self.chunks.get(&rtxn, &id)?)
     }
 
+    /// Get lightweight metadata for all chunks in a file.
+    ///
+    /// Path matching uses normalized path strings to avoid Windows path-format
+    /// mismatches (`\\?\` prefix, slash direction differences).
+    ///
+    /// Deduplicates historical snapshot duplicates, keeping the highest
+    /// chunk_id (most recent) per unique logical chunk:
+    /// - When `signature` is present: dedup by `(kind, signature)` — the
+    ///   signature identifies the logical entity regardless of line drift.
+    /// - When `signature` is `None`: dedup by `(kind, start_line, end_line)`
+    ///   — positional identity is the best we have for unnamed blocks.
+    ///
+    /// This is a defensive measure — the indexer should delete stale chunks
+    /// before re-inserting, but incremental indexing bugs can leave orphans.
+    ///
+    /// TODO: For large indexes (100k+ chunks), the linear scan is O(n).
+    /// Consider adding a path-based secondary index for production use at scale.
+    pub fn chunks_for_file(&self, path: &str) -> Result<Vec<ChunkMeta>> {
+        use std::collections::HashMap;
+
+        let rtxn = self.env.read_txn()?;
+        let needle = crate::cache::normalize_path_str(path);
+        // Two maps: one keyed by signature (for named chunks), one by line
+        // range (for unnamed blocks).  This avoids cross-contamination where
+        // a null-sig entry could collide with a named entry.
+        let mut by_sig: HashMap<(String, String), ChunkMeta> = HashMap::new();
+        let mut by_range: HashMap<(String, usize, usize), ChunkMeta> = HashMap::new();
+
+        for result in self.chunks.iter(&rtxn)? {
+            let (id, meta) = result?;
+            let chunk_path = crate::cache::normalize_path_str(&meta.path);
+            if chunk_path == needle {
+                let meta = ChunkMeta {
+                    id,
+                    kind: meta.kind,
+                    signature: meta.signature,
+                    start_line: meta.start_line,
+                    end_line: meta.end_line,
+                };
+                if let Some(ref sig) = meta.signature {
+                    let key = (meta.kind.clone(), sig.clone());
+                    by_sig
+                        .entry(key)
+                        .and_modify(|existing| {
+                            if meta.id > existing.id {
+                                existing.id = meta.id;
+                            }
+                        })
+                        .or_insert(meta);
+                } else {
+                    let key = (meta.kind.clone(), meta.start_line, meta.end_line);
+                    by_range
+                        .entry(key)
+                        .and_modify(|existing| {
+                            if meta.id > existing.id {
+                                existing.id = meta.id;
+                            }
+                        })
+                        .or_insert(meta);
+                }
+            }
+        }
+
+        let mut out: Vec<ChunkMeta> = by_sig
+            .into_values()
+            .chain(by_range.into_values())
+            .collect();
+        out.sort_by_key(|c| c.start_line);
+        Ok(out)
+    }
+
+    /// Get the stored embedding vector for a chunk id.
+    pub fn get_embedding(&self, id: u32) -> Result<Option<Vec<f32>>> {
+        let rtxn = self.env.read_txn()?;
+        let reader = Reader::open(&rtxn, 0, self.vectors)?;
+        let vector = reader.item_vector(&rtxn, id)?;
+        Ok(vector.map(|v| v.to_vec()))
+    }
+
     /// Get a chunk as SearchResult (for hybrid search)
     pub fn get_chunk_as_result(&self, id: u32) -> Result<Option<SearchResult>> {
         let rtxn = self.env.read_txn()?;
@@ -1025,5 +1114,76 @@ mod tests {
             let metadata = store.get_chunk(0).unwrap();
             assert!(metadata.is_some());
         }
+    }
+
+    #[test]
+    fn test_chunks_for_file_returns_sorted_candidates_by_filter() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let chunks = vec![
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn a() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    "src/a.rs".to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ),
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn b() {}".to_string(),
+                    2,
+                    3,
+                    ChunkKind::Function,
+                    "src/a.rs".to_string(),
+                ),
+                vec![0.9, 0.1, 0.0, 0.0],
+            ),
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn c() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    "src/other.rs".to_string(),
+                ),
+                vec![0.0, 1.0, 0.0, 0.0],
+            ),
+        ];
+
+        store.insert_chunks(chunks).unwrap();
+
+        let metas = store.chunks_for_file("src/a.rs").unwrap();
+        assert_eq!(metas.len(), 2);
+        assert!(metas.iter().all(|m| m.kind == "Function"));
+    }
+
+    #[test]
+    fn test_get_embedding_returns_vector_after_build() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let chunks = vec![EmbeddedChunk::new(
+            Chunk::new(
+                "fn emb() {}".to_string(),
+                0,
+                1,
+                ChunkKind::Function,
+                "src/emb.rs".to_string(),
+            ),
+            vec![1.0, 0.0, 0.0, 0.0],
+        )];
+
+        store.insert_chunks(chunks).unwrap();
+        store.build_index().unwrap();
+
+        let emb = store.get_embedding(0).unwrap();
+        assert!(emb.is_some());
+        assert_eq!(emb.unwrap().len(), 4);
     }
 }

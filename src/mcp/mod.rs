@@ -200,6 +200,7 @@ mod tests {
     fn test_normal_response_omits_confidence_fields() {
         let response = super::SemanticSearchResponse {
             results: vec![super::SearchResultItem {
+                chunk_id: 1,
                 path: "test.rs".to_string(),
                 start_line: 1,
                 end_line: 10,
@@ -734,6 +735,49 @@ mod tests {
     }
 
     #[test]
+    fn test_file_outline_request_accepts_project_stub() {
+        let json = r#"{"path":"src/mcp/mod.rs","project":"ignored"}"#;
+        let req: super::FileOutlineRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.path, "src/mcp/mod.rs");
+        assert_eq!(req.project.as_deref(), Some("ignored"));
+    }
+
+    #[test]
+    fn test_get_chunk_request_accepts_project_stub() {
+        let json = r#"{"chunk_id":42,"context_lines":25,"project":"ignored"}"#;
+        let req: super::GetChunkRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.chunk_id, 42);
+        assert_eq!(req.context_lines, Some(25));
+        assert_eq!(req.project.as_deref(), Some("ignored"));
+    }
+
+    #[test]
+    fn test_find_imports_request_accepts_project_stub() {
+        let json = r#"{"path":"src/lib.rs","project":"ignored"}"#;
+        let req: super::FindImportsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.path, "src/lib.rs");
+        assert_eq!(req.project.as_deref(), Some("ignored"));
+    }
+
+    #[test]
+    fn test_find_dependents_request_accepts_project_stub() {
+        let json = r#"{"symbol_or_path":"auth","limit":10,"project":"ignored"}"#;
+        let req: super::FindDependentsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.symbol_or_path, "auth");
+        assert_eq!(req.limit, Some(10));
+        assert_eq!(req.project.as_deref(), Some("ignored"));
+    }
+
+    #[test]
+    fn test_similar_chunks_request_accepts_project_stub() {
+        let json = r#"{"chunk_id":7,"limit":5,"project":"ignored"}"#;
+        let req: super::SimilarChunksRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.chunk_id, 7);
+        assert_eq!(req.limit, Some(5));
+        assert_eq!(req.project.as_deref(), Some("ignored"));
+    }
+
+    #[test]
     fn test_semantic_search_request_mode_serde() {
         let json = r#"{"query":"auth handler","mode":"lexical","limit":5}"#;
         let req: super::SemanticSearchRequest = serde_json::from_str(json).unwrap();
@@ -781,6 +825,7 @@ mod tests {
     fn test_semantic_search_response_with_results() {
         let response = super::SemanticSearchResponse {
             results: vec![super::SearchResultItem {
+                chunk_id: 1,
                 path: "test.rs".to_string(),
                 start_line: 1,
                 end_line: 10,
@@ -812,6 +857,47 @@ mod tests {
         assert!(json.contains("\"suggested_tool\":\"find_definition\""));
         assert!(json.contains("\"results\":[]"));
     }
+
+    #[test]
+    fn test_match_line_for_literal_plain_and_fallback() {
+        let content = "first line\nsecond has needle\nthird";
+        let matched = super::match_line_for_literal(content, "needle", None);
+        assert!(matched.is_some());
+        let (offset, snippet) = matched.unwrap();
+        assert_eq!(offset, 1);
+        assert!(snippet.contains("needle"));
+
+        let not_found = super::match_line_for_literal(content, "absent", None);
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_match_line_for_literal_regex() {
+        let content = "alpha\nbeta123\ngamma";
+        let re = regex::Regex::new(r"beta\d+").unwrap();
+        let matched = super::match_line_for_literal(content, "beta", Some(&re));
+        assert!(matched.is_some());
+        let (offset, snippet) = matched.unwrap();
+        assert_eq!(offset, 1);
+        assert!(snippet.contains("beta123"));
+    }
+
+    #[test]
+    fn test_parse_import_lines_detects_common_forms() {
+        let content = "use std::fs;\nimport os\nfrom pkg import thing\n#include <stdio.h>\nconst x = require('x')\nlet y = 1;";
+        let imports = super::parse_import_lines(content, 10);
+        assert_eq!(imports.len(), 5);
+        assert_eq!(imports[0].kind, "use");
+        assert_eq!(imports[0].line, 10);
+        assert_eq!(imports[1].kind, "import");
+        assert_eq!(imports[1].line, 11);
+        assert_eq!(imports[2].kind, "import");
+        assert_eq!(imports[2].line, 12);
+        assert_eq!(imports[3].kind, "include");
+        assert_eq!(imports[3].line, 13);
+        assert_eq!(imports[4].kind, "require");
+        assert_eq!(imports[4].line, 14);
+    }
 }
 
 pub mod types;
@@ -825,13 +911,15 @@ use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_
 use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
 use crate::vectordb::VectorStore;
 use anyhow::{Context, Result};
+use regex::Regex;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -1079,6 +1167,106 @@ fn simple_glob_match_single_star(pattern: &str, path: &str) -> bool {
     true
 }
 
+fn normalize_tool_path(path: &str, project_root: &Path) -> String {
+    let p = Path::new(path);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        project_root.join(p)
+    };
+    crate::cache::normalize_path_str(resolved.to_string_lossy().as_ref())
+}
+
+fn is_import_kind(kind: &str) -> bool {
+    matches!(kind, "Import" | "Use" | "Require" | "Include" | "Imports")
+}
+
+fn truncate_line_around_match(line: &str, match_start_byte: usize, max_chars: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= max_chars {
+        return line.to_string();
+    }
+
+    let match_char_idx = line[..match_start_byte.min(line.len())].chars().count();
+    let half = max_chars / 2;
+    let mut start = match_char_idx.saturating_sub(half);
+    let end = (start + max_chars).min(chars.len());
+    if end - start < max_chars {
+        start = end.saturating_sub(max_chars);
+    }
+
+    chars[start..end].iter().collect()
+}
+
+fn match_line_for_literal(content: &str, query: &str, regex: Option<&Regex>) -> Option<(usize, String)> {
+    if query.is_empty() {
+        return None;
+    }
+
+    for (idx, line) in content.lines().enumerate() {
+        if let Some(re) = regex {
+            if let Some(m) = re.find(line) {
+                let snippet = truncate_line_around_match(line, m.start(), 200);
+                return Some((idx, snippet));
+            }
+        } else if let Some(pos) = line.find(query) {
+            let snippet = truncate_line_around_match(line, pos, 200);
+            return Some((idx, snippet));
+        }
+    }
+
+    None
+}
+
+/// Parse individual import statements from chunk content.
+///
+/// Handles: `use`, `import`, `from ... import`, `#include`, `require(...)`.
+/// Limitation: multi-line imports (e.g. Python `from X import (\n  a,\n  b\n)`)
+/// are only partially captured — the first line is matched, continuation lines
+/// are missed. Acceptable for v1; a proper AST-based approach would require
+/// changes to the chunker.
+fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
+    let mut items = Vec::new();
+
+    for (offset, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parsed = if let Some(rest) = trimmed.strip_prefix("use ") {
+            Some(("use".to_string(), rest.trim().trim_end_matches(';').to_string()))
+        } else if let Some(rest) = trimmed.strip_prefix("import ") {
+            Some(("import".to_string(), rest.trim().trim_end_matches(';').to_string()))
+        } else if let Some(rest) = trimmed.strip_prefix("from ") {
+            Some(("import".to_string(), rest.trim().trim_end_matches(';').to_string()))
+        } else if trimmed.starts_with("#include") {
+            Some((
+                "include".to_string(),
+                trimmed
+                    .trim_start_matches("#include")
+                    .trim()
+                    .trim_end_matches(';')
+                    .to_string(),
+            ))
+        } else if trimmed.contains("require(") {
+            Some(("require".to_string(), trimmed.to_string()))
+        } else {
+            None
+        };
+
+        if let Some((kind, imported)) = parsed {
+            items.push(ImportItem {
+                imported,
+                line: start_line + offset,
+                kind,
+            });
+        }
+    }
+
+    items
+}
+
 // === Tool Router Implementation ===
 
 #[tool_router]
@@ -1220,7 +1408,7 @@ impl CodesearchService {
     }
 
     #[tool(
-        description = "Hybrid code search over tree-sitter AST chunks: vector embeddings + Tantivy FTS + exact-identifier boosting, fused with RRF.\n\nUSE FOR:\n- Conceptual queries (\"where is auth handled\", \"how do we log errors\")\n- Identifier lookups — function/class/variable names are boosted via exact-match FTS\n- Mixed natural-language + symbol queries\n\nDO NOT USE FOR:\n- Finding a symbol's definition specifically — use `find_definition`\n- Finding all call-sites of a symbol — use `find_usages`\n\nOPTIONAL `mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (compact=true). Set compact=false for inline content."
+        description = "Hybrid code search over tree-sitter AST chunks: vector embeddings + Tantivy FTS + exact-identifier boosting, fused with RRF.\n\nUSE FOR:\n- Conceptual queries (\"where is auth handled\", \"how do we log errors\")\n- Identifier lookups — function/class/variable names are boosted via exact-match FTS\n- Mixed natural-language + symbol queries\n\nDO NOT USE FOR:\n- Finding a symbol's definition specifically — use `find_definition`\n- Finding all call-sites of a symbol — use `find_usages`\n\nOPTIONAL `mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (compact=true). Prefer `get_chunk` to read full body/context for a selected result."
     )]
     async fn semantic_search(
         &self,
@@ -1516,6 +1704,7 @@ impl CodesearchService {
                 }
             })
             .map(|r| SearchResultItem {
+                chunk_id: r.id,
                 path: r.path,
                 start_line: r.start_line,
                 end_line: r.end_line,
@@ -1635,6 +1824,7 @@ impl CodesearchService {
                                 }
                             }
                             Some(ReferenceItem {
+                                chunk_id: fts_result.chunk_id,
                                 path: chunk.path,
                                 line: chunk.start_line,
                                 kind: chunk.kind,
@@ -1727,6 +1917,7 @@ impl CodesearchService {
                                 return None;
                             }
                             Some(ReferenceItem {
+                                chunk_id: fts_result.chunk_id,
                                 path: chunk.path,
                                 line: chunk.start_line,
                                 kind: chunk.kind,
@@ -1772,6 +1963,412 @@ impl CodesearchService {
     ) -> Result<CallToolResult, McpError> {
         self.find_usages_impl(request.symbol, request.limit.unwrap_or(20))
             .await
+    }
+
+    #[tool(
+        description = "List all indexed top-level symbols in a file — kind, signature, and line range, no body content.\nUse this to understand a file's structure before deciding which chunks to read.\nMuch cheaper than reading the full file.\n\nUSE FOR: \"what functions are in auth.rs\", \"show me the structure of this module\".\nDO NOT USE FOR: finding where a symbol is defined across the codebase → use `find_definition`."
+    )]
+    async fn file_outline(
+        &self,
+        Parameters(request): Parameters<FileOutlineRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let _project = request.project.as_deref();
+        if let Err(e) = self.ensure_database_exists() {
+            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        }
+
+        let normalized = normalize_tool_path(&request.path, &self.project_path);
+        let items = match self
+            .with_vector_store_read(|store| {
+                let mut out: Vec<FileOutlineItem> = store
+                    .chunks_for_file(&normalized)?
+                    .into_iter()
+                    .map(|c| FileOutlineItem {
+                        chunk_id: c.id,
+                        kind: c.kind,
+                        signature: c.signature,
+                        start_line: c.start_line,
+                        end_line: c.end_line,
+                    })
+                    .collect();
+                out.sort_by_key(|i| i.start_line);
+                Ok(out)
+            })
+            .await
+        {
+            Ok(items) => items,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error reading outline: {}",
+                    e
+                ))]));
+            }
+        };
+
+        if items.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No indexed chunks found for path. Verify the file is within the project root and the index is up to date.".to_string(),
+            )]));
+        }
+
+        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Retrieve the full content of a specific chunk by its ID, plus optional surrounding lines for context.\nUse this after semantic_search or file_outline to read the actual code without loading the whole file.\n\nUSE FOR: reading a specific function/class body after finding it via search.\nSet context_lines (default 0, max 20) to include lines before and after the chunk."
+    )]
+    async fn get_chunk(
+        &self,
+        Parameters(request): Parameters<GetChunkRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let _project = request.project.as_deref();
+        if let Err(e) = self.ensure_database_exists() {
+            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        }
+
+        let mut clamped = false;
+        let mut context_lines = request.context_lines.unwrap_or(0);
+        if context_lines > 20 {
+            context_lines = 20;
+            clamped = true;
+        }
+
+        let chunk = match self
+            .with_vector_store_read(|store| store.get_chunk(request.chunk_id))
+            .await
+        {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Chunk {} not found. Verify the chunk_id and index state.",
+                    request.chunk_id
+                ))]));
+            }
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error loading chunk: {}",
+                    e
+                ))]));
+            }
+        };
+
+        let mut context_before = None;
+        let mut context_after = None;
+        let mut note = None;
+
+        if context_lines > 0 {
+            // Resolve relative chunk paths against project root (not process CWD).
+            let source_path = if Path::new(&chunk.path).is_absolute() {
+                PathBuf::from(&chunk.path)
+            } else {
+                self.project_path.join(&chunk.path)
+            };
+            match tokio::fs::read_to_string(&source_path).await {
+                Ok(src) => {
+                    let lines: Vec<&str> = src.lines().collect();
+                    if !lines.is_empty() {
+                        let before_start = chunk.start_line.saturating_sub(context_lines);
+                        let before_end = chunk.start_line.min(lines.len());
+                        if before_start < before_end {
+                            context_before = Some(lines[before_start..before_end].join("\n"));
+                        }
+
+                        let after_start = chunk.end_line.min(lines.len());
+                        let after_end = (chunk.end_line + context_lines).min(lines.len());
+                        if after_start < after_end {
+                            context_after = Some(lines[after_start..after_end].join("\n"));
+                        }
+                    }
+                }
+                Err(_) => {
+                    note = Some(
+                        "source file not readable, returning indexed content only".to_string(),
+                    );
+                }
+            }
+        }
+
+        let response = GetChunkResponse {
+            chunk_id: request.chunk_id,
+            path: chunk.path,
+            start_line: chunk.start_line,
+            end_line: chunk.end_line,
+            kind: chunk.kind,
+            signature: chunk.signature,
+            content: chunk.content,
+            context_before,
+            context_after,
+            context_lines_clamped: if clamped { Some(true) } else { None },
+            note,
+        };
+
+        let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "List all imports/dependencies declared in a source file.\nUses tree-sitter AST data already present in the index — no re-parsing needed.\n\nUSE FOR: \"what does auth.rs depend on\", understanding a file's dependencies before refactoring.\nDO NOT USE FOR: finding who imports this file → use `find_dependents`."
+    )]
+    async fn find_imports(
+        &self,
+        Parameters(request): Parameters<FindImportsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let _project = request.project.as_deref();
+        if let Err(e) = self.ensure_database_exists() {
+            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        }
+
+        // Import statements are currently represented mostly as gap-classified
+        // `Imports` chunks (not always as per-statement AST definition chunks).
+        // We therefore parse lines inside import-like chunks and use an FTS
+        // fallback when no import-like chunks exist for the file.
+        let normalized = normalize_tool_path(&request.path, &self.project_path);
+
+        let mut items = match self
+            .with_vector_store_read(|store| {
+                let mut out = Vec::new();
+                for meta in store.chunks_for_file(&normalized)? {
+                    if !is_import_kind(&meta.kind) {
+                        continue;
+                    }
+                    if let Some(chunk) = store.get_chunk(meta.id)? {
+                        out.extend(parse_import_lines(&chunk.content, chunk.start_line));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+        {
+            Ok(items) => items,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error reading imports: {}",
+                    e
+                ))]));
+            }
+        };
+
+        if items.is_empty() {
+            // Fallback: no import-kind chunks found for this file. Broaden the
+            // search to common import keywords and filter to the target path.
+            // Limitation: this only finds chunks containing these literal words;
+            // language-specific import forms that lack these keywords will be missed.
+            let fallback_limit = 40usize;
+            let mut all_hits: Vec<(u32, f32)> = Vec::new();
+            let mut seen_ids: HashSet<u32> = HashSet::new();
+
+            for keyword in &["import", "use", "from", "require", "include"] {
+                let hits = self
+                    .with_fts_store_read(|fts_store| {
+                        fts_store.search_exact(keyword, fallback_limit, None)
+                    })
+                    .await
+                    .unwrap_or_default();
+                for h in hits {
+                    if seen_ids.insert(h.chunk_id) {
+                        all_hits.push((h.chunk_id, h.score));
+                    }
+                }
+            }
+
+            items = self
+                .with_vector_store_read(|store| {
+                    let mut out = Vec::new();
+                    for (chunk_id, _) in &all_hits {
+                        if let Some(chunk) = store.get_chunk(*chunk_id)? {
+                            if crate::cache::normalize_path_str(&chunk.path) == normalized {
+                                out.extend(parse_import_lines(&chunk.content, chunk.start_line));
+                            }
+                        }
+                    }
+                    Ok(out)
+                })
+                .await
+                .unwrap_or_default();
+        }
+
+        items.sort_by_key(|i| i.line);
+        if items.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No import chunks found. The index may not include import statements for this language, or the file has no imports.".to_string(),
+            )]));
+        }
+
+        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Find all files that import or depend on a given module, file path, or symbol.\nEssential for impact analysis: \"if I change this module, what else breaks?\"\n\nUSE FOR: refactoring impact analysis, understanding who depends on a module.\nDO NOT USE FOR: finding usages of a specific function call → use `find_usages`."
+    )]
+    async fn find_dependents(
+        &self,
+        Parameters(request): Parameters<FindDependentsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let _project = request.project.as_deref();
+        if let Err(e) = self.ensure_database_exists() {
+            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        }
+
+        let limit = request.limit.unwrap_or(20).min(200);
+        let high_limit = (limit * 10).max(200); // generous budget for filtering
+
+        // Two-phase search strategy:
+        // 1. `search_exact` — precise term match on signature+content. Better at
+        //    finding specific identifiers inside import regions without drowning
+        //    in noise from non-import chunks.
+        // 2. If that yields no import-kind results, fall back to `search`
+        //    (QueryParser, broader tokenization) with a large limit.
+        //
+        // Limitation: the chunker does not emit per-statement AST import chunks;
+        // imports are gap-classified as `Imports` kind. Chunks whose kind doesn't
+        // match `is_import_kind()` will be missed regardless of search method.
+        let exact_hits = self
+            .with_fts_store_read(|fts_store| {
+                fts_store.search_exact(&request.symbol_or_path, high_limit, None)
+            })
+            .await
+            .unwrap_or_default();
+
+        let fts_results = if exact_hits.is_empty() {
+            self.with_fts_store_read(|fts_store| {
+                fts_store.search(&request.symbol_or_path, high_limit, None)
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            exact_hits
+        };
+
+        let mut items = match self
+            .with_vector_store_read(|store| {
+                let mut seen_paths = HashSet::new();
+                let mut out = Vec::new();
+                for f in &fts_results {
+                    if let Some(chunk) = store.get_chunk(f.chunk_id)? {
+                        if !is_import_kind(&chunk.kind) {
+                            continue;
+                        }
+
+                        let norm = crate::cache::normalize_path_str(&chunk.path);
+                        if !seen_paths.insert(norm) {
+                            continue;
+                        }
+
+                        // Extract the specific import line(s) that mention the
+                        // symbol, rather than returning the entire chunk content.
+                        let import_statement = if chunk
+                            .content
+                            .to_lowercase()
+                            .contains(&request.symbol_or_path.to_lowercase())
+                        {
+                            chunk
+                                .content
+                                .lines()
+                                .find(|l| {
+                                    l.to_lowercase()
+                                        .contains(&request.symbol_or_path.to_lowercase())
+                                })
+                                .unwrap_or("")
+                                .to_string()
+                        } else {
+                            chunk
+                                .signature
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(chunk.content.lines().next().unwrap_or("").to_string())
+                        };
+
+                        out.push(DependentItem {
+                            path: chunk.path,
+                            line: chunk.start_line,
+                            import_statement,
+                        });
+
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .await
+        {
+            Ok(items) => items,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error resolving dependents: {}",
+                    e
+                ))]));
+            }
+        };
+
+        items.sort_by(|a, b| a.path.cmp(&b.path));
+        if items.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "No dependent files found for '{}'.",
+                request.symbol_or_path
+            ))]));
+        }
+
+        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        description = "Find chunks semantically similar to a given chunk (by chunk_id).\nUses the chunk's existing embedding — no new embedding call needed.\n\nUSE FOR: finding duplicate implementations, similar patterns, related code across the codebase.\nDO NOT USE FOR: finding where a symbol is used → use `find_usages`."
+    )]
+    async fn similar_chunks(
+        &self,
+        Parameters(request): Parameters<SimilarChunksRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let _project = request.project.as_deref();
+        if let Err(e) = self.ensure_database_exists() {
+            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        }
+
+        let limit = request.limit.unwrap_or(5).min(20);
+
+        let results = match self
+            .with_vector_store_read(|store| {
+                let embedding = store
+                    .get_embedding(request.chunk_id)?
+                    .ok_or_else(|| anyhow::anyhow!("embedding not found for chunk_id {}", request.chunk_id))?;
+
+                let mut neighbors = store.search(&embedding, limit + 1)?;
+                neighbors.retain(|r| r.id != request.chunk_id);
+                neighbors.truncate(limit);
+
+                let items = neighbors
+                    .into_iter()
+                    .map(|r| SearchResultItem {
+                        chunk_id: r.id,
+                        path: r.path,
+                        start_line: r.start_line,
+                        end_line: r.end_line,
+                        kind: r.kind,
+                        score: r.score,
+                        signature: r.signature,
+                        content: None,
+                        context_prev: None,
+                        context_next: None,
+                    })
+                    .collect::<Vec<_>>();
+                Ok(items)
+            })
+            .await
+        {
+            Ok(items) => items,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error finding similar chunks: {}",
+                    e
+                ))]));
+            }
+        };
+
+        let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(
@@ -1834,6 +2431,11 @@ impl CodesearchService {
         // Resolve chunk metadata and apply post-filters using shared store helper
         let lang_filter = request.language.clone();
         let glob_filter = request.file_glob.clone();
+        let snippet_regex = if request.regex.unwrap_or(false) {
+            Regex::new(&request.query).ok()
+        } else {
+            None
+        };
         // Pre-compute normalized project root for stripping absolute paths in glob matching
         let project_root_normalized = {
             let root = crate::cache::normalize_path_str(self.project_path.to_str().unwrap_or(""));
@@ -1869,18 +2471,35 @@ impl CodesearchService {
                         true
                     })
                     .take(limit)
-                    .map(|(chunk, score)| LiteralSearchResultItem {
-                        path: chunk.path,
-                        start_line: chunk.start_line,
-                        end_line: chunk.end_line,
-                        snippet: chunk.content,
-                        score,
-                        kind: if chunk.kind.is_empty() {
-                            None
-                        } else {
-                            Some(chunk.kind)
-                        },
-                        signature: chunk.signature.filter(|s| !s.is_empty()),
+                    .map(|(chunk, score)| {
+                        // Prefer the first line that actually matches the query.
+                        // Edge case: if FTS tokenization matched across boundaries and no
+                        // concrete line contains the literal/regex, fall back to first line.
+                        let (match_offset, snippet) = match_line_for_literal(
+                            &chunk.content,
+                            &request.query,
+                            snippet_regex.as_ref(),
+                        )
+                        .unwrap_or_else(|| {
+                            (
+                                0,
+                                chunk.content.lines().next().unwrap_or("").to_string(),
+                            )
+                        });
+
+                        LiteralSearchResultItem {
+                            path: chunk.path,
+                            start_line: chunk.start_line + match_offset,
+                            end_line: chunk.end_line,
+                            snippet,
+                            score,
+                            kind: if chunk.kind.is_empty() {
+                                None
+                            } else {
+                                Some(chunk.kind)
+                            },
+                            signature: chunk.signature.filter(|s| !s.is_empty()),
+                        }
                     })
                     .collect();
                 Ok(items)
