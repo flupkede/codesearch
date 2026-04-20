@@ -2212,15 +2212,34 @@ impl CodesearchService {
         }
 
         let limit = request.limit.unwrap_or(20).min(200);
-        // Note: the FTS search is a generic text query. We then filter to
-        // import-kind chunks only. This means if the chunker doesn't classify
-        // a file's import region as an import kind, valid dependents will be
-        // missed. The gap-classified `Imports` kind is currently the primary
-        // source of matches; per-statement AST import chunks do not exist.
-        let fts_results = self
-            .with_fts_store_read(|fts_store| fts_store.search(&request.symbol_or_path, limit * 4, None))
+        let high_limit = (limit * 10).max(200); // generous budget for filtering
+
+        // Two-phase search strategy:
+        // 1. `search_exact` — precise term match on signature+content. Better at
+        //    finding specific identifiers inside import regions without drowning
+        //    in noise from non-import chunks.
+        // 2. If that yields no import-kind results, fall back to `search`
+        //    (QueryParser, broader tokenization) with a large limit.
+        //
+        // Limitation: the chunker does not emit per-statement AST import chunks;
+        // imports are gap-classified as `Imports` kind. Chunks whose kind doesn't
+        // match `is_import_kind()` will be missed regardless of search method.
+        let exact_hits = self
+            .with_fts_store_read(|fts_store| {
+                fts_store.search_exact(&request.symbol_or_path, high_limit, None)
+            })
             .await
             .unwrap_or_default();
+
+        let fts_results = if exact_hits.is_empty() {
+            self.with_fts_store_read(|fts_store| {
+                fts_store.search(&request.symbol_or_path, high_limit, None)
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            exact_hits
+        };
 
         let mut items = match self
             .with_vector_store_read(|store| {
@@ -2237,13 +2256,33 @@ impl CodesearchService {
                             continue;
                         }
 
+                        // Extract the specific import line(s) that mention the
+                        // symbol, rather than returning the entire chunk content.
+                        let import_statement = if chunk
+                            .content
+                            .to_lowercase()
+                            .contains(&request.symbol_or_path.to_lowercase())
+                        {
+                            chunk
+                                .content
+                                .lines()
+                                .find(|l| {
+                                    l.to_lowercase()
+                                        .contains(&request.symbol_or_path.to_lowercase())
+                                })
+                                .unwrap_or("")
+                                .to_string()
+                        } else {
+                            chunk
+                                .signature
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(chunk.content.lines().next().unwrap_or("").to_string())
+                        };
+
                         out.push(DependentItem {
                             path: chunk.path,
                             line: chunk.start_line,
-                            import_statement: chunk
-                                .signature
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or(chunk.content.lines().next().unwrap_or("").to_string()),
+                            import_statement,
                         });
 
                         if out.len() >= limit {
