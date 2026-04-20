@@ -44,6 +44,7 @@ pub struct FindReferencesRequest {
 /// Search result item - returned by semantic_search
 #[derive(Debug, Serialize)]
 pub struct SearchResultItem {
+    pub chunk_id: u32,
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -62,6 +63,8 @@ pub struct SearchResultItem {
 /// Reference/call site item - returned by find_references
 #[derive(Debug, Serialize)]
 pub struct ReferenceItem {
+    /// Chunk ID of the containing chunk
+    pub chunk_id: u32,
     /// File path containing the reference
     pub path: String,
     /// Line number of the reference
@@ -144,11 +147,11 @@ pub struct LiteralSearchRequest {
 pub struct LiteralSearchResultItem {
     /// File path (relative to project root)
     pub path: String,
-    /// Start line number
+    /// Start line number (matching line when available)
     pub start_line: usize,
     /// End line number
     pub end_line: usize,
-    /// Code snippet (content of the matching chunk)
+    /// Code snippet (the first matching line when available)
     pub snippet: String,
     /// BM25 relevance score
     pub score: f32,
@@ -200,4 +203,98 @@ pub struct FindUsagesRequest {
     pub symbol: String,
     /// Maximum number of results to return (default: 20)
     pub limit: Option<usize>,
+}
+
+/// Request for file outline navigation
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FileOutlineRequest {
+    /// File path, relative to project root or absolute.
+    pub path: String,
+    /// Forward-compat stub — ignored in this branch.
+    pub project: Option<String>,
+}
+
+/// File outline entry
+#[derive(Debug, Serialize)]
+pub struct FileOutlineItem {
+    pub chunk_id: u32,
+    pub kind: String,
+    pub signature: Option<String>,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+/// Request to fetch a chunk by ID
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetChunkRequest {
+    /// chunk_id as returned by semantic_search, file_outline, find_definition, or find_usages.
+    pub chunk_id: u32,
+    /// Lines of surrounding context to include (default: 0, max: 20).
+    pub context_lines: Option<usize>,
+    /// Forward-compat stub — ignored in this branch.
+    pub project: Option<String>,
+}
+
+/// Response payload for get_chunk
+#[derive(Debug, Serialize)]
+pub struct GetChunkResponse {
+    pub chunk_id: u32,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: String,
+    pub signature: Option<String>,
+    pub content: String,
+    /// Lines before the chunk start (up to context_lines).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_before: Option<String>,
+    /// Lines after the chunk end (up to context_lines).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_after: Option<String>,
+    /// True when requested context_lines was clamped to the max (20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_lines_clamped: Option<bool>,
+    /// Optional informational note (e.g. source file unreadable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Request to find imports in a file
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindImportsRequest {
+    pub path: String,
+    pub project: Option<String>,
+}
+
+/// Import/dependency item found in a file
+#[derive(Debug, Serialize)]
+pub struct ImportItem {
+    pub imported: String,
+    pub line: usize,
+    pub kind: String,
+}
+
+/// Request to find files depending on a symbol/path
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindDependentsRequest {
+    /// Module name, file path, or symbol to find dependents of.
+    pub symbol_or_path: String,
+    pub limit: Option<usize>,
+    pub project: Option<String>,
+}
+
+/// File/path dependent item
+#[derive(Debug, Serialize)]
+pub struct DependentItem {
+    pub path: String,
+    pub line: usize,
+    pub import_statement: String,
+}
+
+/// Request to find semantically similar chunks for a chunk_id
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SimilarChunksRequest {
+    pub chunk_id: u32,
+    pub limit: Option<usize>,
+    pub project: Option<String>,
 }
