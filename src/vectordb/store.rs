@@ -726,27 +726,50 @@ impl VectorStore {
     /// Path matching uses normalized path strings to avoid Windows path-format
     /// mismatches (`\\?\` prefix, slash direction differences).
     ///
+    /// Deduplicates historical snapshot duplicates by `(kind, signature,
+    /// start_line, end_line)`, keeping the highest chunk_id (most recent).
+    /// This is a defensive measure — the indexer should delete stale chunks
+    /// before re-inserting, but incremental indexing bugs can leave orphans.
+    ///
     /// TODO: For large indexes (100k+ chunks), the linear scan is O(n).
     /// Consider adding a path-based secondary index for production use at scale.
     pub fn chunks_for_file(&self, path: &str) -> Result<Vec<ChunkMeta>> {
+        use std::collections::HashMap;
+
         let rtxn = self.env.read_txn()?;
         let needle = crate::cache::normalize_path_str(path);
-        let mut out = Vec::new();
+        let mut best: HashMap<(String, Option<String>, usize, usize), ChunkMeta> =
+            HashMap::new();
 
         for result in self.chunks.iter(&rtxn)? {
             let (id, meta) = result?;
             let chunk_path = crate::cache::normalize_path_str(&meta.path);
             if chunk_path == needle {
-                out.push(ChunkMeta {
-                    id,
-                    kind: meta.kind,
-                    signature: meta.signature,
-                    start_line: meta.start_line,
-                    end_line: meta.end_line,
-                });
+                let key = (
+                    meta.kind.clone(),
+                    meta.signature.clone(),
+                    meta.start_line,
+                    meta.end_line,
+                );
+                // Keep highest id (most recent insertion) per unique logical chunk.
+                best.entry(key)
+                    .and_modify(|existing| {
+                        if id > existing.id {
+                            existing.id = id;
+                        }
+                    })
+                    .or_insert(ChunkMeta {
+                        id,
+                        kind: meta.kind,
+                        signature: meta.signature,
+                        start_line: meta.start_line,
+                        end_line: meta.end_line,
+                    });
             }
         }
 
+        let mut out: Vec<ChunkMeta> = best.into_values().collect();
+        out.sort_by_key(|c| c.start_line);
         Ok(out)
     }
 

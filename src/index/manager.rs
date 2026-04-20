@@ -1234,6 +1234,42 @@ impl IndexManager {
             .as_str()
             .unwrap_or("minilm-l6-q");
 
+        // ── Delete stale chunks for this file BEFORE inserting new ones ──
+        // When a file is re-indexed (e.g. after a content change), the old
+        // chunk_ids must be removed from both VectorStore and FTSStore to
+        // prevent orphaned duplicates.  FileMetaStore.remove_file gives us
+        // the previous chunk_ids (if any) and atomically clears them so that
+        // update_file below can store the fresh set.
+        {
+            let mut file_meta_store =
+                FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
+            if let Some(old_meta) = file_meta_store.remove_file(file_path) {
+                let old_ids = old_meta.chunk_ids;
+                if !old_ids.is_empty() {
+                    debug!(
+                        "Removing {} stale chunks before re-index: {}",
+                        old_ids.len(),
+                        file_path.display()
+                    );
+                    // Vector store — batch delete
+                    {
+                        let mut store = stores.vector_store.write().await;
+                        store.delete_chunks(&old_ids)?;
+                    }
+                    // FTS store — per-chunk delete + commit
+                    {
+                        let mut fts_store = stores.fts_store.write().await;
+                        for id in &old_ids {
+                            fts_store.delete_chunk(*id)?;
+                        }
+                        fts_store.commit()?;
+                    }
+                }
+                // Persist the removal so the stale ids are gone from metadata
+                file_meta_store.save(&db_path)?;
+            }
+        }
+
         // Use shared stores with write lock
         let chunk_ids = {
             let mut store = stores.vector_store.write().await;
