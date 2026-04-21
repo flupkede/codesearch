@@ -22,8 +22,9 @@ Phase 1 built the infrastructure: `src/serve/mod.rs`, `src/mcp/proxy.rs`, `src/d
 - Output paths don't include the alias prefix
 - `project`/`group` params are silently ignored in stdio mode instead of returning a clear error
 - Key acceptance tests from AGENTS_multi_repo.md are not implemented
-- **A running serve doesn't notice new repos:** if the user runs `codesearch index add` (or edits `repos.json` directly) while serve is running, the new repo isn't queryable until serve is restarted. Likewise for removed repos — serve keeps them "open" until restart.
-- **`index add` doesn't register the repo with serve:** creating an index in a new directory or worktree only creates the local `.codesearch.db/`; it does not write an entry to `~/.codesearch/repos.json`. The user has to run `codesearch repos add <path>` as a separate step, which is easy to forget and makes the new repo invisible to any running serve.
+- **A running serve doesn't notice new or removed repos:** if the user runs `codesearch index add` / `index rm` (or edits `repos.json` directly) while serve is running, the change isn't reflected until serve is restarted.
+- **`index add` doesn't register the repo with serve:** creating an index in a new directory or worktree only creates the local `.codesearch.db/`; it does not write an entry to `~/.codesearch/repos.json`. The user has to run `codesearch repos add <path>` as a separate step, which is easy to forget.
+- **Having two parallel command surfaces is confusing:** `codesearch index add/rm` and `codesearch repos add/rm` do overlapping things from the user's perspective (both manage what repos are "known" to the system). This phase collapses them — `index` becomes the only entry point.
 
 ## Scope — what to implement in this phase
 
@@ -32,15 +33,16 @@ Phase 1 built the infrastructure: `src/serve/mod.rs`, `src/mcp/proxy.rs`, `src/d
 3. **Alias-prefixed paths in output.** All response paths in serve/proxy mode must be `{alias}/{relative_path}`.
 4. **Validation errors.** `project`/`group` in stdio mode without serve → clear error message, not silent ignore.
 5. **Acceptance tests.** Add the tests listed in AGENTS_multi_repo.md §Acceptance criteria that are still missing.
-6. **Auto-register in `index add`.** When the user creates a new index in a directory (including a new worktree), automatically add an entry to `~/.codesearch/repos.json` if one doesn't already exist for that path.
-7. **Config reload on demand in serve.** `ServeState` detects changes to `~/.codesearch/repos.json` via mtime comparison on every lookup, reloads transparently, and cleans up stores for removed aliases.
+6. **CLI consolidation: `index` is the single entry point.** Remove the `repos` top-level subcommand. `index add` registers, `index rm` unregisters, `index list` shows all registered repos + their index state. Groups keep their own subcommand (`groups add/list/rm`) because they operate on aliases, not paths.
+7. **Auto-register / auto-unregister symmetry.** `index add` writes an entry to `~/.codesearch/repos.json`; `index rm` removes the entry (and from any groups that contained it). This falls out naturally from §6.
+8. **Config reload on demand in serve.** `ServeState` detects changes to `~/.codesearch/repos.json` via mtime comparison on every lookup, reloads transparently, and cleans up stores for removed aliases.
 
 ## Scope — what NOT to touch
 
 - `src/serve/mod.rs`'s `run_serve()` function — it works as-is.
 - `src/mcp/proxy.rs` — leave the proxy mechanics alone.
-- `src/db_discovery/repos.rs` — ReposConfig is complete. **Exception:** you may add a small helper like `ReposConfig::load_if_changed_since(mtime)` if it cleans up the reload logic, but keep the public API stable.
-- CLI subcommands — `serve`, `repos`, `groups` are wired. **Exception:** the `index add` handler needs the auto-register call (see §7).
+- `src/db_discovery/repos.rs` — `ReposConfig` is complete. **Exception:** you may add a small helper like `ReposConfig::load_if_changed_since(mtime)` if it cleans up the reload logic, but keep the public API stable.
+- `groups` subcommand — stays as-is. Groups operate on aliases; they're orthogonal to index management.
 - The existing single-repo behavior of stdio-mode `codesearch mcp` — must stay unchanged when no serve is running.
 - The consolidated tool surface (`search`/`find`/`explore`/`get_chunk`/`status`) and deprecated aliases — don't re-design.
 - HTTP transport, authentication, non-localhost binding — deferred to future work.
@@ -245,23 +247,66 @@ Currently loads from disk config only. In serve mode, augment with live state fr
 
 Keep the proxy-forward branch at the top as already implemented.
 
-### Auto-register on `index add`
+### CLI consolidation: fold `repos` into `index`
 
-**Problem.** Today, `codesearch index add <path>` (or its equivalent in `IndexCommands::Add`) creates the `.codesearch.db/` directory and populates it, but does not write an entry to `~/.codesearch/repos.json`. The user has to separately run `codesearch repos add <path>`, which most users will forget. A running serve then has no way to know about the new repo, even after reloading config — because the config literally doesn't contain it.
+**Goal.** Remove the `repos` top-level subcommand entirely. `index` becomes the single user-facing command for everything related to what repos the system knows about.
 
-**Fix.** Hook into the `IndexCommands::Add` CLI handler (and any equivalent path that creates a fresh index, including the auto-create branch inside `run_mcp_server`). After the index is created successfully, load `ReposConfig`, check whether an entry already exists for the canonical path, and if not, call `ReposConfig::register(path)` and `save()`. Log the alias that was assigned so the user sees it.
+**Final CLI surface:**
 
-Behaviour details:
+```
+codesearch index add <path> [--alias <name>] [--global]   Create index AND register in repos.json
+codesearch index rm <path> [--keep-config]                Remove index AND unregister from repos.json
+codesearch index list                                      Show all registered repos + their index state
+codesearch groups add <name> <alias>...                   Create/update a group (unchanged)
+codesearch groups rm <name>                                Remove a group (unchanged)
+codesearch groups list                                     List groups (unchanged)
+```
 
-- Canonicalize the path before comparing (reuse the logic in `ReposConfig::register`).
-- If an entry already exists for the same canonical path (same path, different alias, or re-indexing of an existing repo), leave the config alone — do not re-register.
-- If `repos.json` can't be written (permissions, disk full, etc.), log a warning but do not fail the index operation — indexing succeeded, the registration is a convenience layer.
-- Print one line to stderr: `✅ Registered as '{alias}'. Use this as the `project` parameter in serve-mode queries.`
-- Do not touch any existing auto-create branch in `run_mcp_server` that creates a fallback `.codesearch.db/` without user intent — that code path specifically handles the no-DB-no-create-flag case and shouldn't register without explicit user action. Only register when the user explicitly ran `index add`.
+No `codesearch repos …` commands. They're gone.
 
-**Global-index case.** When `index add --global` is used, the index is created in a global location, not in the current directory. The `repos.json` entry should still use the project path (not the global DB location) so that `ServeState::get_or_open_stores` can locate the DB via the usual `project_path.join(DB_DIR_NAME)` convention. If the global-index layout stores the DB somewhere else, either skip auto-register for `--global` (document it clearly) or extend `ReposConfig` with an optional explicit `db_path` override per entry. Start with "skip + warn": *"Global indexes are not auto-registered. Use `codesearch repos add` manually or consider creating a local index instead."* This keeps the scope contained.
+**Behaviour of each `index` subcommand:**
 
-**Worktree case.** Each git worktree is a distinct project root (already handled correctly by the existing worktree detection in `find_git_root`). The auto-register produces a unique alias via `unique_alias_for_path`, so running `index add` in two worktrees of the same repo results in two distinct aliases (e.g. `codesearch` and `codesearch-2`). This is the desired behaviour — each worktree has its own index and should be addressable independently.
+- **`index add <path>`**
+  - Canonicalize path.
+  - Create the `.codesearch.db/` under that path if it doesn't exist. If the DB already exists (user is re-registering an existing index): skip creation, emit `ℹ️ Index already exists at {path}; reusing.`
+  - Load `ReposConfig`. If an entry already exists for this canonical path: skip register, print `ℹ️ Already registered as '{existing_alias}'.` — do not error.
+  - Otherwise: register with `register_with_alias(path, --alias)`. If `--alias` collides with an existing alias for a different path: error clearly (let `register_with_alias` handle this, it already does).
+  - `--global`: build a global index. Do NOT auto-register — global indexes live in a shared location and don't map cleanly to per-project aliases. Emit: `⚠️ Global indexes are not auto-registered. Use 'codesearch index add <path>' without --global if you want serve to discover it.`
+  - Print one-line success: `✅ Indexed {path} as '{alias}'. Use 'codesearch search --project {alias}' or rely on serve auto-discovery.`
+
+- **`index rm <path>`**
+  - Canonicalize path.
+  - Look up the alias for this path via `ReposConfig::alias_for_path`. If none: the repo wasn't registered — proceed with DB deletion only, no config write.
+  - If `--keep-config` is NOT set (default): remove the alias from `repos.json` via `unregister_path(&path)`. This also strips the alias from any groups that contained it, and drops any group that becomes empty (existing `unregister_alias` behaviour).
+  - Delete the `.codesearch.db/` directory. Handle "directory in use" errors on Windows gracefully: emit `⚠️ Database files may be locked by a running codesearch process. Stop it and retry.`
+  - `--keep-config`: leaves the `repos.json` entry intact. Useful for rare cases (scripted re-indexing). Print `ℹ️ Config entry preserved.`
+  - On any failure: do not leave the system half-registered. If DB deletion fails, the config entry stays (reversible state). If config write fails, DB deletion still happens — emit a warning that the user should clean up `repos.json` manually.
+
+- **`index list`**
+  - Read `ReposConfig`.
+  - For each alias, report: alias, project path, DB exists (yes/no), total chunks, total files, model, and — if serve is running on the default port — live lock_status from a quick HTTP query to the running serve (best effort; if serve isn't reachable, skip this column).
+  - Pretty-print as a table to stdout. Also support `--json` for scripting.
+  - Include groups at the end: one line per group showing `group_name → [alias1, alias2, …]`.
+  - Keep the existing "current directory index status" idea as a separate hint at the bottom: "Current directory: {path} → {alias or 'not registered'}".
+
+**Code changes:**
+
+In `src/cli/mod.rs`:
+
+- Remove `ReposCommands` enum and the `Repos { command: ReposCommands }` variant from the top-level `Commands` enum.
+- Update `IndexCommands::Add` to include an `--alias` flag and keep `--global`.
+- Update `IndexCommands::Remove` to include a `--keep-config` flag.
+- `IndexCommands::List` stays but the handler now reads `ReposConfig` (not just the current directory).
+
+In the corresponding CLI handler module (wherever `Commands::Index { … }` is dispatched):
+
+- `Add`: call existing indexer AND `ReposConfig::register_with_alias` (new path — already exists in `ReposConfig`). Save.
+- `Remove`: call `ReposConfig::unregister_path` unless `--keep-config`. Save. Then delete the DB directory.
+- `List`: read `ReposConfig`, enumerate, format as table.
+
+In tests, update any call-sites that used `Commands::Repos(…)` to use `Commands::Index(…)`.
+
+**Do not** keep `repos` as a deprecated alias. This project is pre-1.0 and `repos` was only added in phase 1 of this same multi-repo work — it has never shipped. A clean removal is the right call.
 
 ### Config reload on demand in serve
 
@@ -315,7 +360,7 @@ Call `reload_if_changed` at the start of:
 
 **Do not reload from a file watcher.** An explicit watcher on `repos.json` adds async plumbing and race conditions. On-demand mtime-check is simpler and sufficient for human-editing frequencies. If future performance shows this being hot, we can add debouncing.
 
-**Interaction with the `--register` CLI flag on serve.** When `codesearch serve --register /some/path` is used at startup, the existing code already loads config, calls `register`, and saves before `ServeState::new`. This means the initial mtime captured will be the post-registration mtime. Good — no spurious reload on first query.
+**Interaction with `codesearch serve --register`.** The `--register` flag on `serve` stays — it's convenient for one-shot setup. It does the same thing as `index add` + `serve`. When used, the existing code already loads config, calls `register`, and saves before `ServeState::new`, so the initial mtime captured will be the post-registration mtime. No spurious reload on first query.
 
 ## Acceptance criteria
 
@@ -339,8 +384,15 @@ All must hold before PR merge:
 - `conflicted_repo_isolated`: stdio mcp holds write-lock on repo X; spawn `run_serve` that tries to open repo X; assert serve marks X as Conflicted and other repos still work.
 - `cross_repo_search_group`: fixture with two indexed repos; semantic_search with `group="both"` returns results from both, paths alias-prefixed, no duplicate `(alias, chunk_id)` pairs in output.
 - `single_repo_tools_reject_group`: `file_outline` / `get_chunk` / `similar_chunks` / `find_imports` with `group=Some(...)` → error about single-repo tool.
-- `index_add_auto_registers`: run `index add` programmatically (or via CLI in a test harness) in a temp directory; assert `~/.codesearch/repos.json` contains an entry for that path with a plausible alias; assert running `index add` again in the same directory does not create a duplicate entry.
-- `index_add_global_skips_register`: run `index add --global` in a temp directory; assert `repos.json` is NOT modified; assert a user-visible warning was emitted.
+- `cli_no_repos_subcommand`: assert `codesearch repos --help` returns a CLI error (subcommand removed). Assert `codesearch index add --help` shows the `--alias` and `--global` flags. Assert `codesearch index rm --help` shows the `--keep-config` flag.
+- `index_add_auto_registers`: run `index add` programmatically in a temp directory; assert `repos.json` contains an entry for that path with a plausible alias; assert a second `index add` in the same directory does not create a duplicate entry and prints `Already registered as '{alias}'`.
+- `index_add_with_explicit_alias`: `index add /tmp/x --alias myrepo` → `repos.json` has entry with alias `myrepo`.
+- `index_add_alias_collision`: `repos.json` already has alias `foo` pointing to `/tmp/a`; `index add /tmp/b --alias foo` → error, no write.
+- `index_add_global_skips_register`: `index add --global` in a temp directory; assert `repos.json` is NOT modified; assert the `--global` warning was emitted.
+- `index_rm_auto_unregisters`: set up a registered repo with alias `x` that is also a member of group `g`; run `index rm /path`; assert alias `x` is gone from `repos.json`; assert group `g` no longer contains `x`; if `x` was the only member of `g`, assert `g` is also removed.
+- `index_rm_preserves_config_with_flag`: run `index rm /path --keep-config`; assert DB is deleted but `repos.json` entry remains.
+- `index_rm_unregistered_path_ok`: run `index rm /path` on a path that was never registered; assert no error, DB is still deleted.
+- `index_list_shows_registered_repos`: register two repos + one group; run `index list`; assert all appear in output.
 - `config_reload_picks_up_new_alias`: start `ServeState` with config containing repo A. Without restarting, append repo B to `repos.json` and update mtime. Call `serve_state.aliases()`; assert it includes B. Call `get_or_open_stores("B")`; assert success.
 - `config_reload_drops_removed_alias`: start `ServeState` with repos A and B. Pre-open B. Rewrite `repos.json` with only A. Call `get_or_open_stores("B")`; assert error "Unknown alias". Assert the entry for B has been removed from `self.repos`.
 - `config_reload_no_spurious_reload`: call `get_or_open_stores` twice in a row without touching `repos.json`; verify (via a counter or tracing assertion) that `ReposConfig::load` was called at most once.
@@ -359,7 +411,7 @@ Suggested order to minimize rework:
 6. Add single-repo-tool rejection for `group` param.
 7. Add path-prefix helper + apply in all handlers.
 8. Extend `list_projects` serve-mode augmentation.
-9. Implement auto-register in `index add` (self-contained CLI change).
+9. **CLI consolidation:** remove `ReposCommands`, add `--alias` to `IndexCommands::Add`, add `--keep-config` to `IndexCommands::Remove`, implement auto-register in Add handler, auto-unregister in Remove handler, rewrite List handler to read `ReposConfig`. One commit per change.
 10. Implement `reload_if_changed` in `ServeState` and wire it into the lookup methods.
 11. Write the acceptance tests.
 
@@ -368,16 +420,28 @@ Each step is a commit.
 ## Commit hygiene
 
 - One logical change per commit.
-- Conventional-commit style: `feat(mcp): add RepoContext resolver`, `feat(mcp): route file_outline via project param`, `feat(cli): auto-register repo on index add`, `feat(serve): reload repos config on mtime change`, `test(mcp): add cross-repo search integration test`, etc.
+- Conventional-commit style: `feat(mcp): add RepoContext resolver`, `feat(mcp): route file_outline via project param`, `refactor(cli): remove repos subcommand, fold into index`, `feat(cli): auto-register repo on index add`, `feat(cli): auto-unregister repo on index rm`, `feat(serve): reload repos config on mtime change`, `test(mcp): add cross-repo search integration test`, etc.
 - Author: Filip Develter personal GitHub (`flupkede`).
 
 ## PR expectations
 
-- Title: `feat(mcp): complete multi-repo routing, cross-repo fan-out, and live config reload`
+- Title: `feat(mcp): complete multi-repo routing, unified index CLI, and live config reload`
 - Target base: `main`.
 - PR description must include:
-  - A "Before/after" section: what works now that didn't before.
-  - A manual-test script the reviewer can run: start serve, register 2 repos, call `status(kind="projects")`, call `search(mode="semantic", group="both", query="...")`, verify alias-prefixed results. **Also:** in a third terminal run `codesearch index add /tmp/new-repo`, then without restarting serve call `status(kind="projects")` again and verify the new repo appears.
+  - A "Before/after" section: what works now that didn't before. Call out the CLI consolidation prominently — `codesearch repos …` is gone.
+  - A manual-test script the reviewer can run:
+    1. `codesearch index add /tmp/repo-a` — assert success + registration message
+    2. `codesearch index add /tmp/repo-b --alias bravo` — assert custom alias worked
+    3. `codesearch index list` — assert both appear with correct aliases
+    4. `codesearch groups add pair alpha bravo` (alpha was auto-generated from repo-a)
+    5. `codesearch serve --port 39725 &` — start serve
+    6. From MCP client: call `status(kind="projects")` — assert both repos + group visible
+    7. Call `search(mode="semantic", group="pair", query="...")` — assert alias-prefixed results
+    8. In a third terminal: `codesearch index add /tmp/repo-c` — without restarting serve
+    9. Call `status(kind="projects")` again — assert repo-c appears
+    10. `codesearch index rm /tmp/repo-a` — without restarting serve
+    11. Call `search(..., project="alpha", ...)` — assert "Unknown alias" error
+    12. Call `status(kind="projects")` — assert alpha is gone and group "pair" now contains only `bravo` (or was dropped if bravo was the only survivor)
   - Link to this AGENTS file and `AGENTS_multi_repo.md`.
 
 ## Deliberately out of scope
@@ -392,3 +456,5 @@ Each step is a commit.
 - Query expansion.
 - File-watcher-based config reload — on-demand mtime-check is sufficient for v1.
 - Auto-register for `--global` indexes — skip + warn is the v1 behaviour.
+- Keeping `repos` as a deprecated CLI alias — clean removal instead.
+- An `index rename` command — users can edit `repos.json` directly or `index rm` + `index add --alias`. Low enough priority to defer.
