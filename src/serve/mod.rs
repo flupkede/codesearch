@@ -54,8 +54,6 @@ pub(crate) struct ServeState {
     config: ReposConfig,
     /// Cache for model dimensions (inferred from metadata).
     #[allow(dead_code)] // Used for dynamic dimension lookup when opening repos
-    dimensions_cache: DashMap<String, usize>,
-}
 
 impl std::fmt::Debug for ServeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,7 +70,6 @@ impl ServeState {
             repos: DashMap::new(),
             config,
             dimensions_cache: DashMap::new(),
-        }
     }
 
     /// Try to open a repo by alias. Returns a clone of the Arc<SharedStores>
@@ -153,10 +150,6 @@ impl ServeState {
 
     /// Resolve a project alias to its path.
     #[allow(dead_code)] // Available for admin/debug tooling
-    pub(crate) fn resolve_alias(&self, alias: &str) -> Option<PathBuf> {
-        self.config.resolve(alias)
-    }
-
     /// Get all registered aliases.
     pub(crate) fn aliases(&self) -> Vec<String> {
         self.config.repos.keys().cloned().collect()

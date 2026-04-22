@@ -34,3 +34,4 @@ criterion/
 
 # codesearch database (local index, binary files)
 .codesearch.db/
+test_tools.jsonl
