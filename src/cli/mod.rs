@@ -50,6 +50,54 @@ pub enum CacheCommands {
     },
 }
 
+/// Repos subcommands
+#[derive(Subcommand, Debug)]
+pub enum ReposCommands {
+    /// List all registered repositories
+    List,
+
+    /// Register a repository
+    Add {
+        /// Path to register (defaults to current directory)
+        path: Option<PathBuf>,
+
+        /// Alias for this repository (auto-generated from directory name if omitted)
+        #[arg(short, long)]
+        alias: Option<String>,
+    },
+
+    /// Remove a registered repository
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// Alias of the repository to remove
+        alias: String,
+    },
+}
+
+/// Groups subcommands
+#[derive(Subcommand, Debug)]
+pub enum GroupsCommands {
+    /// List all groups
+    List,
+
+    /// Create or update a group
+    Add {
+        /// Group name
+        name: String,
+
+        /// Aliases to include in the group (space-separated)
+        #[arg(short, long, num_args = 1..)]
+        aliases: Vec<String>,
+    },
+
+    /// Remove a group
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// Group name
+        name: String,
+    },
+}
+
 /// Fast, local semantic code search powered by Rust
 #[derive(Parser, Debug)]
 #[command(name = "codesearch")]
@@ -180,27 +228,15 @@ pub enum Commands {
         list: bool,
     },
 
-    /// Run a background server with live file watching
+    /// Run a background MCP server with live file watching and multi-repo support
     Serve {
-        /// Port to listen on
-        #[arg(short, long, default_value = "4444")]
-        port: u16,
+        /// Port to listen on (default: 39725, override with CODESEARCH_SERVE_PORT)
+        #[arg(short, long)]
+        port: Option<u16>,
 
-        /// Path to serve (defaults to current directory)
-        path: Option<PathBuf>,
-
-        /// Automatically create index if it doesn't exist (default: true)
-        #[arg(
-            short = 'c',
-            long,
-            default_value_t = true,
-            action = ArgAction::Set,
-            value_parser = BoolishValueParser::new(),
-            num_args = 0..=1,
-            require_equals = true,
-            default_missing_value = "true"
-        )]
-        create_index: bool,
+        /// Register one or more repo paths at startup (can be repeated)
+        #[arg(short, long, action = ArgAction::Append)]
+        register: Vec<PathBuf>,
     },
 
     /// Show statistics about the vector database
@@ -254,6 +290,18 @@ pub enum Commands {
             default_missing_value = "true"
         )]
         create_index: bool,
+    },
+
+    /// Manage registered repositories
+    Repos {
+        #[command(subcommand)]
+        command: ReposCommands,
+    },
+
+    /// Manage repository groups
+    Groups {
+        #[command(subcommand)]
+        command: GroupsCommands,
     },
 
     /// Manage persistent embedding cache
@@ -381,29 +429,17 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Serve {
             port,
-            path,
-            create_index,
+            register,
         } => {
-            // Discover database path and initialize logger with file output
+            // Initialize logger for serve mode
             // NOTE: For Serve, tracing is NOT initialized in main.rs — init_logger
             // is the first and only call to set the global subscriber
-            let effective_path = path
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| std::env::current_dir().unwrap());
             if let Ok(Some(db_info)) =
-                crate::db_discovery::find_best_database(Some(&effective_path))
+                crate::db_discovery::find_best_database(None as Option<&std::path::Path>)
             {
-                match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
-                    Err(e) => {
-                        eprintln!("Warning: Failed to initialize file logger: {}", e);
-                    }
-                    _ => {
-                        // Logger initialized successfully (either FileLogging or ConsoleOnly)
-                    }
-                }
+                let _ = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet);
             }
-            crate::server::serve(port, path, create_index, cancel_token.clone()).await
+            crate::serve::run_serve(port, register, cancel_token.clone()).await
         }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
         Commands::Doctor { fix, json } => crate::cli::doctor::run(fix, json).await,
@@ -417,6 +453,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
             CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
         },
+        Commands::Repos { command } => run_repos_command(command).await,
+        Commands::Groups { command } => run_groups_command(command).await,
     }
 }
 
@@ -575,6 +613,91 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
         eprintln!("Total: {} entries cleared", total_cleared);
     }
 
+    Ok(())
+}
+
+/// Handle repos subcommands
+async fn run_repos_command(command: ReposCommands) -> Result<()> {
+    match command {
+        ReposCommands::List => {
+            let config = crate::db_discovery::load_repos_config()?;
+            if config.repos.is_empty() {
+                println!("No registered repositories.");
+                return Ok(());
+            }
+            println!("Registered repositories:");
+            for (alias, path) in &config.repos {
+                let db_path = path.join(crate::constants::DB_DIR_NAME);
+                let indexed = if db_path.exists() { "indexed" } else { "not indexed" };
+                println!("  {} → {} ({})", alias, path.display(), indexed);
+            }
+        }
+        ReposCommands::Add { path, alias } => {
+            let effective_path = path
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            let canonical = effective_path.canonicalize()
+                .unwrap_or_else(|_| effective_path.clone());
+            let mut config = crate::db_discovery::load_repos_config()?;
+            let assigned_alias = crate::db_discovery::repos::ReposConfig::register_with_alias(
+                &mut config, canonical, alias,
+            )?;
+            config.save()?;
+            println!("Registered '{}' → {}", assigned_alias, effective_path.display());
+        }
+        ReposCommands::Remove { alias } => {
+            let mut config = crate::db_discovery::load_repos_config()?;
+            if config.unregister_alias(&alias) {
+                config.save()?;
+                println!("Removed repository '{}'", alias);
+            } else {
+                eprintln!("Alias '{}' not found.", alias);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle groups subcommands
+async fn run_groups_command(command: GroupsCommands) -> Result<()> {
+    match command {
+        GroupsCommands::List => {
+            let config = crate::db_discovery::load_repos_config()?;
+            if config.groups.is_empty() {
+                println!("No groups defined.");
+                return Ok(());
+            }
+            println!("Groups:");
+            for (name, aliases) in &config.groups {
+                println!("  {}: {}", name, aliases.join(", "));
+            }
+        }
+        GroupsCommands::Add { name, aliases } => {
+            if aliases.is_empty() {
+                return Err(anyhow::anyhow!("--aliases is required and must specify at least one alias."));
+            }
+            let mut config = crate::db_discovery::load_repos_config()?;
+            // Validate that all aliases exist
+            for alias in &aliases {
+                if !config.repos.contains_key(alias) {
+                    return Err(anyhow::anyhow!(
+                        "alias '{}' is not registered. Use 'codesearch repos add' first.", alias
+                    ));
+                }
+            }
+            config.add_group(name.clone(), aliases)?;
+            config.save()?;
+            println!("Group '{}' created/updated.", name);
+        }
+        GroupsCommands::Remove { name } => {
+            let mut config = crate::db_discovery::load_repos_config()?;
+            if config.remove_group(&name) {
+                config.save()?;
+                println!("Group '{}' removed.", name);
+            } else {
+                eprintln!("Group '{}' not found.", name);
+            }
+        }
+    }
     Ok(())
 }
 

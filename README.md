@@ -44,6 +44,8 @@ codesearch is designed as the primary bridge between AI agents and your codebase
 - [Embedding Cache](#embedding-cache)
 - [Searching](#searching)
 - [MCP Server Configuration](#mcp-server-configuration)
+- [MCP Serve Mode](#mcp-serve-mode)
+- [Repository Management](#repository-management)
 - [Other Commands](#other-commands)
 - [Search Modes](#search-modes)
 - [Global vs Local Indexes](#global-vs-local-indexes)
@@ -235,7 +237,7 @@ codesearch index [PATH] [OPTIONS]
 
 ### Auto-Index Feature
 
-codesearch can automatically create the index when you first use `search`, `serve`, or `mcp` commands if it doesn't exist.
+codesearch can automatically create the index when you first use `search` or `mcp` commands if it doesn't exist.
 
 **Default Behavior:** `--create-index=true` (auto-index enabled)
 
@@ -244,7 +246,6 @@ codesearch can automatically create the index when you first use `search`, `serv
 | Command | Behavior |
 |---|---|
 | `search` | Creates index synchronously before searching (~30-60s) |
-| `serve` | Creates index synchronously before starting server (~30-60s) |
 | `mcp` | Creates minimal placeholder immediately, then indexes in background via incremental refresh |
 
 **Example usage:**
@@ -252,13 +253,11 @@ codesearch can automatically create the index when you first use `search`, `serv
 ```bash
 # Auto-index enabled (default)
 codesearch search "authentication logic"           # Creates index if missing, then searches
-codesearch serve --port 4444                      # Creates index if missing, then starts server
 codesearch mcp                                    # Starts server immediately, indexes in background
 
 # Disable auto-index (fail if no index exists)
 codesearch search "query" --create-index=false
 codesearch mcp --create-index=false
-codesearch serve --create-index=false
 ```
 
 **MCP Server Behavior (Important):**
@@ -504,10 +503,11 @@ On Windows, use the full path to `codesearch.exe` if it's not in your `PATH`. Re
 
 When the MCP server starts, it goes through this sequence:
 
-1. **Database discovery** — Searches for `.codesearch.db/` at the git root (by detecting `.git/` from the current directory), then walks up parent directories (up to 10 levels for non-git projects), and finally checks the global location (`~/.codesearch.dbs/`). The first database found is used. If none is found and `--create-index=true` (default), a minimal placeholder database is created to allow immediate startup.
-2. **Incremental index** — Automatically runs an incremental re-index against the detected database (or full index if placeholder was created), so the index is up-to-date before the agent starts working. This happens in the background for placeholder databases.
-3. **File system watcher (FSW)** — Starts watching the project directory for changes. Any file modifications, additions, or deletions are picked up and the index is updated in the background (with debouncing), keeping the database current throughout the session.
-4. **Git HEAD watcher** — Monitors `.git/HEAD` for branch changes. When a branch switch is detected, an automatic incremental re-index is triggered to update the database with files from the new branch.
+1. **Serve detection** — Probes `GET /health` on `127.0.0.1:39725` (or `CODESEARCH_SERVE_PORT`). If a matching serve instance is found, enters **proxy mode** and forwards all tool calls. If not reachable, continues with local stdio mode. If version mismatch, exits with error.
+2. **Database discovery** — Searches for `.codesearch.db/` at the git root (by detecting `.git/` from the current directory), then walks up parent directories (up to 10 levels for non-git projects), and finally checks the global location (`~/.codesearch.dbs/`). The first database found is used. If none is found and `--create-index=true` (default), a minimal placeholder database is created to allow immediate startup.
+3. **Incremental index** — Automatically runs an incremental re-index against the detected database (or full index if placeholder was created), so the index is up-to-date before the agent starts working. This happens in the background for placeholder databases.
+4. **File system watcher (FSW)** — Starts watching the project directory for changes. Any file modifications, additions, or deletions are picked up and the index is updated in the background (with debouncing), keeping the database current throughout the session.
+5. **Git HEAD watcher** — Monitors `.git/HEAD` for branch changes. When a branch switch is detected, an automatic incremental re-index is triggered to update the database with files from the new branch.
 
 **Important:** The MCP server starts in **under 5 seconds** even when no index exists (when `--create-index=true`). It creates a minimal database structure immediately and runs full indexing in the background via the incremental refresh mechanism. This ensures the server meets OpenCode's startup timeout requirements while still providing full indexing capabilities.
 
@@ -515,16 +515,38 @@ When the MCP server starts, it goes through this sequence:
 
 ### MCP Tools
 
+The tool surface is consolidated into **5 primary tools** with deprecated aliases for backward compatibility.
+
+#### Primary Tools
+
 | Tool | Parameters | Description |
 |---|---|---|
-| `semantic_search` | `query`, `limit`, `compact` (default: true), `filter_path` | Semantic code search. Compact mode returns metadata only (~93% fewer tokens). |
-| `find_references` | `symbol`, `limit` (default: 50) | Find all usages/call sites of a symbol across the codebase. |
-| `find_databases` | | Discover available codesearch databases. |
-| `index_status` | | Check index existence, status, and statistics. |
+| `search` | `query`, `mode` ("semantic" default, "literal"), `limit`, `compact`, `filter_path`, `project`, `group` | Unified code search. Semantic mode uses vector embeddings + FTS; literal mode is pure FTS (regex, phrase, exact). |
+| `find` | `kind` ("definition" default, "usages", "imports", "dependents"), `symbol`, `limit`, `project` | Unified symbol navigation. Locate definitions, call-sites, import graphs, and dependency chains. |
+| `explore` | `kind` ("outline" default, "similar"), `target`, `limit`, `project` | File exploration. Outline shows file structure; similar finds semantically related chunks. |
+| `get_chunk` | `chunk_id`, `context_lines` (default: 0, max: 20), `project` | Retrieve full chunk content by ID with optional surrounding context. |
+| `status` | `kind` ("index" default, "projects") | Index health/stats or list registered projects and groups. |
 
-### `index_status` Tool Response
+#### Deprecated Aliases (still functional)
 
-The `index_status` tool returns current index state including availability status:
+| Tool | Use instead |
+|---|---|
+| `semantic_search` | `search(mode="semantic")` |
+| `literal_search` | `search(mode="literal")` |
+| `find_definition` | `find(kind="definition")` |
+| `find_usages` | `find(kind="usages")` |
+| `find_references` | `find(kind="usages")` |
+| `find_imports` | `find(kind="imports")` |
+| `find_dependents` | `find(kind="dependents")` |
+| `file_outline` | `explore(kind="outline")` |
+| `similar_chunks` | `explore(kind="similar")` |
+| `index_status` | `status(kind="index")` |
+| `list_projects` | `status(kind="projects")` |
+| `find_databases` | `status(kind="projects")` |
+
+### `status(kind="index")` Response
+
+The `status` tool with `kind="index"` (or the deprecated `index_status`) returns current index state:
 
 ```json
 {
@@ -551,26 +573,26 @@ The `index_status` tool returns current index state including availability statu
 | `ready` | Index has chunks and is fully indexed | ✅ Available |
 | `error` | Error accessing or reading index | ❌ Not available |
 
-**Agent Best Practice:** Before searching, check `index_status`. If `status === "building"`, inform the user that indexing is in progress and suggest they try again in a few minutes.
+**Agent Best Practice:** Before searching, check `status(kind="index")`. If `status === "building"`, inform the user that indexing is in progress and suggest they try again in a few minutes.
 
 ### How AI Agents Use the Tools
 
 The MCP tools are designed to work together in a **search → narrow → read** workflow that minimizes token usage:
 
-1. **`semantic_search`** — The agent starts here. A natural language query like `"where do we handle authentication?"` returns a ranked list of matches. With `compact=true` (the default), only metadata is returned: file path, line numbers, chunk kind, signature, and score — roughly 40 tokens per result instead of 600.
+1. **`search`** — The agent starts here. A natural language query like `"where do we handle authentication?"` returns a ranked list of matches. With `compact=true` (the default), only metadata is returned: file path, line numbers, chunk kind, signature, and score — roughly 40 tokens per result instead of 600.
 
-2. **`find_references`** — Once the agent identifies a relevant function or symbol, it can ask for all usages and call sites across the codebase. This is much more efficient than grep-based searching and stays within the codesearch ecosystem. Example: `find_references("authenticate")` returns every location that calls or references that symbol.
+2. **`find`** — Once the agent identifies a relevant function or symbol, it can ask for all usages and call sites across the codebase. This is much more efficient than grep-based searching and stays within the codesearch ecosystem. Example: `find(kind="usages", symbol="authenticate")` returns every location that calls or references that symbol.
 
 3. **Targeted file reads** — Once the agent identifies a relevant function or symbol, it reads only the specific lines it needs using its built-in file read tools (e.g., `read("src/auth/handler.rs", offset=45, limit=30)`). The compact search results include exact line numbers, making targeted reads precise and efficient.
 
-4. **Iterate** — The agent continues narrowing down with additional `semantic_search` or `find_references` calls as needed.
+4. **Iterate** — The agent continues narrowing down with additional `search` or `find` calls as needed.
 
 **Example session:**
 ```
-Agent: semantic_search("auth handler", compact=true)
+Agent: search("auth handler", compact=true)
   → 20 results, ~800 tokens total (paths, signatures, scores)
 
-Agent: find_references("authenticate")
+Agent: find(kind="usages", symbol="authenticate")
   → 8 call sites across 5 files, ~100 tokens
 
 Agent: read("src/auth/handler.rs", lines 45-75)
@@ -662,25 +684,93 @@ export CODESEARCH_LOG_CLEANUP_INTERVAL_HOURS=12
 
 | Command | Description |
 |---|---|
-| `codesearch serve [PATH] -p <PORT> [-c]` | HTTP server with live file watching (default port 4444) |
+| `codesearch serve [--port PORT] [--register PATH]...` | MCP streamable HTTP server (default port 39725) |
+| `codesearch repos list` | List registered repositories |
+| `codesearch repos add [PATH] [--alias NAME]` | Register a repository |
+| `codesearch repos remove <ALIAS>` | Unregister a repository |
+| `codesearch groups list` | List repository groups |
+| `codesearch groups add <NAME> --aliases A1 A2` | Create/update a group |
+| `codesearch groups remove <NAME>` | Remove a group |
 | `codesearch stats [PATH]` | Show database statistics |
 | `codesearch clear [PATH] [-y]` | Delete the index |
 | `codesearch list` | List all indexed repositories |
 | `codesearch doctor` | Check installation health |
 | `codesearch setup [--model <MODEL>]` | Pre-download embedding models |
 
-**Server Options:**
+### MCP Serve Mode
+
+`codesearch serve` starts an MCP streamable HTTP server that allows multiple AI agents to share a single codesearch instance:
+
+```bash
+# Start serve with default port (39725)
+codesearch serve
+
+# Custom port
+codesearch serve --port 8080
+
+# Register repos at startup
+codesearch serve --register /path/to/project-a --register /path/to/project-b
+```
+
 | Option | Short | Default | Description |
 |---|---|---|---|
-| `--create-index` | `-c` | `true` | Automatically create index if it doesn't exist |
+| `--port` | `-p` | 39725 (or `CODESEARCH_SERVE_PORT`) | Port to listen on |
+| `--register` | `-r` | | Register repo paths at startup (repeatable) |
 
-### HTTP Server API
-
+**Endpoints:**
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/health` | Health check |
-| GET | `/status` | Index statistics |
-| POST | `/search` | Search (JSON body: `{"query": "...", "limit": 10}`) |
+| GET | `/health` | Health check (`{"codesearch_server": true, "version": "..."}`) |
+| POST | `/mcp` | MCP streamable HTTP endpoint |
+
+**Auto-detection:** When `codesearch mcp` starts, it probes `GET /health` on the configured port (200ms timeout):
+- If a matching serve instance is found → enters **proxy mode** (forwards all tool calls)
+- If not reachable → falls back to local stdio mode (existing behavior)
+- If version mismatch → hard error (update binaries to match)
+
+### Repository Management
+
+codesearch tracks registered repositories in `~/.codesearch/repos.json`. Repos can be grouped for cross-project search.
+
+**Register repos:**
+```bash
+# Register current directory (alias auto-generated from folder name)
+codesearch repos add
+
+# Register with a custom alias
+codesearch repos add /path/to/project --alias my-project
+
+# List all registered repos
+codesearch repos list
+
+# Remove a repo by alias
+codesearch repos remove my-project
+```
+
+**Manage groups:**
+```bash
+# Create a group containing multiple repos
+codesearch groups add frontend --aliases web-app admin-panel shared-ui
+
+# List all groups
+codesearch groups list
+
+# Remove a group
+codesearch groups remove frontend
+```
+
+**Config file format** (`~/.codesearch/repos.json`):
+```json
+{
+  "repos": {
+    "web-app": "/projects/web-app",
+    "admin-panel": "/projects/admin-panel"
+  },
+  "groups": {
+    "frontend": ["web-app", "admin-panel"]
+  }
+}
+```
 
 ---
 
@@ -778,6 +868,7 @@ The model used for indexing is stored in metadata. Always search with the same m
 |---|---|---|
 | `CODESEARCH_CACHE_MAX_MEMORY` | Max embedding cache in MB | 500 |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size | Auto |
+| `CODESEARCH_SERVE_PORT` | Override serve mode default port | 39725 |
 | `RUST_LOG` | Logging level | `codesearch=info` |
 
 ### Ignore Files
@@ -817,12 +908,12 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 | Poor search results | Try `--sync` to update, `--rerank` for accuracy, or `--force` to rebuild |
 | Model mismatch warning | Re-index: `codesearch index --force --model <model>` |
 | Out of memory | `CODESEARCH_BATCH_SIZE=32 codesearch index` |
-| Port in use (serve) | `codesearch serve --port 5555` |
+| Port in use (serve) | `codesearch serve --port 5555` or set `CODESEARCH_SERVE_PORT=5555` |
 | Wrong database found | Check where `.codesearch.db/` is located with `codesearch list` |
 | Index not updating after branch switch | The Git HEAD watcher refreshes automatically; check `codesearch stats` to verify |
 | Cache too large | Clear cache: `codesearch cache clear <model>` |
 | MCP server starts but searches fail | Index is still being created in background. Check logs for progress. |
-| Want to disable auto-index | Use `--create-index=false` flag with search/serve/mcp commands |
+| Want to disable auto-index | Use `--create-index=false` flag with search/mcp commands |
 
 ### Git-Specific Troubleshooting
 

@@ -9,7 +9,9 @@ use tracing::{debug, info};
 
 use crate::cache::{normalize_path, FileMetaStore};
 use crate::chunker::SemanticChunker;
-use crate::db_discovery::{find_best_database, register_repository, unregister_repository};
+use crate::db_discovery::{
+    find_best_database, is_registered_repository, register_repository, unregister_repository,
+};
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
@@ -17,7 +19,7 @@ use crate::vectordb::VectorStore;
 
 // Index manager module
 mod manager;
-pub use manager::{IndexManager, SharedStores};
+pub use manager::{IndexManager, SharedStores, is_database_locked};
 
 /// Get the database path and project path for a given directory
 /// Uses automatic database discovery to find indexes in parent/global directories
@@ -1127,23 +1129,7 @@ pub async fn add_to_index(
     let local_db = canonical_path.join(".codesearch.db");
     let has_local = local_db.exists();
 
-    let repos_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-        .join(".codesearch")
-        .join("repos.json");
-
-    let has_global = if repos_path.exists() {
-        let content = fs::read_to_string(&repos_path)?;
-        if let Ok(repos) =
-            serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&content)
-        {
-            repos.contains_key(canonical_path.to_str().unwrap_or(""))
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let has_global = is_registered_repository(&canonical_path)?;
 
     // Conflict checks
     if global && has_local {
@@ -1206,23 +1192,7 @@ pub async fn remove_from_index(path: Option<PathBuf>) -> Result<()> {
     let local_db = canonical_path.join(".codesearch.db");
     let has_local = local_db.exists();
 
-    let repos_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-        .join(".codesearch")
-        .join("repos.json");
-
-    let has_global = if repos_path.exists() {
-        let content = fs::read_to_string(&repos_path)?;
-        if let Ok(repos) =
-            serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&content)
-        {
-            repos.contains_key(canonical_path.to_str().unwrap_or(""))
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let has_global = is_registered_repository(&canonical_path)?;
 
     if !has_local && !has_global {
         println!("\n{}", "⚠️  No index found for this project.".yellow());

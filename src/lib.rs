@@ -13,7 +13,7 @@ pub mod mcp;
 pub mod output;
 pub mod rerank;
 pub mod search;
-pub mod server;
+pub mod serve;
 pub mod utils;
 pub mod vectordb;
 pub mod watch;
