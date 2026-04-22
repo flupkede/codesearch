@@ -1,47 +1,249 @@
 //! MCP types and request/response structures
+//!
+//! The tool surface is consolidated into 5 tools:
+//! - `search`   — semantic + literal search (mode: "semantic" | "literal")
+//! - `find`     — symbol navigation (kind: "definition" | "usages" | "imports" | "dependents")
+//! - `explore`  — file exploration (kind: "outline" | "similar")
+//! - `get_chunk`— fetch chunk content by ID
+//! - `status`   — index + project info (kind: "index" | "projects")
 
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-/// Request for semantic/hybrid search
+// ═══════════════════════════════════════════════════════════════════
+// Consolidated request types (the 5 primary tools)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Unified search request — replaces `semantic_search` and `literal_search`.
+///
+/// Set `mode` to choose the search backend:
+/// - `"semantic"` (default) — vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF.
+/// - `"literal"` — pure FTS, no embeddings. Supports regex, phrase, and exact-term matching.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct SemanticSearchRequest {
-    /// The search query (natural language or code snippet)
+pub struct SearchRequest {
+    /// The search query (natural language, code snippet, regex, or exact term).
     pub query: String,
 
-    /// Maximum number of results to return (default: 10)
-    pub limit: Option<usize>,
+    /// Search backend: `"semantic"` (default) or `"literal"`.
+    pub mode: Option<String>,
 
+    // ── Semantic-mode options (ignored in literal mode) ──
     /// Return compact results (metadata only) to save tokens (default: true).
-    /// When true: returns only path, start_line, end_line, kind, signature, score.
-    /// When false: also includes full code content and surrounding context.
-    /// Use compact=true (default) and then read specific files with line offsets for the code you need.
+    /// Only applies in semantic mode.
     pub compact: Option<bool>,
 
-    /// Only return results from files under this path prefix (e.g., "src/api/")
+    /// Override auto-detection of query intent (semantic mode only).
+    /// `"auto"` (default) | `"semantic"` | `"lexical"` | `"hybrid"`
+    pub semantic_mode: Option<String>,
+
+    /// Only return results from files under this path prefix (semantic mode).
     pub filter_path: Option<String>,
 
-    /// Override auto-detection of query intent.
-    /// "auto" (default) | "semantic" | "lexical" | "hybrid"
-    /// - "semantic": skip FTS fusion, use vector results only
-    /// - "lexical":  skip embedding, use FTS path only
-    /// - "hybrid":   force full hybrid even if auto would choose a single path
-    pub mode: Option<String>,
+    // ── Literal-mode options (ignored in semantic mode) ──
+    /// Treat `query` as a regex pattern (literal mode only).
+    pub regex: Option<bool>,
+
+    /// Treat `query` as a phrase (literal mode only).
+    pub phrase: Option<bool>,
+
+    /// File glob filter (literal mode). e.g. "src/mcp/**", "**/*.rs"
+    pub file_glob: Option<String>,
+
+    /// Language filter (literal mode). e.g. "Rust", "Python"
+    pub language: Option<String>,
+
+    /// Output format for literal mode: `"json"` (default) or `"grep"`.
+    pub format: Option<String>,
+
+    // ── Common options ──
+    /// Maximum number of results (default: 10 for semantic, 20 for literal).
+    pub limit: Option<usize>,
+
+    /// Route to a specific project (requires `codesearch serve`).
+    #[serde(default)]
+    pub project: Option<String>,
+
+    /// Route to all projects in a group (requires `codesearch serve`).
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
-/// Request to find references/call sites of a symbol.
-/// Use this AFTER semantic_search to find where a function/class/variable is used.
-/// Use this INSTEAD OF grep for finding symbol usages in the codebase.
+/// Unified symbol navigation request — replaces `find_definition`, `find_usages`,
+/// `find_imports`, and `find_dependents`.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct FindReferencesRequest {
-    /// The symbol name to find references for (e.g., "authenticate", "User", "Config")
+pub struct FindRequest {
+    /// What to find: `"definition"` (default) | `"usages"` | `"imports"` | `"dependents"`.
+    pub kind: Option<String>,
+
+    /// Symbol name (for definition/usages) or module path (for imports/dependents).
     pub symbol: String,
 
-    /// Maximum number of references to return (default: 20)
+    /// Optional kind filter for definitions.
+    /// Accepted: "Function" | "Class" | "Method" | "Struct" | "Trait" | "Enum" | "TypeAlias" | "Interface"
+    pub definition_kind: Option<String>,
+
+    /// Maximum number of results (default: 20).
     pub limit: Option<usize>,
+
+    /// Route to a specific project (requires `codesearch serve`).
+    #[serde(default)]
+    pub project: Option<String>,
+
+    /// Route to all projects in a group (requires `codesearch serve`).
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
-/// Search result item - returned by semantic_search
+/// Unified exploration request — replaces `file_outline` and `similar_chunks`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExploreRequest {
+    /// What to explore: `"outline"` (default) | `"similar"`.
+    pub kind: Option<String>,
+
+    /// File path for outline mode, or chunk_id for similar mode.
+    /// For outline: a file path relative to project root or absolute.
+    /// For similar: a numeric chunk_id.
+    pub target: String,
+
+    /// Maximum number of results (default: 5 for similar, unlimited for outline).
+    pub limit: Option<usize>,
+
+    /// Route to a specific project (requires `codesearch serve`).
+    #[serde(default)]
+    pub project: Option<String>,
+
+    /// Route to all projects in a group (requires `codesearch serve`).
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// Unified status/info request — replaces `index_status` and `list_projects`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StatusRequest {
+    /// What status to return: `"index"` (default) | `"projects"`.
+    pub kind: Option<String>,
+
+    /// Route to a specific project's index status (requires `codesearch serve`).
+    #[serde(default)]
+    pub project: Option<String>,
+
+    /// Route to all projects in a group for aggregated index status (requires `codesearch serve`).
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Legacy request types (kept for backward compat / deprecated tool aliases)
+// ═══════════════════════════════════════════════════════════════════
+
+/// DEPRECATED: Use `SearchRequest` with `mode="semantic"`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SemanticSearchRequest {
+    pub query: String,
+    pub limit: Option<usize>,
+    pub compact: Option<bool>,
+    pub filter_path: Option<String>,
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// DEPRECATED: Use `FindRequest` with `kind="usages"`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindReferencesRequest {
+    pub symbol: String,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// DEPRECATED: Use `SearchRequest` with `mode="literal"`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct LiteralSearchRequest {
+    pub query: String,
+    pub regex: Option<bool>,
+    pub phrase: Option<bool>,
+    pub limit: Option<usize>,
+    pub file_glob: Option<String>,
+    pub language: Option<String>,
+    pub format: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// DEPRECATED: Use `FindRequest` with `kind="definition"`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindDefinitionRequest {
+    pub symbol: String,
+    pub kind: Option<String>,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// DEPRECATED: Use `FindRequest` with `kind="usages"`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindUsagesRequest {
+    pub symbol: String,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// DEPRECATED: Use `ExploreRequest` with `kind="outline"`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FileOutlineRequest {
+    pub path: String,
+    pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// DEPRECATED: Use `FindRequest` with `kind="imports"`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindImportsRequest {
+    pub path: String,
+    pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// DEPRECATED: Use `FindRequest` with `kind="dependents"`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindDependentsRequest {
+    pub symbol_or_path: String,
+    pub limit: Option<usize>,
+    pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// DEPRECATED: Use `ExploreRequest` with `kind="similar"`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SimilarChunksRequest {
+    pub chunk_id: u32,
+    pub limit: Option<usize>,
+    pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Response types
+// ═══════════════════════════════════════════════════════════════════
+
+/// Search result item — returned by semantic search
 #[derive(Debug, Serialize)]
 pub struct SearchResultItem {
     pub chunk_id: u32,
@@ -60,7 +262,7 @@ pub struct SearchResultItem {
     pub context_next: Option<String>,
 }
 
-/// Reference/call site item - returned by find_references
+/// Reference/call site item — returned by find_references, find_definition, find_usages
 #[derive(Debug, Serialize)]
 pub struct ReferenceItem {
     /// Chunk ID of the containing chunk
@@ -69,12 +271,12 @@ pub struct ReferenceItem {
     pub path: String,
     /// Line number of the reference
     pub line: usize,
-    /// The kind of chunk containing the reference (e.g., "Function", "Method")
+    /// The kind of chunk (e.g., "Function", "Method", "Class")
     pub kind: String,
     /// Signature of the containing function/method (if available)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-    /// FTS relevance score
+    /// Relevance score (BM25 or RRF-fused)
     pub score: f32,
 }
 
@@ -97,121 +299,32 @@ pub struct IndexStatusResponse {
     pub error_message: Option<String>,
 }
 
-/// Database info response
-#[derive(Debug, Serialize)]
-pub struct DatabaseInfoResponse {
-    pub database_path: String,
-    pub project_path: String,
-    pub is_current_directory: bool,
-    pub depth_from_current: usize,
-    pub total_chunks: usize,
-    pub total_files: usize,
-    pub model: String,
-}
-
-/// Request for literal/FTS-only search.
-///
-/// Three mutually exclusive modes (first match wins):
-/// - `regex=true` → regex search on indexed content
-/// - `phrase=true` → phrase query (tokens must appear in sequence)
-/// - default → exact term search (BM25)
-///
-/// No embedding service is used — this tool is fast and works without a model.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct LiteralSearchRequest {
-    /// The search query (exact terms, regex pattern, or phrase depending on mode flags)
-    pub query: String,
-
-    /// Treat `query` as a regex pattern (e.g., "fn \\w+_handler")
-    pub regex: Option<bool>,
-
-    /// Treat `query` as a phrase (tokens must appear in sequence, e.g., "fn new")
-    pub phrase: Option<bool>,
-
-    /// Maximum number of results to return (default: 20)
-    pub limit: Option<usize>,
-
-    /// Only return results from files matching this glob pattern.
-    /// v1 supports prefix/suffix patterns with `*` and `**` (e.g., "src/mcp/**", "**/*.rs")
-    pub file_glob: Option<String>,
-
-    /// Only return results from files of this language (e.g., "Rust", "Python", "TypeScript")
-    pub language: Option<String>,
-
-    /// Output format: "json" (structured) or "grep" (file:line:snippet). Default: "json"
-    pub format: Option<String>,
-}
-
-/// Search result item - returned by literal_search
+/// Search result item — returned by literal search
 #[derive(Debug, Serialize)]
 pub struct LiteralSearchResultItem {
     /// File path (relative to project root)
     pub path: String,
-    /// Start line number (matching line when available)
+    /// Line number of the matching line (not the chunk start)
     pub start_line: usize,
-    /// End line number
+    /// Same as start_line — literal search pinpoints a single matching line
     pub end_line: usize,
-    /// Code snippet (the first matching line when available)
+    /// The matching line (truncated to 200 chars centered on the match)
     pub snippet: String,
-    /// BM25 relevance score
     pub score: f32,
-    /// Kind of chunk (e.g., "function", "struct", "class")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// Signature (e.g., function signature) if available
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-}
-
-/// Find databases response
-#[derive(Debug, Serialize)]
-pub struct FindDatabasesResponse {
-    pub databases: Vec<DatabaseInfoResponse>,
-    pub message: String,
-    pub current_directory: String,
 }
 
 /// Semantic search response wrapper with low-confidence signaling
 #[derive(Debug, Serialize)]
 pub struct SemanticSearchResponse {
-    /// Search results
     pub results: Vec<SearchResultItem>,
-    /// Set when the top RRF score is below the confidence threshold.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub low_confidence: Option<bool>,
-    /// Populated alongside `low_confidence`. Suggests a better-suited tool for this query.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_tool: Option<String>,
-}
-
-/// Request to find the definition of a symbol
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct FindDefinitionRequest {
-    /// Symbol name (function, class, method, struct, trait, enum, type)
-    pub symbol: String,
-    /// Optional filter to a specific kind. If omitted, all definition kinds are searched.
-    /// Accepted: "Function" | "Class" | "Method" | "Struct" | "Trait" | "Enum" | "TypeAlias" | "Interface"
-    pub kind: Option<String>,
-    /// Maximum number of results to return (default: 20)
-    pub limit: Option<usize>,
-}
-
-/// Request to find usages/call-sites of a symbol
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct FindUsagesRequest {
-    /// Symbol name to find usages for
-    pub symbol: String,
-    /// Maximum number of results to return (default: 20)
-    pub limit: Option<usize>,
-}
-
-/// Request for file outline navigation
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct FileOutlineRequest {
-    /// File path, relative to project root or absolute.
-    pub path: String,
-    /// Forward-compat stub — ignored in this branch.
-    pub project: Option<String>,
 }
 
 /// File outline entry
@@ -227,12 +340,11 @@ pub struct FileOutlineItem {
 /// Request to fetch a chunk by ID
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetChunkRequest {
-    /// chunk_id as returned by semantic_search, file_outline, find_definition, or find_usages.
     pub chunk_id: u32,
-    /// Lines of surrounding context to include (default: 0, max: 20).
     pub context_lines: Option<usize>,
-    /// Forward-compat stub — ignored in this branch.
     pub project: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 /// Response payload for get_chunk
@@ -245,25 +357,14 @@ pub struct GetChunkResponse {
     pub kind: String,
     pub signature: Option<String>,
     pub content: String,
-    /// Lines before the chunk start (up to context_lines).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_before: Option<String>,
-    /// Lines after the chunk end (up to context_lines).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_after: Option<String>,
-    /// True when requested context_lines was clamped to the max (20).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_lines_clamped: Option<bool>,
-    /// Optional informational note (e.g. source file unreadable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-}
-
-/// Request to find imports in a file
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct FindImportsRequest {
-    pub path: String,
-    pub project: Option<String>,
 }
 
 /// Import/dependency item found in a file
@@ -274,15 +375,6 @@ pub struct ImportItem {
     pub kind: String,
 }
 
-/// Request to find files depending on a symbol/path
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct FindDependentsRequest {
-    /// Module name, file path, or symbol to find dependents of.
-    pub symbol_or_path: String,
-    pub limit: Option<usize>,
-    pub project: Option<String>,
-}
-
 /// File/path dependent item
 #[derive(Debug, Serialize)]
 pub struct DependentItem {
@@ -291,10 +383,111 @@ pub struct DependentItem {
     pub import_statement: String,
 }
 
-/// Request to find semantically similar chunks for a chunk_id
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SimilarChunksRequest {
-    pub chunk_id: u32,
-    pub limit: Option<usize>,
-    pub project: Option<String>,
+/// Response for the `list_projects` tool.
+#[derive(Debug, Serialize)]
+pub struct ListProjectsResponse {
+    pub repos: Vec<RepoInfo>,
+    pub groups: HashMap<String, Vec<String>>,
+    pub serve_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serve_url: Option<String>,
+    pub current_directory: String,
+}
+
+/// Information about a single registered project/repo.
+#[derive(Debug, Serialize)]
+pub struct RepoInfo {
+    pub alias: String,
+    pub project_path: String,
+    pub database_path: String,
+    pub total_chunks: usize,
+    pub total_files: usize,
+    pub model: String,
+    pub lock_status: String,
+}
+
+/// Health response served by `codesearch serve` at GET /health.
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub codesearch_server: bool,
+    pub version: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════
+
+/// Validate project/group routing params — returns error message if invalid.
+pub fn validate_project_group(
+    project: &Option<String>,
+    group: &Option<String>,
+    serve_active: bool,
+) -> Result<(), String> {
+    match (project, group) {
+        // Both project and group are mutually exclusive.
+        (Some(_), Some(_)) => {
+            Err("Cannot specify both `project` and `group` — they are mutually exclusive.".to_string())
+        }
+        // Either project or group is set but empty/whitespace.
+        // The pattern binds `p` from whichever side is Some — both arms share the same guard.
+        (Some(p), None) | (None, Some(p)) if p.trim().is_empty() => {
+            Err("`project`/`group` must not be empty.".to_string())
+        }
+        // Either project or group is set but serve is not running.
+        (Some(_), None) | (None, Some(_)) if !serve_active => {
+            Err("project/group routing requires `codesearch serve` to be running.".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_neither_set() {
+        assert!(validate_project_group(&None, &None, false).is_ok());
+        assert!(validate_project_group(&None, &None, true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_both_set_rejected() {
+        let err = validate_project_group(&Some("foo".into()), &Some("bar".into()), true).unwrap_err();
+        assert!(err.contains("mutually exclusive"), "Expected mutual exclusion error, got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_project_requires_serve() {
+        let err = validate_project_group(&Some("myrepo".into()), &None, false).unwrap_err();
+        assert!(err.contains("serve"), "Expected serve-required error, got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_group_requires_serve() {
+        let err = validate_project_group(&None, &Some("mygroup".into()), false).unwrap_err();
+        assert!(err.contains("serve"), "Expected serve-required error, got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_project_ok_when_serving() {
+        assert!(validate_project_group(&Some("myrepo".into()), &None, true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_group_ok_when_serving() {
+        assert!(validate_project_group(&None, &Some("mygroup".into()), true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_project_rejected() {
+        let err = validate_project_group(&Some("".into()), &None, true).unwrap_err();
+        assert!(err.contains("must not be empty"), "Expected empty error, got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_empty_group_rejected() {
+        let err = validate_project_group(&None, &Some("  ".into()), true).unwrap_err();
+        assert!(err.contains("must not be empty"), "Expected empty error, got: {}", err);
+    }
 }
