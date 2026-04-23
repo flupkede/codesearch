@@ -383,9 +383,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             force,
             add,
             global,
-            alias: _alias,
+            alias,
             remove,
-            keep_config: _keep_config,
+            keep_config,
             list,
         } => {
             // Subcommand path (preferred)
@@ -411,10 +411,10 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
                 if add || is_add_cmd {
                     let effective_path = if is_add_cmd { None } else { path };
-                    crate::index::add_to_index(effective_path, global, _alias, cancel_token.clone()).await
+                    crate::index::add_to_index(effective_path, global, alias, cancel_token.clone()).await
                 } else if remove || is_rm_cmd {
                     let effective_path = if is_rm_cmd { None } else { path };
-                    crate::index::remove_from_index(effective_path, _keep_config).await
+                    crate::index::remove_from_index(effective_path, keep_config).await
                 } else if list || is_list_cmd {
                     crate::index::list_index_status().await
                 } else {

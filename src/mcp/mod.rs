@@ -2457,12 +2457,10 @@ impl CodesearchService {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Legacy tools (deprecated — delegate to consolidated tools above)
+    // Internal implementations (called by consolidated tools above)
     // ─────────────────────────────────────────────────────────────────
 
-    #[tool(
-        description = "DEPRECATED. Use `search` with `mode=\"semantic\"` instead.\n\nHybrid code search over tree-sitter AST chunks: vector embeddings + Tantivy FTS + exact-identifier boosting, fused with RRF.\n\nOPTIONAL `mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\"."
-    )]
+    /// Internal: semantic/hybrid search implementation used by `search(mode="semantic")`.
     async fn semantic_search(
         &self,
         Parameters(request): Parameters<SemanticSearchRequest>,
@@ -3093,11 +3091,9 @@ impl CodesearchService {
         .unwrap_or_default()
     }
 
-    // === find_definition tool ===
+    // === find_definition internal ===
 
-    #[tool(
-        description = "DEPRECATED. Use `find` with `kind=\"definition\"` instead.\n\nLocate the definition of a symbol (function, class, method, struct, trait, enum, type)."
-    )]
+    /// Internal: find symbol definitions, used by `find(kind="definition")`.
     async fn find_definition(
         &self,
         Parameters(request): Parameters<FindDefinitionRequest>,
@@ -3252,7 +3248,7 @@ impl CodesearchService {
             .await
     }
 
-    /// Shared implementation for find_usages and the deprecated find_references alias.
+    /// Shared implementation for find_usages (used by `find(kind="usages")`).
     async fn find_usages_impl(
         &self,
         symbol: String,
@@ -3958,9 +3954,7 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "DEPRECATED. Use `explore` with `kind=\"similar\"` instead.\n\nFind chunks semantically similar to a given chunk (by chunk_id)."
-    )]
+    /// Internal: find similar chunks, used by `explore(kind="similar")`.
     async fn similar_chunks(
         &self,
         Parameters(request): Parameters<SimilarChunksRequest>,

@@ -134,10 +134,10 @@ pub struct StatusRequest {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Legacy request types (kept for backward compat / deprecated tool aliases)
+// Internal parameter types (used by consolidated tools to dispatch to implementations)
 // ═══════════════════════════════════════════════════════════════════
 
-/// DEPRECATED: Use `SearchRequest` with `mode="semantic"`.
+/// Internal params for semantic search (used by `search` tool dispatch).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SemanticSearchRequest {
     pub query: String,
@@ -151,7 +151,7 @@ pub struct SemanticSearchRequest {
     pub group: Option<String>,
 }
 
-/// DEPRECATED: Use `SearchRequest` with `mode="literal"`.
+/// Internal params for literal search (used by `search` tool dispatch).
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct LiteralSearchRequest {
     pub query: String,
@@ -167,7 +167,7 @@ pub struct LiteralSearchRequest {
     pub group: Option<String>,
 }
 
-/// DEPRECATED: Use `FindRequest` with `kind="definition"`.
+/// Internal params for find-definition (used by `find` tool dispatch).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindDefinitionRequest {
     pub symbol: String,
@@ -179,7 +179,7 @@ pub struct FindDefinitionRequest {
     pub group: Option<String>,
 }
 
-/// DEPRECATED: Use `FindRequest` with `kind="usages"`.
+/// Internal params for find-usages (used by `find` tool dispatch).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindUsagesRequest {
     pub symbol: String,
@@ -190,7 +190,7 @@ pub struct FindUsagesRequest {
     pub group: Option<String>,
 }
 
-/// DEPRECATED: Use `ExploreRequest` with `kind="outline"`.
+/// Internal params for file-outline (used by `explore` tool dispatch).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FileOutlineRequest {
     pub path: String,
@@ -199,7 +199,7 @@ pub struct FileOutlineRequest {
     pub group: Option<String>,
 }
 
-/// DEPRECATED: Use `FindRequest` with `kind="imports"`.
+/// Internal params for find-imports (used by `find` tool dispatch).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindImportsRequest {
     pub path: String,
@@ -208,7 +208,7 @@ pub struct FindImportsRequest {
     pub group: Option<String>,
 }
 
-/// DEPRECATED: Use `FindRequest` with `kind="dependents"`.
+/// Internal params for find-dependents (used by `find` tool dispatch).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindDependentsRequest {
     pub symbol_or_path: String,
@@ -218,7 +218,7 @@ pub struct FindDependentsRequest {
     pub group: Option<String>,
 }
 
-/// DEPRECATED: Use `ExploreRequest` with `kind="similar"`.
+/// Internal params for similar-chunks (used by `explore` tool dispatch).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SimilarChunksRequest {
     pub chunk_id: u32,

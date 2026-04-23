@@ -404,7 +404,7 @@ pub async fn run_serve(
         config.save().context("Failed to save repos config")?;
     }
 
-        let serve_state = Arc::new(ServeState::new(config, None));
+    let serve_state = Arc::new(ServeState::new(config, None));
 
     // Log startup
     let addr = SocketAddr::from(([127, 0, 0, 1], effective_port));
