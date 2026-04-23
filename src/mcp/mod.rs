@@ -3409,16 +3409,6 @@ impl CodesearchService {
                 )
                 .await
                 .unwrap_or_default()
-
-
-
-
-
-
-
-
-
-
         };
 
         let chunk = match chunk {
