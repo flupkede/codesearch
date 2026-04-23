@@ -45,7 +45,8 @@ codesearch is designed as the primary bridge between AI agents and your codebase
 - [Searching](#searching)
 - [MCP Server Configuration](#mcp-server-configuration)
 - [MCP Serve Mode](#mcp-serve-mode)
-- [Repository Management](#repository-management)
+- [Index & Project Management](#index--project-management)
+- [Groups](#groups)
 - [Other Commands](#other-commands)
 - [Search Modes](#search-modes)
 - [Global vs Local Indexes](#global-vs-local-indexes)
@@ -515,34 +516,15 @@ When the MCP server starts, it goes through this sequence:
 
 ### MCP Tools
 
-The tool surface is consolidated into **5 primary tools** with deprecated aliases for backward compatibility.
-
-#### Primary Tools
+The tool surface is consolidated into **5 primary tools**:
 
 | Tool | Parameters | Description |
 |---|---|---|
 | `search` | `query`, `mode` ("semantic" default, "literal"), `limit`, `compact`, `filter_path`, `project`, `group` | Unified code search. Semantic mode uses vector embeddings + FTS; literal mode is pure FTS (regex, phrase, exact). |
-| `find` | `kind` ("definition" default, "usages", "imports", "dependents"), `symbol`, `limit`, `project` | Unified symbol navigation. Locate definitions, call-sites, import graphs, and dependency chains. |
+| `find` | `kind` ("definition" default, "usages", "imports", "dependents"), `symbol`, `limit`, `project`, `group` | Unified symbol navigation. Locate definitions, call-sites, import graphs, and dependency chains. |
 | `explore` | `kind` ("outline" default, "similar"), `target`, `limit`, `project` | File exploration. Outline shows file structure; similar finds semantically related chunks. |
 | `get_chunk` | `chunk_id`, `context_lines` (default: 0, max: 20), `project` | Retrieve full chunk content by ID with optional surrounding context. |
 | `status` | `kind` ("index" default, "projects") | Index health/stats or list registered projects and groups. |
-
-#### Deprecated Aliases (still functional)
-
-| Tool | Use instead |
-|---|---|
-| `semantic_search` | `search(mode="semantic")` |
-| `literal_search` | `search(mode="literal")` |
-| `find_definition` | `find(kind="definition")` |
-| `find_usages` | `find(kind="usages")` |
-| `find_references` | `find(kind="usages")` |
-| `find_imports` | `find(kind="imports")` |
-| `find_dependents` | `find(kind="dependents")` |
-| `file_outline` | `explore(kind="outline")` |
-| `similar_chunks` | `explore(kind="similar")` |
-| `index_status` | `status(kind="index")` |
-| `list_projects` | `status(kind="projects")` |
-| `find_databases` | `status(kind="projects")` |
 
 ### `status(kind="index")` Response
 
@@ -685,12 +667,12 @@ export CODESEARCH_LOG_CLEANUP_INTERVAL_HOURS=12
 | Command | Description |
 |---|---|
 | `codesearch serve [--port PORT] [--register PATH]...` | MCP streamable HTTP server (default port 39725) |
-| `codesearch repos list` | List registered repositories |
-| `codesearch repos add [PATH] [--alias NAME]` | Register a repository |
-| `codesearch repos remove <ALIAS>` | Unregister a repository |
-| `codesearch groups list` | List repository groups |
+| `codesearch index add [PATH] [--alias NAME] [--global]` | Create index AND register in `repos.json` |
+| `codesearch index rm [PATH] [--keep-config]` | Remove index AND unregister |
+| `codesearch index list` | Show all registered repos + groups |
 | `codesearch groups add <NAME> --aliases A1 A2` | Create/update a group |
-| `codesearch groups remove <NAME>` | Remove a group |
+| `codesearch groups rm <NAME>` | Remove a group |
+| `codesearch groups list` | List all groups |
 | `codesearch stats [PATH]` | Show database statistics |
 | `codesearch clear [PATH] [-y]` | Delete the index |
 | `codesearch list` | List all indexed repositories |
@@ -723,41 +705,54 @@ codesearch serve --register /path/to/project-a --register /path/to/project-b
 | GET | `/health` | Health check (`{"codesearch_server": true, "version": "..."}`) |
 | POST | `/mcp` | MCP streamable HTTP endpoint |
 
-**Auto-detection:** When `codesearch mcp` starts, it probes `GET /health` on the configured port (200ms timeout):
+**Proxy auto-detection:** When `codesearch mcp` starts, it probes `GET /health` on the configured port (200ms timeout):
 - If a matching serve instance is found → enters **proxy mode** (forwards all tool calls)
 - If not reachable → falls back to local stdio mode (existing behavior)
-- If version mismatch → hard error (update binaries to match)
+- If version mismatch → hard error with actionable fix instructions
 
-### Repository Management
+**Dead session:** If serve becomes unreachable mid-session, all subsequent tool calls return a fixed error. The client must reconnect after restarting serve.
 
-codesearch tracks registered repositories in `~/.codesearch/repos.json`. Repos can be grouped for cross-project search.
+**Live file watching:** Each opened repo gets its own FSW + git-HEAD watcher. File edits and branch switches are picked up automatically — no manual re-index needed.
 
-**Register repos:**
+**Config reload:** `repos.json` changes are picked up on the next tool call (via mtime check). No serve restart required. Added repos are immediately queryable; removed repos have their watchers stopped and are cleaned up.
+
+### Index & Project Management
+
+`codesearch index` creates, refreshes, and manages indexes. Use one of these subcommands:
+
 ```bash
-# Register current directory (alias auto-generated from folder name)
-codesearch repos add
+codesearch index add [PATH] [--alias NAME] [--global]
+# Creates an index AND registers it in ~/.codesearch/repos.json
+# --alias: assign a custom alias (auto-generated from dir name otherwise)
+# --global: create a global index at ~/.codesearch.dbs/ (not auto-registered)
 
-# Register with a custom alias
-codesearch repos add /path/to/project --alias my-project
+codesearch index rm  [PATH] [--keep-config]
+# Removes the index AND unregisters it (symmetric with add)
+# --keep-config: delete the DB only, preserve the repos.json entry
 
-# List all registered repos
-codesearch repos list
-
-# Remove a repo by alias
-codesearch repos remove my-project
+codesearch index list
+# Shows all registered repos, their index state, and any groups
 ```
 
-**Manage groups:**
-```bash
-# Create a group containing multiple repos
-codesearch groups add frontend --aliases web-app admin-panel shared-ui
+Re-indexing (`codesearch index` without add/rm) leaves the config alone.
 
-# List all groups
+### Groups
+
+Groups let you search across multiple related repos in a single MCP call — useful for refactoring across a shared library and its consumers, or finding where a symbol is used across a whole platform.
+
+Groups are created manually by you. AI agents don't create them — only you know which repos belong together.
+
+```bash
+codesearch groups add platform --aliases shared-lib service-a service-b
 codesearch groups list
-
-# Remove a group
-codesearch groups remove frontend
+codesearch groups rm platform
 ```
+
+From an AI agent session:
+```
+search(mode="semantic", group="platform", query="where is the auth token validated?")
+```
+fans out across all repos in the group and returns merged, alias-prefixed results (e.g. `shared-lib/src/auth.rs:42`).
 
 **Config file format** (`~/.codesearch/repos.json`):
 ```json
@@ -914,6 +909,10 @@ Create `.codesearchignore` in your project root (same syntax as `.gitignore`). A
 | Cache too large | Clear cache: `codesearch cache clear <model>` |
 | MCP server starts but searches fail | Index is still being created in background. Check logs for progress. |
 | Want to disable auto-index | Use `--create-index=false` flag with search/mcp commands |
+| `codesearch index` hangs during a serve session | Serve holds the write lock. Let serve's built-in watcher pick up changes, or stop serve first |
+| New repo added with `index add` not visible to running serve | No action needed — serve detects `repos.json` changes on the next tool call |
+| Serve shows "database not found" for a registered repo | The `.codesearch.db/` was removed externally. Run `codesearch index add <path>` to recreate, or `codesearch index rm <path>` to clean up the config entry |
+| Serve + MCP version mismatch | Stop serve, install matching binary on both endpoints, restart serve |
 
 ### Git-Specific Troubleshooting
 
