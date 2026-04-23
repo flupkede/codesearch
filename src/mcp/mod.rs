@@ -4462,8 +4462,6 @@ impl CodesearchService {
             });
         }
 
-        // Load repos config
-        let config = load_repos_config().unwrap_or_default();
         let serve_active = self.serve_state.is_some();
         let serve_url = if serve_active {
             Some(crate::mcp::proxy::serve_url_from_env())
@@ -4471,6 +4469,68 @@ impl CodesearchService {
             None
         };
 
+        // When serve is active, use ServeState as source of truth for lock status
+        if let Some(ref serve_state) = self.serve_state {
+            let config = serve_state.config_snapshot();
+            let mut repos_info = Vec::new();
+
+            for (alias, path) in &config.repos {
+                let db_path = path.join(crate::constants::DB_DIR_NAME);
+
+                let (total_chunks, total_files, model, lock_status) = if db_path.exists() {
+                    let (model_name, dims) = read_model_metadata(&db_path);
+
+                    // Use DashMap state for opened repos, disk check for unopened
+                    let lock_status = match serve_state.repo_lock_status(alias) {
+                        Some(s) => s.to_string(),
+                        None => {
+                            // Not yet opened in DashMap — fall back to disk check
+                            if crate::index::is_database_locked(&db_path) {
+                                "locked-externally".to_string()
+                            } else {
+                                "available".to_string()
+                            }
+                        }
+                    };
+
+                    if let Ok(store) = VectorStore::new(&db_path, dims) {
+                        if let Ok(stats) = store.stats() {
+                            (stats.total_chunks, stats.total_files, model_name, lock_status)
+                        } else {
+                            (0, 0, model_name, lock_status)
+                        }
+                    } else {
+                        (0, 0, model_name, lock_status)
+                    }
+                } else {
+                    (0, 0, "not indexed".to_string(), "unknown".to_string())
+                };
+
+                repos_info.push(RepoInfo {
+                    alias: alias.clone(),
+                    project_path: path.display().to_string(),
+                    database_path: db_path.display().to_string(),
+                    total_chunks,
+                    total_files,
+                    model,
+                    lock_status,
+                });
+            }
+
+            let response = ListProjectsResponse {
+                repos: repos_info,
+                groups: config.groups,
+                serve_active,
+                serve_url,
+                current_directory: current_dir.display().to_string(),
+            };
+
+            let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
+        // Stdio mode: fall back to disk-based lock detection
+        let config = load_repos_config().unwrap_or_default();
         let mut repos_info = Vec::new();
         for (alias, path) in &config.repos {
             let db_path = path.join(crate::constants::DB_DIR_NAME);

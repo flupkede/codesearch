@@ -334,6 +334,28 @@ impl ServeState {
         config.repos.keys().cloned().collect()
     }
 
+    /// Get the lock status string for a given alias from the DashMap.
+    /// Returns None if the alias is not yet opened (never queried).
+    pub(crate) fn repo_lock_status(&self, alias: &str) -> Option<&'static str> {
+        match self.repos.get(alias) {
+            Some(entry) => match entry.value() {
+                RepoState::Write { .. } => Some("write"),
+                RepoState::Readonly { .. } => Some("readonly"),
+                RepoState::Conflicted => Some("conflicted"),
+            },
+            None => None,
+        }
+    }
+
+    /// Get the config (for listing all registered repos and groups).
+    /// Triggers reload_if_changed first.
+    pub(crate) fn config_snapshot(&self) -> ReposConfig {
+        let _ = self.reload_if_changed();
+        self.config.read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
     /// Resolve a group name to its constituent aliases.
     /// Returns an error if the group doesn't exist.
     pub(crate) fn resolve_group_aliases(&self, group: &str) -> std::result::Result<Vec<String>, String> {
