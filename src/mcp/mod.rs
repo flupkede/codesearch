@@ -257,6 +257,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_no_deprecated_tool_aliases_in_instructions() {
+        let src = include_str!("mod.rs");
+        let instructions_start = src.find("codesearch — semantic + lexical");
+        assert!(instructions_start.is_some());
+        let start = instructions_start.unwrap();
+        let remaining = &src[start..];
+        let instructions_end = remaining.find("\"#,");
+        assert!(instructions_end.is_some());
+        let instructions_text = &remaining[..instructions_end.unwrap()];
+
+        let deprecated = [
+            "semantic_search",
+            "literal_search",
+            "find_definition",
+            "find_usages",
+            "find_references",
+            "find_imports",
+            "find_dependents",
+            "file_outline",
+            "similar_chunks",
+            "index_status",
+            "list_projects",
+            "find_databases",
+            "Deprecated aliases",
+        ];
+        for name in &deprecated {
+            assert!(
+                !instructions_text.contains(name),
+                "Instructions still mentions deprecated tool/section: {}",
+                name
+            );
+        }
+    }
+
+    // === prefix_path_with_alias tests ===
+
+    #[test]
+    fn test_path_prefix_windows_backslashes() {
+        let result = super::prefix_path_with_alias(
+            r"C:\repo\src\main.rs",
+            Some("myrepo"),
+            r"C:\repo",
+        );
+        assert_eq!(result, "myrepo/src/main.rs");
+    }
+
+    #[test]
+    fn test_path_prefix_unc_prefix() {
+        let result = super::prefix_path_with_alias(
+            r"\\?\C:\repo\src\main.rs",
+            Some("myrepo"),
+            r"C:\repo",
+        );
+        // After normalization, UNC prefix is stripped by normalize_path_str
+        assert!(
+            result.starts_with("myrepo/"),
+            "Expected alias prefix, got: {}",
+            result
+        );
+        assert!(
+            result.contains("main.rs"),
+            "Expected filename in result, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_path_prefix_mixed_separators() {
+        let result = super::prefix_path_with_alias(
+            r"C:\repo/src\main.rs",
+            Some("myrepo"),
+            r"C:\repo",
+        );
+        assert_eq!(result, "myrepo/src/main.rs");
+    }
+
+    #[test]
+    fn test_path_prefix_no_alias() {
+        let result = super::prefix_path_with_alias(
+            "C:/repo/src/main.rs",
+            None,
+            "C:/repo",
+        );
+        assert_eq!(result, "src/main.rs");
+    }
+
+    #[test]
+    fn test_path_prefix_empty_alias() {
+        let result = super::prefix_path_with_alias(
+            "C:/repo/src/main.rs",
+            Some(""),
+            "C:/repo",
+        );
+        assert_eq!(result, "src/main.rs");
+    }
+
+    #[test]
+    fn test_path_prefix_preserves_path_outside_root() {
+        let result = super::prefix_path_with_alias(
+            "C:/other/src/main.rs",
+            Some("myrepo"),
+            "C:/repo",
+        );
+        // Path doesn't start with root — returned normalized, no alias prefix
+        assert_eq!(result, "C:/other/src/main.rs");
+    }
+
     // === simple_glob_match tests ===
 
     #[test]
@@ -1164,15 +1272,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_references_request_with_group() {
-        let json = r#"{"symbol":"Config","limit":20,"group":"all"}"#;
-        let req: super::types::FindReferencesRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.symbol, "Config");
-        assert_eq!(req.limit, Some(20));
-        assert_eq!(req.group.as_deref(), Some("all"));
-    }
-
-    #[test]
     fn test_literal_search_request_with_group() {
         let json = r#"{"query":"TODO","group":"all","format":"grep"}"#;
         let req: super::types::LiteralSearchRequest = serde_json::from_str(json).unwrap();
@@ -1686,6 +1785,27 @@ fn normalize_tool_path(path: &str, project_root: &Path) -> String {
     crate::cache::normalize_path_str(resolved.to_string_lossy().as_ref())
 }
 
+/// Prefix a result path with its repo alias for group queries, normalizing
+/// Windows backslashes to forward slashes in the process. When `alias` is
+/// None or empty, the path is still normalized (useful for stdio mode).
+#[allow(dead_code)]
+pub(crate) fn prefix_path_with_alias(path: &str, alias: Option<&str>, project_root: &str) -> String {
+    let normalized = crate::cache::normalize_path_str(path);
+    let normalized_root = crate::cache::normalize_path_str(project_root)
+        .trim_end_matches('/')
+        .to_string();
+    match normalized.strip_prefix(&normalized_root) {
+        Some(rest) => {
+            let relative = rest.trim_start_matches('/');
+            match alias {
+                Some(a) if !a.is_empty() => format!("{}/{}", a, relative),
+                _ => relative.to_string(),
+            }
+        }
+        None => normalized,
+    }
+}
+
 fn is_import_kind(kind: &str) -> bool {
     matches!(kind, "Import" | "Use" | "Require" | "Include" | "Imports")
 }
@@ -1937,7 +2057,7 @@ impl CodesearchService {
     /// - `Ok(None)` — no project/group specified, use default local stores
     /// - `Ok(Some(vec))` — one or more stores to query (fan out and merge)
     /// - `Err(msg)` — validation error
-    fn resolve_repo_stores_multi(
+    async fn resolve_repo_stores_multi(
         &self,
         project: &Option<String>,
         group: &Option<String>,
@@ -1955,7 +2075,7 @@ impl CodesearchService {
         types::validate_project_group(project, group, true)?;
 
         if let Some(ref alias) = project {
-            let stores = serve_state.get_or_open_stores(alias)?;
+            let stores = serve_state.get_or_open_stores(alias).await?;
             return Ok(Some(vec![stores]));
         }
 
@@ -1966,7 +2086,7 @@ impl CodesearchService {
             }
             let mut all_stores = Vec::with_capacity(aliases.len());
             for alias in &aliases {
-                all_stores.push(serve_state.get_or_open_stores(alias)?);
+                all_stores.push(serve_state.get_or_open_stores(alias).await?);
             }
             return Ok(Some(all_stores));
         }
@@ -1978,12 +2098,12 @@ impl CodesearchService {
     ///
     /// Encapsulates the common pattern: resolve multi-stores, extract single override
     /// vs multi-store vec, and determine if local DB check is needed.
-    fn resolve_routing(
+    async fn resolve_routing(
         &self,
         project: &Option<String>,
         group: &Option<String>,
     ) -> std::result::Result<MultiStoreContext, String> {
-        let multi_stores = self.resolve_repo_stores_multi(project, group)?;
+        let multi_stores = self.resolve_repo_stores_multi(project, group).await?;
         let is_multi = multi_stores.as_ref().is_some_and(|v| v.len() > 1);
         let stores = match &multi_stores {
             None => None,
@@ -2356,7 +2476,7 @@ impl CodesearchService {
         }
 
         // Resolve project/group routing (multi-store for group fan-out)
-        let ctx = match self.resolve_routing(&request.project, &request.group) {
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -2992,7 +3112,7 @@ impl CodesearchService {
         );
 
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group) {
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -3124,9 +3244,6 @@ impl CodesearchService {
 
     // === find_usages tool ===
 
-    #[tool(
-        description = "DEPRECATED. Use `find` with `kind=\"usages\"` instead.\n\nFind call-sites and other usages of a symbol across the codebase."
-    )]
     async fn find_usages(
         &self,
         Parameters(request): Parameters<FindUsagesRequest>,
@@ -3146,7 +3263,7 @@ impl CodesearchService {
         tracing::debug!("MCP find_usages: symbol='{}', limit={}", symbol, limit);
 
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&project, &group) {
+        let ctx = match self.resolve_routing(&project, &group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -3262,26 +3379,12 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "DEPRECATED. Use `find` with `kind=\"usages\"` instead. This tool is an alias for `find_usages`."
-    )]
-    async fn find_references(
-        &self,
-        Parameters(request): Parameters<FindReferencesRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        self.find_usages_impl(request.symbol, request.limit.unwrap_or(20), request.project, request.group)
-            .await
-    }
-
-    #[tool(
-        description = "DEPRECATED. Use `explore` with `kind=\"outline\"` instead.\n\nList all indexed top-level symbols in a file — kind, signature, and line range."
-    )]
     async fn file_outline(
         &self,
         Parameters(request): Parameters<FileOutlineRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group) {
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -3371,7 +3474,7 @@ impl CodesearchService {
         Parameters(request): Parameters<GetChunkRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group) {
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -3475,15 +3578,12 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "DEPRECATED. Use `find` with `kind=\"imports\"` instead.\n\nList all imports/dependencies declared in a source file."
-    )]
     async fn find_imports(
         &self,
         Parameters(request): Parameters<FindImportsRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group) {
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -3646,15 +3746,12 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "DEPRECATED. Use `find` with `kind=\"dependents\"` instead.\n\nFind all files that import or depend on a given module, file path, or symbol."
-    )]
     async fn find_dependents(
         &self,
         Parameters(request): Parameters<FindDependentsRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group) {
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -3869,7 +3966,7 @@ impl CodesearchService {
         Parameters(request): Parameters<SimilarChunksRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group) {
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -3989,9 +4086,6 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "DEPRECATED. Use `search` with `mode=\"literal\"` instead.\n\nSearch code using literal/FTS matching without embeddings."
-    )]
     async fn literal_search(
         &self,
         Parameters(request): Parameters<LiteralSearchRequest>,
@@ -4005,7 +4099,7 @@ impl CodesearchService {
         }
 
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group) {
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4211,17 +4305,10 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(
-        description = "DEPRECATED. Use `status` with `kind=\"index\"` instead.\n\nGet the status of the semantic search index including model info and statistics."
-    )]
-    async fn index_status(&self) -> Result<CallToolResult, McpError> {
-        self.index_status_impl(None, None).await
-    }
-
     /// Internal implementation for index_status with optional project/group routing.
     async fn index_status_impl(&self, project: Option<String>, group: Option<String>) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&project, &group) {
+        let ctx = match self.resolve_routing(&project, &group).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4364,19 +4451,7 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "DEPRECATED. Use `status` with `kind=\"projects\"` instead.\n\nFind all available codesearch databases."
-    )]
-    async fn find_databases(&self) -> Result<CallToolResult, McpError> {
-        // Delegate to list_projects — both deprecated in favor of status(kind="projects").
-        // list_projects reads from repos.json and returns richer structured output.
-        self.list_projects().await
-    }
-
     /// List all registered projects and groups. Called by `status(kind="projects")`.
-    #[tool(
-        description = "DEPRECATED. Use `status` with `kind=\"projects\"` instead.\n\nList all registered projects/repositories and their index status, plus group definitions."
-    )]
     async fn list_projects(&self) -> Result<CallToolResult, McpError> {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -4524,7 +4599,7 @@ impl ServerHandler for CodesearchService {
             instructions: Some(format!(
                 r#"codesearch — semantic + lexical code search MCP server.
 
-TOOLS (5 primary + deprecated aliases):
+TOOLS:
 | Tool          | Use for                                              |
 |---------------|------------------------------------------------------|
 | search        | Code search: `mode="semantic"` (default) or `mode="literal"` |
@@ -4532,22 +4607,6 @@ TOOLS (5 primary + deprecated aliases):
 | explore       | File exploration: `kind="outline"` (default) or `"similar"` |
 | get_chunk     | Read full chunk content by chunk_id                  |
 | status        | Index/project info: `kind="index"` (default) or `"projects"` |
-
-Deprecated aliases (still functional):
-| Tool              | Use instead of              |
-|-------------------|-----------------------------|
-| semantic_search   | `search(mode="semantic")`   |
-| literal_search    | `search(mode="literal")`    |
-| find_definition   | `find(kind="definition")`   |
-| find_usages       | `find(kind="usages")`       |
-| find_references   | `find(kind="usages")`       |
-| find_imports      | `find(kind="imports")`      |
-| find_dependents   | `find(kind="dependents")`   |
-| file_outline      | `explore(kind="outline")`   |
-| similar_chunks    | `explore(kind="similar")`   |
-| index_status      | `status(kind="index")`      |
-| list_projects     | `status(kind="projects")`   |
-| find_databases    | `status(kind="projects")`   |
 
 Indexing is done via CLI: `codesearch index`. The MCP server cannot index.
 

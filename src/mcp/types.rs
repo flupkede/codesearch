@@ -151,17 +151,6 @@ pub struct SemanticSearchRequest {
     pub group: Option<String>,
 }
 
-/// DEPRECATED: Use `FindRequest` with `kind="usages"`.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct FindReferencesRequest {
-    pub symbol: String,
-    pub limit: Option<usize>,
-    #[serde(default)]
-    pub project: Option<String>,
-    #[serde(default)]
-    pub group: Option<String>,
-}
-
 /// DEPRECATED: Use `SearchRequest` with `mode="literal"`.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct LiteralSearchRequest {

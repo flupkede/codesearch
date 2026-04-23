@@ -17,6 +17,10 @@ pub enum IndexCommands {
         /// Create global index instead of local
         #[arg(short = 'g', long)]
         global: bool,
+
+        /// Alias for this repository (auto-generated from directory name if omitted)
+        #[arg(short, long)]
+        alias: Option<String>,
     },
 
     /// Remove the index (local or global, auto-detected)
@@ -24,6 +28,10 @@ pub enum IndexCommands {
     Remove {
         /// Path to remove (defaults to current directory)
         path: Option<PathBuf>,
+
+        /// Delete the DB only, preserve the config entry
+        #[arg(long)]
+        keep_config: bool,
     },
 
     /// Show index status (local or global)
@@ -47,30 +55,6 @@ pub enum CacheCommands {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
-    },
-}
-
-/// Repos subcommands
-#[derive(Subcommand, Debug)]
-pub enum ReposCommands {
-    /// List all registered repositories
-    List,
-
-    /// Register a repository
-    Add {
-        /// Path to register (defaults to current directory)
-        path: Option<PathBuf>,
-
-        /// Alias for this repository (auto-generated from directory name if omitted)
-        #[arg(short, long)]
-        alias: Option<String>,
-    },
-
-    /// Remove a registered repository
-    #[command(visible_alias = "rm")]
-    Remove {
-        /// Alias of the repository to remove
-        alias: String,
     },
 }
 
@@ -200,7 +184,11 @@ pub enum Commands {
 
     /// Index the repository or manage global index registry
     Index {
-        /// Path to index (defaults to current directory), or use "list" to show status
+        /// Subcommand: add, rm, list (preferred)
+        #[command(subcommand)]
+        command: Option<IndexCommands>,
+
+        /// Path to index (defaults to current directory) — used when no subcommand given
         path: Option<PathBuf>,
 
         /// Show what would be indexed without actually indexing
@@ -211,6 +199,7 @@ pub enum Commands {
         #[arg(short = 'f', long, alias = "full")]
         force: bool,
 
+        // Backward-compat flags (predate subcommands)
         /// Add a repository to the index (creates local or global index)
         #[arg(long)]
         add: bool,
@@ -219,9 +208,17 @@ pub enum Commands {
         #[arg(short = 'g', long)]
         global: bool,
 
+        /// Alias for this repository (only with --add)
+        #[arg(short, long)]
+        alias: Option<String>,
+
         /// Remove the index (local or global, auto-detected)
         #[arg(long, visible_alias = "rm")]
         remove: bool,
+
+        /// Delete the DB only, preserve the config entry (only with --remove)
+        #[arg(long)]
+        keep_config: bool,
 
         /// Show index status (local or global)
         #[arg(long)]
@@ -290,12 +287,6 @@ pub enum Commands {
             default_missing_value = "true"
         )]
         create_index: bool,
-    },
-
-    /// Manage registered repositories
-    Repos {
-        #[command(subcommand)]
-        command: ReposCommands,
     },
 
     /// Manage repository groups
@@ -386,44 +377,57 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             crate::search::search(&query, path, options).await
         }
         Commands::Index {
+            command,
             path,
             dry_run,
             force,
             add,
             global,
+            alias: _alias,
             remove,
+            keep_config: _keep_config,
             list,
         } => {
-            // Check if path is "list", "add", or "rm"/"remove" as special cases (backward compatibility)
-            let path_str = path.as_ref().and_then(|p| p.to_str());
-            let is_list_cmd = path_str.map(|s| s == "list").unwrap_or(false);
-            let is_add_cmd = path_str.map(|s| s == "add").unwrap_or(false);
-            let is_rm_cmd = path_str
-                .map(|s| s == "rm" || s == "remove")
-                .unwrap_or(false);
-
-            if add || is_add_cmd {
-                // Clear path if it's "add" to avoid treating it as a directory
-                let effective_path = if is_add_cmd { None } else { path };
-                crate::index::add_to_index(effective_path, global, cancel_token.clone()).await
-            } else if remove || is_rm_cmd {
-                // Clear path if it's "rm"/"remove" to avoid treating it as a directory
-                let effective_path = if is_rm_cmd { None } else { path };
-                crate::index::remove_from_index(effective_path).await
-            } else if list || is_list_cmd {
-                crate::index::list_index_status().await
+            // Subcommand path (preferred)
+            if let Some(cmd) = command {
+                match cmd {
+                    IndexCommands::Add { path: add_path, global, alias } => {
+                        crate::index::add_to_index(add_path, global, alias, cancel_token.clone()).await
+                    }
+                    IndexCommands::Remove { path: rm_path, keep_config } => {
+                        crate::index::remove_from_index(rm_path, keep_config).await
+                    }
+                    IndexCommands::List => crate::index::list_index_status().await,
+                }
             } else {
-                // For 'codesearch index .' or 'codesearch index <path>', just run indexing
-                // The index() function will handle checking for existing indexes
-                crate::index::index(
-                    path,
-                    dry_run,
-                    force,
-                    false,
-                    model_type,
-                    cancel_token.clone(),
-                )
-                .await
+                // Flag-based backward-compat path
+                // Check if path is "list", "add", or "rm"/"remove" as special cases
+                let path_str = path.as_ref().and_then(|p| p.to_str());
+                let is_list_cmd = path_str.map(|s| s == "list").unwrap_or(false);
+                let is_add_cmd = path_str.map(|s| s == "add").unwrap_or(false);
+                let is_rm_cmd = path_str
+                    .map(|s| s == "rm" || s == "remove")
+                    .unwrap_or(false);
+
+                if add || is_add_cmd {
+                    let effective_path = if is_add_cmd { None } else { path };
+                    crate::index::add_to_index(effective_path, global, _alias, cancel_token.clone()).await
+                } else if remove || is_rm_cmd {
+                    let effective_path = if is_rm_cmd { None } else { path };
+                    crate::index::remove_from_index(effective_path, _keep_config).await
+                } else if list || is_list_cmd {
+                    crate::index::list_index_status().await
+                } else {
+                    crate::index::index(
+                        path,
+                        dry_run,
+                        force,
+                        false,
+                        model_type,
+                        cancel_token.clone(),
+                    )
+                    .await
+                }
             }
         }
         Commands::Stats { path } => crate::index::stats(path).await,
@@ -453,7 +457,6 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
             CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
         },
-        Commands::Repos { command } => run_repos_command(command).await,
         Commands::Groups { command } => run_groups_command(command).await,
     }
 }
@@ -616,47 +619,6 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Handle repos subcommands
-async fn run_repos_command(command: ReposCommands) -> Result<()> {
-    match command {
-        ReposCommands::List => {
-            let config = crate::db_discovery::load_repos_config()?;
-            if config.repos.is_empty() {
-                println!("No registered repositories.");
-                return Ok(());
-            }
-            println!("Registered repositories:");
-            for (alias, path) in &config.repos {
-                let db_path = path.join(crate::constants::DB_DIR_NAME);
-                let indexed = if db_path.exists() { "indexed" } else { "not indexed" };
-                println!("  {} → {} ({})", alias, path.display(), indexed);
-            }
-        }
-        ReposCommands::Add { path, alias } => {
-            let effective_path = path
-                .unwrap_or_else(|| std::env::current_dir().unwrap());
-            let canonical = effective_path.canonicalize()
-                .unwrap_or_else(|_| effective_path.clone());
-            let mut config = crate::db_discovery::load_repos_config()?;
-            let assigned_alias = crate::db_discovery::repos::ReposConfig::register_with_alias(
-                &mut config, canonical, alias,
-            )?;
-            config.save()?;
-            println!("Registered '{}' → {}", assigned_alias, effective_path.display());
-        }
-        ReposCommands::Remove { alias } => {
-            let mut config = crate::db_discovery::load_repos_config()?;
-            if config.unregister_alias(&alias) {
-                config.save()?;
-                println!("Removed repository '{}'", alias);
-            } else {
-                eprintln!("Alias '{}' not found.", alias);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Handle groups subcommands
 async fn run_groups_command(command: GroupsCommands) -> Result<()> {
     match command {
@@ -680,7 +642,7 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
             for alias in &aliases {
                 if !config.repos.contains_key(alias) {
                     return Err(anyhow::anyhow!(
-                        "alias '{}' is not registered. Use 'codesearch repos add' first.", alias
+                        "alias '{}' is not registered. Use 'codesearch index add' first.", alias
                     ));
                 }
             }
@@ -734,6 +696,38 @@ mod tests {
         match cli.command {
             Commands::Mcp { create_index, .. } => assert!(create_index),
             _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_no_repos_subcommand() {
+        let result = Cli::try_parse_from(["codesearch", "repos", "--help"]);
+        assert!(result.is_err(), "'repos' subcommand should no longer exist");
+    }
+
+    #[test]
+    fn test_cli_index_add_accepts_alias_flag() {
+        let cli = Cli::try_parse_from(["codesearch", "index", "add", "/tmp/foo", "--alias", "myrepo"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Index {
+                command: Some(IndexCommands::Add { alias: Some(a), .. }),
+                ..
+            } => assert_eq!(a, "myrepo"),
+            _ => panic!("expected Index::Add subcommand with alias"),
+        }
+    }
+
+    #[test]
+    fn test_cli_index_rm_accepts_keep_config_flag() {
+        let cli = Cli::try_parse_from(["codesearch", "index", "rm", "/tmp/foo", "--keep-config"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Index {
+                command: Some(IndexCommands::Remove { keep_config: true, .. }),
+                ..
+            } => (),
+            _ => panic!("expected Index::Remove subcommand with keep_config"),
         }
     }
 }

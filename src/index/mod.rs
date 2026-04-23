@@ -1077,6 +1077,7 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
+    alias: Option<String>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
@@ -1162,6 +1163,7 @@ pub async fn add_to_index(
         )
         .await?;
         println!("\n{}", "✅ Global index created!".green());
+        eprintln!("⚠️ Global indexes are not auto-registered. Use 'index add' without --global for serve discovery.");
     } else {
         println!("\n{}", "Creating local index...".cyan());
         index(
@@ -1174,13 +1176,49 @@ pub async fn add_to_index(
         )
         .await?;
         println!("\n{}", "✅ Local index created!".green());
+
+        // Auto-register in repos.json for serve discovery
+        let config_path = match crate::db_discovery::repos::ReposConfig::path() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("⚠️ Could not determine repos config path: {}", e);
+                return Ok(());
+            }
+        };
+
+        let mut config = crate::db_discovery::repos::ReposConfig::load()
+            .unwrap_or_default();
+
+        if let Some(existing) = config.alias_for_path(&canonical_path) {
+            eprintln!("ℹ️ Already registered as '{}'.", existing);
+        } else {
+            match config.register_with_alias(canonical_path.clone(), alias) {
+                Ok(assigned) => {
+                    if let Err(e) = config.save() {
+                        eprintln!("⚠️ Index created, but failed to save repos config: {}", e);
+                        eprintln!("   Config path: {}", config_path.display());
+                    } else {
+                        eprintln!("✅ Registered as '{}'.", assigned);
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Index created, but registration failed: {}",
+                        e
+                    ));
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
 /// Remove the index (local or global, auto-detected)
-pub async fn remove_from_index(path: Option<PathBuf>) -> Result<()> {
+pub async fn remove_from_index(
+    path: Option<PathBuf>,
+    keep_config: bool,
+) -> Result<()> {
     let project_path = path.unwrap_or_else(|| PathBuf::from("."));
     let canonical_path = project_path.canonicalize()?;
 
@@ -1199,6 +1237,21 @@ pub async fn remove_from_index(path: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
+    // Auto-unregister from repos.json unless --keep-config
+    if !keep_config {
+        let mut config = crate::db_discovery::repos::ReposConfig::load()
+            .unwrap_or_default();
+        if config.unregister_path(&canonical_path) {
+            if let Err(e) = config.save() {
+                eprintln!("⚠️ Failed to update repos config: {}", e);
+            } else {
+                println!("{}", "🗑️  Unregistered from repos.json".green());
+            }
+        }
+    } else {
+        println!("{}", "ℹ️ Config entry preserved.".cyan());
+    }
+
     // If both exist (shouldn't happen), remove local with warning
     if has_local && has_global {
         println!(
@@ -1206,7 +1259,10 @@ pub async fn remove_from_index(path: Option<PathBuf>) -> Result<()> {
             "⚠️  Warning: Both local and global indexes exist!".yellow()
         );
         println!("   Removing local index...");
-        fs::remove_dir_all(&local_db)?;
+        if let Err(e) = fs::remove_dir_all(&local_db) {
+            eprintln!("⚠️ Database files may be locked by a running codesearch serve. Stop it and retry.");
+            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
+        }
         println!("   {}", "✅ Local index removed".green());
         println!("   (Global index remains)");
         return Ok(());
@@ -1215,8 +1271,10 @@ pub async fn remove_from_index(path: Option<PathBuf>) -> Result<()> {
     // Remove whichever exists
     if has_local {
         println!("\n{}", "Removing local index...".cyan());
-        // Note: fastembed cache is inside .codesearch.db/fastembed_cache, so it's removed automatically
-        fs::remove_dir_all(&local_db)?;
+        if let Err(e) = fs::remove_dir_all(&local_db) {
+            eprintln!("⚠️ Database files may be locked by a running codesearch serve. Stop it and retry.");
+            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
+        }
         println!("{}", "✅ Local index removed!".green());
     } else if has_global {
         println!("\n{}", "Removing global index...".cyan());

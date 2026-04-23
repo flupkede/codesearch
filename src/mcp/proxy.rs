@@ -98,10 +98,10 @@ impl McpProxy {
         let my_version = env!("CARGO_PKG_VERSION").to_string();
         if body.version != my_version {
             return Err(anyhow::anyhow!(
-                "codesearch serve version mismatch: serve={} mcp={}. \
-                 Restart serve or update the mcp binary.",
-                body.version,
-                my_version
+                "codesearch serve version mismatch: serve at {} reports v{}, this binary is v{}. \
+                 To fix: (1) stop the running `codesearch serve`, (2) install the matching binary version on both endpoints, \
+                 (3) restart serve. Until versions match, MCP clients cannot connect through proxy mode.",
+                base_url, body.version, my_version
             ));
         }
 
@@ -233,5 +233,40 @@ impl McpProxy {
     #[allow(dead_code)] // Available for diagnostics
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::Json as AxumJson;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn version_mismatch_errors_actionable() {
+        // Spawn a tiny server that reports a different version
+        let app = axum::Router::new().route(
+            crate::constants::HEALTH_PATH,
+            axum::routing::get(|| async {
+                AxumJson(json!({
+                    "codesearch_server": true,
+                    "version": "0.0.1-test"
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base_url = format!("http://{}", addr);
+        let result = McpProxy::check_health(&base_url).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("stop"), "error should mention 'stop': {}", err);
+        assert!(err.contains("install"), "error should mention 'install': {}", err);
+        assert!(err.contains("restart"), "error should mention 'restart': {}", err);
+        assert!(err.contains(&base_url), "error should mention the base_url: {}", err);
     }
 }

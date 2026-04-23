@@ -19,11 +19,19 @@ struct LegacyReposConfig(HashMap<String, serde_json::Value>);
 impl ReposConfig {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
+        Self::load_from(&path).or_else(|e| {
+            tracing::warn!("{}. Returning empty config.", e);
+            Ok(Self::default())
+        })
+    }
+
+    /// Load from an explicit path (useful in tests).
+    pub fn load_from(path: &std::path::Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
 
-        let content = fs::read_to_string(&path)?;
+        let content = fs::read_to_string(path)?;
 
         // New format
         if let Ok(config) = serde_json::from_str::<Self>(&content) {
@@ -46,19 +54,29 @@ impl ReposConfig {
         }
 
         // Both parses failed — file is corrupt
-        tracing::warn!(
-            "repos.json is corrupt or unrecognised; returning empty config. Path: {}",
+        Err(anyhow::anyhow!(
+            "repos.json is corrupt or unrecognised at: {}",
             path.display()
-        );
-        Ok(Self::default())
+        ))
     }
 
     pub fn save(&self) -> Result<()> {
-        let config_dir = config_dir()?;
-        fs::create_dir_all(&config_dir)?;
-        let path = config_dir.join(REPOS_CONFIG_FILE);
+        let path = Self::path()?;
+        self.save_to(&path)
+    }
+
+    /// Save to an explicit path (useful in tests).
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())
+    }
+
+    /// Return the path to the repos config file.
+    pub fn path() -> Result<PathBuf> {
+        config_path()
     }
 
     pub fn register(&mut self, path: PathBuf) -> String {
@@ -77,6 +95,7 @@ impl ReposConfig {
         alias
     }
 
+    #[allow(dead_code)]
     pub fn register_with_alias(&mut self, path: PathBuf, alias: Option<String>) -> Result<String> {
         let canonical = path.canonicalize().unwrap_or(path);
 
@@ -194,6 +213,9 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 pub fn config_path() -> Result<PathBuf> {
+    if let Ok(override_path) = std::env::var("CODESEARCH_REPOS_CONFIG") {
+        return Ok(PathBuf::from(override_path));
+    }
     Ok(config_dir()?.join(REPOS_CONFIG_FILE))
 }
 
