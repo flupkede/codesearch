@@ -123,12 +123,9 @@ impl McpProxy {
             )]));
         }
 
-        // Build the JSON-RPC request body matching MCP spec
         let mut args_map: JsonObject = serde_json::Map::new();
-        if let Some(p) = params {
-            if let Value::Object(map) = p {
-                args_map = map;
-            }
+        if let Some(Value::Object(map)) = params {
+            args_map = map;
         }
 
         let request_body = serde_json::json!({

@@ -1200,6 +1200,7 @@ mod tests {
 
     /// Simulates the decomposition in `resolve_routing()`.
     /// Returns (stores, stores_vec, is_multi, needs_local_db).
+    #[allow(clippy::type_complexity)]
     fn decompose_routing_ctx<T: Clone>(
         multi_stores: Option<Vec<std::sync::Arc<T>>>,
     ) -> (
@@ -1208,7 +1209,7 @@ mod tests {
         bool,
         bool,
     ) {
-        let is_multi = multi_stores.as_ref().map_or(false, |v| v.len() > 1);
+        let is_multi = multi_stores.as_ref().is_some_and(|v| v.len() > 1);
         let stores = match &multi_stores {
             None => None,
             Some(vec) if vec.len() == 1 => Some(vec[0].clone()),
@@ -1983,7 +1984,7 @@ impl CodesearchService {
         group: &Option<String>,
     ) -> std::result::Result<MultiStoreContext, String> {
         let multi_stores = self.resolve_repo_stores_multi(project, group)?;
-        let is_multi = multi_stores.as_ref().map_or(false, |v| v.len() > 1);
+        let is_multi = multi_stores.as_ref().is_some_and(|v| v.len() > 1);
         let stores = match &multi_stores {
             None => None,
             Some(vec) if vec.len() == 1 => Some(vec[0].clone()),
@@ -3401,16 +3402,23 @@ impl CodesearchService {
             }
             found
         } else {
-            match self
+            self
                 .with_vector_store_read_for(
                     |store| store.get_chunk(request.chunk_id),
                     ctx.stores,
                 )
                 .await
-            {
-                Ok(maybe_chunk) => maybe_chunk,
-                Err(_) => None,
-            }
+                .unwrap_or_default()
+
+
+
+
+
+
+
+
+
+
         };
 
         let chunk = match chunk {

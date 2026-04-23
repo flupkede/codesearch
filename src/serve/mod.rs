@@ -209,7 +209,7 @@ pub async fn run_serve(
         // We create a minimal service; actual repo routing is handled inside
         // the tool handlers via serve_state.
         crate::mcp::CodesearchService::new_for_serve(state_for_factory.clone())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .map_err(std::io::Error::other)
     };
 
     let session_manager = Arc::new(LocalSessionManager::default());

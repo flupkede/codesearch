@@ -833,6 +833,7 @@ impl VectorStore {
     }
 
     /// Check if the index is built
+    #[allow(dead_code)]
     pub fn is_indexed(&self) -> bool {
         self.indexed
     }
