@@ -2489,6 +2489,13 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<SearchRequest>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            "📥 search(query={:?}, mode={:?}, project={:?}, group={:?})",
+            request.query,
+            request.mode,
+            request.project,
+            request.group,
+        );
         let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
         match mode.as_str() {
             "semantic" => {
@@ -2535,6 +2542,13 @@ impl CodesearchService {
         Parameters(request): Parameters<FindRequest>,
     ) -> Result<CallToolResult, McpError> {
         let kind = request.kind.as_deref().unwrap_or("definition").to_lowercase();
+        tracing::info!(
+            "📥 find(symbol={:?}, kind={}, project={:?}, group={:?})",
+            request.symbol,
+            kind,
+            request.project,
+            request.group,
+        );
         match kind.as_str() {
             "definition" => {
                 let def_req = FindDefinitionRequest {
@@ -2588,6 +2602,12 @@ impl CodesearchService {
         Parameters(request): Parameters<ExploreRequest>,
     ) -> Result<CallToolResult, McpError> {
         let kind = request.kind.as_deref().unwrap_or("outline").to_lowercase();
+        tracing::info!(
+            "📥 explore(target={:?}, kind={}, project={:?})",
+            request.target,
+            kind,
+            request.project,
+        );
         match kind.as_str() {
             "outline" => {
                 let outline_req = FileOutlineRequest {
@@ -2631,6 +2651,7 @@ impl CodesearchService {
         Parameters(request): Parameters<StatusRequest>,
     ) -> Result<CallToolResult, McpError> {
         let kind = request.kind.as_deref().unwrap_or("index").to_lowercase();
+        tracing::info!("📥 status(kind={})", kind);
         match kind.as_str() {
             "index" => self.index_status_impl(request.project, request.group).await,
             "projects" => self.list_projects().await,
@@ -3625,7 +3646,17 @@ impl CodesearchService {
             }
         }
 
-        let normalized = normalize_tool_path(&request.path, &self.project_path);
+        // In serve mode, use the resolved project root from alias_roots;
+        // self.project_path is "serve://multi-repo" which doesn't resolve.
+        let project_root = if let Some(ref alias) = ctx.project_alias {
+            ctx.alias_roots
+                .get(alias)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.project_path.clone())
+        } else {
+            self.project_path.clone()
+        };
+        let normalized = normalize_tool_path(&request.path, &project_root);
 
         let items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store group fan-out: collect outline items from all stores
@@ -3703,6 +3734,11 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<GetChunkRequest>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            "📥 get_chunk(chunk_id={}, project={:?})",
+            request.chunk_id,
+            request.project,
+        );
         // Resolve project/group routing
         let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
@@ -3827,11 +3863,16 @@ impl CodesearchService {
             }
         }
 
-        // Import statements are currently represented mostly as gap-classified
-        // `Imports` chunks (not always as per-statement AST definition chunks).
-        // We therefore parse lines inside import-like chunks and use an FTS
-        // fallback when no import-like chunks exist for the file.
-        let normalized = normalize_tool_path(&request.path, &self.project_path);
+        // In serve mode, use the resolved project root from alias_roots
+        let project_root = if let Some(ref alias) = ctx.project_alias {
+            ctx.alias_roots
+                .get(alias)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.project_path.clone())
+        } else {
+            self.project_path.clone()
+        };
+        let normalized = normalize_tool_path(&request.path, &project_root);
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store group fan-out: collect import items from all stores

@@ -1103,6 +1103,30 @@ pub async fn add_to_index(
             println!("   Type: {}", "Local".bright_green());
         }
 
+        // If an alias is provided and this is a local DB in the current dir,
+        // register it in repos.json (for legacy DB's that predate auto-registration).
+        if alias.is_some() && db.is_current && !db.is_global {
+            let mut config = crate::db_discovery::repos::ReposConfig::load()
+                .unwrap_or_default();
+            if let Some(existing) = config.alias_for_path(&canonical_path) {
+                println!("   Already registered as '{}'.", existing);
+            } else {
+                match config.register_with_alias(canonical_path.clone(), alias.clone()) {
+                    Ok(assigned) => {
+                        if let Err(e) = config.save() {
+                            eprintln!("⚠️ Failed to save repos config: {}", e);
+                        } else {
+                            println!("   ✅ Registered as '{}'.", assigned);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Registration failed: {}", e);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         println!(
             "\n{}",
             "You cannot create a separate index for a subdirectory.".yellow()

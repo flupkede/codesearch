@@ -228,6 +228,27 @@ impl ServeState {
             }
         };
 
+        // Ensure the HNSW vector index is built from existing data.
+        // When opening an existing DB, VectorStore starts with indexed=false.
+        // Without this, search fails with "Index not built" until the background
+        // refresh completes (which may take minutes for large repos).
+        {
+            let mut vstore = stores.vector_store.write().await;
+            match vstore.stats() {
+                Ok(s) if s.total_chunks > 0 && !s.indexed => {
+                    info!(
+                        "Building vector index for '{}' ({} existing chunks)",
+                        alias, s.total_chunks
+                    );
+                    if let Err(e) = vstore.build_index() {
+                        warn!("Failed to build vector index for '{}': {}", alias, e);
+                    }
+                }
+                Ok(_) => {} // already indexed or no chunks
+                Err(e) => warn!("Could not read stats for '{}': {}", alias, e),
+            }
+        }
+
         let stores_arc = Arc::new(stores);
 
         // Try to create IndexManager for live file watching.
