@@ -34,6 +34,8 @@ pub(crate) enum RepoState {
     /// Writable repo — full file watching + git HEAD watching active.
     Write {
         stores: Arc<SharedStores>,
+        /// Stored for its `Drop` side-effect: dropping the IndexManager stops
+        /// the background file watcher thread and releases the write lock.
         #[allow(dead_code)]
         index_manager: Option<Arc<IndexManager>>,
         cancel_token: CancellationToken,
@@ -147,7 +149,10 @@ impl ServeState {
             }
         }
 
-        // Swap in the new config
+        // Swap in the new config and mtime.
+        // Note: these are two separate writes, so a concurrent reader could observe
+        // the new config with the old mtime (or vice versa). This causes at most a
+        // spurious extra reload on the next call, which is benign.
         *self.config.write().map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))? = new_config;
         *self.config_mtime.write().map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))? = mtime;
 

@@ -1109,39 +1109,42 @@ mod tests {
     }
 
     /// Simulate the dedup logic from `with_fts_store_read_multi` to verify correctness.
+    /// Uses (alias, chunk_id) as dedup key — matching production cross-store dedup.
     #[test]
     fn test_multi_store_dedup_keeps_highest_score() {
         use std::collections::HashMap;
 
-        // Simulate results from 3 stores with overlapping chunk_ids
+        let aliases = ["repo_a", "repo_b", "repo_c"];
+
+        // Simulate results from 3 stores with overlapping chunk_ids across repos
         let store1_results = vec![
             crate::fts::FtsResult { chunk_id: 1, score: 0.5 },
             crate::fts::FtsResult { chunk_id: 2, score: 0.8 },
             crate::fts::FtsResult { chunk_id: 3, score: 0.3 },
         ];
         let store2_results = vec![
-            crate::fts::FtsResult { chunk_id: 1, score: 0.9 }, // higher score for chunk 1
+            crate::fts::FtsResult { chunk_id: 1, score: 0.9 }, // same chunk_id, different alias — NOT a dup
             crate::fts::FtsResult { chunk_id: 4, score: 0.7 },
-            crate::fts::FtsResult { chunk_id: 2, score: 0.4 }, // lower score for chunk 2
+            crate::fts::FtsResult { chunk_id: 2, score: 0.4 }, // same chunk_id, different alias — NOT a dup
         ];
         let store3_results = vec![
-            crate::fts::FtsResult { chunk_id: 3, score: 0.6 }, // higher score for chunk 3
+            crate::fts::FtsResult { chunk_id: 3, score: 0.6 }, // same chunk_id, different alias — NOT a dup
             crate::fts::FtsResult { chunk_id: 5, score: 0.2 },
         ];
 
-        // Apply the same dedup logic as with_fts_store_read_multi
+        // Apply the same dedup logic as with_fts_store_read_multi: key is (alias, chunk_id)
         let mut all_results: Vec<crate::fts::FtsResult> = Vec::new();
-        let mut seen_ids: HashMap<u32, usize> = HashMap::new();
+        let mut seen_ids: HashMap<(String, u32), usize> = HashMap::new();
 
-        for results in [&store1_results, &store2_results, &store3_results] {
+        for (alias, results) in aliases.iter().zip([&store1_results, &store2_results, &store3_results]) {
             for r in results {
-                let id = super::HasChunkId::chunk_id(r);
-                if let Some(&existing_idx) = seen_ids.get(&id) {
+                let key = (alias.to_string(), super::HasChunkId::chunk_id(r));
+                if let Some(&existing_idx) = seen_ids.get(&key) {
                     if super::HasScore::score(r) > super::HasScore::score(&all_results[existing_idx]) {
                         all_results[existing_idx] = r.clone();
                     }
                 } else {
-                    seen_ids.insert(id, all_results.len());
+                    seen_ids.insert(key, all_results.len());
                     all_results.push(r.clone());
                 }
             }
@@ -1154,20 +1157,8 @@ mod tests {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Verify: 5 unique chunks, deduped scores, sorted desc
-        assert_eq!(all_results.len(), 5, "Should have 5 unique chunks");
-
-        // Check dedup: chunk 1 should have score 0.9 (from store2), not 0.5
-        let chunk1 = all_results.iter().find(|r| r.chunk_id == 1).unwrap();
-        assert!((chunk1.score - 0.9).abs() < f32::EPSILON, "Chunk 1 should keep highest score 0.9, got {}", chunk1.score);
-
-        // Check dedup: chunk 2 should have score 0.8 (from store1), not 0.4
-        let chunk2 = all_results.iter().find(|r| r.chunk_id == 2).unwrap();
-        assert!((chunk2.score - 0.8).abs() < f32::EPSILON, "Chunk 2 should keep highest score 0.8, got {}", chunk2.score);
-
-        // Check dedup: chunk 3 should have score 0.6 (from store3), not 0.3
-        let chunk3 = all_results.iter().find(|r| r.chunk_id == 3).unwrap();
-        assert!((chunk3.score - 0.6).abs() < f32::EPSILON, "Chunk 3 should keep highest score 0.6, got {}", chunk3.score);
+        // Verify: 8 unique (alias, chunk_id) pairs — NO cross-alias dedup
+        assert_eq!(all_results.len(), 8, "Should have 8 unique (alias, chunk_id) pairs across 3 repos");
 
         // Check sort: first result should be highest score
         assert!((all_results[0].score - 0.9).abs() < f32::EPSILON, "First result should have highest score");
@@ -2552,6 +2543,14 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<FindRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // If in proxy mode, forward to serve
+        if let Some(ref proxy) = self.proxy {
+            let params = serde_json::to_value(&request).ok();
+            return proxy.forward("find", params).await.map_err(|e| {
+                McpError::internal_error(e.message.into_owned(), None)
+            });
+        }
+
         let kind = request.kind.as_deref().unwrap_or("definition").to_lowercase();
         tracing::info!(
             "📥 find(symbol={:?}, kind={}, project={:?}, group={:?})",
@@ -2612,6 +2611,14 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<ExploreRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // If in proxy mode, forward to serve
+        if let Some(ref proxy) = self.proxy {
+            let params = serde_json::to_value(&request).ok();
+            return proxy.forward("explore", params).await.map_err(|e| {
+                McpError::internal_error(e.message.into_owned(), None)
+            });
+        }
+
         let kind = request.kind.as_deref().unwrap_or("outline").to_lowercase();
         tracing::info!(
             "📥 explore(target={:?}, kind={}, project={:?})",
@@ -2661,6 +2668,14 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<StatusRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // If in proxy mode, forward to serve
+        if let Some(ref proxy) = self.proxy {
+            let params = serde_json::to_value(&request).ok();
+            return proxy.forward("status", params).await.map_err(|e| {
+                McpError::internal_error(e.message.into_owned(), None)
+            });
+        }
+
         let kind = request.kind.as_deref().unwrap_or("index").to_lowercase();
         tracing::info!("📥 status(kind={})", kind);
         match kind.as_str() {
@@ -3745,6 +3760,14 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<GetChunkRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // If in proxy mode, forward to serve
+        if let Some(ref proxy) = self.proxy {
+            let params = serde_json::to_value(&request).ok();
+            return proxy.forward("get_chunk", params).await.map_err(|e| {
+                McpError::internal_error(e.message.into_owned(), None)
+            });
+        }
+
         tracing::info!(
             "📥 get_chunk(chunk_id={}, project={:?})",
             request.chunk_id,

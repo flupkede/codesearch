@@ -71,7 +71,7 @@ pub struct SearchRequest {
 
 /// Unified symbol navigation request — replaces `find_definition`, `find_usages`,
 /// `find_imports`, and `find_dependents`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct FindRequest {
     /// What to find: `"definition"` (default) | `"usages"` | `"imports"` | `"dependents"`.
     pub kind: Option<String>,
@@ -96,7 +96,7 @@ pub struct FindRequest {
 }
 
 /// Unified exploration request — replaces `file_outline` and `similar_chunks`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ExploreRequest {
     /// What to explore: `"outline"` (default) | `"similar"`.
     pub kind: Option<String>,
@@ -119,7 +119,7 @@ pub struct ExploreRequest {
 }
 
 /// Unified status/info request — replaces `index_status` and `list_projects`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StatusRequest {
     /// What status to return: `"index"` (default) | `"projects"`.
     pub kind: Option<String>,
@@ -330,7 +330,7 @@ pub struct FileOutlineItem {
 }
 
 /// Request to fetch a chunk by ID
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetChunkRequest {
     pub chunk_id: u32,
     pub context_lines: Option<usize>,

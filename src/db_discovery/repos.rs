@@ -95,7 +95,6 @@ impl ReposConfig {
         alias
     }
 
-    #[allow(dead_code)]
     pub fn register_with_alias(&mut self, path: PathBuf, alias: Option<String>) -> Result<String> {
         let canonical = path.canonicalize().unwrap_or(path);
 
