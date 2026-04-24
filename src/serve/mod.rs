@@ -426,7 +426,11 @@ pub async fn run_serve(
 
     // Log startup
     let addr = SocketAddr::from(([127, 0, 0, 1], effective_port));
-    info!("🚀 Starting codesearch serve on {}", addr);
+    info!(
+        "🚀 Starting codesearch serve v{} on {}",
+        env!("CARGO_PKG_VERSION"),
+        addr
+    );
     info!("📋 Registered repos: {:?}", serve_state.aliases());
 
     // Create the MCP service factory — each session gets a fresh CodesearchService
