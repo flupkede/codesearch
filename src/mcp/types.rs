@@ -286,6 +286,9 @@ pub struct IndexStatusResponse {
     pub project_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// MCP mode: "proxy", "serve_hub", or "stdio"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// Search result item — returned by literal search

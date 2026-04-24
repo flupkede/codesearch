@@ -118,9 +118,22 @@ impl McpProxy {
         params: Option<Value>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if self.dead.load(Ordering::SeqCst) {
-            return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                dead_session_text(&self.base_url),
-            )]));
+            // Attempt recovery: re-probe health endpoint
+            match Self::check_health(&self.base_url).await {
+                Ok(true) => {
+                    tracing::info!(
+                        "🔄 codesearch serve recovered at {} — resuming proxy mode",
+                        self.base_url
+                    );
+                    self.dead.store(false, Ordering::SeqCst);
+                    // Fall through to retry the forward
+                }
+                _ => {
+                    return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                        dead_session_text(&self.base_url),
+                    )]));
+                }
+            }
         }
 
         let mut args_map: JsonObject = serde_json::Map::new();
@@ -230,7 +243,6 @@ impl McpProxy {
     }
 
     /// Get the base URL of the serve instance.
-    #[allow(dead_code)] // Available for diagnostics
     pub fn base_url(&self) -> &str {
         &self.base_url
     }

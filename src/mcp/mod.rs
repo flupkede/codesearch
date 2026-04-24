@@ -2164,6 +2164,17 @@ impl CodesearchService {
         Ok(guard)
     }
 
+    /// Return the current MCP mode as a string for diagnostics.
+    fn mcp_mode(&self) -> Option<String> {
+        if self.proxy.is_some() {
+            Some(format!("proxy → {}", self.proxy.as_ref().unwrap().base_url()))
+        } else if self.serve_state.is_some() {
+            Some("serve_hub".to_string())
+        } else {
+            Some("stdio".to_string())
+        }
+    }
+
     /// Check if database exists and return error if not
     fn ensure_database_exists(&self) -> Result<(), String> {
         if !self.db_path.exists() {
@@ -4570,6 +4581,7 @@ impl CodesearchService {
                     db_path: self.db_path.display().to_string(),
                     project_path: self.project_path.display().to_string(),
                     error_message: None,
+                    mode: self.mcp_mode(),
                 };
                 let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![Content::text(json)]));
@@ -4630,6 +4642,7 @@ impl CodesearchService {
                 db_path: format!("({} repos)", sv.len()),
                 project_path: format!("group with {} repo(s)", sv.len()),
                 error_message: None,
+                mode: self.mcp_mode(),
             };
 
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -4655,6 +4668,7 @@ impl CodesearchService {
                     db_path: self.db_path.display().to_string(),
                     project_path: self.project_path.display().to_string(),
                     error_message: Some(format!("{}", e)),
+                    mode: self.mcp_mode(),
                 };
                 let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![Content::text(json)]));
@@ -4686,6 +4700,7 @@ impl CodesearchService {
             db_path: self.db_path.display().to_string(),
             project_path: self.project_path.display().to_string(),
             error_message: None,
+            mode: self.mcp_mode(),
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -4887,6 +4902,13 @@ fn is_definition_chunk(kind: &str, signature: &Option<String>, symbol: &str) -> 
 impl ServerHandler for CodesearchService {
     fn get_info(&self) -> ServerInfo {
         let db_exists = self.db_path.exists();
+        let mode = if self.proxy.is_some() {
+            format!("proxy → {} (serve hub)", self.proxy.as_ref().unwrap().base_url())
+        } else if self.serve_state.is_some() {
+            "serve hub (direct)".to_string()
+        } else {
+            "self-contained (stdio)".to_string()
+        };
 
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -4911,10 +4933,12 @@ TOOLS:
 
 Indexing is done via CLI: `codesearch index`. The MCP server cannot index.
 
+Mode: {mode}
 Current project: {project}
 Current database: {db} ({exists})
 Model: {model} ({dims}d)
 "#,
+                mode = mode,
                 project = self.project_path.display(),
                 db = self.db_path.display(),
                 exists = if db_exists { "ready" } else { "not found" },
