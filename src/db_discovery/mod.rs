@@ -104,6 +104,17 @@ pub fn check_database_integrity(db_path: &Path) -> Option<String> {
 ///
 /// Incomplete/corrupt databases are skipped with a warning.
 pub fn find_best_database(target_dir: Option<&Path>) -> Result<Option<DatabaseInfo>> {
+    find_best_database_impl(target_dir, true)
+}
+
+/// Same as [`find_best_database`] but skips the global-database fallback (step 4).
+/// Used by tests that need isolation from the user's `~/.codesearch/repos.json`.
+#[cfg(test)]
+fn find_best_database_no_global(target_dir: Option<&Path>) -> Result<Option<DatabaseInfo>> {
+    find_best_database_impl(target_dir, false)
+}
+
+fn find_best_database_impl(target_dir: Option<&Path>, include_global: bool) -> Result<Option<DatabaseInfo>> {
     let target = target_dir.unwrap_or_else(|| Path::new("."));
 
     // Canonicalize the target path
@@ -207,10 +218,12 @@ pub fn find_best_database(target_dir: Option<&Path>) -> Result<Option<DatabaseIn
         }
     }
 
-    // 4. Check global databases
-    let global_dbs = find_global_databases()?;
-    if !global_dbs.is_empty() {
-        return Ok(Some(global_dbs.into_iter().next().unwrap()));
+    // 4. Check global databases (only when not in test-isolation mode)
+    if include_global {
+        let global_dbs = find_global_databases()?;
+        if !global_dbs.is_empty() {
+            return Ok(Some(global_dbs.into_iter().next().unwrap()));
+        }
     }
 
     Ok(None)
@@ -408,7 +421,7 @@ mod tests {
         fs::create_dir_all(&hidden).unwrap();
         create_fake_db(&hidden.join(DB_DIR_NAME));
 
-        let result = find_best_database(Some(dir.path())).unwrap();
+        let result = find_best_database_no_global(Some(dir.path())).unwrap();
         assert!(
             result.is_none(),
             "Should not find DB in hidden child directory"
@@ -423,7 +436,7 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         create_fake_db(&target.join(DB_DIR_NAME));
 
-        let result = find_best_database(Some(dir.path())).unwrap();
+        let result = find_best_database_no_global(Some(dir.path())).unwrap();
         assert!(result.is_none(), "Should not find DB in target/ directory");
     }
 
@@ -445,7 +458,7 @@ mod tests {
     #[test]
     fn test_find_best_database_none_when_empty() {
         let dir = tempdir().unwrap();
-        let result = find_best_database(Some(dir.path())).unwrap();
+        let result = find_best_database_no_global(Some(dir.path())).unwrap();
         assert!(result.is_none());
     }
 
@@ -459,7 +472,7 @@ mod tests {
         fs::write(db_path.join("metadata.json"), "{}").unwrap();
         // No data.mdb, no fts/ → invalid
 
-        let result = find_best_database(Some(dir.path())).unwrap();
+        let result = find_best_database_no_global(Some(dir.path())).unwrap();
         assert!(result.is_none(), "Should not find incomplete DB");
     }
 }
