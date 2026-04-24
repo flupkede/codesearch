@@ -4040,12 +4040,31 @@ impl CodesearchService {
         let limit = request.limit.unwrap_or(20).min(200);
         let high_limit = (limit * 10).max(200); // generous budget for filtering
 
+        // Extract a meaningful search term from path-like inputs.
+        // Import chunks contain module references like `use crate::constants::X`
+        // but the tool receives file paths like `src/constants.rs`.
+        // We extract the file stem to match against module names in imports.
+        let search_term = if request.symbol_or_path.contains('/')
+            || request.symbol_or_path.contains('\\')
+            || request.symbol_or_path.contains('.')
+        {
+            std::path::Path::new(&request.symbol_or_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&request.symbol_or_path)
+                .to_string()
+        } else {
+            request.symbol_or_path.clone()
+        };
+
+        let import_kind = Some(crate::chunker::ChunkKind::Imports);
+
         // Two-phase search strategy:
-        // 1. `search_exact` — precise term match on signature+content. Better at
-        //    finding specific identifiers inside import regions without drowning
-        //    in noise from non-import chunks.
+        // 1. `search_exact` — precise term match on signature+content with
+        //    MUST filter for Import kind. Strictly limits results to import chunks.
         // 2. If that yields no import-kind results, fall back to `search`
-        //    (QueryParser, broader tokenization) with a large limit.
+        //    (QueryParser, broader tokenization) with kind boost for imports.
         //
         // Limitation: the chunker does not emit per-statement AST import chunks;
         // imports are gap-classified as `Imports` kind. Chunks whose kind doesn't
@@ -4056,7 +4075,7 @@ impl CodesearchService {
             let exact_hits = self
                 .with_fts_store_read_multi(
                     |fts_store| {
-                        fts_store.search_exact(&request.symbol_or_path, high_limit, None)
+                        fts_store.search_exact(&search_term, high_limit, import_kind)
                     },
                     sv.clone(),
                     sa,
@@ -4067,7 +4086,7 @@ impl CodesearchService {
             if exact_hits.is_empty() {
                 self.with_fts_store_read_multi(
                     |fts_store| {
-                        fts_store.search(&request.symbol_or_path, high_limit, None)
+                        fts_store.search(&search_term, high_limit, import_kind)
                     },
                     sv.clone(),
                     sa,
@@ -4082,7 +4101,7 @@ impl CodesearchService {
             let exact_hits = self
                 .with_fts_store_read_for(
                     |fts_store| {
-                        fts_store.search_exact(&request.symbol_or_path, high_limit, None)
+                        fts_store.search_exact(&search_term, high_limit, import_kind)
                     },
                     ctx.stores.clone(),
                 )
@@ -4092,7 +4111,7 @@ impl CodesearchService {
             if exact_hits.is_empty() {
                 self.with_fts_store_read_for(
                     |fts_store| {
-                        fts_store.search(&request.symbol_or_path, high_limit, None)
+                        fts_store.search(&search_term, high_limit, import_kind)
                     },
                     ctx.stores.clone(),
                 )
@@ -4121,17 +4140,18 @@ impl CodesearchService {
                                 break;
                             }
 
+                            let term_lower = search_term.to_lowercase();
                             let import_statement = if chunk
                                 .content
                                 .to_lowercase()
-                                .contains(&request.symbol_or_path.to_lowercase())
+                                .contains(&term_lower)
                             {
                                 chunk
                                     .content
                                     .lines()
                                     .find(|l| {
                                         l.to_lowercase()
-                                            .contains(&request.symbol_or_path.to_lowercase())
+                                            .contains(&term_lower)
                                     })
                                     .unwrap_or("")
                                     .to_string()
@@ -4165,6 +4185,7 @@ impl CodesearchService {
                     |store| {
                     let mut seen_paths = HashSet::new();
                     let mut out = Vec::new();
+                    let term_lower = search_term.to_lowercase();
                     for f in &fts_results {
                         if let Some(chunk) = store.get_chunk(f.chunk_id)? {
                             if !is_import_kind(&chunk.kind) {
@@ -4177,18 +4198,18 @@ impl CodesearchService {
                             }
 
                             // Extract the specific import line(s) that mention the
-                            // symbol, rather than returning the entire chunk content.
+                            // module name, rather than returning the entire chunk content.
                             let import_statement = if chunk
                                 .content
                                 .to_lowercase()
-                                .contains(&request.symbol_or_path.to_lowercase())
+                                .contains(&term_lower)
                             {
                                 chunk
                                     .content
                                     .lines()
                                     .find(|l| {
                                         l.to_lowercase()
-                                            .contains(&request.symbol_or_path.to_lowercase())
+                                            .contains(&term_lower)
                                     })
                                     .unwrap_or("")
                                     .to_string()
