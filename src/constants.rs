@@ -139,9 +139,15 @@ pub const HEALTH_PATH: &str = "/health";
 /// MCP endpoint path served by `codesearch serve` (streamable HTTP).
 pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 
-/// Timeout in milliseconds for the startup health probe from `codesearch mcp`
+/// Timeout in milliseconds for a single startup health probe from `codesearch mcp`
 /// to detect a running serve instance.
 pub const HEALTH_PROBE_TIMEOUT_MS: u64 = 200;
+
+/// Number of attempts to probe `codesearch serve` before falling back to stdio mode.
+pub const HEALTH_PROBE_ATTEMPTS: u32 = 3;
+
+/// Delay in milliseconds between consecutive health probe attempts.
+pub const HEALTH_PROBE_RETRY_DELAY_MS: u64 = 150;
 
 /// Default embedding dimensions used when metadata is missing or unreadable.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;

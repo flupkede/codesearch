@@ -4972,36 +4972,59 @@ pub async fn run_mcp_server(
 ) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
 
-    // === Proxy detection: check if `codesearch serve` is already running ===
+    // === Proxy detection: probe `codesearch serve` with retry ===
     let serve_url = crate::mcp::proxy::serve_url_from_env();
-    match crate::mcp::proxy::McpProxy::check_health(&serve_url).await {
-        Ok(true) => {
-            tracing::info!("🔀 codesearch serve detected at {} — entering proxy mode", serve_url);
-            let proxy = crate::mcp::proxy::McpProxy::new(serve_url);
-            let service = CodesearchService::new_for_proxy(proxy)?;
-            let server = service.serve(stdio()).await?;
-            tracing::info!("🔀 MCP proxy ready — forwarding all tool calls to serve");
-            tokio::select! {
-                result = server.waiting() => {
-                    tracing::info!("MCP proxy transport closed");
-                    result?;
+
+    for attempt in 1..=crate::constants::HEALTH_PROBE_ATTEMPTS {
+        match crate::mcp::proxy::McpProxy::check_health(&serve_url).await {
+            Ok(true) => {
+                tracing::info!(
+                    "🔀 codesearch serve detected at {} — entering proxy mode (attempt {}/{})",
+                    serve_url, attempt, crate::constants::HEALTH_PROBE_ATTEMPTS
+                );
+                let proxy = crate::mcp::proxy::McpProxy::new(serve_url);
+                let service = CodesearchService::new_for_proxy(proxy)?;
+                let server = service.serve(stdio()).await?;
+                tracing::info!("🔀 MCP proxy ready — forwarding all tool calls to serve");
+                tokio::select! {
+                    result = server.waiting() => {
+                        tracing::info!("MCP proxy transport closed");
+                        result?;
+                    }
+                    _ = cancel_token.cancelled() => {
+                        tracing::info!("🛑 Shutdown signal received, stopping MCP proxy...");
+                    }
                 }
-                _ = cancel_token.cancelled() => {
-                    tracing::info!("🛑 Shutdown signal received, stopping MCP proxy...");
+                tracing::info!("✅ MCP proxy shut down cleanly");
+                return Ok(());
+            }
+            Err(e) => {
+                // Version mismatch — hard error, no retry
+                tracing::error!("❌ {}", e);
+                return Err(e);
+            }
+            Ok(false) => {
+                if attempt < crate::constants::HEALTH_PROBE_ATTEMPTS {
+                    tracing::debug!(
+                        "Health probe attempt {}/{} — serve not ready, retrying in {}ms",
+                        attempt,
+                        crate::constants::HEALTH_PROBE_ATTEMPTS,
+                        crate::constants::HEALTH_PROBE_RETRY_DELAY_MS,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        crate::constants::HEALTH_PROBE_RETRY_DELAY_MS,
+                    ))
+                    .await;
                 }
             }
-            tracing::info!("✅ MCP proxy shut down cleanly");
-            return Ok(());
-        }
-        Err(e) => {
-            // Version mismatch — hard error, no fallback
-            tracing::error!("❌ {}", e);
-            return Err(e);
-        }
-        Ok(false) => {
-            tracing::info!("ℹ️  No codesearch serve detected — using local stdio mode");
         }
     }
+
+    // All probes failed — fall through to stdio
+    tracing::info!(
+        "ℹ️  No codesearch serve detected after {} attempts — using local stdio mode",
+        crate::constants::HEALTH_PROBE_ATTEMPTS
+    );
 
     // Set FASTEMBED_CACHE_DIR early (before any embedding work) to ensure fastembed
     // downloads and caches models to ~/.codesearch/models instead of creating
