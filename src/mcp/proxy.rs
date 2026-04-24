@@ -94,15 +94,17 @@ impl McpProxy {
             return Ok(false);
         }
 
-        // Version check
+        // Version check — warn on mismatch but still connect.
+        // During active development the pre-commit hook bumps the version on every
+        // commit, so the running serve will often be one patch behind. Hard-failing
+        // here makes proxy mode unusable in practice.
         let my_version = env!("CARGO_PKG_VERSION").to_string();
         if body.version != my_version {
-            return Err(anyhow::anyhow!(
-                "codesearch serve version mismatch: serve at {} reports v{}, this binary is v{}. \
-                 To fix: (1) stop the running `codesearch serve`, (2) install the matching binary version on both endpoints, \
-                 (3) restart serve. Until versions match, MCP clients cannot connect through proxy mode.",
+            tracing::warn!(
+                "⚠️  codesearch serve version mismatch: serve at {} reports v{}, this binary is v{}. \
+                 Proxy will proceed — restart serve with the latest binary when convenient.",
                 base_url, body.version, my_version
-            ));
+            );
         }
 
         Ok(true)
@@ -255,7 +257,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn version_mismatch_errors_actionable() {
+    async fn version_mismatch_allows_proxy_with_warning() {
         // Spawn a tiny server that reports a different version
         let app = axum::Router::new().route(
             crate::constants::HEALTH_PATH,
@@ -274,11 +276,8 @@ mod tests {
 
         let base_url = format!("http://{}", addr);
         let result = McpProxy::check_health(&base_url).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("stop"), "error should mention 'stop': {}", err);
-        assert!(err.contains("install"), "error should mention 'install': {}", err);
-        assert!(err.contains("restart"), "error should mention 'restart': {}", err);
-        assert!(err.contains(&base_url), "error should mention the base_url: {}", err);
+        // Version mismatch is now a warning, not a hard error — proxy should still connect
+        assert!(result.is_ok(), "version mismatch should not block proxy: {:?}", result);
+        assert!(result.unwrap());
     }
 }
