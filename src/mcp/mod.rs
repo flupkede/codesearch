@@ -365,6 +365,76 @@ mod tests {
         assert_eq!(result, "C:/other/src/main.rs");
     }
 
+    #[test]
+    fn test_group_results_are_alias_prefixed() {
+        // Simulate two stores for aliases "a" and "b", each returning a result
+        // with absolute path = "/abs/root/src/main.rs". After applying prefix_path_with_alias,
+        // assert results have path = "a/src/main.rs" and "b/src/main.rs".
+        let result_a = super::prefix_path_with_alias(
+            "/abs/root/src/main.rs",
+            Some("a"),
+            "/abs/root",
+        );
+        let result_b = super::prefix_path_with_alias(
+            "/abs/root/src/main.rs",
+            Some("b"),
+            "/abs/root",
+        );
+        assert_eq!(result_a, "a/src/main.rs");
+        assert_eq!(result_b, "b/src/main.rs");
+    }
+
+    #[test]
+    fn test_single_project_result_is_alias_prefixed() {
+        // Single store for alias "myrepo", result with path = "/abs/root/src/lib.rs",
+        // project root "/abs/root" → assert path becomes "myrepo/src/lib.rs".
+        let result = super::prefix_path_with_alias(
+            "/abs/root/src/lib.rs",
+            Some("myrepo"),
+            "/abs/root",
+        );
+        assert_eq!(result, "myrepo/src/lib.rs");
+    }
+
+    #[test]
+    fn test_stdio_mode_paths_not_prefixed() {
+        // alias None → path normalized, no prefix added.
+        let result = super::prefix_path_with_alias(
+            "C:/repo/src/main.rs",
+            None,
+            "C:/repo",
+        );
+        assert_eq!(result, "src/main.rs");
+    }
+
+    #[test]
+    fn test_dedup_key_includes_alias() {
+        // Two stores each returning chunk_id=1, different content.
+        // Assert both are kept after merge (key = (alias, chunk_id), not just chunk_id).
+        use std::collections::HashMap;
+
+        // Simulate the dedup logic from with_vector_store_read_multi
+        let mut seen_ids: HashMap<(String, u32), usize> = HashMap::new();
+        let mut all_results: Vec<(String, u32)> = Vec::new();
+
+        // First result from alias "a" with chunk_id 1
+        let key_a = ("a".to_string(), 1u32);
+        seen_ids.insert(key_a.clone(), all_results.len());
+        all_results.push(("a".to_string(), 1u32));
+
+        // Second result from alias "b" with chunk_id 1
+        let key_b = ("b".to_string(), 1u32);
+        if !seen_ids.contains_key(&key_b) {
+            seen_ids.insert(key_b.clone(), all_results.len());
+            all_results.push(("b".to_string(), 1u32));
+        }
+
+        // Both should be kept because keys are different
+        assert_eq!(all_results.len(), 2);
+        assert!(seen_ids.contains_key(&key_a));
+        assert!(seen_ids.contains_key(&key_b));
+    }
+
     // === simple_glob_match tests ===
 
     #[test]
@@ -1788,7 +1858,6 @@ fn normalize_tool_path(path: &str, project_root: &Path) -> String {
 /// Prefix a result path with its repo alias for group queries, normalizing
 /// Windows backslashes to forward slashes in the process. When `alias` is
 /// None or empty, the path is still normalized (useful for stdio mode).
-#[allow(dead_code)]
 pub(crate) fn prefix_path_with_alias(path: &str, alias: Option<&str>, project_root: &str) -> String {
     let normalized = crate::cache::normalize_path_str(path);
     let normalized_root = crate::cache::normalize_path_str(project_root)
@@ -1804,6 +1873,24 @@ pub(crate) fn prefix_path_with_alias(path: &str, alias: Option<&str>, project_ro
         }
         None => normalized,
     }
+}
+
+/// Prefix a result path with the matching repo alias from a set of aliases and their roots.
+/// Used by handlers that have alias/root info but not a full `MultiStoreContext`.
+fn prefix_path_multi(
+    path: &str,
+    aliases: &[String],
+    alias_roots: &std::collections::HashMap<String, String>,
+) -> String {
+    let normalized = crate::cache::normalize_path_str(path);
+    for alias in aliases {
+        if let Some(root) = alias_roots.get(alias) {
+            if normalized.starts_with(root.as_str()) {
+                return prefix_path_with_alias(path, Some(alias), root);
+            }
+        }
+    }
+    normalized
 }
 
 fn is_import_kind(kind: &str) -> bool {
@@ -1910,10 +1997,62 @@ struct MultiStoreContext {
     /// Multi-store vec for fan-out (set when 2+ repos resolved, or None).
     /// Use `if let Some(ref sv) = ctx.stores_vec { ... }` for the multi-store path.
     stores_vec: Option<Vec<Arc<SharedStores>>>,
+    /// Alias for each store in `stores_vec` (parallel with stores_vec).
+    /// Used for path prefixing and per-alias dedup.
+    store_aliases: Option<Vec<String>>,
+    /// Alias for single-project routing (set when project= is given).
+    project_alias: Option<String>,
+    /// Normalized project root for each alias (alias → root path).
+    /// Used by `prefix_path` to strip absolute paths and add alias prefix.
+    alias_roots: std::collections::HashMap<String, String>,
     /// True when `stores_vec` has 2+ entries (group fan-out).
     is_multi: bool,
     /// True when no serve-state stores resolved and local DB should be checked.
     needs_local_db: bool,
+}
+
+impl MultiStoreContext {
+    /// Prefix a result path with its owning alias for multi-repo identification.
+    ///
+    /// Three dispatch modes:
+    /// - Single-project (`project_alias = Some(...)`): prefix with that alias.
+    /// - Group (`store_aliases = Some([...])`): detect alias by prefix-matching
+    ///   the path against known project roots in `alias_roots`.
+    /// - Stdio / no alias info: normalize only, no prefix.
+    ///
+    /// Emits a `tracing::debug!` event when an expected alias cannot be resolved.
+    /// That usually indicates a config mismatch or a path from an unregistered source —
+    /// the path is still normalized and returned, but diagnosis is easier with the log.
+    fn prefix_result_path(&self, path: &str) -> String {
+        if let Some(ref alias) = self.project_alias {
+            if let Some(root) = self.alias_roots.get(alias) {
+                return prefix_path_with_alias(path, Some(alias), root);
+            }
+            tracing::debug!(
+                target: "codesearch::mcp::path_prefix",
+                alias = %alias,
+                path = %path,
+                "project_alias has no entry in alias_roots"
+            );
+        }
+        if let Some(ref aliases) = self.store_aliases {
+            let normalized = crate::cache::normalize_path_str(path);
+            for alias in aliases {
+                if let Some(root) = self.alias_roots.get(alias) {
+                    if normalized.starts_with(root.as_str()) {
+                        return prefix_path_with_alias(path, Some(alias), root);
+                    }
+                }
+            }
+            tracing::debug!(
+                target: "codesearch::mcp::path_prefix",
+                aliases = ?aliases,
+                path = %path,
+                "no alias root matched path in group mode"
+            );
+        }
+        crate::cache::normalize_path_str(path)
+    }
 }
 
 // === Tool Router Implementation ===
@@ -2061,7 +2200,7 @@ impl CodesearchService {
         &self,
         project: &Option<String>,
         group: &Option<String>,
-    ) -> std::result::Result<Option<Vec<Arc<SharedStores>>>, String> {
+    ) -> std::result::Result<Option<(Vec<Arc<SharedStores>>, Vec<String>)>, String> {
         // No routing params → use default stores
         if project.is_none() && group.is_none() {
             return Ok(None);
@@ -2076,7 +2215,7 @@ impl CodesearchService {
 
         if let Some(ref alias) = project {
             let stores = serve_state.get_or_open_stores(alias).await?;
-            return Ok(Some(vec![stores]));
+            return Ok(Some((vec![stores], vec![alias.clone()])));
         }
 
         if let Some(ref group_name) = group {
@@ -2088,7 +2227,7 @@ impl CodesearchService {
             for alias in &aliases {
                 all_stores.push(serve_state.get_or_open_stores(alias).await?);
             }
-            return Ok(Some(all_stores));
+            return Ok(Some((all_stores, aliases)));
         }
 
         Ok(None)
@@ -2103,18 +2242,49 @@ impl CodesearchService {
         project: &Option<String>,
         group: &Option<String>,
     ) -> std::result::Result<MultiStoreContext, String> {
-        let multi_stores = self.resolve_repo_stores_multi(project, group).await?;
-        let is_multi = multi_stores.as_ref().is_some_and(|v| v.len() > 1);
-        let stores = match &multi_stores {
-            None => None,
-            Some(vec) if vec.len() == 1 => Some(vec[0].clone()),
-            Some(_) => None,
+        let resolved = self.resolve_repo_stores_multi(project, group).await?;
+        let is_multi = resolved.as_ref().is_some_and(|(stores, _)| stores.len() > 1);
+        let (stores, stores_vec, store_aliases, project_alias) = match &resolved {
+            None => (None, None, None, None),
+            Some((store_vec, aliases)) if store_vec.len() == 1 => {
+                let alias = aliases.first().cloned();
+                (Some(store_vec[0].clone()), None, None, alias)
+            }
+            Some((store_vec, aliases)) => {
+                (None, Some(store_vec.clone()), Some(aliases.clone()), None)
+            }
         };
-        let stores_vec = if is_multi { multi_stores } else { None };
+
+        // Build alias → normalized project root map for path prefixing
+        let mut alias_roots = std::collections::HashMap::new();
+        if let Some(ref serve_state) = self.serve_state {
+            let cfg = serve_state.config_snapshot();
+            let all_aliases = store_aliases.as_deref().unwrap_or(&[]);
+            for alias in all_aliases.iter() {
+                if let Some(path) = cfg.resolve(alias) {
+                    let root = crate::cache::normalize_path_str(path.to_string_lossy().as_ref())
+                        .trim_end_matches('/')
+                        .to_string();
+                    alias_roots.insert(alias.clone(), root);
+                }
+            }
+            if let Some(ref alias) = project_alias {
+                if let Some(path) = cfg.resolve(alias) {
+                    let root = crate::cache::normalize_path_str(path.to_string_lossy().as_ref())
+                        .trim_end_matches('/')
+                        .to_string();
+                    alias_roots.insert(alias.clone(), root);
+                }
+            }
+        }
+
         let needs_local_db = stores.is_none() && !is_multi;
         Ok(MultiStoreContext {
             stores,
             stores_vec,
+            store_aliases,
+            project_alias,
+            alias_roots,
             is_multi,
             needs_local_db,
         })
@@ -2198,32 +2368,34 @@ impl CodesearchService {
     /// Fan-out vector store read across multiple stores, merging results.
     ///
     /// Runs `action` against each store and merges all results into a single vec,
-    /// deduplicating by chunk_id (keeping highest score) and sorting by score descending.
+    /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
     async fn with_vector_store_read_multi<R, F>(
         &self,
         mut action: F,
         stores: Vec<Arc<SharedStores>>,
+        aliases: &[String],
     ) -> Result<Vec<R>>
     where
         F: FnMut(&VectorStore) -> anyhow::Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
         let mut all_results: Vec<R> = Vec::new();
-        let mut seen_ids: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        let mut seen_ids: std::collections::HashMap<(String, u32), usize> = std::collections::HashMap::new();
 
-        for store_arc in &stores {
+        for (idx, store_arc) in stores.iter().enumerate() {
+            let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
             let store = store_arc.vector_store.read().await;
             match action(&store) {
                 Ok(results) => {
                     for r in results {
-                        let id = r.chunk_id();
-                        if let Some(&existing_idx) = seen_ids.get(&id) {
+                        let key = (alias.to_string(), r.chunk_id());
+                        if let Some(&existing_idx) = seen_ids.get(&key) {
                             // Keep the one with higher score
                             if r.score() > all_results[existing_idx].score() {
                                 all_results[existing_idx] = r;
                             }
                         } else {
-                            seen_ids.insert(id, all_results.len());
+                            seen_ids.insert(key, all_results.len());
                             all_results.push(r);
                         }
                     }
@@ -2247,31 +2419,33 @@ impl CodesearchService {
     /// Fan-out FTS store read across multiple stores, merging results.
     ///
     /// Runs `action` against each store and merges all results into a single vec,
-    /// deduplicating by chunk_id (keeping highest score) and sorting by score descending.
+    /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
     async fn with_fts_store_read_multi<R, F>(
         &self,
         mut action: F,
         stores: Vec<Arc<SharedStores>>,
+        aliases: &[String],
     ) -> Result<Vec<R>>
     where
         F: FnMut(&FtsStore) -> Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
         let mut all_results: Vec<R> = Vec::new();
-        let mut seen_ids: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        let mut seen_ids: std::collections::HashMap<(String, u32), usize> = std::collections::HashMap::new();
 
-        for store_arc in &stores {
+        for (idx, store_arc) in stores.iter().enumerate() {
+            let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
             let fts = store_arc.fts_store.read().await;
             match action(&fts) {
                 Ok(results) => {
                     for r in results {
-                        let id = r.chunk_id();
-                        if let Some(&existing_idx) = seen_ids.get(&id) {
+                        let key = (alias.to_string(), r.chunk_id());
+                        if let Some(&existing_idx) = seen_ids.get(&key) {
                             if r.score() > all_results[existing_idx].score() {
                                 all_results[existing_idx] = r;
                             }
                         } else {
-                            seen_ids.insert(id, all_results.len());
+                            seen_ids.insert(key, all_results.len());
                             all_results.push(r);
                         }
                     }
@@ -2298,7 +2472,7 @@ impl CodesearchService {
 
     /// Unified search tool — dispatches to semantic or literal search based on `mode`.
     #[tool(
-        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Supports regex (`regex=true`), phrase (`phrase=true`), and exact-term matching. Fast and works without an embedding model.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code."
+        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns."
     )]
     async fn search(
         &self,
@@ -2502,6 +2676,8 @@ impl CodesearchService {
             return self.semantic_search_multi(
                 &request, &identifiers, limit, compact,
                 ctx.stores_vec.unwrap(),
+                ctx.store_aliases.as_ref().unwrap(),
+                &ctx.alias_roots,
             ).await;
         }
 
@@ -2509,7 +2685,7 @@ impl CodesearchService {
         if mode == "lexical" {
             tracing::debug!("MCP: mode=lexical — skipping embedding service");
             return self
-                .semantic_search_lexical(&request, &identifiers, limit, compact, ctx.stores)
+                .semantic_search_lexical(&request, &identifiers, limit, compact, ctx.stores, ctx.project_alias.as_deref(), &ctx.alias_roots)
                 .await;
         }
 
@@ -2580,7 +2756,7 @@ impl CodesearchService {
                     results.push(r);
                 }
             }
-            return self.build_semantic_response(results, &request, compact, has_identifiers);
+            return self.build_semantic_response(results, &request, compact, has_identifiers, ctx.project_alias.as_deref(), &ctx.alias_roots);
         }
 
         // === Modes: "hybrid" | "auto" — full hybrid search ===
@@ -2686,13 +2862,14 @@ impl CodesearchService {
         }
 
         tracing::debug!("MCP: Final {} results after hybrid search", results.len());
-        self.build_semantic_response(results, &request, compact, has_identifiers)
+        self.build_semantic_response(results, &request, compact, has_identifiers, ctx.project_alias.as_deref(), &ctx.alias_roots)
     }
 
     // === Helper methods (not exposed as tools) ===
 
     /// Multi-store semantic search: fan out across all stores, merge raw vector/FTS
     /// results, then apply RRF fusion.
+    #[allow(clippy::too_many_arguments)]
     async fn semantic_search_multi(
         &self,
         request: &SemanticSearchRequest,
@@ -2700,6 +2877,8 @@ impl CodesearchService {
         limit: usize,
         compact: bool,
         stores: Vec<Arc<SharedStores>>,
+        aliases: &[String],
+        alias_roots: &std::collections::HashMap<String, String>,
     ) -> Result<CallToolResult, McpError> {
         let mode = request.mode.as_deref().unwrap_or("auto");
         let structural_intent = detect_structural_intent(&request.query);
@@ -2710,6 +2889,7 @@ impl CodesearchService {
                 .with_fts_store_read_multi(
                     |fts_store| fts_store.search(&request.query, limit * 3, structural_intent),
                     stores.clone(),
+                    aliases,
                 )
                 .await
                 .unwrap_or_default();
@@ -2721,6 +2901,7 @@ impl CodesearchService {
                     .with_fts_store_read_multi(
                         |fts_store| fts_store.search_exact(ident, limit * 2, structural_intent),
                         stores.clone(),
+                        aliases,
                     )
                     .await
                     .unwrap_or_default();
@@ -2737,10 +2918,10 @@ impl CodesearchService {
                 // We need mutable results but we have them as vectordb::SearchResult
                 let mut mutable_results = results;
                 boost_kind(&mut mutable_results, target_kind);
-                return self.build_semantic_response(mutable_results, request, compact, !identifiers.is_empty());
+                return self.build_semantic_response(mutable_results, request, compact, !identifiers.is_empty(), None, alias_roots);
             }
 
-            return self.build_semantic_response(results, request, compact, !identifiers.is_empty());
+            return self.build_semantic_response(results, request, compact, !identifiers.is_empty(), None, alias_roots);
         }
 
         // === Modes requiring embedding: "semantic", "hybrid", "auto" ===
@@ -2769,6 +2950,7 @@ impl CodesearchService {
             .with_vector_store_read_multi(
                 |store| store.search(&query_embedding, limit * 3).context("Error searching vector store"),
                 stores.clone(),
+                aliases,
             )
             .await
             .unwrap_or_default();
@@ -2787,7 +2969,7 @@ impl CodesearchService {
                     results.push(r);
                 }
             }
-            return self.build_semantic_response(results, request, compact, !identifiers.is_empty());
+            return self.build_semantic_response(results, request, compact, !identifiers.is_empty(), None, alias_roots);
         }
 
         // === Modes: "hybrid" | "auto" — full hybrid search ===
@@ -2798,6 +2980,7 @@ impl CodesearchService {
             .with_fts_store_read_multi(
                 |fts_store| fts_store.search(&request.query, limit * 3, structural_intent),
                 stores.clone(),
+                aliases,
             )
             .await
             .unwrap_or_default();
@@ -2810,6 +2993,7 @@ impl CodesearchService {
                     .with_fts_store_read_multi(
                         |fts_store| fts_store.search_exact(ident, limit * 2, structural_intent),
                         stores.clone(),
+                        aliases,
                     )
                     .await
                     .unwrap_or_default();
@@ -2861,7 +3045,7 @@ impl CodesearchService {
             boost_kind(&mut mapped, target_kind);
         }
 
-        self.build_semantic_response(mapped, request, compact, !identifiers.is_empty())
+        self.build_semantic_response(mapped, request, compact, !identifiers.is_empty(), None, alias_roots)
     }
 
     /// Resolve a single chunk from multiple stores (used for FTS-only hits in multi-store fusion).
@@ -2931,6 +3115,7 @@ impl CodesearchService {
     }
 
     /// Lexical-only search: FTS without embedding service.
+    #[allow(clippy::too_many_arguments)]
     async fn semantic_search_lexical(
         &self,
         request: &SemanticSearchRequest,
@@ -2938,6 +3123,8 @@ impl CodesearchService {
         limit: usize,
         compact: bool,
         stores: Option<Arc<SharedStores>>,
+        project_alias: Option<&str>,
+        alias_roots: &std::collections::HashMap<String, String>,
     ) -> Result<CallToolResult, McpError> {
         let structural_intent = detect_structural_intent(&request.query);
 
@@ -2984,7 +3171,7 @@ impl CodesearchService {
             boost_kind(&mut results, target_kind);
         }
 
-        self.build_semantic_response(results, request, compact, !identifiers.is_empty())
+        self.build_semantic_response(results, request, compact, !identifiers.is_empty(), project_alias, alias_roots)
     }
 
     /// Build the final SemanticSearchResponse with low-confidence signaling.
@@ -2994,6 +3181,8 @@ impl CodesearchService {
         request: &SemanticSearchRequest,
         compact: bool,
         has_identifiers: bool,
+        project_alias: Option<&str>,
+        alias_roots: &std::collections::HashMap<String, String>,
     ) -> Result<CallToolResult, McpError> {
         if results.is_empty() {
             let response = SemanticSearchResponse {
@@ -3011,7 +3200,7 @@ impl CodesearchService {
             root.trim_end_matches('/').to_string()
         };
 
-        let items: Vec<SearchResultItem> = results
+        let mut items: Vec<SearchResultItem> = results
             .into_iter()
             .filter(|r| {
                 if let Some(ref fp) = request.filter_path {
@@ -3038,6 +3227,19 @@ impl CodesearchService {
                 context_next: if compact { None } else { r.context_next },
             })
             .collect();
+
+        // Prefix paths with alias for multi-repo / single-project identification
+        for item in &mut items {
+            if let Some(alias) = project_alias {
+                if let Some(root) = alias_roots.get(alias) {
+                    item.path = prefix_path_with_alias(&item.path, Some(alias), root);
+                } else {
+                    item.path = crate::cache::normalize_path_str(&item.path);
+                }
+            } else if !alias_roots.is_empty() {
+                item.path = prefix_path_multi(&item.path, &[], alias_roots);
+            }
+        }
 
         // Check low-confidence: top result's RRF score below threshold
         let top_score = items.first().map(|r| r.score);
@@ -3121,9 +3323,11 @@ impl CodesearchService {
 
         // FTS search — multi-store or single
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
+            let sa = ctx.store_aliases.as_ref().unwrap();
             self.with_fts_store_read_multi(
                 |fts_store| fts_store.search(&request.symbol, limit * 3, None),
                 sv.clone(),
+                sa,
             )
             .await
             .unwrap_or_default()
@@ -3150,7 +3354,7 @@ impl CodesearchService {
 
         // Resolve chunk metadata and filter by definition kinds
         let requested_kind = request.kind.clone();
-        let items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
+        let mut items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
             let mut items: Vec<ReferenceItem> = Vec::new();
             'outer: for fts_result in &fts_results {
                 for store_arc in sv {
@@ -3214,7 +3418,7 @@ impl CodesearchService {
                             .collect();
                         Ok(items)
                     },
-                    ctx.stores,
+                    ctx.stores.clone(),
                 )
                 .await
             {
@@ -3226,6 +3430,11 @@ impl CodesearchService {
                 }
             }
         };
+
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut items {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -3272,9 +3481,11 @@ impl CodesearchService {
 
         // FTS search — multi-store or single
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
+            let sa = ctx.store_aliases.as_ref().unwrap();
             self.with_fts_store_read_multi(
                 |fts_store| fts_store.search(&symbol, limit * 2, None),
                 sv.clone(),
+                sa,
             )
             .await
             .unwrap_or_default()
@@ -3300,7 +3511,7 @@ impl CodesearchService {
         }
 
         // Resolve chunks and exclude definition chunks
-        let items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
+        let mut items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
             let mut items: Vec<ReferenceItem> = Vec::new();
             for fts_result in &fts_results {
                 for store_arc in sv {
@@ -3351,7 +3562,7 @@ impl CodesearchService {
                             .collect();
                         Ok(items)
                     },
-                    ctx.stores,
+                    ctx.stores.clone(),
                 )
                 .await
             {
@@ -3363,6 +3574,11 @@ impl CodesearchService {
                 }
             }
         };
+
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut items {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -3384,6 +3600,13 @@ impl CodesearchService {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
+
+        // Outline operates on a single repo — reject group fan-out
+        if ctx.is_multi {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Tool 'explore' operates on a single repo. Use 'project' instead of 'group'.".to_string(),
+            )]));
+        }
 
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
@@ -3438,7 +3661,7 @@ impl CodesearchService {
                         out.sort_by_key(|i| i.start_line);
                         Ok(out)
                     },
-                    ctx.stores,
+                    ctx.stores.clone(),
                 )
                 .await
             {
@@ -3504,13 +3727,13 @@ impl CodesearchService {
             self
                 .with_vector_store_read_for(
                     |store| store.get_chunk(request.chunk_id),
-                    ctx.stores,
+                    ctx.stores.clone(),
                 )
                 .await
                 .unwrap_or_default()
         };
 
-        let chunk = match chunk {
+        let mut chunk = match chunk {
             Some(c) => c,
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -3519,6 +3742,9 @@ impl CodesearchService {
                 ))]));
             }
         };
+
+        // Prefix path with alias for multi-repo identification
+        chunk.path = ctx.prefix_result_path(&chunk.path);
 
         let mut context_before = None;
         let mut context_after = None;
@@ -3668,6 +3894,7 @@ impl CodesearchService {
                                 fts_store.search_exact(keyword, fallback_limit, None)
                             },
                             sv.clone(),
+                            ctx.store_aliases.as_ref().unwrap(),
                         )
                         .await
                         .unwrap_or_default();
@@ -3772,6 +3999,7 @@ impl CodesearchService {
         // imports are gap-classified as `Imports` kind. Chunks whose kind doesn't
         // match `is_import_kind()` will be missed regardless of search method.
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
+            let sa = ctx.store_aliases.as_ref().unwrap();
             // Multi-store FTS search
             let exact_hits = self
                 .with_fts_store_read_multi(
@@ -3779,6 +4007,7 @@ impl CodesearchService {
                         fts_store.search_exact(&request.symbol_or_path, high_limit, None)
                     },
                     sv.clone(),
+                    sa,
                 )
                 .await
                 .unwrap_or_default();
@@ -3789,6 +4018,7 @@ impl CodesearchService {
                         fts_store.search(&request.symbol_or_path, high_limit, None)
                     },
                     sv.clone(),
+                    sa,
                 )
                 .await
                 .unwrap_or_default()
@@ -3929,7 +4159,7 @@ impl CodesearchService {
                         }
                     }
                     Ok(out)
-                }, ctx.stores)
+                }, ctx.stores.clone())
                 .await
             {
                 Ok(items) => items,
@@ -3941,6 +4171,11 @@ impl CodesearchService {
                 }
             }
         };
+
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut items {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
 
         items.sort_by(|a, b| a.path.cmp(&b.path));
         if items.is_empty() {
@@ -3973,7 +4208,7 @@ impl CodesearchService {
 
         let limit = request.limit.unwrap_or(5).min(20);
 
-        let results = if let Some(ref sv) = ctx.stores_vec {
+        let mut results = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store: find the embedding in whichever store has it,
             // then search across all stores for similar chunks.
             let mut embedding: Option<Vec<f32>> = None;
@@ -4062,7 +4297,7 @@ impl CodesearchService {
                             .collect::<Vec<_>>();
                         Ok(items)
                     },
-                    ctx.stores,
+                    ctx.stores.clone(),
                 )
                 .await
             {
@@ -4075,6 +4310,11 @@ impl CodesearchService {
                 }
             }
         };
+
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut results {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
 
         let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -4115,6 +4355,7 @@ impl CodesearchService {
 
         // FTS search — multi-store or single
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
+            let sa = ctx.store_aliases.as_ref().unwrap();
             self.with_fts_store_read_multi(
                 |fts_store| {
                     if request.regex.unwrap_or(false) {
@@ -4126,6 +4367,7 @@ impl CodesearchService {
                     }
                 },
                 sv.clone(),
+                sa,
             )
             .await
             .unwrap_or_default()
@@ -4175,7 +4417,7 @@ impl CodesearchService {
             root.trim_end_matches('/').to_string()
         };
 
-        let items: Vec<LiteralSearchResultItem> = if let Some(ref sv) = ctx.stores_vec {
+        let mut items: Vec<LiteralSearchResultItem> = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store: resolve chunks from all stores
             let mut items: Vec<LiteralSearchResultItem> = Vec::new();
             'outer: for fts_result in &fts_results {
@@ -4266,7 +4508,7 @@ impl CodesearchService {
                         })
                         .collect();
                     Ok(items)
-                }, ctx.stores)
+                }, ctx.stores.clone())
                 .await
             {
                 Ok(items) => items,
@@ -4277,6 +4519,11 @@ impl CodesearchService {
                 }
             }
         };
+
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut items {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -4391,7 +4638,7 @@ impl CodesearchService {
 
         // Single-store path
         let stats = match self
-            .with_vector_store_read_for(|store| store.stats().context("Error getting index stats"), ctx.stores)
+            .with_vector_store_read_for(|store| store.stats().context("Error getting index stats"), ctx.stores.clone())
             .await
         {
             Ok(s) => s,
