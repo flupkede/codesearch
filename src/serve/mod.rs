@@ -378,6 +378,24 @@ async fn health_handler() -> AxumJson<serde_json::Value> {
     }))
 }
 
+/// Axum middleware: log MCP requests (method + path, skips /health spam).
+async fn log_mcp_requests(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+
+    let response = next.run(req).await;
+
+    if path != crate::constants::HEALTH_PATH {
+        let status = response.status().as_u16();
+        tracing::info!("{} {} → {}", method, path, status);
+    }
+
+    response
+}
+
 /// Run the MCP serve mode.
 ///
 /// This is the entry point called from CLI when `codesearch serve` is invoked.
@@ -414,7 +432,10 @@ pub async fn run_serve(
     // Create the MCP service factory — each session gets a fresh CodesearchService
     // that uses serve_state for repo routing.
     let state_for_factory = serve_state.clone();
+    let session_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let service_factory = move || -> std::result::Result<crate::mcp::CodesearchService, std::io::Error> {
+        let session_id = session_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        info!("🔌 MCP client connected (session #{})", session_id);
         // We create a minimal service; actual repo routing is handled inside
         // the tool handlers via serve_state.
         crate::mcp::CodesearchService::new_for_serve(state_for_factory.clone())
@@ -430,10 +451,11 @@ pub async fn run_serve(
         config,
     );
 
-    // Build axum router
+    // Build axum router with request logging
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
-        .nest_service(MCP_ENDPOINT_PATH, mcp_service);
+        .nest_service(MCP_ENDPOINT_PATH, mcp_service)
+        .layer(axum::middleware::from_fn(log_mcp_requests));
 
     // Graceful shutdown
     let server = axum::serve(
