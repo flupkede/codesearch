@@ -234,6 +234,14 @@ pub enum Commands {
         /// Register one or more repo paths at startup (can be repeated)
         #[arg(short, long, action = ArgAction::Append)]
         register: Vec<PathBuf>,
+
+        /// Log to file only, not to console (default: true, cleaner for background server)
+        #[arg(short, long, default_value = "true", action = ArgAction::Set, value_parser = BoolishValueParser::new())]
+        quiet: bool,
+
+        /// Show verbose output on console (overrides --quiet for debugging)
+        #[arg(long, visible_alias = "no-quiet")]
+        verbose: bool,
     },
 
     /// Show statistics about the vector database
@@ -434,6 +442,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Serve {
             port,
             register,
+            quiet,
+            verbose,
         } => {
             // Initialize logger for serve mode
             // NOTE: For Serve, tracing is NOT initialized in main.rs — init_logger
@@ -441,7 +451,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             if let Ok(Some(db_info)) =
                 crate::db_discovery::find_best_database(None as Option<&std::path::Path>)
             {
-                let _ = crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet);
+                // Combine global --quiet with serve-specific --quiet, and allow --verbose to override
+                let effective_quiet = (cli.quiet || quiet) && !verbose;
+                let _ = crate::logger::init_logger(&db_info.db_path, log_level, effective_quiet);
             }
             crate::serve::run_serve(port, register, cancel_token.clone()).await
         }
