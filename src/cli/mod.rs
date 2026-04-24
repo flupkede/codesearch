@@ -235,8 +235,8 @@ pub enum Commands {
         #[arg(short, long, action = ArgAction::Append)]
         register: Vec<PathBuf>,
 
-        /// Log to file only, not to console (default: true, cleaner for background server)
-        #[arg(short, long, default_value = "true", action = ArgAction::Set, value_parser = BoolishValueParser::new())]
+        /// Log to file only, not to console (use for daemon/background mode)
+        #[arg(short, long, default_value = "false", action = ArgAction::Set, value_parser = BoolishValueParser::new())]
         quiet: bool,
 
         /// Show verbose output on console (overrides --quiet for debugging)
@@ -463,7 +463,10 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Mcp { path, create_index } => {
             // Logger is initialized inside run_mcp_server() once db_path is known.
             // This handles both the "DB already exists" and "auto-create DB" paths correctly.
-            crate::mcp::run_mcp_server(path, create_index, log_level, cli.quiet, cancel_token).await
+            //
+            // MCP stdio transport uses stdout for JSON-RPC — always force file-only
+            // logging to keep the channel clean, regardless of the global --quiet flag.
+            crate::mcp::run_mcp_server(path, create_index, log_level, true, cancel_token).await
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
