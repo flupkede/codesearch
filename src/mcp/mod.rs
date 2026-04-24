@@ -2212,8 +2212,19 @@ impl CodesearchService {
         project: &Option<String>,
         group: &Option<String>,
     ) -> std::result::Result<Option<(Vec<Arc<SharedStores>>, Vec<String>)>, String> {
-        // No routing params → use default stores
+        // No routing params → auto-default to all configured repos in serve mode
         if project.is_none() && group.is_none() {
+            if let Some(ref serve_state) = self.serve_state {
+                let cfg = serve_state.config_snapshot();
+                let aliases: Vec<String> = cfg.repos.keys().cloned().collect();
+                if !aliases.is_empty() {
+                    let mut all_stores = Vec::with_capacity(aliases.len());
+                    for alias in &aliases {
+                        all_stores.push(serve_state.get_or_open_stores(alias).await?);
+                    }
+                    return Ok(Some((all_stores, aliases)));
+                }
+            }
             return Ok(None);
         }
 
