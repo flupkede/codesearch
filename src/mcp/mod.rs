@@ -1579,6 +1579,42 @@ mod tests {
         assert!(!super::regex_has_anchorable_token(r"^[A-Z]\w+"));
     }
 
+    // ─── Trailing-escape detector tests ──────────────────────────────
+
+    #[test]
+    fn test_regex_has_anchorable_token_trailing_word_boundary() {
+        assert!(!super::regex_has_anchorable_token(r"impl\b"));
+        assert!(!super::regex_has_anchorable_token(r"Result\b"));
+        assert!(!super::regex_has_anchorable_token(r"match\b"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_trailing_class() {
+        assert!(!super::regex_has_anchorable_token(r"impl[A-Z]"));
+        assert!(!super::regex_has_anchorable_token(r"foo[abc]+"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_trailing_escape_with_clean_run_after() {
+        // After the merged trailing escape, if there's a clean run later, that
+        // later run can still anchor.
+        assert!(super::regex_has_anchorable_token(r"impl\b\s+function_name"));
+        //                                              ^^^^^^^^^^^^^ anchorable
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_trailing_escape_at_end_only() {
+        // Run, then escape, then EOF — not anchorable.
+        assert!(!super::regex_has_anchorable_token(r"impl\s"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_both_sides_escaped() {
+        // \bimpl\b — leading escape already disqualifies "impl"; trailing
+        // doesn't change the answer.
+        assert!(!super::regex_has_anchorable_token(r"\bimpl\b"));
+    }
+
     #[test]
     fn test_regex_no_match_match_line_returns_none() {
         // match_line_for_literal returns None for patterns that don't match
@@ -2080,7 +2116,28 @@ fn regex_has_anchorable_token(pattern: &str) -> bool {
             }
             run += 1;
             if run >= 3 {
-                return true;
+                // Only peek when the run might be ending: check if the next byte
+                // is NOT alphanumeric. If it IS, keep building the run.
+                let next_idx = i + 1;
+                let run_continues = next_idx < bytes.len() && {
+                    let nc = bytes[next_idx] as char;
+                    nc.is_alphanumeric() || nc == '_'
+                };
+                if !run_continues {
+                    // Run has ended. Check if next byte merges (escape or class).
+                    if next_idx < bytes.len() {
+                        let next_c = bytes[next_idx] as char;
+                        if next_c == '\\' || next_c == '[' {
+                            run = 0;
+                            need_separator = true;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    // Run ended naturally (EOF or non-merge separator) → anchorable
+                    return true;
+                }
+                // Run continues — keep building in next iteration
             }
         } else {
             run = 0;
