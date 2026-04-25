@@ -1912,7 +1912,15 @@ mod tests {
 }
 
 pub mod types;
-pub mod proxy;
+
+/// Resolve the serve base URL from env or default port.
+fn serve_url_from_env() -> String {
+    let port = std::env::var(crate::constants::SERVE_PORT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(crate::constants::DEFAULT_SERVE_PORT);
+    format!("http://127.0.0.1:{}", port)
+}
 
 use crate::db_discovery::{find_best_database, load_repos_config};
 use crate::embed::{EmbeddingService, ModelType};
@@ -1997,8 +2005,6 @@ pub struct CodesearchService {
     shared_stores: Option<Arc<SharedStores>>,
     // Serve-mode state (set when running inside `codesearch serve`)
     serve_state: Option<Arc<crate::serve::ServeState>>,
-    // Proxy to serve instance (set when `codesearch mcp` detects a running serve)
-    proxy: Option<crate::mcp::proxy::McpProxy>,
 }
 
 impl std::fmt::Debug for CodesearchService {
@@ -2009,7 +2015,6 @@ impl std::fmt::Debug for CodesearchService {
             .field("dimensions", &self.dimensions)
             .field("has_shared_stores", &self.shared_stores.is_some())
             .field("serve_mode", &self.serve_state.is_some())
-            .field("proxy_mode", &self.proxy.is_some())
             .finish()
     }
 }
@@ -2668,7 +2673,6 @@ impl CodesearchService {
             embedding_service: Mutex::new(None),
             shared_stores,
             serve_state: None,
-            proxy: None,
         })
     }
 
@@ -2688,22 +2692,6 @@ impl CodesearchService {
             embedding_service: Mutex::new(None),
             shared_stores: None,
             serve_state: Some(serve_state),
-            proxy: None,
-        })
-    }
-
-    /// Create a CodesearchService in proxy mode (forwards all calls to serve).
-    pub fn new_for_proxy(proxy: crate::mcp::proxy::McpProxy) -> Result<Self> {
-        Ok(Self {
-            tool_router: Self::tool_router(),
-            db_path: PathBuf::from("proxy://forward-to-serve"),
-            project_path: PathBuf::from("proxy://forward-to-serve"),
-            model_type: ModelType::default(),
-            dimensions: crate::constants::DEFAULT_EMBEDDING_DIMENSIONS,
-            embedding_service: Mutex::new(None),
-            shared_stores: None,
-            serve_state: None,
-            proxy: Some(proxy),
         })
     }
 
@@ -2722,9 +2710,7 @@ impl CodesearchService {
 
     /// Return the current MCP mode as a string for diagnostics.
     fn mcp_mode(&self) -> Option<String> {
-        if self.proxy.is_some() {
-            Some(format!("proxy → {}", self.proxy.as_ref().unwrap().base_url()))
-        } else if self.serve_state.is_some() {
+        if self.serve_state.is_some() {
             Some("serve_hub".to_string())
         } else {
             Some("stdio".to_string())
@@ -3063,13 +3049,6 @@ impl CodesearchService {
             request.project,
             request.group,
         );
-        // Proxy guard: forward ALL search modes to serve rather than dispatching locally
-        if let Some(ref proxy) = self.proxy {
-            let params = serde_json::to_value(&request).ok();
-            return proxy.forward("search", params).await.map_err(|e| {
-                McpError::internal_error(e.message.into_owned(), None)
-            });
-        }
         let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
         match mode.as_str() {
             "semantic" => {
@@ -3115,14 +3094,6 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<FindRequest>,
     ) -> Result<CallToolResult, McpError> {
-        // If in proxy mode, forward to serve
-        if let Some(ref proxy) = self.proxy {
-            let params = serde_json::to_value(&request).ok();
-            return proxy.forward("find", params).await.map_err(|e| {
-                McpError::internal_error(e.message.into_owned(), None)
-            });
-        }
-
         let kind = request.kind.as_deref().unwrap_or("definition").to_lowercase();
         tracing::info!(
             "📥 find(symbol={:?}, kind={}, project={:?}, group={:?})",
@@ -3183,14 +3154,6 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<ExploreRequest>,
     ) -> Result<CallToolResult, McpError> {
-        // If in proxy mode, forward to serve
-        if let Some(ref proxy) = self.proxy {
-            let params = serde_json::to_value(&request).ok();
-            return proxy.forward("explore", params).await.map_err(|e| {
-                McpError::internal_error(e.message.into_owned(), None)
-            });
-        }
-
         let kind = request.kind.as_deref().unwrap_or("outline").to_lowercase();
         tracing::info!(
             "📥 explore(target={:?}, kind={}, project={:?})",
@@ -3240,14 +3203,6 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<StatusRequest>,
     ) -> Result<CallToolResult, McpError> {
-        // If in proxy mode, forward to serve
-        if let Some(ref proxy) = self.proxy {
-            let params = serde_json::to_value(&request).ok();
-            return proxy.forward("status", params).await.map_err(|e| {
-                McpError::internal_error(e.message.into_owned(), None)
-            });
-        }
-
         let kind = request.kind.as_deref().unwrap_or("index").to_lowercase();
         tracing::info!("📥 status(kind={})", kind);
         match kind.as_str() {
@@ -3269,14 +3224,6 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<SemanticSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
-        // If in proxy mode, forward to serve
-        if let Some(ref proxy) = self.proxy {
-            let params = serde_json::to_value(&request).ok();
-            return proxy.forward("semantic_search", params).await.map_err(|e| {
-                McpError::internal_error(e.message.into_owned(), None)
-            });
-        }
-
         // Resolve project/group routing (multi-store for group fan-out)
         let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
@@ -4332,14 +4279,6 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<GetChunkRequest>,
     ) -> Result<CallToolResult, McpError> {
-        // If in proxy mode, forward to serve
-        if let Some(ref proxy) = self.proxy {
-            let params = serde_json::to_value(&request).ok();
-            return proxy.forward("get_chunk", params).await.map_err(|e| {
-                McpError::internal_error(e.message.into_owned(), None)
-            });
-        }
-
         tracing::info!(
             "📥 get_chunk(chunk_id={}, project={:?})",
             request.chunk_id,
@@ -5003,14 +4942,6 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<LiteralSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
-        // If in proxy mode, forward to serve
-        if let Some(ref proxy) = self.proxy {
-            let params = serde_json::to_value(&request).ok();
-            return proxy.forward("literal_search", params).await.map_err(|e| {
-                McpError::internal_error(e.message.into_owned(), None)
-            });
-        }
-
         // Resolve project/group routing
         let ctx = match self.resolve_routing(&request.project, &request.group).await {
             Ok(c) => c,
@@ -5552,16 +5483,9 @@ impl CodesearchService {
     async fn list_projects(&self) -> Result<CallToolResult, McpError> {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        // If in proxy mode, forward to serve
-        if let Some(ref proxy) = self.proxy {
-            return proxy.forward("list_projects", None).await.map_err(|e| {
-                McpError::internal_error(e.message.into_owned(), None)
-            });
-        }
-
         let serve_active = self.serve_state.is_some();
         let serve_url = if serve_active {
-            Some(crate::mcp::proxy::serve_url_from_env())
+            Some(serve_url_from_env())
         } else {
             None
         };
@@ -5743,9 +5667,7 @@ fn is_definition_chunk(kind: &str, signature: &Option<String>, symbol: &str) -> 
 impl ServerHandler for CodesearchService {
     fn get_info(&self) -> ServerInfo {
         let db_exists = self.db_path.exists();
-        let mode = if self.proxy.is_some() {
-            format!("proxy → {} (serve hub)", self.proxy.as_ref().unwrap().base_url())
-        } else if self.serve_state.is_some() {
+        let mode = if self.serve_state.is_some() {
             "serve hub (direct)".to_string()
         } else {
             "self-contained (stdio)".to_string()
@@ -5812,60 +5734,6 @@ pub async fn run_mcp_server(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
-
-    // === Proxy detection: probe `codesearch serve` with retry ===
-    let serve_url = crate::mcp::proxy::serve_url_from_env();
-
-    for attempt in 1..=crate::constants::HEALTH_PROBE_ATTEMPTS {
-        match crate::mcp::proxy::McpProxy::check_health(&serve_url).await {
-            Ok(true) => {
-                tracing::info!(
-                    "🔀 codesearch serve detected at {} — entering proxy mode (attempt {}/{})",
-                    serve_url, attempt, crate::constants::HEALTH_PROBE_ATTEMPTS
-                );
-                let proxy = crate::mcp::proxy::McpProxy::new(serve_url);
-                let service = CodesearchService::new_for_proxy(proxy)?;
-                let server = service.serve(stdio()).await?;
-                tracing::info!("🔀 MCP proxy ready — forwarding all tool calls to serve");
-                tokio::select! {
-                    result = server.waiting() => {
-                        tracing::info!("MCP proxy transport closed");
-                        result?;
-                    }
-                    _ = cancel_token.cancelled() => {
-                        tracing::info!("🛑 Shutdown signal received, stopping MCP proxy...");
-                    }
-                }
-                tracing::info!("✅ MCP proxy shut down cleanly");
-                return Ok(());
-            }
-            Err(e) => {
-                // Version mismatch — hard error, no retry
-                tracing::error!("❌ {}", e);
-                return Err(e);
-            }
-            Ok(false) => {
-                if attempt < crate::constants::HEALTH_PROBE_ATTEMPTS {
-                    tracing::debug!(
-                        "Health probe attempt {}/{} — serve not ready, retrying in {}ms",
-                        attempt,
-                        crate::constants::HEALTH_PROBE_ATTEMPTS,
-                        crate::constants::HEALTH_PROBE_RETRY_DELAY_MS,
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        crate::constants::HEALTH_PROBE_RETRY_DELAY_MS,
-                    ))
-                    .await;
-                }
-            }
-        }
-    }
-
-    // All probes failed — fall through to stdio
-    tracing::info!(
-        "ℹ️  No codesearch serve detected after {} attempts — using local stdio mode",
-        crate::constants::HEALTH_PROBE_ATTEMPTS
-    );
 
     // Set FASTEMBED_CACHE_DIR early (before any embedding work) to ensure fastembed
     // downloads and caches models to ~/.codesearch/models instead of creating
