@@ -714,8 +714,15 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let project_path = temp_dir.path();
 
+        // Isolate from global repos.json — point to non-existent config so
+        // find_best_database doesn't discover the developer's real database.
+        let fake_config = temp_dir.path().join("nonexistent_repos.json");
+        std::env::set_var("CODESEARCH_REPOS_CONFIG", &fake_config);
+
         // No .codesearch.db exists
         let result = check_find_database(project_path);
+
+        std::env::remove_var("CODESEARCH_REPOS_CONFIG");
 
         assert_eq!(result.status, CheckStatus::Fail);
         assert_eq!(result.name, "No database found");

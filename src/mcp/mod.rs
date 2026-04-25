@@ -4468,15 +4468,17 @@ impl CodesearchService {
         }
 
         // FTS search — multi-store or single
+        // Note: regex=true uses BM25 for candidates, then post-filters with the
+        // actual regex on raw content (Tantivy's RegexQuery only works on individual
+        // tokens, not raw text — underscores/punctuation cause empty results).
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
             let sa = ctx.store_aliases.as_ref().unwrap();
             self.with_fts_store_read_multi(
                 |fts_store| {
-                    if request.regex.unwrap_or(false) {
-                        fts_store.search_regex(&request.query, limit * 3)
-                    } else if request.phrase.unwrap_or(false) {
+                    if request.phrase.unwrap_or(false) {
                         fts_store.search_phrase(&request.query, limit * 3)
                     } else {
+                        // Both default and regex modes use BM25; regex is post-filtered
                         fts_store.search(&request.query, limit * 3, None)
                     }
                 },
@@ -4489,9 +4491,7 @@ impl CodesearchService {
             match self
                 .with_fts_store_read_for(
                     |fts_store| {
-                        if request.regex.unwrap_or(false) {
-                            fts_store.search_regex(&request.query, limit * 3)
-                        } else if request.phrase.unwrap_or(false) {
+                        if request.phrase.unwrap_or(false) {
                             fts_store.search_phrase(&request.query, limit * 3)
                         } else {
                             fts_store.search(&request.query, limit * 3, None)
@@ -4520,7 +4520,8 @@ impl CodesearchService {
         // Resolve chunk metadata and apply post-filters
         let lang_filter = request.language.clone();
         let glob_filter = request.file_glob.clone();
-        let snippet_regex = if request.regex.unwrap_or(false) {
+        let regex_enabled = request.regex.unwrap_or(false);
+        let snippet_regex = if regex_enabled {
             Regex::new(&request.query).ok()
         } else {
             None
@@ -4554,9 +4555,14 @@ impl CodesearchService {
                                 continue;
                             }
                         }
-                        let (match_offset, snippet) = match_line_for_literal(
+                        let match_info = match_line_for_literal(
                             &chunk.content, &request.query, snippet_regex.as_ref(),
-                        ).unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
+                        );
+                        if regex_enabled && match_info.is_none() {
+                            continue;
+                        }
+                        let (match_offset, snippet) = match_info
+                            .unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
                         let match_line = chunk.start_line + match_offset;
                         items.push(LiteralSearchResultItem {
                             path: chunk.path,
@@ -4605,12 +4611,17 @@ impl CodesearchService {
                             true
                         })
                         .take(limit)
-                        .map(|(chunk, score)| {
-                            let (match_offset, snippet) = match_line_for_literal(
+                        .filter_map(|(chunk, score)| {
+                            let match_info = match_line_for_literal(
                                 &chunk.content, &request.query, snippet_regex.as_ref(),
-                            ).unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
+                            );
+                            if regex_enabled && match_info.is_none() {
+                                return None;
+                            }
+                            let (match_offset, snippet) = match_info
+                                .unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
                             let match_line = chunk.start_line + match_offset;
-                            LiteralSearchResultItem {
+                            Some(LiteralSearchResultItem {
                                 path: chunk.path,
                                 start_line: match_line,
                                 end_line: match_line,
@@ -4618,7 +4629,7 @@ impl CodesearchService {
                                 score,
                                 kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
                                 signature: chunk.signature.filter(|s| !s.is_empty()),
-                            }
+                            })
                         })
                         .collect();
                     Ok(items)
