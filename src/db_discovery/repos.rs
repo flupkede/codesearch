@@ -212,7 +212,7 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("CODESEARCH_REPOS_CONFIG") {
+    if let Ok(override_path) = std::env::var(crate::constants::REPOS_CONFIG_ENV) {
         return Ok(PathBuf::from(override_path));
     }
     Ok(config_dir()?.join(REPOS_CONFIG_FILE))

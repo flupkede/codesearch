@@ -152,6 +152,9 @@ pub const HEALTH_PROBE_RETRY_DELAY_MS: u64 = 150;
 /// Default embedding dimensions used when metadata is missing or unreadable.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
 
+/// Environment variable to override repos config file path.
+pub const REPOS_CONFIG_ENV: &str = "CODESEARCH_REPOS_CONFIG";
+
 /// File extensions that should never be indexed, regardless of content.
 /// These are generated/compiled/binary-adjacent files with no semantic code value.
 pub const ALWAYS_SKIP_EXTENSIONS: &[&str] = &[

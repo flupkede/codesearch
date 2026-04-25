@@ -2253,11 +2253,11 @@ impl CodesearchService {
             let dims = json
                 .get("dimensions")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(384) as usize;
+                .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS as u64) as usize;
             let mt = ModelType::parse(model_name).unwrap_or_default();
             (mt, dims)
         } else {
-            (ModelType::default(), 384)
+            (ModelType::default(), crate::constants::DEFAULT_EMBEDDING_DIMENSIONS)
         };
 
         Ok(Self {
@@ -5518,14 +5518,18 @@ pub async fn run_mcp_server(
             Some(d) => d as usize,
             None => {
                 tracing::warn!(
-                    "⚠️  Could not parse dimensions from metadata.json, using default 384"
+                    "⚠️  Could not parse dimensions from metadata.json, using default {}",
+                    crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
                 );
-                384
+                crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
             }
         }
     } else {
-        tracing::warn!("⚠️  metadata.json not found, using default dimensions 384");
-        384
+        tracing::warn!(
+            "⚠️  metadata.json not found, using default dimensions {}",
+            crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
+        );
+        crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
     };
 
     // Create shared stores - try write mode first, fall back to readonly if locked
