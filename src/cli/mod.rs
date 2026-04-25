@@ -17,6 +17,10 @@ pub enum IndexCommands {
         /// Create global index instead of local
         #[arg(short = 'g', long)]
         global: bool,
+
+        /// Alias for this repository (auto-generated from directory name if omitted)
+        #[arg(short, long)]
+        alias: Option<String>,
     },
 
     /// Remove the index (local or global, auto-detected)
@@ -24,6 +28,10 @@ pub enum IndexCommands {
     Remove {
         /// Path to remove (defaults to current directory)
         path: Option<PathBuf>,
+
+        /// Delete the DB only, preserve the config entry
+        #[arg(long)]
+        keep_config: bool,
     },
 
     /// Show index status (local or global)
@@ -47,6 +55,30 @@ pub enum CacheCommands {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+}
+
+/// Groups subcommands
+#[derive(Subcommand, Debug)]
+pub enum GroupsCommands {
+    /// List all groups
+    List,
+
+    /// Create or update a group
+    Add {
+        /// Group name
+        name: String,
+
+        /// Aliases to include in the group (space-separated)
+        #[arg(short, long, num_args = 1..)]
+        aliases: Vec<String>,
+    },
+
+    /// Remove a group
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// Group name
+        name: String,
     },
 }
 
@@ -152,7 +184,11 @@ pub enum Commands {
 
     /// Index the repository or manage global index registry
     Index {
-        /// Path to index (defaults to current directory), or use "list" to show status
+        /// Subcommand: add, rm, list (preferred)
+        #[command(subcommand)]
+        command: Option<IndexCommands>,
+
+        /// Path to index (defaults to current directory) — used when no subcommand given
         path: Option<PathBuf>,
 
         /// Show what would be indexed without actually indexing
@@ -163,6 +199,7 @@ pub enum Commands {
         #[arg(short = 'f', long, alias = "full")]
         force: bool,
 
+        // Backward-compat flags (predate subcommands)
         /// Add a repository to the index (creates local or global index)
         #[arg(long)]
         add: bool,
@@ -171,36 +208,40 @@ pub enum Commands {
         #[arg(short = 'g', long)]
         global: bool,
 
+        /// Alias for this repository (only with --add)
+        #[arg(short, long)]
+        alias: Option<String>,
+
         /// Remove the index (local or global, auto-detected)
         #[arg(long, visible_alias = "rm")]
         remove: bool,
+
+        /// Delete the DB only, preserve the config entry (only with --remove)
+        #[arg(long)]
+        keep_config: bool,
 
         /// Show index status (local or global)
         #[arg(long)]
         list: bool,
     },
 
-    /// Run a background server with live file watching
+    /// Run a background MCP server with live file watching and multi-repo support
     Serve {
-        /// Port to listen on
-        #[arg(short, long, default_value = "4444")]
-        port: u16,
+        /// Port to listen on (default: 39725, override with CODESEARCH_SERVE_PORT)
+        #[arg(short, long)]
+        port: Option<u16>,
 
-        /// Path to serve (defaults to current directory)
-        path: Option<PathBuf>,
+        /// Register one or more repo paths at startup (can be repeated)
+        #[arg(short, long, action = ArgAction::Append)]
+        register: Vec<PathBuf>,
 
-        /// Automatically create index if it doesn't exist (default: true)
-        #[arg(
-            short = 'c',
-            long,
-            default_value_t = true,
-            action = ArgAction::Set,
-            value_parser = BoolishValueParser::new(),
-            num_args = 0..=1,
-            require_equals = true,
-            default_missing_value = "true"
-        )]
-        create_index: bool,
+        /// Log to file only, not to console (use for daemon/background mode)
+        #[arg(short, long, default_value = "false", action = ArgAction::Set, value_parser = BoolishValueParser::new())]
+        quiet: bool,
+
+        /// Show verbose output on console (overrides --quiet for debugging)
+        #[arg(long, visible_alias = "no-quiet")]
+        verbose: bool,
     },
 
     /// Show statistics about the vector database
@@ -254,6 +295,12 @@ pub enum Commands {
             default_missing_value = "true"
         )]
         create_index: bool,
+    },
+
+    /// Manage repository groups
+    Groups {
+        #[command(subcommand)]
+        command: GroupsCommands,
     },
 
     /// Manage persistent embedding cache
@@ -338,72 +385,77 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             crate::search::search(&query, path, options).await
         }
         Commands::Index {
+            command,
             path,
             dry_run,
             force,
             add,
             global,
+            alias,
             remove,
+            keep_config,
             list,
         } => {
-            // Check if path is "list", "add", or "rm"/"remove" as special cases (backward compatibility)
-            let path_str = path.as_ref().and_then(|p| p.to_str());
-            let is_list_cmd = path_str.map(|s| s == "list").unwrap_or(false);
-            let is_add_cmd = path_str.map(|s| s == "add").unwrap_or(false);
-            let is_rm_cmd = path_str
-                .map(|s| s == "rm" || s == "remove")
-                .unwrap_or(false);
-
-            if add || is_add_cmd {
-                // Clear path if it's "add" to avoid treating it as a directory
-                let effective_path = if is_add_cmd { None } else { path };
-                crate::index::add_to_index(effective_path, global, cancel_token.clone()).await
-            } else if remove || is_rm_cmd {
-                // Clear path if it's "rm"/"remove" to avoid treating it as a directory
-                let effective_path = if is_rm_cmd { None } else { path };
-                crate::index::remove_from_index(effective_path).await
-            } else if list || is_list_cmd {
-                crate::index::list_index_status().await
+            // Subcommand path (preferred)
+            if let Some(cmd) = command {
+                match cmd {
+                    IndexCommands::Add { path: add_path, global, alias } => {
+                        crate::index::add_to_index(add_path, global, alias, cancel_token.clone()).await
+                    }
+                    IndexCommands::Remove { path: rm_path, keep_config } => {
+                        crate::index::remove_from_index(rm_path, keep_config).await
+                    }
+                    IndexCommands::List => crate::index::list_index_status().await,
+                }
             } else {
-                // For 'codesearch index .' or 'codesearch index <path>', just run indexing
-                // The index() function will handle checking for existing indexes
-                crate::index::index(
-                    path,
-                    dry_run,
-                    force,
-                    false,
-                    model_type,
-                    cancel_token.clone(),
-                )
-                .await
+                // Flag-based backward-compat path
+                // Check if path is "list", "add", or "rm"/"remove" as special cases
+                let path_str = path.as_ref().and_then(|p| p.to_str());
+                let is_list_cmd = path_str.map(|s| s == "list").unwrap_or(false);
+                let is_add_cmd = path_str.map(|s| s == "add").unwrap_or(false);
+                let is_rm_cmd = path_str
+                    .map(|s| s == "rm" || s == "remove")
+                    .unwrap_or(false);
+
+                if add || is_add_cmd {
+                    let effective_path = if is_add_cmd { None } else { path };
+                    crate::index::add_to_index(effective_path, global, alias, cancel_token.clone()).await
+                } else if remove || is_rm_cmd {
+                    let effective_path = if is_rm_cmd { None } else { path };
+                    crate::index::remove_from_index(effective_path, keep_config).await
+                } else if list || is_list_cmd {
+                    crate::index::list_index_status().await
+                } else {
+                    crate::index::index(
+                        path,
+                        dry_run,
+                        force,
+                        false,
+                        model_type,
+                        cancel_token.clone(),
+                    )
+                    .await
+                }
             }
         }
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Serve {
             port,
-            path,
-            create_index,
+            register,
+            quiet,
+            verbose,
         } => {
-            // Discover database path and initialize logger with file output
+            // Initialize logger for serve mode
             // NOTE: For Serve, tracing is NOT initialized in main.rs — init_logger
             // is the first and only call to set the global subscriber
-            let effective_path = path
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| std::env::current_dir().unwrap());
             if let Ok(Some(db_info)) =
-                crate::db_discovery::find_best_database(Some(&effective_path))
+                crate::db_discovery::find_best_database(None as Option<&std::path::Path>)
             {
-                match crate::logger::init_logger(&db_info.db_path, log_level, cli.quiet) {
-                    Err(e) => {
-                        eprintln!("Warning: Failed to initialize file logger: {}", e);
-                    }
-                    _ => {
-                        // Logger initialized successfully (either FileLogging or ConsoleOnly)
-                    }
-                }
+                // Combine global --quiet with serve-specific --quiet, and allow --verbose to override
+                let effective_quiet = (cli.quiet || quiet) && !verbose;
+                let _ = crate::logger::init_logger(&db_info.db_path, log_level, effective_quiet);
             }
-            crate::server::serve(port, path, create_index, cancel_token.clone()).await
+            crate::serve::run_serve(port, register, cancel_token.clone()).await
         }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
         Commands::Doctor { fix, json } => crate::cli::doctor::run(fix, json).await,
@@ -411,12 +463,16 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Mcp { path, create_index } => {
             // Logger is initialized inside run_mcp_server() once db_path is known.
             // This handles both the "DB already exists" and "auto-create DB" paths correctly.
-            crate::mcp::run_mcp_server(path, create_index, log_level, cli.quiet, cancel_token).await
+            //
+            // MCP stdio transport uses stdout for JSON-RPC — always force file-only
+            // logging to keep the channel clean, regardless of the global --quiet flag.
+            crate::mcp::run_mcp_server(path, create_index, log_level, true, cancel_token).await
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
             CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
         },
+        Commands::Groups { command } => run_groups_command(command).await,
     }
 }
 
@@ -578,6 +634,50 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Handle groups subcommands
+async fn run_groups_command(command: GroupsCommands) -> Result<()> {
+    match command {
+        GroupsCommands::List => {
+            let config = crate::db_discovery::load_repos_config()?;
+            if config.groups.is_empty() {
+                println!("No groups defined.");
+                return Ok(());
+            }
+            println!("Groups:");
+            for (name, aliases) in &config.groups {
+                println!("  {}: {}", name, aliases.join(", "));
+            }
+        }
+        GroupsCommands::Add { name, aliases } => {
+            if aliases.is_empty() {
+                return Err(anyhow::anyhow!("--aliases is required and must specify at least one alias."));
+            }
+            let mut config = crate::db_discovery::load_repos_config()?;
+            // Validate that all aliases exist
+            for alias in &aliases {
+                if !config.repos.contains_key(alias) {
+                    return Err(anyhow::anyhow!(
+                        "alias '{}' is not registered. Use 'codesearch index add' first.", alias
+                    ));
+                }
+            }
+            config.add_group(name.clone(), aliases)?;
+            config.save()?;
+            println!("Group '{}' created/updated.", name);
+        }
+        GroupsCommands::Remove { name } => {
+            let mut config = crate::db_discovery::load_repos_config()?;
+            if config.remove_group(&name) {
+                config.save()?;
+                println!("Group '{}' removed.", name);
+            } else {
+                eprintln!("Group '{}' not found.", name);
+            }
+        }
+    }
+    Ok(())
+}
+
 mod doctor;
 mod setup;
 
@@ -611,6 +711,38 @@ mod tests {
         match cli.command {
             Commands::Mcp { create_index, .. } => assert!(create_index),
             _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_no_repos_subcommand() {
+        let result = Cli::try_parse_from(["codesearch", "repos", "--help"]);
+        assert!(result.is_err(), "'repos' subcommand should no longer exist");
+    }
+
+    #[test]
+    fn test_cli_index_add_accepts_alias_flag() {
+        let cli = Cli::try_parse_from(["codesearch", "index", "add", "/tmp/foo", "--alias", "myrepo"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Index {
+                command: Some(IndexCommands::Add { alias: Some(a), .. }),
+                ..
+            } => assert_eq!(a, "myrepo"),
+            _ => panic!("expected Index::Add subcommand with alias"),
+        }
+    }
+
+    #[test]
+    fn test_cli_index_rm_accepts_keep_config_flag() {
+        let cli = Cli::try_parse_from(["codesearch", "index", "rm", "/tmp/foo", "--keep-config"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Index {
+                command: Some(IndexCommands::Remove { keep_config: true, .. }),
+                ..
+            } => (),
+            _ => panic!("expected Index::Remove subcommand with keep_config"),
         }
     }
 }

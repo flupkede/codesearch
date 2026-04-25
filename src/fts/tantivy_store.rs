@@ -513,10 +513,11 @@ impl FtsStore {
         self.collect_fts_results(top_docs)
     }
 
-    /// Search using a regex pattern against the content field.
+    /// Search using a regex pattern against tokenized content.
     ///
-    /// Uses Tantivy's `RegexQuery` for efficient regex matching on the indexed content.
-    /// The pattern syntax follows the `regex` crate conventions.
+    /// NOTE: Tantivy regex runs on analyzed tokens, not raw file text.
+    /// This helper is test-only and used to document/tokenizer behavior.
+    #[cfg(test)]
     pub fn search_regex(&self, pattern: &str, limit: usize) -> Result<Vec<FtsResult>> {
         use tantivy::query::RegexQuery;
 

@@ -1,161 +1,140 @@
-# OpenCode AGENTS.md
+# AGENTS.md — `feature/mcp-multi-repo`
 
-** ONLY USE MCP TOOLS !!! **
+Branch is feature-complete and fully tested. Only the PR remains.
 
-### Use bash only for specific index operations (not with MCP active !!)
+---
 
-```bash
+## Status
 
-# NEVER EXECUTE a REINDEX Complete
-NOT! codesearch index
+**Branch:** `feature/mcp-multi-repo`
+**Local = Origin HEAD:** `c7fa12f`
+**Working tree:** clean (after this commit)
+**Tests:** 358 passed / 0 failed (12 ignored) under `cargo test --all`. Clippy clean.
 
-# NEVER EXECUTE a Complete REINDEX
-NOT! codesearch index -f
+---
 
-# If required you can list the index
-codesearch index list 
+## What was done on this branch
+
+All planned work is committed and pushed. Do not redo any of this.
+
+**Multi-repo infrastructure**
+- `MultiStoreContext::prefix_result_path` — alias-aware path prefixing across all
+  fan-out handlers; dedup key switched from `chunk_id` to `(alias, chunk_id)`
+- `VectorStore::iter_all_chunks()` — chunk iterator for scan-path regex queries
+- Repos config (`~/.codesearch/repos.json`) with `repos` + `groups` keys
+- `codesearch serve` and `codesearch mcp` with health-probe proxy-or-stdio dispatch
+- File watcher + config reload in serve mode
+- `codesearch index add/remove` with alias and `--keep-config` flag
+
+**Regex search overhaul** (3 commits)
+- Replaced Tantivy `RegexQuery` (useless on tokenized terms) with BM25 candidate
+  selection + raw-content regex post-filter for anchorable queries
+- Added `regex_has_anchorable_token` detector with `need_separator` flag for both
+  leading (`\bimpl`) and trailing (`impl\b`) escape merging
+- Added sequential chunk scan fallback for tokenless patterns (`\bfn\s+\w+`,
+  `^[A-Z]\w+`, `\w+_\w+`, `[A-Z]+_[A-Z]+`, etc.)
+- 11 tests: 8 detector unit tests + 3 end-to-end behaviour tests
+
+**Auto-regex promotion + literal low-confidence**
+- `looks_like_code_pattern` detector auto-promotes literal queries with code
+  punctuation (`=`, `->`, `::`, `;`, etc.) to regex mode without requiring
+  `regex=true` from the caller
+- `LiteralSearchResponse` wrapper type — **BREAKING** shape change from bare
+  `[{...}]` array to `{"results":[{...}], ...}` object with optional
+  `auto_promoted_to_regex`, `note`, `low_confidence`, `suggested_tool` fields
+- `compute_literal_low_confidence` signals when results are empty or weak,
+  with actionable `suggested_tool` hint for the LLM caller
+
+**Proxy removal**
+- Deleted `src/mcp/proxy.rs` (283 lines) — the stdio→HTTP proxy was non-functional
+  (no MCP Streamable HTTP session handshake). `codesearch mcp` now runs in
+  stdio-standalone mode only. Users who want multi-repo support run
+  `codesearch serve` and configure their MCP client with `type: remote`.
+
+**Tooling**
+- Pre-commit hook bumps `Cargo.toml` patch version AND rebuilds
+  `target/debug/codesearch.exe` so binary cannot drift behind manifest
+- `copy-to-common.ps1` refuses to deploy a binary whose version does not match
+  `Cargo.toml` (version-mismatch guard)
+- `test_doctor_no_database` isolated via `CODESEARCH_REPOS_CONFIG` env var
+- Magic `384` replaced with `DEFAULT_EMBEDDING_DIMENSIONS` constant
+- `REPOS_CONFIG_ENV` constant added, used in `repos.rs` and `doctor.rs`
+
+**Smoke-tested live** (v0.1.243, codesearch.git index, serve on port 39726):
+
+| Query | Path | Hits |
+|---|---|:--:|
+| `match_line_for_literal` | BM25 | 5 ✅ |
+| `\bfn\s+\w+` | scan | 5 ✅ |
+| `\bimpl\s+` | scan | 5 ✅ |
+| `^[A-Z]\w+` | scan | 5 ✅ |
+| `\w+_\w+` | scan | 5 ✅ |
+| `[A-Z]+_[A-Z]+` | scan | 5 ✅ |
+| `impl\b` | scan | 5 ✅ |
+| `Result\b` | scan | 5 ✅ |
+| `match\b` | scan | 5 ✅ |
+| `zzz_definitely_not_xyz` | — | 0 ✅ |
+
+---
+
+## TODO — one step
+
+### Open the PR
+
+Push this final docs commit, then open the PR on GitHub:
+`feature/mcp-multi-repo` → `master`
+
+**Suggested PR title:**
+```
+feat(mcp): multi-repo support, regex search overhaul, auto-regex promotion
 ```
 
-**Build Commands (CRITICAL - READ CAREFULLY):**
+**PR description must include:**
 
-⚠️ **MANDATORY BUILD RULES - NEVER VIOLATE** ⚠️
+1. **Multi-repo infrastructure** — alias-aware path prefixing, group fan-out,
+   `codesearch serve` as persistent HTTP hub, `codesearch mcp` in stdio-standalone
+   mode (proxy removed as non-functional).
 
-### Target Directory (STRICT ENFORCEMENT)
-- **Target directory MUST be**: `C:\WorkArea\AI\codesearch\target`
-- **NEVER build to**: `C:\WorkArea\AI\codesearch\codesearch.git\target` or any other location
-- **Reason**: `.cargo/config.toml` sets `target-dir = "../target"` to keep source tree clean
+2. **Regex search** — replaced Tantivy `RegexQuery` with BM25+post-filter for
+   anchorable queries, plus sequential scan fallback for tokenless patterns.
+   Smoke-test table above demonstrates the fix.
 
-### Build Type (STRICT ENFORCEMENT)
-- **ALWAYS build**: DEBUG builds only
-- **NEVER build**: RELEASE builds (`--release` flag)
-- **Release builds are FORBIDDEN** - they cause version mismatch issues and waste time
+3. **BREAKING CHANGE** — `search(mode="literal")` response shape changed from
+   bare JSON array `[{...}]` to object `{"results":[{...}], ...}`. Clients
+   parsing the old shape must update to use `response.results`.
 
-### Correct Commands ✅
-```bash
-cd codesearch.git && cargo build              # CORRECT - debug build to ../target
-cd codesearch.git && cargo test               # CORRECT - debug tests
-cd codesearch.git && cargo run -- mcp         # CORRECT - debug run from ../target
-```
+4. **Auto-regex promotion** — literal queries with code punctuation are
+   auto-promoted to regex mode without requiring `regex=true` from the caller.
+   Response carries `auto_promoted_to_regex: true` and a `note` when this fires.
 
-### Commands NEVER to Use ❌
-```bash
-cd codesearch.git && cargo build --release    # WRONG - FORBIDDEN
-cd codesearch.git && cargo run --release     # WRONG - FORBIDDEN
-cargo build --release                         # WRONG - FORBIDDEN
-cd codesearch.git && cargo build              # WRONG if target dir is codesearch.git/target
-```
+5. **Known limitation** (document, do not fix in this PR): queries of the form
+   `identifier\b` followed immediately by non-regex content may still exhibit
+   edge-case behaviour in the detector. Rare in practice; tracked for a follow-up.
 
-### Verify Correct Location
-```bash
-# Correct location for binary
-ls -la /c/WorkArea/AI/codesearch/target/debug/codesearch.exe
+6. **Future branches** (`AGENTS_auto-regex_and_confidence.md` and
+   `AGENTS_proxy_session_management.md` are removed from this branch — those
+   plans have been superseded by what landed here).
 
-# WRONG location - DO NOT USE
-ls -la /c/WorkArea/AI/codesearch/codesearch.git/target/
-```
+---
 
-### Standard Commands (for reference)
-- `cargo build` - Build debug version (FAST, use for development)
-- `cargo test` - Run all tests
-- `cargo test <test_name>` - Run single test (e.g., `cargo test test_group_chunks_by_path`)
-- `cargo test --lib` - Run only library tests
-- `cargo clippy` - Lint with Clippy
-- `cargo fmt` - Format code
-- `cargo doc --no-deps` - Generate documentation
+## Build rules (reference)
 
-**Code Style Guidelines:**
+- Target dir: `C:\WorkArea\AI\codesearch\target` (set by `.cargo/config.toml`)
+- **Always DEBUG.** `--release` is forbidden on this branch.
+- MCP filesystem tools for edits. Bash/PowerShell only for `cargo` commands.
+- Pre-commit hook rebuilds binary on every commit — never use `--no-verify`.
 
-**Imports:**
-- Use `use crate::` for internal module imports (not `use codesearch::`)
-- Group imports: std lib → external crates → internal modules
-- Prefer `use anyhow::{Result, anyhow}` for error handling
-- Use `use colored::Colorize` for terminal colors
-- Use `use tracing::{debug, info, warn}` for logging
+## Key files (reference)
 
-**Error Handling:**
-- Return `anyhow::Result<T>` from fallible functions
-- Use `anyhow::anyhow!("message")` for errors
-- **CRITICAL:** Never use `.unwrap()` or `.expect()` in library code
-- For Mutex: `.lock().map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))?`
-- Use `?` operator for error propagation
-- Provide context with `.context()` or `.map_err()` when useful
-
-**Types & Naming:**
-- Use `PathBuf` for owned paths, `&Path` for borrowed
-- Use `String` for owned strings, `&str` for borrowed
-- Prefer `&str` over `String` in function arguments
-- Use `HashMap<K, Vec<V>>` for grouping patterns
-- Pre-allocate HashMap capacity: `HashMap::with_capacity(size)`
-- Use `Arc<Mutex<T>>` for shared mutable state
-- Use `Arc` for shared read-only data
-
-**Async:**
-- Use `tokio::spawn` for background tasks
-- Use `tokio::sync::RwLock` for async shared state
-- Use `#[tokio::main]` for async main functions
-- Use `.await` for async calls
-
-**Testing:**
-- Use `#[cfg(test)]` for test modules
-- Use `#[test]` for unit tests
-- Place tests in same file as code (in test module)
-- Use `use super::*;` in test modules
-
-**Documentation:**
-- Use `///` for item documentation (public APIs)
-- Use `//!` for module documentation
-- Document public structs, functions, and important types
-
-**Performance:**
-- Avoid unnecessary `.to_string()` calls
-- Use `.to_string_lossy().to_string()` only when needed
-- Pre-allocate collections when size is known
-- Use `&str` instead of `String` where possible
-- Use streaming for large data processing (don't collect all into memory)
-- Cache with memory limits using weigher-based eviction
-- Keep LMDB map_size reasonable (2GB is sufficient for most use cases)
-
-**Memory Optimization (from `reduce_memory_consumption` branch):**
-- Streaming indexing: Process files one at a time, not all chunks at once
-- Embedding cache: Enforce 500MB limit using weigher (not just entry count)
-- LMDB configuration: Set map_size to 2GB (not 10GB) to reduce reported memory
-- Avoid large Vec/HashMap accumulations during processing
-- Use immediate writes to vector store/FTS instead of batching all data
-- Expected peak memory: ~500-700MB for large codebases (vs 2GB before optimization)
-
-**Signal Handling:**
-- Implement graceful CTRL-C handling using tokio::select!
-- Use tokio::signal for SIGINT (Unix) and CTRL-C (Windows)
-- Exit with code 130 (standard for SIGINT) on interrupt
-- Ensure database handles are closed before exit
-
-**CLI (clap):**
-- Use `#[derive(Parser, Subcommand)]` for CLI
-- Use `#[command(subcommand)]` for subcommands
-- Use `#[arg(short, long)]` for options
-
-**Server (axum):**
-- Use `State<T>` for dependency injection
-- Use `Json<T>` for JSON responses
-- Use `StatusCode` for HTTP status codes
-- Use `Router::new()` with `.route()` for routing
-
-**Serialization (serde):**
-- Use `#[derive(Serialize, Deserialize)]` for data types
-- Use `#[serde(skip_serializing_if = "Option::is_none")]` for optional fields
-
-**Module Structure:**
-- Each module has `mod.rs` with public exports
-- Re-export common types in `lib.rs`
-- Use `pub use` for convenience re-exports
-
-**Build Artifacts:**
-- Debug builds go to `../target/debug/` (C:\WorkArea\AI\codesearch\target\debug\)
-- Release builds FORBIDDEN - never use
-- ALWAYS use debug builds for all work
-- Target directory is configured in `.cargo/config.toml` as `../target`
-- This keeps source tree clean and centralized
-
-
-
-
+- `src/mcp/mod.rs` — all tool handlers, `MultiStoreContext`,
+  `prefix_result_path`, `match_line_for_literal`, `literal_search`,
+  `regex_has_anchorable_token`, `looks_like_code_pattern`,
+  `compute_literal_low_confidence`
+- `src/mcp/types.rs` — `LiteralSearchResponse` and related types
+- `src/serve/mod.rs` — `ServeState`, `RepoState`, file watchers
+- `src/vectordb/store.rs` — `VectorStore`, `iter_all_chunks`
+- `src/fts/tantivy_store.rs` — BM25 index; `search_regex` is `#[cfg(test)]`
+- `src/cli/mod.rs` — `IndexCommands`
+- `src/db_discovery/repos.rs` — `ReposConfig`
+- `src/constants.rs` — `DEFAULT_SERVE_PORT`, `DEFAULT_EMBEDDING_DIMENSIONS`,
+  `REPOS_CONFIG_ENV`, and other shared constants

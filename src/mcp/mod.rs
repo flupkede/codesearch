@@ -257,6 +257,184 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_no_deprecated_tool_aliases_in_instructions() {
+        let src = include_str!("mod.rs");
+        let instructions_start = src.find("codesearch — semantic + lexical");
+        assert!(instructions_start.is_some());
+        let start = instructions_start.unwrap();
+        let remaining = &src[start..];
+        let instructions_end = remaining.find("\"#,");
+        assert!(instructions_end.is_some());
+        let instructions_text = &remaining[..instructions_end.unwrap()];
+
+        let deprecated = [
+            "semantic_search",
+            "literal_search",
+            "find_definition",
+            "find_usages",
+            "find_references",
+            "find_imports",
+            "find_dependents",
+            "file_outline",
+            "similar_chunks",
+            "index_status",
+            "list_projects",
+            "find_databases",
+            "Deprecated aliases",
+        ];
+        for name in &deprecated {
+            assert!(
+                !instructions_text.contains(name),
+                "Instructions still mentions deprecated tool/section: {}",
+                name
+            );
+        }
+    }
+
+    // === prefix_path_with_alias tests ===
+
+    #[test]
+    fn test_path_prefix_windows_backslashes() {
+        let result = super::prefix_path_with_alias(
+            r"C:\repo\src\main.rs",
+            Some("myrepo"),
+            r"C:\repo",
+        );
+        assert_eq!(result, "myrepo/src/main.rs");
+    }
+
+    #[test]
+    fn test_path_prefix_unc_prefix() {
+        let result = super::prefix_path_with_alias(
+            r"\\?\C:\repo\src\main.rs",
+            Some("myrepo"),
+            r"C:\repo",
+        );
+        // After normalization, UNC prefix is stripped by normalize_path_str
+        assert!(
+            result.starts_with("myrepo/"),
+            "Expected alias prefix, got: {}",
+            result
+        );
+        assert!(
+            result.contains("main.rs"),
+            "Expected filename in result, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_path_prefix_mixed_separators() {
+        let result = super::prefix_path_with_alias(
+            r"C:\repo/src\main.rs",
+            Some("myrepo"),
+            r"C:\repo",
+        );
+        assert_eq!(result, "myrepo/src/main.rs");
+    }
+
+    #[test]
+    fn test_path_prefix_no_alias() {
+        let result = super::prefix_path_with_alias(
+            "C:/repo/src/main.rs",
+            None,
+            "C:/repo",
+        );
+        assert_eq!(result, "src/main.rs");
+    }
+
+    #[test]
+    fn test_path_prefix_empty_alias() {
+        let result = super::prefix_path_with_alias(
+            "C:/repo/src/main.rs",
+            Some(""),
+            "C:/repo",
+        );
+        assert_eq!(result, "src/main.rs");
+    }
+
+    #[test]
+    fn test_path_prefix_preserves_path_outside_root() {
+        let result = super::prefix_path_with_alias(
+            "C:/other/src/main.rs",
+            Some("myrepo"),
+            "C:/repo",
+        );
+        // Path doesn't start with root — returned normalized, no alias prefix
+        assert_eq!(result, "C:/other/src/main.rs");
+    }
+
+    #[test]
+    fn test_group_results_are_alias_prefixed() {
+        // Simulate two stores for aliases "a" and "b", each returning a result
+        // with absolute path = "/abs/root/src/main.rs". After applying prefix_path_with_alias,
+        // assert results have path = "a/src/main.rs" and "b/src/main.rs".
+        let result_a = super::prefix_path_with_alias(
+            "/abs/root/src/main.rs",
+            Some("a"),
+            "/abs/root",
+        );
+        let result_b = super::prefix_path_with_alias(
+            "/abs/root/src/main.rs",
+            Some("b"),
+            "/abs/root",
+        );
+        assert_eq!(result_a, "a/src/main.rs");
+        assert_eq!(result_b, "b/src/main.rs");
+    }
+
+    #[test]
+    fn test_single_project_result_is_alias_prefixed() {
+        // Single store for alias "myrepo", result with path = "/abs/root/src/lib.rs",
+        // project root "/abs/root" → assert path becomes "myrepo/src/lib.rs".
+        let result = super::prefix_path_with_alias(
+            "/abs/root/src/lib.rs",
+            Some("myrepo"),
+            "/abs/root",
+        );
+        assert_eq!(result, "myrepo/src/lib.rs");
+    }
+
+    #[test]
+    fn test_stdio_mode_paths_not_prefixed() {
+        // alias None → path normalized, no prefix added.
+        let result = super::prefix_path_with_alias(
+            "C:/repo/src/main.rs",
+            None,
+            "C:/repo",
+        );
+        assert_eq!(result, "src/main.rs");
+    }
+
+    #[test]
+    fn test_dedup_key_includes_alias() {
+        // Two stores each returning chunk_id=1, different content.
+        // Assert both are kept after merge (key = (alias, chunk_id), not just chunk_id).
+        use std::collections::HashMap;
+
+        // Simulate the dedup logic from with_vector_store_read_multi
+        let mut seen_ids: HashMap<(String, u32), usize> = HashMap::new();
+        let mut all_results: Vec<(String, u32)> = Vec::new();
+
+        // First result from alias "a" with chunk_id 1
+        let key_a = ("a".to_string(), 1u32);
+        seen_ids.insert(key_a.clone(), all_results.len());
+        all_results.push(("a".to_string(), 1u32));
+
+        // Second result from alias "b" with chunk_id 1
+        let key_b = ("b".to_string(), 1u32);
+        if !seen_ids.contains_key(&key_b) {
+            seen_ids.insert(key_b.clone(), all_results.len());
+            all_results.push(("b".to_string(), 1u32));
+        }
+
+        // Both should be kept because keys are different
+        assert_eq!(all_results.len(), 2);
+        assert!(seen_ids.contains_key(&key_a));
+        assert!(seen_ids.contains_key(&key_b));
+    }
+
     // === simple_glob_match tests ===
 
     #[test]
@@ -898,11 +1076,853 @@ mod tests {
         assert_eq!(imports[4].kind, "require");
         assert_eq!(imports[4].line, 14);
     }
+
+    // === Project/group routing tests ===
+
+    #[test]
+    fn test_has_chunk_id_and_score_fts_result() {
+        let result = crate::fts::FtsResult { chunk_id: 42, score: 0.85 };
+        assert_eq!(super::HasChunkId::chunk_id(&result), 42);
+        assert!((super::HasScore::score(&result) - 0.85).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_has_chunk_id_and_score_search_result() {
+        let result = crate::vectordb::SearchResult {
+            id: 99,
+            content: String::new(),
+            path: String::new(),
+            start_line: 1,
+            end_line: 5,
+            kind: String::new(),
+            signature: None,
+            docstring: None,
+            context: None,
+            hash: String::new(),
+            distance: 0.1,
+            score: 0.75,
+            context_prev: None,
+            context_next: None,
+        };
+        assert_eq!(super::HasChunkId::chunk_id(&result), 99);
+        assert!((super::HasScore::score(&result) - 0.75).abs() < f32::EPSILON);
+    }
+
+    /// Simulate the dedup logic from `with_fts_store_read_multi` to verify correctness.
+    /// Uses (alias, chunk_id) as dedup key — matching production cross-store dedup.
+    #[test]
+    fn test_multi_store_dedup_keeps_highest_score() {
+        use std::collections::HashMap;
+
+        let aliases = ["repo_a", "repo_b", "repo_c"];
+
+        // Simulate results from 3 stores with overlapping chunk_ids across repos
+        let store1_results = vec![
+            crate::fts::FtsResult { chunk_id: 1, score: 0.5 },
+            crate::fts::FtsResult { chunk_id: 2, score: 0.8 },
+            crate::fts::FtsResult { chunk_id: 3, score: 0.3 },
+        ];
+        let store2_results = vec![
+            crate::fts::FtsResult { chunk_id: 1, score: 0.9 }, // same chunk_id, different alias — NOT a dup
+            crate::fts::FtsResult { chunk_id: 4, score: 0.7 },
+            crate::fts::FtsResult { chunk_id: 2, score: 0.4 }, // same chunk_id, different alias — NOT a dup
+        ];
+        let store3_results = vec![
+            crate::fts::FtsResult { chunk_id: 3, score: 0.6 }, // same chunk_id, different alias — NOT a dup
+            crate::fts::FtsResult { chunk_id: 5, score: 0.2 },
+        ];
+
+        // Apply the same dedup logic as with_fts_store_read_multi: key is (alias, chunk_id)
+        let mut all_results: Vec<crate::fts::FtsResult> = Vec::new();
+        let mut seen_ids: HashMap<(String, u32), usize> = HashMap::new();
+
+        for (alias, results) in aliases.iter().zip([&store1_results, &store2_results, &store3_results]) {
+            for r in results {
+                let key = (alias.to_string(), super::HasChunkId::chunk_id(r));
+                if let Some(&existing_idx) = seen_ids.get(&key) {
+                    if super::HasScore::score(r) > super::HasScore::score(&all_results[existing_idx]) {
+                        all_results[existing_idx] = r.clone();
+                    }
+                } else {
+                    seen_ids.insert(key, all_results.len());
+                    all_results.push(r.clone());
+                }
+            }
+        }
+
+        // Sort by score descending (same as with_fts_store_read_multi)
+        all_results.sort_by(|a, b| {
+            super::HasScore::score(b)
+                .partial_cmp(&super::HasScore::score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Verify: 8 unique (alias, chunk_id) pairs — NO cross-alias dedup
+        assert_eq!(all_results.len(), 8, "Should have 8 unique (alias, chunk_id) pairs across 3 repos");
+
+        // Check sort: first result should be highest score
+        assert!((all_results[0].score - 0.9).abs() < f32::EPSILON, "First result should have highest score");
+
+        // Check sort: scores should be descending
+        for i in 1..all_results.len() {
+            assert!(all_results[i].score <= all_results[i - 1].score,
+                "Results should be sorted by score descending, but [{}]={} > [{}]={}",
+                i - 1, all_results[i - 1].score, i, all_results[i].score);
+        }
+    }
+
+    #[test]
+    fn test_multi_store_dedup_no_overlap() {
+        // Non-overlapping results — all should be kept
+        let store1 = vec![crate::fts::FtsResult { chunk_id: 1, score: 0.5 }];
+        let store2 = vec![crate::fts::FtsResult { chunk_id: 2, score: 0.8 }];
+        let store3 = vec![crate::fts::FtsResult { chunk_id: 3, score: 0.3 }];
+
+        let mut all_results: Vec<crate::fts::FtsResult> = Vec::new();
+        let mut seen_ids: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+
+        for results in [&store1, &store2, &store3] {
+            for r in results {
+                let id = super::HasChunkId::chunk_id(r);
+                if let Some(&existing_idx) = seen_ids.get(&id) {
+                    if super::HasScore::score(r) > super::HasScore::score(&all_results[existing_idx]) {
+                        all_results[existing_idx] = r.clone();
+                    }
+                } else {
+                    seen_ids.insert(id, all_results.len());
+                    all_results.push(r.clone());
+                }
+            }
+        }
+
+        assert_eq!(all_results.len(), 3, "All 3 non-overlapping results should be kept");
+    }
+
+    #[test]
+    fn test_multi_store_dedup_all_same_ids() {
+        // All stores return same chunk_ids — only keep each once with max score
+        let store1 = vec![crate::fts::FtsResult { chunk_id: 1, score: 0.3 }];
+        let store2 = vec![crate::fts::FtsResult { chunk_id: 1, score: 0.9 }];
+        let store3 = vec![crate::fts::FtsResult { chunk_id: 1, score: 0.6 }];
+
+        let mut all_results: Vec<crate::fts::FtsResult> = Vec::new();
+        let mut seen_ids: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+
+        for results in [&store1, &store2, &store3] {
+            for r in results {
+                let id = super::HasChunkId::chunk_id(r);
+                if let Some(&existing_idx) = seen_ids.get(&id) {
+                    if super::HasScore::score(r) > super::HasScore::score(&all_results[existing_idx]) {
+                        all_results[existing_idx] = r.clone();
+                    }
+                } else {
+                    seen_ids.insert(id, all_results.len());
+                    all_results.push(r.clone());
+                }
+            }
+        }
+
+        assert_eq!(all_results.len(), 1, "Should deduplicate to 1 result");
+        assert!((all_results[0].score - 0.9).abs() < f32::EPSILON,
+            "Should keep highest score 0.9, got {}", all_results[0].score);
+    }
+
+    // === Serde roundtrip tests for group field ===
+
+    #[test]
+    fn test_find_request_with_group() {
+        let json = r#"{"symbol":"authenticate","kind":"definition","group":"frontend"}"#;
+        let req: super::types::FindRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.symbol, "authenticate");
+        assert_eq!(req.group.as_deref(), Some("frontend"));
+        assert!(req.project.is_none());
+    }
+
+    #[test]
+    fn test_find_request_with_project_and_group_exclusive() {
+        // Both project and group can be deserialized (validation happens at runtime)
+        let json = r#"{"symbol":"foo","project":"repo1","group":"grp1"}"#;
+        let req: super::types::FindRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.project.as_deref(), Some("repo1"));
+        assert_eq!(req.group.as_deref(), Some("grp1"));
+    }
+
+    #[test]
+    fn test_explore_request_with_group() {
+        let json = r#"{"kind":"outline","target":"src/main.rs","group":"backend"}"#;
+        let req: super::types::ExploreRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.kind.as_deref(), Some("outline"));
+        assert_eq!(req.group.as_deref(), Some("backend"));
+    }
+
+    #[test]
+    fn test_status_request_with_group() {
+        let json = r#"{"kind":"index","group":"all"}"#;
+        let req: super::types::StatusRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.kind.as_deref(), Some("index"));
+        assert_eq!(req.group.as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn test_search_request_with_group() {
+        let json = r#"{"query":"auth","group":"platform","mode":"semantic"}"#;
+        let req: super::types::SearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "auth");
+        assert_eq!(req.group.as_deref(), Some("platform"));
+        assert_eq!(req.mode.as_deref(), Some("semantic"));
+    }
+
+    #[test]
+    fn test_find_definition_request_with_group() {
+        let json = r#"{"symbol":"User","project":"api","group":"backend"}"#;
+        let req: super::types::FindDefinitionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.symbol, "User");
+        assert_eq!(req.project.as_deref(), Some("api"));
+        assert_eq!(req.group.as_deref(), Some("backend"));
+    }
+
+    #[test]
+    fn test_find_usages_request_with_group() {
+        let json = r#"{"symbol":"handle_request","group":"services"}"#;
+        let req: super::types::FindUsagesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.symbol, "handle_request");
+        assert_eq!(req.group.as_deref(), Some("services"));
+        assert!(req.project.is_none());
+    }
+
+    #[test]
+    fn test_file_outline_request_with_group() {
+        let json = r#"{"path":"src/main.rs","group":"all"}"#;
+        let req: super::types::FileOutlineRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.path, "src/main.rs");
+        assert_eq!(req.group.as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn test_get_chunk_request_with_group() {
+        let json = r#"{"chunk_id":42,"group":"backend"}"#;
+        let req: super::types::GetChunkRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.chunk_id, 42);
+        assert_eq!(req.group.as_deref(), Some("backend"));
+    }
+
+    #[test]
+    fn test_find_imports_request_with_group() {
+        let json = r#"{"path":"src/lib.rs","group":"platform"}"#;
+        let req: super::types::FindImportsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.path, "src/lib.rs");
+        assert_eq!(req.group.as_deref(), Some("platform"));
+    }
+
+    #[test]
+    fn test_find_dependents_request_with_group() {
+        let json = r#"{"symbol_or_path":"auth","limit":10,"group":"services"}"#;
+        let req: super::types::FindDependentsRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.symbol_or_path, "auth");
+        assert_eq!(req.limit, Some(10));
+        assert_eq!(req.group.as_deref(), Some("services"));
+    }
+
+    #[test]
+    fn test_similar_chunks_request_with_group() {
+        let json = r#"{"chunk_id":7,"limit":5,"group":"frontend"}"#;
+        let req: super::types::SimilarChunksRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.chunk_id, 7);
+        assert_eq!(req.limit, Some(5));
+        assert_eq!(req.group.as_deref(), Some("frontend"));
+    }
+
+    #[test]
+    fn test_literal_search_request_with_group() {
+        let json = r#"{"query":"TODO","group":"all","format":"grep"}"#;
+        let req: super::types::LiteralSearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "TODO");
+        assert_eq!(req.group.as_deref(), Some("all"));
+        assert_eq!(req.format.as_deref(), Some("grep"));
+    }
+
+    #[test]
+    fn test_semantic_search_request_with_group() {
+        let json = r#"{"query":"authentication flow","group":"platform","mode":"hybrid"}"#;
+        let req: super::types::SemanticSearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.query, "authentication flow");
+        assert_eq!(req.group.as_deref(), Some("platform"));
+        assert_eq!(req.mode.as_deref(), Some("hybrid"));
+    }
+
+    // === MultiStoreContext decomposition tests ===
+    //
+    // These tests verify the pure decomposition logic used by `resolve_routing()`:
+    //   Option<Vec<Arc<SharedStores>>> → { stores, stores_vec, is_multi, needs_local_db }
+    //
+    // We simulate the exact same logic without needing a real CodesearchService
+    // (which requires LMDB databases, file system state, etc).
+
+    /// Simulates the decomposition in `resolve_routing()`.
+    /// Returns (stores, stores_vec, is_multi, needs_local_db).
+    #[allow(clippy::type_complexity)]
+    fn decompose_routing_ctx<T: Clone>(
+        multi_stores: Option<Vec<std::sync::Arc<T>>>,
+    ) -> (
+        Option<std::sync::Arc<T>>,
+        Option<Vec<std::sync::Arc<T>>>,
+        bool,
+        bool,
+    ) {
+        let is_multi = multi_stores.as_ref().is_some_and(|v| v.len() > 1);
+        let stores = match &multi_stores {
+            None => None,
+            Some(vec) if vec.len() == 1 => Some(vec[0].clone()),
+            Some(_) => None,
+        };
+        let stores_vec = if is_multi { multi_stores } else { None };
+        let needs_local_db = stores.is_none() && !is_multi;
+        (stores, stores_vec, is_multi, needs_local_db)
+    }
+
+    // Helper: create Arc<i32> as a stand-in for Arc<SharedStores>
+    fn arc_val(v: i32) -> std::sync::Arc<i32> {
+        std::sync::Arc::new(v)
+    }
+
+    #[test]
+    fn test_routing_decomposition_none_input() {
+        // No routing params → all None/false, needs_local_db = true
+        let (stores, stores_vec, is_multi, needs_local_db) =
+            decompose_routing_ctx::<i32>(None);
+        assert!(stores.is_none(), "stores should be None");
+        assert!(stores_vec.is_none(), "stores_vec should be None");
+        assert!(!is_multi, "is_multi should be false");
+        assert!(needs_local_db, "needs_local_db should be true — no serve-state stores");
+    }
+
+    #[test]
+    fn test_routing_decomposition_single_store() {
+        // One repo resolved → stores = Some, stores_vec = None, not multi
+        let (stores, stores_vec, is_multi, needs_local_db) =
+            decompose_routing_ctx(Some(vec![arc_val(1)]));
+        assert!(stores.is_some(), "stores should be Some for single repo");
+        assert!(stores_vec.is_none(), "stores_vec should be None for single repo");
+        assert!(!is_multi, "is_multi should be false for single repo");
+        assert!(!needs_local_db, "needs_local_db should be false — we have a store");
+        assert_eq!(*stores.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_routing_decomposition_two_stores() {
+        // Group with 2 repos → stores = None, stores_vec = Some, is_multi = true
+        let (stores, stores_vec, is_multi, needs_local_db) =
+            decompose_routing_ctx(Some(vec![arc_val(1), arc_val(2)]));
+        assert!(stores.is_none(), "stores should be None for multi-store");
+        assert!(stores_vec.is_some(), "stores_vec should be Some for multi-store");
+        assert!(is_multi, "is_multi should be true for 2+ stores");
+        assert!(!needs_local_db, "needs_local_db should be false — we have stores");
+        let sv = stores_vec.unwrap();
+        assert_eq!(sv.len(), 2);
+    }
+
+    #[test]
+    fn test_routing_decomposition_three_stores() {
+        // Group with 3 repos → same as 2 but verify vec length
+        let (stores, stores_vec, is_multi, needs_local_db) =
+            decompose_routing_ctx(Some(vec![arc_val(10), arc_val(20), arc_val(30)]));
+        assert!(stores.is_none());
+        assert!(stores_vec.is_some());
+        assert!(is_multi);
+        assert!(!needs_local_db);
+        assert_eq!(stores_vec.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_routing_decomposition_empty_vec() {
+        // Empty vec (edge case — shouldn't happen but verify)
+        let (stores, stores_vec, is_multi, needs_local_db) =
+            decompose_routing_ctx::<i32>(Some(vec![]));
+        // Empty vec: is_multi=false (len=0 not > 1), stores=None (len=0 not 1)
+        assert!(stores.is_none(), "empty vec → stores None");
+        assert!(stores_vec.is_none(), "empty vec → stores_vec None (is_multi=false)");
+        assert!(!is_multi, "empty vec → is_multi false");
+        assert!(needs_local_db, "empty vec → needs_local_db true");
+    }
+
+    // === MultiStoreContext decomposition tests ===
+    //
+    // These tests verify the pure decomposition logic used by `resolve_routing()`:
+    //   Option<Vec<Arc<SharedStores>>> → { stores, stores_vec, is_multi, needs_local_db }
+    //
+    // We test the same logic without needing a real CodesearchService
+    // (which requires LMDB databases, file system state, etc).
+
+    #[test]
+    fn test_routing_single_project_maps_to_single_store() {
+        // A single project alias → vec of length 1 → single-store path
+        let multi = Some(vec![arc_val(42)]);
+        let (stores, stores_vec, is_multi, needs_local_db) =
+            decompose_routing_ctx(multi);
+        assert!(!is_multi);
+        assert!(stores.is_some());
+        assert_eq!(*stores.unwrap(), 42);
+        assert!(stores_vec.is_none());
+        assert!(!needs_local_db);
+    }
+
+    #[test]
+    fn test_routing_group_maps_to_multi_store() {
+        // A group with 3 aliases → vec of length 3 → multi-store path
+        let multi = Some(vec![arc_val(1), arc_val(2), arc_val(3)]);
+        let (stores, stores_vec, is_multi, needs_local_db) =
+            decompose_routing_ctx(multi);
+        assert!(is_multi);
+        assert!(stores.is_none(), "multi-store → no single override");
+        assert_eq!(stores_vec.unwrap().len(), 3);
+        assert!(!needs_local_db);
+    }
+
+    // === merge_exact_into_fts routing-relevant tests ===
+
+    #[test]
+    fn test_merge_exact_cross_store_dedup() {
+        // Simulate merging FTS results from multiple stores with overlapping chunk_ids
+        // This is the pattern used by with_fts_store_read_multi
+        let mut base: Vec<crate::fts::FtsResult> = vec![
+            crate::fts::FtsResult { chunk_id: 1, score: 0.5 },
+            crate::fts::FtsResult { chunk_id: 2, score: 0.8 },
+        ];
+        let exact = vec![
+            crate::fts::FtsResult { chunk_id: 1, score: 0.9 }, // higher score
+            crate::fts::FtsResult { chunk_id: 3, score: 0.7 }, // new chunk
+        ];
+
+        super::merge_exact_into_fts(&mut base, exact);
+
+        assert_eq!(base.len(), 3, "should have 3 unique chunks");
+        let chunk1 = base.iter().find(|r| r.chunk_id == 1).unwrap();
+        assert!(
+            (chunk1.score - 0.9).abs() < f32::EPSILON,
+            "chunk 1 should have max score 0.9, got {}",
+            chunk1.score
+        );
+    }
+
+    // ─── regex_has_anchorable_token detector tests ───────────────────────
+
+    #[test]
+    fn test_regex_has_anchorable_token_plain_identifier() {
+        assert!(super::regex_has_anchorable_token("match_line_for_literal"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_generic_with_word() {
+        assert!(super::regex_has_anchorable_token("Vec<.*>"));
+        assert!(super::regex_has_anchorable_token("HashMap::new"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_short_word_below_threshold() {
+        // "fn" alone is only 2 chars — not enough.
+        assert!(!super::regex_has_anchorable_token("fn"));
+        assert!(super::regex_has_anchorable_token("fnx")); // 3 chars triggers
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_word_boundary_pattern() {
+        assert!(!super::regex_has_anchorable_token(r"\bfn\s+\w+"));
+        assert!(!super::regex_has_anchorable_token(r"\bimpl\s+"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_method_call_pattern() {
+        assert!(!super::regex_has_anchorable_token(r"\.\w+\(\)"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_character_classes_dont_count() {
+        // [A-Z] and [a-z] inside brackets must NOT be counted as runs.
+        assert!(!super::regex_has_anchorable_token(r"[A-Z]+_[A-Z]+"));
+        assert!(!super::regex_has_anchorable_token(r"^[A-Z]\w+"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_empty() {
+        assert!(!super::regex_has_anchorable_token(""));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_pure_punctuation() {
+        assert!(!super::regex_has_anchorable_token(r"->"));
+        assert!(!super::regex_has_anchorable_token(r"::"));
+    }
+
+    // ─── Scan-path decision logic tests ──────────────────────────────────
+    //
+    // Full integration tests for literal_search require a CodesearchService
+    // with a working DB/FTS index — no such harness exists yet. These tests
+    // validate the critical decision logic: which queries take the BM25 path
+    // vs the scan path.
+
+    #[test]
+    fn test_regex_anchorable_queries_detected_correctly() {
+        // Queries with ≥3 alphanumeric runs → anchorable → BM25 path
+        assert!(super::regex_has_anchorable_token("match_line_for_literal"));
+        assert!(super::regex_has_anchorable_token("HashMap::new"));
+        assert!(super::regex_has_anchorable_token("Vec<.*>"));
+        assert!(super::regex_has_anchorable_token("fnx"));
+    }
+
+    #[test]
+    fn test_regex_tokenless_queries_detected_correctly() {
+        // Tokenless regex patterns → not anchorable → scan path
+        assert!(!super::regex_has_anchorable_token(r"\bfn\s+\w+"));
+        assert!(!super::regex_has_anchorable_token(r"\bimpl\s+"));
+        assert!(!super::regex_has_anchorable_token(r"\.\w+\(\)"));
+        assert!(!super::regex_has_anchorable_token(r"[A-Z]+_[A-Z]+"));
+        assert!(!super::regex_has_anchorable_token(r"^[A-Z]\w+"));
+    }
+
+    // ─── Trailing-escape detector tests ──────────────────────────────
+
+    #[test]
+    fn test_regex_has_anchorable_token_trailing_word_boundary() {
+        assert!(!super::regex_has_anchorable_token(r"impl\b"));
+        assert!(!super::regex_has_anchorable_token(r"Result\b"));
+        assert!(!super::regex_has_anchorable_token(r"match\b"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_trailing_class() {
+        assert!(!super::regex_has_anchorable_token(r"impl[A-Z]"));
+        assert!(!super::regex_has_anchorable_token(r"foo[abc]+"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_trailing_escape_with_clean_run_after() {
+        // After the merged trailing escape, if there's a clean run later, that
+        // later run can still anchor.
+        assert!(super::regex_has_anchorable_token(r"impl\b\s+function_name"));
+        //                                              ^^^^^^^^^^^^^ anchorable
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_trailing_escape_at_end_only() {
+        // Run, then escape, then EOF — not anchorable.
+        assert!(!super::regex_has_anchorable_token(r"impl\s"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_both_sides_escaped() {
+        // \bimpl\b — leading escape already disqualifies "impl"; trailing
+        // doesn't change the answer.
+        assert!(!super::regex_has_anchorable_token(r"\bimpl\b"));
+    }
+
+    #[test]
+    fn test_regex_no_match_match_line_returns_none() {
+        // match_line_for_literal returns None for patterns that don't match
+        let regex = regex::Regex::new(r"\bfn\s+\w+").unwrap();
+        let content = "struct Foo { x: i32 }\nimpl Foo { fn bar() {} }";
+        // This content DOES match — fn bar() matches \bfn\s+\w+
+        assert!(super::match_line_for_literal(content, r"\bfn\s+\w+", Some(&regex)).is_some());
+
+        // This content does NOT match the regex
+        let regex2 = regex::Regex::new(r"zzz_definitely_not_in_code").unwrap();
+        let content2 = "fn foo() {}\nfn bar() {}";
+        assert!(super::match_line_for_literal(content2, "zzz_definitely_not_in_code", Some(&regex2)).is_none());
+
+        // Non-anchorable regex with no matches → empty (scan path would skip)
+        let regex3 = regex::Regex::new(r"\bimpl\s+\w+\s+for\s+\w+").unwrap();
+        let content3 = "fn simple() {}\nstruct Foo;";
+        assert!(super::match_line_for_literal(content3, r"\bimpl\s+\w+\s+for\s+\w+", Some(&regex3)).is_none());
+    }
+
+    // ─── looks_like_code_pattern detector tests ───────────────────────
+
+    #[test]
+    fn test_looks_like_code_pattern_assignment() {
+        assert!(super::looks_like_code_pattern("foo = null"));
+        assert!(super::looks_like_code_pattern("x = 42"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_arrow() {
+        assert!(super::looks_like_code_pattern("foo->bar"));
+        assert!(super::looks_like_code_pattern("x => y"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_namespace() {
+        assert!(super::looks_like_code_pattern("std::string"));
+        assert!(super::looks_like_code_pattern("a::b::c"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_generics() {
+        assert!(super::looks_like_code_pattern("Vec<T>"));
+        assert!(super::looks_like_code_pattern("HashMap<K, V>"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_statement_end() {
+        assert!(super::looks_like_code_pattern("return x;"));
+        assert!(super::looks_like_code_pattern("if (x) {"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_plain_identifier_false() {
+        assert!(!super::looks_like_code_pattern("ActivitiesListModelResponse"));
+        assert!(!super::looks_like_code_pattern("foo_bar"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_dotted_path_false() {
+        assert!(!super::looks_like_code_pattern("foo.bar"));
+        assert!(!super::looks_like_code_pattern("System.Console"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_empty_false() {
+        assert!(!super::looks_like_code_pattern(""));
+    }
+
+    // ─── compute_literal_low_confidence tests ─────────────────────────
+
+    #[test]
+    fn test_literal_lc_natural_language_zero_results() {
+        let (lc, hint) = super::compute_literal_low_confidence(None, "how do we handle auth");
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("semantic"));
+    }
+
+    #[test]
+    fn test_literal_lc_identifier_zero_results() {
+        let (lc, hint) = super::compute_literal_low_confidence(None, "CodesearchService");
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("regex"));
+    }
+
+    #[test]
+    fn test_literal_lc_code_pattern_zero_results() {
+        let (lc, hint) = super::compute_literal_low_confidence(None, "foo = null");
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("regex"));
+    }
+
+    #[test]
+    fn test_literal_lc_natural_language_weak_score() {
+        // Use a score demonstrably less than f32::MAX
+        let weak_score = super::LITERAL_LOW_CONFIDENCE_BM25 / 2.0;
+        let (lc, hint) = super::compute_literal_low_confidence(
+            Some(weak_score),
+            "how do we handle auth",
+        );
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("semantic"));
+    }
+
+    #[test]
+    fn test_literal_lc_identifier_weak_score() {
+        let weak_score = super::LITERAL_LOW_CONFIDENCE_BM25 / 2.0;
+        let (lc, hint) = super::compute_literal_low_confidence(
+            Some(weak_score),
+            "CodesearchService",
+        );
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("find"));
+    }
+
+    #[test]
+    fn test_literal_lc_threshold_uses_strictly_less_than() {
+        let (lc, hint) = super::compute_literal_low_confidence(
+            Some(super::LITERAL_LOW_CONFIDENCE_BM25),
+            "anything",
+        );
+        assert_eq!(lc, None);
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn test_literal_lc_high_score_returns_none() {
+        let (lc, hint) = super::compute_literal_low_confidence(Some(f32::MAX), "anything");
+        assert_eq!(lc, None);
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn test_literal_response_json_has_lc_fields() {
+        let response = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: Some(true),
+            suggested_tool: Some("search with mode='semantic'".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains(r#""low_confidence":true"#));
+        assert!(json.contains("\"suggested_tool\""));
+    }
+
+    #[test]
+    fn test_literal_response_json_omits_lc_fields_when_none() {
+        let response = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("low_confidence"));
+        assert!(!json.contains("suggested_tool"));
+        assert!(!json.contains("auto_promoted"));
+        assert!(!json.contains("note"));
+    }
+
+    // ─── auto-promotion behaviour tests ────────────────────────────────
+
+    #[test]
+    fn test_auto_promotion_escapes_and_relaxes_spaces() {
+        // "foo = null" → regex::escape → "foo = null" (spaces not escaped) → replace ' ' with \s+ → "foo\s+=\s+null"
+        let query = "foo = null";
+        let escaped = regex::escape(query);
+        let relaxed = escaped.replace(' ', r"\s+");
+        assert_eq!(relaxed, r"foo\s+=\s+null");
+    }
+
+    #[test]
+    fn test_auto_promoted_skipped_when_user_sets_regex() {
+        let user_set_regex = true;
+        let user_set_phrase = false;
+        let auto_promoted = !user_set_regex && !user_set_phrase && super::looks_like_code_pattern("foo = null");
+        assert!(!auto_promoted);
+    }
+
+    #[test]
+    fn test_auto_promoted_skipped_when_user_sets_phrase() {
+        let user_set_regex = false;
+        let user_set_phrase = true;
+        let auto_promoted = !user_set_regex && !user_set_phrase && super::looks_like_code_pattern("foo = null");
+        assert!(!auto_promoted);
+    }
+
+    #[test]
+    fn test_literal_search_response_shape_json() {
+        let response = super::LiteralSearchResponse {
+            results: vec![super::LiteralSearchResultItem {
+                path: "test.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                snippet: "fn test()".to_string(),
+                score: 1.0,
+                kind: None,
+                signature: None,
+            }],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.starts_with('{'));
+        assert!(json.contains("\"results\":["));
+        assert!(!json.starts_with('['));
+    }
+
+    #[test]
+    fn test_literal_search_response_carries_note_when_promoted() {
+        let response = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: Some(true),
+            note: Some("auto-promoted".to_string()),
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains(r#""auto_promoted_to_regex":true"#));
+        assert!(json.contains("\"note\""));
+    }
+
+    #[test]
+    fn test_literal_search_response_omits_fields_when_not_promoted() {
+        let response = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("auto_promoted_to_regex"));
+        assert!(!json.contains("note"));
+    }
+
+    #[test]
+    fn test_grep_format_includes_comment_when_promoted() {
+        let response = super::LiteralSearchResponse {
+            results: vec![super::LiteralSearchResultItem {
+                path: "test.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                snippet: "fn test()".to_string(),
+                score: 0.0,
+                kind: None,
+                signature: None,
+            }],
+            auto_promoted_to_regex: Some(true),
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let mut lines: Vec<String> = Vec::new();
+        if response.auto_promoted_to_regex == Some(true) {
+            lines.push("# auto-promoted to regex mode (query contained code-like punctuation)".to_string());
+        }
+        for item in &response.results {
+            lines.push(format!("{}:{}:{}", item.path, item.start_line, item.snippet));
+        }
+        let output = lines.join("\n");
+        assert!(output.starts_with("# auto-promoted"));
+    }
+
+    #[test]
+    fn test_grep_format_no_comment_when_plain() {
+        let response = super::LiteralSearchResponse {
+            results: vec![super::LiteralSearchResultItem {
+                path: "test.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                snippet: "fn test()".to_string(),
+                score: 1.0,
+                kind: None,
+                signature: None,
+            }],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let mut lines: Vec<String> = Vec::new();
+        if response.auto_promoted_to_regex == Some(true) {
+            lines.push("# auto-promoted to regex mode (query contained code-like punctuation)".to_string());
+        }
+        for item in &response.results {
+            lines.push(format!("{}:{}:{}", item.path, item.start_line, item.snippet));
+        }
+        let output = lines.join("\n");
+        assert!(!output.starts_with('#'));
+    }
 }
 
 pub mod types;
 
-use crate::db_discovery::{find_best_database, find_databases};
+/// Resolve the serve base URL from env or default port.
+fn serve_url_from_env() -> String {
+    let port = std::env::var(crate::constants::SERVE_PORT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(crate::constants::DEFAULT_SERVE_PORT);
+    format!("http://127.0.0.1:{}", port)
+}
+
+use crate::db_discovery::{find_best_database, load_repos_config};
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::Language;
 use crate::fts::FtsStore;
@@ -925,6 +1945,35 @@ use tokio_util::sync::CancellationToken;
 
 // Re-export types
 pub use types::*;
+
+/// Read model short-name and dimensions from a database's `metadata.json`.
+/// Returns `(model_name, dimensions)`, defaulting to `("unknown", DEFAULT_EMBEDDING_DIMENSIONS)`.
+fn read_model_metadata(db_path: &Path) -> (String, usize) {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            let model_name = json
+                .get("model_short_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let dims = json
+                .get("dimensions")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            // If metadata has explicit dimensions, use those; otherwise infer from model name.
+            let dims = if dims > 0 {
+                dims
+            } else {
+                ModelType::parse(&model_name)
+                    .map(|m| m.dimensions())
+                    .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS)
+            };
+            return (model_name, dims);
+        }
+    }
+    ("unknown".to_string(), crate::constants::DEFAULT_EMBEDDING_DIMENSIONS)
+}
 
 /// RRF score threshold below which results are considered low-confidence.
 /// When the top result's RRF score falls below this, the response includes
@@ -954,6 +2003,8 @@ pub struct CodesearchService {
     embedding_service: Mutex<Option<EmbeddingService>>,
     // Shared stores for concurrent access (optional - only set when running with IndexManager)
     shared_stores: Option<Arc<SharedStores>>,
+    // Serve-mode state (set when running inside `codesearch serve`)
+    serve_state: Option<Arc<crate::serve::ServeState>>,
 }
 
 impl std::fmt::Debug for CodesearchService {
@@ -963,8 +2014,37 @@ impl std::fmt::Debug for CodesearchService {
             .field("model_type", &self.model_type)
             .field("dimensions", &self.dimensions)
             .field("has_shared_stores", &self.shared_stores.is_some())
+            .field("serve_mode", &self.serve_state.is_some())
             .finish()
     }
+}
+
+// === Multi-store fan-out traits ===
+
+/// Trait for types that have a chunk ID (used for deduplication in group fan-out).
+trait HasChunkId {
+    fn chunk_id(&self) -> u32;
+}
+
+/// Trait for types that have a relevance score (used for sorting in group fan-out).
+trait HasScore {
+    fn score(&self) -> f32;
+}
+
+impl HasChunkId for crate::vectordb::SearchResult {
+    fn chunk_id(&self) -> u32 { self.id }
+}
+
+impl HasScore for crate::vectordb::SearchResult {
+    fn score(&self) -> f32 { self.score }
+}
+
+impl HasChunkId for crate::fts::FtsResult {
+    fn chunk_id(&self) -> u32 { self.chunk_id }
+}
+
+impl HasScore for crate::fts::FtsResult {
+    fn score(&self) -> f32 { self.score }
 }
 
 // === Simple Glob Matcher ===
@@ -1177,6 +2257,44 @@ fn normalize_tool_path(path: &str, project_root: &Path) -> String {
     crate::cache::normalize_path_str(resolved.to_string_lossy().as_ref())
 }
 
+/// Prefix a result path with its repo alias for group queries, normalizing
+/// Windows backslashes to forward slashes in the process. When `alias` is
+/// None or empty, the path is still normalized (useful for stdio mode).
+pub(crate) fn prefix_path_with_alias(path: &str, alias: Option<&str>, project_root: &str) -> String {
+    let normalized = crate::cache::normalize_path_str(path);
+    let normalized_root = crate::cache::normalize_path_str(project_root)
+        .trim_end_matches('/')
+        .to_string();
+    match normalized.strip_prefix(&normalized_root) {
+        Some(rest) => {
+            let relative = rest.trim_start_matches('/');
+            match alias {
+                Some(a) if !a.is_empty() => format!("{}/{}", a, relative),
+                _ => relative.to_string(),
+            }
+        }
+        None => normalized,
+    }
+}
+
+/// Prefix a result path with the matching repo alias from a set of aliases and their roots.
+/// Used by handlers that have alias/root info but not a full `MultiStoreContext`.
+fn prefix_path_multi(
+    path: &str,
+    aliases: &[String],
+    alias_roots: &std::collections::HashMap<String, String>,
+) -> String {
+    let normalized = crate::cache::normalize_path_str(path);
+    for alias in aliases {
+        if let Some(root) = alias_roots.get(alias) {
+            if normalized.starts_with(root.as_str()) {
+                return prefix_path_with_alias(path, Some(alias), root);
+            }
+        }
+    }
+    normalized
+}
+
 fn is_import_kind(kind: &str) -> bool {
     matches!(kind, "Import" | "Use" | "Require" | "Include" | "Imports")
 }
@@ -1216,6 +2334,165 @@ fn match_line_for_literal(content: &str, query: &str, regex: Option<&Regex>) -> 
     }
 
     None
+}
+
+/// Returns true when a regex pattern contains at least one run of three or more
+/// alphanumerics-or-underscore characters. Such a run is enough for Tantivy's
+/// analyzer to produce a real BM25 token, which means the BM25 candidate path
+/// will work for this query.
+///
+/// When this returns false, the regex is "tokenless" — it consists only of
+/// regex syntax (\b, \s, \w, ^, $, character classes, anchors). BM25 has
+/// nothing to match on, so the caller must fall back to a full chunk scan.
+///
+/// Conservative direction: false positives ("looks anchorable, isn't really")
+/// are safe because the BM25 path will return empty candidates and the regex
+/// post-filter will return empty results — same outcome as the scan path
+/// would on a corpus with no matches. False negatives ("looks tokenless,
+/// actually has tokens") are unsafe because they trigger an unnecessary scan.
+/// We bias toward false positives.
+fn regex_has_anchorable_token(pattern: &str) -> bool {
+    let mut run: usize = 0;
+    let mut need_separator = false;
+    let mut i = 0;
+    let bytes = pattern.as_bytes();
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // Skip the next char after a backslash — it's an escape, not content.
+        // This prevents \w, \s, \b, \d etc. from contributing to the run count.
+        if c == '\\' && i + 1 < bytes.len() {
+            run = 0;
+            need_separator = true; // chars after escape are merged by BM25 tokenizer
+            i += 2;
+            continue;
+        }
+        // Character classes [abc] don't anchor BM25 either — the tokens inside
+        // are alternatives, not a contiguous string. Skip the whole class.
+        if c == '[' {
+            run = 0;
+            need_separator = true;
+            // Find matching ]; tolerate \] inside.
+            let mut j = i + 1;
+            while j < bytes.len() {
+                let cj = bytes[j] as char;
+                if cj == '\\' && j + 1 < bytes.len() {
+                    j += 2;
+                    continue;
+                }
+                if cj == ']' {
+                    break;
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            if need_separator {
+                // After \X or [...], BM25 merges the next alphanumeric run with
+                // the escape/class content (e.g. \bimpl → "bimpl", not "impl").
+                // So we skip these chars — they're not independent tokens.
+                i += 1;
+                continue;
+            }
+            run += 1;
+            if run >= 3 {
+                // Only peek when the run might be ending: check if the next byte
+                // is NOT alphanumeric. If it IS, keep building the run.
+                let next_idx = i + 1;
+                let run_continues = next_idx < bytes.len() && {
+                    let nc = bytes[next_idx] as char;
+                    nc.is_alphanumeric() || nc == '_'
+                };
+                if !run_continues {
+                    // Run has ended. Check if next byte merges (escape or class).
+                    if next_idx < bytes.len() {
+                        let next_c = bytes[next_idx] as char;
+                        if next_c == '\\' || next_c == '[' {
+                            run = 0;
+                            need_separator = true;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    // Run ended naturally (EOF or non-merge separator) → anchorable
+                    return true;
+                }
+                // Run continues — keep building in next iteration
+            }
+        } else {
+            run = 0;
+            need_separator = false;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Returns true when a literal-search query looks like a code pattern whose
+/// punctuation would be destroyed by BM25 tokenization.
+///
+/// Triggers on:
+/// - Multi-char operators: ->, =>, ::, !=, ==, <=, >=, &&, ||, <<, >>
+/// - Space-surrounded single operators: " = ", " < ", " > "
+/// - Statement endings: trailing `;` or `{`
+/// - ≥ 2 angle/square bracket characters: `Vec<T>`, `[0]`
+///
+/// Does NOT trigger on:
+/// - Plain identifiers: "ActivitiesListModelResponse", "foo_bar"
+/// - Dotted paths: "foo.bar", "System.Console"
+/// - Single parens alone: "(error)" — parens are not in the bracket set
+fn looks_like_code_pattern(query: &str) -> bool {
+    const MULTI_OPS: &[&str] = &[
+        "->", "=>", "::", "!=", "==", "<=", ">=", "&&", "||", "<<", ">>",
+    ];
+    if MULTI_OPS.iter().any(|op| query.contains(op)) {
+        return true;
+    }
+    const SPACED_OPS: &[&str] = &[" = ", " < ", " > "];
+    if SPACED_OPS.iter().any(|op| query.contains(op)) {
+        return true;
+    }
+    let trimmed = query.trim();
+    if trimmed.ends_with(';') || trimmed.ends_with('{') {
+        return true;
+    }
+    let bracket_count = query
+        .chars()
+        .filter(|c| matches!(c, '<' | '>' | '[' | ']'))
+        .count();
+    bracket_count >= 2
+}
+
+/// BM25 score threshold for low-confidence signalling in literal search.
+/// IMPORTANT: this value is unvalidated. It is set to f32::MAX (never fires)
+/// until real query scores have been collected. Update after reviewing
+/// `RUST_LOG=codesearch::literal_confidence=debug` output.
+const LITERAL_LOW_CONFIDENCE_BM25: f32 = f32::MAX;
+
+fn compute_literal_low_confidence(
+    top_score: Option<f32>,
+    query: &str,
+) -> (Option<bool>, Option<String>) {
+    let word_count = query.split_whitespace().count();
+    let has_code_chars = query.chars().any(|c| "{}[]<>=|;:".contains(c));
+    let is_natural_language = word_count >= 3 && !has_code_chars;
+
+    let suggest_semantic = "search with mode='semantic'";
+    let suggest_regex    = "search with mode='literal' and regex=true";
+    let suggest_find     = "find with kind='definition' or kind='usages'";
+
+    match top_score {
+        Some(score) if score < LITERAL_LOW_CONFIDENCE_BM25 => {
+            let hint = if is_natural_language { suggest_semantic } else { suggest_find };
+            (Some(true), Some(hint.to_string()))
+        }
+        None => {
+            let hint = if is_natural_language { suggest_semantic } else { suggest_regex };
+            (Some(true), Some(hint.to_string()))
+        }
+        Some(_) => (None, None),
+    }
 }
 
 /// Parse individual import statements from chunk content.
@@ -1267,6 +2544,78 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
     items
 }
 
+// === Multi-Store Routing Context ===
+
+/// Pre-computed routing context for a tool handler.
+///
+/// Created by `CodesearchService::resolve_routing()`, this struct encapsulates
+/// all the decisions a handler needs: which store to use, whether to fan out,
+/// and whether to call `ensure_database_exists()`.
+struct MultiStoreContext {
+    /// Single-store override (set when exactly 1 repo resolved, or None).
+    /// Pass to `with_*_store_read_for()` methods.
+    stores: Option<Arc<SharedStores>>,
+    /// Multi-store vec for fan-out (set when 2+ repos resolved, or None).
+    /// Use `if let Some(ref sv) = ctx.stores_vec { ... }` for the multi-store path.
+    stores_vec: Option<Vec<Arc<SharedStores>>>,
+    /// Alias for each store in `stores_vec` (parallel with stores_vec).
+    /// Used for path prefixing and per-alias dedup.
+    store_aliases: Option<Vec<String>>,
+    /// Alias for single-project routing (set when project= is given).
+    project_alias: Option<String>,
+    /// Normalized project root for each alias (alias → root path).
+    /// Used by `prefix_path` to strip absolute paths and add alias prefix.
+    alias_roots: std::collections::HashMap<String, String>,
+    /// True when `stores_vec` has 2+ entries (group fan-out).
+    is_multi: bool,
+    /// True when no serve-state stores resolved and local DB should be checked.
+    needs_local_db: bool,
+}
+
+impl MultiStoreContext {
+    /// Prefix a result path with its owning alias for multi-repo identification.
+    ///
+    /// Three dispatch modes:
+    /// - Single-project (`project_alias = Some(...)`): prefix with that alias.
+    /// - Group (`store_aliases = Some([...])`): detect alias by prefix-matching
+    ///   the path against known project roots in `alias_roots`.
+    /// - Stdio / no alias info: normalize only, no prefix.
+    ///
+    /// Emits a `tracing::debug!` event when an expected alias cannot be resolved.
+    /// That usually indicates a config mismatch or a path from an unregistered source —
+    /// the path is still normalized and returned, but diagnosis is easier with the log.
+    fn prefix_result_path(&self, path: &str) -> String {
+        if let Some(ref alias) = self.project_alias {
+            if let Some(root) = self.alias_roots.get(alias) {
+                return prefix_path_with_alias(path, Some(alias), root);
+            }
+            tracing::debug!(
+                target: "codesearch::mcp::path_prefix",
+                alias = %alias,
+                path = %path,
+                "project_alias has no entry in alias_roots"
+            );
+        }
+        if let Some(ref aliases) = self.store_aliases {
+            let normalized = crate::cache::normalize_path_str(path);
+            for alias in aliases {
+                if let Some(root) = self.alias_roots.get(alias) {
+                    if normalized.starts_with(root.as_str()) {
+                        return prefix_path_with_alias(path, Some(alias), root);
+                    }
+                }
+            }
+            tracing::debug!(
+                target: "codesearch::mcp::path_prefix",
+                aliases = ?aliases,
+                path = %path,
+                "no alias root matched path in group mode"
+            );
+        }
+        crate::cache::normalize_path_str(path)
+    }
+}
+
 // === Tool Router Implementation ===
 
 #[tool_router]
@@ -1308,11 +2657,11 @@ impl CodesearchService {
             let dims = json
                 .get("dimensions")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(384) as usize;
+                .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS as u64) as usize;
             let mt = ModelType::parse(model_name).unwrap_or_default();
             (mt, dims)
         } else {
-            (ModelType::default(), 384)
+            (ModelType::default(), crate::constants::DEFAULT_EMBEDDING_DIMENSIONS)
         };
 
         Ok(Self {
@@ -1323,6 +2672,26 @@ impl CodesearchService {
             dimensions,
             embedding_service: Mutex::new(None),
             shared_stores,
+            serve_state: None,
+        })
+    }
+
+    /// Create a CodesearchService for use inside `codesearch serve`.
+    ///
+    /// In serve mode, the service does not have a single local DB; instead
+    /// it routes requests to the repo identified by `project`/`group`.
+    pub(crate) fn new_for_serve(
+        serve_state: Arc<crate::serve::ServeState>,
+    ) -> Result<Self> {
+        Ok(Self {
+            tool_router: Self::tool_router(),
+            db_path: PathBuf::from("serve://multi-repo"),
+            project_path: PathBuf::from("serve://multi-repo"),
+            model_type: ModelType::default(),
+            dimensions: crate::constants::DEFAULT_EMBEDDING_DIMENSIONS,
+            embedding_service: Mutex::new(None),
+            shared_stores: None,
+            serve_state: Some(serve_state),
         })
     }
 
@@ -1339,6 +2708,15 @@ impl CodesearchService {
         Ok(guard)
     }
 
+    /// Return the current MCP mode as a string for diagnostics.
+    fn mcp_mode(&self) -> Option<String> {
+        if self.serve_state.is_some() {
+            Some("serve_hub".to_string())
+        } else {
+            Some("stdio".to_string())
+        }
+    }
+
     /// Check if database exists and return error if not
     fn ensure_database_exists(&self) -> Result<(), String> {
         if !self.db_path.exists() {
@@ -1348,7 +2726,7 @@ impl CodesearchService {
                  To fix this, run the following command in your terminal:\n\
                  $ cd {}\n\
                  $ codesearch index\n\n\
-                 For more information about database locations, use the find_databases tool.",
+                 For more information about database locations, use the `status` tool with `kind=\"projects\"`.",
                 self.db_path.display(),
                 self.project_path.display()
             ));
@@ -1356,12 +2734,144 @@ impl CodesearchService {
         Ok(())
     }
 
-    /// Execute a read-only action against the vector store, using shared stores when available
-    /// and falling back to opening a standalone store otherwise.
-    async fn with_vector_store_read<R, F>(&self, mut action: F) -> Result<R>
+    /// Resolve project/group parameters to a specific `Arc<SharedStores>`.
+    ///
+    /// For groups with multiple members, only the first store is returned.
+    /// Use `resolve_repo_stores_multi` for full group fan-out.
+    ///
+    /// Returns:
+    /// Resolve project/group parameters to all matching `Arc<SharedStores>`.
+    ///
+    /// For groups, returns stores for ALL group members (fan-out).
+    /// For project, returns a single-element vec.
+    ///
+    /// Returns:
+    /// - `Ok(None)` — no project/group specified, use default local stores
+    /// - `Ok(Some(vec))` — one or more stores to query (fan out and merge)
+    /// - `Err(msg)` — validation error
+    async fn resolve_repo_stores_multi(
+        &self,
+        project: &Option<String>,
+        group: &Option<String>,
+    ) -> std::result::Result<Option<(Vec<Arc<SharedStores>>, Vec<String>)>, String> {
+        // No routing params → auto-default to all configured repos in serve mode
+        if project.is_none() && group.is_none() {
+            if let Some(ref serve_state) = self.serve_state {
+                let cfg = serve_state.config_snapshot();
+                let aliases: Vec<String> = cfg.repos.keys().cloned().collect();
+                if !aliases.is_empty() {
+                    let mut all_stores = Vec::with_capacity(aliases.len());
+                    for alias in &aliases {
+                        all_stores.push(serve_state.get_or_open_stores(alias).await?);
+                    }
+                    return Ok(Some((all_stores, aliases)));
+                }
+            }
+            return Ok(None);
+        }
+
+        // Must have serve_state to route
+        let serve_state = self.serve_state.as_ref()
+            .ok_or_else(|| "project/group routing requires `codesearch serve` to be running.".to_string())?;
+
+        // Validate params
+        types::validate_project_group(project, group, true)?;
+
+        if let Some(ref alias) = project {
+            let stores = serve_state.get_or_open_stores(alias).await?;
+            return Ok(Some((vec![stores], vec![alias.clone()])));
+        }
+
+        if let Some(ref group_name) = group {
+            let aliases = serve_state.resolve_group_aliases(group_name)?;
+            if aliases.is_empty() {
+                return Err(format!("Group '{}' has no members.", group_name));
+            }
+            let mut all_stores = Vec::with_capacity(aliases.len());
+            for alias in &aliases {
+                all_stores.push(serve_state.get_or_open_stores(alias).await?);
+            }
+            return Ok(Some((all_stores, aliases)));
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve project/group params into a ready-to-use routing context.
+    ///
+    /// Encapsulates the common pattern: resolve multi-stores, extract single override
+    /// vs multi-store vec, and determine if local DB check is needed.
+    async fn resolve_routing(
+        &self,
+        project: &Option<String>,
+        group: &Option<String>,
+    ) -> std::result::Result<MultiStoreContext, String> {
+        let resolved = self.resolve_repo_stores_multi(project, group).await?;
+        let is_multi = resolved.as_ref().is_some_and(|(stores, _)| stores.len() > 1);
+        let (stores, stores_vec, store_aliases, project_alias) = match &resolved {
+            None => (None, None, None, None),
+            Some((store_vec, aliases)) if store_vec.len() == 1 => {
+                let alias = aliases.first().cloned();
+                (Some(store_vec[0].clone()), None, None, alias)
+            }
+            Some((store_vec, aliases)) => {
+                (None, Some(store_vec.clone()), Some(aliases.clone()), None)
+            }
+        };
+
+        // Build alias → normalized project root map for path prefixing
+        let mut alias_roots = std::collections::HashMap::new();
+        if let Some(ref serve_state) = self.serve_state {
+            let cfg = serve_state.config_snapshot();
+            let all_aliases = store_aliases.as_deref().unwrap_or(&[]);
+            for alias in all_aliases.iter() {
+                if let Some(path) = cfg.resolve(alias) {
+                    let root = crate::cache::normalize_path_str(path.to_string_lossy().as_ref())
+                        .trim_end_matches('/')
+                        .to_string();
+                    alias_roots.insert(alias.clone(), root);
+                }
+            }
+            if let Some(ref alias) = project_alias {
+                if let Some(path) = cfg.resolve(alias) {
+                    let root = crate::cache::normalize_path_str(path.to_string_lossy().as_ref())
+                        .trim_end_matches('/')
+                        .to_string();
+                    alias_roots.insert(alias.clone(), root);
+                }
+            }
+        }
+
+        let needs_local_db = stores.is_none() && !is_multi;
+        Ok(MultiStoreContext {
+            stores,
+            stores_vec,
+            store_aliases,
+            project_alias,
+            alias_roots,
+            is_multi,
+            needs_local_db,
+        })
+    }
+
+    /// Execute a read-only action against the vector store with an explicit store override.
+    ///
+    /// If `store_override` is provided (from project/group routing), it takes precedence.
+    async fn with_vector_store_read_for<R, F>(
+        &self,
+        mut action: F,
+        store_override: Option<Arc<SharedStores>>,
+    ) -> Result<R>
     where
         F: FnMut(&VectorStore) -> anyhow::Result<R>,
     {
+        // Priority 1: explicit store override (from project/group routing)
+        if let Some(stores) = store_override {
+            let store = stores.vector_store.read().await;
+            return action(&store).context("Error reading from project-routed vector store");
+        }
+
+        // Priority 2: shared stores (set during IndexManager init)
         if let Some(ref stores) = self.shared_stores {
             let store = stores.vector_store.read().await;
             match action(&store) {
@@ -1391,12 +2901,24 @@ impl CodesearchService {
         action(&store).context("Error reading from vector store")
     }
 
-    /// Execute a read-only action against the FTS store, using shared stores when available
-    /// and falling back to opening a standalone FtsStore otherwise.
-    async fn with_fts_store_read<R, F>(&self, action: F) -> Result<R>
+    /// Execute a read-only action against the FTS store with an explicit store override.
+    ///
+    /// If `store_override` is provided (from project/group routing), it takes precedence.
+    async fn with_fts_store_read_for<R, F>(
+        &self,
+        action: F,
+        store_override: Option<Arc<SharedStores>>,
+    ) -> Result<R>
     where
         F: Fn(&FtsStore) -> Result<R>,
     {
+        // Priority 1: explicit store override (from project/group routing)
+        if let Some(stores) = store_override {
+            let fts = stores.fts_store.read().await;
+            return action(&fts);
+        }
+
+        // Priority 2: shared stores
         if let Some(ref stores) = self.shared_stores {
             let fts = stores.fts_store.read().await;
             return action(&fts);
@@ -1407,13 +2929,307 @@ impl CodesearchService {
         action(&fts_store)
     }
 
+    /// Fan-out vector store read across multiple stores, merging results.
+    ///
+    /// Runs `action` against each store and merges all results into a single vec,
+    /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
+    async fn with_vector_store_read_multi<R, F>(
+        &self,
+        mut action: F,
+        stores: Vec<Arc<SharedStores>>,
+        aliases: &[String],
+    ) -> Result<Vec<R>>
+    where
+        F: FnMut(&VectorStore) -> anyhow::Result<Vec<R>>,
+        R: Clone + HasChunkId + HasScore,
+    {
+        let mut all_results: Vec<R> = Vec::new();
+        let mut seen_ids: std::collections::HashMap<(String, u32), usize> = std::collections::HashMap::new();
+
+        for (idx, store_arc) in stores.iter().enumerate() {
+            let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
+            let store = store_arc.vector_store.read().await;
+            match action(&store) {
+                Ok(results) => {
+                    for r in results {
+                        let key = (alias.to_string(), r.chunk_id());
+                        if let Some(&existing_idx) = seen_ids.get(&key) {
+                            // Keep the one with higher score
+                            if r.score() > all_results[existing_idx].score() {
+                                all_results[existing_idx] = r;
+                            }
+                        } else {
+                            seen_ids.insert(key, all_results.len());
+                            all_results.push(r);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Vector store read failed for multi-store fan-out: {:?}", e);
+                }
+            }
+        }
+
+        // Sort by score descending
+        all_results.sort_by(|a, b| {
+            b.score()
+                .partial_cmp(&a.score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(all_results)
+    }
+
+    /// Fan-out FTS store read across multiple stores, merging results.
+    ///
+    /// Runs `action` against each store and merges all results into a single vec,
+    /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
+    async fn with_fts_store_read_multi<R, F>(
+        &self,
+        mut action: F,
+        stores: Vec<Arc<SharedStores>>,
+        aliases: &[String],
+    ) -> Result<Vec<R>>
+    where
+        F: FnMut(&FtsStore) -> Result<Vec<R>>,
+        R: Clone + HasChunkId + HasScore,
+    {
+        let mut all_results: Vec<R> = Vec::new();
+        let mut seen_ids: std::collections::HashMap<(String, u32), usize> = std::collections::HashMap::new();
+
+        for (idx, store_arc) in stores.iter().enumerate() {
+            let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
+            let fts = store_arc.fts_store.read().await;
+            match action(&fts) {
+                Ok(results) => {
+                    for r in results {
+                        let key = (alias.to_string(), r.chunk_id());
+                        if let Some(&existing_idx) = seen_ids.get(&key) {
+                            if r.score() > all_results[existing_idx].score() {
+                                all_results[existing_idx] = r;
+                            }
+                        } else {
+                            seen_ids.insert(key, all_results.len());
+                            all_results.push(r);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("FTS store read failed for multi-store fan-out: {:?}", e);
+                }
+            }
+        }
+
+        // Sort by score descending
+        all_results.sort_by(|a, b| {
+            b.score()
+                .partial_cmp(&a.score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(all_results)
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Consolidated tools (the primary 5-tool surface)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Unified search tool — dispatches to semantic or literal search based on `mode`.
     #[tool(
-        description = "Hybrid code search over tree-sitter AST chunks: vector embeddings + Tantivy FTS + exact-identifier boosting, fused with RRF.\n\nUSE FOR:\n- Conceptual queries (\"where is auth handled\", \"how do we log errors\")\n- Identifier lookups — function/class/variable names are boosted via exact-match FTS\n- Mixed natural-language + symbol queries\n\nDO NOT USE FOR:\n- Finding a symbol's definition specifically — use `find_definition`\n- Finding all call-sites of a symbol — use `find_usages`\n\nOPTIONAL `mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (compact=true). Prefer `get_chunk` to read full body/context for a selected result."
+        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns."
     )]
+    async fn search(
+        &self,
+        Parameters(request): Parameters<SearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            "📥 search(query={:?}, mode={:?}, project={:?}, group={:?})",
+            request.query,
+            request.mode,
+            request.project,
+            request.group,
+        );
+        let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
+        match mode.as_str() {
+            "semantic" => {
+                // Delegate to the existing semantic_search implementation
+                let semantic_req = SemanticSearchRequest {
+                    query: request.query,
+                    limit: request.limit,
+                    compact: request.compact,
+                    filter_path: request.filter_path,
+                    mode: request.semantic_mode,
+                    project: request.project,
+                    group: request.group,
+                };
+                self.semantic_search(Parameters(semantic_req)).await
+            }
+            "literal" => {
+                // Delegate to the existing literal_search implementation
+                let literal_req = LiteralSearchRequest {
+                    query: request.query,
+                    regex: request.regex,
+                    phrase: request.phrase,
+                    limit: request.limit,
+                    file_glob: request.file_glob,
+                    language: request.language,
+                    format: request.format,
+                    project: request.project,
+                    group: request.group,
+                };
+                self.literal_search(Parameters(literal_req)).await
+            }
+            _ => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Unknown search mode '{}'. Use `semantic` or `literal`.",
+                mode
+            ))])),
+        }
+    }
+
+    /// Unified symbol navigation — dispatches based on `kind`.
+    #[tool(
+        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name."
+    )]
+    async fn find(
+        &self,
+        Parameters(request): Parameters<FindRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = request.kind.as_deref().unwrap_or("definition").to_lowercase();
+        tracing::info!(
+            "📥 find(symbol={:?}, kind={}, project={:?}, group={:?})",
+            request.symbol,
+            kind,
+            request.project,
+            request.group,
+        );
+        match kind.as_str() {
+            "definition" => {
+                let def_req = FindDefinitionRequest {
+                    symbol: request.symbol,
+                    kind: request.definition_kind,
+                    limit: request.limit,
+                    project: request.project,
+                    group: request.group,
+                };
+                self.find_definition(Parameters(def_req)).await
+            }
+            "usages" => {
+                let usages_req = FindUsagesRequest {
+                    symbol: request.symbol,
+                    limit: request.limit,
+                    project: request.project,
+                    group: request.group,
+                };
+                self.find_usages(Parameters(usages_req)).await
+            }
+            "imports" => {
+                let imports_req = FindImportsRequest {
+                    path: request.symbol,
+                    project: request.project,
+                    group: request.group,
+                };
+                self.find_imports(Parameters(imports_req)).await
+            }
+            "dependents" => {
+                let dep_req = FindDependentsRequest {
+                    symbol_or_path: request.symbol,
+                    limit: request.limit,
+                    project: request.project,
+                    group: request.group,
+                };
+                self.find_dependents(Parameters(dep_req)).await
+            }
+            _ => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Unknown find kind '{}'. Use `definition`, `usages`, `imports`, or `dependents`.",
+                kind
+            ))])),
+        }
+    }
+
+    /// Unified exploration tool — dispatches based on `kind`.
+    #[tool(
+        description = "Unified code exploration. Set `kind` to choose the action:\n\n- `outline` (default): list all indexed top-level symbols in a file — kind, signature, and line range. Set `target` to a file path.\n- `similar`: find chunks semantically similar to a given chunk by its ID. Set `target` to the chunk_id (as string)."
+    )]
+    async fn explore(
+        &self,
+        Parameters(request): Parameters<ExploreRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = request.kind.as_deref().unwrap_or("outline").to_lowercase();
+        tracing::info!(
+            "📥 explore(target={:?}, kind={}, project={:?})",
+            request.target,
+            kind,
+            request.project,
+        );
+        match kind.as_str() {
+            "outline" => {
+                let outline_req = FileOutlineRequest {
+                    path: request.target,
+                    project: request.project,
+                    group: request.group,
+                };
+                self.file_outline(Parameters(outline_req)).await
+            }
+            "similar" => {
+                let chunk_id = match request.target.parse::<u32>() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                            "For similar mode, `target` must be a numeric chunk_id, got: '{}'",
+                            request.target
+                        ))]));
+                    }
+                };
+                let similar_req = SimilarChunksRequest {
+                    chunk_id,
+                    limit: request.limit,
+                    project: request.project,
+                    group: request.group,
+                };
+                self.similar_chunks(Parameters(similar_req)).await
+            }
+            _ => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Unknown explore kind '{}'. Use `outline` or `similar`.",
+                kind
+            ))])),
+        }
+    }
+
+    /// Unified status tool — dispatches based on `kind`.
+    #[tool(
+        description = "Unified status/info tool. Set `kind` to choose the action:\n\n- `index` (default): get the status of the local search index (model info, chunk count, readiness)\n- `projects`: list all registered projects/repositories, groups, and their index status"
+    )]
+    async fn status(
+        &self,
+        Parameters(request): Parameters<StatusRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind = request.kind.as_deref().unwrap_or("index").to_lowercase();
+        tracing::info!("📥 status(kind={})", kind);
+        match kind.as_str() {
+            "index" => self.index_status_impl(request.project, request.group).await,
+            "projects" => self.list_projects().await,
+            _ => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Unknown status kind '{}'. Use `index` or `projects`.",
+                kind
+            ))])),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Internal implementations (called by consolidated tools above)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Internal: semantic/hybrid search implementation used by `search(mode="semantic")`.
     async fn semantic_search(
         &self,
         Parameters(request): Parameters<SemanticSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // Resolve project/group routing (multi-store for group fan-out)
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
         let limit = request.limit.unwrap_or(10);
         let compact = request.compact.unwrap_or(true);
         let mode = request.mode.as_deref().unwrap_or("auto");
@@ -1421,23 +3237,32 @@ impl CodesearchService {
         let has_identifiers = !identifiers.is_empty();
 
         tracing::debug!(
-            "MCP semantic_search: query='{}', limit={}, compact={}, mode='{}'",
-            request.query,
-            limit,
-            compact,
-            mode
+            "MCP semantic_search: query='{}', limit={}, compact={}, mode='{}', multi={}",
+            request.query, limit, compact, mode, ctx.is_multi
         );
 
-        // Ensure database exists
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        // Ensure database exists (skip if serve-mode with routed stores)
+        if ctx.needs_local_db {
+            if let Err(e) = self.ensure_database_exists() {
+                return Ok(CallToolResult::success(vec![Content::text(e)]));
+            }
+        }
+
+        // === Multi-store group fan-out ===
+        if ctx.is_multi {
+            return self.semantic_search_multi(
+                &request, &identifiers, limit, compact,
+                ctx.stores_vec.unwrap(),
+                ctx.store_aliases.as_ref().unwrap(),
+                &ctx.alias_roots,
+            ).await;
         }
 
         // === Mode: "lexical" — FTS only, no embedding ===
         if mode == "lexical" {
             tracing::debug!("MCP: mode=lexical — skipping embedding service");
             return self
-                .semantic_search_lexical(&request, &identifiers, limit, compact)
+                .semantic_search_lexical(&request, &identifiers, limit, compact, ctx.stores, ctx.project_alias.as_deref(), &ctx.alias_roots)
                 .await;
         }
 
@@ -1470,11 +3295,14 @@ impl CodesearchService {
 
         // Search vector store
         let vector_results = match self
-            .with_vector_store_read(|store| {
-                store
-                    .search(&query_embedding, limit * 3)
-                    .context("Error searching vector store")
-            })
+            .with_vector_store_read_for(
+                |store| {
+                    store
+                        .search(&query_embedding, limit * 3)
+                        .context("Error searching vector store")
+                },
+                ctx.stores.clone(),
+            )
             .await
         {
             Ok(r) => r,
@@ -1505,7 +3333,7 @@ impl CodesearchService {
                     results.push(r);
                 }
             }
-            return self.build_semantic_response(results, &request, compact, has_identifiers);
+            return self.build_semantic_response(results, &request, compact, has_identifiers, ctx.project_alias.as_deref(), &ctx.alias_roots);
         }
 
         // === Modes: "hybrid" | "auto" — full hybrid search ===
@@ -1522,7 +3350,8 @@ impl CodesearchService {
 
         // Perform FTS search and fusion
         let mut results = match self
-            .with_fts_store_read(|fts_store| {
+            .with_fts_store_read_for(
+                |fts_store| {
                 let fts_results = fts_store
                     .search(&request.query, limit * 3, structural_intent)
                     .unwrap_or_default();
@@ -1560,7 +3389,7 @@ impl CodesearchService {
                 };
 
                 Ok(fused)
-            })
+            }, ctx.stores.clone())
             .await
         {
             Ok(fused) => {
@@ -1610,34 +3439,291 @@ impl CodesearchService {
         }
 
         tracing::debug!("MCP: Final {} results after hybrid search", results.len());
-        self.build_semantic_response(results, &request, compact, has_identifiers)
+        self.build_semantic_response(results, &request, compact, has_identifiers, ctx.project_alias.as_deref(), &ctx.alias_roots)
     }
 
     // === Helper methods (not exposed as tools) ===
 
+    /// Multi-store semantic search: fan out across all stores, merge raw vector/FTS
+    /// results, then apply RRF fusion.
+    #[allow(clippy::too_many_arguments)]
+    async fn semantic_search_multi(
+        &self,
+        request: &SemanticSearchRequest,
+        identifiers: &[String],
+        limit: usize,
+        compact: bool,
+        stores: Vec<Arc<SharedStores>>,
+        aliases: &[String],
+        alias_roots: &std::collections::HashMap<String, String>,
+    ) -> Result<CallToolResult, McpError> {
+        let mode = request.mode.as_deref().unwrap_or("auto");
+        let structural_intent = detect_structural_intent(&request.query);
+
+        // === Lexical mode: FTS only across all stores ===
+        if mode == "lexical" {
+            let fts_results = self
+                .with_fts_store_read_multi(
+                    |fts_store| fts_store.search(&request.query, limit * 3, structural_intent),
+                    stores.clone(),
+                    aliases,
+                )
+                .await
+                .unwrap_or_default();
+
+            // Also do exact search if identifiers detected
+            let mut all_fts = fts_results;
+            for ident in identifiers {
+                let exact = self
+                    .with_fts_store_read_multi(
+                        |fts_store| fts_store.search_exact(ident, limit * 2, structural_intent),
+                        stores.clone(),
+                        aliases,
+                    )
+                    .await
+                    .unwrap_or_default();
+                merge_exact_into_fts(&mut all_fts, exact);
+            }
+
+            all_fts.sort_by(|a, b| {
+                b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let results = self.resolve_fts_to_search_results_multi(&all_fts, limit, &stores).await;
+
+            if let Some(target_kind) = structural_intent {
+                // We need mutable results but we have them as vectordb::SearchResult
+                let mut mutable_results = results;
+                boost_kind(&mut mutable_results, target_kind);
+                return self.build_semantic_response(mutable_results, request, compact, !identifiers.is_empty(), None, alias_roots);
+            }
+
+            return self.build_semantic_response(results, request, compact, !identifiers.is_empty(), None, alias_roots);
+        }
+
+        // === Modes requiring embedding: "semantic", "hybrid", "auto" ===
+        let query_embedding = {
+            let mut service_guard = match self.get_embedding_service() {
+                Ok(g) => g,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error initializing embedding service: {}", e
+                    ))]));
+                }
+            };
+            let service = service_guard.as_mut().unwrap();
+            match service.embed_query(&request.query) {
+                Ok(e) => e,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error embedding query: {}", e
+                    ))]));
+                }
+            }
+        };
+
+        // Search vector stores across all repos
+        let vector_results = self
+            .with_vector_store_read_multi(
+                |store| store.search(&query_embedding, limit * 3).context("Error searching vector store"),
+                stores.clone(),
+                aliases,
+            )
+            .await
+            .unwrap_or_default();
+
+        // === Mode: "semantic" — vector only ===
+        if mode == "semantic" {
+            let fused = vector_only(&vector_results);
+            let chunk_to_result: std::collections::HashMap<u32, &crate::vectordb::SearchResult> =
+                vector_results.iter().map(|r| (r.id, r)).collect();
+
+            let mut results: Vec<crate::vectordb::SearchResult> = Vec::new();
+            for f in fused.into_iter().take(limit) {
+                if let Some(result) = chunk_to_result.get(&f.chunk_id) {
+                    let mut r = (*result).clone();
+                    r.score = f.rrf_score;
+                    results.push(r);
+                }
+            }
+            return self.build_semantic_response(results, request, compact, !identifiers.is_empty(), None, alias_roots);
+        }
+
+        // === Modes: "hybrid" | "auto" — full hybrid search ===
+        let (vector_k, fts_k) = adapt_rrf_k(&request.query);
+
+        // FTS search across all stores
+        let fts_results = self
+            .with_fts_store_read_multi(
+                |fts_store| fts_store.search(&request.query, limit * 3, structural_intent),
+                stores.clone(),
+                aliases,
+            )
+            .await
+            .unwrap_or_default();
+
+        // Exact identifier search across all stores
+        let all_exact = if !identifiers.is_empty() {
+            let mut exact_results: Vec<crate::fts::FtsResult> = Vec::new();
+            for ident in identifiers {
+                let exact = self
+                    .with_fts_store_read_multi(
+                        |fts_store| fts_store.search_exact(ident, limit * 2, structural_intent),
+                        stores.clone(),
+                        aliases,
+                    )
+                    .await
+                    .unwrap_or_default();
+                for r in exact {
+                    if !exact_results.iter().any(|e| e.chunk_id == r.chunk_id) {
+                        exact_results.push(r);
+                    }
+                }
+            }
+            exact_results
+        } else {
+            Vec::new()
+        };
+
+        // RRF fusion
+        let fused = if identifiers.is_empty() {
+            rrf_fusion(&vector_results, &fts_results, vector_k as f32)
+        } else {
+            rrf_fusion_with_exact(
+                &vector_results,
+                &fts_results,
+                &all_exact,
+                vector_k as f32,
+                fts_k as f32,
+                EXACT_MATCH_RRF_K,
+            )
+        };
+
+        // Map FusedResult back to SearchResult via chunk lookup across all stores
+        let chunk_to_result: std::collections::HashMap<u32, &crate::vectordb::SearchResult> =
+            vector_results.iter().map(|r| (r.id, r)).collect();
+
+        let mut mapped: Vec<crate::vectordb::SearchResult> = Vec::new();
+        for f in fused.into_iter().take(limit) {
+            if let Some(result) = chunk_to_result.get(&f.chunk_id) {
+                let mut r = (*result).clone();
+                r.score = f.rrf_score;
+                mapped.push(r);
+            } else {
+                // Chunk from FTS but not in vector results — resolve from stores
+                if let Some(resolved) = self.resolve_chunk_from_stores(f.chunk_id, f.rrf_score, &stores).await {
+                    mapped.push(resolved);
+                }
+            }
+        }
+
+        // Apply kind boost
+        if let Some(target_kind) = structural_intent {
+            boost_kind(&mut mapped, target_kind);
+        }
+
+        self.build_semantic_response(mapped, request, compact, !identifiers.is_empty(), None, alias_roots)
+    }
+
+    /// Resolve a single chunk from multiple stores (used for FTS-only hits in multi-store fusion).
+    async fn resolve_chunk_from_stores(
+        &self,
+        chunk_id: u32,
+        score: f32,
+        stores: &[Arc<SharedStores>],
+    ) -> Option<crate::vectordb::SearchResult> {
+        for store_arc in stores {
+            let store = store_arc.vector_store.read().await;
+            if let Ok(Some(chunk)) = store.get_chunk(chunk_id) {
+                return Some(crate::vectordb::SearchResult {
+                    id: chunk_id,
+                    content: chunk.content,
+                    path: chunk.path,
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    kind: chunk.kind,
+                    signature: chunk.signature,
+                    docstring: chunk.docstring,
+                    context: chunk.context,
+                    hash: chunk.hash,
+                    distance: 0.0,
+                    score,
+                    context_prev: chunk.context_prev,
+                    context_next: chunk.context_next,
+                });
+            }
+        }
+        None
+    }
+
+    /// Resolve FTS results to SearchResult using multiple stores.
+    async fn resolve_fts_to_search_results_multi(
+        &self,
+        fts_results: &[crate::fts::FtsResult],
+        limit: usize,
+        stores: &[Arc<SharedStores>],
+    ) -> Vec<crate::vectordb::SearchResult> {
+        let mut results = Vec::new();
+        for fts in fts_results.iter().take(limit) {
+            for store_arc in stores {
+                let store = store_arc.vector_store.read().await;
+                if let Ok(Some(chunk)) = store.get_chunk(fts.chunk_id) {
+                    results.push(crate::vectordb::SearchResult {
+                        id: fts.chunk_id,
+                        content: chunk.content,
+                        path: chunk.path,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        kind: chunk.kind,
+                        signature: chunk.signature,
+                        docstring: chunk.docstring,
+                        context: chunk.context,
+                        hash: chunk.hash,
+                        distance: 0.0,
+                        score: fts.score,
+                        context_prev: chunk.context_prev,
+                        context_next: chunk.context_next,
+                    });
+                    break; // Found in this store, skip remaining stores
+                }
+            }
+        }
+        results
+    }
+
     /// Lexical-only search: FTS without embedding service.
+    #[allow(clippy::too_many_arguments)]
     async fn semantic_search_lexical(
         &self,
         request: &SemanticSearchRequest,
         identifiers: &[String],
         limit: usize,
         compact: bool,
+        stores: Option<Arc<SharedStores>>,
+        project_alias: Option<&str>,
+        alias_roots: &std::collections::HashMap<String, String>,
     ) -> Result<CallToolResult, McpError> {
         let structural_intent = detect_structural_intent(&request.query);
 
         let mut fts_results = self
-            .with_fts_store_read(|fts_store| {
-                fts_store.search(&request.query, limit * 3, structural_intent)
-            })
+            .with_fts_store_read_for(
+                |fts_store| {
+                    fts_store.search(&request.query, limit * 3, structural_intent)
+                },
+                stores.clone(),
+            )
             .await
             .unwrap_or_default();
 
         // Also do exact search if identifiers detected
         for ident in identifiers {
             let exact = match self
-                .with_fts_store_read(|fts_store| {
-                    fts_store.search_exact(ident, limit * 2, structural_intent)
-                })
+                .with_fts_store_read_for(
+                    |fts_store| {
+                        fts_store.search_exact(ident, limit * 2, structural_intent)
+                    },
+                    stores.clone(),
+                )
                 .await
             {
                 Ok(r) => r,
@@ -1654,7 +3740,7 @@ impl CodesearchService {
 
         // Resolve FTS results to chunk metadata
         let mut results = self
-            .resolve_fts_to_search_results(&fts_results, limit)
+            .resolve_fts_to_search_results(&fts_results, limit, stores)
             .await;
 
         // Apply kind boost
@@ -1662,7 +3748,7 @@ impl CodesearchService {
             boost_kind(&mut results, target_kind);
         }
 
-        self.build_semantic_response(results, request, compact, !identifiers.is_empty())
+        self.build_semantic_response(results, request, compact, !identifiers.is_empty(), project_alias, alias_roots)
     }
 
     /// Build the final SemanticSearchResponse with low-confidence signaling.
@@ -1672,6 +3758,8 @@ impl CodesearchService {
         request: &SemanticSearchRequest,
         compact: bool,
         has_identifiers: bool,
+        project_alias: Option<&str>,
+        alias_roots: &std::collections::HashMap<String, String>,
     ) -> Result<CallToolResult, McpError> {
         if results.is_empty() {
             let response = SemanticSearchResponse {
@@ -1689,7 +3777,7 @@ impl CodesearchService {
             root.trim_end_matches('/').to_string()
         };
 
-        let items: Vec<SearchResultItem> = results
+        let mut items: Vec<SearchResultItem> = results
             .into_iter()
             .filter(|r| {
                 if let Some(ref fp) = request.filter_path {
@@ -1717,6 +3805,19 @@ impl CodesearchService {
             })
             .collect();
 
+        // Prefix paths with alias for multi-repo / single-project identification
+        for item in &mut items {
+            if let Some(alias) = project_alias {
+                if let Some(root) = alias_roots.get(alias) {
+                    item.path = prefix_path_with_alias(&item.path, Some(alias), root);
+                } else {
+                    item.path = crate::cache::normalize_path_str(&item.path);
+                }
+            } else if !alias_roots.is_empty() {
+                item.path = prefix_path_multi(&item.path, &[], alias_roots);
+            }
+        }
+
         // Check low-confidence: top result's RRF score below threshold
         let top_score = items.first().map(|r| r.score);
         let (low_confidence, suggested_tool) = compute_low_confidence(top_score, has_identifiers);
@@ -1736,40 +3837,42 @@ impl CodesearchService {
         &self,
         fts_results: &[crate::fts::FtsResult],
         limit: usize,
+        stores: Option<Arc<SharedStores>>,
     ) -> Vec<crate::vectordb::SearchResult> {
-        self.with_vector_store_read(|store| {
-            let mut results = Vec::new();
-            for fts in fts_results.iter().take(limit) {
-                if let Ok(Some(chunk)) = store.get_chunk(fts.chunk_id) {
-                    results.push(crate::vectordb::SearchResult {
-                        id: fts.chunk_id,
-                        content: chunk.content,
-                        path: chunk.path,
-                        start_line: chunk.start_line,
-                        end_line: chunk.end_line,
-                        kind: chunk.kind,
-                        signature: chunk.signature,
-                        docstring: chunk.docstring,
-                        context: chunk.context,
-                        hash: chunk.hash,
-                        distance: 0.0,
-                        score: fts.score,
-                        context_prev: chunk.context_prev,
-                        context_next: chunk.context_next,
-                    });
+        self.with_vector_store_read_for(
+            |store| {
+                let mut results = Vec::new();
+                for fts in fts_results.iter().take(limit) {
+                    if let Ok(Some(chunk)) = store.get_chunk(fts.chunk_id) {
+                        results.push(crate::vectordb::SearchResult {
+                            id: fts.chunk_id,
+                            content: chunk.content,
+                            path: chunk.path,
+                            start_line: chunk.start_line,
+                            end_line: chunk.end_line,
+                            kind: chunk.kind,
+                            signature: chunk.signature,
+                            docstring: chunk.docstring,
+                            context: chunk.context,
+                            hash: chunk.hash,
+                            distance: 0.0,
+                            score: fts.score,
+                            context_prev: chunk.context_prev,
+                            context_next: chunk.context_next,
+                        });
+                    }
                 }
-            }
-            Ok(results)
-        })
+                Ok(results)
+            },
+            stores,
+        )
         .await
         .unwrap_or_default()
     }
 
-    // === find_definition tool ===
+    // === find_definition internal ===
 
-    #[tool(
-        description = "Locate the definition of a symbol (function, class, method, struct, trait, enum, type).\nUses FTS + chunk-kind filter to exclude usages, comments, and string literals.\n\nUSE FOR: \"where is X defined\", \"show me the declaration of X\".\nDO NOT USE FOR: finding all call-sites → use `find_usages`."
-    )]
+    /// Internal: find symbol definitions, used by `find(kind="definition")`.
     async fn find_definition(
         &self,
         Parameters(request): Parameters<FindDefinitionRequest>,
@@ -1783,21 +3886,39 @@ impl CodesearchService {
             limit
         );
 
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        // Resolve project/group routing
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        if ctx.needs_local_db {
+            if let Err(e) = self.ensure_database_exists() {
+                return Ok(CallToolResult::success(vec![Content::text(e)]));
+            }
         }
 
-        // Search with extra results — we'll filter down
-        let fts_results = match self
-            .with_fts_store_read(|fts_store| fts_store.search(&request.symbol, limit * 3, None))
+        // FTS search — multi-store or single
+        let fts_results = if let Some(ref sv) = ctx.stores_vec {
+            let sa = ctx.store_aliases.as_ref().unwrap();
+            self.with_fts_store_read_multi(
+                |fts_store| fts_store.search(&request.symbol, limit * 3, None),
+                sv.clone(),
+                sa,
+            )
             .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error searching: {}",
-                    e
-                ))]));
+            .unwrap_or_default()
+        } else {
+            match self
+                .with_fts_store_read_for(|fts_store| fts_store.search(&request.symbol, limit * 3, None), ctx.stores.clone())
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error searching: {}", e
+                    ))]));
+                }
             }
         };
 
@@ -1809,46 +3930,88 @@ impl CodesearchService {
         }
 
         // Resolve chunk metadata and filter by definition kinds
-        let items: Vec<ReferenceItem> = match self
-            .with_vector_store_read(|store| {
-                let items = fts_results
-                    .iter()
-                    .filter_map(|fts_result| {
-                        if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
-                            if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
-                                return None;
-                            }
-                            if let Some(ref requested_kind) = request.kind {
-                                if chunk.kind != *requested_kind {
-                                    return None;
-                                }
-                            }
-                            Some(ReferenceItem {
-                                chunk_id: fts_result.chunk_id,
-                                path: chunk.path,
-                                line: chunk.start_line,
-                                kind: chunk.kind,
-                                signature: chunk.signature,
-                                score: fts_result.score,
-                            })
-                        } else {
-                            None
+        let requested_kind = request.kind.clone();
+        let mut items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
+            let mut items: Vec<ReferenceItem> = Vec::new();
+            'outer: for fts_result in &fts_results {
+                for store_arc in sv {
+                    let store = store_arc.vector_store.read().await;
+                    if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                        // Skip non-definition kinds — try next FTS result, not next store
+                        if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
+                            continue 'outer;
                         }
-                    })
-                    .take(limit)
-                    .collect();
-                Ok(items)
-            })
-            .await
-        {
-            Ok(items) => items,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error opening database: {}",
-                    e
-                ))]));
+                        if let Some(ref rk) = requested_kind {
+                            if chunk.kind != *rk {
+                                continue 'outer;
+                            }
+                        }
+                        items.push(ReferenceItem {
+                            chunk_id: fts_result.chunk_id,
+                            path: chunk.path,
+                            line: chunk.start_line,
+                            kind: chunk.kind,
+                            signature: chunk.signature,
+                            score: fts_result.score,
+                        });
+                        if items.len() >= limit {
+                            break 'outer;
+                        }
+                        break; // Found in this store — move to next FTS result
+                    }
+                }
+                // If we get here, chunk wasn't found in any store — just skip it
+            }
+            items
+        } else {
+            match self
+                .with_vector_store_read_for(
+                    |store| {
+                        let items = fts_results
+                            .iter()
+                            .filter_map(|fts_result| {
+                                if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                                    if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
+                                        return None;
+                                    }
+                                    if let Some(ref requested_kind) = requested_kind {
+                                        if chunk.kind != *requested_kind {
+                                            return None;
+                                        }
+                                    }
+                                    Some(ReferenceItem {
+                                        chunk_id: fts_result.chunk_id,
+                                        path: chunk.path,
+                                        line: chunk.start_line,
+                                        kind: chunk.kind,
+                                        signature: chunk.signature,
+                                        score: fts_result.score,
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .take(limit)
+                            .collect();
+                        Ok(items)
+                    },
+                    ctx.stores.clone(),
+                )
+                .await
+            {
+                Ok(items) => items,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error opening database: {}", e
+                    ))]));
+                }
             }
         };
+
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut items {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1863,39 +4026,57 @@ impl CodesearchService {
 
     // === find_usages tool ===
 
-    #[tool(
-        description = "Find call-sites and other usages of a symbol across the codebase.\nUses FTS; excludes the chunks that are the symbol's own definition.\n\nUSE FOR: impact analysis, refactoring, \"who calls X\".\nDO NOT USE FOR: finding the definition itself → use `find_definition`."
-    )]
     async fn find_usages(
         &self,
         Parameters(request): Parameters<FindUsagesRequest>,
     ) -> Result<CallToolResult, McpError> {
-        self.find_usages_impl(request.symbol.clone(), request.limit.unwrap_or(20))
+        self.find_usages_impl(request.symbol.clone(), request.limit.unwrap_or(20), request.project, request.group)
             .await
     }
 
-    /// Shared implementation for find_usages and the deprecated find_references alias.
+    /// Shared implementation for find_usages (used by `find(kind="usages")`).
     async fn find_usages_impl(
         &self,
         symbol: String,
         limit: usize,
+        project: Option<String>,
+        group: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         tracing::debug!("MCP find_usages: symbol='{}', limit={}", symbol, limit);
 
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        // Resolve project/group routing
+        let ctx = match self.resolve_routing(&project, &group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        if ctx.needs_local_db {
+            if let Err(e) = self.ensure_database_exists() {
+                return Ok(CallToolResult::success(vec![Content::text(e)]));
+            }
         }
 
-        let fts_results = match self
-            .with_fts_store_read(|fts_store| fts_store.search(&symbol, limit * 2, None))
+        // FTS search — multi-store or single
+        let fts_results = if let Some(ref sv) = ctx.stores_vec {
+            let sa = ctx.store_aliases.as_ref().unwrap();
+            self.with_fts_store_read_multi(
+                |fts_store| fts_store.search(&symbol, limit * 2, None),
+                sv.clone(),
+                sa,
+            )
             .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error searching: {}",
-                    e
-                ))]));
+            .unwrap_or_default()
+        } else {
+            match self
+                .with_fts_store_read_for(|fts_store| fts_store.search(&symbol, limit * 2, None), ctx.stores.clone())
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error searching: {}", e
+                    ))]));
+                }
             }
         };
 
@@ -1907,41 +4088,74 @@ impl CodesearchService {
         }
 
         // Resolve chunks and exclude definition chunks
-        let items: Vec<ReferenceItem> = match self
-            .with_vector_store_read(|store| {
-                let items = fts_results
-                    .iter()
-                    .filter_map(|fts_result| {
-                        if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
-                            if is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
-                                return None;
-                            }
-                            Some(ReferenceItem {
+        let mut items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
+            let mut items: Vec<ReferenceItem> = Vec::new();
+            for fts_result in &fts_results {
+                for store_arc in sv {
+                    let store = store_arc.vector_store.read().await;
+                    if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                        if !is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
+                            items.push(ReferenceItem {
                                 chunk_id: fts_result.chunk_id,
                                 path: chunk.path,
                                 line: chunk.start_line,
                                 kind: chunk.kind,
                                 signature: chunk.signature,
                                 score: fts_result.score,
-                            })
-                        } else {
-                            None
+                            });
                         }
-                    })
-                    .take(limit)
-                    .collect();
-                Ok(items)
-            })
-            .await
-        {
-            Ok(items) => items,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error opening database: {}",
-                    e
-                ))]));
+                        break;
+                    }
+                }
+                if items.len() >= limit {
+                    break;
+                }
+            }
+            items
+        } else {
+            match self
+                .with_vector_store_read_for(
+                    |store| {
+                        let items = fts_results
+                            .iter()
+                            .filter_map(|fts_result| {
+                                if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                                    if is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
+                                        return None;
+                                    }
+                                    Some(ReferenceItem {
+                                        chunk_id: fts_result.chunk_id,
+                                        path: chunk.path,
+                                        line: chunk.start_line,
+                                        kind: chunk.kind,
+                                        signature: chunk.signature,
+                                        score: fts_result.score,
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .take(limit)
+                            .collect();
+                        Ok(items)
+                    },
+                    ctx.stores.clone(),
+                )
+                .await
+            {
+                Ok(items) => items,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error opening database: {}", e
+                    ))]));
+                }
             }
         };
+
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut items {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1954,54 +4168,97 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "DEPRECATED. Use `find_definition` to locate a symbol's declaration, or `find_usages` to find call-sites.\nThis tool is retained as an alias for `find_usages` and may be removed in a future version."
-    )]
-    async fn find_references(
-        &self,
-        Parameters(request): Parameters<FindReferencesRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        self.find_usages_impl(request.symbol, request.limit.unwrap_or(20))
-            .await
-    }
-
-    #[tool(
-        description = "List all indexed top-level symbols in a file — kind, signature, and line range, no body content.\nUse this to understand a file's structure before deciding which chunks to read.\nMuch cheaper than reading the full file.\n\nUSE FOR: \"what functions are in auth.rs\", \"show me the structure of this module\".\nDO NOT USE FOR: finding where a symbol is defined across the codebase → use `find_definition`."
-    )]
     async fn file_outline(
         &self,
         Parameters(request): Parameters<FileOutlineRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let _project = request.project.as_deref();
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        // Resolve project/group routing
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        // Outline operates on a single repo — reject group fan-out
+        if ctx.is_multi {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Tool 'explore' operates on a single repo. Use 'project' instead of 'group'.".to_string(),
+            )]));
         }
 
-        let normalized = normalize_tool_path(&request.path, &self.project_path);
-        let items = match self
-            .with_vector_store_read(|store| {
-                let mut out: Vec<FileOutlineItem> = store
-                    .chunks_for_file(&normalized)?
-                    .into_iter()
-                    .map(|c| FileOutlineItem {
-                        chunk_id: c.id,
-                        kind: c.kind,
-                        signature: c.signature,
-                        start_line: c.start_line,
-                        end_line: c.end_line,
-                    })
-                    .collect();
-                out.sort_by_key(|i| i.start_line);
-                Ok(out)
-            })
-            .await
-        {
-            Ok(items) => items,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error reading outline: {}",
-                    e
-                ))]));
+        if ctx.needs_local_db {
+            if let Err(e) = self.ensure_database_exists() {
+                return Ok(CallToolResult::success(vec![Content::text(e)]));
+            }
+        }
+
+        // In serve mode, use the resolved project root from alias_roots;
+        // self.project_path is "serve://multi-repo" which doesn't resolve.
+        let project_root = if let Some(ref alias) = ctx.project_alias {
+            ctx.alias_roots
+                .get(alias)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.project_path.clone())
+        } else {
+            self.project_path.clone()
+        };
+        let normalized = normalize_tool_path(&request.path, &project_root);
+
+        let items = if let Some(ref sv) = ctx.stores_vec {
+            // Multi-store group fan-out: collect outline items from all stores
+            let mut all_items: Vec<FileOutlineItem> = Vec::new();
+            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for store_arc in sv {
+                let store = store_arc.vector_store.read().await;
+                match store.chunks_for_file(&normalized) {
+                    Ok(metas) => {
+                        for c in metas {
+                            if seen_ids.insert(c.id) {
+                                all_items.push(FileOutlineItem {
+                                    chunk_id: c.id,
+                                    kind: c.kind,
+                                    signature: c.signature,
+                                    start_line: c.start_line,
+                                    end_line: c.end_line,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Vector store read failed in file_outline fan-out: {:?}", e);
+                    }
+                }
+            }
+            all_items.sort_by_key(|i| i.start_line);
+            all_items
+        } else {
+            match self
+                .with_vector_store_read_for(
+                    |store| {
+                        let mut out: Vec<FileOutlineItem> = store
+                            .chunks_for_file(&normalized)?
+                            .into_iter()
+                            .map(|c| FileOutlineItem {
+                                chunk_id: c.id,
+                                kind: c.kind,
+                                signature: c.signature,
+                                start_line: c.start_line,
+                                end_line: c.end_line,
+                            })
+                            .collect();
+                        out.sort_by_key(|i| i.start_line);
+                        Ok(out)
+                    },
+                    ctx.stores.clone(),
+                )
+                .await
+            {
+                Ok(items) => items,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error reading outline: {}",
+                        e
+                    ))]));
+                }
             }
         };
 
@@ -2022,9 +4279,21 @@ impl CodesearchService {
         &self,
         Parameters(request): Parameters<GetChunkRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let _project = request.project.as_deref();
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        tracing::info!(
+            "📥 get_chunk(chunk_id={}, project={:?})",
+            request.chunk_id,
+            request.project,
+        );
+        // Resolve project/group routing
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        if ctx.needs_local_db {
+            if let Err(e) = self.ensure_database_exists() {
+                return Ok(CallToolResult::success(vec![Content::text(e)]));
+            }
         }
 
         let mut clamped = false;
@@ -2034,24 +4303,40 @@ impl CodesearchService {
             clamped = true;
         }
 
-        let chunk = match self
-            .with_vector_store_read(|store| store.get_chunk(request.chunk_id))
-            .await
-        {
-            Ok(Some(c)) => c,
-            Ok(None) => {
+        // Look up chunk — multi-store: try each store until found
+        let chunk = if let Some(ref sv) = ctx.stores_vec {
+            let mut found = None;
+            for store_arc in sv {
+                let store = store_arc.vector_store.read().await;
+                match store.get_chunk(request.chunk_id) {
+                    Ok(Some(c)) => { found = Some(c); break; }
+                    Ok(None) => continue,
+                    Err(_) => break,
+                }
+            }
+            found
+        } else {
+            self
+                .with_vector_store_read_for(
+                    |store| store.get_chunk(request.chunk_id),
+                    ctx.stores.clone(),
+                )
+                .await
+                .unwrap_or_default()
+        };
+
+        let mut chunk = match chunk {
+            Some(c) => c,
+            None => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
                     "Chunk {} not found. Verify the chunk_id and index state.",
                     request.chunk_id
                 ))]));
             }
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error loading chunk: {}",
-                    e
-                ))]));
-            }
         };
+
+        // Prefix path with alias for multi-repo identification
+        chunk.path = ctx.prefix_result_path(&chunk.path);
 
         let mut context_before = None;
         let mut context_after = None;
@@ -2107,45 +4392,84 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "List all imports/dependencies declared in a source file.\nUses tree-sitter AST data already present in the index — no re-parsing needed.\n\nUSE FOR: \"what does auth.rs depend on\", understanding a file's dependencies before refactoring.\nDO NOT USE FOR: finding who imports this file → use `find_dependents`."
-    )]
     async fn find_imports(
         &self,
         Parameters(request): Parameters<FindImportsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let _project = request.project.as_deref();
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        // Resolve project/group routing
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        if ctx.needs_local_db {
+            if let Err(e) = self.ensure_database_exists() {
+                return Ok(CallToolResult::success(vec![Content::text(e)]));
+            }
         }
 
-        // Import statements are currently represented mostly as gap-classified
-        // `Imports` chunks (not always as per-statement AST definition chunks).
-        // We therefore parse lines inside import-like chunks and use an FTS
-        // fallback when no import-like chunks exist for the file.
-        let normalized = normalize_tool_path(&request.path, &self.project_path);
+        // In serve mode, use the resolved project root from alias_roots
+        let project_root = if let Some(ref alias) = ctx.project_alias {
+            ctx.alias_roots
+                .get(alias)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.project_path.clone())
+        } else {
+            self.project_path.clone()
+        };
+        let normalized = normalize_tool_path(&request.path, &project_root);
 
-        let mut items = match self
-            .with_vector_store_read(|store| {
-                let mut out = Vec::new();
-                for meta in store.chunks_for_file(&normalized)? {
-                    if !is_import_kind(&meta.kind) {
-                        continue;
+        let mut items = if let Some(ref sv) = ctx.stores_vec {
+            // Multi-store group fan-out: collect import items from all stores
+            let mut all_items: Vec<ImportItem> = Vec::new();
+            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for store_arc in sv {
+                let store = store_arc.vector_store.read().await;
+                match store.chunks_for_file(&normalized) {
+                    Ok(metas) => {
+                        for meta in metas {
+                            if !is_import_kind(&meta.kind) {
+                                continue;
+                            }
+                            if seen_ids.insert(meta.id) {
+                                if let Ok(Some(chunk)) = store.get_chunk(meta.id) {
+                                    all_items.extend(parse_import_lines(&chunk.content, chunk.start_line));
+                                }
+                            }
+                        }
                     }
-                    if let Some(chunk) = store.get_chunk(meta.id)? {
-                        out.extend(parse_import_lines(&chunk.content, chunk.start_line));
+                    Err(e) => {
+                        tracing::warn!("Vector store read failed in find_imports fan-out: {:?}", e);
                     }
                 }
-                Ok(out)
-            })
-            .await
-        {
-            Ok(items) => items,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error reading imports: {}",
-                    e
-                ))]));
+            }
+            all_items
+        } else {
+            match self
+                .with_vector_store_read_for(
+                    |store| {
+                        let mut out = Vec::new();
+                        for meta in store.chunks_for_file(&normalized)? {
+                            if !is_import_kind(&meta.kind) {
+                                continue;
+                            }
+                            if let Some(chunk) = store.get_chunk(meta.id)? {
+                                out.extend(parse_import_lines(&chunk.content, chunk.start_line));
+                            }
+                        }
+                        Ok(out)
+                    },
+                    ctx.stores.clone(),
+                )
+                .await
+            {
+                Ok(items) => items,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error reading imports: {}",
+                        e
+                    ))]));
+                }
             }
         };
 
@@ -2156,36 +4480,79 @@ impl CodesearchService {
             // language-specific import forms that lack these keywords will be missed.
             let fallback_limit = 40usize;
             let mut all_hits: Vec<(u32, f32)> = Vec::new();
-            let mut seen_ids: HashSet<u32> = HashSet::new();
+            let mut seen_fts_ids: HashSet<u32> = HashSet::new();
 
-            for keyword in &["import", "use", "from", "require", "include"] {
-                let hits = self
-                    .with_fts_store_read(|fts_store| {
-                        fts_store.search_exact(keyword, fallback_limit, None)
-                    })
-                    .await
-                    .unwrap_or_default();
-                for h in hits {
-                    if seen_ids.insert(h.chunk_id) {
-                        all_hits.push((h.chunk_id, h.score));
-                    }
-                }
-            }
-
-            items = self
-                .with_vector_store_read(|store| {
-                    let mut out = Vec::new();
-                    for (chunk_id, _) in &all_hits {
-                        if let Some(chunk) = store.get_chunk(*chunk_id)? {
-                            if crate::cache::normalize_path_str(&chunk.path) == normalized {
-                                out.extend(parse_import_lines(&chunk.content, chunk.start_line));
-                            }
+            if let Some(ref sv) = ctx.stores_vec {
+                // Multi-store FTS fallback
+                for keyword in &["import", "use", "from", "require", "include"] {
+                    let hits = self
+                        .with_fts_store_read_multi(
+                            |fts_store| {
+                                fts_store.search_exact(keyword, fallback_limit, None)
+                            },
+                            sv.clone(),
+                            ctx.store_aliases.as_ref().unwrap(),
+                        )
+                        .await
+                        .unwrap_or_default();
+                    for h in hits {
+                        if seen_fts_ids.insert(h.chunk_id) {
+                            all_hits.push((h.chunk_id, h.score));
                         }
                     }
-                    Ok(out)
-                })
-                .await
-                .unwrap_or_default();
+                }
+
+                // Resolve FTS hits via vector stores
+                let mut resolved: Vec<ImportItem> = Vec::new();
+                for (chunk_id, _) in &all_hits {
+                    for store_arc in sv {
+                        let store = store_arc.vector_store.read().await;
+                        if let Ok(Some(chunk)) = store.get_chunk(*chunk_id) {
+                            if crate::cache::normalize_path_str(&chunk.path) == normalized {
+                                resolved.extend(parse_import_lines(&chunk.content, chunk.start_line));
+                            }
+                            break;
+                        }
+                    }
+                }
+                items = resolved;
+            } else {
+                // Single-store FTS fallback
+                for keyword in &["import", "use", "from", "require", "include"] {
+                    let hits = self
+                        .with_fts_store_read_for(
+                            |fts_store| {
+                                fts_store.search_exact(keyword, fallback_limit, None)
+                            },
+                            ctx.stores.clone(),
+                        )
+                        .await
+                        .unwrap_or_default();
+                    for h in hits {
+                        if seen_fts_ids.insert(h.chunk_id) {
+                            all_hits.push((h.chunk_id, h.score));
+                        }
+                    }
+                }
+
+                items = self
+                    .with_vector_store_read_for(
+                        |store| {
+                            let mut out = Vec::new();
+                            for (chunk_id, _) in &all_hits {
+                                if let Some(chunk) = store.get_chunk(*chunk_id)? {
+                                    if crate::cache::normalize_path_str(&chunk.path) == normalized {
+                                        out.extend(parse_import_lines(&chunk.content, chunk.start_line));
+                                    }
+                                }
+                            }
+                            Ok(out)
+                        },
+                        ctx.stores.clone(),
+                    )
+                    .await
+                    .unwrap_or_default();
+            }
         }
 
         items.sort_by_key(|i| i.line);
@@ -2199,109 +4566,234 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "Find all files that import or depend on a given module, file path, or symbol.\nEssential for impact analysis: \"if I change this module, what else breaks?\"\n\nUSE FOR: refactoring impact analysis, understanding who depends on a module.\nDO NOT USE FOR: finding usages of a specific function call → use `find_usages`."
-    )]
     async fn find_dependents(
         &self,
         Parameters(request): Parameters<FindDependentsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let _project = request.project.as_deref();
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        // Resolve project/group routing
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        if ctx.needs_local_db {
+            if let Err(e) = self.ensure_database_exists() {
+                return Ok(CallToolResult::success(vec![Content::text(e)]));
+            }
         }
 
         let limit = request.limit.unwrap_or(20).min(200);
         let high_limit = (limit * 10).max(200); // generous budget for filtering
 
+        // Extract a meaningful search term from path-like inputs.
+        // Import chunks contain module references like `use crate::constants::X`
+        // but the tool receives file paths like `src/constants.rs`.
+        // We extract the file stem to match against module names in imports.
+        let search_term = if request.symbol_or_path.contains('/')
+            || request.symbol_or_path.contains('\\')
+            || request.symbol_or_path.contains('.')
+        {
+            std::path::Path::new(&request.symbol_or_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&request.symbol_or_path)
+                .to_string()
+        } else {
+            request.symbol_or_path.clone()
+        };
+
+        let import_kind = Some(crate::chunker::ChunkKind::Imports);
+
         // Two-phase search strategy:
-        // 1. `search_exact` — precise term match on signature+content. Better at
-        //    finding specific identifiers inside import regions without drowning
-        //    in noise from non-import chunks.
+        // 1. `search_exact` — precise term match on signature+content with
+        //    MUST filter for Import kind. Strictly limits results to import chunks.
         // 2. If that yields no import-kind results, fall back to `search`
-        //    (QueryParser, broader tokenization) with a large limit.
+        //    (QueryParser, broader tokenization) with kind boost for imports.
         //
         // Limitation: the chunker does not emit per-statement AST import chunks;
         // imports are gap-classified as `Imports` kind. Chunks whose kind doesn't
         // match `is_import_kind()` will be missed regardless of search method.
-        let exact_hits = self
-            .with_fts_store_read(|fts_store| {
-                fts_store.search_exact(&request.symbol_or_path, high_limit, None)
-            })
-            .await
-            .unwrap_or_default();
+        let fts_results = if let Some(ref sv) = ctx.stores_vec {
+            let sa = ctx.store_aliases.as_ref().unwrap();
+            // Multi-store FTS search
+            let exact_hits = self
+                .with_fts_store_read_multi(
+                    |fts_store| {
+                        fts_store.search_exact(&search_term, high_limit, import_kind)
+                    },
+                    sv.clone(),
+                    sa,
+                )
+                .await
+                .unwrap_or_default();
 
-        let fts_results = if exact_hits.is_empty() {
-            self.with_fts_store_read(|fts_store| {
-                fts_store.search(&request.symbol_or_path, high_limit, None)
-            })
-            .await
-            .unwrap_or_default()
+            if exact_hits.is_empty() {
+                self.with_fts_store_read_multi(
+                    |fts_store| {
+                        fts_store.search(&search_term, high_limit, import_kind)
+                    },
+                    sv.clone(),
+                    sa,
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                exact_hits
+            }
         } else {
-            exact_hits
-        };
+            // Single-store FTS search
+            let exact_hits = self
+                .with_fts_store_read_for(
+                    |fts_store| {
+                        fts_store.search_exact(&search_term, high_limit, import_kind)
+                    },
+                    ctx.stores.clone(),
+                )
+                .await
+                .unwrap_or_default();
 
-        let mut items = match self
-            .with_vector_store_read(|store| {
-                let mut seen_paths = HashSet::new();
-                let mut out = Vec::new();
-                for f in &fts_results {
-                    if let Some(chunk) = store.get_chunk(f.chunk_id)? {
-                        if !is_import_kind(&chunk.kind) {
-                            continue;
-                        }
-
-                        let norm = crate::cache::normalize_path_str(&chunk.path);
-                        if !seen_paths.insert(norm) {
-                            continue;
-                        }
-
-                        // Extract the specific import line(s) that mention the
-                        // symbol, rather than returning the entire chunk content.
-                        let import_statement = if chunk
-                            .content
-                            .to_lowercase()
-                            .contains(&request.symbol_or_path.to_lowercase())
-                        {
-                            chunk
-                                .content
-                                .lines()
-                                .find(|l| {
-                                    l.to_lowercase()
-                                        .contains(&request.symbol_or_path.to_lowercase())
-                                })
-                                .unwrap_or("")
-                                .to_string()
-                        } else {
-                            chunk
-                                .signature
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or(chunk.content.lines().next().unwrap_or("").to_string())
-                        };
-
-                        out.push(DependentItem {
-                            path: chunk.path,
-                            line: chunk.start_line,
-                            import_statement,
-                        });
-
-                        if out.len() >= limit {
-                            break;
-                        }
-                    }
-                }
-                Ok(out)
-            })
-            .await
-        {
-            Ok(items) => items,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error resolving dependents: {}",
-                    e
-                ))]));
+            if exact_hits.is_empty() {
+                self.with_fts_store_read_for(
+                    |fts_store| {
+                        fts_store.search(&search_term, high_limit, import_kind)
+                    },
+                    ctx.stores.clone(),
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                exact_hits
             }
         };
+
+        let mut items = if let Some(ref sv) = ctx.stores_vec {
+            // Multi-store: resolve chunks across all stores
+            let mut seen_paths = HashSet::new();
+            let mut out = Vec::new();
+            for f in &fts_results {
+                for store_arc in sv {
+                    let store = store_arc.vector_store.read().await;
+                    match store.get_chunk(f.chunk_id) {
+                        Ok(Some(chunk)) => {
+                            if !is_import_kind(&chunk.kind) {
+                                break; // try next FTS result
+                            }
+
+                            let norm = crate::cache::normalize_path_str(&chunk.path);
+                            if !seen_paths.insert(norm) {
+                                break;
+                            }
+
+                            let term_lower = search_term.to_lowercase();
+                            let import_statement = if chunk
+                                .content
+                                .to_lowercase()
+                                .contains(&term_lower)
+                            {
+                                chunk
+                                    .content
+                                    .lines()
+                                    .find(|l| {
+                                        l.to_lowercase()
+                                            .contains(&term_lower)
+                                    })
+                                    .unwrap_or("")
+                                    .to_string()
+                            } else {
+                                chunk
+                                    .signature
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(chunk.content.lines().next().unwrap_or("").to_string())
+                            };
+
+                            out.push(DependentItem {
+                                path: chunk.path,
+                                line: chunk.start_line,
+                                import_statement,
+                            });
+
+                            break; // found in this store, move to next FTS result
+                        }
+                        Ok(None) => {} // try next store
+                        Err(_) => break,
+                    }
+                }
+                if out.len() >= limit {
+                    break;
+                }
+            }
+            out
+        } else {
+            match self
+                .with_vector_store_read_for(
+                    |store| {
+                    let mut seen_paths = HashSet::new();
+                    let mut out = Vec::new();
+                    let term_lower = search_term.to_lowercase();
+                    for f in &fts_results {
+                        if let Some(chunk) = store.get_chunk(f.chunk_id)? {
+                            if !is_import_kind(&chunk.kind) {
+                                continue;
+                            }
+
+                            let norm = crate::cache::normalize_path_str(&chunk.path);
+                            if !seen_paths.insert(norm) {
+                                continue;
+                            }
+
+                            // Extract the specific import line(s) that mention the
+                            // module name, rather than returning the entire chunk content.
+                            let import_statement = if chunk
+                                .content
+                                .to_lowercase()
+                                .contains(&term_lower)
+                            {
+                                chunk
+                                    .content
+                                    .lines()
+                                    .find(|l| {
+                                        l.to_lowercase()
+                                            .contains(&term_lower)
+                                    })
+                                    .unwrap_or("")
+                                    .to_string()
+                            } else {
+                                chunk
+                                    .signature
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(chunk.content.lines().next().unwrap_or("").to_string())
+                            };
+
+                            out.push(DependentItem {
+                                path: chunk.path,
+                                line: chunk.start_line,
+                                import_statement,
+                            });
+
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(out)
+                }, ctx.stores.clone())
+                .await
+            {
+                Ok(items) => items,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error resolving dependents: {}",
+                        e
+                    ))]));
+                }
+            }
+        };
+
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut items {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
 
         items.sort_by(|a, b| a.path.cmp(&b.path));
         if items.is_empty() {
@@ -2315,253 +4807,623 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "Find chunks semantically similar to a given chunk (by chunk_id).\nUses the chunk's existing embedding — no new embedding call needed.\n\nUSE FOR: finding duplicate implementations, similar patterns, related code across the codebase.\nDO NOT USE FOR: finding where a symbol is used → use `find_usages`."
-    )]
+    /// Internal: find similar chunks, used by `explore(kind="similar")`.
     async fn similar_chunks(
         &self,
         Parameters(request): Parameters<SimilarChunksRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let _project = request.project.as_deref();
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
+        // Resolve project/group routing
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        if ctx.needs_local_db {
+            if let Err(e) = self.ensure_database_exists() {
+                return Ok(CallToolResult::success(vec![Content::text(e)]));
+            }
         }
 
         let limit = request.limit.unwrap_or(5).min(20);
 
-        let results = match self
-            .with_vector_store_read(|store| {
-                let embedding = store
-                    .get_embedding(request.chunk_id)?
-                    .ok_or_else(|| anyhow::anyhow!("embedding not found for chunk_id {}", request.chunk_id))?;
+        let mut results = if let Some(ref sv) = ctx.stores_vec {
+            // Multi-store: find the embedding in whichever store has it,
+            // then search across all stores for similar chunks.
+            let mut embedding: Option<Vec<f32>> = None;
+            for store_arc in sv {
+                let store = store_arc.vector_store.read().await;
+                if let Ok(Some(emb)) = store.get_embedding(request.chunk_id) {
+                    embedding = Some(emb);
+                    break;
+                }
+            }
 
-                let mut neighbors = store.search(&embedding, limit + 1)?;
-                neighbors.retain(|r| r.id != request.chunk_id);
-                neighbors.truncate(limit);
+            let embedding = match embedding {
+                Some(e) => e,
+                None => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Embedding not found for chunk_id {} in any store.",
+                        request.chunk_id
+                    ))]));
+                }
+            };
 
-                let items = neighbors
-                    .into_iter()
-                    .map(|r| SearchResultItem {
-                        chunk_id: r.id,
-                        path: r.path,
-                        start_line: r.start_line,
-                        end_line: r.end_line,
-                        kind: r.kind,
-                        score: r.score,
-                        signature: r.signature,
-                        content: None,
-                        context_prev: None,
-                        context_next: None,
-                    })
-                    .collect::<Vec<_>>();
-                Ok(items)
-            })
-            .await
-        {
-            Ok(items) => items,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error finding similar chunks: {}",
-                    e
-                ))]));
+            // Search across all stores with the found embedding
+            let mut all_results: Vec<SearchResultItem> = Vec::new();
+            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for store_arc in sv {
+                let store = store_arc.vector_store.read().await;
+                match store.search(&embedding, limit + 1) {
+                    Ok(mut neighbors) => {
+                        neighbors.retain(|r| r.id != request.chunk_id);
+                        for r in neighbors {
+                            if seen_ids.insert(r.id) {
+                                all_results.push(SearchResultItem {
+                                    chunk_id: r.id,
+                                    path: r.path,
+                                    start_line: r.start_line,
+                                    end_line: r.end_line,
+                                    kind: r.kind,
+                                    score: r.score,
+                                    signature: r.signature,
+                                    content: None,
+                                    context_prev: None,
+                                    context_next: None,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Similarity search failed in fan-out: {:?}", e);
+                    }
+                }
+            }
+
+            all_results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            all_results.truncate(limit);
+            all_results
+        } else {
+            match self
+                .with_vector_store_read_for(
+                    |store| {
+                        let embedding = store
+                            .get_embedding(request.chunk_id)?
+                            .ok_or_else(|| anyhow::anyhow!("embedding not found for chunk_id {}", request.chunk_id))?;
+
+                        let mut neighbors = store.search(&embedding, limit + 1)?;
+                        neighbors.retain(|r| r.id != request.chunk_id);
+                        neighbors.truncate(limit);
+
+                        let items = neighbors
+                            .into_iter()
+                            .map(|r| SearchResultItem {
+                                chunk_id: r.id,
+                                path: r.path,
+                                start_line: r.start_line,
+                                end_line: r.end_line,
+                                kind: r.kind,
+                                score: r.score,
+                                signature: r.signature,
+                                content: None,
+                                context_prev: None,
+                                context_next: None,
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(items)
+                    },
+                    ctx.stores.clone(),
+                )
+                .await
+            {
+                Ok(items) => items,
+                Err(e) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error finding similar chunks: {}",
+                        e
+                    ))]));
+                }
             }
         };
+
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut results {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
 
         let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "Search code using literal/FTS matching without embeddings. Three modes: exact (default), regex (set regex=true), phrase (set phrase=true). Supports file_glob and language post-filters. Use this when you need fast exact text search, pattern matching, or phrase search. Does NOT require an embedding model."
-    )]
     async fn literal_search(
         &self,
         Parameters(request): Parameters<LiteralSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // Resolve project/group routing
+        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
         let limit = request.limit.unwrap_or(20);
         let output_format = request.format.as_deref().unwrap_or("json");
 
-        tracing::debug!(
-            "MCP literal_search: query='{}', regex={:?}, phrase={:?}, limit={}, file_glob={:?}, language={:?}, format={}",
-            request.query,
-            request.regex,
-            request.phrase,
-            limit,
-            request.file_glob,
-            request.language,
-            output_format
-        );
+        // Auto-regex promotion: detect code patterns that BM25 would destroy
+        let user_set_regex  = request.regex.unwrap_or(false);
+        let user_set_phrase = request.phrase.unwrap_or(false);
+        let auto_promoted   = !user_set_regex
+            && !user_set_phrase
+            && looks_like_code_pattern(&request.query);
 
-        // Ensure database exists
-        if let Err(e) = self.ensure_database_exists() {
-            return Ok(CallToolResult::success(vec![Content::text(e)]));
-        }
-
-        // Use shared FTS store when available, open standalone otherwise
-        let fts_results = match self
-            .with_fts_store_read(|fts_store| {
-                // Determine search mode and execute
-                if request.regex.unwrap_or(false) {
-                    fts_store.search_regex(&request.query, limit * 3)
-                } else if request.phrase.unwrap_or(false) {
-                    fts_store.search_phrase(&request.query, limit * 3)
-                } else {
-                    // Default: BM25 exact term search
-                    fts_store.search(&request.query, limit * 3, None)
-                }
-            })
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error searching: {}",
-                    e
-                ))]));
-            }
+        let (effective_query, effective_regex) = if auto_promoted {
+            let escaped = regex::escape(&request.query);
+            // Relax whitespace to \s+ so "foo = null" → "foo\s+=\s+null"
+            // regex::escape does not escape spaces, so replace literal spaces.
+            let relaxed = escaped.replace(' ', r"\s+");
+            (relaxed, true)
+        } else {
+            (request.query.clone(), user_set_regex)
         };
 
-        if fts_results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No results found for '{}'. Try a different query or mode.",
-                request.query
-            ))]));
+        tracing::debug!(
+            "MCP literal_search: query='{}', regex={:?}, phrase={:?}, limit={}, file_glob={:?}, language={:?}, format={}, multi={}",
+            request.query, request.regex, request.phrase, limit,
+            request.file_glob, request.language, output_format, ctx.is_multi
+        );
+
+        if ctx.needs_local_db {
+            if let Err(e) = self.ensure_database_exists() {
+                return Ok(CallToolResult::success(vec![Content::text(e)]));
+            }
         }
 
-        // Resolve chunk metadata and apply post-filters using shared store helper
+        // Pre-compute normalized project root for stripping absolute paths in glob matching
         let lang_filter = request.language.clone();
         let glob_filter = request.file_glob.clone();
-        let snippet_regex = if request.regex.unwrap_or(false) {
-            Regex::new(&request.query).ok()
+        let regex_enabled = effective_regex;
+        let snippet_regex = if regex_enabled {
+            Regex::new(&effective_query).ok()
         } else {
             None
         };
-        // Pre-compute normalized project root for stripping absolute paths in glob matching
         let project_root_normalized = {
             let root = crate::cache::normalize_path_str(self.project_path.to_str().unwrap_or(""));
             root.trim_end_matches('/').to_string()
         };
-        let items: Vec<LiteralSearchResultItem> = match self
-            .with_vector_store_read(|store| {
-                let items: Vec<LiteralSearchResultItem> = fts_results
-                    .iter()
-                    .filter_map(|fts_result| {
-                        let chunk = store.get_chunk(fts_result.chunk_id).ok()??;
-                        Some((chunk, fts_result.score))
-                    })
-                    .filter(|(chunk, _)| {
-                        // Language post-filter
+
+        // Decide: BM25 path (for anchorable queries) or scan path (for tokenless regex)
+        let tokenless_regex = regex_enabled
+            && snippet_regex.is_some()
+            && !regex_has_anchorable_token(&effective_query);
+
+        let mut items: Vec<LiteralSearchResultItem> = if tokenless_regex {
+            // ── Scan path ──────────────────────────────────────────────
+            // Tokenless regex (e.g. \bfn\s+\w+) — BM25 cannot produce useful
+            // candidates. Scan all chunks sequentially, apply regex post-filter.
+            // Score is 0.0 for all results (no BM25 ranking applies).
+            tracing::debug!("literal_search: tokenless regex detected, using scan path");
+            if let Some(ref sv) = ctx.stores_vec {
+                // Multi-store scan
+                let mut items: Vec<LiteralSearchResultItem> = Vec::new();
+                for store_arc in sv {
+                    let store = store_arc.vector_store.read().await;
+                    let all_chunks = match store.iter_all_chunks() {
+                        Ok(chunks) => chunks,
+                        Err(_) => continue,
+                    };
+                    for (_, chunk) in all_chunks {
                         if let Some(ref lang) = lang_filter {
                             let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
                             if file_lang.name() != lang {
-                                return false;
+                                continue;
                             }
                         }
-                        // file_glob post-filter (strip project root to get relative path)
                         if let Some(ref glob) = glob_filter {
-                            let relative_path = chunk
-                                .path
+                            let relative_path = chunk.path
                                 .strip_prefix(&project_root_normalized)
                                 .unwrap_or(&chunk.path)
                                 .trim_start_matches('/');
                             if !simple_glob_match(glob, relative_path) {
-                                return false;
+                                continue;
                             }
                         }
-                        true
-                    })
-                    .take(limit)
-                    .map(|(chunk, score)| {
-                        // Prefer the first line that actually matches the query.
-                        // Edge case: if FTS tokenization matched across boundaries and no
-                        // concrete line contains the literal/regex, fall back to first line.
-                        let (match_offset, snippet) = match_line_for_literal(
-                            &chunk.content,
-                            &request.query,
-                            snippet_regex.as_ref(),
-                        )
-                        .unwrap_or_else(|| {
-                            (
-                                0,
-                                chunk.content.lines().next().unwrap_or("").to_string(),
-                            )
-                        });
-
-                        LiteralSearchResultItem {
-                            path: chunk.path,
-                            start_line: chunk.start_line + match_offset,
-                            end_line: chunk.end_line,
-                            snippet,
-                            score,
-                            kind: if chunk.kind.is_empty() {
-                                None
-                            } else {
-                                Some(chunk.kind)
-                            },
-                            signature: chunk.signature.filter(|s| !s.is_empty()),
+                        if let Some((match_offset, snippet)) = match_line_for_literal(
+                            &chunk.content, &effective_query, snippet_regex.as_ref(),
+                        ) {
+                            let match_line = chunk.start_line + match_offset;
+                            items.push(LiteralSearchResultItem {
+                                path: chunk.path,
+                                start_line: match_line,
+                                end_line: match_line,
+                                snippet,
+                                score: 0.0, // No BM25 score — scan-path results are unranked
+                                kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
+                                signature: chunk.signature.filter(|s| !s.is_empty()),
+                            });
+                            if items.len() >= limit {
+                                break;
+                            }
                         }
-                    })
-                    .collect();
-                Ok(items)
-            })
-            .await
-        {
-            Ok(items) => items,
-            Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error resolving search results: {}",
-                    e
-                ))]));
+                    }
+                    if items.len() >= limit {
+                        break;
+                    }
+                }
+                items
+            } else {
+                // Single-store scan
+                match self
+                    .with_vector_store_read_for(
+                        |store| {
+                            let all_chunks = store.iter_all_chunks()?;
+                            let mut items: Vec<LiteralSearchResultItem> = Vec::new();
+                            for (_, chunk) in all_chunks {
+                                if let Some(ref lang) = lang_filter {
+                                    let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                                    if file_lang.name() != lang {
+                                        continue;
+                                    }
+                                }
+                                if let Some(ref glob) = glob_filter {
+                                    let relative_path = chunk
+                                        .path
+                                        .strip_prefix(&project_root_normalized)
+                                        .unwrap_or(&chunk.path)
+                                        .trim_start_matches('/');
+                                    if !simple_glob_match(glob, relative_path) {
+                                        continue;
+                                    }
+                                }
+                                if let Some((match_offset, snippet)) = match_line_for_literal(
+                                    &chunk.content, &effective_query, snippet_regex.as_ref(),
+                                ) {
+                                    let match_line = chunk.start_line + match_offset;
+                                    items.push(LiteralSearchResultItem {
+                                        path: chunk.path,
+                                        start_line: match_line,
+                                        end_line: match_line,
+                                        snippet,
+                                        score: 0.0, // No BM25 score — scan-path results are unranked
+                                        kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
+                                        signature: chunk.signature.filter(|s| !s.is_empty()),
+                                    });
+                                    if items.len() >= limit {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(items)
+                        },
+                        ctx.stores.clone(),
+                    )
+                    .await
+                {
+                    Ok(items) => items,
+                    Err(e) => {
+                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Error scanning chunks: {}", e
+                        ))]));
+                    }
+                }
+            }
+        } else {
+            // ── BM25 path ──────────────────────────────────────────────
+            // Note: regex=true uses BM25 for candidates, then post-filters with the
+            // actual regex on raw content (Tantivy's RegexQuery only works on individual
+            // tokens, not raw text — underscores/punctuation cause empty results).
+            let fts_results = if let Some(ref sv) = ctx.stores_vec {
+                let sa = ctx.store_aliases.as_ref().unwrap();
+                self.with_fts_store_read_multi(
+                    |fts_store| {
+                        if request.phrase.unwrap_or(false) {
+                            fts_store.search_phrase(&effective_query, limit * 3)
+                        } else {
+                            fts_store.search(&effective_query, limit * 3, None)
+                        }
+                    },
+                    sv.clone(),
+                    sa,
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                match self
+                    .with_fts_store_read_for(
+                        |fts_store| {
+                            if request.phrase.unwrap_or(false) {
+                                fts_store.search_phrase(&effective_query, limit * 3)
+                            } else {
+                                fts_store.search(&effective_query, limit * 3, None)
+                            }
+                        },
+                        ctx.stores.clone(),
+                    )
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Error searching: {}", e
+                        ))]));
+                    }
+                }
+            };
+
+            // Resolve chunk metadata and apply post-filters
+            if let Some(ref sv) = ctx.stores_vec {
+                // Multi-store: resolve chunks from all stores
+                let mut items: Vec<LiteralSearchResultItem> = Vec::new();
+                'outer: for fts_result in &fts_results {
+                    for store_arc in sv {
+                        let store = store_arc.vector_store.read().await;
+                        if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                            if let Some(ref lang) = lang_filter {
+                                let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                                if file_lang.name() != lang {
+                                    continue;
+                                }
+                            }
+                            if let Some(ref glob) = glob_filter {
+                                let relative_path = chunk.path
+                                    .strip_prefix(&project_root_normalized)
+                                    .unwrap_or(&chunk.path)
+                                    .trim_start_matches('/');
+                                if !simple_glob_match(glob, relative_path) {
+                                    continue;
+                                }
+                            }
+                            let match_info = match_line_for_literal(
+                                &chunk.content, &effective_query, snippet_regex.as_ref(),
+                            );
+                            if regex_enabled && match_info.is_none() {
+                                continue;
+                            }
+                            let (match_offset, snippet) = match_info
+                                .unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
+                            let match_line = chunk.start_line + match_offset;
+                            items.push(LiteralSearchResultItem {
+                                path: chunk.path,
+                                start_line: match_line,
+                                end_line: match_line,
+                                snippet,
+                                score: fts_result.score,
+                                kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
+                                signature: chunk.signature.filter(|s| !s.is_empty()),
+                            });
+                            if items.len() >= limit {
+                                break 'outer;
+                            }
+                            break; // Found in this store
+                        }
+                    }
+                }
+                items
+            } else {
+                match self
+                    .with_vector_store_read_for(
+                        |store| {
+                        let items: Vec<LiteralSearchResultItem> = fts_results
+                            .iter()
+                            .filter_map(|fts_result| {
+                                let chunk = store.get_chunk(fts_result.chunk_id).ok()??;
+                                Some((chunk, fts_result.score))
+                            })
+                            .filter(|(chunk, _)| {
+                                if let Some(ref lang) = lang_filter {
+                                    let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                                    if file_lang.name() != lang {
+                                        return false;
+                                    }
+                                }
+                                if let Some(ref glob) = glob_filter {
+                                    let relative_path = chunk
+                                        .path
+                                        .strip_prefix(&project_root_normalized)
+                                        .unwrap_or(&chunk.path)
+                                        .trim_start_matches('/');
+                                    if !simple_glob_match(glob, relative_path) {
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                            .take(limit)
+                            .filter_map(|(chunk, score)| {
+                                let match_info = match_line_for_literal(
+                                    &chunk.content, &effective_query, snippet_regex.as_ref(),
+                                );
+                                if regex_enabled && match_info.is_none() {
+                                    return None;
+                                }
+                                let (match_offset, snippet) = match_info
+                                    .unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
+                                let match_line = chunk.start_line + match_offset;
+                                Some(LiteralSearchResultItem {
+                                    path: chunk.path,
+                                    start_line: match_line,
+                                    end_line: match_line,
+                                    snippet,
+                                    score,
+                                    kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
+                                    signature: chunk.signature.filter(|s| !s.is_empty()),
+                                })
+                            })
+                            .collect();
+                        Ok(items)
+                    }, ctx.stores.clone())
+                    .await
+                {
+                    Ok(items) => items,
+                    Err(e) => {
+                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Error resolving search results: {}", e
+                        ))]));
+                    }
+                }
             }
         };
 
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No results found for '{}' after applying filters.",
-                request.query
-            ))]));
+        // Prefix paths with alias for multi-repo identification
+        for item in &mut items {
+            item.path = ctx.prefix_result_path(&item.path);
+        }
+
+        // Compute low-confidence signal
+        let top_score = items.first().map(|i| i.score);
+        let (low_confidence, suggested_tool) = compute_literal_low_confidence(top_score, &request.query);
+
+        // Build note
+        let note = if auto_promoted {
+            Some(format!(
+                "Query auto-promoted to regex mode (original: '{}', effective: '{}'). \
+                 The query contained code-like punctuation that BM25 would tokenize incorrectly.",
+                request.query, effective_query
+            ))
+        } else if low_confidence == Some(true) {
+            suggested_tool.clone()
+        } else {
+            None
+        };
+
+        let response = LiteralSearchResponse {
+            results: items,
+            auto_promoted_to_regex: if auto_promoted { Some(true) } else { None },
+            note,
+            low_confidence,
+            suggested_tool: if low_confidence == Some(true) { suggested_tool } else { None },
+        };
+
+        // Instrument BM25 score for threshold calibration
+        if let Some(top) = response.results.first() {
+            tracing::debug!(
+                target: "codesearch::literal_confidence",
+                query = %request.query,
+                top_bm25_score = top.score,
+                result_count = response.results.len(),
+                "literal_search score sample"
+            );
         }
 
         // Format output
         let output = if output_format == "grep" {
-            items
-                .iter()
-                .map(|item| format!("{}:{}:{}", item.path, item.start_line, item.snippet))
-                .collect::<Vec<_>>()
-                .join("\n")
+            let mut lines: Vec<String> = Vec::new();
+            if response.auto_promoted_to_regex == Some(true) {
+                lines.push("# auto-promoted to regex mode (query contained code-like punctuation)".to_string());
+            }
+            if response.low_confidence == Some(true) {
+                if let Some(ref hint) = response.suggested_tool {
+                    lines.push(format!("# low confidence — consider: {}", hint));
+                }
+            }
+            for item in &response.results {
+                lines.push(format!("{}:{}:{}", item.path, item.start_line, item.snippet));
+            }
+            lines.join("\n")
         } else {
-            serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+            serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
         };
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(
-        description = "Get the status of the semantic search index including model info and statistics. Check this before searching to verify the index is ready."
-    )]
-    async fn index_status(&self) -> Result<CallToolResult, McpError> {
-        let indexed = self.db_path.exists();
+    /// Internal implementation for index_status with optional project/group routing.
+    async fn index_status_impl(&self, project: Option<String>, group: Option<String>) -> Result<CallToolResult, McpError> {
+        // Resolve project/group routing
+        let ctx = match self.resolve_routing(&project, &group).await {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
 
-        if !indexed {
-            let response = IndexStatusResponse {
-                indexed: false,
-                status: "not_indexed".to_string(),
-                status_message: "No index found. Run 'codesearch index' or start with --create-index=true to automatically create one.".to_string(),
-                total_chunks: 0,
-                total_files: 0,
-                model: "none".to_string(),
-                dimensions: 0,
-                max_chunk_id: 0,
-                db_path: self.db_path.display().to_string(),
-                project_path: self.project_path.display().to_string(),
-                error_message: None,
+        if ctx.needs_local_db {
+            let indexed = self.db_path.exists();
+
+            if !indexed {
+                let response = IndexStatusResponse {
+                    indexed: false,
+                    status: "not_indexed".to_string(),
+                    status_message: "No index found. Run 'codesearch index' or start with --create-index=true to automatically create one.".to_string(),
+                    total_chunks: 0,
+                    total_files: 0,
+                    model: "none".to_string(),
+                    dimensions: 0,
+                    max_chunk_id: 0,
+                    db_path: self.db_path.display().to_string(),
+                    project_path: self.project_path.display().to_string(),
+                    error_message: None,
+                    mode: self.mcp_mode(),
+                };
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+        }
+
+        if let Some(ref sv) = ctx.stores_vec {
+            // Multi-store: aggregate stats across all group members
+            let mut total_chunks = 0usize;
+            let mut total_files = 0usize;
+            let mut max_chunk_id = 0u32;
+            let mut dimensions = 0usize;
+            let mut all_indexed = true;
+
+            for store_arc in sv {
+                let store = store_arc.vector_store.read().await;
+                match store.stats() {
+                    Ok(stats) => {
+                        total_chunks += stats.total_chunks;
+                        total_files += stats.total_files;
+                        if stats.max_chunk_id > max_chunk_id {
+                            max_chunk_id = stats.max_chunk_id;
+                        }
+                        if stats.dimensions > 0 {
+                            dimensions = stats.dimensions;
+                        }
+                        if !stats.indexed {
+                            all_indexed = false;
+                        }
+                    }
+                    Err(_) => {
+                        all_indexed = false;
+                    }
+                }
+            }
+
+            let (status, status_message) = if total_chunks == 0 {
+                (
+                    "building".to_string(),
+                    format!("Index is being built across {} repo(s). Searches may fail until indexing completes.", sv.len()),
+                )
+            } else {
+                (
+                    "ready".to_string(),
+                    format!("Index is ready for searching across {} repo(s).", sv.len()),
+                )
             };
+
+            let response = IndexStatusResponse {
+                indexed: all_indexed,
+                status,
+                status_message,
+                total_chunks,
+                total_files,
+                model: self.model_type.short_name().to_string(),
+                dimensions,
+                max_chunk_id,
+                db_path: format!("({} repos)", sv.len()),
+                project_path: format!("group with {} repo(s)", sv.len()),
+                error_message: None,
+                mode: self.mcp_mode(),
+            };
+
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
             return Ok(CallToolResult::success(vec![Content::text(json)]));
         }
 
+        // Single-store path
         let stats = match self
-            .with_vector_store_read(|store| store.stats().context("Error getting index stats"))
+            .with_vector_store_read_for(|store| store.stats().context("Error getting index stats"), ctx.stores.clone())
             .await
         {
             Ok(s) => s,
@@ -2578,6 +5440,7 @@ impl CodesearchService {
                     db_path: self.db_path.display().to_string(),
                     project_path: self.project_path.display().to_string(),
                     error_message: Some(format!("{}", e)),
+                    mode: self.mcp_mode(),
                 };
                 let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![Content::text(json)]));
@@ -2609,92 +5472,129 @@ impl CodesearchService {
             db_path: self.db_path.display().to_string(),
             project_path: self.project_path.display().to_string(),
             error_message: None,
+            mode: self.mcp_mode(),
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(
-        description = "Find all available codesearch databases in current directory, parent directories, and globally tracked repositories. Use this to discover which databases are available for searching."
-    )]
-    async fn find_databases(&self) -> Result<CallToolResult, McpError> {
+    /// List all registered projects and groups. Called by `status(kind="projects")`.
+    async fn list_projects(&self) -> Result<CallToolResult, McpError> {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let dbs = find_databases().unwrap_or_default();
 
-        let mut response_dbs = Vec::new();
+        let serve_active = self.serve_state.is_some();
+        let serve_url = if serve_active {
+            Some(serve_url_from_env())
+        } else {
+            None
+        };
 
-        for db_info in &dbs {
-            // Get stats for this database
-            let (total_chunks, total_files, model) = if db_info.db_path.exists() {
-                // Try to read model from metadata
-                let metadata_path = db_info.db_path.join("metadata.json");
-                let model_name = if metadata_path.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&metadata_path) {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                            json.get("model_short_name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string()
+        // When serve is active, use ServeState as source of truth for lock status
+        if let Some(ref serve_state) = self.serve_state {
+            let config = serve_state.config_snapshot();
+            let mut repos_info = Vec::new();
+
+            for (alias, path) in &config.repos {
+                let db_path = path.join(crate::constants::DB_DIR_NAME);
+
+                let (total_chunks, total_files, model, lock_status) = if db_path.exists() {
+                    let (model_name, dims) = read_model_metadata(&db_path);
+
+                    // Use DashMap state for opened repos, disk check for unopened
+                    let lock_status = match serve_state.repo_lock_status(alias) {
+                        Some(s) => s.to_string(),
+                        None => {
+                            // Not yet opened in DashMap — fall back to disk check
+                            if crate::index::is_database_locked(&db_path) {
+                                "locked-externally".to_string()
+                            } else {
+                                "available".to_string()
+                            }
+                        }
+                    };
+
+                    if let Ok(store) = VectorStore::new(&db_path, dims) {
+                        if let Ok(stats) = store.stats() {
+                            (stats.total_chunks, stats.total_files, model_name, lock_status)
                         } else {
-                            "unknown".to_string()
+                            (0, 0, model_name, lock_status)
                         }
                     } else {
-                        "unknown".to_string()
+                        (0, 0, model_name, lock_status)
                     }
                 } else {
-                    "unknown".to_string()
+                    (0, 0, "not indexed".to_string(), "unknown".to_string())
                 };
 
-                // Try to get stats - need to infer dimensions from model name
-                let dims = match model_name.as_str() {
-                    "minilm-l6" | "minilm-l6-q" | "minilm-l12" | "minilm-l12-q" | "bge-small"
-                    | "bge-small-q" | "e5-multilingual" => 384,
-                    "bge-base" | "jina-code" | "nomic-v1.5" => 768,
-                    "bge-large" | "mxbai-large" => 1024,
-                    _ => 384, // default
-                };
+                repos_info.push(RepoInfo {
+                    alias: alias.clone(),
+                    project_path: path.display().to_string(),
+                    database_path: db_path.display().to_string(),
+                    total_chunks,
+                    total_files,
+                    model,
+                    lock_status,
+                });
+            }
 
-                // Try to get stats
-                if let Ok(store) = VectorStore::new(&db_info.db_path, dims) {
-                    if let Ok(stats) = store.stats() {
-                        (stats.total_chunks, stats.total_files, model_name)
-                    } else {
-                        (0, 0, model_name)
-                    }
-                } else {
-                    (0, 0, model_name)
-                }
-            } else {
-                (0, 0, "not found".to_string())
+            let response = ListProjectsResponse {
+                repos: repos_info,
+                groups: config.groups,
+                serve_active,
+                serve_url,
+                current_directory: current_dir.display().to_string(),
             };
 
-            response_dbs.push(DatabaseInfoResponse {
-                database_path: db_info.db_path.display().to_string(),
-                project_path: db_info.project_path.display().to_string(),
-                is_current_directory: db_info.is_current,
-                depth_from_current: db_info.depth,
+            let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
+        // Stdio mode: fall back to disk-based lock detection
+        let config = load_repos_config().unwrap_or_default();
+        let mut repos_info = Vec::new();
+        for (alias, path) in &config.repos {
+            let db_path = path.join(crate::constants::DB_DIR_NAME);
+
+            // Get stats
+            let (total_chunks, total_files, model, lock_status) = if db_path.exists() {
+                let (model_name, dims) = read_model_metadata(&db_path);
+
+                let lock = if crate::index::is_database_locked(&db_path) {
+                    "conflicted"
+                } else {
+                    "available"
+                };
+
+                if let Ok(store) = VectorStore::new(&db_path, dims) {
+                    if let Ok(stats) = store.stats() {
+                        (stats.total_chunks, stats.total_files, model_name, lock.to_string())
+                    } else {
+                        (0, 0, model_name, lock.to_string())
+                    }
+                } else {
+                    (0, 0, model_name, "readonly".to_string())
+                }
+            } else {
+                (0, 0, "not indexed".to_string(), "unknown".to_string())
+            };
+
+            repos_info.push(RepoInfo {
+                alias: alias.clone(),
+                project_path: path.display().to_string(),
+                database_path: db_path.display().to_string(),
                 total_chunks,
                 total_files,
                 model,
+                lock_status,
             });
         }
 
-        // Build message based on what was found
-        let message = if dbs.is_empty() {
-            "❌ No databases found. Run 'codesearch index' to create an index.".to_string()
-        } else if dbs.iter().any(|d| d.is_current) {
-            format!(
-                "✅ Found {} database(s). Current directory has an index.",
-                dbs.len()
-            )
-        } else {
-            format!("⚠️  Found {} database(s) in parent/global directories, but not in current directory.", dbs.len())
-        };
-
-        let response = FindDatabasesResponse {
-            databases: response_dbs,
-            message,
+        let response = ListProjectsResponse {
+            repos: repos_info,
+            groups: config.groups,
+            serve_active,
+            serve_url,
             current_directory: current_dir.display().to_string(),
         };
 
@@ -2767,6 +5667,11 @@ fn is_definition_chunk(kind: &str, signature: &Option<String>, symbol: &str) -> 
 impl ServerHandler for CodesearchService {
     fn get_info(&self) -> ServerInfo {
         let db_exists = self.db_path.exists();
+        let mode = if self.serve_state.is_some() {
+            "serve hub (direct)".to_string()
+        } else {
+            "self-contained (stdio)".to_string()
+        };
 
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -2781,22 +5686,22 @@ impl ServerHandler for CodesearchService {
                 r#"codesearch — semantic + lexical code search MCP server.
 
 TOOLS:
-| Tool              | Use for                                              |
-|-------------------|------------------------------------------------------|
-| semantic_search   | Conceptual queries, identifier + natural-language mix |
-| find_definition   | Where is symbol X defined                             |
-| find_usages       | Who uses / calls symbol X                             |
-| find_references   | DEPRECATED — alias for find_usages                    |
-| index_status      | Verify the index is ready                             |
-| find_databases    | Discover available indexes                            |
-| literal_search    | Fast exact text search (regex, phrase, BM25)          |
+| Tool          | Use for                                              |
+|---------------|------------------------------------------------------|
+| search        | Code search: `mode="semantic"` (default) or `mode="literal"` |
+| find          | Symbol navigation: `kind="definition"` (default), `"usages"`, `"imports"`, `"dependents"` |
+| explore       | File exploration: `kind="outline"` (default) or `"similar"` |
+| get_chunk     | Read full chunk content by chunk_id                  |
+| status        | Index/project info: `kind="index"` (default) or `"projects"` |
 
 Indexing is done via CLI: `codesearch index`. The MCP server cannot index.
 
+Mode: {mode}
 Current project: {project}
 Current database: {db} ({exists})
 Model: {model} ({dims}d)
 "#,
+                mode = mode,
                 project = self.project_path.display(),
                 db = self.db_path.display(),
                 exists = if db_exists { "ready" } else { "not found" },
@@ -2927,14 +5832,18 @@ pub async fn run_mcp_server(
             Some(d) => d as usize,
             None => {
                 tracing::warn!(
-                    "⚠️  Could not parse dimensions from metadata.json, using default 384"
+                    "⚠️  Could not parse dimensions from metadata.json, using default {}",
+                    crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
                 );
-                384
+                crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
             }
         }
     } else {
-        tracing::warn!("⚠️  metadata.json not found, using default dimensions 384");
-        384
+        tracing::warn!(
+            "⚠️  metadata.json not found, using default dimensions {}",
+            crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
+        );
+        crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
     };
 
     // Create shared stores - try write mode first, fall back to readonly if locked

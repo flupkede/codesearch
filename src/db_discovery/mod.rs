@@ -17,11 +17,15 @@
 use anyhow::Result;
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::constants::{CONFIG_DIR_NAME, DB_DIR_NAME, REPOS_CONFIG_FILE};
+use crate::constants::DB_DIR_NAME;
+
+pub mod repos;
+
+use repos::ReposConfig;
 
 /// Information about a discovered database
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,80 +94,6 @@ pub fn check_database_integrity(db_path: &Path) -> Option<String> {
     }
 }
 
-/// Find databases in current directory and parent directories
-///
-/// Only returns databases that pass validation (have metadata.json, data.mdb, fts/).
-/// Incomplete/corrupt databases are logged and skipped.
-pub fn find_databases() -> Result<Vec<DatabaseInfo>> {
-    let mut databases = Vec::new();
-
-    // 1. Check current directory
-    let current_dir = std::env::current_dir()?;
-    let current_db = current_dir.join(DB_DIR_NAME);
-
-    if current_db.exists() {
-        if is_valid_database(&current_db) {
-            databases.push(DatabaseInfo {
-                project_path: current_dir.clone(),
-                db_path: current_db,
-                is_current: true,
-                depth: 0,
-                is_global: false,
-            });
-        } else if let Some(reason) = check_database_integrity(&current_db) {
-            eprintln!(
-                "{}",
-                format!(
-                    "⚠️  Skipping incomplete database at {}: {}",
-                    current_db.display(),
-                    reason
-                )
-                .yellow()
-            );
-        }
-    }
-
-    // 2. Check parent directories (up to 5 levels up)
-    let mut parent_dir = current_dir.clone();
-    for depth in 1..=5 {
-        if let Some(parent) = parent_dir.parent() {
-            parent_dir = parent.to_path_buf();
-            let parent_db = parent_dir.join(DB_DIR_NAME);
-
-            if parent_db.exists() {
-                if is_valid_database(&parent_db) {
-                    databases.push(DatabaseInfo {
-                        project_path: parent_dir.clone(),
-                        db_path: parent_db,
-                        is_current: false,
-                        depth,
-                        is_global: false,
-                    });
-                } else if let Some(reason) = check_database_integrity(&parent_db) {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "⚠️  Skipping incomplete database at {}: {}",
-                            parent_db.display(),
-                            reason
-                        )
-                        .yellow()
-                    );
-                }
-            }
-        } else {
-            break; // Reached filesystem root
-        }
-    }
-
-    // 3. Check globally tracked repositories
-    if let Ok(global_dbs) = find_global_databases() {
-        databases.extend(global_dbs);
-    }
-
-    Ok(databases)
-}
-
 /// Find the best database to use for a given directory
 ///
 /// Priority order:
@@ -174,6 +104,17 @@ pub fn find_databases() -> Result<Vec<DatabaseInfo>> {
 ///
 /// Incomplete/corrupt databases are skipped with a warning.
 pub fn find_best_database(target_dir: Option<&Path>) -> Result<Option<DatabaseInfo>> {
+    find_best_database_impl(target_dir, true)
+}
+
+/// Same as [`find_best_database`] but skips the global-database fallback (step 4).
+/// Used by tests that need isolation from the user's `~/.codesearch/repos.json`.
+#[cfg(test)]
+fn find_best_database_no_global(target_dir: Option<&Path>) -> Result<Option<DatabaseInfo>> {
+    find_best_database_impl(target_dir, false)
+}
+
+fn find_best_database_impl(target_dir: Option<&Path>, include_global: bool) -> Result<Option<DatabaseInfo>> {
     let target = target_dir.unwrap_or_else(|| Path::new("."));
 
     // Canonicalize the target path
@@ -277,10 +218,12 @@ pub fn find_best_database(target_dir: Option<&Path>) -> Result<Option<DatabaseIn
         }
     }
 
-    // 4. Check global databases
-    let global_dbs = find_global_databases()?;
-    if !global_dbs.is_empty() {
-        return Ok(Some(global_dbs.into_iter().next().unwrap()));
+    // 4. Check global databases (only when not in test-isolation mode)
+    if include_global {
+        let global_dbs = find_global_databases()?;
+        if !global_dbs.is_empty() {
+            return Ok(Some(global_dbs.into_iter().next().unwrap()));
+        }
     }
 
     Ok(None)
@@ -290,20 +233,10 @@ pub fn find_best_database(target_dir: Option<&Path>) -> Result<Option<DatabaseIn
 ///
 /// Only returns databases that pass validation.
 fn find_global_databases() -> Result<Vec<DatabaseInfo>> {
-    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory found"))?;
-    let config_dir = home_dir.join(CONFIG_DIR_NAME);
-    let config_path = config_dir.join(REPOS_CONFIG_FILE);
-
-    if !config_path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let content = fs::read_to_string(&config_path)?;
-    let repos_map: HashMap<String, serde_json::Value> = serde_json::from_str(&content)?;
+    let config = ReposConfig::load()?;
 
     let mut databases = Vec::new();
-    for (project_path, _meta) in repos_map {
-        let path = PathBuf::from(&project_path);
+    for path in config.repos.into_values() {
         let db_path = path.join(DB_DIR_NAME);
 
         if is_valid_database(&db_path) {
@@ -324,55 +257,48 @@ fn find_global_databases() -> Result<Vec<DatabaseInfo>> {
 
 /// Register a repository in the global tracking file
 pub fn register_repository(project_path: &Path) -> Result<()> {
-    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory found"))?;
-    let config_dir = home_dir.join(CONFIG_DIR_NAME);
-    let config_path = config_dir.join(REPOS_CONFIG_FILE);
-
-    // Create config directory if it doesn't exist
-    fs::create_dir_all(&config_dir)?;
-
-    let mut repos_map: HashMap<String, serde_json::Value> = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)?;
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
-
-    // Add or update repository entry
-    let canonical_path = project_path.canonicalize()?;
-    let path_str = canonical_path.to_string_lossy().to_string();
-    repos_map.insert(
-        path_str.clone(),
-        serde_json::json!({
-            "indexed_at": chrono::Utc::now().to_rfc3339(),
-        }),
-    );
-
-    // Write back
-    fs::write(&config_path, serde_json::to_string_pretty(&repos_map)?)?;
+    let mut config = ReposConfig::load()?;
+    config.register(project_path.to_path_buf());
+    config.save()?;
 
     Ok(())
 }
 
 /// Unregister a repository from global tracking
 pub fn unregister_repository(project_path: &Path) -> Result<()> {
-    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory found"))?;
-    let config_dir = home_dir.join(CONFIG_DIR_NAME);
-    let config_path = config_dir.join(REPOS_CONFIG_FILE);
-
-    if !config_path.exists() {
-        return Ok(()); // Nothing to remove
+    let mut config = ReposConfig::load()?;
+    if config.unregister_path(project_path) {
+        config.save()?;
     }
 
-    let content = fs::read_to_string(&config_path)?;
-    let mut repos_map: HashMap<String, serde_json::Value> = serde_json::from_str(&content)?;
+    Ok(())
+}
 
-    let canonical_path = project_path.canonicalize()?;
-    let path_str = canonical_path.to_string_lossy().to_string();
-    repos_map.remove(&path_str);
+/// Check whether a canonical project path is globally registered.
+pub fn is_registered_repository(project_path: &Path) -> Result<bool> {
+    let config = ReposConfig::load()?;
+    Ok(config.alias_for_path(project_path).is_some())
+}
 
-    fs::write(&config_path, serde_json::to_string_pretty(&repos_map)?)?;
+/// List globally registered repositories as alias/path pairs.
+#[allow(dead_code)] // Available for CLI and admin tooling
+pub fn list_registered_repositories() -> Result<Vec<(String, PathBuf)>> {
+    let config = ReposConfig::load()?;
+    let mut repos: Vec<(String, PathBuf)> = config.repos.into_iter().collect();
+    repos.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(repos)
+}
 
+/// Load full repositories configuration (repos + groups).
+pub fn load_repos_config() -> Result<ReposConfig> {
+    ReposConfig::load()
+}
+
+/// Save full repositories configuration (repos + groups).
+#[allow(dead_code)] // Available for CLI and admin tooling
+pub fn save_repos_config(config: &ReposConfig) -> Result<()> {
+    config.save()?;
+    
     Ok(())
 }
 
@@ -446,14 +372,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_databases() {
-        let databases = find_databases();
-        assert!(databases.is_ok());
-        let dbs = databases.unwrap();
-        println!("Found {} databases", dbs.len());
-    }
-
-    #[test]
     fn test_is_valid_database() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join(DB_DIR_NAME);
@@ -503,7 +421,7 @@ mod tests {
         fs::create_dir_all(&hidden).unwrap();
         create_fake_db(&hidden.join(DB_DIR_NAME));
 
-        let result = find_best_database(Some(dir.path())).unwrap();
+        let result = find_best_database_no_global(Some(dir.path())).unwrap();
         assert!(
             result.is_none(),
             "Should not find DB in hidden child directory"
@@ -518,7 +436,7 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         create_fake_db(&target.join(DB_DIR_NAME));
 
-        let result = find_best_database(Some(dir.path())).unwrap();
+        let result = find_best_database_no_global(Some(dir.path())).unwrap();
         assert!(result.is_none(), "Should not find DB in target/ directory");
     }
 
@@ -540,7 +458,7 @@ mod tests {
     #[test]
     fn test_find_best_database_none_when_empty() {
         let dir = tempdir().unwrap();
-        let result = find_best_database(Some(dir.path())).unwrap();
+        let result = find_best_database_no_global(Some(dir.path())).unwrap();
         assert!(result.is_none());
     }
 
@@ -554,7 +472,7 @@ mod tests {
         fs::write(db_path.join("metadata.json"), "{}").unwrap();
         // No data.mdb, no fts/ → invalid
 
-        let result = find_best_database(Some(dir.path())).unwrap();
+        let result = find_best_database_no_global(Some(dir.path())).unwrap();
         assert!(result.is_none(), "Should not find incomplete DB");
     }
 }

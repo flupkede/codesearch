@@ -313,6 +313,7 @@ impl FileMetaStore {
     }
 
     /// Set last full index time
+    #[allow(dead_code)]
     pub fn mark_full_index(&mut self) {
         self.last_full_index = Some(
             SystemTime::now()

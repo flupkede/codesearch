@@ -13,7 +13,7 @@ mod mcp;
 mod output;
 mod rerank;
 mod search;
-mod server;
+mod serve;
 mod vectordb;
 mod watch;
 

@@ -219,6 +219,7 @@ impl FileWatcher {
     }
 
     /// Block and wait for events (with timeout)
+    #[allow(dead_code)]
     pub fn wait_for_events(&self, timeout: Duration) -> Vec<FileEvent> {
         let Some(ref receiver) = self.receiver else {
             return vec![];

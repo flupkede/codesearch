@@ -9,7 +9,9 @@ use tracing::{debug, info};
 
 use crate::cache::{normalize_path, FileMetaStore};
 use crate::chunker::SemanticChunker;
-use crate::db_discovery::{find_best_database, register_repository, unregister_repository};
+use crate::db_discovery::{
+    find_best_database, is_registered_repository, register_repository, unregister_repository,
+};
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
@@ -17,7 +19,7 @@ use crate::vectordb::VectorStore;
 
 // Index manager module
 mod manager;
-pub use manager::{IndexManager, SharedStores};
+pub use manager::{IndexManager, SharedStores, is_database_locked};
 
 /// Get the database path and project path for a given directory
 /// Uses automatic database discovery to find indexes in parent/global directories
@@ -1075,6 +1077,7 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
+    alias: Option<String>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
@@ -1098,6 +1101,30 @@ pub async fn add_to_index(
             println!("   Type: {} (parent directory)", "Local".bright_green());
         } else {
             println!("   Type: {}", "Local".bright_green());
+        }
+
+        // If an alias is provided and this is a local DB in the current dir,
+        // register it in repos.json (for legacy DB's that predate auto-registration).
+        if alias.is_some() && db.is_current && !db.is_global {
+            let mut config = crate::db_discovery::repos::ReposConfig::load()
+                .unwrap_or_default();
+            if let Some(existing) = config.alias_for_path(&canonical_path) {
+                println!("   Already registered as '{}'.", existing);
+            } else {
+                match config.register_with_alias(canonical_path.clone(), alias.clone()) {
+                    Ok(assigned) => {
+                        if let Err(e) = config.save() {
+                            eprintln!("⚠️ Failed to save repos config: {}", e);
+                        } else {
+                            println!("   ✅ Registered as '{}'.", assigned);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ Registration failed: {}", e);
+                    }
+                }
+            }
+            return Ok(());
         }
 
         println!(
@@ -1127,23 +1154,7 @@ pub async fn add_to_index(
     let local_db = canonical_path.join(".codesearch.db");
     let has_local = local_db.exists();
 
-    let repos_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-        .join(".codesearch")
-        .join("repos.json");
-
-    let has_global = if repos_path.exists() {
-        let content = fs::read_to_string(&repos_path)?;
-        if let Ok(repos) =
-            serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&content)
-        {
-            repos.contains_key(canonical_path.to_str().unwrap_or(""))
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let has_global = is_registered_repository(&canonical_path)?;
 
     // Conflict checks
     if global && has_local {
@@ -1176,6 +1187,7 @@ pub async fn add_to_index(
         )
         .await?;
         println!("\n{}", "✅ Global index created!".green());
+        eprintln!("⚠️ Global indexes are not auto-registered. Use 'index add' without --global for serve discovery.");
     } else {
         println!("\n{}", "Creating local index...".cyan());
         index(
@@ -1188,13 +1200,49 @@ pub async fn add_to_index(
         )
         .await?;
         println!("\n{}", "✅ Local index created!".green());
+
+        // Auto-register in repos.json for serve discovery
+        let config_path = match crate::db_discovery::repos::ReposConfig::path() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("⚠️ Could not determine repos config path: {}", e);
+                return Ok(());
+            }
+        };
+
+        let mut config = crate::db_discovery::repos::ReposConfig::load()
+            .unwrap_or_default();
+
+        if let Some(existing) = config.alias_for_path(&canonical_path) {
+            eprintln!("ℹ️ Already registered as '{}'.", existing);
+        } else {
+            match config.register_with_alias(canonical_path.clone(), alias) {
+                Ok(assigned) => {
+                    if let Err(e) = config.save() {
+                        eprintln!("⚠️ Index created, but failed to save repos config: {}", e);
+                        eprintln!("   Config path: {}", config_path.display());
+                    } else {
+                        eprintln!("✅ Registered as '{}'.", assigned);
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Index created, but registration failed: {}",
+                        e
+                    ));
+                }
+            }
+        }
     }
 
     Ok(())
 }
 
 /// Remove the index (local or global, auto-detected)
-pub async fn remove_from_index(path: Option<PathBuf>) -> Result<()> {
+pub async fn remove_from_index(
+    path: Option<PathBuf>,
+    keep_config: bool,
+) -> Result<()> {
     let project_path = path.unwrap_or_else(|| PathBuf::from("."));
     let canonical_path = project_path.canonicalize()?;
 
@@ -1206,27 +1254,26 @@ pub async fn remove_from_index(path: Option<PathBuf>) -> Result<()> {
     let local_db = canonical_path.join(".codesearch.db");
     let has_local = local_db.exists();
 
-    let repos_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-        .join(".codesearch")
-        .join("repos.json");
-
-    let has_global = if repos_path.exists() {
-        let content = fs::read_to_string(&repos_path)?;
-        if let Ok(repos) =
-            serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&content)
-        {
-            repos.contains_key(canonical_path.to_str().unwrap_or(""))
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let has_global = is_registered_repository(&canonical_path)?;
 
     if !has_local && !has_global {
         println!("\n{}", "⚠️  No index found for this project.".yellow());
         return Ok(());
+    }
+
+    // Auto-unregister from repos.json unless --keep-config
+    if !keep_config {
+        let mut config = crate::db_discovery::repos::ReposConfig::load()
+            .unwrap_or_default();
+        if config.unregister_path(&canonical_path) {
+            if let Err(e) = config.save() {
+                eprintln!("⚠️ Failed to update repos config: {}", e);
+            } else {
+                println!("{}", "🗑️  Unregistered from repos.json".green());
+            }
+        }
+    } else {
+        println!("{}", "ℹ️ Config entry preserved.".cyan());
     }
 
     // If both exist (shouldn't happen), remove local with warning
@@ -1236,7 +1283,10 @@ pub async fn remove_from_index(path: Option<PathBuf>) -> Result<()> {
             "⚠️  Warning: Both local and global indexes exist!".yellow()
         );
         println!("   Removing local index...");
-        fs::remove_dir_all(&local_db)?;
+        if let Err(e) = fs::remove_dir_all(&local_db) {
+            eprintln!("⚠️ Database files may be locked by a running codesearch serve. Stop it and retry.");
+            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
+        }
         println!("   {}", "✅ Local index removed".green());
         println!("   (Global index remains)");
         return Ok(());
@@ -1245,8 +1295,10 @@ pub async fn remove_from_index(path: Option<PathBuf>) -> Result<()> {
     // Remove whichever exists
     if has_local {
         println!("\n{}", "Removing local index...".cyan());
-        // Note: fastembed cache is inside .codesearch.db/fastembed_cache, so it's removed automatically
-        fs::remove_dir_all(&local_db)?;
+        if let Err(e) = fs::remove_dir_all(&local_db) {
+            eprintln!("⚠️ Database files may be locked by a running codesearch serve. Stop it and retry.");
+            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
+        }
         println!("{}", "✅ Local index removed!".green());
     } else if has_global {
         println!("\n{}", "Removing global index...".cyan());

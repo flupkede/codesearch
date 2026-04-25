@@ -126,6 +126,25 @@ pub const DEFAULT_FSW_DEBOUNCE_MS: u64 = 2000;
 /// This prevents multiple processes from writing to the same database
 pub const WRITER_LOCK_FILE: &str = ".writer.lock";
 
+/// Default port for `codesearch serve` (MCP streamable HTTP mode).
+/// Override with `--port` or `CODESEARCH_SERVE_PORT`.
+pub const DEFAULT_SERVE_PORT: u16 = 39725;
+
+/// Environment variable to override the serve port.
+pub const SERVE_PORT_ENV: &str = "CODESEARCH_SERVE_PORT";
+
+/// Health-check path served by `codesearch serve`.
+pub const HEALTH_PATH: &str = "/health";
+
+/// MCP endpoint path served by `codesearch serve` (streamable HTTP).
+pub const MCP_ENDPOINT_PATH: &str = "/mcp";
+
+/// Default embedding dimensions used when metadata is missing or unreadable.
+pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
+
+/// Environment variable to override repos config file path.
+pub const REPOS_CONFIG_ENV: &str = "CODESEARCH_REPOS_CONFIG";
+
 /// File extensions that should never be indexed, regardless of content.
 /// These are generated/compiled/binary-adjacent files with no semantic code value.
 pub const ALWAYS_SKIP_EXTENSIONS: &[&str] = &[
