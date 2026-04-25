@@ -536,6 +536,18 @@ impl VectorStore {
     ///
     /// Returns a map of file_path -> Vec<chunk_id> for every chunk in the store.
     /// Used by branch refresh to find orphaned chunks not tracked by FileMetaStore.
+    /// Iterate all chunks in the store, returning (chunk_id, metadata) pairs.
+    /// Used by the scan-path fallback for tokenless regex queries where BM25
+    /// cannot produce useful candidates.
+    pub fn iter_all_chunks(&self) -> Result<Vec<(u32, ChunkMetadata)>> {
+        let rtxn = self.env.read_txn()?;
+        let mut all = Vec::new();
+        for result in self.chunks.iter(&rtxn)? {
+            all.push(result?);
+        }
+        Ok(all)
+    }
+
     pub fn get_chunks_by_file(&self) -> Result<std::collections::HashMap<String, Vec<u32>>> {
         let rtxn = self.env.read_txn()?;
         let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =

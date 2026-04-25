@@ -1503,6 +1503,100 @@ mod tests {
             chunk1.score
         );
     }
+
+    // ─── regex_has_anchorable_token detector tests ───────────────────────
+
+    #[test]
+    fn test_regex_has_anchorable_token_plain_identifier() {
+        assert!(super::regex_has_anchorable_token("match_line_for_literal"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_generic_with_word() {
+        assert!(super::regex_has_anchorable_token("Vec<.*>"));
+        assert!(super::regex_has_anchorable_token("HashMap::new"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_short_word_below_threshold() {
+        // "fn" alone is only 2 chars — not enough.
+        assert!(!super::regex_has_anchorable_token("fn"));
+        assert!(super::regex_has_anchorable_token("fnx")); // 3 chars triggers
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_word_boundary_pattern() {
+        assert!(!super::regex_has_anchorable_token(r"\bfn\s+\w+"));
+        assert!(!super::regex_has_anchorable_token(r"\bimpl\s+"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_method_call_pattern() {
+        assert!(!super::regex_has_anchorable_token(r"\.\w+\(\)"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_character_classes_dont_count() {
+        // [A-Z] and [a-z] inside brackets must NOT be counted as runs.
+        assert!(!super::regex_has_anchorable_token(r"[A-Z]+_[A-Z]+"));
+        assert!(!super::regex_has_anchorable_token(r"^[A-Z]\w+"));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_empty() {
+        assert!(!super::regex_has_anchorable_token(""));
+    }
+
+    #[test]
+    fn test_regex_has_anchorable_token_pure_punctuation() {
+        assert!(!super::regex_has_anchorable_token(r"->"));
+        assert!(!super::regex_has_anchorable_token(r"::"));
+    }
+
+    // ─── Scan-path decision logic tests ──────────────────────────────────
+    //
+    // Full integration tests for literal_search require a CodesearchService
+    // with a working DB/FTS index — no such harness exists yet. These tests
+    // validate the critical decision logic: which queries take the BM25 path
+    // vs the scan path.
+
+    #[test]
+    fn test_regex_anchorable_queries_detected_correctly() {
+        // Queries with ≥3 alphanumeric runs → anchorable → BM25 path
+        assert!(super::regex_has_anchorable_token("match_line_for_literal"));
+        assert!(super::regex_has_anchorable_token("HashMap::new"));
+        assert!(super::regex_has_anchorable_token("Vec<.*>"));
+        assert!(super::regex_has_anchorable_token("fnx"));
+    }
+
+    #[test]
+    fn test_regex_tokenless_queries_detected_correctly() {
+        // Tokenless regex patterns → not anchorable → scan path
+        assert!(!super::regex_has_anchorable_token(r"\bfn\s+\w+"));
+        assert!(!super::regex_has_anchorable_token(r"\bimpl\s+"));
+        assert!(!super::regex_has_anchorable_token(r"\.\w+\(\)"));
+        assert!(!super::regex_has_anchorable_token(r"[A-Z]+_[A-Z]+"));
+        assert!(!super::regex_has_anchorable_token(r"^[A-Z]\w+"));
+    }
+
+    #[test]
+    fn test_regex_no_match_match_line_returns_none() {
+        // match_line_for_literal returns None for patterns that don't match
+        let regex = regex::Regex::new(r"\bfn\s+\w+").unwrap();
+        let content = "struct Foo { x: i32 }\nimpl Foo { fn bar() {} }";
+        // This content DOES match — fn bar() matches \bfn\s+\w+
+        assert!(super::match_line_for_literal(content, r"\bfn\s+\w+", Some(&regex)).is_some());
+
+        // This content does NOT match the regex
+        let regex2 = regex::Regex::new(r"zzz_definitely_not_in_code").unwrap();
+        let content2 = "fn foo() {}\nfn bar() {}";
+        assert!(super::match_line_for_literal(content2, "zzz_definitely_not_in_code", Some(&regex2)).is_none());
+
+        // Non-anchorable regex with no matches → empty (scan path would skip)
+        let regex3 = regex::Regex::new(r"\bimpl\s+\w+\s+for\s+\w+").unwrap();
+        let content3 = "fn simple() {}\nstruct Foo;";
+        assert!(super::match_line_for_literal(content3, r"\bimpl\s+\w+\s+for\s+\w+", Some(&regex3)).is_none());
+    }
 }
 
 pub mod types;
@@ -1923,6 +2017,78 @@ fn match_line_for_literal(content: &str, query: &str, regex: Option<&Regex>) -> 
     }
 
     None
+}
+
+/// Returns true when a regex pattern contains at least one run of three or more
+/// alphanumerics-or-underscore characters. Such a run is enough for Tantivy's
+/// analyzer to produce a real BM25 token, which means the BM25 candidate path
+/// will work for this query.
+///
+/// When this returns false, the regex is "tokenless" — it consists only of
+/// regex syntax (\b, \s, \w, ^, $, character classes, anchors). BM25 has
+/// nothing to match on, so the caller must fall back to a full chunk scan.
+///
+/// Conservative direction: false positives ("looks anchorable, isn't really")
+/// are safe because the BM25 path will return empty candidates and the regex
+/// post-filter will return empty results — same outcome as the scan path
+/// would on a corpus with no matches. False negatives ("looks tokenless,
+/// actually has tokens") are unsafe because they trigger an unnecessary scan.
+/// We bias toward false positives.
+fn regex_has_anchorable_token(pattern: &str) -> bool {
+    let mut run: usize = 0;
+    let mut need_separator = false;
+    let mut i = 0;
+    let bytes = pattern.as_bytes();
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // Skip the next char after a backslash — it's an escape, not content.
+        // This prevents \w, \s, \b, \d etc. from contributing to the run count.
+        if c == '\\' && i + 1 < bytes.len() {
+            run = 0;
+            need_separator = true; // chars after escape are merged by BM25 tokenizer
+            i += 2;
+            continue;
+        }
+        // Character classes [abc] don't anchor BM25 either — the tokens inside
+        // are alternatives, not a contiguous string. Skip the whole class.
+        if c == '[' {
+            run = 0;
+            need_separator = true;
+            // Find matching ]; tolerate \] inside.
+            let mut j = i + 1;
+            while j < bytes.len() {
+                let cj = bytes[j] as char;
+                if cj == '\\' && j + 1 < bytes.len() {
+                    j += 2;
+                    continue;
+                }
+                if cj == ']' {
+                    break;
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            if need_separator {
+                // After \X or [...], BM25 merges the next alphanumeric run with
+                // the escape/class content (e.g. \bimpl → "bimpl", not "impl").
+                // So we skip these chars — they're not independent tokens.
+                i += 1;
+                continue;
+            }
+            run += 1;
+            if run >= 3 {
+                return true;
+            }
+        } else {
+            run = 0;
+            need_separator = false;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Parse individual import statements from chunk content.
@@ -4467,57 +4633,7 @@ impl CodesearchService {
             }
         }
 
-        // FTS search — multi-store or single
-        // Note: regex=true uses BM25 for candidates, then post-filters with the
-        // actual regex on raw content (Tantivy's RegexQuery only works on individual
-        // tokens, not raw text — underscores/punctuation cause empty results).
-        let fts_results = if let Some(ref sv) = ctx.stores_vec {
-            let sa = ctx.store_aliases.as_ref().unwrap();
-            self.with_fts_store_read_multi(
-                |fts_store| {
-                    if request.phrase.unwrap_or(false) {
-                        fts_store.search_phrase(&request.query, limit * 3)
-                    } else {
-                        // Both default and regex modes use BM25; regex is post-filtered
-                        fts_store.search(&request.query, limit * 3, None)
-                    }
-                },
-                sv.clone(),
-                sa,
-            )
-            .await
-            .unwrap_or_default()
-        } else {
-            match self
-                .with_fts_store_read_for(
-                    |fts_store| {
-                        if request.phrase.unwrap_or(false) {
-                            fts_store.search_phrase(&request.query, limit * 3)
-                        } else {
-                            fts_store.search(&request.query, limit * 3, None)
-                        }
-                    },
-                    ctx.stores.clone(),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error searching: {}", e
-                    ))]));
-                }
-            }
-        };
-
-        if fts_results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No results found for '{}'. Try a different query or mode.",
-                request.query
-            ))]));
-        }
-
-        // Resolve chunk metadata and apply post-filters
+        // Pre-compute normalized project root for stripping absolute paths in glob matching
         let lang_filter = request.language.clone();
         let glob_filter = request.file_glob.clone();
         let regex_enabled = request.regex.unwrap_or(false);
@@ -4526,20 +4642,32 @@ impl CodesearchService {
         } else {
             None
         };
-        // Pre-compute normalized project root for stripping absolute paths in glob matching
         let project_root_normalized = {
             let root = crate::cache::normalize_path_str(self.project_path.to_str().unwrap_or(""));
             root.trim_end_matches('/').to_string()
         };
 
-        let mut items: Vec<LiteralSearchResultItem> = if let Some(ref sv) = ctx.stores_vec {
-            // Multi-store: resolve chunks from all stores
-            let mut items: Vec<LiteralSearchResultItem> = Vec::new();
-            'outer: for fts_result in &fts_results {
+        // Decide: BM25 path (for anchorable queries) or scan path (for tokenless regex)
+        let tokenless_regex = regex_enabled
+            && snippet_regex.is_some()
+            && !regex_has_anchorable_token(&request.query);
+
+        let mut items: Vec<LiteralSearchResultItem> = if tokenless_regex {
+            // ── Scan path ──────────────────────────────────────────────
+            // Tokenless regex (e.g. \bfn\s+\w+) — BM25 cannot produce useful
+            // candidates. Scan all chunks sequentially, apply regex post-filter.
+            // Score is 0.0 for all results (no BM25 ranking applies).
+            tracing::debug!("literal_search: tokenless regex detected, using scan path");
+            if let Some(ref sv) = ctx.stores_vec {
+                // Multi-store scan
+                let mut items: Vec<LiteralSearchResultItem> = Vec::new();
                 for store_arc in sv {
                     let store = store_arc.vector_store.read().await;
-                    if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
-                        // Apply filters
+                    let all_chunks = match store.iter_all_chunks() {
+                        Ok(chunks) => chunks,
+                        Err(_) => continue,
+                    };
+                    for (_, chunk) in all_chunks {
                         if let Some(ref lang) = lang_filter {
                             let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
                             if file_lang.name() != lang {
@@ -4555,92 +4683,245 @@ impl CodesearchService {
                                 continue;
                             }
                         }
-                        let match_info = match_line_for_literal(
+                        if let Some((match_offset, snippet)) = match_line_for_literal(
                             &chunk.content, &request.query, snippet_regex.as_ref(),
-                        );
-                        if regex_enabled && match_info.is_none() {
-                            continue;
-                        }
-                        let (match_offset, snippet) = match_info
-                            .unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
-                        let match_line = chunk.start_line + match_offset;
-                        items.push(LiteralSearchResultItem {
-                            path: chunk.path,
-                            start_line: match_line,
-                            end_line: match_line,
-                            snippet,
-                            score: fts_result.score,
-                            kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
-                            signature: chunk.signature.filter(|s| !s.is_empty()),
-                        });
-                        if items.len() >= limit {
-                            break 'outer;
-                        }
-                        break; // Found in this store
-                    }
-                }
-            }
-            items
-        } else {
-            match self
-                .with_vector_store_read_for(
-                    |store| {
-                    let items: Vec<LiteralSearchResultItem> = fts_results
-                        .iter()
-                        .filter_map(|fts_result| {
-                            let chunk = store.get_chunk(fts_result.chunk_id).ok()??;
-                            Some((chunk, fts_result.score))
-                        })
-                        .filter(|(chunk, _)| {
-                            if let Some(ref lang) = lang_filter {
-                                let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
-                                if file_lang.name() != lang {
-                                    return false;
-                                }
-                            }
-                            if let Some(ref glob) = glob_filter {
-                                let relative_path = chunk
-                                    .path
-                                    .strip_prefix(&project_root_normalized)
-                                    .unwrap_or(&chunk.path)
-                                    .trim_start_matches('/');
-                                if !simple_glob_match(glob, relative_path) {
-                                    return false;
-                                }
-                            }
-                            true
-                        })
-                        .take(limit)
-                        .filter_map(|(chunk, score)| {
-                            let match_info = match_line_for_literal(
-                                &chunk.content, &request.query, snippet_regex.as_ref(),
-                            );
-                            if regex_enabled && match_info.is_none() {
-                                return None;
-                            }
-                            let (match_offset, snippet) = match_info
-                                .unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
+                        ) {
                             let match_line = chunk.start_line + match_offset;
-                            Some(LiteralSearchResultItem {
+                            items.push(LiteralSearchResultItem {
                                 path: chunk.path,
                                 start_line: match_line,
                                 end_line: match_line,
                                 snippet,
-                                score,
+                                score: 0.0, // No BM25 score — scan-path results are unranked
                                 kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
                                 signature: chunk.signature.filter(|s| !s.is_empty()),
-                            })
-                        })
-                        .collect();
-                    Ok(items)
-                }, ctx.stores.clone())
+                            });
+                            if items.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    if items.len() >= limit {
+                        break;
+                    }
+                }
+                items
+            } else {
+                // Single-store scan
+                match self
+                    .with_vector_store_read_for(
+                        |store| {
+                            let all_chunks = store.iter_all_chunks()?;
+                            let mut items: Vec<LiteralSearchResultItem> = Vec::new();
+                            for (_, chunk) in all_chunks {
+                                if let Some(ref lang) = lang_filter {
+                                    let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                                    if file_lang.name() != lang {
+                                        continue;
+                                    }
+                                }
+                                if let Some(ref glob) = glob_filter {
+                                    let relative_path = chunk
+                                        .path
+                                        .strip_prefix(&project_root_normalized)
+                                        .unwrap_or(&chunk.path)
+                                        .trim_start_matches('/');
+                                    if !simple_glob_match(glob, relative_path) {
+                                        continue;
+                                    }
+                                }
+                                if let Some((match_offset, snippet)) = match_line_for_literal(
+                                    &chunk.content, &request.query, snippet_regex.as_ref(),
+                                ) {
+                                    let match_line = chunk.start_line + match_offset;
+                                    items.push(LiteralSearchResultItem {
+                                        path: chunk.path,
+                                        start_line: match_line,
+                                        end_line: match_line,
+                                        snippet,
+                                        score: 0.0, // No BM25 score — scan-path results are unranked
+                                        kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
+                                        signature: chunk.signature.filter(|s| !s.is_empty()),
+                                    });
+                                    if items.len() >= limit {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(items)
+                        },
+                        ctx.stores.clone(),
+                    )
+                    .await
+                {
+                    Ok(items) => items,
+                    Err(e) => {
+                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Error scanning chunks: {}", e
+                        ))]));
+                    }
+                }
+            }
+        } else {
+            // ── BM25 path ──────────────────────────────────────────────
+            // Note: regex=true uses BM25 for candidates, then post-filters with the
+            // actual regex on raw content (Tantivy's RegexQuery only works on individual
+            // tokens, not raw text — underscores/punctuation cause empty results).
+            let fts_results = if let Some(ref sv) = ctx.stores_vec {
+                let sa = ctx.store_aliases.as_ref().unwrap();
+                self.with_fts_store_read_multi(
+                    |fts_store| {
+                        if request.phrase.unwrap_or(false) {
+                            fts_store.search_phrase(&request.query, limit * 3)
+                        } else {
+                            fts_store.search(&request.query, limit * 3, None)
+                        }
+                    },
+                    sv.clone(),
+                    sa,
+                )
                 .await
-            {
-                Ok(items) => items,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error resolving search results: {}", e
-                    ))]));
+                .unwrap_or_default()
+            } else {
+                match self
+                    .with_fts_store_read_for(
+                        |fts_store| {
+                            if request.phrase.unwrap_or(false) {
+                                fts_store.search_phrase(&request.query, limit * 3)
+                            } else {
+                                fts_store.search(&request.query, limit * 3, None)
+                            }
+                        },
+                        ctx.stores.clone(),
+                    )
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Error searching: {}", e
+                        ))]));
+                    }
+                }
+            };
+
+            if fts_results.is_empty() {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "No results found for '{}'. Try a different query or mode.",
+                    request.query
+                ))]));
+            }
+
+            // Resolve chunk metadata and apply post-filters
+            if let Some(ref sv) = ctx.stores_vec {
+                // Multi-store: resolve chunks from all stores
+                let mut items: Vec<LiteralSearchResultItem> = Vec::new();
+                'outer: for fts_result in &fts_results {
+                    for store_arc in sv {
+                        let store = store_arc.vector_store.read().await;
+                        if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                            if let Some(ref lang) = lang_filter {
+                                let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                                if file_lang.name() != lang {
+                                    continue;
+                                }
+                            }
+                            if let Some(ref glob) = glob_filter {
+                                let relative_path = chunk.path
+                                    .strip_prefix(&project_root_normalized)
+                                    .unwrap_or(&chunk.path)
+                                    .trim_start_matches('/');
+                                if !simple_glob_match(glob, relative_path) {
+                                    continue;
+                                }
+                            }
+                            let match_info = match_line_for_literal(
+                                &chunk.content, &request.query, snippet_regex.as_ref(),
+                            );
+                            if regex_enabled && match_info.is_none() {
+                                continue;
+                            }
+                            let (match_offset, snippet) = match_info
+                                .unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
+                            let match_line = chunk.start_line + match_offset;
+                            items.push(LiteralSearchResultItem {
+                                path: chunk.path,
+                                start_line: match_line,
+                                end_line: match_line,
+                                snippet,
+                                score: fts_result.score,
+                                kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
+                                signature: chunk.signature.filter(|s| !s.is_empty()),
+                            });
+                            if items.len() >= limit {
+                                break 'outer;
+                            }
+                            break; // Found in this store
+                        }
+                    }
+                }
+                items
+            } else {
+                match self
+                    .with_vector_store_read_for(
+                        |store| {
+                        let items: Vec<LiteralSearchResultItem> = fts_results
+                            .iter()
+                            .filter_map(|fts_result| {
+                                let chunk = store.get_chunk(fts_result.chunk_id).ok()??;
+                                Some((chunk, fts_result.score))
+                            })
+                            .filter(|(chunk, _)| {
+                                if let Some(ref lang) = lang_filter {
+                                    let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                                    if file_lang.name() != lang {
+                                        return false;
+                                    }
+                                }
+                                if let Some(ref glob) = glob_filter {
+                                    let relative_path = chunk
+                                        .path
+                                        .strip_prefix(&project_root_normalized)
+                                        .unwrap_or(&chunk.path)
+                                        .trim_start_matches('/');
+                                    if !simple_glob_match(glob, relative_path) {
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                            .take(limit)
+                            .filter_map(|(chunk, score)| {
+                                let match_info = match_line_for_literal(
+                                    &chunk.content, &request.query, snippet_regex.as_ref(),
+                                );
+                                if regex_enabled && match_info.is_none() {
+                                    return None;
+                                }
+                                let (match_offset, snippet) = match_info
+                                    .unwrap_or_else(|| (0, chunk.content.lines().next().unwrap_or("").to_string()));
+                                let match_line = chunk.start_line + match_offset;
+                                Some(LiteralSearchResultItem {
+                                    path: chunk.path,
+                                    start_line: match_line,
+                                    end_line: match_line,
+                                    snippet,
+                                    score,
+                                    kind: if chunk.kind.is_empty() { None } else { Some(chunk.kind) },
+                                    signature: chunk.signature.filter(|s| !s.is_empty()),
+                                })
+                            })
+                            .collect();
+                        Ok(items)
+                    }, ctx.stores.clone())
+                    .await
+                {
+                    Ok(items) => items,
+                    Err(e) => {
+                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Error resolving search results: {}", e
+                        ))]));
+                    }
                 }
             }
         };
