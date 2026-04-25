@@ -1633,6 +1633,282 @@ mod tests {
         let content3 = "fn simple() {}\nstruct Foo;";
         assert!(super::match_line_for_literal(content3, r"\bimpl\s+\w+\s+for\s+\w+", Some(&regex3)).is_none());
     }
+
+    // ─── looks_like_code_pattern detector tests ───────────────────────
+
+    #[test]
+    fn test_looks_like_code_pattern_assignment() {
+        assert!(super::looks_like_code_pattern("foo = null"));
+        assert!(super::looks_like_code_pattern("x = 42"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_arrow() {
+        assert!(super::looks_like_code_pattern("foo->bar"));
+        assert!(super::looks_like_code_pattern("x => y"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_namespace() {
+        assert!(super::looks_like_code_pattern("std::string"));
+        assert!(super::looks_like_code_pattern("a::b::c"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_generics() {
+        assert!(super::looks_like_code_pattern("Vec<T>"));
+        assert!(super::looks_like_code_pattern("HashMap<K, V>"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_statement_end() {
+        assert!(super::looks_like_code_pattern("return x;"));
+        assert!(super::looks_like_code_pattern("if (x) {"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_plain_identifier_false() {
+        assert!(!super::looks_like_code_pattern("ActivitiesListModelResponse"));
+        assert!(!super::looks_like_code_pattern("foo_bar"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_dotted_path_false() {
+        assert!(!super::looks_like_code_pattern("foo.bar"));
+        assert!(!super::looks_like_code_pattern("System.Console"));
+    }
+
+    #[test]
+    fn test_looks_like_code_pattern_empty_false() {
+        assert!(!super::looks_like_code_pattern(""));
+    }
+
+    // ─── compute_literal_low_confidence tests ─────────────────────────
+
+    #[test]
+    fn test_literal_lc_natural_language_zero_results() {
+        let (lc, hint) = super::compute_literal_low_confidence(None, "how do we handle auth");
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("semantic"));
+    }
+
+    #[test]
+    fn test_literal_lc_identifier_zero_results() {
+        let (lc, hint) = super::compute_literal_low_confidence(None, "CodesearchService");
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("regex"));
+    }
+
+    #[test]
+    fn test_literal_lc_code_pattern_zero_results() {
+        let (lc, hint) = super::compute_literal_low_confidence(None, "foo = null");
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("regex"));
+    }
+
+    #[test]
+    fn test_literal_lc_natural_language_weak_score() {
+        // Use a score demonstrably less than f32::MAX
+        let weak_score = super::LITERAL_LOW_CONFIDENCE_BM25 / 2.0;
+        let (lc, hint) = super::compute_literal_low_confidence(
+            Some(weak_score),
+            "how do we handle auth",
+        );
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("semantic"));
+    }
+
+    #[test]
+    fn test_literal_lc_identifier_weak_score() {
+        let weak_score = super::LITERAL_LOW_CONFIDENCE_BM25 / 2.0;
+        let (lc, hint) = super::compute_literal_low_confidence(
+            Some(weak_score),
+            "CodesearchService",
+        );
+        assert_eq!(lc, Some(true));
+        assert!(hint.unwrap().contains("find"));
+    }
+
+    #[test]
+    fn test_literal_lc_threshold_uses_strictly_less_than() {
+        let (lc, hint) = super::compute_literal_low_confidence(
+            Some(super::LITERAL_LOW_CONFIDENCE_BM25),
+            "anything",
+        );
+        assert_eq!(lc, None);
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn test_literal_lc_high_score_returns_none() {
+        let (lc, hint) = super::compute_literal_low_confidence(Some(f32::MAX), "anything");
+        assert_eq!(lc, None);
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn test_literal_response_json_has_lc_fields() {
+        let response = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: Some(true),
+            suggested_tool: Some("search with mode='semantic'".to_string()),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains(r#""low_confidence":true"#));
+        assert!(json.contains("\"suggested_tool\""));
+    }
+
+    #[test]
+    fn test_literal_response_json_omits_lc_fields_when_none() {
+        let response = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("low_confidence"));
+        assert!(!json.contains("suggested_tool"));
+        assert!(!json.contains("auto_promoted"));
+        assert!(!json.contains("note"));
+    }
+
+    // ─── auto-promotion behaviour tests ────────────────────────────────
+
+    #[test]
+    fn test_auto_promotion_escapes_and_relaxes_spaces() {
+        // "foo = null" → regex::escape → "foo = null" (spaces not escaped) → replace ' ' with \s+ → "foo\s+=\s+null"
+        let query = "foo = null";
+        let escaped = regex::escape(query);
+        let relaxed = escaped.replace(' ', r"\s+");
+        assert_eq!(relaxed, r"foo\s+=\s+null");
+    }
+
+    #[test]
+    fn test_auto_promoted_skipped_when_user_sets_regex() {
+        let user_set_regex = true;
+        let user_set_phrase = false;
+        let auto_promoted = !user_set_regex && !user_set_phrase && super::looks_like_code_pattern("foo = null");
+        assert!(!auto_promoted);
+    }
+
+    #[test]
+    fn test_auto_promoted_skipped_when_user_sets_phrase() {
+        let user_set_regex = false;
+        let user_set_phrase = true;
+        let auto_promoted = !user_set_regex && !user_set_phrase && super::looks_like_code_pattern("foo = null");
+        assert!(!auto_promoted);
+    }
+
+    #[test]
+    fn test_literal_search_response_shape_json() {
+        let response = super::LiteralSearchResponse {
+            results: vec![super::LiteralSearchResultItem {
+                path: "test.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                snippet: "fn test()".to_string(),
+                score: 1.0,
+                kind: None,
+                signature: None,
+            }],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.starts_with('{'));
+        assert!(json.contains("\"results\":["));
+        assert!(!json.starts_with('['));
+    }
+
+    #[test]
+    fn test_literal_search_response_carries_note_when_promoted() {
+        let response = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: Some(true),
+            note: Some("auto-promoted".to_string()),
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains(r#""auto_promoted_to_regex":true"#));
+        assert!(json.contains("\"note\""));
+    }
+
+    #[test]
+    fn test_literal_search_response_omits_fields_when_not_promoted() {
+        let response = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("auto_promoted_to_regex"));
+        assert!(!json.contains("note"));
+    }
+
+    #[test]
+    fn test_grep_format_includes_comment_when_promoted() {
+        let response = super::LiteralSearchResponse {
+            results: vec![super::LiteralSearchResultItem {
+                path: "test.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                snippet: "fn test()".to_string(),
+                score: 0.0,
+                kind: None,
+                signature: None,
+            }],
+            auto_promoted_to_regex: Some(true),
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let mut lines: Vec<String> = Vec::new();
+        if response.auto_promoted_to_regex == Some(true) {
+            lines.push("# auto-promoted to regex mode (query contained code-like punctuation)".to_string());
+        }
+        for item in &response.results {
+            lines.push(format!("{}:{}:{}", item.path, item.start_line, item.snippet));
+        }
+        let output = lines.join("\n");
+        assert!(output.starts_with("# auto-promoted"));
+    }
+
+    #[test]
+    fn test_grep_format_no_comment_when_plain() {
+        let response = super::LiteralSearchResponse {
+            results: vec![super::LiteralSearchResultItem {
+                path: "test.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                snippet: "fn test()".to_string(),
+                score: 1.0,
+                kind: None,
+                signature: None,
+            }],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+        };
+        let mut lines: Vec<String> = Vec::new();
+        if response.auto_promoted_to_regex == Some(true) {
+            lines.push("# auto-promoted to regex mode (query contained code-like punctuation)".to_string());
+        }
+        for item in &response.results {
+            lines.push(format!("{}:{}:{}", item.path, item.start_line, item.snippet));
+        }
+        let output = lines.join("\n");
+        assert!(!output.starts_with('#'));
+    }
 }
 
 pub mod types;
@@ -2146,6 +2422,72 @@ fn regex_has_anchorable_token(pattern: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Returns true when a literal-search query looks like a code pattern whose
+/// punctuation would be destroyed by BM25 tokenization.
+///
+/// Triggers on:
+/// - Multi-char operators: ->, =>, ::, !=, ==, <=, >=, &&, ||, <<, >>
+/// - Space-surrounded single operators: " = ", " < ", " > "
+/// - Statement endings: trailing `;` or `{`
+/// - ≥ 2 angle/square bracket characters: `Vec<T>`, `[0]`
+///
+/// Does NOT trigger on:
+/// - Plain identifiers: "ActivitiesListModelResponse", "foo_bar"
+/// - Dotted paths: "foo.bar", "System.Console"
+/// - Single parens alone: "(error)" — parens are not in the bracket set
+fn looks_like_code_pattern(query: &str) -> bool {
+    const MULTI_OPS: &[&str] = &[
+        "->", "=>", "::", "!=", "==", "<=", ">=", "&&", "||", "<<", ">>",
+    ];
+    if MULTI_OPS.iter().any(|op| query.contains(op)) {
+        return true;
+    }
+    const SPACED_OPS: &[&str] = &[" = ", " < ", " > "];
+    if SPACED_OPS.iter().any(|op| query.contains(op)) {
+        return true;
+    }
+    let trimmed = query.trim();
+    if trimmed.ends_with(';') || trimmed.ends_with('{') {
+        return true;
+    }
+    let bracket_count = query
+        .chars()
+        .filter(|c| matches!(c, '<' | '>' | '[' | ']'))
+        .count();
+    bracket_count >= 2
+}
+
+/// BM25 score threshold for low-confidence signalling in literal search.
+/// IMPORTANT: this value is unvalidated. It is set to f32::MAX (never fires)
+/// until real query scores have been collected. Update after reviewing
+/// `RUST_LOG=codesearch::literal_confidence=debug` output.
+const LITERAL_LOW_CONFIDENCE_BM25: f32 = f32::MAX;
+
+fn compute_literal_low_confidence(
+    top_score: Option<f32>,
+    query: &str,
+) -> (Option<bool>, Option<String>) {
+    let word_count = query.split_whitespace().count();
+    let has_code_chars = query.chars().any(|c| "{}[]<>=|;:".contains(c));
+    let is_natural_language = word_count >= 3 && !has_code_chars;
+
+    let suggest_semantic = "search with mode='semantic'";
+    let suggest_regex    = "search with mode='literal' and regex=true";
+    let suggest_find     = "find with kind='definition' or kind='usages'";
+
+    match top_score {
+        Some(score) if score < LITERAL_LOW_CONFIDENCE_BM25 => {
+            let hint = if is_natural_language { suggest_semantic } else { suggest_find };
+            (Some(true), Some(hint.to_string()))
+        }
+        None => {
+            let hint = if is_natural_language { suggest_semantic } else { suggest_regex };
+            (Some(true), Some(hint.to_string()))
+        }
+        Some(_) => (None, None),
+    }
 }
 
 /// Parse individual import statements from chunk content.
@@ -4678,6 +5020,23 @@ impl CodesearchService {
         let limit = request.limit.unwrap_or(20);
         let output_format = request.format.as_deref().unwrap_or("json");
 
+        // Auto-regex promotion: detect code patterns that BM25 would destroy
+        let user_set_regex  = request.regex.unwrap_or(false);
+        let user_set_phrase = request.phrase.unwrap_or(false);
+        let auto_promoted   = !user_set_regex
+            && !user_set_phrase
+            && looks_like_code_pattern(&request.query);
+
+        let (effective_query, effective_regex) = if auto_promoted {
+            let escaped = regex::escape(&request.query);
+            // Relax whitespace to \s+ so "foo = null" → "foo\s+=\s+null"
+            // regex::escape does not escape spaces, so replace literal spaces.
+            let relaxed = escaped.replace(' ', r"\s+");
+            (relaxed, true)
+        } else {
+            (request.query.clone(), user_set_regex)
+        };
+
         tracing::debug!(
             "MCP literal_search: query='{}', regex={:?}, phrase={:?}, limit={}, file_glob={:?}, language={:?}, format={}, multi={}",
             request.query, request.regex, request.phrase, limit,
@@ -4693,9 +5052,9 @@ impl CodesearchService {
         // Pre-compute normalized project root for stripping absolute paths in glob matching
         let lang_filter = request.language.clone();
         let glob_filter = request.file_glob.clone();
-        let regex_enabled = request.regex.unwrap_or(false);
+        let regex_enabled = effective_regex;
         let snippet_regex = if regex_enabled {
-            Regex::new(&request.query).ok()
+            Regex::new(&effective_query).ok()
         } else {
             None
         };
@@ -4707,7 +5066,7 @@ impl CodesearchService {
         // Decide: BM25 path (for anchorable queries) or scan path (for tokenless regex)
         let tokenless_regex = regex_enabled
             && snippet_regex.is_some()
-            && !regex_has_anchorable_token(&request.query);
+            && !regex_has_anchorable_token(&effective_query);
 
         let mut items: Vec<LiteralSearchResultItem> = if tokenless_regex {
             // ── Scan path ──────────────────────────────────────────────
@@ -4741,7 +5100,7 @@ impl CodesearchService {
                             }
                         }
                         if let Some((match_offset, snippet)) = match_line_for_literal(
-                            &chunk.content, &request.query, snippet_regex.as_ref(),
+                            &chunk.content, &effective_query, snippet_regex.as_ref(),
                         ) {
                             let match_line = chunk.start_line + match_offset;
                             items.push(LiteralSearchResultItem {
@@ -4788,7 +5147,7 @@ impl CodesearchService {
                                     }
                                 }
                                 if let Some((match_offset, snippet)) = match_line_for_literal(
-                                    &chunk.content, &request.query, snippet_regex.as_ref(),
+                                    &chunk.content, &effective_query, snippet_regex.as_ref(),
                                 ) {
                                     let match_line = chunk.start_line + match_offset;
                                     items.push(LiteralSearchResultItem {
@@ -4829,9 +5188,9 @@ impl CodesearchService {
                 self.with_fts_store_read_multi(
                     |fts_store| {
                         if request.phrase.unwrap_or(false) {
-                            fts_store.search_phrase(&request.query, limit * 3)
+                            fts_store.search_phrase(&effective_query, limit * 3)
                         } else {
-                            fts_store.search(&request.query, limit * 3, None)
+                            fts_store.search(&effective_query, limit * 3, None)
                         }
                     },
                     sv.clone(),
@@ -4844,9 +5203,9 @@ impl CodesearchService {
                     .with_fts_store_read_for(
                         |fts_store| {
                             if request.phrase.unwrap_or(false) {
-                                fts_store.search_phrase(&request.query, limit * 3)
+                                fts_store.search_phrase(&effective_query, limit * 3)
                             } else {
-                                fts_store.search(&request.query, limit * 3, None)
+                                fts_store.search(&effective_query, limit * 3, None)
                             }
                         },
                         ctx.stores.clone(),
@@ -4861,13 +5220,6 @@ impl CodesearchService {
                     }
                 }
             };
-
-            if fts_results.is_empty() {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "No results found for '{}'. Try a different query or mode.",
-                    request.query
-                ))]));
-            }
 
             // Resolve chunk metadata and apply post-filters
             if let Some(ref sv) = ctx.stores_vec {
@@ -4893,7 +5245,7 @@ impl CodesearchService {
                                 }
                             }
                             let match_info = match_line_for_literal(
-                                &chunk.content, &request.query, snippet_regex.as_ref(),
+                                &chunk.content, &effective_query, snippet_regex.as_ref(),
                             );
                             if regex_enabled && match_info.is_none() {
                                 continue;
@@ -4950,7 +5302,7 @@ impl CodesearchService {
                             .take(limit)
                             .filter_map(|(chunk, score)| {
                                 let match_info = match_line_for_literal(
-                                    &chunk.content, &request.query, snippet_regex.as_ref(),
+                                    &chunk.content, &effective_query, snippet_regex.as_ref(),
                                 );
                                 if regex_enabled && match_info.is_none() {
                                     return None;
@@ -4988,22 +5340,59 @@ impl CodesearchService {
             item.path = ctx.prefix_result_path(&item.path);
         }
 
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No results found for '{}' after applying filters.",
-                request.query
-            ))]));
+        // Compute low-confidence signal
+        let top_score = items.first().map(|i| i.score);
+        let (low_confidence, suggested_tool) = compute_literal_low_confidence(top_score, &request.query);
+
+        // Build note
+        let note = if auto_promoted {
+            Some(format!(
+                "Query auto-promoted to regex mode (original: '{}', effective: '{}'). \
+                 The query contained code-like punctuation that BM25 would tokenize incorrectly.",
+                request.query, effective_query
+            ))
+        } else if low_confidence == Some(true) {
+            suggested_tool.clone()
+        } else {
+            None
+        };
+
+        let response = LiteralSearchResponse {
+            results: items,
+            auto_promoted_to_regex: if auto_promoted { Some(true) } else { None },
+            note,
+            low_confidence,
+            suggested_tool: if low_confidence == Some(true) { suggested_tool } else { None },
+        };
+
+        // Instrument BM25 score for threshold calibration
+        if let Some(top) = response.results.first() {
+            tracing::debug!(
+                target: "codesearch::literal_confidence",
+                query = %request.query,
+                top_bm25_score = top.score,
+                result_count = response.results.len(),
+                "literal_search score sample"
+            );
         }
 
         // Format output
         let output = if output_format == "grep" {
-            items
-                .iter()
-                .map(|item| format!("{}:{}:{}", item.path, item.start_line, item.snippet))
-                .collect::<Vec<_>>()
-                .join("\n")
+            let mut lines: Vec<String> = Vec::new();
+            if response.auto_promoted_to_regex == Some(true) {
+                lines.push("# auto-promoted to regex mode (query contained code-like punctuation)".to_string());
+            }
+            if response.low_confidence == Some(true) {
+                if let Some(ref hint) = response.suggested_tool {
+                    lines.push(format!("# low confidence — consider: {}", hint));
+                }
+            }
+            for item in &response.results {
+                lines.push(format!("{}:{}:{}", item.path, item.start_line, item.snippet));
+            }
+            lines.join("\n")
         } else {
-            serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+            serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
         };
 
         Ok(CallToolResult::success(vec![Content::text(output)]))

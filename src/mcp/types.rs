@@ -292,7 +292,7 @@ pub struct IndexStatusResponse {
 }
 
 /// Search result item — returned by literal search
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiteralSearchResultItem {
     /// File path (relative to project root)
     pub path: String,
@@ -307,6 +307,32 @@ pub struct LiteralSearchResultItem {
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+}
+
+/// Response from `search(mode="literal")`.
+///
+/// Replaces the previous bare `Vec<LiteralSearchResultItem>` JSON array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiteralSearchResponse {
+    pub results: Vec<LiteralSearchResultItem>,
+
+    /// True when codesearch auto-escaped the query and enabled regex mode
+    /// because the original query contained code-like punctuation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_promoted_to_regex: Option<bool>,
+
+    /// Actionable note for the LLM caller (present iff auto_promoted_to_regex
+    /// or low_confidence is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+
+    /// True when results are empty or top BM25 score is below threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_confidence: Option<bool>,
+
+    /// Suggested next tool when low_confidence is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_tool: Option<String>,
 }
 
 /// Semantic search response wrapper with low-confidence signaling
