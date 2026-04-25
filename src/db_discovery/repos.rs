@@ -155,7 +155,7 @@ impl ReposConfig {
         self.repos.get(project).cloned()
     }
 
-    #[allow(dead_code)] // Available for group-based routing
+    #[allow(dead_code)] // Used in tests only — dead in bin targets
     pub fn resolve_group(&self, group: &str) -> Vec<(String, PathBuf)> {
         let Some(aliases) = self.groups.get(group) else {
             return Vec::new();

@@ -2498,6 +2498,13 @@ impl CodesearchService {
             request.project,
             request.group,
         );
+        // Proxy guard: forward ALL search modes to serve rather than dispatching locally
+        if let Some(ref proxy) = self.proxy {
+            let params = serde_json::to_value(&request).ok();
+            return proxy.forward("search", params).await.map_err(|e| {
+                McpError::internal_error(e.message.into_owned(), None)
+            });
+        }
         let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
         match mode.as_str() {
             "semantic" => {

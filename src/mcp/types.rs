@@ -20,7 +20,7 @@ use std::collections::HashMap;
 /// Set `mode` to choose the search backend:
 /// - `"semantic"` (default) — vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF.
 /// - `"literal"` — pure FTS, no embeddings. Supports regex, phrase, and exact-term matching.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct SearchRequest {
     /// The search query (natural language, code snippet, regex, or exact term).
     pub query: String,
