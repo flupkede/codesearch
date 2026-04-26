@@ -2100,14 +2100,18 @@ pub use types::*;
 /// This is the correct architecture for Claude Desktop: it has no repo context of its own
 /// and therefore cannot use `--mode local`. With `--mode client` it always connects to
 /// the serve hub, gaining access to all registered repos.
+///
+/// Only tool operations (`list_tools`, `call_tool`) are forwarded. Prompts, resources,
+/// and completion are not proxied — the serve hub does not expose them.
 struct McpProxyService {
-    /// HTTP client connection to the serve hub, wrapped in Arc for Send + Sync.
-    client: Arc<RunningService<RoleClient, ()>>,
+    /// Clonable peer handle to the serve hub. `Peer` supports `list_tools` / `call_tool`
+    /// directly via the rmcp `method!` macro.
+    peer: rmcp::service::Peer<RoleClient>,
 }
 
 impl McpProxyService {
-    fn new(client: RunningService<RoleClient, ()>) -> Self {
-        Self { client: Arc::new(client) }
+    fn new(peer: rmcp::service::Peer<RoleClient>) -> Self {
+        Self { peer }
     }
 }
 
@@ -2135,7 +2139,7 @@ impl ServerHandler for McpProxyService {
         request: Option<PaginatedRequestParam>,
         _cx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        self.client
+        self.peer
             .list_tools(request)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))
@@ -2146,7 +2150,7 @@ impl ServerHandler for McpProxyService {
         request: CallToolRequestParam,
         _cx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.client
+        self.peer
             .call_tool(request)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))
@@ -6081,9 +6085,10 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
 
     tracing::info!("✅ Connected to codesearch serve hub");
 
-    // Step 2: Wrap in proxy and start stdio server for Claude Desktop.
-    // McpProxyService forwards every list_tools / call_tool to the HTTP client.
-    let proxy = McpProxyService::new(http_client);
+    // Step 2: Clone the Peer (cheap handle — Clonable) for the proxy.
+    // Keep the owned RunningService for .waiting() to detect serve disconnect.
+    let peer = http_client.peer().clone();
+    let proxy = McpProxyService::new(peer);
     let server = proxy
         .serve(stdio())
         .await
@@ -6091,10 +6096,14 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
 
     tracing::info!("🚀 MCP proxy ready — forwarding Claude Desktop ↔ codesearch serve");
 
-    // Step 3: Wait for Claude Desktop to close the pipe or a cancel signal.
+    // Step 3: Wait for any of: stdio close, serve disconnect, or cancel signal.
     tokio::select! {
         result = server.waiting() => {
             tracing::info!("MCP proxy transport closed");
+            result?;
+        }
+        result = http_client.waiting() => {
+            tracing::warn!("codesearch serve disconnected");
             result?;
         }
         _ = cancel_token.cancelled() => {
