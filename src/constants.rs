@@ -82,6 +82,19 @@ pub fn get_global_models_cache_dir() -> anyhow::Result<PathBuf> {
     Ok(models_dir)
 }
 
+/// Get the global cache directory (~/.codesearch/).
+///
+/// Used for client/auto mode logging when no local DB is available.
+/// The directory is created if it does not exist.
+pub fn get_global_cache_dir() -> PathBuf {
+    let base = dirs::home_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let cache_dir = base.join(CONFIG_DIR_NAME);
+    if !cache_dir.exists() {
+        let _ = std::fs::create_dir_all(&cache_dir);
+    }
+    cache_dir
+}
+
 /// Name of the repos configuration file
 pub const REPOS_CONFIG_FILE: &str = "repos.json";
 
@@ -147,6 +160,9 @@ pub const REPOS_CONFIG_ENV: &str = "CODESEARCH_REPOS_CONFIG";
 
 /// Environment variable to set MCP mode: "auto", "client", or "local".
 pub const MCP_MODE_ENV: &str = "CODESEARCH_MCP_MODE";
+
+/// Timeout for serve health probe in auto/client mode (milliseconds).
+pub const MCP_HEALTH_PROBE_TIMEOUT_MS: u64 = 500;
 
 /// File extensions that should never be indexed, regardless of content.
 /// These are generated/compiled/binary-adjacent files with no semantic code value.

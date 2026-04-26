@@ -1845,17 +1845,19 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_mcp_mode_cli_overrides_env() {
-        // CLI override should always win
-        let mode = super::resolve_mcp_mode(Some(super::McpMode::Local));
-        assert_eq!(mode, super::McpMode::Local);
+    fn test_mcp_mode_env_is_used_by_cli() {
+        // The CLI uses clap's #[arg(env = "...")] which handles env var fallback.
+        // When no --mode is provided and no env var, default is Auto.
+        assert_eq!(super::McpMode::default(), super::McpMode::Auto);
     }
 
     #[test]
-    fn test_resolve_mcp_mode_none_uses_default() {
-        // When no CLI and no env, default to Auto
-        let mode = super::resolve_mcp_mode(None);
-        assert_eq!(mode, super::McpMode::Auto);
+    fn test_mcp_mode_from_str_covers_all() {
+        // Verify all valid modes parse correctly
+        for mode in &["auto", "client", "local", "AUTO", "Client", "LOCAL"] {
+            assert!(mode.parse::<super::McpMode>().is_ok(), "failed to parse: {}", mode);
+        }
+        assert!("invalid".parse::<super::McpMode>().is_err());
     }
 
     // ─── auto-promotion behaviour tests ────────────────────────────────
@@ -5853,21 +5855,12 @@ impl std::str::FromStr for McpMode {
     }
 }
 
-/// Resolve MCP mode from: CLI flag > env var > default (Auto).
-fn resolve_mcp_mode(cli_override: Option<McpMode>) -> McpMode {
-    if let Some(mode) = cli_override {
-        return mode;
-    }
-    std::env::var(crate::constants::MCP_MODE_ENV)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_default()
-}
-
 /// Probe the serve health endpoint. Returns Ok(serve_url) if serve is alive.
 async fn probe_serve_health(serve_url: &str) -> bool {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_millis(
+            crate::constants::MCP_HEALTH_PROBE_TIMEOUT_MS,
+        ))
         .build();
     let Ok(client) = client else { return false };
     let url = format!("{}{}", serve_url, crate::constants::HEALTH_PATH);
@@ -5937,11 +5930,11 @@ pub async fn run_mcp_server(
     mode: McpMode,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    // Resolve effective mode
-    let effective_mode = resolve_mcp_mode(Some(mode));
     let serve_url = serve_url_from_env();
 
-    // Initialize logger early for mode dispatch logging
+    // Set FASTEMBED_CACHE_DIR early (before any embedding work) to ensure fastembed
+    // downloads and caches models to ~/.codesearch/models instead of creating
+    // .fastembed_cache in the current working directory. Do this once for all modes.
     match crate::constants::get_global_models_cache_dir() {
         Ok(models_dir) => {
             std::env::set_var("FASTEMBED_CACHE_DIR", &models_dir);
@@ -5951,11 +5944,11 @@ pub async fn run_mcp_server(
         }
     }
 
-    match effective_mode {
+    match mode {
         McpMode::Client => {
-            // Initialize file logger for client mode
+            // Client mode: init logger using global cache dir (no local DB needed)
             if let Err(e) = crate::logger::init_logger(
-                &std::env::current_dir()?.join(".codesearch.db"),
+                &crate::constants::get_global_cache_dir(),
                 log_level,
                 quiet,
             ) {
@@ -5972,9 +5965,9 @@ pub async fn run_mcp_server(
             return run_mcp_client(&serve_url, cancel_token).await;
         }
         McpMode::Auto => {
-            // Initialize file logger early for auto-mode logging
+            // Auto mode: init logger early for probe logging
             if let Err(e) = crate::logger::init_logger(
-                &std::env::current_dir()?.join(".codesearch.db"),
+                &crate::constants::get_global_cache_dir(),
                 log_level,
                 quiet,
             ) {
@@ -5995,18 +5988,6 @@ pub async fn run_mcp_server(
 
     // ── Local stdio mode (original behavior) ──────────────────────────
     use rmcp::{transport::stdio, ServiceExt};
-
-    // Set FASTEMBED_CACHE_DIR early (before any embedding work) to ensure fastembed
-    // downloads and caches models to ~/.codesearch/models instead of creating
-    // .fastembed_cache in the current working directory.
-    match crate::constants::get_global_models_cache_dir() {
-        Ok(models_dir) => {
-            std::env::set_var("FASTEMBED_CACHE_DIR", &models_dir);
-        }
-        Err(e) => {
-            tracing::warn!("Could not set FASTEMBED_CACHE_DIR: {}", e);
-        }
-    }
 
     tracing::info!("🚀 Starting codesearch MCP server");
 

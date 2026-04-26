@@ -296,14 +296,12 @@ pub enum Commands {
         )]
         create_index: bool,
 
-        /// MCP connection mode (default: auto)
+        /// MCP connection mode (default: auto, override with CODESEARCH_MCP_MODE)
         ///
         /// - auto:   Connect to serve if running, otherwise use local DB
         /// - client: Always connect to serve; fail if not running
         /// - local:  Always use local DB (classic stdio behavior)
-        ///
-        /// Override with CODESEARCH_MCP_MODE env var.
-        #[arg(short, long, default_value = "auto")]
+        #[arg(short, long, env = crate::constants::MCP_MODE_ENV, default_value = "auto")]
         mode: crate::mcp::McpMode,
     },
 
