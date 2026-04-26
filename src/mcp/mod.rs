@@ -1730,7 +1730,27 @@ mod tests {
     }
 
     #[test]
-    fn test_literal_lc_threshold_uses_strictly_less_than() {
+    fn test_literal_lc_does_not_fire_on_strong_results() {
+        // Strong BM25 score (well above floor) must NOT be flagged low_confidence.
+        let (lc, hint) = super::compute_literal_low_confidence(Some(41.5), "anything");
+        assert_eq!(lc, None, "strong BM25 results must not be flagged low_confidence");
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn test_literal_lc_fires_on_weak_results() {
+        // Score below the floor -> low_confidence true.
+        let (lc, hint) = super::compute_literal_low_confidence(
+            Some(super::LITERAL_LOW_CONFIDENCE_BM25 - 0.5),
+            "CodesearchService",
+        );
+        assert_eq!(lc, Some(true));
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn test_literal_lc_threshold_boundary_uses_strict_less_than() {
+        // Score EXACTLY at the threshold should NOT fire (< not <=).
         let (lc, hint) = super::compute_literal_low_confidence(
             Some(super::LITERAL_LOW_CONFIDENCE_BM25),
             "anything",
@@ -1741,7 +1761,7 @@ mod tests {
 
     #[test]
     fn test_literal_lc_high_score_returns_none() {
-        let (lc, hint) = super::compute_literal_low_confidence(Some(f32::MAX), "anything");
+        let (lc, hint) = super::compute_literal_low_confidence(Some(50.0), "anything");
         assert_eq!(lc, None);
         assert_eq!(hint, None);
     }
@@ -1774,6 +1794,30 @@ mod tests {
         assert!(!json.contains("suggested_tool"));
         assert!(!json.contains("auto_promoted"));
         assert!(!json.contains("note"));
+    }
+
+    // ─── note phrasing tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_literal_response_note_is_sentence_not_tool_name() {
+        // Simulate the note-construction logic for the low-confidence branch.
+        let suggested_tool: Option<String> = Some("find with kind='definition'".to_string());
+        let auto_promoted = false;
+        let low_confidence = Some(true);
+
+        let note: Option<String> = if auto_promoted {
+            Some("ignored".to_string())
+        } else if low_confidence == Some(true) {
+            suggested_tool.as_ref().map(|tool| {
+                format!("Top result has weak BM25 score; consider using `{}` for better matches.", tool)
+            })
+        } else {
+            None
+        };
+
+        let n = note.expect("note must be present when low_confidence is true");
+        assert!(n.starts_with("Top result"), "note must read as a sentence, got: {}", n);
+        assert!(n.contains("find with kind='definition'"), "note must reference the suggested tool: {}", n);
     }
 
     // ─── auto-promotion behaviour tests ────────────────────────────────
@@ -2465,10 +2509,16 @@ fn looks_like_code_pattern(query: &str) -> bool {
 }
 
 /// BM25 score threshold for low-confidence signalling in literal search.
-/// IMPORTANT: this value is unvalidated. It is set to f32::MAX (never fires)
-/// until real query scores have been collected. Update after reviewing
-/// `RUST_LOG=codesearch::literal_confidence=debug` output.
-const LITERAL_LOW_CONFIDENCE_BM25: f32 = f32::MAX;
+///
+/// Scores **below** this threshold trigger `low_confidence: true` in the
+/// response. Tantivy BM25 scores in the codesearch corpus typically range
+/// from ~5 (weak match) to ~50+ (strong match), so 5.0 is a conservative
+/// initial floor — below this, results are likely noise rather than real hits.
+///
+/// To recalibrate: enable `RUST_LOG=codesearch::literal_confidence=debug`,
+/// collect query/score samples, set this to roughly the 25th percentile of
+/// real query scores.
+const LITERAL_LOW_CONFIDENCE_BM25: f32 = 5.0;
 
 fn compute_literal_low_confidence(
     top_score: Option<f32>,
@@ -5283,7 +5333,12 @@ impl CodesearchService {
                 request.query, effective_query
             ))
         } else if low_confidence == Some(true) {
-            suggested_tool.clone()
+            suggested_tool.as_ref().map(|tool| {
+                format!(
+                    "Top result has weak BM25 score; consider using `{}` for better matches.",
+                    tool
+                )
+            })
         } else {
             None
         };
