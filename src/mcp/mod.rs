@@ -1615,6 +1615,58 @@ mod tests {
         assert!(!super::regex_has_anchorable_token(r"\bimpl\b"));
     }
 
+    // ── regex_has_disjunctive_or tests ──────────────────────────────
+
+    #[test]
+    fn test_disjunctive_or_simple_alternation() {
+        assert!(super::regex_has_disjunctive_or("TODO|FIXME|HACK"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_two_alternatives() {
+        assert!(super::regex_has_disjunctive_or("foo|bar"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_pipe_inside_group_not_counted() {
+        // (foo|bar) is inside parens — not top-level
+        assert!(!super::regex_has_disjunctive_or("(foo|bar)"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_pipe_inside_bracket_not_counted() {
+        // [|] is inside character class
+        assert!(!super::regex_has_disjunctive_or("[a|b]"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_escaped_pipe_not_counted() {
+        assert!(!super::regex_has_disjunctive_or(r"foo\|bar"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_no_pipe() {
+        assert!(!super::regex_has_disjunctive_or("TODO"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_mixed_top_level_and_group() {
+        // foo|(bar|baz) — the first | is top-level
+        assert!(super::regex_has_disjunctive_or("foo|(bar|baz)"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_nested_groups() {
+        // ((a|b)) — pipe inside double parens
+        assert!(!super::regex_has_disjunctive_or("((a|b))"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_mixed_top_level_and_bracket() {
+        // [a-z]|foo — pipe after bracket is top-level
+        assert!(super::regex_has_disjunctive_or("[a-z]|foo"));
+    }
+
     #[test]
     fn test_regex_no_match_match_line_returns_none() {
         // match_line_for_literal returns None for patterns that don't match
@@ -1720,13 +1772,16 @@ mod tests {
 
     #[test]
     fn test_literal_lc_identifier_weak_score() {
+        // Single-word identifiers with low BM25 score: trust the result.
+        // BM25 IDF artefacts (e.g. `or` in a snake_case name) must not
+        // cause false low_confidence signals when results exist.
         let weak_score = super::LITERAL_LOW_CONFIDENCE_BM25 / 2.0;
         let (lc, hint) = super::compute_literal_low_confidence(
             Some(weak_score),
             "CodesearchService",
         );
-        assert_eq!(lc, Some(true));
-        assert!(hint.unwrap().contains("find"));
+        assert_eq!(lc, None, "single identifier with results must not be flagged low_confidence");
+        assert_eq!(hint, None);
     }
 
     #[test]
@@ -1739,10 +1794,11 @@ mod tests {
 
     #[test]
     fn test_literal_lc_fires_on_weak_results() {
-        // Score below the floor -> low_confidence true.
+        // Multi-word queries (not single identifiers) still fire low_confidence
+        // when the BM25 score is below the floor.
         let (lc, hint) = super::compute_literal_low_confidence(
             Some(super::LITERAL_LOW_CONFIDENCE_BM25 - 0.5),
-            "CodesearchService",
+            "how do we handle authentication",  // multi-word natural language
         );
         assert_eq!(lc, Some(true));
         assert!(hint.is_some());
@@ -2019,8 +2075,12 @@ use regex::Regex;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
+    model::{
+        CallToolRequestParam, CallToolResult, Content, ListToolsResult, PaginatedRequestParam,
+        ServerCapabilities, ServerInfo,
+    },
+    service::{RequestContext, RunningService},
+    tool, tool_handler, tool_router, ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -2029,6 +2089,77 @@ use tokio_util::sync::CancellationToken;
 
 // Re-export types
 pub use types::*;
+
+// ═══════════════════════════════════════════════════════════════════
+// MCP Proxy Service  (--mode client / --mode auto with serve detected)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Transparent stdio↔HTTP proxy.
+///
+/// When `codesearch mcp --mode client` is started by Claude Desktop:
+/// - Claude Desktop sends MCP requests over stdio
+/// - `McpProxyService` forwards every request to the running `codesearch serve` hub via HTTP
+/// - Responses flow back unchanged
+///
+/// This is the correct architecture for Claude Desktop: it has no repo context of its own
+/// and therefore cannot use `--mode local`. With `--mode client` it always connects to
+/// the serve hub, gaining access to all registered repos.
+///
+/// Only tool operations (`list_tools`, `call_tool`) are forwarded. Prompts, resources,
+/// and completion are not proxied — the serve hub does not expose them.
+struct McpProxyService {
+    /// Clonable peer handle to the serve hub. `Peer` supports `list_tools` / `call_tool`
+    /// directly via the rmcp `method!` macro.
+    peer: rmcp::service::Peer<RoleClient>,
+}
+
+impl McpProxyService {
+    fn new(peer: rmcp::service::Peer<RoleClient>) -> Self {
+        Self { peer }
+    }
+}
+
+impl ServerHandler for McpProxyService {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: rmcp::model::Implementation {
+                name: "codesearch".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                title: Some("codesearch (serve proxy)".to_string()),
+                icons: None,
+                website_url: None,
+            },
+            instructions: Some(
+                "Proxy to a running codesearch serve hub. All tool calls are forwarded to the hub."
+                    .to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParam>,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        self.peer
+            .list_tools(request)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParam,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.peer
+            .call_tool(request)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+}
 
 /// Read model short-name and dimensions from a database's `metadata.json`.
 /// Returns `(model_name, dimensions)`, defaulting to `("unknown", DEFAULT_EMBEDDING_DIMENSIONS)`.
@@ -2513,6 +2644,57 @@ fn regex_has_anchorable_token(pattern: &str) -> bool {
     false
 }
 
+/// Returns true when a regex pattern contains a top-level alternation (`|`)
+/// that is NOT inside a group `(...)` or character class `[...]`.
+///
+/// BM25 treats a query like `TODO|FIXME|HACK` as a conjunction of all tokens
+/// (`TODO AND FIXME AND HACK`), which returns 0 results because no single chunk
+/// contains all three. The regex post-filter would then discard everything.
+/// Detecting top-level `|` lets us fall back to the scan path, which applies the
+/// regex correctly (matching any alternative per chunk).
+///
+/// Escaped pipes (`\|`) are ignored.
+fn regex_has_disjunctive_or(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut depth_paren = 0u32; // nesting depth of (...)
+    let mut in_bracket = false; // inside [...]
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // Skip escaped char
+        if c == '\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if in_bracket {
+            if c == ']' {
+                in_bracket = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                in_bracket = true;
+            }
+            '(' => {
+                depth_paren += 1;
+            }
+            ')' => {
+                depth_paren = depth_paren.saturating_sub(1);
+            }
+            '|' => {
+                if depth_paren == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Returns true when a literal-search query looks like a code pattern whose
 /// punctuation would be destroyed by BM25 tokenization.
 ///
@@ -2567,6 +2749,11 @@ fn compute_literal_low_confidence(
     let word_count = query.split_whitespace().count();
     let has_code_chars = query.chars().any(|c| "{}[]<>=|;:".contains(c));
     let is_natural_language = word_count >= 3 && !has_code_chars;
+    // A single identifier with no spaces: trust results even when BM25 score is low.
+    // BM25 scores are unreliable for identifiers that tokenise into common sub-words
+    // (e.g. `regex_has_disjunctive_or` → `or` has near-zero IDF and drags the score
+    // below the floor even when the match is correct).
+    let is_single_identifier = word_count == 1 && !has_code_chars;
 
     let suggest_semantic = "search with mode='semantic'";
     let suggest_regex    = "search with mode='literal' and regex=true";
@@ -2574,6 +2761,11 @@ fn compute_literal_low_confidence(
 
     match top_score {
         Some(score) if score < LITERAL_LOW_CONFIDENCE_BM25 => {
+            if is_single_identifier {
+                // Results exist for a single-word identifier: low BM25 score is an
+                // IDF artefact, not a quality signal. Trust the results.
+                return (None, None);
+            }
             let hint = if is_natural_language { suggest_semantic } else { suggest_find };
             (Some(true), Some(hint.to_string()))
         }
@@ -5084,10 +5276,12 @@ impl CodesearchService {
             root.trim_end_matches('/').to_string()
         };
 
-        // Decide: BM25 path (for anchorable queries) or scan path (for tokenless regex)
+        // Decide: BM25 path (for anchorable queries) or scan path (for tokenless regex
+        // or disjunctive OR patterns like TODO|FIXME|HACK that BM25 treats as AND).
         let tokenless_regex = regex_enabled
             && snippet_regex.is_some()
-            && !regex_has_anchorable_token(&effective_query);
+            && (!regex_has_anchorable_token(&effective_query)
+                || regex_has_disjunctive_or(&effective_query));
 
         let mut items: Vec<LiteralSearchResultItem> = if tokenless_regex {
             // ── Scan path ──────────────────────────────────────────────
@@ -5872,44 +6066,69 @@ async fn probe_serve_health(serve_url: &str) -> bool {
 /// Uses rmcp's `StreamableHttpClientWorker` with `reqwest::Client` to speak
 /// MCP Streamable HTTP to the serve hub. The MCP client (e.g. Claude Code)
 /// talks JSON-RPC over stdio to us, and rmcp relays to the serve HTTP endpoint.
+/// Run `codesearch mcp` as a transparent stdio↔HTTP proxy to `codesearch serve`.
+///
+/// Architecture:
+///   Claude Desktop ──(stdio JSON-RPC)──▶ McpProxyService ──(HTTP Streamable)──▶ codesearch serve
+///
+/// Every MCP request from Claude Desktop is forwarded verbatim to the serve hub and the
+/// response is returned unchanged. This allows Claude Desktop — which has no repo context
+/// of its own — to reach all repos managed by `codesearch serve`.
 async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Result<()> {
-    use rmcp::ServiceExt;
+    use rmcp::{ServiceExt, transport::stdio};
 
     let mcp_url = format!("{}{}", serve_url, crate::constants::MCP_ENDPOINT_PATH);
     tracing::info!("🔗 Connecting to codesearch serve at {}", mcp_url);
 
-    // Create a minimal client handler — only needs to respond to server→client
-    // requests like ping, list_roots, etc.
-    let client: () = (); // () implements ClientHandler with default no-op responses
+    // Step 1: Establish HTTP MCP client connection to the serve hub.
+    // () implements ClientHandler with no-op responses to server→client requests (ping, etc.).
     let transport =
         rmcp::transport::streamable_http_client::StreamableHttpClientWorker::<reqwest::Client>::new_simple(mcp_url.as_str());
 
-    // Start the client — this performs the MCP initialize handshake
-    let running = match client.serve(transport).await {
-        Ok(r) => r,
+    let http_client: RunningService<RoleClient, ()> = match ().serve(transport).await {
+        Ok(c) => c,
         Err(e) => {
             return Err(anyhow::anyhow!(
-                "Failed to connect to codesearch serve at {}: {}. \
+                "Failed to connect to codesearch serve at {}.\n\
+                 Error: {}\n\
                  Is `codesearch serve` running?",
                 mcp_url, e
             ));
         }
     };
 
-    tracing::info!("✅ Connected to serve hub at {}", mcp_url);
+    tracing::info!("✅ Connected to codesearch serve hub");
 
-    // Wait for shutdown
+    // Step 2: Clone the Peer (cheap handle — Clonable) for the proxy.
+    // Keep the owned RunningService for .waiting() to detect serve disconnect.
+    let peer = http_client.peer().clone();
+    let proxy = McpProxyService::new(peer);
+    let server = proxy
+        .serve(stdio())
+        .await
+        .context("Failed to start proxy stdio server")?;
+
+    tracing::info!("🚀 MCP proxy ready — forwarding Claude Desktop ↔ codesearch serve");
+
+    // Step 3: Wait for any of: stdio close, serve disconnect, or cancel signal.
     tokio::select! {
-        result = running.waiting() => {
-            tracing::info!("MCP client transport closed");
+        result = server.waiting() => {
+            tracing::info!("MCP proxy transport closed");
             result?;
         }
+        result = http_client.waiting() => {
+            // Do NOT propagate the error: returning Ok(()) causes codesearch to exit
+            // with code 0 (clean EOF on stdio) rather than crashing, so Claude Desktop
+            // gets a graceful server-closed signal instead of an unexpected disconnect
+            // that wipes the current chat context ("een stuk vd chat verdwijnt").
+            tracing::warn!("codesearch serve disconnected — exiting cleanly: {:?}", result);
+        }
         _ = cancel_token.cancelled() => {
-            tracing::info!("🛑 Shutdown signal received, stopping MCP client...");
+            tracing::info!("🛑 Shutdown signal received, stopping MCP proxy...");
         }
     }
 
-    tracing::info!("✅ MCP client shut down cleanly");
+    tracing::info!("✅ MCP proxy shut down cleanly");
     Ok(())
 }
 
