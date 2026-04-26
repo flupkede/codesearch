@@ -1615,6 +1615,58 @@ mod tests {
         assert!(!super::regex_has_anchorable_token(r"\bimpl\b"));
     }
 
+    // ── regex_has_disjunctive_or tests ──────────────────────────────
+
+    #[test]
+    fn test_disjunctive_or_simple_alternation() {
+        assert!(super::regex_has_disjunctive_or("TODO|FIXME|HACK"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_two_alternatives() {
+        assert!(super::regex_has_disjunctive_or("foo|bar"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_pipe_inside_group_not_counted() {
+        // (foo|bar) is inside parens — not top-level
+        assert!(!super::regex_has_disjunctive_or("(foo|bar)"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_pipe_inside_bracket_not_counted() {
+        // [|] is inside character class
+        assert!(!super::regex_has_disjunctive_or("[a|b]"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_escaped_pipe_not_counted() {
+        assert!(!super::regex_has_disjunctive_or(r"foo\|bar"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_no_pipe() {
+        assert!(!super::regex_has_disjunctive_or("TODO"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_mixed_top_level_and_group() {
+        // foo|(bar|baz) — the first | is top-level
+        assert!(super::regex_has_disjunctive_or("foo|(bar|baz)"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_nested_groups() {
+        // ((a|b)) — pipe inside double parens
+        assert!(!super::regex_has_disjunctive_or("((a|b))"));
+    }
+
+    #[test]
+    fn test_disjunctive_or_mixed_top_level_and_bracket() {
+        // [a-z]|foo — pipe after bracket is top-level
+        assert!(super::regex_has_disjunctive_or("[a-z]|foo"));
+    }
+
     #[test]
     fn test_regex_no_match_match_line_returns_none() {
         // match_line_for_literal returns None for patterns that don't match
@@ -2019,8 +2071,12 @@ use regex::Regex;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
+    model::{
+        CallToolRequestParam, CallToolResult, Content, ListToolsResult, PaginatedRequestParam,
+        ServerCapabilities, ServerInfo,
+    },
+    service::{RequestContext, RunningService},
+    tool, tool_handler, tool_router, ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -2029,6 +2085,73 @@ use tokio_util::sync::CancellationToken;
 
 // Re-export types
 pub use types::*;
+
+// ═══════════════════════════════════════════════════════════════════
+// MCP Proxy Service  (--mode client / --mode auto with serve detected)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Transparent stdio↔HTTP proxy.
+///
+/// When `codesearch mcp --mode client` is started by Claude Desktop:
+/// - Claude Desktop sends MCP requests over stdio
+/// - `McpProxyService` forwards every request to the running `codesearch serve` hub via HTTP
+/// - Responses flow back unchanged
+///
+/// This is the correct architecture for Claude Desktop: it has no repo context of its own
+/// and therefore cannot use `--mode local`. With `--mode client` it always connects to
+/// the serve hub, gaining access to all registered repos.
+struct McpProxyService {
+    /// HTTP client connection to the serve hub, wrapped in Arc for Send + Sync.
+    client: Arc<RunningService<RoleClient, ()>>,
+}
+
+impl McpProxyService {
+    fn new(client: RunningService<RoleClient, ()>) -> Self {
+        Self { client: Arc::new(client) }
+    }
+}
+
+impl ServerHandler for McpProxyService {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: rmcp::model::Implementation {
+                name: "codesearch".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                title: Some("codesearch (serve proxy)".to_string()),
+                icons: None,
+                website_url: None,
+            },
+            instructions: Some(
+                "Proxy to a running codesearch serve hub. All tool calls are forwarded to the hub."
+                    .to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParam>,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        self.client
+            .list_tools(request)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParam,
+        _cx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.client
+            .call_tool(request)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+}
 
 /// Read model short-name and dimensions from a database's `metadata.json`.
 /// Returns `(model_name, dimensions)`, defaulting to `("unknown", DEFAULT_EMBEDDING_DIMENSIONS)`.
@@ -2507,6 +2630,57 @@ fn regex_has_anchorable_token(pattern: &str) -> bool {
         } else {
             run = 0;
             need_separator = false;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Returns true when a regex pattern contains a top-level alternation (`|`)
+/// that is NOT inside a group `(...)` or character class `[...]`.
+///
+/// BM25 treats a query like `TODO|FIXME|HACK` as a conjunction of all tokens
+/// (`TODO AND FIXME AND HACK`), which returns 0 results because no single chunk
+/// contains all three. The regex post-filter would then discard everything.
+/// Detecting top-level `|` lets us fall back to the scan path, which applies the
+/// regex correctly (matching any alternative per chunk).
+///
+/// Escaped pipes (`\|`) are ignored.
+fn regex_has_disjunctive_or(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut depth_paren = 0u32; // nesting depth of (...)
+    let mut in_bracket = false; // inside [...]
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // Skip escaped char
+        if c == '\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if in_bracket {
+            if c == ']' {
+                in_bracket = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                in_bracket = true;
+            }
+            '(' => {
+                depth_paren += 1;
+            }
+            ')' => {
+                depth_paren = depth_paren.saturating_sub(1);
+            }
+            '|' => {
+                if depth_paren == 0 {
+                    return true;
+                }
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -5084,10 +5258,12 @@ impl CodesearchService {
             root.trim_end_matches('/').to_string()
         };
 
-        // Decide: BM25 path (for anchorable queries) or scan path (for tokenless regex)
+        // Decide: BM25 path (for anchorable queries) or scan path (for tokenless regex
+        // or disjunctive OR patterns like TODO|FIXME|HACK that BM25 treats as AND).
         let tokenless_regex = regex_enabled
             && snippet_regex.is_some()
-            && !regex_has_anchorable_token(&effective_query);
+            && (!regex_has_anchorable_token(&effective_query)
+                || regex_has_disjunctive_or(&effective_query));
 
         let mut items: Vec<LiteralSearchResultItem> = if tokenless_regex {
             // ── Scan path ──────────────────────────────────────────────
@@ -5872,44 +6048,61 @@ async fn probe_serve_health(serve_url: &str) -> bool {
 /// Uses rmcp's `StreamableHttpClientWorker` with `reqwest::Client` to speak
 /// MCP Streamable HTTP to the serve hub. The MCP client (e.g. Claude Code)
 /// talks JSON-RPC over stdio to us, and rmcp relays to the serve HTTP endpoint.
+/// Run `codesearch mcp` as a transparent stdio↔HTTP proxy to `codesearch serve`.
+///
+/// Architecture:
+///   Claude Desktop ──(stdio JSON-RPC)──▶ McpProxyService ──(HTTP Streamable)──▶ codesearch serve
+///
+/// Every MCP request from Claude Desktop is forwarded verbatim to the serve hub and the
+/// response is returned unchanged. This allows Claude Desktop — which has no repo context
+/// of its own — to reach all repos managed by `codesearch serve`.
 async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Result<()> {
-    use rmcp::ServiceExt;
+    use rmcp::{ServiceExt, transport::stdio};
 
     let mcp_url = format!("{}{}", serve_url, crate::constants::MCP_ENDPOINT_PATH);
     tracing::info!("🔗 Connecting to codesearch serve at {}", mcp_url);
 
-    // Create a minimal client handler — only needs to respond to server→client
-    // requests like ping, list_roots, etc.
-    let client: () = (); // () implements ClientHandler with default no-op responses
+    // Step 1: Establish HTTP MCP client connection to the serve hub.
+    // () implements ClientHandler with no-op responses to server→client requests (ping, etc.).
     let transport =
         rmcp::transport::streamable_http_client::StreamableHttpClientWorker::<reqwest::Client>::new_simple(mcp_url.as_str());
 
-    // Start the client — this performs the MCP initialize handshake
-    let running = match client.serve(transport).await {
-        Ok(r) => r,
+    let http_client: RunningService<RoleClient, ()> = match ().serve(transport).await {
+        Ok(c) => c,
         Err(e) => {
             return Err(anyhow::anyhow!(
-                "Failed to connect to codesearch serve at {}: {}. \
+                "Failed to connect to codesearch serve at {}.\n\
+                 Error: {}\n\
                  Is `codesearch serve` running?",
                 mcp_url, e
             ));
         }
     };
 
-    tracing::info!("✅ Connected to serve hub at {}", mcp_url);
+    tracing::info!("✅ Connected to codesearch serve hub");
 
-    // Wait for shutdown
+    // Step 2: Wrap in proxy and start stdio server for Claude Desktop.
+    // McpProxyService forwards every list_tools / call_tool to the HTTP client.
+    let proxy = McpProxyService::new(http_client);
+    let server = proxy
+        .serve(stdio())
+        .await
+        .context("Failed to start proxy stdio server")?;
+
+    tracing::info!("🚀 MCP proxy ready — forwarding Claude Desktop ↔ codesearch serve");
+
+    // Step 3: Wait for Claude Desktop to close the pipe or a cancel signal.
     tokio::select! {
-        result = running.waiting() => {
-            tracing::info!("MCP client transport closed");
+        result = server.waiting() => {
+            tracing::info!("MCP proxy transport closed");
             result?;
         }
         _ = cancel_token.cancelled() => {
-            tracing::info!("🛑 Shutdown signal received, stopping MCP client...");
+            tracing::info!("🛑 Shutdown signal received, stopping MCP proxy...");
         }
     }
 
-    tracing::info!("✅ MCP client shut down cleanly");
+    tracing::info!("✅ MCP proxy shut down cleanly");
     Ok(())
 }
 
