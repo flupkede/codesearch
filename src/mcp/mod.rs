@@ -1772,13 +1772,16 @@ mod tests {
 
     #[test]
     fn test_literal_lc_identifier_weak_score() {
+        // Single-word identifiers with low BM25 score: trust the result.
+        // BM25 IDF artefacts (e.g. `or` in a snake_case name) must not
+        // cause false low_confidence signals when results exist.
         let weak_score = super::LITERAL_LOW_CONFIDENCE_BM25 / 2.0;
         let (lc, hint) = super::compute_literal_low_confidence(
             Some(weak_score),
             "CodesearchService",
         );
-        assert_eq!(lc, Some(true));
-        assert!(hint.unwrap().contains("find"));
+        assert_eq!(lc, None, "single identifier with results must not be flagged low_confidence");
+        assert_eq!(hint, None);
     }
 
     #[test]
@@ -1791,10 +1794,11 @@ mod tests {
 
     #[test]
     fn test_literal_lc_fires_on_weak_results() {
-        // Score below the floor -> low_confidence true.
+        // Multi-word queries (not single identifiers) still fire low_confidence
+        // when the BM25 score is below the floor.
         let (lc, hint) = super::compute_literal_low_confidence(
             Some(super::LITERAL_LOW_CONFIDENCE_BM25 - 0.5),
-            "CodesearchService",
+            "how do we handle authentication",  // multi-word natural language
         );
         assert_eq!(lc, Some(true));
         assert!(hint.is_some());
@@ -2745,6 +2749,11 @@ fn compute_literal_low_confidence(
     let word_count = query.split_whitespace().count();
     let has_code_chars = query.chars().any(|c| "{}[]<>=|;:".contains(c));
     let is_natural_language = word_count >= 3 && !has_code_chars;
+    // A single identifier with no spaces: trust results even when BM25 score is low.
+    // BM25 scores are unreliable for identifiers that tokenise into common sub-words
+    // (e.g. `regex_has_disjunctive_or` → `or` has near-zero IDF and drags the score
+    // below the floor even when the match is correct).
+    let is_single_identifier = word_count == 1 && !has_code_chars;
 
     let suggest_semantic = "search with mode='semantic'";
     let suggest_regex    = "search with mode='literal' and regex=true";
@@ -2752,6 +2761,11 @@ fn compute_literal_low_confidence(
 
     match top_score {
         Some(score) if score < LITERAL_LOW_CONFIDENCE_BM25 => {
+            if is_single_identifier {
+                // Results exist for a single-word identifier: low BM25 score is an
+                // IDF artefact, not a quality signal. Trust the results.
+                return (None, None);
+            }
             let hint = if is_natural_language { suggest_semantic } else { suggest_find };
             (Some(true), Some(hint.to_string()))
         }
@@ -6103,8 +6117,11 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
             result?;
         }
         result = http_client.waiting() => {
-            tracing::warn!("codesearch serve disconnected");
-            result?;
+            // Do NOT propagate the error: returning Ok(()) causes codesearch to exit
+            // with code 0 (clean EOF on stdio) rather than crashing, so Claude Desktop
+            // gets a graceful server-closed signal instead of an unexpected disconnect
+            // that wipes the current chat context ("een stuk vd chat verdwijnt").
+            tracing::warn!("codesearch serve disconnected — exiting cleanly: {:?}", result);
         }
         _ = cancel_token.cancelled() => {
             tracing::info!("🛑 Shutdown signal received, stopping MCP proxy...");
