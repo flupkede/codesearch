@@ -295,6 +295,16 @@ pub enum Commands {
             default_missing_value = "true"
         )]
         create_index: bool,
+
+        /// MCP connection mode (default: auto)
+        ///
+        /// - auto:   Connect to serve if running, otherwise use local DB
+        /// - client: Always connect to serve; fail if not running
+        /// - local:  Always use local DB (classic stdio behavior)
+        ///
+        /// Override with CODESEARCH_MCP_MODE env var.
+        #[arg(short, long, default_value = "auto")]
+        mode: crate::mcp::McpMode,
     },
 
     /// Manage repository groups
@@ -460,13 +470,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
         Commands::Doctor { fix, json } => crate::cli::doctor::run(fix, json).await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp { path, create_index } => {
+        Commands::Mcp { path, create_index, mode } => {
             // Logger is initialized inside run_mcp_server() once db_path is known.
             // This handles both the "DB already exists" and "auto-create DB" paths correctly.
             //
             // MCP stdio transport uses stdout for JSON-RPC — always force file-only
             // logging to keep the channel clean, regardless of the global --quiet flag.
-            crate::mcp::run_mcp_server(path, create_index, log_level, true, cancel_token).await
+            crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token).await
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,

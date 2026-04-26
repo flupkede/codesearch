@@ -145,6 +145,9 @@ pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
 /// Environment variable to override repos config file path.
 pub const REPOS_CONFIG_ENV: &str = "CODESEARCH_REPOS_CONFIG";
 
+/// Environment variable to set MCP mode: "auto", "client", or "local".
+pub const MCP_MODE_ENV: &str = "CODESEARCH_MCP_MODE";
+
 /// File extensions that should never be indexed, regardless of content.
 /// These are generated/compiled/binary-adjacent files with no semantic code value.
 pub const ALWAYS_SKIP_EXTENSIONS: &[&str] = &[

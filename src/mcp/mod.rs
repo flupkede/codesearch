@@ -1820,6 +1820,44 @@ mod tests {
         assert!(n.contains("find with kind='definition'"), "note must reference the suggested tool: {}", n);
     }
 
+    // ─── MCP mode selection tests ────────────────────────────────────
+
+    #[test]
+    fn test_mcp_mode_from_str() {
+        assert_eq!("auto".parse::<super::McpMode>().unwrap(), super::McpMode::Auto);
+        assert_eq!("client".parse::<super::McpMode>().unwrap(), super::McpMode::Client);
+        assert_eq!("local".parse::<super::McpMode>().unwrap(), super::McpMode::Local);
+        assert_eq!("AUTO".parse::<super::McpMode>().unwrap(), super::McpMode::Auto);
+        assert_eq!("Client".parse::<super::McpMode>().unwrap(), super::McpMode::Client);
+        assert!("invalid".parse::<super::McpMode>().is_err());
+    }
+
+    #[test]
+    fn test_mcp_mode_display() {
+        assert_eq!(super::McpMode::Auto.to_string(), "auto");
+        assert_eq!(super::McpMode::Client.to_string(), "client");
+        assert_eq!(super::McpMode::Local.to_string(), "local");
+    }
+
+    #[test]
+    fn test_mcp_mode_default_is_auto() {
+        assert_eq!(super::McpMode::default(), super::McpMode::Auto);
+    }
+
+    #[test]
+    fn test_resolve_mcp_mode_cli_overrides_env() {
+        // CLI override should always win
+        let mode = super::resolve_mcp_mode(Some(super::McpMode::Local));
+        assert_eq!(mode, super::McpMode::Local);
+    }
+
+    #[test]
+    fn test_resolve_mcp_mode_none_uses_default() {
+        // When no CLI and no env, default to Auto
+        let mode = super::resolve_mcp_mode(None);
+        assert_eq!(mode, super::McpMode::Auto);
+    }
+
     // ─── auto-promotion behaviour tests ────────────────────────────────
 
     #[test]
@@ -5772,6 +5810,116 @@ Model: {model} ({dims}d)
 
 /// Run the MCP server using stdio transport with file watching for live index updates.
 ///
+/// MCP server mode: how `codesearch mcp` connects to the index backend.
+///
+/// - **Auto** — If `codesearch serve` is running, connect as an HTTP client;
+///   otherwise fall back to local stdio mode.
+/// - **Client** — Always connect to `codesearch serve` via HTTP; fail if not running.
+/// - **Local** — Always use local DB in stdio mode (classic behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpMode {
+    /// Connect to serve if available, otherwise local.
+    #[default]
+    Auto,
+    /// Always connect to serve; fail if unreachable.
+    Client,
+    /// Always use local DB (stdio).
+    Local,
+}
+
+impl std::fmt::Display for McpMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpMode::Auto => write!(f, "auto"),
+            McpMode::Client => write!(f, "client"),
+            McpMode::Local => write!(f, "local"),
+        }
+    }
+}
+
+impl std::str::FromStr for McpMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(McpMode::Auto),
+            "client" => Ok(McpMode::Client),
+            "local" => Ok(McpMode::Local),
+            other => Err(format!(
+                "invalid MCP mode '{}': must be 'auto', 'client', or 'local'",
+                other
+            )),
+        }
+    }
+}
+
+/// Resolve MCP mode from: CLI flag > env var > default (Auto).
+fn resolve_mcp_mode(cli_override: Option<McpMode>) -> McpMode {
+    if let Some(mode) = cli_override {
+        return mode;
+    }
+    std::env::var(crate::constants::MCP_MODE_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default()
+}
+
+/// Probe the serve health endpoint. Returns Ok(serve_url) if serve is alive.
+async fn probe_serve_health(serve_url: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build();
+    let Ok(client) = client else { return false };
+    let url = format!("{}{}", serve_url, crate::constants::HEALTH_PATH);
+    client.get(&url).send().await.is_ok()
+}
+
+/// Run `codesearch mcp` as an HTTP client connecting to a running serve instance.
+///
+/// Uses rmcp's `StreamableHttpClientWorker` with `reqwest::Client` to speak
+/// MCP Streamable HTTP to the serve hub. The MCP client (e.g. Claude Code)
+/// talks JSON-RPC over stdio to us, and rmcp relays to the serve HTTP endpoint.
+async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Result<()> {
+    use rmcp::ServiceExt;
+
+    let mcp_url = format!("{}{}", serve_url, crate::constants::MCP_ENDPOINT_PATH);
+    tracing::info!("🔗 Connecting to codesearch serve at {}", mcp_url);
+
+    // Create a minimal client handler — only needs to respond to server→client
+    // requests like ping, list_roots, etc.
+    let client: () = (); // () implements ClientHandler with default no-op responses
+    let transport =
+        rmcp::transport::streamable_http_client::StreamableHttpClientWorker::<reqwest::Client>::new_simple(mcp_url.as_str());
+
+    // Start the client — this performs the MCP initialize handshake
+    let running = match client.serve(transport).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to connect to codesearch serve at {}: {}. \
+                 Is `codesearch serve` running?",
+                mcp_url, e
+            ));
+        }
+    };
+
+    tracing::info!("✅ Connected to serve hub at {}", mcp_url);
+
+    // Wait for shutdown
+    tokio::select! {
+        result = running.waiting() => {
+            tracing::info!("MCP client transport closed");
+            result?;
+        }
+        _ = cancel_token.cancelled() => {
+            tracing::info!("🛑 Shutdown signal received, stopping MCP client...");
+        }
+    }
+
+    tracing::info!("✅ MCP client shut down cleanly");
+    Ok(())
+}
+
 /// # Multi-instance Support
 ///
 /// When another instance is already running with write access to the same database,
@@ -5786,8 +5934,66 @@ pub async fn run_mcp_server(
     create_index: bool,
     log_level: crate::logger::LogLevel,
     quiet: bool,
+    mode: McpMode,
     cancel_token: CancellationToken,
 ) -> Result<()> {
+    // Resolve effective mode
+    let effective_mode = resolve_mcp_mode(Some(mode));
+    let serve_url = serve_url_from_env();
+
+    // Initialize logger early for mode dispatch logging
+    match crate::constants::get_global_models_cache_dir() {
+        Ok(models_dir) => {
+            std::env::set_var("FASTEMBED_CACHE_DIR", &models_dir);
+        }
+        Err(e) => {
+            tracing::warn!("Could not set FASTEMBED_CACHE_DIR: {}", e);
+        }
+    }
+
+    match effective_mode {
+        McpMode::Client => {
+            // Initialize file logger for client mode
+            if let Err(e) = crate::logger::init_logger(
+                &std::env::current_dir()?.join(".codesearch.db"),
+                log_level,
+                quiet,
+            ) {
+                tracing::warn!("Failed to initialize file logger: {}", e);
+            }
+            tracing::info!("📡 MCP mode: client — connecting to serve at {}", serve_url);
+            if !probe_serve_health(&serve_url).await {
+                return Err(anyhow::anyhow!(
+                    "codesearch serve is not running at {}. \
+                     Start it with `codesearch serve` or use --mode auto/local.",
+                    serve_url
+                ));
+            }
+            return run_mcp_client(&serve_url, cancel_token).await;
+        }
+        McpMode::Auto => {
+            // Initialize file logger early for auto-mode logging
+            if let Err(e) = crate::logger::init_logger(
+                &std::env::current_dir()?.join(".codesearch.db"),
+                log_level,
+                quiet,
+            ) {
+                tracing::warn!("Failed to initialize file logger: {}", e);
+            }
+            if probe_serve_health(&serve_url).await {
+                tracing::info!("📡 MCP mode: auto — serve detected at {}, connecting as client", serve_url);
+                return run_mcp_client(&serve_url, cancel_token).await;
+            }
+            tracing::info!("📡 MCP mode: auto — no serve detected, falling back to local stdio");
+            // Fall through to local mode
+        }
+        McpMode::Local => {
+            tracing::info!("📡 MCP mode: local — using local DB (stdio)");
+            // Fall through to local mode
+        }
+    }
+
+    // ── Local stdio mode (original behavior) ──────────────────────────
     use rmcp::{transport::stdio, ServiceExt};
 
     // Set FASTEMBED_CACHE_DIR early (before any embedding work) to ensure fastembed
