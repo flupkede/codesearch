@@ -459,6 +459,26 @@ pub async fn run_serve(
     );
     info!("📋 Registered repos: {:?}", serve_state.aliases());
 
+    // ── Sequential pre-warming ──
+    // Open all registered repos sequentially before accepting connections.
+    // This avoids burst I/O and LMDB "already opened with different options"
+    // errors when multiple repos are first queried concurrently.
+    {
+        let aliases = serve_state.aliases();
+        if !aliases.is_empty() {
+            info!("🔥 Pre-warming {} repos sequentially...", aliases.len());
+            for alias in &aliases {
+                match serve_state.get_or_open_stores(alias).await {
+                    Ok(_) => info!("  ✅ {} ready", alias),
+                    Err(e) => warn!("  ⚠️  {} failed: {}", alias, e),
+                }
+                // Small delay between repos to avoid I/O burst
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            info!("🔥 Pre-warming complete");
+        }
+    }
+
     // Create the MCP service factory — each session gets a fresh CodesearchService
     // that uses serve_state for repo routing.
     let state_for_factory = serve_state.clone();

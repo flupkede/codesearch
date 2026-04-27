@@ -15,6 +15,43 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use tracing::warn;
 
+/// Read the persisted LMDB map size from metadata.json in the database directory.
+/// Returns DEFAULT_LMDB_MAP_SIZE_MB if no persisted value is found.
+fn read_persisted_map_size(db_path: &Path) -> usize {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(mb) = json.get("lmdb_map_size_mb").and_then(|v| v.as_u64()) {
+                return mb as usize;
+            }
+        }
+    }
+    crate::constants::DEFAULT_LMDB_MAP_SIZE_MB
+}
+
+/// Persist the current LMDB map size into metadata.json so that subsequent
+/// opens in the same process use the same value (avoids "already opened with
+/// different options" errors from LMDB when multiple repos have been resized).
+fn persist_map_size(db_path: &Path, map_size_mb: usize) -> Result<()> {
+    let metadata_path = db_path.join("metadata.json");
+    let mut json: serde_json::Value = if metadata_path.exists() {
+        let content = fs::read_to_string(&metadata_path)?;
+        serde_json::from_str(&content).unwrap_or(serde_json::Value::Object(Default::default()))
+    } else {
+        serde_json::Value::Object(Default::default())
+    };
+
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "lmdb_map_size_mb".to_string(),
+            serde_json::Value::Number(map_size_mb.into()),
+        );
+    }
+
+    fs::write(&metadata_path, serde_json::to_string_pretty(&json)?)?;
+    Ok(())
+}
+
 /// Chunk metadata stored in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMetadata {
@@ -127,10 +164,18 @@ impl VectorStore {
         cleanup_stale_del_files(db_path)?;
 
         // Open LMDB environment
-        let map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
+        // Read persisted map_size from metadata.json if available, so that
+        // multiple repos in the same process use a consistent map size after
+        // one repo has been resized.  Use the max of persisted, env-var, and
+        // default to never shrink below what was previously allocated.
+        let persisted_map_size_mb = read_persisted_map_size(db_path);
+        let env_map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
             .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
+            .and_then(|s| s.parse::<usize>().ok());
+        let map_size_mb = env_map_size_mb
+            .unwrap_or(persisted_map_size_mb)
+            .max(persisted_map_size_mb)
+            .max(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size_mb * 1024 * 1024)
@@ -204,10 +249,15 @@ impl VectorStore {
         }
 
         // Open LMDB environment in read-only mode
-        let map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
+        // Use same map-size resolution as new() for consistency
+        let persisted_map_size_mb = read_persisted_map_size(db_path);
+        let env_map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
             .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
+            .and_then(|s| s.parse::<usize>().ok());
+        let map_size_mb = env_map_size_mb
+            .unwrap_or(persisted_map_size_mb)
+            .max(persisted_map_size_mb)
+            .max(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size_mb * 1024 * 1024)
@@ -326,6 +376,12 @@ impl VectorStore {
 
         // Update the map size tracking
         self.map_size_mb = new_size_mb;
+
+        // Persist the new map size so subsequent opens in the same process
+        // use the same value (avoids "already opened with different options").
+        if let Err(e) = persist_map_size(self.env.path(), new_size_mb) {
+            tracing::warn!("Failed to persist LMDB map size: {}", e);
+        }
 
         tracing::info!(
             "✅ LMDB environment resized to {}MB (next_id: {}, indexed: {})",
