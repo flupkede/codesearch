@@ -2464,6 +2464,23 @@ fn normalize_tool_path(path: &str, project_root: &Path) -> String {
     crate::cache::normalize_path_str(resolved.to_string_lossy().as_ref())
 }
 
+/// Strip a project-alias prefix from a tool path.
+///
+/// In serve mode, tools like explore receive `target = "ALIAS/src/foo.rs"` with
+/// `project = "ALIAS"`.  The alias prefix must be stripped before calling
+/// `chunks_for_file`, which expects a path relative to the project root.
+fn strip_alias_prefix(path: &str, alias: Option<&String>) -> String {
+    if let Some(a) = alias {
+        let prefix = format!("{}/", a);
+        match path.strip_prefix(&prefix) {
+            Some(rest) => rest.to_string(),
+            None => path.to_string(),
+        }
+    } else {
+        path.to_string()
+    }
+}
+
 /// Prefix a result path with its repo alias for group queries, normalizing
 /// Windows backslashes to forward slashes in the process. When `alias` is
 /// None or empty, the path is still normalized (useful for stdio mode).
@@ -4477,15 +4494,7 @@ impl CodesearchService {
         };
         // Strip project-alias prefix from target path if present.
         // E.g. "HUSQ.Aprimo/src/foo.cs" with project="HUSQ.Aprimo" → "src/foo.cs"
-        let stripped_path = if let Some(ref alias) = ctx.project_alias {
-            let prefix = format!("{}/", alias);
-            match request.path.strip_prefix(&prefix) {
-                Some(rest) => rest.to_string(),
-                None => request.path.clone(),
-            }
-        } else {
-            request.path.clone()
-        };
+        let stripped_path = strip_alias_prefix(&request.path, ctx.project_alias.as_ref());
         let normalized = normalize_tool_path(&stripped_path, &project_root);
 
         let items = if let Some(ref sv) = ctx.stores_vec {
@@ -4703,15 +4712,7 @@ impl CodesearchService {
             self.project_path.clone()
         };
         // Strip project-alias prefix from target path if present.
-        let stripped_path = if let Some(ref alias) = ctx.project_alias {
-            let prefix = format!("{}/", alias);
-            match request.path.strip_prefix(&prefix) {
-                Some(rest) => rest.to_string(),
-                None => request.path.clone(),
-            }
-        } else {
-            request.path.clone()
-        };
+        let stripped_path = strip_alias_prefix(&request.path, ctx.project_alias.as_ref());
         let normalized = normalize_tool_path(&stripped_path, &project_root);
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {

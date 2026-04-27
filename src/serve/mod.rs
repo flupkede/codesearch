@@ -411,25 +411,33 @@ async fn health_handler() -> AxumJson<serde_json::Value> {
 async fn reindex_handler(
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
-) -> axum::response::Json<serde_json::Value> {
+) -> (axum::http::StatusCode, axum::response::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+
     // Resolve the project path for this alias
     let project_path = {
         let config = match state.config.read() {
             Ok(c) => c,
             Err(e) => {
-                return axum::response::Json(json!({
-                    "error": format!("Config lock poisoned: {}", e),
-                    "status": "error"
-                }));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::response::Json(json!({
+                        "error": format!("Config lock poisoned: {}", e),
+                        "status": "error"
+                    })),
+                );
             }
         };
         match config.resolve(&alias) {
             Some(p) => p,
             None => {
-                return axum::response::Json(json!({
-                    "error": format!("Unknown alias '{}'", alias),
-                    "status": "not_found"
-                }));
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::response::Json(json!({
+                        "error": format!("Unknown alias '{}'", alias),
+                        "status": "not_found"
+                    })),
+                );
             }
         }
     };
@@ -438,10 +446,13 @@ async fn reindex_handler(
     let stores = match state.get_or_open_stores(&alias).await {
         Ok(s) => s,
         Err(e) => {
-            return axum::response::Json(json!({
-                "error": e,
-                "status": "error"
-            }));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::response::Json(json!({
+                    "error": e,
+                    "status": "error"
+                })),
+            );
         }
     };
 
@@ -468,11 +479,14 @@ async fn reindex_handler(
         }
     });
 
-    axum::response::Json(json!({
-        "status": "accepted",
-        "alias": alias,
-        "message": "Reindex started in background"
-    }))
+    (
+        StatusCode::ACCEPTED,
+        axum::response::Json(json!({
+            "status": "accepted",
+            "alias": alias,
+            "message": "Reindex started in background"
+        })),
+    )
 }
 
 /// Axum middleware: log MCP requests (method + path, skips /health spam).

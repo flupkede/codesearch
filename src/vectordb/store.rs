@@ -29,6 +29,19 @@ fn read_persisted_map_size(db_path: &Path) -> usize {
     crate::constants::DEFAULT_LMDB_MAP_SIZE_MB
 }
 
+/// Resolve the effective LMDB map size using the max of persisted, env-var, and default.
+/// This ensures consistency across multiple repo opens in the same process.
+fn resolve_map_size(db_path: &Path) -> usize {
+    let persisted = read_persisted_map_size(db_path);
+    let from_env = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    from_env
+        .unwrap_or(persisted)
+        .max(persisted)
+        .max(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB)
+}
+
 /// Persist the current LMDB map size into metadata.json so that subsequent
 /// opens in the same process use the same value (avoids "already opened with
 /// different options" errors from LMDB when multiple repos have been resized).
@@ -168,14 +181,7 @@ impl VectorStore {
         // multiple repos in the same process use a consistent map size after
         // one repo has been resized.  Use the max of persisted, env-var, and
         // default to never shrink below what was previously allocated.
-        let persisted_map_size_mb = read_persisted_map_size(db_path);
-        let env_map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
-        let map_size_mb = env_map_size_mb
-            .unwrap_or(persisted_map_size_mb)
-            .max(persisted_map_size_mb)
-            .max(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
+        let map_size_mb = resolve_map_size(db_path);
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size_mb * 1024 * 1024)
@@ -250,14 +256,7 @@ impl VectorStore {
 
         // Open LMDB environment in read-only mode
         // Use same map-size resolution as new() for consistency
-        let persisted_map_size_mb = read_persisted_map_size(db_path);
-        let env_map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
-        let map_size_mb = env_map_size_mb
-            .unwrap_or(persisted_map_size_mb)
-            .max(persisted_map_size_mb)
-            .max(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
+        let map_size_mb = resolve_map_size(db_path);
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size_mb * 1024 * 1024)
