@@ -299,6 +299,36 @@ Compact mode (default) returns only metadata: path, line range, kind, signature,
 
 ---
 
+## Searching (CLI)
+
+```bash
+codesearch search <QUERY> [OPTIONS]
+```
+
+| Option | Short | Default | Description |
+|---|---|---|---|
+| `--max-results` | `-m` | 25 | Maximum results |
+| `--per-file` | | 1 | Max matches per file |
+| `--content` | `-c` | | Show full chunk content |
+| `--scores` | | | Show relevance scores and timing |
+| `--compact` | | | File paths only (like `grep -l`) |
+| `--sync` | `-s` | | Re-index changed files before searching |
+| `--json` | | | JSON output for scripting |
+| `--filter-path` | | | Restrict to path (e.g. `src/api/`) |
+| `--vector-only` | | | Vector similarity only, no BM25 |
+| `--rerank` | | | Neural reranking (~1.7s extra, higher accuracy) |
+| `--rrf-k` | | 20 | RRF fusion parameter |
+| `--create-index` | | `true` | Auto-create index if none exists |
+
+```bash
+codesearch search "database connection pooling"
+codesearch search "error handling" --content --rerank
+codesearch search "validation" --filter-path src/api --json -m 10
+codesearch search "auth logic" --sync   # re-index changed files first
+```
+
+---
+
 ## Supported Languages
 
 **Full AST chunking** (tree-sitter): Rust, Python, JavaScript, TypeScript, C, C++, C#, Go, Java
