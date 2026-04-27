@@ -471,22 +471,62 @@ async fn reindex_handler(
         // Step 1: close the repo to release LMDB file handles
         state.close_repo(&alias);
 
+        // state was used above for close_repo; consume it here to prevent
+        // the async move closure from capturing (and unnecessarily holding) it.
+        // The ServeState must not stay alive in the spawned task because it
+        // keeps LMDB handles open for all OTHER repos.
+        drop(state);
+
         tokio::spawn(async move {
             tracing::info!("🗑️  Force reindex for '{}': closing and deleting DB", alias_bg);
 
-            // Step 2: wait for Windows to release memory-mapped file handles
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Step 2: give Windows time to release memory-mapped file handles.
+            //
+            // close_repo() removed the RepoState from the map, which drops
+            // SharedStores (and the LMDB Env). On Windows, the OS may hold
+            // the file handle open for a short but unpredictable period after
+            // the Rust drop completes. We retry with exponential backoff.
 
-            // Step 3: delete the DB directory
+            // Step 3: delete the DB directory (with retries for Windows)
             if db_path.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&db_path) {
-                    tracing::error!(
-                        "❌ Force reindex for '{}': failed to delete DB at {}: {}",
-                        alias_bg, db_path.display(), e
-                    );
+                let mut retry_delay = std::time::Duration::from_millis(300);
+                let mut deleted = false;
+                for attempt in 0..6 {
+                    if attempt > 0 {
+                        tracing::info!(
+                            "⏳ Force reindex for '{}': retry {} delete after {}ms",
+                            alias_bg, attempt, retry_delay.as_millis()
+                        );
+                        tokio::time::sleep(retry_delay).await;
+                    }
+                    match std::fs::remove_dir_all(&db_path) {
+                        Ok(()) => {
+                            tracing::info!("🗑️  Deleted DB at {} for '{}'", db_path.display(), alias_bg);
+                            deleted = true;
+                            break;
+                        }
+                        Err(e) if e.raw_os_error() == Some(32) => {
+                            // OS error 32: file in use — retry with longer delay
+                            retry_delay = retry_delay.saturating_mul(2);
+                            if attempt == 5 {
+                                tracing::error!(
+                                    "❌ Force reindex for '{}': failed to delete DB at {} after {} retries: {}",
+                                    alias_bg, db_path.display(), attempt + 1, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "❌ Force reindex for '{}': failed to delete DB at {}: {}",
+                                alias_bg, db_path.display(), e
+                            );
+                            break;
+                        }
+                    }
+                }
+                if !deleted {
                     return;
                 }
-                tracing::info!("🗑️  Deleted DB at {} for '{}'", db_path.display(), alias_bg);
             }
 
             // Step 4: full reindex from scratch
