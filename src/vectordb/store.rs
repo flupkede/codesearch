@@ -315,8 +315,12 @@ impl VectorStore {
         error.to_string().contains("MDB_MAP_FULL") || error.to_string().contains("map full")
     }
 
-    /// Resize the LMDB environment to a new map size
-    /// This requires closing and reopening the environment
+    /// Resize the LMDB environment to a new map size.
+    ///
+    /// Uses `heed::Env::resize()` which calls `mdb_env_set_mapsize()` under the
+    /// hood.  This resizes in-place without closing and reopening the
+    /// environment, which avoids the "an environment is already opened with
+    /// different options" error when a live serve process needs to grow the map.
     fn resize_environment(&mut self, new_size_mb: usize) -> Result<()> {
         if new_size_mb > MAX_LMDB_MAP_SIZE_MB {
             return Err(anyhow::anyhow!(
@@ -326,54 +330,18 @@ impl VectorStore {
             ));
         }
 
+        let new_size_bytes = new_size_mb * 1024 * 1024;
+
         tracing::warn!("🔧 Resizing LMDB environment to {}MB", new_size_mb);
 
-        // Store the current database path
-        let db_path = self.env.path().to_path_buf();
+        // SAFETY: mdb_env_set_mapsize() is safe to call when no transaction is
+        // active.  Our caller holds &mut self and just got MDB_MAP_FULL on an
+        // insert — any write transaction that triggered the error has already
+        // been dropped by the caller before invoking the retry logic.
+        unsafe {
+            self.env.resize(new_size_bytes)?;
+        }
 
-        // Note: We don't need to explicitly drop the env/databases
-        // They will be dropped when we replace them below
-
-        // Open a new environment with the new map size
-        // Note: This is a simple implementation that just increases the map size
-        // In production, you might want to handle this more gracefully
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(new_size_mb * 1024 * 1024)
-                .max_dbs(10)
-                .open(&db_path)?
-        };
-
-        // Reopen databases
-        let mut wtxn = env.write_txn()?;
-        let vectors: ArroyDatabase<Cosine> = env.create_database(&mut wtxn, Some("vectors"))?;
-        let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
-            env.create_database(&mut wtxn, Some("chunks"))?;
-
-        // Get the next ID
-        let next_id = match chunks.last(&wtxn)? {
-            Some((max_key, _)) => max_key + 1,
-            None => 0,
-        };
-
-        wtxn.commit()?;
-
-        // Check if database is already indexed
-        let indexed = if next_id > 0 {
-            let rtxn = env.read_txn()?;
-            Reader::open(&rtxn, 0, vectors).is_ok()
-        } else {
-            false
-        };
-
-        // Replace the old environment with the new one
-        self.env = env;
-        self.vectors = vectors;
-        self.chunks = chunks;
-        self.next_id = next_id;
-        self.indexed = indexed;
-
-        // Update the map size tracking
         self.map_size_mb = new_size_mb;
 
         // Persist the new map size so subsequent opens in the same process
@@ -383,10 +351,8 @@ impl VectorStore {
         }
 
         tracing::info!(
-            "✅ LMDB environment resized to {}MB (next_id: {}, indexed: {})",
-            new_size_mb,
-            next_id,
-            indexed
+            "✅ LMDB environment resized to {}MB (in-place, no reopen)",
+            new_size_mb
         );
 
         Ok(())
