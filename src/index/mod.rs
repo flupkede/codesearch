@@ -50,50 +50,72 @@ fn get_db_path_smart(
             .unwrap_or_else(|_| PathBuf::from(project_path)),
     ));
 
-    // Step 1: Check if there's an existing database (local or global)
-    let existing_db = find_best_database(target)?;
-
-    // Step 2: Handle --force flag
+    // Step 1: Handle --force flag — delete databases
     if force {
-        if let Some(ref db_info) = existing_db {
-            // Safety check: only delete a database that is inside the project path.
-            // If find_best_database found a database in a parent directory or a
-            // globally-registered repo that is NOT the current project, refuse to
-            // delete it — that would destroy another project's index.
-            let db_project_normalized = normalize_path(&db_info.project_path);
-            let canonical_path_str = normalize_path(&canonical_path);
-            let db_is_for_this_project = db_project_normalized == canonical_path_str
-                || canonical_path.as_path().starts_with(Path::new(&*db_project_normalized));
-
-            if !db_is_for_this_project {
-                anyhow::bail!(
-                    "Found database at {} for project '{}', but you are indexing '{}'. \
-                     Cowardly refusing to delete another project's database. \
-                     If the database is stale, delete it manually or run from the correct directory.",
-                    db_info.db_path.display(),
-                    db_project_normalized,
-                    canonical_path_str
-                );
-            }
-
-            // Delete existing database (local or global)
+        // 1a. First, check for a database directly in the project directory.
+        //     This catches incomplete/corrupt databases that find_best_database
+        //     would skip (it only returns valid databases).
+        //     We always delete the local DB when --force is used from its own directory.
+        let local_db = canonical_path.join(crate::constants::DB_DIR_NAME);
+        if local_db.is_dir() {
             println!(
                 "{}",
                 format!(
                     "🗑️  Force rebuild: deleting existing database at {}",
-                    db_info.db_path.display()
+                    local_db.display()
                 )
                 .yellow()
             );
-            std::fs::remove_dir_all(&db_info.db_path)?;
+            std::fs::remove_dir_all(&local_db)?;
             // Wait for Windows to fully release file handles (memory-mapped files
             // from LMDB/tantivy may not be immediately released after deletion)
-            // Increased to 1000ms to handle slow file handle release on Windows
             std::thread::sleep(std::time::Duration::from_millis(1000));
             println!("✅ Existing database deleted");
+        } else {
+            // 1b. No local DB — check if find_best_database found one elsewhere.
+            //     This handles --global or cases where the DB is in a parent dir.
+            let existing_db = find_best_database(target)?;
+            if let Some(ref db_info) = existing_db {
+                // Safety check: only delete a database that belongs to this project.
+                let db_project_normalized = normalize_path(&db_info.project_path);
+                let canonical_path_str = normalize_path(&canonical_path);
+                let db_is_for_this_project = db_project_normalized == canonical_path_str
+                    || canonical_path.as_path().starts_with(Path::new(&*db_project_normalized));
+
+                if !db_is_for_this_project {
+                    anyhow::bail!(
+                        "Found database at {} for project '{}', but you are indexing '{}'. \
+                         Cowardly refusing to delete another project's database. \
+                         If the database is stale, delete it manually or run from the correct directory.",
+                        db_info.db_path.display(),
+                        db_project_normalized,
+                        canonical_path_str
+                    );
+                }
+
+                println!(
+                    "{}",
+                    format!(
+                        "🗑️  Force rebuild: deleting existing database at {}",
+                        db_info.db_path.display()
+                    )
+                    .yellow()
+                );
+                std::fs::remove_dir_all(&db_info.db_path)?;
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                println!("✅ Existing database deleted");
+            }
         }
         // After deletion, continue to create new database
     }
+
+    // Step 2: Check if there's an existing database (for non-force paths)
+    let existing_db = if force {
+        // Already handled above — DB was deleted, no existing DB to find
+        None
+    } else {
+        find_best_database(target)?
+    };
 
     // Step 3: Handle --global flag
     if global {
