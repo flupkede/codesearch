@@ -15,6 +15,56 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use tracing::warn;
 
+/// Read the persisted LMDB map size from metadata.json in the database directory.
+/// Returns DEFAULT_LMDB_MAP_SIZE_MB if no persisted value is found.
+fn read_persisted_map_size(db_path: &Path) -> usize {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(mb) = json.get("lmdb_map_size_mb").and_then(|v| v.as_u64()) {
+                return mb as usize;
+            }
+        }
+    }
+    crate::constants::DEFAULT_LMDB_MAP_SIZE_MB
+}
+
+/// Resolve the effective LMDB map size using the max of persisted, env-var, and default.
+/// This ensures consistency across multiple repo opens in the same process.
+fn resolve_map_size(db_path: &Path) -> usize {
+    let persisted = read_persisted_map_size(db_path);
+    let from_env = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    from_env
+        .unwrap_or(persisted)
+        .max(persisted)
+        .max(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB)
+}
+
+/// Persist the current LMDB map size into metadata.json so that subsequent
+/// opens in the same process use the same value (avoids "already opened with
+/// different options" errors from LMDB when multiple repos have been resized).
+fn persist_map_size(db_path: &Path, map_size_mb: usize) -> Result<()> {
+    let metadata_path = db_path.join("metadata.json");
+    let mut json: serde_json::Value = if metadata_path.exists() {
+        let content = fs::read_to_string(&metadata_path)?;
+        serde_json::from_str(&content).unwrap_or(serde_json::Value::Object(Default::default()))
+    } else {
+        serde_json::Value::Object(Default::default())
+    };
+
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "lmdb_map_size_mb".to_string(),
+            serde_json::Value::Number(map_size_mb.into()),
+        );
+    }
+
+    fs::write(&metadata_path, serde_json::to_string_pretty(&json)?)?;
+    Ok(())
+}
+
 /// Chunk metadata stored in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMetadata {
@@ -127,10 +177,11 @@ impl VectorStore {
         cleanup_stale_del_files(db_path)?;
 
         // Open LMDB environment
-        let map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
+        // Read persisted map_size from metadata.json if available, so that
+        // multiple repos in the same process use a consistent map size after
+        // one repo has been resized.  Use the max of persisted, env-var, and
+        // default to never shrink below what was previously allocated.
+        let map_size_mb = resolve_map_size(db_path);
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size_mb * 1024 * 1024)
@@ -204,10 +255,8 @@ impl VectorStore {
         }
 
         // Open LMDB environment in read-only mode
-        let map_size_mb = std::env::var("CODESEARCH_LMDB_MAP_SIZE_MB")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB);
+        // Use same map-size resolution as new() for consistency
+        let map_size_mb = resolve_map_size(db_path);
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size_mb * 1024 * 1024)
@@ -266,8 +315,12 @@ impl VectorStore {
         error.to_string().contains("MDB_MAP_FULL") || error.to_string().contains("map full")
     }
 
-    /// Resize the LMDB environment to a new map size
-    /// This requires closing and reopening the environment
+    /// Resize the LMDB environment to a new map size.
+    ///
+    /// Uses `heed::Env::resize()` which calls `mdb_env_set_mapsize()` under the
+    /// hood.  This resizes in-place without closing and reopening the
+    /// environment, which avoids the "an environment is already opened with
+    /// different options" error when a live serve process needs to grow the map.
     fn resize_environment(&mut self, new_size_mb: usize) -> Result<()> {
         if new_size_mb > MAX_LMDB_MAP_SIZE_MB {
             return Err(anyhow::anyhow!(
@@ -277,61 +330,29 @@ impl VectorStore {
             ));
         }
 
+        let new_size_bytes = new_size_mb * 1024 * 1024;
+
         tracing::warn!("🔧 Resizing LMDB environment to {}MB", new_size_mb);
 
-        // Store the current database path
-        let db_path = self.env.path().to_path_buf();
+        // SAFETY: mdb_env_set_mapsize() is safe to call when no transaction is
+        // active.  Our caller holds &mut self and just got MDB_MAP_FULL on an
+        // insert — any write transaction that triggered the error has already
+        // been dropped by the caller before invoking the retry logic.
+        unsafe {
+            self.env.resize(new_size_bytes)?;
+        }
 
-        // Note: We don't need to explicitly drop the env/databases
-        // They will be dropped when we replace them below
-
-        // Open a new environment with the new map size
-        // Note: This is a simple implementation that just increases the map size
-        // In production, you might want to handle this more gracefully
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(new_size_mb * 1024 * 1024)
-                .max_dbs(10)
-                .open(&db_path)?
-        };
-
-        // Reopen databases
-        let mut wtxn = env.write_txn()?;
-        let vectors: ArroyDatabase<Cosine> = env.create_database(&mut wtxn, Some("vectors"))?;
-        let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
-            env.create_database(&mut wtxn, Some("chunks"))?;
-
-        // Get the next ID
-        let next_id = match chunks.last(&wtxn)? {
-            Some((max_key, _)) => max_key + 1,
-            None => 0,
-        };
-
-        wtxn.commit()?;
-
-        // Check if database is already indexed
-        let indexed = if next_id > 0 {
-            let rtxn = env.read_txn()?;
-            Reader::open(&rtxn, 0, vectors).is_ok()
-        } else {
-            false
-        };
-
-        // Replace the old environment with the new one
-        self.env = env;
-        self.vectors = vectors;
-        self.chunks = chunks;
-        self.next_id = next_id;
-        self.indexed = indexed;
-
-        // Update the map size tracking
         self.map_size_mb = new_size_mb;
 
+        // Persist the new map size so subsequent opens in the same process
+        // use the same value (avoids "already opened with different options").
+        if let Err(e) = persist_map_size(self.env.path(), new_size_mb) {
+            tracing::warn!("Failed to persist LMDB map size: {}", e);
+        }
+
         tracing::info!(
-            "✅ LMDB environment resized to {}MB (next_id: {}, indexed: {})",
-            new_size_mb,
-            next_id,
-            indexed
+            "✅ LMDB environment resized to {}MB (in-place, no reopen)",
+            new_size_mb
         );
 
         Ok(())

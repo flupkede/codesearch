@@ -19,6 +19,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 use crate::constants::{
     DEFAULT_LOG_MAX_FILES, DEFAULT_LOG_RETENTION_DAYS, LOG_DIR_NAME, LOG_FILE_NAME,
+    SERVE_LOG_FILE_NAME,
 };
 
 /// Result of logger initialization, indicating whether file logging is active
@@ -274,6 +275,92 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<L
 
     tracing::info!(
         "Logger initialized: level={}, log_dir={:?}, max_files={}, retention_days={}",
+        log_level.as_str(),
+        log_dir,
+        config.max_files,
+        config.retention_days,
+    );
+
+    Ok(LoggerInitResult::FileLogging)
+}
+
+/// Initialize the serve logger, writing to `~/.codesearch/logs/serve.log.YYYY-MM-DD`.
+///
+/// This is separate from the per-database logger used by `init_logger()`.
+/// The serve process manages multiple repos and has no single "home" database,
+/// so it logs to the global config directory instead.
+///
+/// When `quiet` is false, logs are written to both stderr and the rotating file.
+/// When `quiet` is true, logs go to the file only (useful when serve is daemonized).
+///
+/// # Returns
+/// Returns `LoggerInitResult` indicating whether file logging is active.
+pub fn init_serve_logger(log_level: LogLevel, quiet: bool) -> Result<LoggerInitResult> {
+    let log_dir = crate::constants::get_global_cache_dir().join(LOG_DIR_NAME);
+    ensure_log_dir(&log_dir)?;
+
+    let config = LogRotationConfig::from_env();
+
+    // Separate file name so serve logs don't mix with per-repo MCP client logs.
+    let file_appender =
+        RollingFileAppender::new(Rotation::DAILY, &log_dir, SERVE_LOG_FILE_NAME);
+
+    let filter_str = format!(
+        "{level},tantivy=warn,arroy=warn,ort=warn,h2=warn,hyper=warn,tower=warn",
+        level = log_level.as_str()
+    );
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&filter_str));
+
+    let subscriber = tracing_subscriber::registry().with(env_filter);
+
+    if quiet {
+        let result = subscriber
+            .with(
+                fmt::layer()
+                    .with_writer(file_appender)
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_ids(false),
+            )
+            .try_init();
+
+        if let Err(e) = result {
+            eprintln!(
+                "Serve logger: subscriber already set ({}), file logging not active",
+                e
+            );
+            return Ok(LoggerInitResult::ConsoleOnly);
+        }
+    } else {
+        let result = subscriber
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(true)
+                    .with_target(true)
+                    .with_thread_ids(false),
+            )
+            .with(
+                fmt::layer()
+                    .with_writer(file_appender)
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_thread_ids(false),
+            )
+            .try_init();
+
+        if let Err(e) = result {
+            eprintln!(
+                "Serve logger: subscriber already set ({}), file logging not active",
+                e
+            );
+            return Ok(LoggerInitResult::ConsoleOnly);
+        }
+    }
+
+    tracing::info!(
+        "Serve logger initialized: level={}, log_dir={:?}, max_files={}, retention_days={}",
         log_level.as_str(),
         log_dir,
         config.max_files,

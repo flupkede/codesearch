@@ -50,30 +50,89 @@ fn get_db_path_smart(
             .unwrap_or_else(|_| PathBuf::from(project_path)),
     ));
 
-    // Step 1: Check if there's an existing database (local or global)
-    let existing_db = find_best_database(target)?;
-
-    // Step 2: Handle --force flag
+    // Step 1: Handle --force flag — delete databases
     if force {
-        if let Some(ref db_info) = existing_db {
-            // Delete existing database (local or global)
+        // 1a. First, check for a database directly in the project directory.
+        //     This catches incomplete/corrupt databases that find_best_database
+        //     would skip (it only returns valid databases).
+        //     We always delete the local DB when --force is used from its own directory.
+        let local_db = canonical_path.join(crate::constants::DB_DIR_NAME);
+        if local_db.is_dir() {
             println!(
                 "{}",
                 format!(
                     "🗑️  Force rebuild: deleting existing database at {}",
-                    db_info.db_path.display()
+                    local_db.display()
                 )
                 .yellow()
             );
-            std::fs::remove_dir_all(&db_info.db_path)?;
+            std::fs::remove_dir_all(&local_db).map_err(|e| {
+                // On Windows, OS error 32 = "file in use by another process".
+                // This typically means 'codesearch serve' has the LMDB memory-mapped.
+                // The serve's /repos/{alias}/reindex endpoint should have been used instead.
+                #[cfg(target_os = "windows")]
+                if e.raw_os_error() == Some(32) {
+                    return anyhow::anyhow!(
+                        "Cannot delete database at {} — it is held open by another process \
+                        (likely 'codesearch serve').\n\
+                        Hint: 'codesearch index -f' automatically delegates to serve when it is \
+                        running. The delegation may have failed because this repo is not registered \
+                        in repos.json or the alias could not be resolved.\n\
+                        Run 'codesearch serve --register .' to register this repo, then retry.",
+                        local_db.display()
+                    );
+                }
+                anyhow::anyhow!("Failed to delete database at {}: {}", local_db.display(), e)
+            })?;
             // Wait for Windows to fully release file handles (memory-mapped files
             // from LMDB/tantivy may not be immediately released after deletion)
-            // Increased to 1000ms to handle slow file handle release on Windows
             std::thread::sleep(std::time::Duration::from_millis(1000));
             println!("✅ Existing database deleted");
+        } else {
+            // 1b. No local DB — check if find_best_database found one elsewhere.
+            //     This handles --global or cases where the DB is in a parent dir.
+            let existing_db = find_best_database(target)?;
+            if let Some(ref db_info) = existing_db {
+                // Safety check: only delete a database that belongs to this project.
+                let db_project_normalized = normalize_path(&db_info.project_path);
+                let canonical_path_str = normalize_path(&canonical_path);
+                let db_is_for_this_project = db_project_normalized == canonical_path_str
+                    || canonical_path.as_path().starts_with(Path::new(&*db_project_normalized));
+
+                if !db_is_for_this_project {
+                    anyhow::bail!(
+                        "Found database at {} for project '{}', but you are indexing '{}'. \
+                         Cowardly refusing to delete another project's database. \
+                         If the database is stale, delete it manually or run from the correct directory.",
+                        db_info.db_path.display(),
+                        db_project_normalized,
+                        canonical_path_str
+                    );
+                }
+
+                println!(
+                    "{}",
+                    format!(
+                        "🗑️  Force rebuild: deleting existing database at {}",
+                        db_info.db_path.display()
+                    )
+                    .yellow()
+                );
+                std::fs::remove_dir_all(&db_info.db_path)?;
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                println!("✅ Existing database deleted");
+            }
         }
         // After deletion, continue to create new database
     }
+
+    // Step 2: Check if there's an existing database (for non-force paths)
+    let existing_db = if force {
+        // Already handled above — DB was deleted, no existing DB to find
+        None
+    } else {
+        find_best_database(target)?
+    };
 
     // Step 3: Handle --global flag
     if global {
@@ -348,6 +407,30 @@ pub async fn index(
     model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
+    // When force=true, try to delegate to a running serve instance via HTTP.
+    // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
+    if force && !dry_run {
+        match try_delegate_reindex_to_serve(&path, force).await {
+            Ok((alias, project_path)) => {
+                println!(
+                    "{}",
+                    format!(
+                        "🔄 Delegated reindex to running serve instance (alias: '{}', path: {})",
+                        alias,
+                        project_path.display()
+                    )
+                    .bright_cyan()
+                );
+                return Ok(());
+            }
+            Err(reason) => {
+                debug!(
+                    "Could not delegate reindex to serve (falling back to local): {}",
+                    reason
+                );
+            }
+        }
+    }
     index_with_options(path, dry_run, force, global, model, false, cancel_token).await
 }
 
@@ -1394,4 +1477,101 @@ struct DbStats {
     chunk_count: usize,
     size_mb: f64,
     bloat_ratio: Option<f64>,
+}
+
+/// Try to delegate a reindex to a running serve instance.
+///
+/// Returns `Ok((alias, project_path))` if the serve accepted the reindex request.
+/// Returns `Err(reason)` with a human-readable reason if delegation failed.
+async fn try_delegate_reindex_to_serve(
+    path: &Option<PathBuf>,
+    force: bool,
+) -> std::result::Result<(String, PathBuf), String> {
+    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+
+    let port: u16 = std::env::var(SERVE_PORT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SERVE_PORT);
+
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    // 1. Health check — is serve running?
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+
+    let health_resp = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
+
+    if !health_resp.status().is_success() {
+        return Err(format!("serve health check returned {}", health_resp.status()));
+    }
+
+    // 2. Resolve the project path to an alias by loading repos config
+    let raw_project_path = path
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // Canonicalize to resolve symlinks and normalize separators (incl. UNC on Windows)
+    let project_path = raw_project_path
+        .canonicalize()
+        .unwrap_or_else(|_| raw_project_path.clone());
+
+    let config = crate::db_discovery::repos::ReposConfig::load()
+        .map_err(|e| format!("cannot load repos.json: {}", e))?;
+
+    /// Normalize a path for comparison: canonicalize, then strip Windows UNC prefix
+    /// (`\\?\`) so that `\\?\C:\foo` and `C:\foo` compare equal.
+    fn normalize_for_cmp(p: &std::path::Path) -> String {
+        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let s = canonical.to_string_lossy().to_string();
+        // Strip Windows extended-length UNC prefix
+        let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+        s.to_lowercase()
+    }
+
+    let project_norm = normalize_for_cmp(&project_path);
+
+    // Find the alias for this path
+    let alias = config
+        .repos
+        .iter()
+        .find(|(_, p)| normalize_for_cmp(p) == project_norm)
+        .map(|(a, _)| a.clone())
+        .unwrap_or_else(|| {
+            // Fallback: use the directory name as alias
+            tracing::debug!(
+                "try_delegate_reindex: path '{}' not found in repos.json, using dir name as alias",
+                project_norm
+            );
+            project_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        });
+
+    // 3. POST /repos/{alias}/reindex[?force=true]
+    let url = if force {
+        format!("{}/repos/{}/reindex?force=true", base_url, alias)
+    } else {
+        format!("{}/repos/{}/reindex", base_url, alias)
+    };
+    let reindex_resp = client
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| format!("reindex POST failed: {}", e))?;
+
+    if reindex_resp.status().is_success() {
+        Ok((alias, project_path))
+    } else {
+        let status = reindex_resp.status();
+        let body = reindex_resp.text().await.unwrap_or_default();
+        Err(format!("serve returned {} for alias '{}': {}", status, alias, body))
+    }
 }

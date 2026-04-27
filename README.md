@@ -40,6 +40,20 @@ The solution: run `codesearch serve` as a persistent background process that hol
 
 This also unlocks **multi-repo search**: a single serve instance manages multiple projects, and agents can search across all of them in one call using groups.
 
+### Auto-reconnect (Claude Desktop proxy)
+
+When `codesearch serve` is restarted (update, config change, crash), the MCP proxy does **not** exit. Instead:
+
+```
+  serve stops  ──▶  proxy detects disconnect
+                    ├── clears peer (tool calls return "reconnecting")
+                    ├── retries every 3 seconds
+                    ├── serve comes back ──▶  hot-swap peer ──▶ tools work instantly
+                    └── no serve after 5 min ──▶ clean exit (Claude Desktop detects EOF)
+```
+
+Claude Desktop's stdio connection stays alive throughout. Tool calls during the reconnect window return a descriptive error that Claude will retry automatically. No manual intervention needed for a simple serve restart.
+
 ### MCP Mode Selection
 
 `codesearch mcp` accepts a `--mode` flag:
@@ -364,6 +378,7 @@ codesearch setup --model jina-code
 |---|---|
 | "No database found" | Run `codesearch index` in your project directory |
 | Claude Desktop times out on connect | Make sure `codesearch serve` is running before starting Claude Desktop |
+| "codesearch serve is reconnecting" error | Transient — serve was restarted and the proxy is reconnecting (up to 5 min). No action needed. |
 | serve not finding a repo | Check `repos.json` with `codesearch index list`; re-register with `codesearch index add` |
 | Search results stale after branch switch | File watcher handles this automatically; check serve logs if it doesn't |
 | Port conflict | `codesearch serve --port 8080` or set `CODESEARCH_SERVE_PORT=8080` |

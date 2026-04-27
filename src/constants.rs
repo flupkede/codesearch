@@ -50,6 +50,9 @@ pub const LOG_DIR_NAME: &str = "logs";
 /// Default log file name
 pub const LOG_FILE_NAME: &str = "codesearch.log";
 
+/// Serve-specific log file name (written to ~/.codesearch/logs/)
+pub const SERVE_LOG_FILE_NAME: &str = "serve.log";
+
 /// Default number of log files to retain
 pub const DEFAULT_LOG_MAX_FILES: usize = 5;
 

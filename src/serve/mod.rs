@@ -164,6 +164,25 @@ impl ServeState {
         Ok(())
     }
 
+    /// Close and remove a repo from the open-stores map.
+    ///
+    /// Fires the cancel token (stops FSW/git-HEAD watcher) and drops the
+    /// RepoState, which releases the LMDB write lock and closes all file handles.
+    /// Close a repo and release its LMDB file handles.
+    ///
+    /// Removes the repo from the live map, dropping SharedStores and stopping
+    /// the file watcher. On Windows this is required before deleting the DB
+    /// directory. Not used by force reindex (which clears data in-place instead).
+    #[allow(dead_code)]
+    fn close_repo(&self, alias: &str) {
+        if let Some((_, state)) = self.repos.remove(alias) {
+            if let RepoState::Write { cancel_token, .. } = state {
+                cancel_token.cancel();
+            }
+            tracing::info!("Closed repo '{}' (released LMDB handles)", alias);
+        }
+    }
+
     /// Try to open a repo by alias. Returns a clone of the Arc<SharedStores>
     /// if successful, or an error string if conflicted/unknown.
     pub(crate) async fn get_or_open_stores(
@@ -404,6 +423,134 @@ async fn health_handler() -> AxumJson<serde_json::Value> {
     }))
 }
 
+/// Reindex handler: POST /repos/{alias}/reindex
+///
+/// Query params:
+/// - `force=true` — close the repo, delete the DB, full reindex, reopen.
+///   Required when the caller wants a clean rebuild (e.g. `codesearch index -f`).
+///   Without force, performs an incremental refresh only.
+///
+/// Returns 202 Accepted immediately; the reindex runs in the background.
+async fn reindex_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> (axum::http::StatusCode, axum::response::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+
+    let force = params.get("force").map(|v| v == "true" || v == "1").unwrap_or(false);
+
+    // Resolve the project path for this alias
+    let project_path = {
+        let config = match state.config.read() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::response::Json(json!({
+                        "error": format!("Config lock poisoned: {}", e),
+                        "status": "error"
+                    })),
+                );
+            }
+        };
+        match config.resolve(&alias) {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::response::Json(json!({
+                        "error": format!("Unknown alias '{}'", alias),
+                        "status": "not_found"
+                    })),
+                );
+            }
+        }
+    };
+
+    let db_path = project_path.join(DB_DIR_NAME);
+    let alias_bg = alias.clone();
+
+    if force {
+        // Force rebuild: clear data in-place → full reindex.
+        // No files are deleted, so no OS error 32 on Windows.
+        // The repo stays open throughout — LMDB handles remain valid.
+
+        let stores = match state.get_or_open_stores(&alias).await {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::response::Json(json!({
+                        "error": e,
+                        "status": "error"
+                    })),
+                );
+            }
+        };
+
+        tokio::spawn(async move {
+            tracing::info!("🔄 Force reindex for '{}': clearing stores and reindexing", alias_bg);
+
+            match IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!("✅ Force reindex complete for '{}'", alias_bg);
+                }
+                Err(e) => {
+                    tracing::error!("❌ Force reindex failed for '{}': {}", alias_bg, e);
+                }
+            }
+        });
+    } else {
+        // Incremental refresh: ensure the repo is opened, then refresh
+        let stores = match state.get_or_open_stores(&alias).await {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::response::Json(json!({
+                        "error": e,
+                        "status": "error"
+                    })),
+                );
+            }
+        };
+
+        tokio::spawn(async move {
+            tracing::info!("🔄 Incremental reindex triggered for '{}' via HTTP API", alias_bg);
+            match IndexManager::perform_incremental_refresh_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!("✅ Reindex complete for '{}'", alias_bg);
+                }
+                Err(e) => {
+                    tracing::error!("❌ Reindex failed for '{}': {}", alias_bg, e);
+                }
+            }
+        });
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        axum::response::Json(json!({
+            "status": "accepted",
+            "alias": alias,
+            "message": "Reindex started in background"
+        })),
+    )
+}
+
 /// Axum middleware: log MCP requests (method + path, skips /health spam).
 async fn log_mcp_requests(
     req: axum::extract::Request,
@@ -448,6 +595,14 @@ pub async fn run_serve(
         config.save().context("Failed to save repos config")?;
     }
 
+    // Auto-discover: if config is empty, scan CWD for a database
+    let discovered = config.auto_discover_from_cwd();
+    if discovered > 0 {
+        if let Err(e) = config.save() {
+            warn!("Failed to save auto-discovered repos: {}", e);
+        }
+    }
+
     let serve_state = Arc::new(ServeState::new(config, None));
 
     // Log startup
@@ -458,6 +613,26 @@ pub async fn run_serve(
         addr
     );
     info!("📋 Registered repos: {:?}", serve_state.aliases());
+
+    // ── Sequential pre-warming ──
+    // Open all registered repos sequentially before accepting connections.
+    // This avoids burst I/O and LMDB "already opened with different options"
+    // errors when multiple repos are first queried concurrently.
+    {
+        let aliases = serve_state.aliases();
+        if !aliases.is_empty() {
+            info!("🔥 Pre-warming {} repos sequentially...", aliases.len());
+            for alias in &aliases {
+                match serve_state.get_or_open_stores(alias).await {
+                    Ok(_) => info!("  ✅ {} ready", alias),
+                    Err(e) => warn!("  ⚠️  {} failed: {}", alias, e),
+                }
+                // Small delay between repos to avoid I/O burst
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            info!("🔥 Pre-warming complete");
+        }
+    }
 
     // Create the MCP service factory — each session gets a fresh CodesearchService
     // that uses serve_state for repo routing.
@@ -484,8 +659,10 @@ pub async fn run_serve(
     // Build axum router with request logging
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
+            .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
-        .layer(axum::middleware::from_fn(log_mcp_requests));
+        .layer(axum::middleware::from_fn(log_mcp_requests))
+        .with_state(serve_state.clone());
 
     // Graceful shutdown
     //
@@ -719,6 +896,66 @@ mod tests {
         let _ = state.aliases();
         let after_second = state.reload_count.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(after_second, after_first);
+    }
+
+    /// Verify that the /repos/:alias/reindex route is registered and reachable.
+    /// This test starts a real axum server on a random port and sends a POST request.
+    #[tokio::test]
+    async fn reindex_route_is_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("myrepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config.register_with_alias(repo_path.clone(), Some("testalias".to_string())).unwrap();
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+
+        let state = Arc::new(ServeState::new(config, Some(config_file)));
+
+        let app = axum::Router::new()
+            .route(crate::constants::HEALTH_PATH, axum::routing::get(health_handler))
+            .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // POST to unknown alias → 404 from our handler (not axum's built-in 404)
+        let resp = client
+            .post(format!("http://{}/repos/unknown/reindex", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "expected 404 from our handler");
+        let body: serde_json::Value = resp.json().await.expect("handler should return JSON body for 404");
+        assert!(body.get("error").is_some(), "expected JSON error body, got: {}", body);
+
+        // POST to known alias → 202 Accepted or 500 (DB missing), but NOT axum's built-in 404
+        // The key assertion is that the route IS registered (we get our handler's response, not axum's empty 404)
+        let resp = client
+            .post(format!("http://{}/repos/testalias/reindex", addr))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("handler should return JSON body");
+        assert!(
+            status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "expected 202 or 500 from our handler (not axum's 404), got {}: {}",
+            status, body
+        );
+        assert!(body.get("status").is_some(), "expected JSON with 'status' field, got: {}", body);
     }
 
     #[test]

@@ -453,15 +453,15 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             quiet,
             verbose,
         } => {
-            // Initialize logger for serve mode
-            // NOTE: For Serve, tracing is NOT initialized in main.rs — init_logger
-            // is the first and only call to set the global subscriber
-            if let Ok(Some(db_info)) =
-                crate::db_discovery::find_best_database(None as Option<&std::path::Path>)
+            // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
+            // regardless of whether a database exists in the current directory.
+            // This is a central log for the multi-repo serve process, separate from
+            // per-database logs written by the MCP client (codesearch.log.YYYY-MM-DD).
+            let effective_quiet = (cli.quiet || quiet) && !verbose;
+            if let Err(e) =
+                crate::logger::init_serve_logger(log_level, effective_quiet)
             {
-                // Combine global --quiet with serve-specific --quiet, and allow --verbose to override
-                let effective_quiet = (cli.quiet || quiet) && !verbose;
-                let _ = crate::logger::init_logger(&db_info.db_path, log_level, effective_quiet);
+                eprintln!("Warning: failed to initialize serve logger: {}", e);
             }
             crate::serve::run_serve(port, register, cancel_token.clone()).await
         }
