@@ -488,6 +488,16 @@ pub async fn run_serve(
         .layer(axum::middleware::from_fn(log_mcp_requests));
 
     // Graceful shutdown
+    //
+    // axum::serve::with_graceful_shutdown stops accepting new connections when the
+    // future resolves, then waits for all existing connections to close before
+    // server.await returns. MCP SSE sessions are long-lived and never close on
+    // their own, so without a deadline server.await hangs indefinitely after Ctrl-C.
+    //
+    // Fix: drive server.await in a tokio::select! against a deadline that fires
+    // 3 seconds after the cancel_token is cancelled. This gives in-flight HTTP
+    // requests time to complete while preventing a permanent hang on open sessions.
+    let cancel_for_deadline = cancel_token.clone();
     let server = axum::serve(
         tokio::net::TcpListener::bind(addr).await?,
         app,
@@ -501,9 +511,21 @@ pub async fn run_serve(
     info!("   Health: http://{}{}", addr, HEALTH_PATH);
     info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
 
-    server.await.context("Serve error")?;
+    tokio::select! {
+        result = server => {
+            result.context("Serve error")?;
+            info!("✅ codesearch serve shut down cleanly");
+        }
+        _ = async {
+            cancel_for_deadline.cancelled().await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        } => {
+            // Connections did not drain within 3 s — force-complete shutdown.
+            // This is expected when MCP clients hold open SSE sessions.
+            info!("⚠️  Shutdown deadline reached — forcing exit (open sessions dropped)");
+        }
+    }
 
-    info!("✅ codesearch serve shut down cleanly");
     Ok(())
 }
 
