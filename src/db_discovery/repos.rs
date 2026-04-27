@@ -136,6 +136,28 @@ impl ReposConfig {
         true
     }
 
+    /// Auto-discover repos when the config is empty.
+    ///
+    /// Scans the current working directory for a `.codesearch.db` database.
+    /// If found and the repo list is empty, registers the CWD as a repo.
+    /// Returns the number of newly discovered repos (0 or 1).
+    pub fn auto_discover_from_cwd(&mut self) -> usize {
+        if !self.repos.is_empty() {
+            return 0;
+        }
+
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let db_path = cwd.join(crate::constants::DB_DIR_NAME);
+
+        if crate::db_discovery::is_valid_database(&db_path) {
+            let alias = self.register(cwd);
+            tracing::info!("🔍 Auto-discovered repo '{}' from CWD", alias);
+            return 1;
+        }
+
+        0
+    }
+
     pub fn unregister_path(&mut self, path: &Path) -> bool {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let to_remove = self

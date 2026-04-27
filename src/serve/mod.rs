@@ -448,6 +448,14 @@ pub async fn run_serve(
         config.save().context("Failed to save repos config")?;
     }
 
+    // Auto-discover: if config is empty, scan CWD for a database
+    let discovered = config.auto_discover_from_cwd();
+    if discovered > 0 {
+        if let Err(e) = config.save() {
+            warn!("Failed to save auto-discovered repos: {}", e);
+        }
+    }
+
     let serve_state = Arc::new(ServeState::new(config, None));
 
     // Log startup
