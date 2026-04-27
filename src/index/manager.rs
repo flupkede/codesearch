@@ -610,6 +610,68 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Force a full reindex using the already-open stores.
+    ///
+    /// Instead of closing and deleting the LMDB database (which fails on Windows
+    /// when another process holds the memory-mapped file), this:
+    /// 1. Clears all data from VectorStore, FtsStore, and FileMetaStore in-place
+    /// 2. Reindexes every file from scratch using the existing store handles
+    ///
+    /// No files are deleted, so there is no OS error 32 (file in use).
+    pub async fn force_reindex_with_stores(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+    ) -> Result<()> {
+        use crate::cache::FileMetaStore;
+
+        info!("🔄 Force reindex: clearing all store data in-place...");
+
+        // 1. Clear vector store (LMDB databases)
+        {
+            let mut vstore = stores.vector_store.write().await;
+            vstore.clear()?;
+        }
+
+        // 2. Clear full-text search store (Tantivy index)
+        {
+            let mut fts = stores.fts_store.write().await;
+            fts.clear()?;
+        }
+
+        // 3. Clear file metadata so every file is treated as new
+        {
+            let metadata_path = db_path.join("metadata.json");
+            let model_name = if metadata_path.exists() {
+                let content = std::fs::read_to_string(&metadata_path)?;
+                let json: serde_json::Value = serde_json::from_str(&content)?;
+                json.get("model_short_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("minilm-l6-q")
+                    .to_string()
+            } else {
+                "minilm-l6-q".to_string()
+            };
+            let dimensions = if metadata_path.exists() {
+                let content = std::fs::read_to_string(&metadata_path)?;
+                let json: serde_json::Value = serde_json::from_str(&content)?;
+                json.get("dimensions")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(384) as usize
+            } else {
+                384
+            };
+            let mut file_meta = FileMetaStore::load_or_create(db_path, &model_name, dimensions)?;
+            file_meta.clear();
+            file_meta.save(db_path)?;
+        }
+
+        info!("✅ Stores cleared. Starting full reindex...");
+
+        // 4. Reindex — all files will be treated as "changed" since metadata is empty
+        Self::perform_incremental_refresh_with_stores(codebase_path, db_path, stores).await
+    }
+
     /// Start the file system watcher (begin collecting events) without starting the processing loop.
     ///
     /// Call this BEFORE a long-running operation (like incremental refresh) to capture

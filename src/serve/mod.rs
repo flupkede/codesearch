@@ -168,7 +168,12 @@ impl ServeState {
     ///
     /// Fires the cancel token (stops FSW/git-HEAD watcher) and drops the
     /// RepoState, which releases the LMDB write lock and closes all file handles.
-    /// On Windows this is required before deleting the DB directory.
+    /// Close a repo and release its LMDB file handles.
+    ///
+    /// Removes the repo from the live map, dropping SharedStores and stopping
+    /// the file watcher. On Windows this is required before deleting the DB
+    /// directory. Not used by force reindex (which clears data in-place instead).
+    #[allow(dead_code)]
     fn close_repo(&self, alias: &str) {
         if let Some((_, state)) = self.repos.remove(alias) {
             if let RepoState::Write { cancel_token, .. } = state {
@@ -467,71 +472,33 @@ async fn reindex_handler(
     let alias_bg = alias.clone();
 
     if force {
-        // Force rebuild: close → delete → full reindex → reopen
-        // Step 1: close the repo to release LMDB file handles
-        state.close_repo(&alias);
+        // Force rebuild: clear data in-place → full reindex.
+        // No files are deleted, so no OS error 32 on Windows.
+        // The repo stays open throughout — LMDB handles remain valid.
 
-        // state was used above for close_repo; consume it here to prevent
-        // the async move closure from capturing (and unnecessarily holding) it.
-        // The ServeState must not stay alive in the spawned task because it
-        // keeps LMDB handles open for all OTHER repos.
-        drop(state);
+        let stores = match state.get_or_open_stores(&alias).await {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::response::Json(json!({
+                        "error": e,
+                        "status": "error"
+                    })),
+                );
+            }
+        };
 
         tokio::spawn(async move {
-            tracing::info!("🗑️  Force reindex for '{}': closing and deleting DB", alias_bg);
+            tracing::info!("🔄 Force reindex for '{}': clearing stores and reindexing", alias_bg);
 
-            // Step 2: give Windows time to release memory-mapped file handles.
-            //
-            // close_repo() removed the RepoState from the map, which drops
-            // SharedStores (and the LMDB Env). On Windows, the OS may hold
-            // the file handle open for a short but unpredictable period after
-            // the Rust drop completes. We retry with exponential backoff.
-
-            // Step 3: delete the DB directory (with retries for Windows)
-            if db_path.exists() {
-                let mut retry_delay = std::time::Duration::from_millis(300);
-                let mut deleted = false;
-                for attempt in 0..6 {
-                    if attempt > 0 {
-                        tracing::info!(
-                            "⏳ Force reindex for '{}': retry {} delete after {}ms",
-                            alias_bg, attempt, retry_delay.as_millis()
-                        );
-                        tokio::time::sleep(retry_delay).await;
-                    }
-                    match std::fs::remove_dir_all(&db_path) {
-                        Ok(()) => {
-                            tracing::info!("🗑️  Deleted DB at {} for '{}'", db_path.display(), alias_bg);
-                            deleted = true;
-                            break;
-                        }
-                        Err(e) if e.raw_os_error() == Some(32) => {
-                            // OS error 32: file in use — retry with longer delay
-                            retry_delay = retry_delay.saturating_mul(2);
-                            if attempt == 5 {
-                                tracing::error!(
-                                    "❌ Force reindex for '{}': failed to delete DB at {} after {} retries: {}",
-                                    alias_bg, db_path.display(), attempt + 1, e
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "❌ Force reindex for '{}': failed to delete DB at {}: {}",
-                                alias_bg, db_path.display(), e
-                            );
-                            break;
-                        }
-                    }
-                }
-                if !deleted {
-                    return;
-                }
-            }
-
-            // Step 4: full reindex from scratch
-            tracing::info!("🔄 Full reindex starting for '{}'", alias_bg);
-            match crate::index::index_quiet(Some(project_path), true, CancellationToken::new()).await {
+            match IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+            )
+            .await
+            {
                 Ok(()) => {
                     tracing::info!("✅ Force reindex complete for '{}'", alias_bg);
                 }
@@ -539,7 +506,6 @@ async fn reindex_handler(
                     tracing::error!("❌ Force reindex failed for '{}': {}", alias_bg, e);
                 }
             }
-            // Step 5: serve will lazy-reopen on next query (get_or_open_stores)
         });
     } else {
         // Incremental refresh: ensure the repo is opened, then refresh
