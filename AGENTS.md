@@ -215,14 +215,17 @@ impl rmcp::ServerHandler for StdioProxyHandler {
 ### Stap 1: Cargo.toml updaten
 
 Bump `rmcp` naar `"1.5.0"` en `schemars` naar `"1.0"` in `Cargo.toml`.
-Run `cargo build 2>&1 | head -100` om de eerste golf compile errors te zien.
+Run `cargo check 2>&1 | head -100` om de eerste golf compile errors te zien.
 
 ### Stap 2: Iteratief compile-driven fixen
 
-rmcp 1.x heeft veel compile errors bij upgrade vanwege de breaking changes.
+Gebruik `cargo check` voor de fix-loop, **niet** `cargo build`. `cargo check`
+doet geen link stap en is 3-5x sneller. Gebruik `cargo clippy` voor lints.
+Alleen op het **absolute einde** (DoD-check) een volledige `cargo build` draaien.
+
 Aanpak:
 
-1. `cargo build` — bekijk eerste batch errors
+1. `cargo check 2>&1 | head -60` — bekijk eerste batch errors
 2. Fix de meest fundamentele (imports, hernoemingen)
 3. Herhaal tot clean
 
@@ -254,8 +257,9 @@ die rmcp 1.5.0 ondersteunt en Claude Code accepteert voor backwards compat.
 
 ## 4. Definition of Done
 
-- [ ] `cargo build --release` compileert zonder errors of warnings
+- [ ] `cargo check --all-targets` compileert zonder errors
 - [ ] `cargo clippy --all-targets -- -D warnings` clean
+- [ ] `cargo build --release` compileert zonder errors (alleen op het einde)
 - [ ] `cargo test --lib` groen (alle bestaande tests)
 - [ ] `initialize` response bevat `"protocolVersion":"2025-11-05"` (niet `"2025-03-26"`)
 - [ ] Claude Code 2.1.x: `tools/list` wordt gestuurd na `initialize`

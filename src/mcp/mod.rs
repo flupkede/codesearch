@@ -2076,7 +2076,7 @@ use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
     model::{
-        CallToolRequestParam, CallToolResult, Content, ListToolsResult, PaginatedRequestParam,
+        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult, PaginatedRequestParams,
         ServerCapabilities, ServerInfo,
     },
     service::{RequestContext, RunningService},
@@ -2121,26 +2121,17 @@ impl McpProxyService {
 
 impl ServerHandler for McpProxyService {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: rmcp::model::Implementation {
-                name: "codesearch".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: Some("codesearch (serve proxy)".to_string()),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("codesearch", env!("CARGO_PKG_VERSION"))
+                .with_title("codesearch (serve proxy)"))
+            .with_instructions(
                 "Proxy to a running codesearch serve hub. All tool calls are forwarded to the hub."
-                    .to_string(),
-            ),
-            ..Default::default()
-        }
+            )
     }
 
     async fn list_tools(
         &self,
-        request: Option<PaginatedRequestParam>,
+        request: Option<PaginatedRequestParams>,
         _cx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         self.peer
@@ -2151,7 +2142,7 @@ impl ServerHandler for McpProxyService {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         self.peer
@@ -2209,6 +2200,7 @@ const DEFINITION_KINDS: &[&str] = &[
 
 /// Codesearch MCP service
 pub struct CodesearchService {
+    #[allow(dead_code)]
     tool_router: ToolRouter<CodesearchService>,
     db_path: PathBuf,
     project_path: PathBuf,
@@ -5962,16 +5954,9 @@ impl ServerHandler for CodesearchService {
             "self-contained (stdio)".to_string()
         };
 
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: rmcp::model::Implementation {
-                name: "codesearch".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(format!(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("codesearch", env!("CARGO_PKG_VERSION")))
+            .with_instructions(format!(
                 r#"codesearch — semantic + lexical code search MCP server.
 
 TOOLS:
@@ -5996,9 +5981,7 @@ Model: {model} ({dims}d)
                 exists = if db_exists { "ready" } else { "not found" },
                 model = self.model_type.short_name(),
                 dims = self.dimensions
-            )),
-            ..Default::default()
-        }
+            ))
     }
 }
 
@@ -6082,8 +6065,11 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
 
     // Step 1: Establish HTTP MCP client connection to the serve hub.
     // () implements ClientHandler with no-op responses to server→client requests (ping, etc.).
-    let transport =
-        rmcp::transport::streamable_http_client::StreamableHttpClientWorker::<reqwest::Client>::new_simple(mcp_url.as_str());
+    let transport = {
+        use rmcp::transport::streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpClientWorker};
+        let config = StreamableHttpClientTransportConfig::with_uri(mcp_url.as_str());
+        StreamableHttpClientWorker::new(reqwest::Client::new(), config)
+    };
 
     let http_client: RunningService<RoleClient, ()> = match ().serve(transport).await {
         Ok(c) => c,
