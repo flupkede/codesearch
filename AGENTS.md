@@ -1,347 +1,316 @@
-# AGENTS.md — `feature/regression-fix`
+# Upgrade: rmcp 0.9.1 -> 1.5.0 (MCP protocol 2025-11-05)
 
-Hotfix branch voor regressies die uit de post-merge review van PR #18 kwamen.
-Twee taken, beide klein, beide blocking voor LLM-clients die de tool gebruiken.
-
-**Read this entirely before writing any code.** Nothing in scope is large; the
-risk is missing one of the related test/UX fixes alongside the one-line code
-change.
+**Status:** Blokkerend voor Claude Code 2.1.x
+**Branch:** `feature/rmcp-upgrade`
+**Eigenaar:** OpenCode
 
 ---
 
-## Status
+## 1. Probleem
 
-**Branch:** `feature/regression-fix` (cut from `master` at `9a06a14` — the merge
-commit of PR #18).
-**Working tree:** clean (only this AGENTS.md after first commit).
+codesearch adverteert MCP `protocolVersion: "2025-03-26"` (rmcp 0.9.1).
+Claude Code 2.1.119 stuurt `ProtocolVersion("2025-11-25")` in `initialize` en
+verlaat de sessie zonder te onderhandelen als de server een oudere versie adverteert.
+`tools/list` wordt nooit gestuurd, tools zijn onbeschikbaar, `/mcp` toont "Failed to reconnect."
 
-PR #18 landed two real regressions in `src/mcp/mod.rs` that ship to every user
-of `search(mode="literal")`. Both are about how low-confidence is signalled to
-the LLM caller. They are independent of the regex / scan-fallback work that
-otherwise functions correctly.
+Root cause: rmcp 0.9.1 kent protocol `2025-03-26`. Vanaf rmcp 1.x is dit `2025-11-05`.
+
+Crates.io status (27 april 2026):
+- **0.9.1** — huidig (protocol `2025-03-26`)
+- **1.5.0** — latest stable, gepubliceerd 16 april 2026 (protocol `2025-11-05`)
 
 ---
 
-## Bug 1 — `LITERAL_LOW_CONFIDENCE_BM25 = f32::MAX` flags every success as low confidence
+## 2. Scope van de wijzigingen
 
-### Demonstration
+Dit is een **major version bump** (0.x → 1.x) met meerdere breaking changes.
+De upgrade raakt vrijwel alle MCP-gerelateerde code in `src/mcp/mod.rs`,
+`src/serve/mod.rs`, en `Cargo.toml`.
 
-Built `v0.1.243` (current HEAD of `master`), started serve on port 39726,
-queried the codesearch.git index. Verbatim result:
+### 2.1 Cargo.toml
 
+```toml
+# Was:
+rmcp = { version = "0.9.1", features = ["server", "client", "transport-io",
+  "transport-streamable-http-server",
+  "transport-streamable-http-client-reqwest", "macros"] }
+
+# Wordt:
+rmcp = { version = "1.5.0", features = ["server", "client", "transport-io",
+  "transport-streamable-http-server",
+  "transport-streamable-http-client-reqwest", "macros"] }
 ```
-Query:        "match_line_for_literal" (regex=true)
-Hits:         3 (strong matches)
-Top score:    41.485       <- real BM25 score, well above any reasonable threshold
--> low_confidence:  true
--> suggested_tool:  "find with kind='definition' or kind='usages'"
--> note:            "find with kind='definition' or kind='usages'"
+
+`schemars` gaat ook van 0.8 naar 1.0 (rmcp 1.x trekt schemars 1.x mee):
+
+```toml
+# Was:
+schemars = "0.8"
+
+# Wordt:
+schemars = "1.0"
 ```
 
-A successful query with strong matches reports `low_confidence: true` and
-suggests a different tool. This will mislead every LLM client into switching
-tools when there is nothing wrong with the result.
+### 2.2 Breaking changes per categorie
 
-### Root cause
+#### Protocol version in ServerInfo
 
-`src/mcp/mod.rs:2471`:
+In rmcp 1.x heeft `ServerInfo` een expliciet `protocol_version` veld:
 
 ```rust
-const LITERAL_LOW_CONFIDENCE_BM25: f32 = f32::MAX;
+// Was (rmcp 0.9.1): protocol_version afwezig, rmcp zette het impliciet
+ServerInfo {
+    capabilities: ...,
+    server_info: Implementation { ... },
+    instructions: Some("...".to_string()),
+    ..Default::default()
+}
+
+// Wordt (rmcp 1.x):
+use rmcp::model::ProtocolVersion;
+ServerInfo {
+    protocol_version: ProtocolVersion::V_2025_11_05,
+    capabilities: ...,
+    server_info: Implementation { ... },
+    instructions: Some("...".to_string()),
+    ..Default::default()
+}
 ```
 
-The doc-comment on that constant says it is set to `f32::MAX` so the threshold
-"never fires until calibrated." That reasoning would be correct if the
-comparison were `score >= LITERAL_LOW_CONFIDENCE_BM25` (true only when score
-hits f32::MAX, which never happens for finite scores -> never fires). But the
-actual comparison in `compute_literal_low_confidence` is:
+Zoek alle `ServerInfo {` constructies in `src/mcp/mod.rs` en `src/serve/mod.rs`
+en voeg `protocol_version: ProtocolVersion::V_2025_11_05` toe.
+
+#### CallToolRequest / CallToolRequestParam
 
 ```rust
-match top_score {
-    Some(score) if score < LITERAL_LOW_CONFIDENCE_BM25 => {  // <- always true for finite scores
-        let hint = if is_natural_language { suggest_semantic } else { suggest_find };
-        (Some(true), Some(hint.to_string()))
+// Was:
+async fn call_tool(
+    &self,
+    request: CallToolRequest,
+    context: RequestContext<RoleServer>,
+) -> Result<CallToolResult, McpError>
+
+// Wordt (naam veranderd):
+async fn call_tool(
+    &self,
+    request: CallToolRequestParam,
+    context: RequestContext<RoleServer>,
+) -> Result<CallToolResult, ErrorData>
+```
+
+`McpError` is hernoemd naar `ErrorData`. Zoek alle `McpError` en vervang door `ErrorData`.
+Check ook imports: `use rmcp::ErrorData as McpError;` of pas alle call sites aan.
+
+#### #[tool_router] macro en ToolRouter veld
+
+In rmcp 1.x moet de struct een `ToolRouter<Self>` veld bevatten:
+
+```rust
+// Was (rmcp 0.9.1): tool_router als field was optioneel / anders opgezet
+#[derive(Clone)]
+pub struct CodesearchService {
+    // ... velden
+}
+
+// Wordt (rmcp 1.x):
+use rmcp::handler::server::tool::ToolRouter;
+#[derive(Clone)]
+pub struct CodesearchService {
+    tool_router: ToolRouter<Self>,
+    // ... rest van de velden
+}
+
+impl CodesearchService {
+    pub fn new(...) -> Self {
+        Self {
+            tool_router: Self::tool_router(), // gegenereerd door #[tool_router]
+            // ...
+        }
     }
-    None => { /* empty results path */ }
-    Some(_) => (None, None),
 }
 ```
 
-For any finite BM25 score, `score < f32::MAX` is true, the first arm matches,
-and low_confidence is set to true. The `Some(_) => (None, None)` arm is
-unreachable for any finite score.
+De `#[tool_router]` macro op de impl-blok genereert de `tool_router()` associated
+function. De `#[tool_handler]` macro op de `impl ServerHandler` blok wires de
+router aan `list_tools` en `call_tool`.
 
-### Fix
-
-Change the constant value to something below typical BM25 floor scores. Until
-real-world calibration data is collected via the existing
-`codesearch::literal_confidence` tracing target, picking a low-but-not-zero
-value is safer than zero (because zero would never fire even on truly weak
-results).
+Patroon in rmcp 1.x:
 
 ```rust
-// src/mcp/mod.rs near line 2467
-/// BM25 score threshold for low-confidence signalling in literal search.
-///
-/// Scores **below** this threshold trigger `low_confidence: true` in the
-/// response. Tantivy BM25 scores in the codesearch corpus typically range
-/// from ~5 (weak match) to ~50+ (strong match), so 5.0 is a conservative
-/// initial floor — below this, results are likely noise rather than real hits.
-///
-/// To recalibrate: enable `RUST_LOG=codesearch::literal_confidence=debug`,
-/// collect query/score samples, set this to roughly the 25th percentile of
-/// real query scores.
-const LITERAL_LOW_CONFIDENCE_BM25: f32 = 5.0;
-```
-
-### Tests to add / fix
-
-The existing test `test_literal_lc_threshold_uses_strictly_less_than` at
-`src/mcp/mod.rs:1733` validates the boundary at `f32::MAX`, which is a
-non-existent score in practice. The test passes by coincidence (the catch-all
-`Some(_) => (None, None)` arm fires when the score equals the threshold). It
-must be replaced with a real-world test:
-
-```rust
-#[test]
-fn test_literal_lc_does_not_fire_on_strong_results() {
-    // Strong BM25 score (well above floor) must NOT be flagged low_confidence.
-    let (lc, hint) = super::compute_literal_low_confidence(Some(41.5), "anything");
-    assert_eq!(lc, None, "strong BM25 results must not be flagged low_confidence");
-    assert_eq!(hint, None);
+#[tool_router]
+impl CodesearchService {
+    #[tool(description = "...")]
+    async fn search(&self, Parameters(req): Parameters<SearchRequest>, ...) 
+        -> Result<CallToolResult, ErrorData> { ... }
 }
 
-#[test]
-fn test_literal_lc_fires_on_weak_results() {
-    // Score below the floor -> low_confidence true.
-    let (lc, hint) = super::compute_literal_low_confidence(
-        Some(super::LITERAL_LOW_CONFIDENCE_BM25 - 0.5),
-        "CodesearchService",
-    );
-    assert_eq!(lc, Some(true));
-    assert!(hint.is_some());
-}
-
-#[test]
-fn test_literal_lc_threshold_boundary_uses_strict_less_than() {
-    // Score EXACTLY at the threshold should NOT fire (< not <=).
-    let (lc, hint) = super::compute_literal_low_confidence(
-        Some(super::LITERAL_LOW_CONFIDENCE_BM25),
-        "anything",
-    );
-    assert_eq!(lc, None);
-    assert_eq!(hint, None);
+#[tool_handler]
+impl ServerHandler for CodesearchService {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: ProtocolVersion::V_2025_11_05,
+            ...
+        }
+    }
 }
 ```
 
-Two existing tests at `src/mcp/mod.rs:1710` and `:1721` use
-`LITERAL_LOW_CONFIDENCE_BM25 / 2.0` to construct a "weak score". With the new
-value of 5.0 these become `2.5`, which is still well below the floor — they
-should keep passing without modification. **Verify** they do; if they regress,
-that is a bug in the new threshold value.
+#### schemars 0.8 → 1.0
 
----
+schemars 1.0 heeft breaking changes:
+- `#[schemars(description = "...")]` werkt nog steeds
+- `JsonSchema` derive werkt nog steeds
+- Maar sommige helper types en re-exports zijn gewijzigd
 
-## Bug 2 — `note` field carries a tool name instead of a sentence
+Codesearch gebruikt schemars voornamelijk via `#[derive(JsonSchema)]` en
+`#[schemars(description = "...")]` attributes op request structs. Deze werken
+grotendeels ongewijzigd. Laat de compiler de specifieke fouten aanwijzen.
 
-### Demonstration
-
-From the same query above:
-
-```
-note: "find with kind='definition' or kind='usages'"
-```
-
-The `note` field on `LiteralSearchResponse` is documented as
-
-> Actionable note for the LLM caller (present iff auto_promoted_to_regex
-> or low_confidence is set).
-
-An "actionable note" reads like a sentence. The current value is a tool
-invocation string copied from `suggested_tool`. LLM clients see the same
-string twice (once in `suggested_tool`, once in `note`) without explanation.
-
-### Root cause
-
-`src/mcp/mod.rs` inside `literal_search`, near the end of the function:
+#### Parameters wrapper import
 
 ```rust
-let note = if auto_promoted {
-    Some(format!(
-        "Query auto-promoted to regex mode (original: '{}', effective: '{}'). \
-         The query contained code-like punctuation that BM25 would tokenize incorrectly.",
-        request.query, effective_query
-    ))
-} else if low_confidence == Some(true) {
-    suggested_tool.clone()  // <- tool name string, not a sentence
-} else {
-    None
-};
+// Was:
+use rmcp::handler::server::tool::Parameters;
+
+// In rmcp 1.x (check exacte pad):
+use rmcp::handler::server::wrapper::Parameters;
+// of:
+use rmcp::handler::server::tool::Parameters;
+// Laat compiler bepalen wat correct is
 ```
 
-The auto-promoted branch correctly produces a sentence. The low-confidence
-branch copies the tool-name string verbatim.
+#### StdioProxyHandler (toegevoegd in feature/fix-mcp-client, nu op master)
 
-### Fix
-
-Wrap the suggested tool in an explanatory sentence:
+De `StdioProxyHandler` struct in `run_mcp_client` implementeert `ServerHandler`
+handmatig (geen macros). De signatures moeten worden aangepast aan rmcp 1.x:
 
 ```rust
-let note = if auto_promoted {
-    Some(format!(
-        "Query auto-promoted to regex mode (original: '{}', effective: '{}'). \
-         The query contained code-like punctuation that BM25 would tokenize incorrectly.",
-        request.query, effective_query
-    ))
-} else if low_confidence == Some(true) {
-    suggested_tool.as_ref().map(|tool| {
-        format!(
-            "Top result has weak BM25 score; consider using `{}` for better matches.",
-            tool
-        )
-    })
-} else {
-    None
-};
-```
+// Aanpassen:
+impl rmcp::ServerHandler for StdioProxyHandler {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo {
+            protocol_version: rmcp::model::ProtocolVersion::V_2025_11_05,
+            ...
+        }
+    }
 
-After the fix, the same kind of query as above (a real low-confidence case)
-should produce:
+    async fn list_tools(
+        &self,
+        request: Option<rmcp::model::PaginatedRequestParam>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> { ... }
 
-```
-note: "Top result has weak BM25 score; consider using `find with kind='definition' or kind='usages'` for better matches."
-```
-
-### Tests to add
-
-Add to the existing test module in `src/mcp/mod.rs`:
-
-```rust
-#[test]
-fn test_literal_response_note_is_sentence_not_tool_name() {
-    // Simulate the note-construction logic for the low-confidence branch.
-    let suggested_tool: Option<String> = Some("find with kind='definition'".to_string());
-    let auto_promoted = false;
-    let low_confidence = Some(true);
-
-    let note: Option<String> = if auto_promoted {
-        Some("ignored".to_string())
-    } else if low_confidence == Some(true) {
-        suggested_tool.as_ref().map(|tool| {
-            format!("Top result has weak BM25 score; consider using `{}` for better matches.", tool)
-        })
-    } else {
-        None
-    };
-
-    let n = note.expect("note must be present when low_confidence is true");
-    assert!(n.starts_with("Top result"), "note must read as a sentence, got: {}", n);
-    assert!(n.contains("find with kind='definition'"), "note must reference the suggested tool: {}", n);
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParam,  // let op: Param niet Request
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> { ... }
 }
 ```
 
 ---
 
-## Acceptance criteria
+## 3. Aanpak
 
-All of the following must hold before opening the PR:
+### Stap 1: Cargo.toml updaten
 
-1. `cargo test --lib` passes — three new/replaced tests for Bug 1, one new
-   test for Bug 2, plus all 358 existing tests still green.
-2. `cargo test --all` passes.
-3. `cargo clippy --all-targets -- -D warnings` clean.
-4. **Manual smoke test:** start serve on port 39726, query the codesearch.git
-   index for `match_line_for_literal` with `regex=true`, parse the JSON. The
-   response must have:
-   - `results` with >= 1 entry, top score > 5.0
-   - **No** `low_confidence` field
-   - **No** `suggested_tool` field
-   - **No** `note` field
-5. **Manual smoke test for the empty-results path:** query for
-   `zzz_definitely_not_in_code` with `regex=true`. The response must have:
-   - `results` empty
-   - `low_confidence: true`
-   - `suggested_tool` set to a non-empty hint
-   - `note` reads as a complete English sentence (starts with "Top result"
-     or similar), not a bare tool-name string
+Bump `rmcp` naar `"1.5.0"` en `schemars` naar `"1.0"` in `Cargo.toml`.
+Run `cargo build 2>&1 | head -100` om de eerste golf compile errors te zien.
 
-The PowerShell harness used in the bug demonstration is reproducible from the
-chat history; copy it from there if needed.
+### Stap 2: Iteratief compile-driven fixen
 
----
+rmcp 1.x heeft veel compile errors bij upgrade vanwege de breaking changes.
+Aanpak:
 
-## Commit structure
+1. `cargo build` — bekijk eerste batch errors
+2. Fix de meest fundamentele (imports, hernoemingen)
+3. Herhaal tot clean
 
-One commit. Suggested message:
+Verwachte volgorde van fixes:
+1. `McpError` → `ErrorData` (global find-replace)
+2. `CallToolRequest` → `CallToolRequestParam` (let op: alleen in ServerHandler impl, niet bij calls)
+3. `protocol_version: ProtocolVersion::V_2025_11_05` toevoegen aan alle `ServerInfo` constructies
+4. `ToolRouter<Self>` veld toevoegen aan `CodesearchService` en `new()` aanpassen
+5. `schemars` gerelateerde fouten per geval oplossen
+6. `Parameters` import pad corrigeren indien nodig
 
-```
-fix(mcp): correct LITERAL_LOW_CONFIDENCE_BM25 threshold and note phrasing
+### Stap 3: StdioProxyHandler aanpassen
 
-PR #18 landed two regressions in literal_search response signalling:
+Zie sectie 2.2 hierboven. Pas signatures aan en voeg `protocol_version` toe aan `build_proxy_server_info()`.
 
-1. LITERAL_LOW_CONFIDENCE_BM25 was set to f32::MAX with the intent of
-   "never fires until calibrated", but the comparison `score < threshold`
-   means it fires on every finite score instead. Result: every successful
-   literal_search was flagged low_confidence with an unrelated suggested_tool,
-   misleading LLM clients into switching tools needlessly.
+### Stap 4: Verifieer protocol version in initialize response
 
-   Set the threshold to 5.0 (Tantivy BM25 corpus floor for codesearch).
-   Replace the boundary test that validated f32::MAX with three tests that
-   exercise the strong-result, weak-result, and exact-boundary cases.
+Na een succesvolle build, test met:
 
-2. The `note` field on LiteralSearchResponse received the suggested_tool
-   string verbatim ("find with kind='definition'...") instead of a sentence.
-   Wrap the tool name in an explanatory sentence describing why the hint
-   is being given.
-
-Both fixes are user-facing only; no internal API changes.
+```bash
+echo '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | codesearch mcp --mode local
 ```
 
----
-
-## What is explicitly out of scope
-
-These items came up in the post-merge review of PR #18 but are **not** part of
-this hotfix branch:
-
-- Code-duplication in `literal_search` (4 BM25/scan x multi/single paths) —
-  refactoring opportunity, separate branch.
-- Sequential vs parallel multi-store fan-out (`for store in sv { ... await }`
-  could become `join_all`) — performance work, separate branch.
-- Magic limit multipliers (`limit * 3`, `limit * 2`, etc.) becoming named
-  constants — style work, separate branch.
-- Stringly-typed `mode`/`kind`/`format` becoming serde enums — type-safety
-  work, separate branch.
-- Trailing-escape detector — was already documented as a follow-up; no longer
-  relevant since PR #18 already shipped the trailing-escape fix.
-- `looks_like_code_pattern` not detecting `.` in `User.create` — design
-  choice, documented limitation.
-- `ReposConfig::load()` swallowing corrupt-file errors as default — separate
-  reliability concern.
-
-If any of those become blockers in production, file separate issues and cut
-separate branches. Do not bundle.
+Verwacht: response met `"protocolVersion":"2025-11-05"` (niet `"2025-03-26"`).
+Claude Code stuurt `2025-11-25`, wij antwoorden `2025-11-05` — dit is de versie
+die rmcp 1.5.0 ondersteunt en Claude Code accepteert voor backwards compat.
 
 ---
 
-## Build rules (reference)
+## 4. Definition of Done
 
-- Target dir: `C:\WorkArea\AI\codesearch\target` (set by `.cargo/config.toml`).
-- **Always DEBUG.** `--release` is forbidden on this branch.
-- All edits via MCP filesystem tools. Bash/PowerShell only for cargo commands.
-- Pre-commit hook bumps `Cargo.toml` patch version AND rebuilds
-  `target/debug/codesearch.exe` so binary cannot drift behind manifest. Do not
-  use `--no-verify` — `copy-to-common.ps1` will refuse to deploy a mismatched
-  binary.
+- [ ] `cargo build --release` compileert zonder errors of warnings
+- [ ] `cargo clippy --all-targets -- -D warnings` clean
+- [ ] `cargo test --lib` groen (alle bestaande tests)
+- [ ] `initialize` response bevat `"protocolVersion":"2025-11-05"` (niet `"2025-03-26"`)
+- [ ] Claude Code 2.1.x: `tools/list` wordt gestuurd na `initialize`
+- [ ] Claude Code `/mcp` toont codesearch als "Connected" in-session
+- [ ] OpenCode: tools nog steeds beschikbaar (regressietest)
+- [ ] `codesearch mcp --mode client` werkt nog (StdioProxyHandler)
 
-## Key files
+---
 
-- `src/mcp/mod.rs:2471` — `LITERAL_LOW_CONFIDENCE_BM25` constant (Bug 1 fix)
-- `src/mcp/mod.rs` near `compute_literal_low_confidence` (~line 2473) — the
-  comparison logic; no change needed, the fix is purely in the constant value
-- `src/mcp/mod.rs` inside `literal_search`, near the response-construction
-  block — `note` field assignment (Bug 2 fix)
-- `src/mcp/mod.rs:1733` — old test `test_literal_lc_threshold_uses_strictly_less_than`
-  to replace with three new tests
-- `src/mcp/mod.rs:1710` and `:1721` — existing weak-score tests that should
-  keep passing with the new threshold value
+## 5. Niet in scope
+
+- Upgraden naar rmcp 2.x of hoger (als die uitkomt voor merge)
+- OAuth / auth features van rmcp 1.x
+- Nieuwe rmcp 1.x features (elicitation, sampling, etc.)
+- Wijzigingen aan zoeklogica of indexering
+
+---
+
+## 6. Risico's
+
+| Risico | Kans | Mitigatie |
+|--------|------|-----------|
+| schemars 1.0 breekt JsonSchema derives | Gemiddeld | Compiler wijst fouten aan; meeste derives werken ongewijzigd |
+| tool_router macro gedrag veranderd | Gemiddeld | Gebruik rmcp voorbeelden als referentie; compile-driven |
+| HTTP transport API gewijzigd (serve mode) | Laag | Serve gebruikt StreamableHttpServer; check rmcp 1.x transport docs |
+| reqwest versie conflict (rmcp 1.x trekt reqwest 0.13) | Laag | Check Cargo.lock na bump; los versie conflicts op |
+
+---
+
+## 7. Commit message voorstel
+
+```
+fix(mcp): upgrade rmcp 0.9.1 -> 1.5.0 for protocol 2025-11-05 support
+
+Claude Code 2.1.x announces protocolVersion "2025-11-25" and abandons
+the session if the server responds with the old "2025-03-26" version
+(rmcp 0.9.1). tools/list was never sent, making codesearch unavailable
+in Claude Code sessions.
+
+rmcp 1.5.0 advertises protocol version 2025-11-05 which Claude Code
+accepts. Breaking changes addressed:
+- McpError -> ErrorData
+- CallToolRequest -> CallToolRequestParam
+- ServerInfo: add explicit protocol_version field
+- ToolRouter<Self> field required in handler struct
+- schemars 0.8 -> 1.0
+- StdioProxyHandler signatures updated
+
+Closes: AGENTS_rmcp-upgrade.md
+```
+
+---
+
+## 8. Referenties
+
+- rmcp 1.5.0 crates.io: https://crates.io/crates/rmcp/1.5.0
+- rmcp GitHub: https://github.com/modelcontextprotocol/rust-sdk
+- Breaking changes observeerbaar via: `cargo build` compile errors na bump
