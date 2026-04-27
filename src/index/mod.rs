@@ -56,6 +56,26 @@ fn get_db_path_smart(
     // Step 2: Handle --force flag
     if force {
         if let Some(ref db_info) = existing_db {
+            // Safety check: only delete a database that is inside the project path.
+            // If find_best_database found a database in a parent directory or a
+            // globally-registered repo that is NOT the current project, refuse to
+            // delete it — that would destroy another project's index.
+            let db_project_normalized = normalize_path(&db_info.project_path);
+            let canonical_path_str = normalize_path(&canonical_path);
+            let db_is_for_this_project = db_project_normalized == canonical_path_str
+                || canonical_path.as_path().starts_with(Path::new(&*db_project_normalized));
+
+            if !db_is_for_this_project {
+                anyhow::bail!(
+                    "Found database at {} for project '{}', but you are indexing '{}'. \
+                     Cowardly refusing to delete another project's database. \
+                     If the database is stale, delete it manually or run from the correct directory.",
+                    db_info.db_path.display(),
+                    db_project_normalized,
+                    canonical_path_str
+                );
+            }
+
             // Delete existing database (local or global)
             println!(
                 "{}",
@@ -351,20 +371,26 @@ pub async fn index(
     // When force=true, try to delegate to a running serve instance via HTTP.
     // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
     if force && !dry_run {
-        if let Ok(alias_and_path) = try_delegate_reindex_to_serve(&path).await {
-            let (alias, project_path) = alias_and_path;
-            println!(
-                "{}",
-                format!(
-                    "🔄 Delegated reindex to running serve instance (alias: '{}', path: {})",
-                    alias,
-                    project_path.display()
-                )
-                .bright_cyan()
-            );
-            return Ok(());
+        match try_delegate_reindex_to_serve(&path).await {
+            Ok((alias, project_path)) => {
+                println!(
+                    "{}",
+                    format!(
+                        "🔄 Delegated reindex to running serve instance (alias: '{}', path: {})",
+                        alias,
+                        project_path.display()
+                    )
+                    .bright_cyan()
+                );
+                return Ok(());
+            }
+            Err(reason) => {
+                debug!(
+                    "Could not delegate reindex to serve (falling back to local): {}",
+                    reason
+                );
+            }
         }
-        // If delegation failed (serve not running), fall through to local indexing
     }
     index_with_options(path, dry_run, force, global, model, false, cancel_token).await
 }
@@ -1417,10 +1443,10 @@ struct DbStats {
 /// Try to delegate a reindex to a running serve instance.
 ///
 /// Returns `Ok((alias, project_path))` if the serve accepted the reindex request.
-/// Returns `Err` if serve is not running or the alias could not be resolved.
+/// Returns `Err(reason)` with a human-readable reason if delegation failed.
 async fn try_delegate_reindex_to_serve(
     path: &Option<PathBuf>,
-) -> std::result::Result<(String, PathBuf), ()> {
+) -> std::result::Result<(String, PathBuf), String> {
     use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
@@ -1434,16 +1460,16 @@ async fn try_delegate_reindex_to_serve(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
-        .map_err(|_| ())?;
+        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
 
     let health_resp = client
         .get(format!("{}/health", base_url))
         .send()
         .await
-        .map_err(|_| ())?;
+        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
 
     if !health_resp.status().is_success() {
-        return Err(());
+        return Err(format!("serve health check returned {}", health_resp.status()));
     }
 
     // 2. Resolve the project path to an alias by loading repos config
@@ -1452,7 +1478,8 @@ async fn try_delegate_reindex_to_serve(
         .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let config = crate::db_discovery::repos::ReposConfig::load().map_err(|_| ())?;
+    let config = crate::db_discovery::repos::ReposConfig::load()
+        .map_err(|e| format!("cannot load repos.json: {}", e))?;
 
     // Find the alias for this path
     let alias = config
@@ -1477,11 +1504,13 @@ async fn try_delegate_reindex_to_serve(
         .post(format!("{}/repos/{}/reindex", base_url, alias))
         .send()
         .await
-        .map_err(|_| ())?;
+        .map_err(|e| format!("reindex POST failed: {}", e))?;
 
     if reindex_resp.status().is_success() {
         Ok((alias, project_path))
     } else {
-        Err(())
+        let status = reindex_resp.status();
+        let body = reindex_resp.text().await.unwrap_or_default();
+        Err(format!("serve returned {} for alias '{}': {}", status, alias, body))
     }
 }
