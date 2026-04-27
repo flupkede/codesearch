@@ -66,7 +66,24 @@ fn get_db_path_smart(
                 )
                 .yellow()
             );
-            std::fs::remove_dir_all(&local_db)?;
+            std::fs::remove_dir_all(&local_db).map_err(|e| {
+                // On Windows, OS error 32 = "file in use by another process".
+                // This typically means 'codesearch serve' has the LMDB memory-mapped.
+                // The serve's /repos/{alias}/reindex endpoint should have been used instead.
+                #[cfg(target_os = "windows")]
+                if e.raw_os_error() == Some(32) {
+                    return anyhow::anyhow!(
+                        "Cannot delete database at {} — it is held open by another process \
+                        (likely 'codesearch serve').\n\
+                        Hint: 'codesearch index -f' automatically delegates to serve when it is \
+                        running. The delegation may have failed because this repo is not registered \
+                        in repos.json or the alias could not be resolved.\n\
+                        Run 'codesearch serve --register .' to register this repo, then retry.",
+                        local_db.display()
+                    );
+                }
+                anyhow::anyhow!("Failed to delete database at {}: {}", local_db.display(), e)
+            })?;
             // Wait for Windows to fully release file handles (memory-mapped files
             // from LMDB/tantivy may not be immediately released after deletion)
             std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -1495,25 +1512,41 @@ async fn try_delegate_reindex_to_serve(
     }
 
     // 2. Resolve the project path to an alias by loading repos config
-    let project_path = path
-        .as_ref()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+    let raw_project_path = path
+        .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // Canonicalize to resolve symlinks and normalize separators (incl. UNC on Windows)
+    let project_path = raw_project_path
+        .canonicalize()
+        .unwrap_or_else(|_| raw_project_path.clone());
 
     let config = crate::db_discovery::repos::ReposConfig::load()
         .map_err(|e| format!("cannot load repos.json: {}", e))?;
+
+    /// Normalize a path for comparison: canonicalize, then strip Windows UNC prefix
+    /// (`\\?\`) so that `\\?\C:\foo` and `C:\foo` compare equal.
+    fn normalize_for_cmp(p: &std::path::Path) -> String {
+        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let s = canonical.to_string_lossy().to_string();
+        // Strip Windows extended-length UNC prefix
+        let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+        s.to_lowercase()
+    }
+
+    let project_norm = normalize_for_cmp(&project_path);
 
     // Find the alias for this path
     let alias = config
         .repos
         .iter()
-        .find(|(_, p)| {
-            let canonical = p.canonicalize().unwrap_or_else(|_| (*p).clone());
-            canonical == project_path
-        })
+        .find(|(_, p)| normalize_for_cmp(p) == project_norm)
         .map(|(a, _)| a.clone())
         .unwrap_or_else(|| {
             // Fallback: use the directory name as alias
+            tracing::debug!(
+                "try_delegate_reindex: path '{}' not found in repos.json, using dir name as alias",
+                project_norm
+            );
             project_path
                 .file_name()
                 .and_then(|n| n.to_str())
