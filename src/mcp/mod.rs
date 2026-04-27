@@ -2079,7 +2079,7 @@ use rmcp::{
         CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult, PaginatedRequestParams,
         ServerCapabilities, ServerInfo,
     },
-    service::{RequestContext, RunningService},
+    service::RequestContext,
     tool, tool_handler, tool_router, ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
 };
 use std::collections::HashSet;
@@ -2094,7 +2094,7 @@ pub use types::*;
 // MCP Proxy Service  (--mode client / --mode auto with serve detected)
 // ═══════════════════════════════════════════════════════════════════
 
-/// Transparent stdio↔HTTP proxy.
+/// Transparent stdio↔HTTP proxy with automatic reconnect.
 ///
 /// When `codesearch mcp --mode client` is started by Claude Desktop:
 /// - Claude Desktop sends MCP requests over stdio
@@ -2107,16 +2107,33 @@ pub use types::*;
 ///
 /// Only tool operations (`list_tools`, `call_tool`) are forwarded. Prompts, resources,
 /// and completion are not proxied — the serve hub does not expose them.
+///
+/// ## Reconnect
+///
+/// The peer is wrapped in `Arc<RwLock<Option<Peer>>>` so it can be hot-swapped when the
+/// serve connection drops and reconnects. During reconnection, tool calls return a
+/// descriptive "reconnecting" error so Claude Desktop can retry.
 struct McpProxyService {
-    /// Clonable peer handle to the serve hub. `Peer` supports `list_tools` / `call_tool`
-    /// directly via the rmcp `method!` macro.
-    peer: rmcp::service::Peer<RoleClient>,
+    /// Shared peer handle — hot-swapped on reconnect.
+    /// `None` means we're reconnecting to serve; tool calls return a retry-able error.
+    peer: std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>>,
 }
 
 impl McpProxyService {
+    #[allow(dead_code)]
     fn new(peer: rmcp::service::Peer<RoleClient>) -> Self {
-        Self { peer }
+        Self {
+            peer: std::sync::Arc::new(tokio::sync::RwLock::new(Some(peer))),
+        }
     }
+}
+
+/// Reconnect-related constants for the MCP proxy.
+mod reconnect {
+    /// How long to wait between reconnect attempts.
+    pub const INTERVAL_SECS: u64 = 3;
+    /// Maximum total time to spend trying to reconnect before giving up.
+    pub const MAX_DURATION_SECS: u64 = 300; // 5 minutes
 }
 
 impl ServerHandler for McpProxyService {
@@ -2134,10 +2151,17 @@ impl ServerHandler for McpProxyService {
         request: Option<PaginatedRequestParams>,
         _cx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        self.peer
-            .list_tools(request)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
+        let peer = self.peer.read().await.clone();
+        match peer {
+            Some(p) => p
+                .list_tools(request)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None)),
+            None => Err(McpError::internal_error(
+                "codesearch serve is reconnecting — please retry in a moment".to_string(),
+                None,
+            )),
+        }
     }
 
     async fn call_tool(
@@ -2145,10 +2169,17 @@ impl ServerHandler for McpProxyService {
         request: CallToolRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.peer
-            .call_tool(request)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
+        let peer = self.peer.read().await.clone();
+        match peer {
+            Some(p) => p
+                .call_tool(request)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None)),
+            None => Err(McpError::internal_error(
+                "codesearch serve is reconnecting — please retry in a moment".to_string(),
+                None,
+            )),
+        }
     }
 }
 
@@ -6079,64 +6110,167 @@ async fn probe_serve_health(serve_url: &str) -> bool {
 /// Every MCP request from Claude Desktop is forwarded verbatim to the serve hub and the
 /// response is returned unchanged. This allows Claude Desktop — which has no repo context
 /// of its own — to reach all repos managed by `codesearch serve`.
+///
+/// ## Reconnect behaviour
+///
+/// When `codesearch serve` goes away (restart, crash, network blip), the proxy does NOT
+/// exit. Instead it:
+/// 1. Keeps the stdio connection to Claude Desktop alive
+/// 2. Returns "reconnecting" errors for any incoming tool calls
+/// 3. Retries the HTTP connection every 3 seconds for up to 5 minutes
+/// 4. On success, hot-swaps the peer — tool calls resume immediately
+/// 5. After 5 minutes of failure, exits cleanly (Claude Desktop detects the disconnect)
 async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Result<()> {
     use rmcp::{ServiceExt, transport::stdio};
 
     let mcp_url = format!("{}{}", serve_url, crate::constants::MCP_ENDPOINT_PATH);
     tracing::info!("🔗 Connecting to codesearch serve at {}", mcp_url);
 
-    // Step 1: Establish HTTP MCP client connection to the serve hub.
-    // () implements ClientHandler with no-op responses to server→client requests (ping, etc.).
-    let transport = {
-        use rmcp::transport::streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpClientWorker};
-        let config = StreamableHttpClientTransportConfig::with_uri(mcp_url.as_str());
-        StreamableHttpClientWorker::new(reqwest::Client::new(), config)
+    // Channels: spawned monitor tasks notify us when their connection drops.
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (stdio_close_tx, mut stdio_close_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // Shared peer state — hot-swapped on reconnect.
+    let peer_state: std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>> =
+        std::sync::Arc::new(tokio::sync::RwLock::new(None));
+
+    // Step 1: Start stdio proxy for Claude Desktop.
+    // This must happen first so Claude Desktop has something to talk to,
+    // even before the serve connection is established.
+    let proxy = McpProxyService {
+        peer: peer_state.clone(),
     };
-
-    let http_client: RunningService<RoleClient, ()> = match ().serve(transport).await {
-        Ok(c) => c,
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Failed to connect to codesearch serve at {}.\n\
-                 Error: {}\n\
-                 Is `codesearch serve` running?",
-                mcp_url, e
-            ));
-        }
-    };
-
-    tracing::info!("✅ Connected to codesearch serve hub");
-
-    // Step 2: Clone the Peer (cheap handle — Clonable) for the proxy.
-    // Keep the owned RunningService for .waiting() to detect serve disconnect.
-    let peer = http_client.peer().clone();
-    let proxy = McpProxyService::new(peer);
     let server = proxy
         .serve(stdio())
         .await
         .context("Failed to start proxy stdio server")?;
 
+    // Spawn a task that watches the stdio connection (takes ownership of server).
+    tokio::spawn(async move {
+        let _ = server.waiting().await;
+        let _ = stdio_close_tx.send(()).await;
+    });
+
+    // Step 2: Initial connection to serve (must succeed).
+    connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone()).await?;
     tracing::info!("🚀 MCP proxy ready — forwarding Claude Desktop ↔ codesearch serve");
 
-    // Step 3: Wait for any of: stdio close, serve disconnect, or cancel signal.
-    tokio::select! {
-        result = server.waiting() => {
-            tracing::info!("MCP proxy transport closed");
-            result?;
-        }
-        result = http_client.waiting() => {
-            // Do NOT propagate the error: returning Ok(()) causes codesearch to exit
-            // with code 0 (clean EOF on stdio) rather than crashing, so Claude Desktop
-            // gets a graceful server-closed signal instead of an unexpected disconnect
-            // that wipes the current chat context ("een stuk vd chat verdwijnt").
-            tracing::warn!("codesearch serve disconnected — exiting cleanly: {:?}", result);
-        }
-        _ = cancel_token.cancelled() => {
-            tracing::info!("🛑 Shutdown signal received, stopping MCP proxy...");
+    // Step 3: Main loop — wait for stdio close, serve disconnect, or cancel.
+    let mut serve_down_since: Option<std::time::Instant> = None;
+
+    loop {
+        tokio::select! {
+            biased; // Prefer clean shutdown paths over reconnect
+
+            // Claude Desktop closed stdio — we're done.
+            _ = stdio_close_rx.recv() => {
+                tracing::info!("MCP proxy transport closed");
+                return Ok(());
+            }
+
+            // External cancel signal (e.g. process termination).
+            _ = cancel_token.cancelled() => {
+                tracing::info!("🛑 Shutdown signal received, stopping MCP proxy...");
+                return Ok(());
+            }
+
+            // Serve disconnected — enter reconnect loop.
+            _ = disconnect_rx.recv() => {
+                // Clear peer so tool calls get "reconnecting" error.
+                {
+                    let mut p = peer_state.write().await;
+                    *p = None;
+                }
+
+                if serve_down_since.is_none() {
+                    serve_down_since = Some(std::time::Instant::now());
+                    tracing::warn!(
+                        "codesearch serve disconnected — will attempt reconnect every {}s for up to {}s",
+                        reconnect::INTERVAL_SECS,
+                        reconnect::MAX_DURATION_SECS,
+                    );
+                }
+
+                let elapsed = serve_down_since.unwrap().elapsed();
+                if elapsed.as_secs() > reconnect::MAX_DURATION_SECS {
+                    tracing::error!(
+                        "❌ Could not reconnect to serve after {}s — giving up",
+                        reconnect::MAX_DURATION_SECS
+                    );
+                    return Ok(()); // Clean exit so Claude Desktop gets graceful EOF
+                }
+
+                // Wait before retrying.
+                tokio::time::sleep(std::time::Duration::from_secs(reconnect::INTERVAL_SECS)).await;
+
+                match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone()).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "✅ Reconnected to codesearch serve (was down for {:.0}s)",
+                            serve_down_since.unwrap().elapsed().as_secs()
+                        );
+                        serve_down_since = None;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Reconnect attempt failed: {}", e);
+                        // Re-trigger ourselves: the disconnect_tx from the failed
+                        // connect_to_serve was never used, so we send a synthetic
+                        // disconnect to keep the loop going.
+                        let tx = disconnect_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            let _ = tx.send(()).await;
+                        });
+                    }
+                }
+            }
         }
     }
+}
 
-    tracing::info!("✅ MCP proxy shut down cleanly");
+/// Establish (or re-establish) an HTTP MCP client connection to the serve hub.
+///
+/// On success, updates `peer_state` with the new peer and spawns a background task
+/// that monitors the connection and sends a message on `disconnect_tx` when it drops.
+async fn connect_to_serve(
+    mcp_url: &str,
+    peer_state: &std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>>,
+    disconnect_tx: tokio::sync::mpsc::Sender<()>,
+) -> Result<()> {
+    use rmcp::ServiceExt;
+
+    let transport = {
+        use rmcp::transport::streamable_http_client::{
+            StreamableHttpClientTransportConfig, StreamableHttpClientWorker,
+        };
+        let config = StreamableHttpClientTransportConfig::with_uri(mcp_url);
+        StreamableHttpClientWorker::new(reqwest::Client::new(), config)
+    };
+
+    let http_client: rmcp::service::RunningService<RoleClient, ()> =
+        ().serve(transport).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to connect to codesearch serve at {}.\n\
+                 Error: {}\n\
+                 Is `codesearch serve` running?",
+                mcp_url, e
+            )
+        })?;
+
+    // Update the shared peer.
+    let peer = http_client.peer().clone();
+    {
+        let mut p = peer_state.write().await;
+        *p = Some(peer);
+    }
+
+    // Spawn a monitor task that detects when the connection drops.
+    tokio::spawn(async move {
+        let _ = http_client.waiting().await;
+        // Connection lost — notify main loop.
+        let _ = disconnect_tx.send(()).await;
+    });
+
     Ok(())
 }
 
