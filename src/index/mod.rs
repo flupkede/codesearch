@@ -410,7 +410,7 @@ pub async fn index(
     // When force=true, try to delegate to a running serve instance via HTTP.
     // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
     if force && !dry_run {
-        match try_delegate_reindex_to_serve(&path).await {
+        match try_delegate_reindex_to_serve(&path, force).await {
             Ok((alias, project_path)) => {
                 println!(
                     "{}",
@@ -1485,6 +1485,7 @@ struct DbStats {
 /// Returns `Err(reason)` with a human-readable reason if delegation failed.
 async fn try_delegate_reindex_to_serve(
     path: &Option<PathBuf>,
+    force: bool,
 ) -> std::result::Result<(String, PathBuf), String> {
     use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
@@ -1554,9 +1555,14 @@ async fn try_delegate_reindex_to_serve(
                 .to_string()
         });
 
-    // 3. POST /repos/{alias}/reindex
+    // 3. POST /repos/{alias}/reindex[?force=true]
+    let url = if force {
+        format!("{}/repos/{}/reindex?force=true", base_url, alias)
+    } else {
+        format!("{}/repos/{}/reindex", base_url, alias)
+    };
     let reindex_resp = client
-        .post(format!("{}/repos/{}/reindex", base_url, alias))
+        .post(&url)
         .send()
         .await
         .map_err(|e| format!("reindex POST failed: {}", e))?;
