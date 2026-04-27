@@ -865,7 +865,26 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         });
     }
 
-    // Truncate to max_results after reranking and filtering
+    // Deduplicate by (path, start_line, end_line) — eliminates historical
+    // index snapshots that share the same location but have different chunk_ids.
+    // Strategy: sort by chunk_id descending (newest first), retain first match.
+    results.sort_by(|a, b| b.id.cmp(&a.id));
+    {
+        let mut seen_locations: std::collections::HashSet<(String, usize, usize)> =
+            std::collections::HashSet::new();
+        results.retain(|r| {
+            let key = (r.path.clone(), r.start_line, r.end_line);
+            seen_locations.insert(key)
+        });
+    }
+    // Re-sort by score descending for output
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Truncate to max_results after reranking, dedup, and filtering
     results.truncate(options.max_results);
 
     // Output results
