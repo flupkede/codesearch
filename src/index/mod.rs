@@ -348,6 +348,24 @@ pub async fn index(
     model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
+    // When force=true, try to delegate to a running serve instance via HTTP.
+    // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
+    if force && !dry_run {
+        if let Ok(alias_and_path) = try_delegate_reindex_to_serve(&path).await {
+            let (alias, project_path) = alias_and_path;
+            println!(
+                "{}",
+                format!(
+                    "🔄 Delegated reindex to running serve instance (alias: '{}', path: {})",
+                    alias,
+                    project_path.display()
+                )
+                .bright_cyan()
+            );
+            return Ok(());
+        }
+        // If delegation failed (serve not running), fall through to local indexing
+    }
     index_with_options(path, dry_run, force, global, model, false, cancel_token).await
 }
 
@@ -1394,4 +1412,76 @@ struct DbStats {
     chunk_count: usize,
     size_mb: f64,
     bloat_ratio: Option<f64>,
+}
+
+/// Try to delegate a reindex to a running serve instance.
+///
+/// Returns `Ok((alias, project_path))` if the serve accepted the reindex request.
+/// Returns `Err` if serve is not running or the alias could not be resolved.
+async fn try_delegate_reindex_to_serve(
+    path: &Option<PathBuf>,
+) -> std::result::Result<(String, PathBuf), ()> {
+    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+
+    let port: u16 = std::env::var(SERVE_PORT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SERVE_PORT);
+
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    // 1. Health check — is serve running?
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|_| ())?;
+
+    let health_resp = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .map_err(|_| ())?;
+
+    if !health_resp.status().is_success() {
+        return Err(());
+    }
+
+    // 2. Resolve the project path to an alias by loading repos config
+    let project_path = path
+        .as_ref()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    let config = crate::db_discovery::repos::ReposConfig::load().map_err(|_| ())?;
+
+    // Find the alias for this path
+    let alias = config
+        .repos
+        .iter()
+        .find(|(_, p)| {
+            let canonical = p.canonicalize().unwrap_or_else(|_| (*p).clone());
+            canonical == project_path
+        })
+        .map(|(a, _)| a.clone())
+        .unwrap_or_else(|| {
+            // Fallback: use the directory name as alias
+            project_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        });
+
+    // 3. POST /repos/{alias}/reindex
+    let reindex_resp = client
+        .post(format!("{}/repos/{}/reindex", base_url, alias))
+        .send()
+        .await
+        .map_err(|_| ())?;
+
+    if reindex_resp.status().is_success() {
+        Ok((alias, project_path))
+    } else {
+        Err(())
+    }
 }

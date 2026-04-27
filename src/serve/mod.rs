@@ -404,6 +404,77 @@ async fn health_handler() -> AxumJson<serde_json::Value> {
     }))
 }
 
+/// Reindex handler: POST /repos/{alias}/reindex
+///
+/// Triggers an incremental refresh for the given repo alias.
+/// Returns 202 Accepted immediately; the reindex runs in the background.
+async fn reindex_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> axum::response::Json<serde_json::Value> {
+    // Resolve the project path for this alias
+    let project_path = {
+        let config = match state.config.read() {
+            Ok(c) => c,
+            Err(e) => {
+                return axum::response::Json(json!({
+                    "error": format!("Config lock poisoned: {}", e),
+                    "status": "error"
+                }));
+            }
+        };
+        match config.resolve(&alias) {
+            Some(p) => p,
+            None => {
+                return axum::response::Json(json!({
+                    "error": format!("Unknown alias '{}'", alias),
+                    "status": "not_found"
+                }));
+            }
+        }
+    };
+
+    // Ensure the repo is opened (lazy-open if needed)
+    let stores = match state.get_or_open_stores(&alias).await {
+        Ok(s) => s,
+        Err(e) => {
+            return axum::response::Json(json!({
+                "error": e,
+                "status": "error"
+            }));
+        }
+    };
+
+    let db_path = project_path.join(DB_DIR_NAME);
+
+    // Clone alias for the background task before we use it in the response
+    let alias_bg = alias.clone();
+    // Spawn the reindex in the background
+    tokio::spawn(async move {
+        tracing::info!("🔄 Reindex triggered for '{}' via HTTP API", alias_bg);
+        match IndexManager::perform_incremental_refresh_with_stores(
+            &project_path,
+            &db_path,
+            &stores,
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::info!("✅ Reindex complete for '{}'", alias_bg);
+            }
+            Err(e) => {
+                tracing::error!("❌ Reindex failed for '{}': {}", alias_bg, e);
+            }
+        }
+    });
+
+    axum::response::Json(json!({
+        "status": "accepted",
+        "alias": alias,
+        "message": "Reindex started in background"
+    }))
+}
+
 /// Axum middleware: log MCP requests (method + path, skips /health spam).
 async fn log_mcp_requests(
     req: axum::extract::Request,
@@ -512,8 +583,10 @@ pub async fn run_serve(
     // Build axum router with request logging
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
+        .route("/repos/{alias}/reindex", axum::routing::post(reindex_handler))
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
-        .layer(axum::middleware::from_fn(log_mcp_requests));
+        .layer(axum::middleware::from_fn(log_mcp_requests))
+        .with_state(serve_state.clone());
 
     // Graceful shutdown
     //
