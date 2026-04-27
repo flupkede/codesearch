@@ -653,7 +653,7 @@ pub async fn run_serve(
     // Build axum router with request logging
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
-        .route("/repos/{alias}/reindex", axum::routing::post(reindex_handler))
+            .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(log_mcp_requests))
         .with_state(serve_state.clone());
@@ -890,6 +890,66 @@ mod tests {
         let _ = state.aliases();
         let after_second = state.reload_count.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(after_second, after_first);
+    }
+
+    /// Verify that the /repos/:alias/reindex route is registered and reachable.
+    /// This test starts a real axum server on a random port and sends a POST request.
+    #[tokio::test]
+    async fn reindex_route_is_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("myrepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config.register_with_alias(repo_path.clone(), Some("testalias".to_string())).unwrap();
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+
+        let state = Arc::new(ServeState::new(config, Some(config_file)));
+
+        let app = axum::Router::new()
+            .route(crate::constants::HEALTH_PATH, axum::routing::get(health_handler))
+            .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // POST to unknown alias → 404 from our handler (not axum's built-in 404)
+        let resp = client
+            .post(format!("http://{}/repos/unknown/reindex", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "expected 404 from our handler");
+        let body: serde_json::Value = resp.json().await.expect("handler should return JSON body for 404");
+        assert!(body.get("error").is_some(), "expected JSON error body, got: {}", body);
+
+        // POST to known alias → 202 Accepted or 500 (DB missing), but NOT axum's built-in 404
+        // The key assertion is that the route IS registered (we get our handler's response, not axum's empty 404)
+        let resp = client
+            .post(format!("http://{}/repos/testalias/reindex", addr))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("handler should return JSON body");
+        assert!(
+            status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "expected 202 or 500 from our handler (not axum's 404), got {}: {}",
+            status, body
+        );
+        assert!(body.get("status").is_some(), "expected JSON with 'status' field, got: {}", body);
     }
 
     #[test]
