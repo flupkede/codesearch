@@ -624,51 +624,78 @@ impl IndexManager {
         stores: &SharedStores,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
+        use anyhow::Context;
 
         info!("🔄 Force reindex: clearing all store data in-place...");
 
-        // 1. Clear vector store (LMDB databases)
+        // ── Step 0: Read and preserve metadata BEFORE clearing anything ──
+        // This is defensive: the DB may be incomplete (no metadata.json at all),
+        // or clear() may indirectly remove it. We preserve model info so we can
+        // write it back before the reindex starts.
+        let metadata_path = db_path.join("metadata.json");
+        let preserved_metadata: serde_json::Value = if metadata_path.exists() {
+            let content = std::fs::read_to_string(&metadata_path)
+                .with_context(|| format!("Failed to read {}", metadata_path.display()))?;
+            serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {}", metadata_path.display()))?
+        } else {
+            warn!(
+                "⚠️  No metadata.json found in {} — using defaults for force reindex",
+                db_path.display()
+            );
+            serde_json::json!({
+                "model_short_name": "minilm-l6-q",
+                "model_name": "all-MiniLM-L6-v2-q",
+                "dimensions": 384,
+            })
+        };
+        let model_name = preserved_metadata
+            .get("model_short_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("minilm-l6-q")
+            .to_string();
+        let dimensions = preserved_metadata
+            .get("dimensions")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(384) as usize;
+
+        // ── Step 1: Clear vector store (LMDB databases) ──
         {
             let mut vstore = stores.vector_store.write().await;
             vstore.clear()?;
         }
 
-        // 2. Clear full-text search store (Tantivy index)
+        // ── Step 2: Clear full-text search store (Tantivy index) ──
         {
             let mut fts = stores.fts_store.write().await;
             fts.clear()?;
         }
 
-        // 3. Clear file metadata so every file is treated as new
+        // ── Step 3: Clear file metadata so every file is treated as new ──
         {
-            let metadata_path = db_path.join("metadata.json");
-            let model_name = if metadata_path.exists() {
-                let content = std::fs::read_to_string(&metadata_path)?;
-                let json: serde_json::Value = serde_json::from_str(&content)?;
-                json.get("model_short_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("minilm-l6-q")
-                    .to_string()
-            } else {
-                "minilm-l6-q".to_string()
-            };
-            let dimensions = if metadata_path.exists() {
-                let content = std::fs::read_to_string(&metadata_path)?;
-                let json: serde_json::Value = serde_json::from_str(&content)?;
-                json.get("dimensions")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(384) as usize
-            } else {
-                384
-            };
             let mut file_meta = FileMetaStore::load_or_create(db_path, &model_name, dimensions)?;
             file_meta.clear();
             file_meta.save(db_path)?;
         }
 
-        info!("✅ Stores cleared. Starting full reindex...");
+        // ── Step 4: Ensure metadata.json exists before reindex ──
+        // perform_incremental_refresh_with_stores() hard-fails without it.
+        // Write back the preserved metadata (with updated timestamp).
+        {
+            let mut metadata_to_write = preserved_metadata.clone();
+            metadata_to_write["indexed_at"] = serde_json::Value::String(
+                chrono::Utc::now().to_rfc3339(),
+            );
+            std::fs::write(
+                &metadata_path,
+                serde_json::to_string_pretty(&metadata_to_write)?,
+            )
+            .with_context(|| format!("Failed to write {}", metadata_path.display()))?;
+        }
 
-        // 4. Reindex — all files will be treated as "changed" since metadata is empty
+        info!("✅ Stores cleared, metadata preserved. Starting full reindex...");
+
+        // ── Step 5: Reindex — all files treated as "changed" since metadata is empty ──
         Self::perform_incremental_refresh_with_stores(codebase_path, db_path, stores).await
     }
 
