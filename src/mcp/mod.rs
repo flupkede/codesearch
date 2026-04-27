@@ -4475,7 +4475,18 @@ impl CodesearchService {
         } else {
             self.project_path.clone()
         };
-        let normalized = normalize_tool_path(&request.path, &project_root);
+        // Strip project-alias prefix from target path if present.
+        // E.g. "HUSQ.Aprimo/src/foo.cs" with project="HUSQ.Aprimo" → "src/foo.cs"
+        let stripped_path = if let Some(ref alias) = ctx.project_alias {
+            let prefix = format!("{}/", alias);
+            match request.path.strip_prefix(&prefix) {
+                Some(rest) => rest.to_string(),
+                None => request.path.clone(),
+            }
+        } else {
+            request.path.clone()
+        };
+        let normalized = normalize_tool_path(&stripped_path, &project_root);
 
         let items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store group fan-out: collect outline items from all stores
@@ -4691,7 +4702,17 @@ impl CodesearchService {
         } else {
             self.project_path.clone()
         };
-        let normalized = normalize_tool_path(&request.path, &project_root);
+        // Strip project-alias prefix from target path if present.
+        let stripped_path = if let Some(ref alias) = ctx.project_alias {
+            let prefix = format!("{}/", alias);
+            match request.path.strip_prefix(&prefix) {
+                Some(rest) => rest.to_string(),
+                None => request.path.clone(),
+            }
+        } else {
+            request.path.clone()
+        };
+        let normalized = normalize_tool_path(&stripped_path, &project_root);
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store group fan-out: collect import items from all stores
