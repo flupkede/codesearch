@@ -24,6 +24,7 @@ use tracing::{info, warn};
 
 use crate::constants::{
     DEFAULT_SERVE_PORT, HEALTH_PATH, MCP_ENDPOINT_PATH, SERVE_PORT_ENV, DB_DIR_NAME,
+    REPO_IDLE_TIMEOUT_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
 };
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{IndexManager, SharedStores};
@@ -64,6 +65,9 @@ impl std::fmt::Debug for RepoState {
 pub(crate) struct ServeState {
     /// Repo alias → opened stores (or conflicted marker).
     repos: DashMap<String, RepoState>,
+    /// Repo alias → timestamp of last query that touched this repo.
+    /// Used by the idle-reaper to evict repos after `REPO_IDLE_TIMEOUT_SECS`.
+    last_access: DashMap<String, std::time::Instant>,
     /// Loaded repos config (alias → path).
     config: std::sync::RwLock<ReposConfig>,
     /// Last observed mtime of the repos config file.
@@ -91,6 +95,7 @@ impl ServeState {
     fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
         Self {
             repos: DashMap::new(),
+            last_access: DashMap::new(),
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
@@ -383,6 +388,7 @@ impl ServeState {
                 stores: stores_arc,
             },
         );
+        self.touch_access(alias);
         Ok(())
     }
 
@@ -396,6 +402,7 @@ impl ServeState {
 
         // Fast path: already opened
         if let Some(entry) = self.repos.get(alias) {
+            self.touch_access(alias);
             return match entry.value() {
                 RepoState::Write { stores, .. } | RepoState::Readonly { stores } => {
                     Ok(stores.clone())
@@ -716,6 +723,79 @@ impl ServeState {
             .cloned()
             .ok_or_else(|| format!("Unknown group '{}'", group))
     }
+
+    /// Record that a repo was just accessed (query or reindex).
+    /// Called from `get_or_open_stores`, `warmup_repo`, and `reindex_handler`.
+    fn touch_access(&self, alias: &str) {
+        self.last_access.insert(alias.to_string(), std::time::Instant::now());
+    }
+
+    /// Get the configured idle timeout duration.
+    /// Reads from env var if set, falls back to the compile-time constant.
+    fn idle_timeout(&self) -> std::time::Duration {
+        std::env::var(REPO_IDLE_TIMEOUT_ENV)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| std::time::Duration::from_secs(REPO_IDLE_TIMEOUT_SECS))
+    }
+
+    /// Evict all repos that have been idle longer than the timeout.
+    ///
+    /// Closes DB handles, stops FSW, and releases memory. The repo will be
+    /// automatically re-opened (and re-warmed) on the next query.
+    /// Active reindexes are never evicted.
+    pub(crate) fn evict_idle_repos(&self) {
+        let timeout = self.idle_timeout();
+        let now = std::time::Instant::now();
+
+        // Collect aliases to evict (can't mutate DashMap while iterating)
+        let to_evict: Vec<String> = self.last_access
+            .iter()
+            .filter(|entry| {
+                let alias = entry.key();
+                // Don't evict repos that are being reindexed
+                if self.active_reindexes.contains(alias) {
+                    return false;
+                }
+                now.duration_since(*entry.value()) >= timeout
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        if to_evict.is_empty() {
+            return;
+        }
+
+        for alias in &to_evict {
+            match self.repos.remove(alias) {
+                Some((_, RepoState::Write { cancel_token, .. })) => {
+                    cancel_token.cancel();
+                    self.last_access.remove(alias);
+                    info!("🕐 Evicted idle repo '{}' (FSW stopped, DB closed)", alias);
+                }
+                Some((_, RepoState::Warm { .. } | RepoState::Readonly { .. })) => {
+                    self.last_access.remove(alias);
+                    info!("🕐 Evicted idle repo '{}' (DB closed)", alias);
+                }
+                Some((_, RepoState::Conflicted)) => {
+                    self.last_access.remove(alias);
+                }
+                None => {
+                    self.last_access.remove(alias);
+                }
+            }
+        }
+
+        if !to_evict.is_empty() {
+            info!(
+                "🕐 Idle reaper: evicted {} repo(s), {} still open",
+                to_evict.len(),
+                self.repos.len()
+            );
+        }
+    }
 }
 
 /// Health check handler: GET /health
@@ -1015,6 +1095,27 @@ pub async fn run_serve(
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 info!("🔥 Background warming complete");
+            }
+        });
+    }
+
+    // ── Idle reaper ──
+    // Periodically evicts repos that haven't been queried for REPO_IDLE_TIMEOUT_SECS.
+    // Stops FSW, closes DB handles, releases memory. Re-opens on next query.
+    {
+        let reaper_state = serve_state.clone();
+        let reaper_cancel = cancel_token.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(REAPER_INTERVAL_SECS);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        reaper_state.evict_idle_repos();
+                    }
+                    _ = reaper_cancel.cancelled() => {
+                        break;
+                    }
+                }
             }
         });
     }
