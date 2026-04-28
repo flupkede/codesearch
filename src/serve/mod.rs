@@ -40,6 +40,9 @@ pub(crate) enum RepoState {
         index_manager: Option<Arc<IndexManager>>,
         cancel_token: CancellationToken,
     },
+    /// Opened and vector-index built, but NO file system watcher running.
+    /// Transitions to `Write` on first actual query (lazy FSW start).
+    Warm { stores: Arc<SharedStores> },
     /// Another process holds the write lock. Read-only access, no live updates.
     Readonly { stores: Arc<SharedStores> },
     /// Both write and readonly open failed.
@@ -50,6 +53,7 @@ impl std::fmt::Debug for RepoState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RepoState::Write { .. } => f.debug_struct("RepoState::Write").finish(),
+            RepoState::Warm { .. } => f.debug_struct("RepoState::Warm").finish(),
             RepoState::Readonly { .. } => f.debug_struct("RepoState::Readonly").finish(),
             RepoState::Conflicted => f.debug_struct("RepoState::Conflicted").finish(),
         }
@@ -148,8 +152,8 @@ impl ServeState {
         for alias in &removed {
             if let Some((_, RepoState::Write { cancel_token, .. })) = self.repos.remove(alias) {
                 cancel_token.cancel();
-                // Readonly and Conflicted just drop
             }
+            // Warm, Readonly, Conflicted just drop
         }
 
         // Swap in the new config and mtime.
@@ -169,7 +173,7 @@ impl ServeState {
 
     /// Stop the file system watcher for a repo by cancelling its token.
     ///
-    /// Returns the stores Arc if the repo was open in write mode (so the caller
+    /// Returns the stores Arc if the repo was open in write or warm mode (so the caller
     /// can still use it for reindexing), or None if the repo wasn't found.
     fn stop_fsw(&self, alias: &str) -> Option<Arc<SharedStores>> {
         if let Some(mut entry) = self.repos.get_mut(alias) {
@@ -177,6 +181,9 @@ impl ServeState {
                 RepoState::Write { cancel_token, stores, .. } => {
                     cancel_token.cancel();
                     tracing::info!("Stopped FSW for '{}'", alias);
+                    return Some(stores.clone());
+                }
+                RepoState::Warm { stores } => {
                     return Some(stores.clone());
                 }
                 RepoState::Readonly { stores } => {
@@ -263,6 +270,122 @@ impl ServeState {
         }
     }
 
+    /// Warm up a repo by opening its DB, building the vector index, and performing
+    /// an incremental refresh — but WITHOUT starting the file system watcher.
+    ///
+    /// This is used during background pre-warming so the server accepts connections
+    /// immediately while repos become search-ready one-by-one. When a repo in `Warm`
+    /// state is first queried, `get_or_open_stores()` will transition it to `Write`
+    /// and start the FSW lazily.
+    pub(crate) async fn warmup_repo(&self, alias: &str) -> std::result::Result<(), String> {
+        let _ = self.reload_if_changed();
+
+        // Fast path: already opened in any state
+        if let Some(entry) = self.repos.get(alias) {
+            match entry.value() {
+                RepoState::Write { .. } | RepoState::Warm { .. } | RepoState::Readonly { .. } => {
+                    return Ok(());
+                }
+                RepoState::Conflicted => return Err(Self::conflicted_msg(alias)),
+            }
+        }
+
+        let path = {
+            let config = self.config.read().map_err(|e| format!("Mutex poisoned: {}", e))?;
+            config.resolve(alias)
+                .ok_or_else(|| format!("Unknown alias '{}'", alias))?
+        };
+
+        let db_path = path.join(DB_DIR_NAME);
+
+        // Database existence precheck — don't cache missing DB as Conflicted
+        if !db_path.exists() {
+            return Err(format!(
+                "Database not found at {}. This usually means the repo was removed externally. \
+                 Run `codesearch index add {}` to recreate, or `codesearch index rm {}` to clean up the config entry.",
+                db_path.display(), path.display(), path.display()
+            ));
+        }
+
+        // Read dimensions from metadata
+        let dims = self.get_dimensions_for_path(&db_path);
+
+        // Try write-mode first, then readonly
+        let stores = match SharedStores::new(&db_path, dims) {
+            Ok(s) => {
+                info!("Warmup '{}': opened in write mode", alias);
+                s
+            }
+            Err(_) => {
+                match SharedStores::new_readonly(&db_path, dims) {
+                    Ok(s) => {
+                        info!("Warmup '{}': opened in readonly mode", alias);
+                        let stores_arc = Arc::new(s);
+                        self.repos.insert(
+                            alias.to_string(),
+                            RepoState::Readonly {
+                                stores: stores_arc.clone(),
+                            },
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("Warmup '{}': failed to open: {}", alias, e);
+                        self.repos
+                            .insert(alias.to_string(), RepoState::Conflicted);
+                        return Err(Self::conflicted_msg(alias));
+                    }
+                }
+            }
+        };
+
+        // Build vector index from existing data
+        {
+            let mut vstore = stores.vector_store.write().await;
+            match vstore.stats() {
+                Ok(s) if s.total_chunks > 0 && !s.indexed => {
+                    info!(
+                        "Warmup '{}': building vector index ({} existing chunks)",
+                        alias, s.total_chunks
+                    );
+                    if let Err(e) = vstore.build_index() {
+                        warn!("Warmup '{}': failed to build vector index: {}", alias, e);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!("Warmup '{}': could not read stats: {}", alias, e),
+            }
+        }
+
+        let stores_arc = Arc::new(stores);
+
+        // Perform incremental refresh in the background (don't block warmup of next repo)
+        let bg_alias = alias.to_string();
+        let bg_path = path.clone();
+        let bg_db_path = db_path.clone();
+        let bg_stores = stores_arc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
+                &bg_path,
+                &bg_db_path,
+                &bg_stores,
+            )
+            .await
+            {
+                tracing::warn!("Warmup '{}': incremental refresh failed: {}", bg_alias, e);
+            }
+        });
+
+        // Store as Warm — FSW will be started lazily on first query
+        self.repos.insert(
+            alias.to_string(),
+            RepoState::Warm {
+                stores: stores_arc,
+            },
+        );
+        Ok(())
+    }
+
     /// Try to open a repo by alias. Returns a clone of the Arc<SharedStores>
     /// if successful, or an error string if conflicted/unknown.
     pub(crate) async fn get_or_open_stores(
@@ -276,6 +399,39 @@ impl ServeState {
             return match entry.value() {
                 RepoState::Write { stores, .. } | RepoState::Readonly { stores } => {
                     Ok(stores.clone())
+                }
+                RepoState::Warm { stores } => {
+                    // Lazy FSW start: transition Warm → Write on first actual query
+                    let stores = stores.clone();
+                    drop(entry); // release DashMap read guard before mutation
+
+                    // Only one caller should do the transition; use a compare-and-swap pattern.
+                    // Check if someone else already transitioned it.
+                    if let Some(mut mut_entry) = self.repos.get_mut(alias) {
+                        if let RepoState::Write { stores, .. } = mut_entry.value() {
+                            return Ok(stores.clone());
+                        }
+                        if let RepoState::Warm { stores } = mut_entry.value() {
+                            let stores = stores.clone();
+                            let path = {
+                                let config = self.config.read().map_err(|e| format!("Mutex poisoned: {}", e))?;
+                                config.resolve(alias)
+                                    .ok_or_else(|| format!("Unknown alias '{}'", alias))?
+                            };
+
+                            // Start FSW in background for this repo
+                            self.spawn_fsw_for_warm(alias, &path, stores.clone(), &mut mut_entry);
+                            return Ok(stores);
+                        }
+                        // Someone else transitioned it already
+                        if let RepoState::Readonly { stores } = mut_entry.value() {
+                            return Ok(stores.clone());
+                        }
+                        if let RepoState::Conflicted = mut_entry.value() {
+                            return Err(Self::conflicted_msg(alias));
+                        }
+                    }
+                    Ok(stores)
                 }
                 RepoState::Conflicted => Err(Self::conflicted_msg(alias)),
             };
@@ -434,6 +590,72 @@ impl ServeState {
         Ok(stores_arc)
     }
 
+    /// Spawn the file system watcher for a repo that was warmed up without FSW.
+    ///
+    /// Called from `get_or_open_stores()` when a `Warm` repo receives its first
+    /// actual query. Transitions `Warm` → `Write` with a live FSW.
+    fn spawn_fsw_for_warm(
+        &self,
+        alias: &str,
+        project_path: &std::path::Path,
+        stores: Arc<SharedStores>,
+        entry: &mut dashmap::mapref::one::RefMut<String, RepoState>,
+    ) {
+        let alias_bg = alias.to_string();
+        let path_bg = project_path.to_path_buf();
+        let stores_bg = stores.clone();
+
+        let cancel_token = CancellationToken::new();
+        let token_for_task = cancel_token.clone();
+
+        // Fire-and-forget: create IndexManager + start FSW in background.
+        // We don't block the first query — the repo is already searchable from the Warm state.
+        tokio::spawn(async move {
+            if token_for_task.is_cancelled() {
+                return;
+            }
+
+            match IndexManager::new_without_refresh(&path_bg, stores_bg.clone()).await {
+                Ok(im) => {
+                    let im_arc = Arc::new(im);
+                    let im_for_task = im_arc.clone();
+
+                    if token_for_task.is_cancelled() {
+                        return;
+                    }
+
+                    if let Err(e) = im_for_task.start_watching().await {
+                        tracing::warn!("Lazy FSW start for '{}': pre-start failed: {}", alias_bg, e);
+                    }
+
+                    if token_for_task.is_cancelled() {
+                        return;
+                    }
+
+                    if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                        tracing::error!("Lazy FSW for '{}' stopped: {}", alias_bg, e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Lazy FSW for '{}': IndexManager init failed: {} — live updates disabled",
+                        alias_bg, e
+                    );
+                }
+            }
+        });
+
+        // Transition to Write immediately so future requests see this repo as active.
+        // The IndexManager is created inside the spawned task, so we store None here.
+        // The cancel_token is the real token used by that task and can stop FSW via stop_fsw().
+        *entry.value_mut() = RepoState::Write {
+            stores,
+            index_manager: None,
+            cancel_token,
+        };
+        tracing::info!("Lazy FSW started for '{}' (Warm → Write)", alias);
+    }
+
     fn get_dimensions_for_path(&self, db_path: &std::path::Path) -> usize {
         let metadata_path = db_path.join("metadata.json");
         if let Ok(content) = std::fs::read_to_string(&metadata_path) {
@@ -465,6 +687,7 @@ impl ServeState {
         match self.repos.get(alias) {
             Some(entry) => match entry.value() {
                 RepoState::Write { .. } => Some("write"),
+                RepoState::Warm { .. } => Some("warm"),
                 RepoState::Readonly { .. } => Some("readonly"),
                 RepoState::Conflicted => Some("conflicted"),
             },
@@ -731,25 +954,9 @@ pub async fn run_serve(
     );
     info!("📋 Registered repos: {:?}", serve_state.aliases());
 
-    // ── Sequential pre-warming ──
-    // Open all registered repos sequentially before accepting connections.
-    // This avoids burst I/O and LMDB "already opened with different options"
-    // errors when multiple repos are first queried concurrently.
-    {
-        let aliases = serve_state.aliases();
-        if !aliases.is_empty() {
-            info!("🔥 Pre-warming {} repos sequentially...", aliases.len());
-            for alias in &aliases {
-                match serve_state.get_or_open_stores(alias).await {
-                    Ok(_) => info!("  ✅ {} ready", alias),
-                    Err(e) => warn!("  ⚠️  {} failed: {}", alias, e),
-                }
-                // Small delay between repos to avoid I/O burst
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-            info!("🔥 Pre-warming complete");
-        }
-    }
+    // ── Start HTTP server FIRST ──
+    // Accept connections immediately so MCP clients don't time out.
+    // Pre-warming runs in the background below.
 
     // Create the MCP service factory — each session gets a fresh CodesearchService
     // that uses serve_state for repo routing.
@@ -781,6 +988,37 @@ pub async fn run_serve(
         .layer(axum::middleware::from_fn(log_mcp_requests))
         .with_state(serve_state.clone());
 
+    // Bind TCP listener BEFORE spawning background warmup, so we know the port is live.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    info!("✅ codesearch serve ready at http://{}", addr);
+    info!("   Health: http://{}{}", addr, HEALTH_PATH);
+    info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
+
+    // ── Background pre-warming (NO FSW) ──
+    // Open all registered repos sequentially: opens DB, builds vector index,
+    // starts incremental refresh — but does NOT start file system watchers.
+    // FSW is started lazily on first query via get_or_open_stores().
+    // This saves memory and overhead for repos that are never queried.
+    {
+        let warmup_state = serve_state.clone();
+        tokio::spawn(async move {
+            let aliases = warmup_state.aliases();
+            if !aliases.is_empty() {
+                info!("🔥 Background warming {} repos (no FSW)...", aliases.len());
+                for alias in &aliases {
+                    match warmup_state.warmup_repo(alias).await {
+                        Ok(()) => info!("  ✅ {} warmed (no FSW)", alias),
+                        Err(e) => warn!("  ⚠️  {} warmup failed: {}", alias, e),
+                    }
+                    // Small delay between repos to avoid I/O burst
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                info!("🔥 Background warming complete");
+            }
+        });
+    }
+
     // Graceful shutdown
     //
     // axum::serve::with_graceful_shutdown stops accepting new connections when the
@@ -792,18 +1030,11 @@ pub async fn run_serve(
     // 3 seconds after the cancel_token is cancelled. This gives in-flight HTTP
     // requests time to complete while preventing a permanent hang on open sessions.
     let cancel_for_deadline = cancel_token.clone();
-    let server = axum::serve(
-        tokio::net::TcpListener::bind(addr).await?,
-        app,
-    )
-    .with_graceful_shutdown(async move {
-        cancel_token.cancelled().await;
-        info!("🛑 codesearch serve shutting down...");
-    });
-
-    info!("✅ codesearch serve ready at http://{}", addr);
-    info!("   Health: http://{}{}", addr, HEALTH_PATH);
-    info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            cancel_token.cancelled().await;
+            info!("🛑 codesearch serve shutting down...");
+        });
 
     tokio::select! {
         result = server => {
