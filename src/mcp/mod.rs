@@ -6290,7 +6290,8 @@ async fn connect_to_serve(
         use rmcp::transport::streamable_http_client::{
             StreamableHttpClientTransportConfig, StreamableHttpClientWorker,
         };
-        let config = StreamableHttpClientTransportConfig::with_uri(mcp_url);
+        let config = StreamableHttpClientTransportConfig::with_uri(mcp_url)
+            .reinit_on_expired_session(true);
         StreamableHttpClientWorker::new(reqwest::Client::new(), config)
     };
 
