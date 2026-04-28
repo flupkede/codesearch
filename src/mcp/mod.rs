@@ -2835,6 +2835,13 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
 
         let parsed = if let Some(rest) = trimmed.strip_prefix("use ") {
             Some(("use".to_string(), rest.trim().trim_end_matches(';').to_string()))
+        } else if let Some(rest) = trimmed.strip_prefix("using ") {
+            // C# using directive — skip `using (...)` statements and `using var` declarations
+            if rest.starts_with('(') || rest.starts_with("var ") {
+                None
+            } else {
+                Some(("using".to_string(), rest.trim().trim_end_matches(';').to_string()))
+            }
         } else if let Some(rest) = trimmed.strip_prefix("import ") {
             Some(("import".to_string(), rest.trim().trim_end_matches(';').to_string()))
         } else if let Some(rest) = trimmed.strip_prefix("from ") {
@@ -4811,7 +4818,7 @@ impl CodesearchService {
 
             if let Some(ref sv) = ctx.stores_vec {
                 // Multi-store FTS fallback
-                for keyword in &["import", "use", "from", "require", "include"] {
+                for keyword in &["import", "use", "using", "from", "require", "include"] {
                     let hits = self
                         .with_fts_store_read_multi(
                             |fts_store| {
@@ -4845,7 +4852,7 @@ impl CodesearchService {
                 items = resolved;
             } else {
                 // Single-store FTS fallback
-                for keyword in &["import", "use", "from", "require", "include"] {
+                for keyword in &["import", "use", "using", "from", "require", "include"] {
                     let hits = self
                         .with_fts_store_read_for(
                             |fts_store| {

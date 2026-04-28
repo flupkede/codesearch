@@ -452,6 +452,7 @@ impl<'a> GapTracker<'a> {
                 line.starts_with("import ")
                     || line.starts_with("from ")
                     || line.starts_with("use ")
+                    || line.starts_with("using ")
                     || line.starts_with("#include")
             })
             .count();
