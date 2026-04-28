@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::response::Json as AxumJson;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rmcp::transport::{
     StreamableHttpServerConfig, StreamableHttpService,
     streamable_http_server::session::local::LocalSessionManager,
@@ -66,6 +66,8 @@ pub(crate) struct ServeState {
     config_mtime: std::sync::RwLock<Option<std::time::SystemTime>>,
     /// Optional override for the repos config path (used in tests to avoid env vars).
     config_path_override: Option<PathBuf>,
+    /// Aliases currently being reindexed — prevents concurrent force reindex on the same repo.
+    active_reindexes: DashSet<String>,
     /// Test-only counter for reload invocations that actually swapped config.
     #[cfg(test)]
     reload_count: std::sync::atomic::AtomicUsize,
@@ -88,6 +90,7 @@ impl ServeState {
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
+            active_reindexes: DashSet::new(),
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -168,11 +171,8 @@ impl ServeState {
     ///
     /// Fires the cancel token (stops FSW/git-HEAD watcher) and drops the
     /// RepoState, which releases the LMDB write lock and closes all file handles.
-    /// Close a repo and release its LMDB file handles.
-    ///
-    /// Removes the repo from the live map, dropping SharedStores and stopping
-    /// the file watcher. On Windows this is required before deleting the DB
-    /// directory. Not used by force reindex (which clears data in-place instead).
+    /// On Windows this is required before deleting the DB directory.
+    /// Not used by force reindex (which clears data in-place instead).
     #[allow(dead_code)]
     fn close_repo(&self, alias: &str) {
         if let Some((_, state)) = self.repos.remove(alias) {
@@ -471,6 +471,21 @@ async fn reindex_handler(
     let db_path = project_path.join(DB_DIR_NAME);
     let alias_bg = alias.clone();
 
+    // Concurrent reindex guard — reject if this alias is already being reindexed
+    if !state.active_reindexes.insert(alias_bg.clone()) {
+        return (
+            StatusCode::CONFLICT,
+            axum::response::Json(json!({
+                "error": format!("Reindex already in progress for '{}'", alias),
+                "status": "conflict"
+            })),
+        );
+    }
+
+    // Ensure the guard is removed when we return early or the background task finishes.
+    let guard_alias = alias_bg.clone();
+    let guard_state = state.clone();
+
     if force {
         // Force rebuild: clear data in-place → full reindex.
         // No files are deleted, so no OS error 32 on Windows.
@@ -479,6 +494,7 @@ async fn reindex_handler(
         let stores = match state.get_or_open_stores(&alias).await {
             Ok(s) => s,
             Err(e) => {
+                state.active_reindexes.remove(&guard_alias);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::response::Json(json!({
@@ -489,6 +505,8 @@ async fn reindex_handler(
             }
         };
 
+        let g_alias = guard_alias.clone();
+        let g_state = guard_state.clone();
         tokio::spawn(async move {
             tracing::info!("🔄 Force reindex for '{}': clearing stores and reindexing", alias_bg);
 
@@ -506,12 +524,14 @@ async fn reindex_handler(
                     tracing::error!("❌ Force reindex failed for '{}': {}", alias_bg, e);
                 }
             }
+            g_state.active_reindexes.remove(&g_alias);
         });
     } else {
         // Incremental refresh: ensure the repo is opened, then refresh
         let stores = match state.get_or_open_stores(&alias).await {
             Ok(s) => s,
             Err(e) => {
+                state.active_reindexes.remove(&guard_alias);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::response::Json(json!({
@@ -522,6 +542,8 @@ async fn reindex_handler(
             }
         };
 
+        let g_alias = guard_alias.clone();
+        let g_state = guard_state.clone();
         tokio::spawn(async move {
             tracing::info!("🔄 Incremental reindex triggered for '{}' via HTTP API", alias_bg);
             match IndexManager::perform_incremental_refresh_with_stores(
@@ -538,6 +560,7 @@ async fn reindex_handler(
                     tracing::error!("❌ Reindex failed for '{}': {}", alias_bg, e);
                 }
             }
+            g_state.active_reindexes.remove(&g_alias);
         });
     }
 
@@ -659,7 +682,7 @@ pub async fn run_serve(
     // Build axum router with request logging
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
-            .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
+        .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(log_mcp_requests))
         .with_state(serve_state.clone());
@@ -979,5 +1002,65 @@ mod tests {
         // Should not panic; old config still usable
         let aliases = state.aliases();
         assert!(aliases.contains(&"a".to_string()));
+    }
+
+    /// Verify that concurrent reindex requests for the same alias return 409 Conflict.
+    #[tokio::test]
+    async fn concurrent_reindex_returns_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("myrepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config.register_with_alias(repo_path.clone(), Some("testalias".to_string())).unwrap();
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+
+        let state = Arc::new(ServeState::new(config, Some(config_file)));
+
+        let app = axum::Router::new()
+            .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // First request: 202 Accepted (or 500 if DB missing) — but NOT 409
+        let resp1 = client
+            .post(format!("http://{}/repos/testalias/reindex", addr))
+            .send()
+            .await
+            .unwrap();
+        let status1 = resp1.status();
+        assert!(
+            status1 == reqwest::StatusCode::ACCEPTED || status1 == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "first request should be 202 or 500, got {}", status1
+        );
+
+        // If the first request was accepted (202), the reindex is running in background.
+        // Send a second request immediately — should get 409 Conflict.
+        if status1 == reqwest::StatusCode::ACCEPTED {
+            let resp2 = client
+                .post(format!("http://{}/repos/testalias/reindex", addr))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp2.status(),
+                reqwest::StatusCode::CONFLICT,
+                "second concurrent request should be 409 Conflict"
+            );
+            let body: serde_json::Value = resp2.json().await.unwrap();
+            assert_eq!(body["status"], "conflict");
+        }
     }
 }

@@ -2554,6 +2554,10 @@ fn is_import_kind(kind: &str) -> bool {
     matches!(kind, "Import" | "Use" | "Require" | "Include" | "Imports")
 }
 
+/// Common import-keyword literals used by the FTS fallback when no import-kind
+/// chunks are found via vector-store lookup.
+const IMPORT_FTS_KEYWORDS: &[&str] = &["import", "use", "using", "from", "require", "include"];
+
 fn truncate_line_around_match(line: &str, match_start_byte: usize, max_chars: usize) -> String {
     let chars: Vec<char> = line.chars().collect();
     if chars.len() <= max_chars {
@@ -4818,7 +4822,7 @@ impl CodesearchService {
 
             if let Some(ref sv) = ctx.stores_vec {
                 // Multi-store FTS fallback
-                for keyword in &["import", "use", "using", "from", "require", "include"] {
+                for keyword in IMPORT_FTS_KEYWORDS {
                     let hits = self
                         .with_fts_store_read_multi(
                             |fts_store| {
@@ -4852,7 +4856,7 @@ impl CodesearchService {
                 items = resolved;
             } else {
                 // Single-store FTS fallback
-                for keyword in &["import", "use", "using", "from", "require", "include"] {
+                for keyword in IMPORT_FTS_KEYWORDS {
                     let hits = self
                         .with_fts_store_read_for(
                             |fts_store| {
