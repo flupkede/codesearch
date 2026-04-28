@@ -5993,7 +5993,7 @@ fn is_definition_chunk(kind: &str, signature: &Option<String>, symbol: &str) -> 
         "static ",
     ];
 
-    PREFIXES.iter().any(|prefix| {
+    let prefix_match = PREFIXES.iter().any(|prefix| {
         if !sig.starts_with(prefix) {
             return false;
         }
@@ -6005,7 +6005,43 @@ fn is_definition_chunk(kind: &str, signature: &Option<String>, symbol: &str) -> 
 
         let next = rest[symbol.len()..].chars().next();
         matches!(next, None | Some('(' | '<' | ':' | ' ' | '\t'))
-    })
+    });
+
+    if prefix_match {
+        return true;
+    }
+
+    // Fallback for languages with verbose signatures (C#, Java):
+    // signatures include access modifiers and return types before the symbol name,
+    // e.g. "public async Task<string> UploadFileAsync(...)" or "protected override void Update(...)".
+    // Search for the symbol as a whole word anywhere in the signature.
+    contains_symbol_as_word(sig, symbol)
+}
+
+/// Check whether `symbol` appears as a whole word in `sig`.
+/// A word boundary requires the character before to be a space/tab (or start-of-string)
+/// and the character after to be `(`, `<`, `:`, space, tab, or end-of-string.
+/// This is intentionally conservative to avoid matching parameter type names.
+fn contains_symbol_as_word(sig: &str, symbol: &str) -> bool {
+    let sig_bytes = sig.as_bytes();
+    let sym_len = symbol.len();
+    let mut start = 0usize;
+    while start + sym_len <= sig.len() {
+        if let Some(rel) = sig[start..].find(symbol) {
+            let abs = start + rel;
+            let before_ok = abs == 0
+                || matches!(sig_bytes.get(abs - 1), Some(&b' ') | Some(&b'\t') | Some(&b'\n'));
+            let after_char = sig[abs + sym_len..].chars().next();
+            let after_ok = matches!(after_char, None | Some('(' | '<' | ':' | ' ' | '\t'));
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + 1;
+        } else {
+            break;
+        }
+    }
+    false
 }
 
 #[tool_handler]
