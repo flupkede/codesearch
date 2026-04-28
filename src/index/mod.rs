@@ -438,9 +438,10 @@ pub async fn index(
 pub async fn index_quiet(
     path: Option<PathBuf>,
     force: bool,
+    global: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    index_with_options(path, false, force, false, None, true, cancel_token).await
+    index_with_options(path, false, force, global, None, true, cancel_token).await
 }
 
 /// Internal index function with all options
@@ -1170,6 +1171,21 @@ pub async fn add_to_index(
     println!("{}", "=".repeat(60));
     println!("📂 Project: {}", canonical_path.display());
 
+    // Try delegating to a running serve instance first.
+    // Serve handles: register in repos.json + create index + warmup.
+    match try_delegate_add_to_serve(&path, &alias, global).await {
+        Ok((assigned_alias, _)) => {
+            println!("\n{}", "✅ Delegated to running serve instance.".green());
+            println!("   Registered as '{}'.", assigned_alias);
+            println!("   Index creation running in background on the server.");
+            return Ok(());
+        }
+        Err(reason) => {
+            // Serve not running or delegation failed — fall through to local operation.
+            tracing::debug!("add_to_index: delegation skipped ({})", reason);
+        }
+    }
+
     // Check if ANY index exists (current directory OR parent directories OR global)
     let db_info = find_best_database(path.as_deref())?;
 
@@ -1326,12 +1342,29 @@ pub async fn remove_from_index(
     path: Option<PathBuf>,
     keep_config: bool,
 ) -> Result<()> {
-    let project_path = path.unwrap_or_else(|| PathBuf::from("."));
+    let project_path = path.clone().unwrap_or_else(|| PathBuf::from("."));
     let canonical_path = project_path.canonicalize()?;
 
     println!("{}", "➖ Remove Index".bright_red().bold());
     println!("{}", "=".repeat(60));
     println!("📂 Project: {}", canonical_path.display());
+
+    // Try delegating to a running serve instance first (unless --keep-config,
+    // which the serve endpoint doesn't support — serve always unregisters).
+    if !keep_config {
+        match try_delegate_rm_to_serve(&path).await {
+            Ok((alias, _)) => {
+                println!("\n{}", "✅ Delegated to running serve instance.".green());
+                println!("   Removed alias '{}'.", alias);
+                println!("   FSW stopped, repo evicted from memory, DB deleted.");
+                return Ok(());
+            }
+            Err(reason) => {
+                // Serve not running or delegation failed — fall through to local operation.
+                tracing::debug!("remove_from_index: delegation skipped ({})", reason);
+            }
+        }
+    }
 
     // Check what exists
     let local_db = canonical_path.join(".codesearch.db");
@@ -1571,5 +1604,154 @@ async fn try_delegate_reindex_to_serve(
         let status = reindex_resp.status();
         let body = reindex_resp.text().await.unwrap_or_default();
         Err(format!("serve returned {} for alias '{}': {}", status, alias, body))
+    }
+}
+
+/// Try to delegate `index add` to a running serve instance.
+///
+/// Returns `Ok((alias, project_path))` if the serve accepted the add request.
+/// Returns `Err(reason)` with a human-readable reason if delegation failed
+/// (e.g. serve not running, conflict).
+pub(crate) async fn try_delegate_add_to_serve(
+    path: &Option<PathBuf>,
+    alias: &Option<String>,
+    global: bool,
+) -> std::result::Result<(String, PathBuf), String> {
+    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+
+    let port: u16 = std::env::var(SERVE_PORT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SERVE_PORT);
+
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    // 1. Health check
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+
+    let health_resp = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
+
+    if !health_resp.status().is_success() {
+        return Err(format!("serve health check returned {}", health_resp.status()));
+    }
+
+    // 2. Resolve path
+    let raw_project_path = path
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let project_path = raw_project_path
+        .canonicalize()
+        .unwrap_or_else(|_| raw_project_path.clone());
+
+    // 3. Build request body
+    let mut body = serde_json::json!({
+        "path": project_path,
+        "global": global,
+    });
+    if let Some(a) = alias {
+        body["alias"] = serde_json::Value::String(a.clone());
+    }
+
+    // 4. POST /repos
+    let add_resp = client
+        .post(format!("{}/repos", base_url))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("add POST failed: {}", e))?;
+
+    if add_resp.status().is_success() {
+        let resp_body: serde_json::Value = add_resp.json().await.unwrap_or_default();
+        let assigned_alias = resp_body["alias"]
+            .as_str()
+            .unwrap_or_else(|| project_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown"))
+            .to_string();
+        Ok((assigned_alias, project_path))
+    } else {
+        let status = add_resp.status();
+        let text = add_resp.text().await.unwrap_or_default();
+        Err(format!("serve returned {}: {}", status, text))
+    }
+}
+
+/// Try to delegate `index rm` to a running serve instance.
+///
+/// Returns `Ok((alias, project_path))` if the serve accepted the remove request.
+/// Returns `Err(reason)` with a human-readable reason if delegation failed.
+pub(crate) async fn try_delegate_rm_to_serve(
+    path: &Option<PathBuf>,
+) -> std::result::Result<(String, PathBuf), String> {
+    use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
+
+    let port: u16 = std::env::var(SERVE_PORT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SERVE_PORT);
+
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    // 1. Health check
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
+
+    let health_resp = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
+
+    if !health_resp.status().is_success() {
+        return Err(format!("serve health check returned {}", health_resp.status()));
+    }
+
+    // 2. Resolve the project path to an alias
+    let raw_project_path = path
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let project_path = raw_project_path
+        .canonicalize()
+        .unwrap_or_else(|_| raw_project_path.clone());
+
+    fn normalize_for_cmp(p: &std::path::Path) -> String {
+        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        crate::cache::normalize_path(&canonical).to_lowercase()
+    }
+
+    let project_norm = normalize_for_cmp(&project_path);
+    let config = crate::db_discovery::repos::ReposConfig::load()
+        .map_err(|e| format!("cannot load repos.json: {}", e))?;
+
+    let alias = config
+        .repos
+        .iter()
+        .find(|(_, p)| normalize_for_cmp(p) == project_norm)
+        .map(|(a, _)| a.clone())
+        .ok_or_else(|| format!("path '{}' not found in repos.json", project_path.display()))?;
+
+    // 3. DELETE /repos/:alias
+    let delete_resp = client
+        .delete(format!("{}/repos/{}", base_url, alias))
+        .send()
+        .await
+        .map_err(|e| format!("delete failed: {}", e))?;
+
+    if delete_resp.status().is_success() {
+        Ok((alias, project_path))
+    } else {
+        let status = delete_resp.status();
+        let text = delete_resp.text().await.unwrap_or_default();
+        Err(format!("serve returned {} for alias '{}': {}", status, alias, text))
     }
 }

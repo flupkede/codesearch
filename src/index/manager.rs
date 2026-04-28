@@ -1247,7 +1247,7 @@ impl IndexManager {
 
         // Call the quiet index function from the parent module (no CLI output)
         // For incremental refresh, we use force=false which enables incremental mode
-        super::index_quiet(Some(path.to_path_buf()), false, CancellationToken::new()).await?;
+        super::index_quiet(Some(path.to_path_buf()), false, false, CancellationToken::new()).await?;
 
         let elapsed = start.elapsed();
         info!(

@@ -2,6 +2,9 @@
 //!
 //! Binds on `127.0.0.1:{port}` and serves:
 //! - `GET /health` → JSON health check
+//! - `POST /repos` → register + index + warmup a new repo
+//! - `DELETE /repos/:alias` → stop FSW + evict + unregister + delete DB
+//! - `POST /repos/:alias/reindex` → trigger incremental or force reindex
 //! - MCP streamable HTTP at `/mcp` via rmcp tower service
 //!
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
@@ -971,6 +974,244 @@ async fn reindex_handler(
     )
 }
 
+/// Request body for POST /repos
+#[derive(serde::Deserialize)]
+struct AddRepoRequest {
+    /// Absolute or relative path to the project directory (required).
+    path: PathBuf,
+    /// Optional alias to register under. If omitted, the directory name is used.
+    alias: Option<String>,
+    /// Create a global index instead of local.
+    #[serde(default)]
+    global: bool,
+}
+
+/// Add-repo handler: POST /repos
+///
+/// Registers a new repo in repos.json, creates the index, and warms it up.
+/// Returns 201 on success.
+async fn add_repo_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+    axum::extract::Json(body): axum::extract::Json<AddRepoRequest>,
+) -> (axum::http::StatusCode, axum::response::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+
+    // Canonicalize the path
+    let canonical_path = match body.path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::response::Json(json!({
+                    "error": format!("Cannot canonicalize path '{}': {}", body.path.display(), e),
+                    "status": "error"
+                })),
+            );
+        }
+    };
+
+    // Register in repos.json
+    let alias = {
+        let mut config = match state.config.write() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::response::Json(json!({
+                        "error": format!("Config lock poisoned: {}", e),
+                        "status": "error"
+                    })),
+                );
+            }
+        };
+
+        // Check if already registered
+        if let Some(existing_alias) = config.alias_for_path(&canonical_path) {
+            return (
+                StatusCode::CONFLICT,
+                axum::response::Json(json!({
+                    "error": format!("Path already registered as '{}'", existing_alias),
+                    "status": "conflict",
+                    "alias": existing_alias,
+                })),
+            );
+        }
+
+        let alias = match config.register_with_alias(canonical_path.clone(), body.alias.clone()) {
+            Ok(a) => a,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::response::Json(json!({
+                        "error": format!("Registration failed: {}", e),
+                        "status": "error"
+                    })),
+                );
+            }
+        };
+
+        if let Err(e) = config.save() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::response::Json(json!({
+                    "error": format!("Failed to save repos config: {}", e),
+                    "status": "error"
+                })),
+            );
+        }
+
+        alias
+    };
+
+    // Create the index using index_quiet
+    let cancel_token = CancellationToken::new();
+    let index_path = canonical_path.clone();
+    let alias_bg = alias.clone();
+    let state_bg = state.clone();
+
+    match crate::index::index_quiet(
+        Some(index_path.clone()),
+        false,
+        body.global,
+        cancel_token,
+    )
+    .await
+    {
+        Ok(()) => {
+            tracing::info!("Index created for '{}' ({})", alias, index_path.display());
+        }
+        Err(e) => {
+            // Index failed — remove the config entry we just added
+            tracing::error!("Index creation failed for '{}': {}", alias, e);
+            {
+                if let Ok(mut config) = state.config.write() {
+                    config.unregister_alias(&alias);
+                    let _ = config.save();
+                }
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::response::Json(json!({
+                    "error": format!("Index creation failed: {}", e),
+                    "status": "error"
+                })),
+            );
+        }
+    }
+
+    // Warmup the repo (opens DB, builds vector index, stores as Warm)
+    tokio::spawn(async move {
+        if let Err(e) = state_bg.warmup_repo(&alias_bg).await {
+            tracing::warn!("Warmup failed for newly added repo '{}': {}", alias_bg, e);
+        }
+    });
+
+    (
+        StatusCode::CREATED,
+        axum::response::Json(json!({
+            "status": "created",
+            "alias": alias,
+            "path": canonical_path,
+            "message": "Repo registered, indexed, and warming up"
+        })),
+    )
+}
+
+/// Remove-repo handler: DELETE /repos/:alias
+///
+/// Stops the FSW, evicts the repo from memory, unregisters from repos.json,
+/// and deletes the database directory. Returns 200 on success.
+async fn remove_repo_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> (axum::http::StatusCode, axum::response::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+
+    // 1. Resolve project path from config
+    let project_path = {
+        let config = match state.config.read() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::response::Json(json!({
+                        "error": format!("Config lock poisoned: {}", e),
+                        "status": "error"
+                    })),
+                );
+            }
+        };
+        match config.resolve(&alias) {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::response::Json(json!({
+                        "error": format!("Unknown alias '{}'", alias),
+                        "status": "not_found"
+                    })),
+                );
+            }
+        }
+    };
+
+    let db_path = project_path.join(DB_DIR_NAME);
+
+    // 2. Stop FSW and evict from memory
+    let _ = state.stop_fsw(&alias);
+    state.repos.remove(&alias);
+    state.last_access.remove(&alias);
+    tracing::info!("Evicted repo '{}' from memory", alias);
+
+    // 3. Unregister from repos.json
+    {
+        let mut config = match state.config.write() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::response::Json(json!({
+                        "error": format!("Config lock poisoned: {}", e),
+                        "status": "error"
+                    })),
+                );
+            }
+        };
+        config.unregister_alias(&alias);
+        if let Err(e) = config.save() {
+            tracing::warn!("Failed to save repos config after removing '{}': {}", alias, e);
+        }
+    }
+
+    // 4. Delete the database directory
+    if db_path.exists() {
+        match std::fs::remove_dir_all(&db_path) {
+            Ok(()) => {
+                tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to delete database for '{}' (may be locked): {}",
+                    alias,
+                    e
+                );
+                // Don't fail the request — the repo is already unregistered and evicted.
+                // The DB files might be locked; they'll be cleaned up on next start.
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        axum::response::Json(json!({
+            "status": "removed",
+            "alias": alias,
+            "path": project_path,
+            "message": "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+        })),
+    )
+}
+
 /// Axum middleware: log MCP requests (method + path, skips /health spam).
 async fn log_mcp_requests(
     req: axum::extract::Request,
@@ -1063,6 +1304,8 @@ pub async fn run_serve(
     // Build axum router with request logging
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
+        .route("/repos", axum::routing::post(add_repo_handler))
+        .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
         .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(log_mcp_requests))
