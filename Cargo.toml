@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.0.32"
+version = "1.0.34"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
