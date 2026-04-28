@@ -3134,10 +3134,12 @@ impl CodesearchService {
     ///
     /// Encapsulates the common pattern: resolve multi-stores, extract single override
     /// vs multi-store vec, and determine if local DB check is needed.
+    /// Also records the tool call for dashboard tracking when serve_state is active.
     async fn resolve_routing(
         &self,
         project: &Option<String>,
         group: &Option<String>,
+        tool_name: &str,
     ) -> std::result::Result<MultiStoreContext, String> {
         let resolved = self.resolve_repo_stores_multi(project, group).await?;
         let is_multi = resolved.as_ref().is_some_and(|(stores, _)| stores.len() > 1);
@@ -3176,6 +3178,19 @@ impl CodesearchService {
         }
 
         let needs_local_db = stores.is_none() && !is_multi;
+
+        // Record tool call for serve dashboard tracking
+        if let Some(ref serve_state) = self.serve_state {
+            if let Some(ref aliases) = store_aliases {
+                for alias in aliases {
+                    serve_state.record_tool_call(alias, tool_name);
+                }
+            }
+            if let Some(ref alias) = project_alias {
+                serve_state.record_tool_call(alias, tool_name);
+            }
+        }
+
         Ok(MultiStoreContext {
             stores,
             stores_vec,
@@ -3558,7 +3573,7 @@ impl CodesearchService {
         Parameters(request): Parameters<SemanticSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing (multi-store for group fan-out)
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, "semantic_search").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4220,7 +4235,7 @@ impl CodesearchService {
         );
 
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, "find_definition").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4378,7 +4393,7 @@ impl CodesearchService {
         tracing::debug!("MCP find_usages: symbol='{}', limit={}", symbol, limit);
 
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&project, &group).await {
+        let ctx = match self.resolve_routing(&project, &group, "find_usages").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4506,7 +4521,7 @@ impl CodesearchService {
         Parameters(request): Parameters<FileOutlineRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, "explore").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4621,7 +4636,7 @@ impl CodesearchService {
             request.project,
         );
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, "get_chunk").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4733,7 +4748,7 @@ impl CodesearchService {
         Parameters(request): Parameters<FindImportsRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, "find_imports").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4909,7 +4924,7 @@ impl CodesearchService {
         Parameters(request): Parameters<FindDependentsRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, "find_dependents").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5151,7 +5166,7 @@ impl CodesearchService {
         Parameters(request): Parameters<SimilarChunksRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, "similar_chunks").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5281,7 +5296,7 @@ impl CodesearchService {
         Parameters(request): Parameters<LiteralSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, "literal_search").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5676,8 +5691,54 @@ impl CodesearchService {
 
     /// Internal implementation for index_status with optional project/group routing.
     async fn index_status_impl(&self, project: Option<String>, group: Option<String>) -> Result<CallToolResult, McpError> {
-        // Resolve project/group routing
-        let ctx = match self.resolve_routing(&project, &group).await {
+        // When no project/group specified in serve mode, return lightweight aggregated
+        // status WITHOUT opening any databases. Only a specific project/group request
+        // should trigger DB activation.
+        if project.is_none() && group.is_none() {
+            if let Some(ref serve_state) = self.serve_state {
+                let config = serve_state.config_snapshot();
+                let repo_count = config.repos.len();
+                let group_count = config.groups.len();
+                let statuses = serve_state.repo_statuses_lightweight();
+                let open_count = statuses.iter().filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Open)).count();
+                let warm_count = statuses.iter().filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Warm)).count();
+                let closed_count = statuses.iter().filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Closed)).count();
+
+                let status = if open_count + warm_count > 0 {
+                    "ready".to_string()
+                } else if repo_count > 0 {
+                    "idle".to_string()
+                } else {
+                    "no_repos".to_string()
+                };
+
+                let status_message = format!(
+                    "{} repo(s) registered, {} group(s). Open: {}, Warm: {}, Closed: {}.",
+                    repo_count, group_count, open_count, warm_count, closed_count
+                );
+
+                let response = IndexStatusResponse {
+                    indexed: open_count + warm_count > 0,
+                    status,
+                    status_message,
+                    total_chunks: 0, // Not available without opening DBs
+                    total_files: 0,
+                    model: self.model_type.short_name().to_string(),
+                    dimensions: 0,
+                    max_chunk_id: 0,
+                    db_path: format!("({} repos)", repo_count),
+                    project_path: format!("serve mode — {} repo(s)", repo_count),
+                    error_message: None,
+                    mode: self.mcp_mode(),
+                };
+
+                let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+        }
+
+        // Resolve project/group routing (only for specific project/group)
+        let ctx = match self.resolve_routing(&project, &group, "status").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5844,28 +5905,24 @@ impl CodesearchService {
                 let db_path = path.join(crate::constants::DB_DIR_NAME);
 
                 let (total_chunks, total_files, model, lock_status) = if db_path.exists() {
-                    let (model_name, dims) = read_model_metadata(&db_path);
+                    let (model_name, _dims) = read_model_metadata(&db_path);
 
-                    // Use DashMap state for opened repos, disk check for unopened
-                    let lock_status = match serve_state.repo_lock_status(alias) {
-                        Some(s) => s.to_string(),
-                        None => {
-                            // Not yet opened in DashMap — fall back to disk check
-                            if crate::index::is_database_locked(&db_path) {
-                                "locked-externally".to_string()
-                            } else {
-                                "available".to_string()
-                            }
-                        }
-                    };
-
-                    if let Ok(store) = VectorStore::new(&db_path, dims) {
-                        if let Ok(stats) = store.stats() {
-                            (stats.total_chunks, stats.total_files, model_name, lock_status)
-                        } else {
-                            (0, 0, model_name, lock_status)
+                    // For repos already opened in DashMap, use the live SharedStores for stats
+                    // WITHOUT opening a new VectorStore connection.
+                    // For unopened repos, just report metadata — do NOT open the DB.
+                    if let Some(stores) = serve_state.get_opened_stores(alias) {
+                        let vs = stores.vector_store.read().await;
+                        match vs.stats() {
+                            Ok(stats) => (stats.total_chunks, stats.total_files, model_name, serve_state.repo_lock_status(alias).unwrap_or("unknown").to_string()),
+                            Err(_) => (0, 0, model_name, serve_state.repo_lock_status(alias).unwrap_or("unknown").to_string()),
                         }
                     } else {
+                        // Repo NOT opened — use metadata only, no DB open
+                        let lock_status = if crate::index::is_database_locked(&db_path) {
+                            "locked-externally".to_string()
+                        } else {
+                            "available".to_string()
+                        };
                         (0, 0, model_name, lock_status)
                     }
                 } else {

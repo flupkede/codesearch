@@ -13,9 +13,11 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use axum::response::Json as AxumJson;
+use colored::Colorize;
 use dashmap::{DashMap, DashSet};
 use rmcp::transport::{
     StreamableHttpServerConfig, StreamableHttpService,
@@ -32,6 +34,51 @@ use crate::constants::{
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{IndexManager, SharedStores};
 use crate::mcp::types::HealthResponse;
+
+/// Lightweight repo status derived from DashMap state only (no DB opens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepoStateLabel {
+    Open,
+    Warm,
+    Readonly,
+    Closed,
+    Indexing,
+    Error,
+    NoIndex,
+}
+
+impl RepoStateLabel {
+    fn colored(&self) -> colored::ColoredString {
+        match self {
+            Self::Open => "Open".green().bold(),
+            Self::Warm => "Warm".yellow(),
+            Self::Readonly => "Readonly".cyan(),
+            Self::Closed => "Closed".dimmed(),
+            Self::Indexing => "Indexing".magenta().bold(),
+            Self::Error => "Error".red().bold(),
+            Self::NoIndex => "No Index".dimmed(),
+        }
+    }
+}
+
+/// Lightweight status info for a single repo (no DB I/O).
+pub(crate) struct RepoStatusInfo {
+    pub(crate) status: RepoStateLabel,
+    pub(crate) changes: u64,
+    pub(crate) last_tool_call: Option<String>,
+}
+
+/// Format a tool call name and elapsed time into a human-readable string.
+fn format_tool_call_ago(tool_name: &str, elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{} ({}s ago)", tool_name, secs)
+    } else if secs < 3600 {
+        format!("{} ({}m ago)", tool_name, secs / 60)
+    } else {
+        format!("{} ({}h {}m ago)", tool_name, secs / 3600, (secs % 3600) / 60)
+    }
+}
 
 /// Per-repo state managed by the serve instance.
 pub(crate) enum RepoState {
@@ -79,6 +126,14 @@ pub(crate) struct ServeState {
     config_path_override: Option<PathBuf>,
     /// Aliases currently being reindexed — prevents concurrent force reindex on the same repo.
     active_reindexes: DashSet<String>,
+    /// Per-repo change count since serve started (incremented by index/reindex operations).
+    repo_changes: DashMap<String, AtomicU64>,
+    /// Per-repo last tool call: (tool_name, timestamp).
+    last_tool_call: DashMap<String, (String, std::time::Instant)>,
+    /// Currently active MCP sessions.
+    active_sessions: AtomicU64,
+    /// Total MCP sessions since serve started.
+    total_sessions: AtomicU64,
     /// Test-only counter for reload invocations that actually swapped config.
     #[cfg(test)]
     reload_count: std::sync::atomic::AtomicUsize,
@@ -103,6 +158,10 @@ impl ServeState {
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
             active_reindexes: DashSet::new(),
+            repo_changes: DashMap::new(),
+            last_tool_call: DashMap::new(),
+            active_sessions: AtomicU64::new(0),
+            total_sessions: AtomicU64::new(0),
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -705,6 +764,17 @@ impl ServeState {
         }
     }
 
+    /// Get the SharedStores for an already-opened repo (no DB open).
+    /// Returns None if the repo is not opened or is in Conflicted state.
+    pub(crate) fn get_opened_stores(&self, alias: &str) -> Option<Arc<SharedStores>> {
+        self.repos.get(alias).and_then(|entry| match entry.value() {
+            RepoState::Write { stores, .. } => Some(stores.clone()),
+            RepoState::Warm { stores } => Some(stores.clone()),
+            RepoState::Readonly { stores } => Some(stores.clone()),
+            RepoState::Conflicted => None,
+        })
+    }
+
     /// Get the config (for listing all registered repos and groups).
     /// Triggers reload_if_changed first.
     pub(crate) fn config_snapshot(&self) -> ReposConfig {
@@ -731,6 +801,175 @@ impl ServeState {
     /// Called from `get_or_open_stores`, `warmup_repo`, and `reindex_handler`.
     fn touch_access(&self, alias: &str) {
         self.last_access.insert(alias.to_string(), std::time::Instant::now());
+    }
+
+    /// Record a tool call for a specific repo (for dashboard display).
+    pub(crate) fn record_tool_call(&self, alias: &str, tool_name: &str) {
+        self.last_tool_call.insert(alias.to_string(), (tool_name.to_string(), std::time::Instant::now()));
+    }
+
+    /// Record that changes were made to a repo (index/reindex).
+    #[allow(dead_code)]
+    pub(crate) fn record_changes(&self, alias: &str, count: u64) {
+        self.repo_changes
+            .entry(alias.to_string())
+            .and_modify(|c| { c.fetch_add(count, Ordering::Relaxed); })
+            .or_insert_with(|| AtomicU64::new(count));
+    }
+
+    /// Increment active session count. Returns the new session ID.
+    pub(crate) fn session_connected(&self) -> u64 {
+        self.active_sessions.fetch_add(1, Ordering::Relaxed);
+        self.total_sessions.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Decrement active session count.
+    #[allow(dead_code)]
+    pub(crate) fn session_disconnected(&self) {
+        self.active_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Get the current number of active sessions.
+    #[allow(dead_code)]
+    pub(crate) fn active_session_count(&self) -> u64 {
+        self.active_sessions.load(Ordering::Relaxed)
+    }
+
+    /// Get lightweight repo statuses WITHOUT opening any databases.
+    /// Returns a list of (alias, status_info) where status is derived from DashMap state only.
+    pub(crate) fn repo_statuses_lightweight(&self) -> Vec<(String, RepoStatusInfo)> {
+        let config = match self.config.read() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut result = Vec::with_capacity(config.repos.len());
+        for (alias, path) in &config.repos {
+            let db_path = path.join(DB_DIR_NAME);
+            let db_exists = db_path.exists();
+
+            let label = if self.active_reindexes.contains(alias) {
+                RepoStateLabel::Indexing
+            } else {
+                match self.repos.get(alias) {
+                    Some(entry) => match entry.value() {
+                        RepoState::Write { .. } => RepoStateLabel::Open,
+                        RepoState::Warm { .. } => RepoStateLabel::Warm,
+                        RepoState::Readonly { .. } => RepoStateLabel::Readonly,
+                        RepoState::Conflicted => RepoStateLabel::Error,
+                    },
+                    None => {
+                        if !db_exists {
+                            RepoStateLabel::NoIndex
+                        } else {
+                            RepoStateLabel::Closed
+                        }
+                    }
+                }
+            };
+
+            let changes = self.repo_changes.get(alias)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+
+            let last_tool = self.last_tool_call.get(alias)
+                .map(|e| (e.value().0.clone(), e.value().1.elapsed()))
+                .map(|(name, ago)| format_tool_call_ago(&name, ago));
+
+            result.push((alias.clone(), RepoStatusInfo {
+                status: label,
+                changes,
+                last_tool_call: last_tool,
+            }));
+        }
+        result
+    }
+
+    /// Print a formatted dashboard table to stderr.
+    pub(crate) fn print_dashboard(&self) {
+        let repos = self.repo_statuses_lightweight();
+        if repos.is_empty() {
+            return;
+        }
+
+        let active = self.active_sessions.load(Ordering::Relaxed);
+        let total = self.total_sessions.load(Ordering::Relaxed);
+
+        // Column widths (min 10 for status to fit "Readonly")
+        let alias_w = repos.iter().map(|(a, _)| a.len()).max().unwrap_or(5).max(5);
+        let status_w = 10;
+
+        let sep = "─".repeat(alias_w + 2);
+        let sep_s = "─".repeat(status_w + 2);
+        let sep_c = "─".repeat(9);
+        let sep_t = "─".repeat(26);
+
+        let top = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            "╭", sep, "┬", sep_s, "┬", sep_c, "┬", sep_t, "╮"
+        );
+        let mid = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            "╞", sep, "╪", sep_s, "╪", sep_c, "╪", sep_t, "╡"
+        );
+        let bot = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            "╰", sep, "┴", sep_s, "┴", sep_c, "┴", sep_t, "╯"
+        );
+
+        eprintln!();
+        eprintln!("{}", top.bright_black());
+
+        // Header
+        eprintln!("{} {:<w_alias$} {} {:<w_status$} {} {:>7} {} {:<24} {}",
+            "│".bright_black(), "Project".bold(), "│".bright_black(),
+            "Status".bold(), "│".bright_black(),
+            "Changes".bold(), "│".bright_black(),
+            "Last Tool Call".bold(), "│".bright_black(),
+            w_alias = alias_w, w_status = status_w,
+        );
+
+        eprintln!("{}", mid.bright_black());
+
+        // Rows
+        for (alias, info) in &repos {
+            let status_str = info.status.colored().to_string();
+            let tool_str = info.last_tool_call.as_deref().unwrap_or("—");
+            eprintln!("{} {:<w_alias$} {} {:<w_status$} {} {:>7} {} {:<24} {}",
+                "│".bright_black(), alias, "│".bright_black(),
+                status_str, "│".bright_black(),
+                info.changes, "│".bright_black(),
+                tool_str, "│".bright_black(),
+                w_alias = alias_w, w_status = status_w,
+            );
+        }
+
+        eprintln!("{}", bot.bright_black());
+
+        // Overall status
+        let has_error = repos.iter().any(|(_, r)| matches!(r.status, RepoStateLabel::Error));
+        let health = if has_error {
+            "Error".red().bold().to_string()
+        } else {
+            "Healthy".green().bold().to_string()
+        };
+
+        let open_count = repos.iter().filter(|(_, r)| matches!(r.status, RepoStateLabel::Open)).count();
+        let warm_count = repos.iter().filter(|(_, r)| matches!(r.status, RepoStateLabel::Warm)).count();
+        let closed_count = repos.iter().filter(|(_, r)| matches!(r.status, RepoStateLabel::Closed | RepoStateLabel::NoIndex)).count();
+
+        eprintln!();
+        eprintln!("  {} {}   {} {}   {} {}   {} {}",
+            "Status:".dimmed(), health,
+            "Open:".dimmed(), format!("{}", open_count).green(),
+            "Warm:".dimmed(), format!("{}", warm_count).yellow(),
+            "Closed:".dimmed(), format!("{}", closed_count).dimmed(),
+        );
+        eprintln!("  {} {}   {} {}",
+            "Active Sessions:".dimmed(), format!("{}", active).cyan(),
+            "Total Since Start:".dimmed(), format!("{}", total).dimmed(),
+        );
+        eprintln!();
     }
 
     /// Get the configured idle timeout duration.
@@ -1157,8 +1396,12 @@ async fn remove_repo_handler(
 
     let db_path = project_path.join(DB_DIR_NAME);
 
-    // 2. Stop FSW and evict from memory
-    let _ = state.stop_fsw(&alias);
+    // 2. Stop FSW and evict from memory.
+    // Drop the returned stores Arc explicitly so DB handles are released ASAP.
+    {
+        let stores = state.stop_fsw(&alias);
+        drop(stores);
+    }
     state.repos.remove(&alias);
     state.last_access.remove(&alias);
     tracing::info!("Evicted repo '{}' from memory", alias);
@@ -1183,22 +1426,41 @@ async fn remove_repo_handler(
         }
     }
 
-    // 4. Delete the database directory
+    // 4. Delete the database directory.
+    //    Background tasks (incremental refresh) may still hold Arc<SharedStores>
+    //    clones for a brief moment after eviction. Retry with a short delay so
+    //    those tasks finish and release their file handles — critical on Windows
+    //    where open file handles block directory deletion (os error 32).
     if db_path.exists() {
-        match std::fs::remove_dir_all(&db_path) {
-            Ok(()) => {
-                tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
+        let mut deleted = false;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to delete database for '{}' (may be locked): {}",
-                    alias,
-                    e
-                );
-                // Don't fail the request — the repo is already unregistered and evicted.
-                // The DB files might be locked; they'll be cleaned up on next start.
+            match std::fs::remove_dir_all(&db_path) {
+                Ok(()) => {
+                    tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
+                    deleted = true;
+                    break;
+                }
+                Err(e) if attempt < 4 => {
+                    tracing::debug!(
+                        "DB delete attempt {} for '{}' failed (will retry): {}",
+                        attempt + 1,
+                        alias,
+                        e
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to delete database for '{}' after 5 attempts (may be locked): {}",
+                        alias,
+                        e
+                    );
+                }
             }
         }
+        let _ = deleted; // used for logging only
     }
 
     (
@@ -1282,9 +1544,8 @@ pub async fn run_serve(
     // Create the MCP service factory — each session gets a fresh CodesearchService
     // that uses serve_state for repo routing.
     let state_for_factory = serve_state.clone();
-    let session_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let service_factory = move || -> std::result::Result<crate::mcp::CodesearchService, std::io::Error> {
-        let session_id = session_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let session_id = state_for_factory.session_connected();
         info!("🔌 MCP client connected (session #{})", session_id);
         // We create a minimal service; actual repo routing is handled inside
         // the tool handlers via serve_state.
@@ -1292,7 +1553,11 @@ pub async fn run_serve(
             .map_err(std::io::Error::other)
     };
 
-    let session_manager = Arc::new(LocalSessionManager::default());
+    // Build session manager with extended keep_alive (default is 5 min which kills
+    // idle MCP sessions too aggressively). 30 minutes matches our repo idle eviction.
+    let mut session_manager = LocalSessionManager::default();
+    session_manager.session_config.keep_alive = Some(std::time::Duration::from_secs(30 * 60));
+    let session_manager = Arc::new(session_manager);
     let config = StreamableHttpServerConfig::default();
 
     let mcp_service = StreamableHttpService::new(
@@ -1318,6 +1583,9 @@ pub async fn run_serve(
     info!("   Health: http://{}{}", addr, HEALTH_PATH);
     info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
 
+    // Print initial dashboard
+    serve_state.print_dashboard();
+
     // ── Background pre-warming (NO FSW) ──
     // Open all registered repos sequentially: opens DB, builds vector index,
     // starts incremental refresh — but does NOT start file system watchers.
@@ -1338,6 +1606,7 @@ pub async fn run_serve(
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 info!("🔥 Background warming complete");
+                warmup_state.print_dashboard();
             }
         });
     }
@@ -1353,7 +1622,11 @@ pub async fn run_serve(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
+                        let before = reaper_state.repos.len();
                         reaper_state.evict_idle_repos();
+                        if reaper_state.repos.len() < before {
+                            reaper_state.print_dashboard();
+                        }
                     }
                     _ = reaper_cancel.cancelled() => {
                         break;
