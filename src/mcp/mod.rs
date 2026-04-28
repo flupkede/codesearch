@@ -6198,12 +6198,28 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
         let _ = stdio_close_tx.send(()).await;
     });
 
-    // Step 2: Initial connection to serve (must succeed).
-    connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone()).await?;
-    tracing::info!("🚀 MCP proxy ready — forwarding Claude Desktop ↔ codesearch serve");
+    // Step 2: Initial connection to serve (tolerant — may not be running yet).
+    let mut serve_down_since: Option<std::time::Instant> = None;
+    match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone()).await {
+        Ok(()) => {
+            tracing::info!("🚀 MCP proxy ready — forwarding Claude Desktop ↔ codesearch serve");
+        }
+        Err(e) => {
+            serve_down_since = Some(std::time::Instant::now());
+            tracing::warn!(
+                "codesearch serve not yet available ({}). Proxy is up, will retry every {}s.",
+                e, reconnect::INTERVAL_SECS
+            );
+            // Seed a synthetic disconnect so the main loop starts reconnecting.
+            let tx = disconnect_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let _ = tx.send(()).await;
+            });
+        }
+    }
 
     // Step 3: Main loop — wait for stdio close, serve disconnect, or cancel.
-    let mut serve_down_since: Option<std::time::Instant> = None;
 
     loop {
         tokio::select! {
