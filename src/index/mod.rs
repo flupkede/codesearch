@@ -1524,14 +1524,12 @@ async fn try_delegate_reindex_to_serve(
     let config = crate::db_discovery::repos::ReposConfig::load()
         .map_err(|e| format!("cannot load repos.json: {}", e))?;
 
-    /// Normalize a path for comparison: canonicalize, then strip Windows UNC prefix
-    /// (`\\?\`) so that `\\?\C:\foo` and `C:\foo` compare equal.
+    /// Normalize a path for alias comparison: canonicalize (resolves symlinks,
+    /// relative components), then normalize via `cache::normalize_path` (strips
+    /// Windows UNC prefix, converts backslashes) and lowercases for case-insensitive match.
     fn normalize_for_cmp(p: &std::path::Path) -> String {
         let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        let s = canonical.to_string_lossy().to_string();
-        // Strip Windows extended-length UNC prefix
-        let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
-        s.to_lowercase()
+        crate::cache::normalize_path(&canonical).to_lowercase()
     }
 
     let project_norm = normalize_for_cmp(&project_path);
