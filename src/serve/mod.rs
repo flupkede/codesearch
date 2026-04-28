@@ -167,19 +167,99 @@ impl ServeState {
         Ok(())
     }
 
-    /// Close and remove a repo from the open-stores map.
+    /// Stop the file system watcher for a repo by cancelling its token.
     ///
-    /// Fires the cancel token (stops FSW/git-HEAD watcher) and drops the
-    /// RepoState, which releases the LMDB write lock and closes all file handles.
-    /// On Windows this is required before deleting the DB directory.
-    /// Not used by force reindex (which clears data in-place instead).
-    #[allow(dead_code)]
-    fn close_repo(&self, alias: &str) {
-        if let Some((_, state)) = self.repos.remove(alias) {
-            if let RepoState::Write { cancel_token, .. } = state {
-                cancel_token.cancel();
+    /// Returns the stores Arc if the repo was open in write mode (so the caller
+    /// can still use it for reindexing), or None if the repo wasn't found.
+    fn stop_fsw(&self, alias: &str) -> Option<Arc<SharedStores>> {
+        if let Some(mut entry) = self.repos.get_mut(alias) {
+            match entry.value_mut() {
+                RepoState::Write { cancel_token, stores, .. } => {
+                    cancel_token.cancel();
+                    tracing::info!("Stopped FSW for '{}'", alias);
+                    return Some(stores.clone());
+                }
+                RepoState::Readonly { stores } => {
+                    return Some(stores.clone());
+                }
+                RepoState::Conflicted => return None,
             }
-            tracing::info!("Closed repo '{}' (released LMDB handles)", alias);
+        }
+        None
+    }
+
+    /// Spawn the FSW background task for a repo after it has been stopped.
+    ///
+    /// Creates a fresh IndexManager, performs an initial incremental refresh,
+    /// then starts the continuous file watcher loop. Updates the RepoState with
+    /// the new cancel token and IndexManager.
+    async fn restart_fsw(&self, alias: &str, stores: Arc<SharedStores>) {
+        let path = {
+            let config = match self.config.read() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Cannot restart FSW for '{}': config lock poisoned: {}", alias, e);
+                    return;
+                }
+            };
+            match config.resolve(alias) {
+                Some(p) => p,
+                None => {
+                    tracing::error!("Cannot restart FSW: alias '{}' not in config", alias);
+                    return;
+                }
+            }
+        };
+        let db_path = path.join(DB_DIR_NAME);
+
+        match IndexManager::new_without_refresh(&path, stores.clone()).await {
+            Ok(im) => {
+                let im_arc = Arc::new(im);
+                let token = CancellationToken::new();
+                let alias_bg = alias.to_string();
+                let project_path = path.clone();
+                let db_path_bg = db_path.clone();
+                let stores_bg = stores.clone();
+                let im_for_task = im_arc.clone();
+                let token_for_task = token.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) = im_for_task.start_watching().await {
+                        tracing::warn!("Could not pre-start FSW for '{}': {}", alias_bg, e);
+                    }
+
+                    if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
+                        &project_path,
+                        &db_path_bg,
+                        &stores_bg,
+                    ).await {
+                        tracing::error!("Post-reindex refresh for '{}' failed: {}", alias_bg, e);
+                    }
+
+                    if token_for_task.is_cancelled() {
+                        return;
+                    }
+
+                    if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                        tracing::error!("File watcher for '{}' stopped: {}", alias_bg, e);
+                    }
+                });
+
+                if let Some(mut entry) = self.repos.get_mut(alias) {
+                    *entry.value_mut() = RepoState::Write {
+                        stores,
+                        index_manager: Some(im_arc),
+                        cancel_token: token,
+                    };
+                }
+                tracing::info!("Restarted FSW for '{}'", alias);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "IndexManager init failed for '{}': {} - FSW not restarted, searches still work",
+                    alias, e
+                );
+            }
         }
     }
 
@@ -487,29 +567,38 @@ async fn reindex_handler(
     let guard_state = state.clone();
 
     if force {
-        // Force rebuild: clear data in-place → full reindex.
-        // No files are deleted, so no OS error 32 on Windows.
-        // The repo stays open throughout — LMDB handles remain valid.
+        // Force rebuild: stop FSW -> clear data in-place -> full reindex -> restart FSW.
+        // The FSW must be stopped before clearing the FileMetaStore, otherwise it
+        // sees all the file writes during reindex as "new changes" and triggers
+        // endless incremental refresh cycles.
 
-        let stores = match state.get_or_open_stores(&alias).await {
-            Ok(s) => s,
-            Err(e) => {
-                state.active_reindexes.remove(&guard_alias);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::response::Json(json!({
-                        "error": e,
-                        "status": "error"
-                    })),
-                );
+        // 1. Stop the FSW (cancel its token)
+        let stores = match state.stop_fsw(&alias) {
+            Some(s) => s,
+            None => {
+                // FSW not running -- try opening normally
+                match state.get_or_open_stores(&alias).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        state.active_reindexes.remove(&guard_alias);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::response::Json(json!({
+                                "error": e,
+                                "status": "error"
+                            })),
+                        );
+                    }
+                }
             }
         };
 
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
         tokio::spawn(async move {
-            tracing::info!("🔄 Force reindex for '{}': clearing stores and reindexing", alias_bg);
+            tracing::info!("Force reindex for '{}': clearing stores and reindexing", alias_bg);
 
+            // 2. Clear data and reindex
             match IndexManager::force_reindex_with_stores(
                 &project_path,
                 &db_path,
@@ -518,15 +607,20 @@ async fn reindex_handler(
             .await
             {
                 Ok(()) => {
-                    tracing::info!("✅ Force reindex complete for '{}'", alias_bg);
+                    tracing::info!("Force reindex complete for '{}'", alias_bg);
                 }
                 Err(e) => {
-                    tracing::error!("❌ Force reindex failed for '{}': {}", alias_bg, e);
+                    tracing::error!("Force reindex failed for '{}': {}", alias_bg, e);
                 }
             }
+
+            // 3. Restart FSW with fresh IndexManager
+            g_state.restart_fsw(&g_alias, stores).await;
+
             g_state.active_reindexes.remove(&g_alias);
         });
     } else {
+
         // Incremental refresh: ensure the repo is opened, then refresh
         let stores = match state.get_or_open_stores(&alias).await {
             Ok(s) => s,
