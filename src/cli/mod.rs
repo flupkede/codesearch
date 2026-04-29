@@ -242,6 +242,19 @@ pub enum Commands {
         /// Show verbose output on console (overrides --quiet for debugging)
         #[arg(long, visible_alias = "no-quiet")]
         verbose: bool,
+
+        /// Automatically create index if it doesn't exist (default: true)
+        #[arg(
+            short = 'c',
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            value_parser = BoolishValueParser::new(),
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true"
+        )]
+        create_index: bool,
     },
 
     /// Show statistics about the vector database
@@ -452,6 +465,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             register,
             quiet,
             verbose,
+            create_index: _,
         } => {
             // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
             // regardless of whether a database exists in the current directory.
