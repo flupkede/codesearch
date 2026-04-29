@@ -4609,7 +4609,7 @@ impl CodesearchService {
     }
 
     #[tool(
-        description = "Retrieve the full content of a specific chunk by its ID, plus optional surrounding lines for context.\nUse this after semantic_search or file_outline to read the actual code without loading the whole file.\n\nUSE FOR: reading a specific function/class body after finding it via search.\nSet context_lines (default 0, max 20) to include lines before and after the chunk."
+        description = "Retrieve the full content of a specific chunk by its ID, plus optional surrounding lines for context.\nUse this after search or explore to read the actual code without loading the whole file.\n\nUSE FOR: reading a specific function/class body after finding it via search.\nSet context_lines (default 0, max 20) to include lines before and after the chunk.\n\nIMPORTANT (multi-repo): chunk_ids are local to each repository and are NOT globally unique.\nAlways pass `project` matching the alias from the search result that returned this chunk_id.\nOmitting `project` in multi-repo mode returns an error."
     )]
     async fn get_chunk(
         &self,
@@ -4639,8 +4639,16 @@ impl CodesearchService {
             clamped = true;
         }
 
-        // Look up chunk — multi-store: try each store until found
+        // Look up chunk — multi-store: require project when multiple stores are active
+        // to avoid chunk_id collision (IDs are local per database, not globally unique).
         let chunk = if let Some(ref sv) = ctx.stores_vec {
+            if sv.len() > 1 && request.project.is_none() {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "get_chunk requires a `project` parameter in multi-repo mode. \
+                     chunk_ids are local to each repository database and may collide. \
+                     Pass the same project alias used in the search call that returned this chunk_id."
+                )]));
+            }
             let mut found = None;
             for store_arc in sv {
                 let store = store_arc.vector_store.read().await;
