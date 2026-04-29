@@ -2,6 +2,14 @@ use crate::constants::MAX_LMDB_MAP_SIZE_MB;
 use crate::embed::EmbeddedChunk;
 use crate::info_print;
 use anyhow::{anyhow, Result};
+
+/// Current database schema version.
+///
+/// Stored in `metadata.json` alongside other per-database settings.
+/// Increment when the on-disk format changes (e.g., UUID chunk IDs, vector
+/// format change). The open path checks this and reports mismatches so the
+/// caller can trigger a rebuild.
+const SCHEMA_VERSION: u32 = 1;
 use arroy::distances::Cosine;
 use arroy::{Database as ArroyDatabase, ItemId, Reader, Writer};
 use heed::byteorder::BigEndian;
@@ -40,6 +48,95 @@ fn resolve_map_size(db_path: &Path) -> usize {
         .unwrap_or(persisted)
         .max(persisted)
         .max(crate::constants::DEFAULT_LMDB_MAP_SIZE_MB)
+}
+
+/// Read a metadata field from metadata.json.
+/// Returns `None` if the file or key doesn't exist.
+fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
+    let metadata_path = db_path.join("metadata.json");
+    let content = fs::read_to_string(&metadata_path).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    json.get(key).and_then(|v| v.as_u64()).map(|v| v as u32)
+}
+
+/// Write a metadata field into metadata.json (creates/updates key in existing JSON).
+fn write_metadata_u32(db_path: &Path, key: &str, value: u32) -> Result<()> {
+    let metadata_path = db_path.join("metadata.json");
+    let mut json: serde_json::Value = if metadata_path.exists() {
+        let content = fs::read_to_string(&metadata_path)?;
+        serde_json::from_str(&content).unwrap_or(serde_json::Value::Object(Default::default()))
+    } else {
+        serde_json::Value::Object(Default::default())
+    };
+
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            key.to_string(),
+            serde_json::Value::Number(value.into()),
+        );
+    }
+
+    fs::write(&metadata_path, serde_json::to_string_pretty(&json)?)?;
+    Ok(())
+}
+
+/// Ensure the database schema version matches the current version.
+///
+/// - New database → writes `SCHEMA_VERSION` and returns Ok.
+/// - Existing database without version → treated as v1 (baseline), writes it.
+/// - Version matches → Ok.
+/// - Version older → returns error (rebuild required).
+/// - Version newer → returns error (upgrade codesearch).
+fn ensure_schema_version(db_path: &Path) -> Result<()> {
+    let stored = read_metadata_u32(db_path, "schema_version");
+    match stored {
+        None => {
+            // New database or pre-versioning database.
+            // If the DB already has chunks (next_id > 0 in caller), we still
+            // assign v1 — existing indexes are considered v1 baseline.
+            tracing::info!(
+                "Initializing schema_version = {} for database at {}",
+                SCHEMA_VERSION,
+                db_path.display()
+            );
+            write_metadata_u32(db_path, "schema_version", SCHEMA_VERSION)?;
+            Ok(())
+        }
+        Some(v) if v == SCHEMA_VERSION => {
+            tracing::debug!(
+                "Database schema_version = {} (current) at {}",
+                v,
+                db_path.display()
+            );
+            Ok(())
+        }
+        Some(v) if v < SCHEMA_VERSION => {
+            tracing::warn!(
+                "Database at {} has schema v{}, current is v{}. Rebuild required.",
+                db_path.display(),
+                v,
+                SCHEMA_VERSION
+            );
+            Err(anyhow!(
+                "Database schema outdated: found v{}, need v{}. Run `codesearch index --force` to rebuild.",
+                v,
+                SCHEMA_VERSION
+            ))
+        }
+        Some(v) => {
+            tracing::error!(
+                "Database at {} has schema v{}, newer than supported v{}. Upgrade codesearch.",
+                db_path.display(),
+                v,
+                SCHEMA_VERSION
+            );
+            Err(anyhow!(
+                "Database schema v{} is newer than supported v{}. Upgrade codesearch.",
+                v,
+                SCHEMA_VERSION
+            ))
+        }
+    }
 }
 
 /// Persist the current LMDB map size into metadata.json so that subsequent
@@ -176,6 +273,10 @@ impl VectorStore {
         // Clean up any stale .del files from previous crashed runs
         cleanup_stale_del_files(db_path)?;
 
+        // Check schema version before opening LMDB.
+        // This catches outdated databases that need a rebuild.
+        ensure_schema_version(db_path)?;
+
         // Open LMDB environment
         // Read persisted map_size from metadata.json if available, so that
         // multiple repos in the same process use a consistent map size after
@@ -253,6 +354,9 @@ impl VectorStore {
                 db_path.display()
             ));
         }
+
+        // Check schema version before opening LMDB
+        ensure_schema_version(db_path)?;
 
         // Open LMDB environment in read-only mode
         // Use same map-size resolution as new() for consistency
