@@ -290,12 +290,16 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<L
 /// The serve process manages multiple repos and has no single "home" database,
 /// so it logs to the global config directory instead.
 ///
-/// When `quiet` is false, logs are written to both stderr and the rotating file.
-/// When `quiet` is true, logs go to the file only (useful when serve is daemonized).
+/// Serve mode always logs to file only — never to stderr/TUI.
+/// The TUI manages its own display and any stderr output corrupts it.
+/// `info_print!` is also suppressed via `set_quiet(true)`.
 ///
 /// # Returns
 /// Returns `LoggerInitResult` indicating whether file logging is active.
-pub fn init_serve_logger(log_level: LogLevel, quiet: bool) -> Result<LoggerInitResult> {
+pub fn init_serve_logger(log_level: LogLevel, _quiet: bool) -> Result<LoggerInitResult> {
+    // Suppress info_print! / eprintln output — serve TUI must not be corrupted.
+    crate::output::set_quiet(true);
+
     let log_dir = crate::constants::get_global_cache_dir().join(LOG_DIR_NAME);
     ensure_log_dir(&log_dir)?;
 
@@ -314,49 +318,23 @@ pub fn init_serve_logger(log_level: LogLevel, quiet: bool) -> Result<LoggerInitR
 
     let subscriber = tracing_subscriber::registry().with(env_filter);
 
-    if quiet {
-        let result = subscriber
-            .with(
-                fmt::layer()
-                    .with_writer(file_appender)
-                    .with_ansi(false)
-                    .with_target(true)
-                    .with_thread_ids(false),
-            )
-            .try_init();
+    // Always file-only in serve mode — no stderr console layer.
+    let result = subscriber
+        .with(
+            fmt::layer()
+                .with_writer(file_appender)
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(false),
+        )
+        .try_init();
 
-        if let Err(e) = result {
-            eprintln!(
-                "Serve logger: subscriber already set ({}), file logging not active",
-                e
-            );
-            return Ok(LoggerInitResult::ConsoleOnly);
-        }
-    } else {
-        let result = subscriber
-            .with(
-                fmt::layer()
-                    .with_writer(std::io::stderr)
-                    .with_ansi(true)
-                    .with_target(true)
-                    .with_thread_ids(false),
-            )
-            .with(
-                fmt::layer()
-                    .with_writer(file_appender)
-                    .with_ansi(false)
-                    .with_target(true)
-                    .with_thread_ids(false),
-            )
-            .try_init();
-
-        if let Err(e) = result {
-            eprintln!(
-                "Serve logger: subscriber already set ({}), file logging not active",
-                e
-            );
-            return Ok(LoggerInitResult::ConsoleOnly);
-        }
+    if let Err(e) = result {
+        eprintln!(
+            "Serve logger: subscriber already set ({}), file logging not active",
+            e
+        );
+        return Ok(LoggerInitResult::ConsoleOnly);
     }
 
     tracing::info!(

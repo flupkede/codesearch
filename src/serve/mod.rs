@@ -1512,6 +1512,7 @@ pub async fn run_serve(
     for path in &register_paths {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         let alias = config.register(canonical);
+        eprintln!("Registered repo '{}' -> {}", alias, path.display());
         info!("Registered repo '{}' -> {}", alias, path.display());
     }
     if !register_paths.is_empty() {
@@ -1535,7 +1536,14 @@ pub async fn run_serve(
         env!("CARGO_PKG_VERSION"),
         addr
     );
-    info!("📋 Registered repos: {:?}", serve_state.aliases());
+    eprintln!(
+        "🚀 Starting codesearch serve v{} on {}",
+        env!("CARGO_PKG_VERSION"),
+        addr
+    );
+    let repo_list = format!("{:?}", serve_state.aliases());
+    info!("📋 Registered repos: {}", repo_list);
+    eprintln!("📋 Registered repos: {}", repo_list);
 
     // ── Start HTTP server FIRST ──
     // Accept connections immediately so MCP clients don't time out.

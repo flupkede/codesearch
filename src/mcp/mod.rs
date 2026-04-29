@@ -3086,12 +3086,17 @@ impl CodesearchService {
         &self,
         project: &Option<String>,
         group: &Option<String>,
+        allow_unscoped: bool,
     ) -> std::result::Result<Option<(Vec<Arc<SharedStores>>, Vec<String>)>, String> {
-        // No routing params → auto-default to all configured repos in serve mode
+        // No routing params → resolve based on repo count
         if project.is_none() && group.is_none() {
             if let Some(ref serve_state) = self.serve_state {
                 let cfg = serve_state.config_snapshot();
                 let aliases: Vec<String> = cfg.repos.keys().cloned().collect();
+                if aliases.len() > 1 && !allow_unscoped {
+                    // Multi-repo: reject fan-out, require explicit scope
+                    return Err(self.format_scope_error());
+                }
                 if !aliases.is_empty() {
                     let mut all_stores = Vec::with_capacity(aliases.len());
                     for alias in &aliases {
@@ -3099,6 +3104,7 @@ impl CodesearchService {
                     }
                     return Ok(Some((all_stores, aliases)));
                 }
+                // No repos configured — fall through to local DB
             }
             return Ok(None);
         }
@@ -3139,9 +3145,10 @@ impl CodesearchService {
         &self,
         project: &Option<String>,
         group: &Option<String>,
+        allow_unscoped: bool,
         tool_name: &str,
     ) -> std::result::Result<MultiStoreContext, String> {
-        let resolved = self.resolve_repo_stores_multi(project, group).await?;
+        let resolved = self.resolve_repo_stores_multi(project, group, allow_unscoped).await?;
         let is_multi = resolved.as_ref().is_some_and(|(stores, _)| stores.len() > 1);
         let (stores, stores_vec, store_aliases, project_alias) = match &resolved {
             None => (None, None, None, None),
@@ -3200,6 +3207,33 @@ impl CodesearchService {
             is_multi,
             needs_local_db,
         })
+    }
+
+    /// Build a structured `scope_required` error JSON for multi-repo mode.
+    ///
+    /// Returns a JSON string containing `error_code`, `message`, `available_projects`,
+    /// `available_groups`, and `hint_for_agent` so that LLM agents can programmatically
+    /// react to the scope requirement.
+    fn format_scope_error(&self) -> String {
+        let (projects, groups) = if let Some(ref serve_state) = self.serve_state {
+            let cfg = serve_state.config_snapshot();
+            let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
+            projects.sort();
+            let mut groups: Vec<String> = cfg.groups.keys().cloned().collect();
+            groups.sort();
+            (projects, groups)
+        } else {
+            (vec![], vec![])
+        };
+
+        let payload = serde_json::json!({
+            "error_code": "scope_required",
+            "message": "Specify project= for a single repository or group= for cross-repo search.",
+            "available_projects": projects,
+            "available_groups": groups,
+            "hint_for_agent": "If the user has not indicated which repository to search, ask them to choose. Show available_projects and available_groups as options."
+        });
+        payload.to_string()
     }
 
     /// Execute a read-only action against the vector store with an explicit store override.
@@ -3384,7 +3418,7 @@ impl CodesearchService {
 
     /// Unified search tool — dispatches to semantic or literal search based on `mode`.
     #[tool(
-        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns."
+        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     async fn search(
         &self,
@@ -3436,7 +3470,7 @@ impl CodesearchService {
 
     /// Unified symbol navigation — dispatches based on `kind`.
     #[tool(
-        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name."
+        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     async fn find(
         &self,
@@ -3496,7 +3530,7 @@ impl CodesearchService {
 
     /// Unified exploration tool — dispatches based on `kind`.
     #[tool(
-        description = "Unified code exploration. Set `kind` to choose the action:\n\n- `outline` (default): list all indexed top-level symbols in a file — kind, signature, and line range. Set `target` to a file path.\n- `similar`: find chunks semantically similar to a given chunk by its ID. Set `target` to the chunk_id (as string)."
+        description = "Unified code exploration. Set `kind` to choose the action:\n\n- `outline` (default): list all indexed top-level symbols in a file — kind, signature, and line range. Set `target` to a file path.\n- `similar`: find chunks semantically similar to a given chunk by its ID. Set `target` to the chunk_id (as string).\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     async fn explore(
         &self,
@@ -3573,7 +3607,7 @@ impl CodesearchService {
         Parameters(request): Parameters<SemanticSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing (multi-store for group fan-out)
-        let ctx = match self.resolve_routing(&request.project, &request.group, "semantic_search").await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false, "search").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4235,7 +4269,7 @@ impl CodesearchService {
         );
 
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group, "find_definition").await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false, "find").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4393,7 +4427,7 @@ impl CodesearchService {
         tracing::debug!("MCP find_usages: symbol='{}', limit={}", symbol, limit);
 
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&project, &group, "find_usages").await {
+        let ctx = match self.resolve_routing(&project, &group, false, "find").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4521,7 +4555,7 @@ impl CodesearchService {
         Parameters(request): Parameters<FileOutlineRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group, "explore").await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false, "explore").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4624,7 +4658,7 @@ impl CodesearchService {
     }
 
     #[tool(
-        description = "Retrieve the full content of a specific chunk by its ID, plus optional surrounding lines for context.\nUse this after search or explore to read the actual code without loading the whole file.\n\nUSE FOR: reading a specific function/class body after finding it via search.\nSet context_lines (default 0, max 20) to include lines before and after the chunk.\n\nIMPORTANT (multi-repo): chunk_ids are local to each repository and are NOT globally unique.\nAlways pass `project` matching the alias from the search result that returned this chunk_id.\nOmitting `project` in multi-repo mode returns an error."
+        description = "Retrieve the full content of a specific chunk by its ID, plus optional surrounding lines for context.\nUse this after search or explore to read the actual code without loading the whole file.\n\nUSE FOR: reading a specific function/class body after finding it via search.\nSet context_lines (default 0, max 20) to include lines before and after the chunk.\n\nIMPORTANT (multi-repo): chunk_ids are local to each repository and are NOT globally unique.\nWhen `project` is omitted in multi-repo mode, the tool scans all repositories for the chunk_id.\nIf found in exactly one repo, it is returned automatically. If found in multiple repos, an `ambiguous_chunk_id` error lists the candidates so you can retry with `project`."
     )]
     async fn get_chunk(
         &self,
@@ -4635,8 +4669,8 @@ impl CodesearchService {
             request.chunk_id,
             request.project,
         );
-        // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group, "get_chunk").await {
+        // Resolve project/group routing — allow unscoped for smart candidate detection
+        let ctx = match self.resolve_routing(&request.project, &request.group, true, "get_chunk").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4654,26 +4688,67 @@ impl CodesearchService {
             clamped = true;
         }
 
-        // Look up chunk — multi-store: require project when multiple stores are active
-        // to avoid chunk_id collision (IDs are local per database, not globally unique).
+        // Look up chunk — multi-store: smart candidate detection for chunk_id collision.
+        // chunk_ids are local per database, not globally unique. When no project is specified
+        // and multiple stores are active, scan all stores to find which ones have this chunk_id.
         let chunk = if let Some(ref sv) = ctx.stores_vec {
             if sv.len() > 1 && request.project.is_none() {
-                return Ok(CallToolResult::success(vec![Content::text(
-                    "get_chunk requires a `project` parameter in multi-repo mode. \
-                     chunk_ids are local to each repository database and may collide. \
-                     Pass the same project alias used in the search call that returned this chunk_id."
-                )]));
-            }
-            let mut found = None;
-            for store_arc in sv {
-                let store = store_arc.vector_store.read().await;
-                match store.get_chunk(request.chunk_id) {
-                    Ok(Some(c)) => { found = Some(c); break; }
-                    Ok(None) => continue,
-                    Err(_) => break,
+                // Smart candidate detection: find which stores actually contain this chunk_id
+                let mut candidates: Vec<(&Arc<SharedStores>, &String)> = Vec::new();
+                let aliases = ctx.store_aliases.as_deref().unwrap();
+                for (i, store_arc) in sv.iter().enumerate() {
+                    let store = store_arc.vector_store.read().await;
+                    match store.get_chunk(request.chunk_id) {
+                        Ok(Some(_)) => {
+                            if let Some(alias) = aliases.get(i) {
+                                candidates.push((store_arc, alias));
+                            }
+                        }
+                        Ok(None) => continue,
+                        Err(_) => continue,
+                    }
                 }
+                match candidates.len() {
+                    0 => {
+                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                            "Chunk {} not found in any repository. Verify the chunk_id and index state.",
+                            request.chunk_id
+                        ))]));
+                    }
+                    1 => {
+                        // Exactly one store has this chunk_id — auto-route
+                        let (store_arc, _alias) = candidates[0];
+                        let store = store_arc.vector_store.read().await;
+                        store.get_chunk(request.chunk_id).unwrap_or_default()
+                    }
+                    _ => {
+                        // Multiple stores have this chunk_id — ambiguous
+                        let candidate_names: Vec<&str> =
+                            candidates.iter().map(|(_, a)| a.as_str()).collect();
+                        let payload = serde_json::json!({
+                            "error_code": "ambiguous_chunk_id",
+                            "message": format!("chunk_id {} exists in multiple repositories. Specify which one.", request.chunk_id),
+                            "candidate_projects": candidate_names,
+                            "hint_for_agent": "The chunk_id collision is a known limitation of multi-repo mode. Re-run get_chunk with one of the candidate_projects, or use search to identify the correct repository first."
+                        });
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            payload.to_string(),
+                        )]));
+                    }
+                }
+            } else {
+                // Single store or project specified — direct lookup
+                let mut found = None;
+                for store_arc in sv {
+                    let store = store_arc.vector_store.read().await;
+                    match store.get_chunk(request.chunk_id) {
+                        Ok(Some(c)) => { found = Some(c); break; }
+                        Ok(None) => continue,
+                        Err(_) => break,
+                    }
+                }
+                found
             }
-            found
         } else {
             self
                 .with_vector_store_read_for(
@@ -4756,7 +4831,7 @@ impl CodesearchService {
         Parameters(request): Parameters<FindImportsRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group, "find_imports").await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false, "find").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4932,7 +5007,7 @@ impl CodesearchService {
         Parameters(request): Parameters<FindDependentsRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group, "find_dependents").await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false, "find").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5174,7 +5249,7 @@ impl CodesearchService {
         Parameters(request): Parameters<SimilarChunksRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group, "similar_chunks").await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false, "explore").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5304,7 +5379,7 @@ impl CodesearchService {
         Parameters(request): Parameters<LiteralSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group, "literal_search").await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false, "search").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5745,8 +5820,8 @@ impl CodesearchService {
             }
         }
 
-        // Resolve project/group routing (only for specific project/group)
-        let ctx = match self.resolve_routing(&project, &group, "status").await {
+        // Resolve project/group routing — status is scope-free, allow unscoped fan-out
+        let ctx = match self.resolve_routing(&project, &group, true, "status").await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
