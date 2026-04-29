@@ -417,7 +417,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 "🚀 No index found, creating one...".bright_cyan()
             ));
             let cancel_token = tokio_util::sync::CancellationToken::new();
-            crate::index::index_quiet(path, false, cancel_token).await?;
+            crate::index::index_quiet(path, false, false, cancel_token).await?;
             crate::output::print_info(format_args!("{}", "✅ Index created successfully!".green()));
         } else {
             println!("{}", "❌ No database found!".red());

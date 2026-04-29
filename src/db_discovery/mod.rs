@@ -23,6 +23,11 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::DB_DIR_NAME;
 
+/// Compare two paths by normalizing them (case-insensitive on Windows).
+fn same_path(a: &Path, b: &Path) -> bool {
+    crate::cache::normalize_path(a) == crate::cache::normalize_path(b)
+}
+
 pub mod repos;
 
 use repos::ReposConfig;
@@ -218,11 +223,16 @@ fn find_best_database_impl(target_dir: Option<&Path>, include_global: bool) -> R
         }
     }
 
-    // 4. Check global databases (only when not in test-isolation mode)
+    // 4. Check global databases — find one that matches the target directory
     if include_global {
         let global_dbs = find_global_databases()?;
-        if !global_dbs.is_empty() {
-            return Ok(Some(global_dbs.into_iter().next().unwrap()));
+        // Only return a global DB if it actually belongs to the target path.
+        // Returning an unrelated global DB (e.g. BOIN.Experimental when the
+        // target is ~/investing) would cause false "index already exists" errors.
+        for db in global_dbs {
+            if same_path(&db.project_path, &canonical) {
+                return Ok(Some(db));
+            }
         }
     }
 

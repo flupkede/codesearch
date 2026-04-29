@@ -155,6 +155,18 @@ pub const HEALTH_PATH: &str = "/health";
 /// MCP endpoint path served by `codesearch serve` (streamable HTTP).
 pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 
+/// How long an open repo may remain idle (no queries) before it is evicted.
+/// Eviction closes the DB handles, stops the FSW, and releases memory.
+/// The repo is automatically re-opened on the next query.
+/// Override with `CODESEARCH_REPO_IDLE_TIMEOUT_SECS`.
+pub const REPO_IDLE_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
+
+/// How often the idle-reaper background task checks for repos to evict.
+pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
+
+/// Environment variable to override the repo idle timeout.
+pub const REPO_IDLE_TIMEOUT_ENV: &str = "CODESEARCH_REPO_IDLE_TIMEOUT_SECS";
+
 /// Default embedding dimensions used when metadata is missing or unreadable.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
 

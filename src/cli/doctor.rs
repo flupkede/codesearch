@@ -604,7 +604,7 @@ pub async fn run(fix: bool, json: bool) -> Result<()> {
                 println!();
                 println!("Running incremental refresh...");
                 if let Err(e) =
-                    crate::index::index_quiet(None, false, CancellationToken::new()).await
+                    crate::index::index_quiet(None, false, false, CancellationToken::new()).await
                 {
                     eprintln!("{} Failed to run index: {}", "❌".red(), e);
                 } else {
