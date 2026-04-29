@@ -4,6 +4,97 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serialise all quiet-mode tests: they share a single global AtomicBool,
+    /// so running them in parallel would cause races on the flag.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_quiet_mode_toggle() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // Initial state
+        set_quiet(false);
+        assert!(!is_quiet());
+
+        // Enable
+        set_quiet(true);
+        assert!(is_quiet());
+
+        // Disable
+        set_quiet(false);
+        assert!(!is_quiet());
+    }
+
+    #[test]
+    fn test_print_info_not_quiet() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        set_quiet(false);
+        assert!(!is_quiet());
+
+        // Test that print_info doesn't panic when quiet mode is off
+        print_info(format_args!("info message"));
+
+        // Reset
+        set_quiet(false);
+    }
+
+    #[test]
+    fn test_print_info_quiet() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        set_quiet(true);
+        assert!(is_quiet());
+
+        // Test that print_info doesn't panic when quiet mode is on
+        print_info(format_args!("suppressed info message"));
+
+        // Reset
+        set_quiet(false);
+    }
+
+    #[test]
+    fn test_print_warn_not_quiet() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        set_quiet(false);
+        assert!(!is_quiet());
+
+        // Test that print_warn doesn't panic when quiet mode is off
+        print_warn(format_args!("warning message"));
+
+        // Reset
+        set_quiet(false);
+    }
+
+    #[test]
+    fn test_print_warn_quiet() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        set_quiet(true);
+        assert!(is_quiet());
+
+        // Test that print_warn doesn't panic when quiet mode is on
+        print_warn(format_args!("suppressed warning message"));
+
+        // Reset
+        set_quiet(false);
+    }
+
+    #[test]
+    fn test_multiple_print_calls() {
+        set_quiet(false);
+        print_info(format_args!("first"));
+        print_warn(format_args!("second"));
+
+        set_quiet(true);
+        print_info(format_args!("suppressed first"));
+        print_warn(format_args!("suppressed second"));
+
+        set_quiet(false);
+    }
+}
+
 /// Global quiet mode flag
 static QUIET_MODE: AtomicBool = AtomicBool::new(false);
 
