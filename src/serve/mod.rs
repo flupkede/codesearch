@@ -612,6 +612,7 @@ pub async fn run_serve(
     for path in &register_paths {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
         let alias = config.register(canonical);
+        eprintln!("Registered repo '{}' -> {}", alias, path.display());
         info!("Registered repo '{}' -> {}", alias, path.display());
     }
     if !register_paths.is_empty() {
@@ -635,7 +636,14 @@ pub async fn run_serve(
         env!("CARGO_PKG_VERSION"),
         addr
     );
-    info!("📋 Registered repos: {:?}", serve_state.aliases());
+    eprintln!(
+        "🚀 Starting codesearch serve v{} on {}",
+        env!("CARGO_PKG_VERSION"),
+        addr
+    );
+    let repo_list = format!("{:?}", serve_state.aliases());
+    info!("📋 Registered repos: {}", repo_list);
+    eprintln!("📋 Registered repos: {}", repo_list);
 
     // ── Sequential pre-warming ──
     // Open all registered repos sequentially before accepting connections.
@@ -644,15 +652,23 @@ pub async fn run_serve(
     {
         let aliases = serve_state.aliases();
         if !aliases.is_empty() {
+            eprintln!("🔥 Pre-warming {} repos sequentially...", aliases.len());
             info!("🔥 Pre-warming {} repos sequentially...", aliases.len());
             for alias in &aliases {
                 match serve_state.get_or_open_stores(alias).await {
-                    Ok(_) => info!("  ✅ {} ready", alias),
-                    Err(e) => warn!("  ⚠️  {} failed: {}", alias, e),
+                    Ok(_) => {
+                        eprintln!("  ✅ {} ready", alias);
+                        info!("  ✅ {} ready", alias);
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠️  {} failed: {}", alias, e);
+                        warn!("  ⚠️  {} failed: {}", alias, e);
+                    }
                 }
                 // Small delay between repos to avoid I/O burst
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
+            eprintln!("🔥 Pre-warming complete");
             info!("🔥 Pre-warming complete");
         }
     }
@@ -707,6 +723,9 @@ pub async fn run_serve(
         info!("🛑 codesearch serve shutting down...");
     });
 
+    eprintln!("✅ codesearch serve ready at http://{}", addr);
+    eprintln!("   Health: http://{}{}", addr, HEALTH_PATH);
+    eprintln!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
     info!("✅ codesearch serve ready at http://{}", addr);
     info!("   Health: http://{}{}", addr, HEALTH_PATH);
     info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
