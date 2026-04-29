@@ -3086,20 +3086,23 @@ impl CodesearchService {
         &self,
         project: &Option<String>,
         group: &Option<String>,
+        allow_unscoped: bool,
     ) -> std::result::Result<Option<(Vec<Arc<SharedStores>>, Vec<String>)>, String> {
         // No routing params → resolve based on repo count
         if project.is_none() && group.is_none() {
             if let Some(ref serve_state) = self.serve_state {
                 let cfg = serve_state.config_snapshot();
                 let aliases: Vec<String> = cfg.repos.keys().cloned().collect();
-                if aliases.len() > 1 {
+                if aliases.len() > 1 && !allow_unscoped {
                     // Multi-repo: reject fan-out, require explicit scope
                     return Err(self.format_scope_error());
                 }
-                if aliases.len() == 1 {
-                    // Single repo: auto-route to the only repo
-                    let stores = serve_state.get_or_open_stores(&aliases[0]).await?;
-                    return Ok(Some((vec![stores], aliases)));
+                if !aliases.is_empty() {
+                    let mut all_stores = Vec::with_capacity(aliases.len());
+                    for alias in &aliases {
+                        all_stores.push(serve_state.get_or_open_stores(alias).await?);
+                    }
+                    return Ok(Some((all_stores, aliases)));
                 }
                 // No repos configured — fall through to local DB
             }
@@ -3141,8 +3144,9 @@ impl CodesearchService {
         &self,
         project: &Option<String>,
         group: &Option<String>,
+        allow_unscoped: bool,
     ) -> std::result::Result<MultiStoreContext, String> {
-        let resolved = self.resolve_repo_stores_multi(project, group).await?;
+        let resolved = self.resolve_repo_stores_multi(project, group, allow_unscoped).await?;
         let is_multi = resolved.as_ref().is_some_and(|(stores, _)| stores.len() > 1);
         let (stores, stores_vec, store_aliases, project_alias) = match &resolved {
             None => (None, None, None, None),
@@ -3588,7 +3592,7 @@ impl CodesearchService {
         Parameters(request): Parameters<SemanticSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing (multi-store for group fan-out)
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4250,7 +4254,7 @@ impl CodesearchService {
         );
 
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4408,7 +4412,7 @@ impl CodesearchService {
         tracing::debug!("MCP find_usages: symbol='{}', limit={}", symbol, limit);
 
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&project, &group).await {
+        let ctx = match self.resolve_routing(&project, &group, false).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4536,7 +4540,7 @@ impl CodesearchService {
         Parameters(request): Parameters<FileOutlineRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4650,8 +4654,8 @@ impl CodesearchService {
             request.chunk_id,
             request.project,
         );
-        // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        // Resolve project/group routing — allow unscoped for smart candidate detection
+        let ctx = match self.resolve_routing(&request.project, &request.group, true).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4669,7 +4673,7 @@ impl CodesearchService {
             clamped = true;
         }
 
-        // Look up chunk — multi-store: smart candidate detection for chunk_id collision
+        // Look up chunk — multi-store: smart candidate detection for chunk_id collision.
         // chunk_ids are local per database, not globally unique. When no project is specified
         // and multiple stores are active, scan all stores to find which ones have this chunk_id.
         let chunk = if let Some(ref sv) = ctx.stores_vec {
@@ -4812,7 +4816,7 @@ impl CodesearchService {
         Parameters(request): Parameters<FindImportsRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -4988,7 +4992,7 @@ impl CodesearchService {
         Parameters(request): Parameters<FindDependentsRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5230,7 +5234,7 @@ impl CodesearchService {
         Parameters(request): Parameters<SimilarChunksRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5360,7 +5364,7 @@ impl CodesearchService {
         Parameters(request): Parameters<LiteralSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing
-        let ctx = match self.resolve_routing(&request.project, &request.group).await {
+        let ctx = match self.resolve_routing(&request.project, &request.group, false).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
@@ -5755,8 +5759,8 @@ impl CodesearchService {
 
     /// Internal implementation for index_status with optional project/group routing.
     async fn index_status_impl(&self, project: Option<String>, group: Option<String>) -> Result<CallToolResult, McpError> {
-        // Resolve project/group routing
-        let ctx = match self.resolve_routing(&project, &group).await {
+        // Resolve project/group routing — status is scope-free, allow unscoped fan-out
+        let ctx = match self.resolve_routing(&project, &group, true).await {
             Ok(c) => c,
             Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
         };
