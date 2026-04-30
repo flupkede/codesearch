@@ -81,18 +81,23 @@ async fn run_tui_loop(
             }
         }
 
+        // Load session count for footer
+        let active = state.active_sessions.load(std::sync::atomic::Ordering::Relaxed);
+
         terminal.draw(|f| {
             let size = f.area();
             let chunks = Layout::vertical([
                 Constraint::Length(3), // header
-                Constraint::Min(3),    // body (table)
+                Constraint::Min(4),    // body (table)
+                Constraint::Length(3), // detail panel (selected repo info)
                 Constraint::Length(1), // footer
             ])
             .split(size);
 
             render_header(f, chunks[0], serve_url);
             render_table(f, chunks[1], &repos, &mut table_state);
-            render_footer(f, chunks[2], &repos, &table_state);
+            render_detail(f, chunks[2], &repos, &table_state, &state);
+            render_footer(f, chunks[3], &repos, &table_state, active);
         })?;
 
         // Poll for key events
@@ -280,7 +285,7 @@ fn render_table(
     )
     .row_highlight_style(
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(Color::Rgb(30, 30, 50))
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("▶ ");
@@ -288,11 +293,86 @@ fn render_table(
     f.render_stateful_widget(table, area, table_state);
 }
 
+fn render_detail(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    repos: &[(String, super::RepoStatusInfo)],
+    table_state: &TableState,
+    state: &Arc<ServeState>,
+) {
+    if repos.is_empty() {
+        return;
+    }
+
+    let idx = table_state.selected().unwrap_or(0);
+    if idx >= repos.len() {
+        return;
+    }
+
+    let (alias, info) = &repos[idx];
+    let config = state.config_snapshot();
+    let path = config.resolve(alias)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "—".to_string());
+
+    // Truncate path if too long for the area
+    let max_path_len = (area.width as usize).saturating_sub(14);
+    let display_path = if path.len() > max_path_len && max_path_len > 3 {
+        format!("...{}", &path[path.len() - max_path_len + 3..])
+    } else {
+        path
+    };
+
+    let status_label = match info.status {
+        super::RepoStateLabel::Open => "Open",
+        super::RepoStateLabel::Warm => "Warm (no FSW)",
+        super::RepoStateLabel::Readonly => "Readonly",
+        super::RepoStateLabel::Closed => "Closed",
+        super::RepoStateLabel::Indexing => "Indexing…",
+        super::RepoStateLabel::Error => "Error",
+        super::RepoStateLabel::NoIndex => "No Index",
+    };
+
+    let detail_line = Line::from(vec![
+        Span::styled(" ▶ ", Style::default().fg(Color::Yellow)),
+        Span::styled(alias.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled("  ", Style::default()),
+        Span::styled(status_label, Style::default().fg(Color::Cyan)),
+        Span::styled("  ", Style::default()),
+        Span::styled(display_path, Style::default().fg(Color::DarkGray)),
+    ]);
+
+    // Second line: changes + last tool call
+    let tool_str = info.last_tool_call.as_deref().unwrap_or("—");
+    let info_line = Line::from(vec![
+        Span::styled("   changes:", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" {}  ", info.changes), Style::default().fg(Color::White)),
+        Span::styled("last:", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" {}", tool_str), Style::default().fg(Color::White)),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::Rgb(40, 40, 60)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let detail_chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    f.render_widget(ratatui::widgets::Paragraph::new(detail_line), detail_chunks[0]);
+    f.render_widget(ratatui::widgets::Paragraph::new(info_line), detail_chunks[1]);
+}
+
 fn render_footer(
     f: &mut ratatui::Frame,
     area: Rect,
     repos: &[(String, super::RepoStatusInfo)],
     table_state: &TableState,
+    active: u64,
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
@@ -301,10 +381,13 @@ fn render_footer(
         String::new()
     };
 
+    let sessions_str = format!("Sessions: {}", active);
+
     let footer = Line::from(vec![
         Span::styled(" [q] quit  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[↑↓] scroll  ", Style::default().fg(Color::DarkGray)),
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
+        Span::styled(format!("{:>width$}", sessions_str, width = area.width as usize - 30), Style::default().fg(Color::Cyan)),
     ]);
 
     let footer_area = area.inner(Margin {
@@ -333,11 +416,11 @@ fn status_cell(status: super::RepoStateLabel) -> Cell<'static> {
         Indexing => Cell::from("⟳ idx…".to_string())
             .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Closed => Cell::from("○ closed".to_string())
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(Color::Gray)),
         Error => Cell::from("✗ error".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         NoIndex => Cell::from("— no idx".to_string())
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(Color::Gray)),
     }
 }
 
@@ -347,12 +430,12 @@ fn lock_cell_from_status(status: super::RepoStateLabel) -> Cell<'static> {
     use super::RepoStateLabel::*;
     match status {
         Open => Cell::from("write".to_string()).style(Style::default().fg(Color::Cyan)),
-        Warm => Cell::from("read".to_string()).style(Style::default().fg(Color::DarkGray)),
-        Readonly => Cell::from("read".to_string()).style(Style::default().fg(Color::DarkGray)),
+        Warm => Cell::from("read".to_string()).style(Style::default().fg(Color::White)),
+        Readonly => Cell::from("read".to_string()).style(Style::default().fg(Color::White)),
         Indexing => Cell::from("write".to_string()).style(Style::default().fg(Color::Cyan)),
-        Closed => Cell::from("—".to_string()).style(Style::default().fg(Color::DarkGray)),
+        Closed => Cell::from("—".to_string()).style(Style::default().fg(Color::Gray)),
         Error => Cell::from("—".to_string()).style(Style::default().fg(Color::Red)),
-        NoIndex => Cell::from("—".to_string()).style(Style::default().fg(Color::DarkGray)),
+        NoIndex => Cell::from("—".to_string()).style(Style::default().fg(Color::Gray)),
     }
 }
 
