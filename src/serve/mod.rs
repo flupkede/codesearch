@@ -870,9 +870,17 @@ impl ServeState {
                 }
             };
 
-            let changes = self.repo_changes.get(alias)
-                .map(|c| c.load(Ordering::Relaxed))
-                .unwrap_or(0);
+            let changes = match self.repos.get(alias) {
+                Some(entry) => match entry.value() {
+                    RepoState::Write { stores, .. } | RepoState::Warm { stores } | RepoState::Readonly { stores } => {
+                        stores.changes_count.load(Ordering::Relaxed)
+                    }
+                    RepoState::Conflicted => 0,
+                },
+                None => self.repo_changes.get(alias)
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .unwrap_or(0),
+            };
 
             let last_tool = self.last_tool_call.get(alias)
                 .map(|e| (e.value().0.clone(), e.value().1.elapsed()))
@@ -1023,6 +1031,21 @@ impl ServeState {
             })
             .map(|entry| entry.key().clone())
             .collect();
+
+        // Log reaper status even when nothing to evict (for debugging idle eviction)
+        if !self.last_access.is_empty() {
+            let idle_ages: Vec<(String, u64)> = self.last_access
+                .iter()
+                .map(|e| (e.key().clone(), now.duration_since(*e.value()).as_secs()))
+                .collect();
+            tracing::debug!(
+                "🔍 Reaper check: {} repos tracked, {} eligible for eviction (timeout={}m). Ages: {:?}",
+                self.last_access.len(),
+                to_evict.len(),
+                timeout.as_secs() / 60,
+                idle_ages,
+            );
+        }
 
         if to_evict.is_empty() {
             return;

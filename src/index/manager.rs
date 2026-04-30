@@ -133,6 +133,9 @@ pub struct SharedStores {
     writer_lock: Option<File>,
     /// Whether this instance is in readonly mode
     pub readonly: bool,
+    /// Counter for number of file changes processed (indexed + removed) since serve start.
+    /// Incremented by FSW batches and incremental refreshes. Read by TUI/dashboard.
+    pub changes_count: std::sync::atomic::AtomicU64,
 }
 
 impl SharedStores {
@@ -159,6 +162,7 @@ impl SharedStores {
             fts_store: Arc::new(RwLock::new(fts_store)),
             writer_lock: lock,
             readonly: false,
+            changes_count: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -177,6 +181,7 @@ impl SharedStores {
             fts_store: Arc::new(RwLock::new(fts_store)),
             writer_lock: None,
             readonly: true,
+            changes_count: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -601,6 +606,12 @@ impl IndexManager {
         // Save file metadata
         file_meta_store.save(db_path)?;
 
+        // Track changes for dashboard/TUI
+        let total_changes = (changed_files.len() + deleted_files.len()) as u64;
+        if total_changes > 0 {
+            stores.changes_count.fetch_add(total_changes, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let elapsed = start.elapsed();
         info!(
             "✅ Incremental refresh completed in {:.2}s",
@@ -995,6 +1006,12 @@ impl IndexManager {
 
         // Disable quiet mode after batch processing is complete
         set_quiet(false);
+
+        // Track changes for dashboard/TUI
+        let batch_changes = (files_to_index.len() + files_to_remove.len()) as u64;
+        if batch_changes > 0 {
+            stores.changes_count.fetch_add(batch_changes, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let elapsed = start.elapsed();
         info!(
@@ -1507,6 +1524,7 @@ mod tests {
             fts_store: Arc::new(RwLock::new(FtsStore::new_with_writer(db_path).unwrap())),
             writer_lock: None,
             readonly: false,
+            changes_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
