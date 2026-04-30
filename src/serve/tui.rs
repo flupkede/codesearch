@@ -363,5 +363,24 @@ fn lock_cell_from_status(status: super::RepoStateLabel) -> Cell<'static> {
 /// Check if stdout is connected to a real terminal (TTY).
 /// Returns `false` when piped, redirected, or running as a service.
 pub fn is_tty() -> bool {
+    // crossterm::terminal::size() returns Err when stdout is not a real terminal.
+    // This covers piped, redirected, and service scenarios.
     crossterm::terminal::size().is_ok()
+}
+
+/// Attempt to start the TUI. Returns None if no TTY is available.
+/// Logs a one-line message to stderr in non-TTY mode.
+pub fn maybe_spawn_tui(
+    state: Arc<ServeState>,
+    cancel_token: CancellationToken,
+    serve_url: String,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !is_tty() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        if let Err(e) = run_tui(state, cancel_token, serve_url).await {
+            tracing::error!("TUI error: {}", e);
+        }
+    }))
 }

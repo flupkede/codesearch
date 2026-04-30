@@ -50,6 +50,7 @@ pub(crate) enum RepoStateLabel {
 }
 
 impl RepoStateLabel {
+    #[allow(dead_code)]
     fn colored(&self) -> colored::ColoredString {
         match self {
             Self::Open => "Open".green().bold(),
@@ -887,6 +888,8 @@ impl ServeState {
     }
 
     /// Print a formatted dashboard table to stderr.
+    /// Only used for debugging; the TUI replaces this in production.
+    #[allow(dead_code)]
     pub(crate) fn print_dashboard(&self) {
         let repos = self.repo_statuses_lightweight();
         if repos.is_empty() {
@@ -934,14 +937,28 @@ impl ServeState {
 
         // Rows
         for (alias, info) in &repos {
-            let status_str = info.status.colored().to_string();
+            // Format status as plain text first, then apply color.
+            // This avoids ANSI escape codes interfering with padding alignment.
+            let status_plain = match info.status {
+                RepoStateLabel::Open => "Open",
+                RepoStateLabel::Warm => "Warm",
+                RepoStateLabel::Readonly => "Readonly",
+                RepoStateLabel::Closed => "Closed",
+                RepoStateLabel::Indexing => "Indexing",
+                RepoStateLabel::Error => "Error",
+                RepoStateLabel::NoIndex => "No Index",
+            };
+            let status_colored = info.status.colored();
+            let status_padded = format!("{:<w_status$}", status_plain, w_status = status_w);
+            // Replace the plain text with the colored version
+            let status_display = status_padded.replace(status_plain, &status_colored.to_string());
             let tool_str = info.last_tool_call.as_deref().unwrap_or("—");
-            eprintln!("{} {:<w_alias$} {} {:<w_status$} {} {:>7} {} {:<24} {}",
+            eprintln!("{} {:<w_alias$} {} {} {} {:>7} {} {:<24} {}",
                 "│".bright_black(), alias, "│".bright_black(),
-                status_str, "│".bright_black(),
+                status_display, "│".bright_black(),
                 info.changes, "│".bright_black(),
                 tool_str, "│".bright_black(),
-                w_alias = alias_w, w_status = status_w,
+                w_alias = alias_w,
             );
         }
 
@@ -1600,22 +1617,7 @@ pub async fn run_serve(
     let tui_state = serve_state.clone();
     let tui_url = serve_url.clone();
 
-    let has_tty = tui::is_tty();
-    let tui_handle: Option<tokio::task::JoinHandle<()>> = if has_tty {
-        Some(tokio::spawn(async move {
-            if let Err(e) = tui::run_tui(tui_state, tui_cancel, tui_url).await {
-                tracing::error!("TUI error: {}", e);
-            }
-        }))
-    } else {
-        info!("No TTY detected — running without TUI (log-only mode)");
-        None
-    };
-
-    // Print initial dashboard (non-TTY fallback, or first snapshot for log)
-    if !has_tty {
-        serve_state.print_dashboard();
-    }
+    let tui_handle = tui::maybe_spawn_tui(tui_state, tui_cancel, tui_url);
 
     // ── Background pre-warming (NO FSW) ──
     // Open all registered repos sequentially: opens DB, builds vector index,
