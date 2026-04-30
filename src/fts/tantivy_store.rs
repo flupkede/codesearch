@@ -69,15 +69,8 @@ impl FtsStore {
         Ok(results)
     }
 
-    /// Create or open an FTS index at the given path.
-    ///
-    /// Opens in a mode that supports both reading and writing.
-    /// Writer is lazy-initialized on first write operation.
-    pub fn new(db_path: &Path) -> Result<Self> {
-        let fts_path = db_path.join("fts");
-        std::fs::create_dir_all(&fts_path)?;
-
-        // Build schema
+    /// Build the FTS schema (shared between new() and new_in_memory()).
+    fn build_schema() -> (Schema, Field, Field, Field, Field, Field) {
         let mut schema_builder = Schema::builder();
 
         // Chunk ID - stored and indexed for retrieval and deletion
@@ -98,7 +91,26 @@ impl FtsStore {
         // Kind - stored for filtering (function, class, etc)
         let kind_field = schema_builder.add_text_field("kind", STRING | STORED);
 
-        let schema = schema_builder.build();
+        (
+            schema_builder.build(),
+            chunk_id_field,
+            content_field,
+            path_field,
+            signature_field,
+            kind_field,
+        )
+    }
+
+    /// Create or open an FTS index at the given path.
+    ///
+    /// Opens in a mode that supports both reading and writing.
+    /// Writer is lazy-initialized on first write operation.
+    pub fn new(db_path: &Path) -> Result<Self> {
+        let fts_path = db_path.join("fts");
+        std::fs::create_dir_all(&fts_path)?;
+
+        let (schema, chunk_id_field, content_field, path_field, signature_field, kind_field) =
+            Self::build_schema();
 
         // Open or create index with retry logic for Windows file locking
         let index = Self::open_or_create_index_with_retry(&fts_path, &schema)?;
@@ -110,6 +122,40 @@ impl FtsStore {
             index,
             reader,
             writer: None, // Lazy-initialized on first write
+            schema,
+            chunk_id_field,
+            content_field,
+            path_field,
+            signature_field,
+            kind_field,
+        })
+    }
+
+    /// Create an in-memory FTS index for testing.
+    ///
+    /// Uses `RamDirectory` instead of `MmapDirectory` to avoid Windows file
+    /// locking and mmap staleness issues that cause flaky tests. All data
+    /// lives in process memory — no files are written to disk.
+    #[cfg(test)]
+    pub fn new_in_memory() -> Result<Self> {
+        use tantivy::directory::RamDirectory;
+        use tantivy::ReloadPolicy;
+
+        let (schema, chunk_id_field, content_field, path_field, signature_field, kind_field) =
+            Self::build_schema();
+
+        let directory = RamDirectory::create();
+        let index = Index::create(directory, schema.clone(), IndexSettings::default())?;
+
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+
+        Ok(Self {
+            index,
+            reader,
+            writer: None,
             schema,
             chunk_id_field,
             content_field,
@@ -429,6 +475,12 @@ impl FtsStore {
         // Boost signature field for better matching of function names, class names, etc.
         query_parser.set_field_boost(self.signature_field, 2.0);
 
+        // Use AND (conjunction) by default instead of OR (disjunction).
+        // With OR, "Database cleared" matches any chunk containing EITHER word,
+        // which returns thousands of irrelevant results in large codebases.
+        // AND requires ALL words to be present, producing fewer but accurate results.
+        query_parser.set_conjunction_by_default();
+
         // Boost kind field when structural intent is detected
         if let Some(ref _kind) = target_kind {
             query_parser.set_field_boost(self.kind_field, 3.0); // High boost for kind field
@@ -614,14 +666,10 @@ pub struct FtsStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn test_fts_basic() -> Result<()> {
-        let dir = tempdir()?;
-        let db_path = dir.path().to_path_buf();
-
-        let mut store = FtsStore::new(&db_path)?;
+        let mut store = FtsStore::new_in_memory()?;
 
         // Add some chunks
         store.add_chunk(
@@ -668,10 +716,7 @@ mod tests {
 
     #[test]
     fn test_fts_delete() -> Result<()> {
-        let dir = tempdir()?;
-        let db_path = dir.path().to_path_buf();
-
-        let mut store = FtsStore::new(&db_path)?;
+        let mut store = FtsStore::new_in_memory()?;
 
         store.add_chunk(1, "test content one", "file1.rs", None, "block")?;
         store.add_chunk(2, "test content two", "file2.rs", None, "block")?;
@@ -695,10 +740,7 @@ mod tests {
 
     #[test]
     fn test_fts_search_regex() -> Result<()> {
-        let dir = tempdir()?;
-        let db_path = dir.path().to_path_buf();
-
-        let mut store = FtsStore::new(&db_path)?;
+        let mut store = FtsStore::new_in_memory()?;
 
         store.add_chunk(
             1,
@@ -757,10 +799,7 @@ mod tests {
 
     #[test]
     fn test_fts_search_phrase() -> Result<()> {
-        let dir = tempdir()?;
-        let db_path = dir.path().to_path_buf();
-
-        let mut store = FtsStore::new(&db_path)?;
+        let mut store = FtsStore::new_in_memory()?;
 
         store.add_chunk(
             1,

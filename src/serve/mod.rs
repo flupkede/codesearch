@@ -10,6 +10,8 @@
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
+mod tui;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +50,7 @@ pub(crate) enum RepoStateLabel {
 }
 
 impl RepoStateLabel {
+    #[allow(dead_code)]
     fn colored(&self) -> colored::ColoredString {
         match self {
             Self::Open => "Open".green().bold(),
@@ -824,7 +827,6 @@ impl ServeState {
     }
 
     /// Decrement active session count.
-    #[allow(dead_code)]
     pub(crate) fn session_disconnected(&self) {
         self.active_sessions.fetch_sub(1, Ordering::Relaxed);
     }
@@ -886,6 +888,8 @@ impl ServeState {
     }
 
     /// Print a formatted dashboard table to stderr.
+    /// Only used for debugging; the TUI replaces this in production.
+    #[allow(dead_code)]
     pub(crate) fn print_dashboard(&self) {
         let repos = self.repo_statuses_lightweight();
         if repos.is_empty() {
@@ -933,14 +937,28 @@ impl ServeState {
 
         // Rows
         for (alias, info) in &repos {
-            let status_str = info.status.colored().to_string();
+            // Format status as plain text first, then apply color.
+            // This avoids ANSI escape codes interfering with padding alignment.
+            let status_plain = match info.status {
+                RepoStateLabel::Open => "Open",
+                RepoStateLabel::Warm => "Warm",
+                RepoStateLabel::Readonly => "Readonly",
+                RepoStateLabel::Closed => "Closed",
+                RepoStateLabel::Indexing => "Indexing",
+                RepoStateLabel::Error => "Error",
+                RepoStateLabel::NoIndex => "No Index",
+            };
+            let status_colored = info.status.colored();
+            let status_padded = format!("{:<w_status$}", status_plain, w_status = status_w);
+            // Replace the plain text with the colored version
+            let status_display = status_padded.replace(status_plain, &status_colored.to_string());
             let tool_str = info.last_tool_call.as_deref().unwrap_or("—");
-            eprintln!("{} {:<w_alias$} {} {:<w_status$} {} {:>7} {} {:<24} {}",
+            eprintln!("{} {:<w_alias$} {} {} {} {:>7} {} {:<24} {}",
                 "│".bright_black(), alias, "│".bright_black(),
-                status_str, "│".bright_black(),
+                status_display, "│".bright_black(),
                 info.changes, "│".bright_black(),
                 tool_str, "│".bright_black(),
-                w_alias = alias_w, w_status = status_w,
+                w_alias = alias_w,
             );
         }
 
@@ -1591,8 +1609,15 @@ pub async fn run_serve(
     info!("   Health: http://{}{}", addr, HEALTH_PATH);
     info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
 
-    // Print initial dashboard
-    serve_state.print_dashboard();
+    // ── Start TUI (if TTY available) ──
+    // When a real terminal is attached, launch the fullscreen ratatui TUI.
+    // When piped / no TTY, fall back to periodic eprintln dashboard.
+    let serve_url = format!("http://{}", addr);
+    let tui_cancel = cancel_token.clone();
+    let tui_state = serve_state.clone();
+    let tui_url = serve_url.clone();
+
+    let tui_handle = tui::maybe_spawn_tui(tui_state, tui_cancel, tui_url);
 
     // ── Background pre-warming (NO FSW) ──
     // Open all registered repos sequentially: opens DB, builds vector index,
@@ -1614,7 +1639,6 @@ pub async fn run_serve(
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 info!("🔥 Background warming complete");
-                warmup_state.print_dashboard();
             }
         });
     }
@@ -1630,11 +1654,8 @@ pub async fn run_serve(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        let before = reaper_state.repos.len();
                         reaper_state.evict_idle_repos();
-                        if reaper_state.repos.len() < before {
-                            reaper_state.print_dashboard();
-                        }
+                        // Dashboard refresh handled by TUI auto-refresh (TTY) or not needed (non-TTY)
                     }
                     _ = reaper_cancel.cancelled() => {
                         break;
@@ -1674,6 +1695,13 @@ pub async fn run_serve(
             // This is expected when MCP clients hold open SSE sessions.
             info!("⚠️  Shutdown deadline reached — forcing exit (open sessions dropped)");
         }
+    }
+
+    // Wait for the TUI task to finish cleanup (restore terminal).
+    // The TUI's Drop guard restores the terminal, so we need to give it
+    // a moment before the process exits.
+    if let Some(handle) = tui_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
     }
 
     Ok(())

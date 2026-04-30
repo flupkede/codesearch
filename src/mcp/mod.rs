@@ -2257,6 +2257,16 @@ impl std::fmt::Debug for CodesearchService {
     }
 }
 
+impl Drop for CodesearchService {
+    fn drop(&mut self) {
+        // When a session ends (CodesearchService is dropped), decrement the active session counter.
+        // This pairs with the session_connected() call in the service factory in serve/mod.rs.
+        if let Some(ref serve_state) = self.serve_state {
+            serve_state.session_disconnected();
+        }
+    }
+}
+
 // === Multi-store fan-out traits ===
 
 /// Trait for types that have a chunk ID (used for deduplication in group fan-out).
@@ -3186,15 +3196,20 @@ impl CodesearchService {
 
         let needs_local_db = stores.is_none() && !is_multi;
 
-        // Record tool call for serve dashboard tracking
+        // Record tool call for serve dashboard tracking.
+        // Skip recording for unscoped multi-store fan-out (allow_unscoped=true means
+        // get_chunk or status — get_chunk will record after candidate detection,
+        // status doesn't need per-repo recording).
         if let Some(ref serve_state) = self.serve_state {
-            if let Some(ref aliases) = store_aliases {
-                for alias in aliases {
+            if !allow_unscoped || !is_multi {
+                if let Some(ref aliases) = store_aliases {
+                    for alias in aliases {
+                        serve_state.record_tool_call(alias, tool_name);
+                    }
+                }
+                if let Some(ref alias) = project_alias {
                     serve_state.record_tool_call(alias, tool_name);
                 }
-            }
-            if let Some(ref alias) = project_alias {
-                serve_state.record_tool_call(alias, tool_name);
             }
         }
 
@@ -4717,7 +4732,11 @@ impl CodesearchService {
                     }
                     1 => {
                         // Exactly one store has this chunk_id — auto-route
-                        let (store_arc, _alias) = candidates[0];
+                        let (store_arc, alias) = candidates[0];
+                        // Record tool call for the specific repo that served this chunk
+                        if let Some(ref serve_state) = self.serve_state {
+                            serve_state.record_tool_call(alias, "get_chunk");
+                        }
                         let store = store_arc.vector_store.read().await;
                         store.get_chunk(request.chunk_id).unwrap_or_default()
                     }

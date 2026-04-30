@@ -471,7 +471,7 @@ impl VectorStore {
             return Ok(0);
         }
 
-        eprintln!("📊 Inserting {} chunks...", chunks.len());
+        info_print!("📊 Inserting {} chunks...", chunks.len());
 
         let mut wtxn = self.env.write_txn()?;
         let writer = Writer::new(self.vectors, 0, self.dimensions);
@@ -503,7 +503,7 @@ impl VectorStore {
         // Mark as not indexed (need to rebuild index after inserts)
         self.indexed = false;
 
-        eprintln!(
+        info_print!(
             "✅ Inserted {} chunks (IDs: {}-{})",
             chunks.len(),
             self.next_id - chunks.len() as u32,
@@ -835,7 +835,7 @@ impl VectorStore {
     /// Clear all data from the database
     #[allow(dead_code)] // Reserved for database reset operations
     pub fn clear(&mut self) -> Result<()> {
-        eprintln!("🗑️  Clearing database...");
+        info_print!("🗑️  Clearing database...");
 
         let mut wtxn = self.env.write_txn()?;
 
@@ -848,7 +848,7 @@ impl VectorStore {
         self.next_id = 0;
         self.indexed = false;
 
-        eprintln!("✅ Database cleared");
+        info_print!("✅ Database cleared");
         Ok(())
     }
 

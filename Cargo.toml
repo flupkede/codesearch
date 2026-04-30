@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.0.44"
+version = "1.0.61"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -67,6 +67,10 @@ axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
 # Utilities
 rayon = "1.10"
 dashmap = "6.1"
@@ -91,6 +95,7 @@ rand = "0.8"
 rmcp = { version = "1.5.0", features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros"] }
 schemars = { version = "1.1.0", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+sysinfo = { version = "0.38.4", default-features = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
