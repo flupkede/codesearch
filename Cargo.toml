@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.0.54"
+version = "1.0.55"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -95,6 +95,7 @@ rand = "0.8"
 rmcp = { version = "1.5.0", features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros"] }
 schemars = { version = "1.1.0", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+sysinfo = { version = "0.38.4", default-features = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

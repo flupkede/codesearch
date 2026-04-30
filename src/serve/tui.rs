@@ -381,16 +381,21 @@ fn render_footer(
         String::new()
     };
 
+    let stats = process_stats();
     let sessions_str = format!("Sessions: {}", active);
+    let mem_str = format!("RAM: {}", stats.memory);
+    let cpu_str = format!("CPU: {}", stats.cpu);
 
-    // Use Layout to split footer into left (keys) and right (sessions)
+    // Right side: CPU | RAM | Sessions
+    let right_len = cpu_str.len() + mem_str.len() + sessions_str.len() + 6; // 6 = " | " separators
+
     let footer_inner = area.inner(Margin {
         vertical: 0,
         horizontal: 1,
     });
     let [left, right] = Layout::horizontal([
         Constraint::Min(0),
-        Constraint::Length(sessions_str.len() as u16 + 2),
+        Constraint::Length(right_len as u16 + 2),
     ])
     .areas(footer_inner);
 
@@ -401,6 +406,10 @@ fn render_footer(
     ]);
 
     let right_line = Line::from(vec![
+        Span::styled(cpu_str, Style::default().fg(Color::Green)),
+        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(mem_str, Style::default().fg(Color::Magenta)),
+        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(sessions_str, Style::default().fg(Color::Cyan)),
     ]);
 
@@ -411,6 +420,42 @@ fn render_footer(
 // ---------------------------------------------------------------------------
 // Cell styling helpers
 // ---------------------------------------------------------------------------
+
+/// Get current process memory (RSS) and CPU usage as human-readable strings.
+/// Uses `sysinfo` crate — cross-platform (Windows, Linux, macOS).
+struct ProcessStats {
+    memory: String,
+    cpu: String,
+}
+
+fn process_stats() -> ProcessStats {
+    use sysinfo::{ProcessesToUpdate, System};
+
+    let mut sys = System::new();
+    let pid = match sysinfo::get_current_pid() {
+        Ok(p) => p,
+        Err(_) => return ProcessStats { memory: "—".into(), cpu: "—".into() },
+    };
+
+    // Refresh only our process (memory + cpu)
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+
+    let (memory, cpu) = match sys.process(pid) {
+        Some(proc) => {
+            let bytes = proc.memory();
+            let mem = if bytes >= 1024 * 1024 {
+                format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0))
+            } else {
+                format!("{:.0} KB", bytes as f64 / 1024.0)
+            };
+            let cpu = format!("{:.0}%", proc.cpu_usage());
+            (mem, cpu)
+        }
+        None => ("—".into(), "—".into()),
+    };
+
+    ProcessStats { memory, cpu }
+}
 
 fn status_cell(status: super::RepoStateLabel) -> Cell<'static> {
     use super::RepoStateLabel::*;
