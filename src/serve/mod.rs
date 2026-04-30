@@ -10,6 +10,8 @@
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
+mod tui;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1590,8 +1592,30 @@ pub async fn run_serve(
     info!("   Health: http://{}{}", addr, HEALTH_PATH);
     info!("   MCP:    http://{}{}", addr, MCP_ENDPOINT_PATH);
 
-    // Print initial dashboard
-    serve_state.print_dashboard();
+    // ── Start TUI (if TTY available) ──
+    // When a real terminal is attached, launch the fullscreen ratatui TUI.
+    // When piped / no TTY, fall back to periodic eprintln dashboard.
+    let serve_url = format!("http://{}", addr);
+    let tui_cancel = cancel_token.clone();
+    let tui_state = serve_state.clone();
+    let tui_url = serve_url.clone();
+
+    let has_tty = tui::is_tty();
+    let _tui_handle = if has_tty {
+        Some(tokio::spawn(async move {
+            if let Err(e) = tui::run_tui(tui_state, tui_cancel, tui_url).await {
+                tracing::error!("TUI error: {}", e);
+            }
+        }))
+    } else {
+        info!("No TTY detected — running without TUI (log-only mode)");
+        None
+    };
+
+    // Print initial dashboard (non-TTY fallback, or first snapshot for log)
+    if !has_tty {
+        serve_state.print_dashboard();
+    }
 
     // ── Background pre-warming (NO FSW) ──
     // Open all registered repos sequentially: opens DB, builds vector index,
@@ -1613,7 +1637,6 @@ pub async fn run_serve(
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 info!("🔥 Background warming complete");
-                warmup_state.print_dashboard();
             }
         });
     }
@@ -1629,11 +1652,9 @@ pub async fn run_serve(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        let before = reaper_state.repos.len();
+                        let _before = reaper_state.repos.len();
                         reaper_state.evict_idle_repos();
-                        if reaper_state.repos.len() < before {
-                            reaper_state.print_dashboard();
-                        }
+                        // Dashboard refresh handled by TUI auto-refresh (TTY) or not needed (non-TTY)
                     }
                     _ = reaper_cancel.cancelled() => {
                         break;
