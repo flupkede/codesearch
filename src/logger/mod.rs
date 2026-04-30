@@ -297,8 +297,9 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<L
 /// # Returns
 /// Returns `LoggerInitResult` indicating whether file logging is active.
 pub fn init_serve_logger(log_level: LogLevel, _quiet: bool) -> Result<LoggerInitResult> {
-    // Suppress info_print! / eprintln output — serve TUI must not be corrupted.
-    crate::output::set_quiet(true);
+    // Lock quiet mode — once set, it cannot be unset by background tasks.
+    // This prevents FSW/indexing from printing to stderr and corrupting the TUI.
+    crate::output::lock_quiet();
 
     let log_dir = crate::constants::get_global_cache_dir().join(LOG_DIR_NAME);
     ensure_log_dir(&log_dir)?;

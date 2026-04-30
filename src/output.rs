@@ -1,15 +1,34 @@
 //! Output control for quiet mode and JSON output
 //!
 //! Provides a global quiet mode flag to suppress non-essential output.
+//! In serve mode, quiet is "locked" — once set to true, it cannot be unset.
+//! This prevents background tasks (FSW, warmup) from re-enabling output.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Global quiet mode flag
 static QUIET_MODE: AtomicBool = AtomicBool::new(false);
 
-/// Enable quiet mode (suppresses informational output)
+/// Once set to true (serve mode), quiet cannot be unset.
+/// This prevents FSW/indexing tasks from accidentally re-enabling stderr output.
+static QUIET_LOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Enable quiet mode (suppresses informational output).
+/// In serve mode, call `lock_quiet()` first — then `set_quiet(false)` becomes a no-op.
 pub fn set_quiet(quiet: bool) {
-    QUIET_MODE.store(quiet, Ordering::SeqCst);
+    if quiet {
+        QUIET_MODE.store(true, Ordering::SeqCst);
+    } else if !QUIET_LOCKED.load(Ordering::SeqCst) {
+        QUIET_MODE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Lock quiet mode — once called, `set_quiet(false)` becomes a no-op.
+/// Called once from `init_serve_logger()` to prevent background tasks from
+/// re-enabling stderr output that would corrupt the TUI.
+pub fn lock_quiet() {
+    QUIET_MODE.store(true, Ordering::SeqCst);
+    QUIET_LOCKED.store(true, Ordering::SeqCst);
 }
 
 /// Check if quiet mode is enabled
