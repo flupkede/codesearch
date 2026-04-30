@@ -698,6 +698,25 @@ cargo fmt                # Format
 cargo clippy             # Lint
 ```
 
+### Workflow
+
+- Create feature branches from `develop`: `git checkout -b feature/xxx develop`
+- Open PRs against `develop`
+- `master` is the release branch — only updated via PR `develop → master`
+- Branch naming: `feature/xxx`, `fix/xxx`, `chore/xxx`, `docs/xxx`
+
+### Release Process
+
+1. Create PR `develop → master`
+2. Review and merge
+3. Tag on master:
+   ```bash
+   git checkout master && git pull
+   git tag -a v1.x.x -m "Release v1.x.x"
+   git push origin v1.x.x
+   ```
+4. Create GitHub Release on the tag
+
 ---
 
 ## License
