@@ -429,6 +429,12 @@ impl FtsStore {
         // Boost signature field for better matching of function names, class names, etc.
         query_parser.set_field_boost(self.signature_field, 2.0);
 
+        // Use AND (conjunction) by default instead of OR (disjunction).
+        // With OR, "Database cleared" matches any chunk containing EITHER word,
+        // which returns thousands of irrelevant results in large codebases.
+        // AND requires ALL words to be present, producing fewer but accurate results.
+        query_parser.set_conjunction_by_default();
+
         // Boost kind field when structural intent is detected
         if let Some(ref _kind) = target_kind {
             query_parser.set_field_boost(self.kind_field, 3.0); // High boost for kind field
