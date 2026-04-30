@@ -85,9 +85,9 @@ async fn run_tui_loop(
             }
         }
 
-        // Load session count + process stats for footer
+        // Load session count + CPU for footer
         let active = state.active_session_count();
-        let stats = process_stats(&mut sys_system);
+        let cpu = cpu_usage_str(&mut sys_system);
 
         terminal.draw(|f| {
             let size = f.area();
@@ -102,7 +102,7 @@ async fn run_tui_loop(
             render_header(f, chunks[0], serve_url);
             render_table(f, chunks[1], &repos, &mut table_state);
             render_detail(f, chunks[2], &repos, &table_state, &state);
-            render_footer(f, chunks[3], &repos, &table_state, active, &stats);
+            render_footer(f, chunks[3], &repos, &table_state, active, &cpu);
         })?;
 
         // Poll for key events
@@ -383,7 +383,7 @@ fn render_footer(
     repos: &[(String, super::RepoStatusInfo)],
     table_state: &TableState,
     active: u64,
-    stats: &ProcessStats,
+    cpu: &str,
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
@@ -393,11 +393,10 @@ fn render_footer(
     };
 
     let sessions_str = format!("Sessions: {}", active);
-    let mem_str = format!("Mem: {}", stats.memory);
-    let cpu_str = format!("CPU: {}", stats.cpu);
+    let cpu_str = format!("CPU: {}", cpu);
 
-    // Right side: CPU | RAM | Sessions
-    let right_len = cpu_str.len() + mem_str.len() + sessions_str.len() + 6; // 6 = " | " separators
+    // Right side: CPU | Sessions
+    let right_len = cpu_str.len() + sessions_str.len() + 3; // 3 = " │ "
 
     let footer_inner = area.inner(Margin {
         vertical: 0,
@@ -418,8 +417,6 @@ fn render_footer(
     let right_line = Line::from(vec![
         Span::styled(cpu_str, Style::default().fg(Color::Green)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(mem_str, Style::default().fg(Color::Magenta)),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(sessions_str, Style::default().fg(Color::Cyan)),
     ]);
 
@@ -431,74 +428,30 @@ fn render_footer(
 // Cell styling helpers
 // ---------------------------------------------------------------------------
 
-/// Get current process memory (private) and CPU usage as human-readable strings.
-/// Uses `sysinfo` crate for CPU, and platform-specific API for memory.
+/// Get current process CPU usage as a human-readable string.
 ///
-/// **Important:** `sys_system` must be reused across calls. `cpu_usage()` computes
-/// a delta between refresh calls; a fresh `System` always returns 0%.
+/// Uses `sysinfo` crate — fully cross-platform, no platform-specific code.
 ///
-/// **Memory note:** On Windows we report "Private Bytes" (heap + stack, excluding
-/// mmap'd files like LMDB). This matches Task Manager's "Private Working Set" and
-/// is the meaningful metric for actual RAM consumption. RSS would include the full
-/// LMDB map_size (often 1+ GB of mmap'd pages) which is misleading.
-struct ProcessStats {
-    memory: String,
-    cpu: String,
-}
-
-fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.0} KB", bytes as f64 / 1024.0)
-    }
-}
-
-/// Get the process private bytes (heap + stack, no mmap) in a cross-platform way.
-/// On Windows: uses PROCESS_MEMORY_COUNTERS.PrivateUsage via sysinfo's virtual_memory()
-///             which on Windows returns private bytes, not true virtual memory.
-/// On Linux/macOS: falls back to RSS from sysinfo (less misleading on those platforms).
-fn private_bytes(proc: &sysinfo::Process) -> u64 {
-    // sysinfo's virtual_memory() on Windows returns "Private Bytes" from
-    // PROCESS_MEMORY_COUNTERS.PrivateUsage — exactly what Task Manager shows.
-    // On Linux it returns VIRT (total virtual) which is less useful,
-    // so we fall back to RSS on non-Windows platforms.
-    #[cfg(target_os = "windows")]
-    {
-        proc.virtual_memory()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        proc.memory()
-    }
-}
-
-fn process_stats(sys_system: &mut Option<sysinfo::System>) -> ProcessStats {
+/// **Important:** `sys_system` must be reused across calls so `cpu_usage()` can
+/// compute a delta between refresh calls (first call always returns 0%).
+fn cpu_usage_str(sys_system: &mut Option<sysinfo::System>) -> String {
     use sysinfo::{ProcessesToUpdate, System};
 
     let pid = match sysinfo::get_current_pid() {
         Ok(p) => p,
-        Err(_) => return ProcessStats { memory: "—".into(), cpu: "—".into() },
+        Err(_) => return "—".into(),
     };
 
     // Create System instance on first call, reuse on subsequent calls.
     let sys = sys_system.get_or_insert_with(System::new);
 
-    // Refresh only our process (memory + cpu)
+    // Refresh only our process (cpu)
     sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
 
-    let (memory, cpu) = match sys.process(pid) {
-        Some(proc) => {
-            let mem = format_bytes(private_bytes(proc));
-            let cpu = format!("{:.0}%", proc.cpu_usage());
-            (mem, cpu)
-        }
-        None => ("—".into(), "—".into()),
-    };
-
-    ProcessStats { memory, cpu }
+    match sys.process(pid) {
+        Some(proc) => format!("{:.0}%", proc.cpu_usage()),
+        None => "—".into(),
+    }
 }
 
 fn status_cell(status: super::RepoStateLabel) -> Cell<'static> {
