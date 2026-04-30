@@ -1,160 +1,111 @@
 # codesearch
 
-**Token-efficient MCP server for AI agents — local semantic code search powered by Rust.**
+**Cross-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid search, symbol navigation, and multi-repository orchestration.**
 
-codesearch is designed as the primary bridge between AI agents and your codebase. It provides a Model Context Protocol (MCP) server that enables OpenCode, Claude Code, and other AI assistants to perform intelligent, semantic code searches with minimal token usage — all running locally with no API calls.
+codesearch gives AI agents (OpenCode, Claude Code, Cursor, etc.) deep codebase understanding through 5 unified MCP tools. It runs entirely locally — no API calls, no cloud dependencies. Index once, search semantically across multiple repositories simultaneously.
 
-**Use AI to understand your code:** Query your codebase with natural language like *"where do we handle authentication?"* or *"show me all API endpoints"* and get instant, accurate results.
+## Why codesearch?
 
-> **Fork notice:** This project is a fork of [demongrep](https://github.com/yxanul/demongrep) by [yxanul](https://github.com/yxanul). Huge thanks to yxanul for creating the original project — it's an excellent piece of work and the foundation everything here builds on. Some features (like global database support) were contributed back to demongrep via PR. codesearch extends it further with incremental indexing, MCP token optimizations, AI agent integration, and more.
+- **Multi-repo search**: Fan-out queries across repository groups
+- **Hybrid retrieval**: Vector embeddings + BM25 full-text search fused with Reciprocal Rank Fusion
+- **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents
+- **AST-aware chunking**: Tree-sitter parsing for 9 languages — chunks align to functions/classes, not arbitrary line ranges
+- **Token-efficient**: Returns metadata by default; agents fetch full code only when needed via `get_chunk`
+- **Zero config for single repos**: `codesearch index && codesearch mcp` — done
 
----
+## Architecture
 
-## Features
+```mermaid
+graph TB
+    Agent[AI Agent / MCP Client] -->|MCP stdio or HTTP| Router{MCP Router}
 
-### 🤖 MCP Server (Primary Use Case)
+    Router --> Search[search tool]
+    Router --> Find[find tool]
+    Router --> Explore[explore tool]
+    Router --> GetChunk[get_chunk tool]
+    Router --> Status[status tool]
 
-- **Token-Efficient AI Integration** — Compact responses minimize token usage in AI conversations
-- **OpenCode Compatible** — Seamless integration with OpenCode and other MCP-compatible agents
-- **Automatic Index Discovery** — Finds your codebase index automatically from any directory
-- **Real-Time Updates** — File watcher and git branch detection keep index current during AI sessions
-- **Privacy-First** — All processing local, no code leaves your machine, no external API calls
+    Search -->|mode=semantic| Semantic[Vector ANN + BM25 + RRF Fusion]
+    Search -->|mode=literal| Literal[Tantivy FTS / Regex]
 
-### 🔍 Core Search Capabilities
+    Find -->|definition/usages| SymbolIndex[Symbol Index]
+    Find -->|imports/dependents| DepGraph[Dependency Graph]
 
-- **Semantic Search** — Natural language queries that understand code meaning
-- **Hybrid Search** — Vector similarity + BM25 full-text search with RRF fusion
-- **Neural Reranking** — Optional cross-encoder reranking for higher accuracy
-- **Smart Chunking** — Tree-sitter AST-aware chunking that preserves functions, classes, methods
-- **Incremental Indexing** — Only re-indexes changed files (10–100× faster updates)
-- **Embedding Cache** — Three-layer caching system for dramatically faster subsequent indexes
-- **Git-Aware Index Placement** — Automatically places indexes at git repository roots
-- **Automatic Branch Detection** — Detects git branch changes and refreshes the index
-- **Global & Local Indexes** — Per-project local indexes or a shared global index
-- **Fast** — Sub-second search after initial model load
+    Explore -->|outline| TreeSitter[Tree-sitter AST]
+    Explore -->|similar| Semantic
 
----
+    Semantic --> Arroy[arroy ANN vectors]
+    Semantic --> Tantivy[Tantivy BM25]
+    Arroy --> LMDB[(LMDB)]
+    Tantivy --> TantivyIdx[(Tantivy Index)]
 
-## Table of Contents
+    GetChunk --> LMDB
 
-- [Installation](#installation)
-- [Quick Start for MCP](#quick-start-for-mcp)
-- [Indexing](#indexing)
-- [Git Integration](#git-integration)
-- [Embedding Cache](#embedding-cache)
-- [Searching](#searching)
-- [MCP Server Configuration](#mcp-server-configuration)
-- [Other Commands](#other-commands)
-- [Search Modes](#search-modes)
-- [Global vs Local Indexes](#global-vs-local-indexes)
-- [Supported Languages](#supported-languages)
-- [Embedding Models](#embedding-models)
-- [Configuration](#configuration)
-- [How It Works](#how-it-works)
-- [Troubleshooting](#troubleshooting)
+    subgraph "Serve Mode (multi-repo)"
+        ServeRouter[HTTP Router] -->|project/group routing| Repo1[Repo A]
+        ServeRouter --> Repo2[Repo B]
+        ServeRouter --> RepoN[Repo N]
+    end
 
----
+    Router -->|client mode| ServeRouter
+```
 
-## Installation
+## Quick Start
 
-### 📥 Download Pre-built Binary (Recommended)
+### Install
 
-The fastest way to get started - download a single executable ready to use. No dependencies, no build process, just extract and run.
-
-Download the latest release for your platform from [Releases](https://github.com/flupkede/codesearch/releases):
+Download pre-built binaries from [Releases](https://github.com/flupkede/codesearch/releases):
 
 | Platform | Download |
-|---|---|
-| **Windows x86_64** | `codesearch-windows-x86_64.zip` |
-| **Linux x86_64** | `codesearch-linux-x86_64.tar.gz` |
-| **macOS (Apple Silicon)** | `codesearch-macos-arm64.tar.gz` |
+|----------|----------|
+| Windows x86_64 | `codesearch-windows-x86_64.zip` |
+| Linux x86_64 | `codesearch-linux-x86_64.tar.gz` |
+| macOS ARM64 | `codesearch-macos-arm64.tar.gz` |
 
-Extract and place the binary somewhere on your `PATH`:
-
-**Windows (PowerShell):**
-```powershell
-# Extract zip
-Expand-Archive codesearch-windows-x86_64.zip
-# Add to PATH or move to directory on PATH
-$env:Path += ";$PWD"
-```
-
-**Linux/macOS:**
-```bash
-# Extract tar.gz
-tar -xzf codesearch-linux-x86_64.tar.gz  # or codesearch-macos-arm64.tar.gz
-# Move to PATH
-sudo mv codesearch /usr/local/bin/
-# Verify installation
-codesearch --version
-```
-
-### 🔨 Building from Source
-
-If you prefer to build from source or need a custom build, you'll need Rust and a few dependencies.
-
-#### Prerequisites
-
-| Platform | Command |
-|---|---|
-| **Rust** | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| **Ubuntu/Debian** | `sudo apt-get install -y build-essential protobuf-compiler libssl-dev pkg-config` |
-| **Fedora/RHEL** | `sudo dnf install -y gcc protobuf-compiler openssl-devel pkg-config` |
-| **macOS** | `brew install protobuf openssl pkg-config` |
-| **Windows** | `winget install -e --id Google.Protobuf` or `choco install protoc` |
-
-#### Build Steps
+Or build from source:
 
 ```bash
 git clone https://github.com/flupkede/codesearch.git
 cd codesearch
-
-# Build release binary
 cargo build --release
-
-# Binary location:
-#   Linux/macOS: target/release/codesearch
-#   Windows:     target\release\codesearch.exe
-
-# Optionally add to PATH:
-# Linux/macOS:
-sudo cp target/release/codesearch /usr/local/bin/
-# Windows (PowerShell, as admin):
-Copy-Item target\release\codesearch.exe "$env:LOCALAPPDATA\Microsoft\WindowsApps\"
 ```
 
-
-### Verify Installation
+### Index a repository
 
 ```bash
-codesearch --version
-codesearch doctor
+# Register and index a repo (adds to ~/.codesearch/repos.json)
+codesearch index add /path/to/my-project --alias my-project
+
+# Incremental update (only changed files)
+codesearch index /path/to/my-project
+
+# Full rebuild
+codesearch index /path/to/my-project --force
+
+# Remove a repo
+codesearch index rm /path/to/my-project
+
+# List registered repos
+codesearch index list
 ```
 
----
+First-time indexing takes 2–5 minutes. Subsequent runs are incremental (10–30s). Branch switches trigger automatic re-indexing.
 
-## Quick Start for MCP
+## MCP Configuration
 
-Get up and running with AI agents in under 2 minutes.
+codesearch connects to AI agents via MCP. Two modes:
 
-### 1️⃣ Install codesearch
+| Mode | How | Best for |
+|------|-----|----------|
+| **Local (stdio)** | `codesearch mcp` — single repo, auto-index + file watching | Working on one project |
+| **Serve (HTTP)** | `codesearch serve` — multi-repo, TUI dashboard, lazy FSW | Multiple repos, cross-repo search |
 
-Download the pre-built binary for your platform from [Releases](https://github.com/flupkede/codesearch/releases) and extract it to your PATH, or build from source (see [Installation](#installation)).
+### Local / Single Repo
 
-### 2️⃣ Index your codebase
+The agent spawns `codesearch mcp` as a subprocess. It auto-detects the nearest index and starts a file watcher.
 
-```bash
-cd /path/to/your/project
+**OpenCode** — `~/.config/opencode/config.json`:
 
-# First time: creates index at git root (~2-5 min, depends on codebase size)
-codesearch index
-```
-
-The index is automatically placed at the git repository root, so it works from any subdirectory.
-
-### 3️⃣ Configure your AI agent
-
-**For OpenCode:**
 ```json
 {
   "mcp": {
@@ -167,8 +118,8 @@ The index is automatically placed at the git repository root, so it works from a
 }
 ```
 
-**For Claude Code Desktop:**
-Add to `claude_desktop_config.json` (Windows) or `claude_desktop_config.json` (macOS/Linux):
+**Claude Code** — `~/.config/claude-code/config.json`:
+
 ```json
 {
   "mcpServers": {
@@ -180,544 +131,266 @@ Add to `claude_desktop_config.json` (Windows) or `claude_desktop_config.json` (m
 }
 ```
 
-### 4️⃣ Start using AI to understand your code
+**Claude Desktop** — `claude_desktop_config.json`:
 
-Restart your AI agent and start asking questions:
-- *"Where is the authentication logic?"*
-- *"Show me all API endpoints"*
-- *"How do we handle errors in this project?"*
-
-The AI agent will use codesearch to find relevant code and provide accurate answers with minimal token usage.
-
----
-
-## Quick Start for CLI
-
-```bash
-# 1. Navigate to your project
-cd /path/to/your/project
-
-# 2. Index the codebase (first time ~30–60s, incremental afterwards)
-codesearch index
-
-# 3. Search with natural language
-codesearch search "where do we handle authentication?"
+```json
+{
+  "mcpServers": {
+    "codesearch": {
+      "command": "codesearch",
+      "args": ["mcp"]
+    }
+  }
+}
 ```
 
----
+### Serve / Multi-Repo
 
-## Indexing
-
-Indexing is the core operation — it parses your code into semantic chunks, generates embeddings, and stores them for fast retrieval.
+Start the server first, then connect your agent. The server manages all registered repos with a TUI dashboard, lazy filesystem watchers, and idle eviction.
 
 ```bash
-codesearch index [PATH] [OPTIONS]
+# Start the server (default port 39725)
+codesearch serve
 ```
 
-| Option | Short | Description |
-|---|---|---|
-| `--force` | `-f` | Delete existing index and rebuild from scratch (alias: `--full`) |
-| `--dry-run` | | Preview what would be indexed |
-| `--add` | | Create a new index (combine with `-g` for global) |
-| `--global` | `-g` | Target the global index (with `--add`) |
-| `--rm` | | Remove the index (alias: `--remove`) |
-| `--list` | | Show index status |
-| `--model` | | Override embedding model |
-
-### Incremental Indexing
-
-When an index already exists, `codesearch index` only processes changed, added, and deleted files — typically 10–100× faster than a full rebuild.
-
-```bash
-codesearch index           # Incremental (default)
-codesearch index --force   # Full rebuild
-codesearch index list      # Show index status
-```
-
-### What Gets Indexed
-
-All text files are included, respecting `.gitignore` and `.codesearchignore`. Binary files, `node_modules/`, `.git/`, etc. are skipped automatically.
-
-See [Global vs Local Indexes](#global-vs-local-indexes) for where the index is stored.
-
----
-
-## Git Integration
-
-codesearch is deeply integrated with git for intelligent index management and automatic updates.
-
-### Automatic Git Root Detection
-
-When you run `codesearch index`, the index is automatically placed at the **git repository root** (where `.git/` is located), regardless of your current working directory within the project.
-
-```bash
-cd /projects/myapp/src/api/
-codesearch index  # Creates .codesearch.db/ at /projects/myapp/
-```
-
-**How it works:**
-- Searches upward from the current directory to find `.git/` or `.git` (worktree) file
-- Places `.codesearch.db/` at the same level as the git repository
-- Detects nested git worktrees and errors on multiple child `.git` directories
-- Falls back to current directory if no git repository is found
-
-This ensures a **single, authoritative index per git repository**, avoiding confusion from multiple indexes in subdirectories.
-
----
-
-### Automatic Branch Change Detection
-
-codesearch monitors `.git/HEAD` in real-time and automatically refreshes the index when you switch branches.
-
-```bash
-# Currently on main branch
-codesearch index
-
-# Switch branches
-git checkout feature/new-auth
-
-# Index is automatically refreshed to reflect the new branch files
-```
-
-**Behavior:**
-- The MCP server (and `codesearch serve`) polls `.git/HEAD` every 100ms
-- Detects HEAD changes (branch switches) and triggers an incremental re-index
-- Updates happen automatically in the background — no manual intervention needed
-
-This is especially useful when working with different branches in AI coding sessions — the search results always reflect your current branch state.
-
-### Database Bloat Monitoring
-
-`codesearch stats` now shows a **bloat ratio** that indicates how much free space exists in the LMDB database:
-
-```bash
-$ codesearch stats
-Database: .codesearch.db/
-Files: 1,234
-Chunks: 45,678
-Bloat ratio: 1.2  # 1.2x size indicates 20% free space available
-```
-
-- **Bloat ratio < 1.5**: Healthy, no action needed
-- **Bloat ratio > 2.0**: Consider compacting (future feature)
-
-The bloat ratio is calculated from LMDB's internal statistics and helps monitor database health over time.
-
----
-
-## Embedding Cache
-
-codesearch uses a sophisticated caching system to dramatically speed up subsequent indexing after the initial index is created.
-
-### How Caching Works
-
-When you index your codebase, codesearch computes **embeddings** (vector representations) for each code chunk. This is the most time-consuming part of indexing. The cache system stores these embeddings so they don't need to be recomputed.
-
-```bash
-# First time: slow (all embeddings computed)
-codesearch index
-# Takes ~2-5 minutes for 10k files (depends on CPU)
-
-# Second time: fast (embeddings loaded from cache)
-codesearch index
-# Takes ~10-30 seconds (only changed files processed)
-
-# Switching branches: very fast (embeddings reused from cache)
-git checkout feature-branch
-# Index auto-refreshes in ~5-10 seconds (only new/changed files)
-```
-
-### Cache Types
-
-codesearch uses **three cache layers** for optimal performance:
-
-#### 1. In-Memory Cache (Moka LRU Cache)
-- **Location**: RAM during indexing process
-- **Size**: 100MB (configurable via `CODESEARCH_CACHE_MAX_MEMORY`)
-- **Purpose**: Cache embeddings during a single indexing session
-- **Benefit**: Avoids recomputing embeddings for duplicate chunks within the same index run
-
-#### 2. Persistent Cache (Disk-Based)
-- **Location**: `~/.codesearch/embedding_cache/<model_short_name>/`
-- **Size**: Up to 200,000 entries (~300MB)
-- **Purpose**: Long-term storage keyed by content hash (SHA256)
-- **Benefit**: Embeddings survive MCP restarts and branch switches
-- **Key Benefit**: Files with identical content across different branches share the same embedding
-
-#### 3. Query Cache (Optional)
-- **Location**: In-memory during search operations
-- **Purpose**: Cache query embeddings for repeated searches
-- **Benefit**: Repeated searches with the same query are nearly instant
-
-### Cache Benefits
-
-| Scenario | Without Cache | With Cache |
-|---|---|---|
-| First index (10k files) | ~2-5 min | ~2-5 min (cache empty) |
-| Incremental index (1% changed) | ~30 sec | ~10 sec |
-| Branch switch (50% overlap) | ~1-2 min | ~10 sec |
-| Repeated queries | ~500ms | ~50ms |
-
-### Cache Management
-
-```bash
-# Show cache statistics (all models)
-codesearch cache stats
-
-# Show cache statistics for specific model
-codesearch cache stats bge-small
-
-# Clear persistent cache for specific model
-codesearch cache clear bge-small
-
-# Clear cache without confirmation
-codesearch cache clear bge-small --yes
-```
-
-### Cache Size Monitoring
-
-The persistent cache automatically manages disk usage:
-- Default limit: 200,000 entries (~300MB)
-- Older entries are evicted when limit is reached (LRU policy)
-- Per-model isolation: Each embedding model has its own cache
-
-**Note:** The persistent cache is separate from the index database (`.codesearch.db/`). Clearing the cache does NOT delete your search index — it only deletes cached embeddings, which will be recomputed on the next index.
-
----
-
-## Searching
-
-```bash
-codesearch search <QUERY> [OPTIONS]
-```
-
-| Option | Short | Default | Description |
-|---|---|---|---|
-| `--max-results` | `-m` | 25 | Maximum results |
-| `--per-file` | | 1 | Max matches per file |
-| `--content` | `-c` | | Show full chunk content |
-| `--scores` | | | Show relevance scores and timing |
-| `--compact` | | | File paths only (like `grep -l`) |
-| `--sync` | `-s` | | Re-index changed files before searching |
-| `--json` | | | JSON output for scripting |
-| `--filter-path` | | | Restrict to path (e.g., `src/api/`) |
-| `--vector-only` | | | Disable hybrid, vector similarity only |
-| `--rerank` | | | Enable neural reranking (~1.7s extra) |
-| `--rerank-top` | | 50 | Candidates to rerank |
-| `--rrf-k` | | 20 | RRF fusion parameter |
-
-```bash
-codesearch search "database connection pooling"
-codesearch search "error handling" --content --rerank
-codesearch search "validation" --filter-path src/api --json -m 10
-codesearch search "new feature" --sync
-```
-
----
-
-## MCP Server Configuration
-
-The MCP server is codesearch's primary integration point for AI coding agents. It exposes token-efficient tools for semantic code search. The MCP server **auto-detects** the nearest database (local or global) — no project path argument is needed. If no database is found, the server will **not start**. This is intentional: codesearch never creates a database automatically to avoid polluting your projects.
-
-> **Important:** Always `codesearch index` your project first before using the MCP server.
-
-### OpenCode (recommended)
-
-OpenCode is the primary target for codesearch's MCP integration. Add the following to your OpenCode config at `~/.config/opencode/opencode.json`:
+**OpenCode** — connect via HTTP:
 
 ```json
 {
   "mcp": {
     "codesearch": {
-      "type": "local",
-      "command": [
-        "codesearch",
-        "mcp"
-      ],
+      "type": "remote",
+      "url": "http://127.0.0.1:39725/mcp",
       "enabled": true
     }
   }
 }
 ```
 
-No project path required — codesearch auto-detects the database for the current working directory.
-
-> **⚠️ `codesearch` must be on your system `PATH`** for OpenCode to find it. If you built from source, copy the binary to a directory that's in your `PATH` (e.g., `~/.local/bin/` on Linux/macOS or `C:\Users\<you>\.local\bin\` on Windows). Verify with: `codesearch --version`
-
-### Claude Code
-
-Add to `~/.config/claude-code/config.json`:
+**Claude Code / Claude Desktop** — force serve connection via `--mode client`:
 
 ```json
 {
   "mcpServers": {
     "codesearch": {
       "command": "codesearch",
-      "args": ["mcp"]
+      "args": ["mcp", "--mode", "client"]
     }
   }
 }
 ```
 
-On Windows, use the full path to `codesearch.exe` if it's not in your `PATH`. Restart Claude Code after editing the config.
+> **Note:** In multi-repo mode, agents must specify `project` or `group` in tool calls. `status` always works without scope. `get_chunk` auto-routes when the chunk_id is unique across repos; if ambiguous, it returns candidates and requires `project`.
 
-### What Happens on Startup
+## MCP Tools Reference
 
-When the MCP server starts, it goes through this sequence:
+### `search` — Code Search
 
-1. **Database discovery** — Searches for `.codesearch.db/` at the git root (by detecting `.git/` from the current directory), then walks up parent directories (up to 10 levels for non-git projects), and finally checks the global location (`~/.codesearch.dbs/`). The first database found is used. If none is found, the server exits — it will never create a database on its own.
-2. **Incremental index** — Automatically runs an incremental re-index against the detected database, so the index is up-to-date before the agent starts working.
-3. **File system watcher (FSW)** — Starts watching the project directory for changes. Any file modifications, additions, or deletions are picked up and the index is updated in the background (with debouncing), keeping the database current throughout the session.
-4. **Git HEAD watcher** — Monitors `.git/HEAD` for branch changes. When a branch switch is detected, an automatic incremental re-index is triggered to update the database with files from the new branch.
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `query` | string | Natural language, code snippet, regex, or exact term |
+| `mode` | `"semantic"` \| `"literal"` | Search backend (default: semantic) |
+| `filter_path` | string | Path prefix filter (semantic mode) |
+| `file_glob` | string | Glob filter (literal mode), e.g. `"src/**/*.rs"` |
+| `language` | string | Language filter (literal mode) |
+| `regex` | bool | Treat query as regex (literal mode) |
+| `phrase` | bool | Exact phrase match (literal mode) |
+| `compact` | bool | Metadata only, no code (default: true) |
+| `limit` | int | Max results (default: 10 semantic, 20 literal) |
+| `project` | string | Target specific repo (multi-repo) |
+| `group` | string | Search across repo group (multi-repo) |
 
-> **Important:** Databases are discovered at the *git repository root*, not in subdirectories. Do not manually create `.codesearch.db/` directories inside subfolders — this will cause confusion. One database per git repository, at the git root (or global).
+**Semantic mode** combines vector similarity (fastembed) + BM25 lexical scoring + exact identifier boosting, fused with RRF. Best for conceptual queries and mixed natural-language + symbol searches.
 
-### MCP Tools
+**Literal mode** uses Tantivy FTS. Use `regex=true` for patterns with punctuation (`foo::bar`, `Vec<T>`). Use `phrase=true` for multi-word exact matches.
 
-| Tool | Parameters | Description |
-|---|---|---|
-| `semantic_search` | `query`, `limit`, `compact` (default: true), `filter_path` | Semantic code search. Compact mode returns metadata only (~93% fewer tokens). |
-| `find_references` | `symbol`, `limit` (default: 50) | Find all usages/call sites of a symbol across the codebase. |
-| `get_file_chunks` | `path`, `compact` (default: true) | Get all indexed chunks from a file. |
-| `find_databases` | | Discover available codesearch databases. |
-| `index_status` | | Check index existence and statistics. |
+### `find` — Symbol Navigation
 
-### How AI Agents Use the Tools
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `symbol` | string | Symbol name or file path (for imports) |
+| `kind` | `"definition"` \| `"usages"` \| `"imports"` \| `"dependents"` | Navigation type |
+| `definition_kind` | string | Filter: Function, Class, Method, Struct, Trait, Enum, Interface |
+| `project` / `group` | string | Multi-repo routing |
 
-The MCP tools are designed to work together in a **search → narrow → read** workflow that minimizes token usage:
+### `explore` — File Exploration
 
-1. **`semantic_search`** — The agent starts here. A natural language query like `"where do we handle authentication?"` returns a ranked list of matches. With `compact=true` (the default), only metadata is returned: file path, line numbers, chunk kind, signature, and score — roughly 40 tokens per result instead of 600.
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `target` | string | File path (outline) or chunk_id (similar) |
+| `kind` | `"outline"` \| `"similar"` | Exploration type |
+| `limit` | int | Max results for similar mode |
+| `project` / `group` | string | Multi-repo routing |
 
-2. **`find_references`** — Once the agent identifies a relevant function or symbol, it can ask for all usages and call sites across the codebase. This is much more efficient than grep-based searching and stays within the codesearch ecosystem. Example: `find_references("authenticate")` returns every location that calls or references that symbol.
+**Outline** returns all top-level symbols in a file (kind, signature, line range).
+**Similar** finds semantically related chunks to a given chunk_id.
 
-3. **`get_file_chunks`** — To get a broader view of a specific file's structure, the agent can retrieve all indexed chunks. With `compact=true` this gives an outline (functions, classes, methods with signatures); with `compact=false` it includes full source code.
+### `get_chunk` — Read Code
 
-4. **Targeted file reads** — Finally, the agent reads only the specific lines it needs using its built-in file read tools.
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `chunk_id` | int | Chunk ID from search/explore results |
+| `context_lines` | int | Extra lines before/after (0-20, default: 0) |
+| `project` | string | Disambiguate if chunk_id exists in multiple repos |
 
-**Example session:**
+In multi-repo mode: auto-routes when chunk_id is unique; returns candidates list when ambiguous.
+
+### `status` — Index Info
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `kind` | `"index"` \| `"projects"` | What to query |
+| `project` / `group` | string | Multi-repo routing |
+
+## Serve Mode (Multi-Repo)
+
+For working across multiple repositories simultaneously:
+
+```bash
+codesearch serve
 ```
-Agent: semantic_search("auth handler", compact=true)
-  → 20 results, ~800 tokens total (paths, signatures, scores)
 
-Agent: find_references("authenticate")
-  → 8 call sites across 5 files, ~100 tokens
+This starts a background HTTP server with:
+- **TUI dashboard** (ratatui) showing repo status, CPU usage, active sessions
+- **Lazy filesystem watchers** — activated on first query per repo
+- **Idle eviction** (30min) — unused repos are unloaded from memory
+- **Session tracking** via MCP keep-alive
 
-Agent: read("src/auth/handler.rs", lines 45-75)
-  → Only the code that matters
+### Repository Registration
+
+Repos are registered via `codesearch index add`:
+
+```bash
+# Register a repo (creates index + adds to ~/.codesearch/repos.json)
+codesearch index add /path/to/my-project --alias my-project
+
+# Remove a repo
+codesearch index rm /path/to/my-project
+
+# List registered repos
+codesearch index list
 ```
 
-This workflow typically saves **90%+ tokens** compared to returning full code content for every search result.
+Serve reads `~/.codesearch/repos.json` on startup and manages all registered repos.
 
----
+### Groups
 
-## Other Commands
+Groups let you search across related repositories:
+
+```bash
+codesearch groups add my-group repo1 repo2 repo3
+codesearch groups list
+```
+
+Then in MCP tools: `group="my-group"` fans out the query to all repos in the group.
+
+### MCP Connection Modes
+
+The `codesearch mcp` command supports three modes:
+
+| Mode | Behavior |
+|------|----------|
+| `auto` (default) | Connects to serve if running, otherwise local stdio |
+| `client` | Always connects to serve, fails if not running |
+| `local` | Always uses local DB (classic single-repo stdio) |
+
+```bash
+codesearch mcp --mode client  # force serve connection
+```
+
+The serve endpoint is available at `/mcp` (Streamable HTTP transport).
+
+## CLI Reference
 
 | Command | Description |
-|---|---|
-| `codesearch serve [PATH] -p <PORT>` | HTTP server with live file watching (default port 4444) |
-| `codesearch stats [PATH]` | Show database statistics |
-| `codesearch clear [PATH] [-y]` | Delete the index |
-| `codesearch list` | List all indexed repositories |
-| `codesearch doctor` | Check installation health |
-| `codesearch setup [--model <MODEL>]` | Pre-download embedding models |
-
-### HTTP Server API
-
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/health` | Health check |
-| GET | `/status` | Index statistics |
-| POST | `/search` | Search (JSON body: `{"query": "...", "limit": 10}`) |
-
----
-
-## Search Modes
-
-| Mode | Command | Speed | Best For |
-|---|---|---|---|
-| **Hybrid** (default) | `codesearch search "query"` | ~75ms | Most queries — balances semantic + keyword |
-| **Vector-only** | `codesearch search "query" --vector-only` | ~72ms | Conceptual queries without exact keywords |
-| **Hybrid + Reranking** | `codesearch search "query" --rerank` | ~1.8s | Maximum accuracy |
-
----
-
-## Global vs Local Indexes
-
-codesearch supports two index locations per project. Only one can be active at a time.
-
-| | Local Index | Global Index |
-|---|---|---|
-| **Location** | `<git-root>/.codesearch.db/` | `~/.codesearch.dbs/<project>/` |
-| **Created with** | `codesearch index` (default) | `codesearch index --add -g` |
-| **Visible to** | Only when inside the project tree | From any directory |
-| **Use case** | Per-project, self-contained | Shared/central index, searchable from anywhere |
-
-**How discovery works:** when you run a command, codesearch looks for a database in this order:
-1. `.codesearch.db/` at the git root (automatically detected from current directory)
-2. `.codesearch.db/` in parent directories (up to 10 levels, for non-git projects)
-3. `~/.codesearch.dbs/` (global)
-
-This means you can `cd` into any subfolder and codesearch will still find the project index at the git root.
-
-### Git Worktrees
-
-codesearch works naturally with [git worktrees](https://git-scm.com/docs/git-worktree). Each worktree lives in its own directory and points to a different branch of the same git repository, so each worktree can have its own independent database and MCP server instance. This means you can have separate indexes for different branches — when OpenCode or Claude Code starts in a worktree folder, codesearch auto-detects the database for that specific worktree.
-
-```bash
-# Main repo on main branch
-cd /projects/myapp
-codesearch index
-
-# Worktree for a feature branch
-git worktree add /projects/myapp-feature feature/new-auth
-cd /projects/myapp-feature
-codesearch index
-
-# Each worktree has its own .codesearch.db/ and MCP instance
-# Branch switching within a worktree triggers automatic index refresh
-```
-
-```bash
-codesearch index                 # Create local index (default)
-codesearch index --add -g        # Create global index
-codesearch index rm              # Remove whichever index exists
-codesearch index list            # Show which index is active
-```
-
----
-
-## Supported Languages
-
-### Full AST Chunking (Tree-sitter)
-
-Rust (`.rs`), Python (`.py`, `.pyw`, `.pyi`), JavaScript (`.js`, `.mjs`, `.cjs`), TypeScript (`.ts`, `.mts`, `.cts`, `.tsx`, `.jsx`), C (`.c`, `.h`), C++ (`.cpp`, `.cc`, `.cxx`, `.hpp`), C# (`.cs`), Go (`.go`), Java (`.java`)
-
-### Line-based Chunking
-
-Ruby, PHP, Swift, Kotlin, Shell, Markdown, JSON, YAML, TOML, SQL, HTML, CSS/SCSS/SASS/LESS
-
----
-
-## Embedding Models
-
-| Name | ID | Dimensions | Speed | Notes |
-|---|---|---|---|---|
-| MiniLM-L6 (Q) | `minilm-l6-q` | 384 | Fastest | **Default** |
-| MiniLM-L6 | `minilm-l6` | 384 | Fastest | General use |
-| MiniLM-L12 (Q) | `minilm-l12-q` | 384 | Fast | Higher quality |
-| BGE Small (Q) | `bge-small-q` | 384 | Fast | General use |
-| BGE Base | `bge-base` | 768 | Medium | Higher quality |
-| BGE Large | `bge-large` | 1024 | Slow | Highest quality |
-| **Jina Code** | **`jina-code`** | 768 | Medium | **Code-specific** |
-| Nomic v1.5 | `nomic-v1.5` | 768 | Medium | Long context |
-| E5 Multilingual | `e5-multilingual` | 384 | Fast | Non-English code |
-| MxBai Large | `mxbai-large` | 1024 | Slow | High quality |
-
-The model used for indexing is stored in metadata. Always search with the same model you indexed with, or re-index with `--force` when switching.
-
----
+|---------|-------------|
+| `codesearch index [PATH]` | Index a repo (incremental; `--force` for full rebuild) |
+| `codesearch search <QUERY>` | CLI search (for testing) |
+| `codesearch mcp` | Start MCP stdio server |
+| `codesearch serve` | Start multi-repo HTTP server with TUI |
+| `codesearch stats` | Show database statistics |
+| `codesearch clear` | Delete index |
+| `codesearch doctor` | Health check (model, index, config) |
+| `codesearch setup` | Download embedding models |
+| `codesearch cache stats\|clear` | Manage embedding cache |
+| `codesearch groups list\|add\|remove` | Manage repository groups |
 
 ## Configuration
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|---|---|---|
-| `CODESEARCH_CACHE_MAX_MEMORY` | Max embedding cache in MB | 500 |
-| `CODESEARCH_BATCH_SIZE` | Embedding batch size | Auto |
-| `RUST_LOG` | Logging level | `codesearch=info` |
+| Variable | Description |
+|----------|-------------|
+| `CODESEARCH_SERVE_PORT` | Serve mode port (default: 39725) |
+| `CODESEARCH_MCP_MODE` | MCP mode: auto, client, local |
+| `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
+| `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
+| `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
+| `CODESEARCH_BATCH_SIZE` | Embedding batch size |
+| `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
 
-### Ignore Files
+### `.codesearchignore`
 
-Create `.codesearchignore` in your project root (same syntax as `.gitignore`). Also respects `.gitignore` and `.osgrepignore`.
+Place in repo root. Gitignore syntax. Excludes paths from indexing:
 
-### Global Options
-
-| Option | Short | Description |
-|---|---|---|
-| `--loglevel` | | Set log level (error, warn, info, debug, trace) |
-| `--quiet` | `-q` | Suppress info, only results/errors |
-| `--model` | | Override embedding model |
-| `--store` | | Override store name |
-
----
-
-## How It Works
-
-1. **File Discovery** — Walks the directory respecting ignore files, detects language, skips binaries.
-2. **Git Root Detection** — Automatically finds the git repository root and places `.codesearch.db/` there, ensuring a single index per repository.
-3. **Semantic Chunking** — Tree-sitter AST parsing extracts functions, classes, methods with metadata. Falls back to line-based chunking for unsupported languages.
-4. **Embedding Generation** — fastembed + ONNX Runtime (CPU), batched, with SHA-256 change detection and **caching**.
-5. **Vector Storage** — arroy (ANN search) + LMDB (ACID persistence) in a single `.codesearch.db/` directory at git root.
-6. **Incremental Updates** — FileMetaStore tracks hash/mtime/size; only changed files are re-processed.
-7. **Git Branch Detection** — Monitors `.git/HEAD` for branch switches and automatically refreshes the index.
-8. **Search** — Query → embed → vector search → BM25 → RRF fusion → (optional) reranking.
-
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---|---|
-| "No database found" | Run `codesearch index` first (creates index at git root) |
-| Poor search results | Try `--sync` to update, `--rerank` for accuracy, or `--force` to rebuild |
-| Model mismatch warning | Re-index: `codesearch index --force --model <model>` |
-| Out of memory | `CODESEARCH_BATCH_SIZE=32 codesearch index` |
-| Port in use (serve) | `codesearch serve --port 5555` |
-| Wrong database found | Check where `.codesearch.db/` is located with `codesearch list` |
-| Index not updating after branch switch | The Git HEAD watcher refreshes automatically; check `codesearch stats` to verify |
-| First index very slow | Normal! First time indexes compute all embeddings (2-5 min). Subsequent indexes use cache (10-30 sec) |
-| Cache too large | Clear cache: `codesearch cache clear <model>` |
-
-### Git-Specific Troubleshooting
-
-**"Multiple .git directories detected"**
-- This error occurs when codesearch finds nested git repositories
-- Solution: Remove the nested `.git` directory or index from the outer repository only
-
-**"Database not at git root"**
-- Old versions of codesearch created databases in the current directory
-- Solution: Delete the old `.codesearch.db/` directory and run `codesearch index` — it will be recreated at the git root
-
-### Debug Logging
-
-```bash
-RUST_LOG=codesearch=debug codesearch search "query"
-RUST_LOG=codesearch::embed=trace codesearch index
+```gitignore
+# Vendored code
+vendor/
+node_modules/
+# Generated files
+*.generated.cs
+**/migrations/**
 ```
 
----
+### `repos.json`
+
+Located at `~/.codesearch/repos.json`. Managed by `codesearch index add/rm`. Contains repo aliases → paths and group definitions. See [Serve Mode](#serve-mode-multi-repo).
+
+## Supported Languages
+
+Tree-sitter AST-aware chunking:
+
+| Language | Extensions |
+|----------|-----------|
+| Rust | `.rs` |
+| Python | `.py` |
+| JavaScript | `.js`, `.jsx` |
+| TypeScript | `.ts`, `.tsx` |
+| C | `.c`, `.h` |
+| C++ | `.cpp`, `.hpp` |
+| C# | `.cs` |
+| Go | `.go` |
+| Java | `.java` |
+
+All other text files use line-based chunking as fallback.
+
+## Core Technology
+
+| Component | Technology |
+|-----------|-----------|
+| Embedding | fastembed + ONNX Runtime (CPU) |
+| Vector store | arroy (Approximate Nearest Neighbors) + LMDB |
+| Full-text search | Tantivy (BM25, AND mode) |
+| Chunking | Tree-sitter AST parsing |
+| Incremental sync | SHA-256 content hashing |
+| Caching | 3-layer: in-memory (Moka) → persistent disk → query cache |
+| Schema | Versioned via `metadata.json` |
 
 ## Development
 
 ```bash
-cargo build              # Debug
-cargo build --release    # Release
-cargo test               # Tests
-cargo fmt                # Format
-cargo clippy             # Lint
+# Build
+cargo build
+
+# Run tests
+cargo test
+
+# Check + lint
+cargo clippy --all-targets -- -D warnings
+
+# Format
+cargo fmt --all
 ```
-
-### Workflow
-
-- Create feature branches from `develop`: `git checkout -b feature/xxx develop`
-- Open PRs against `develop`
-- `master` is the release branch — only updated via PR `develop → master`
-- Branch naming: `feature/xxx`, `fix/xxx`, `chore/xxx`, `docs/xxx`
-
-### Release Process
-
-1. Create PR `develop → master`
-2. Review and merge
-3. Tag on master:
-   ```bash
-   git checkout master && git pull
-   git tag -a v1.x.x -m "Release v1.x.x"
-   git push origin v1.x.x
-   ```
-4. Create GitHub Release on the tag
-
----
 
 ## License
 
@@ -725,4 +398,6 @@ Apache-2.0
 
 ## Acknowledgements
 
-This project is a fork of [demongrep](https://github.com/yxanul/demongrep) by [yxanul](https://github.com/yxanul). A huge thank you for building such a solid and well-designed foundation — without demongrep, codesearch wouldn't exist.
+This project is a fork of [demongrep](https://github.com/yxanul/demongrep) by [yxanul](https://github.com/yxanul). Huge thanks for building such a solid foundation.
+
+Built with: [fastembed-rs](https://github.com/Anush008/fastembed-rs), [arroy](https://github.com/meilisearch/arroy), [tantivy](https://github.com/quickwit-oss/tantivy), [tree-sitter](https://tree-sitter.github.io/), [ratatui](https://github.com/ratatui/ratatui), [LMDB](http://www.lmdb.tech/).
