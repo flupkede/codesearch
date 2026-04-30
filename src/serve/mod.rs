@@ -824,7 +824,6 @@ impl ServeState {
     }
 
     /// Decrement active session count.
-    #[allow(dead_code)]
     pub(crate) fn session_disconnected(&self) {
         self.active_sessions.fetch_sub(1, Ordering::Relaxed);
     }
