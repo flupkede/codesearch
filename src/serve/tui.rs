@@ -82,7 +82,7 @@ async fn run_tui_loop(
         }
 
         // Load session count for footer
-        let active = state.active_sessions.load(std::sync::atomic::Ordering::Relaxed);
+        let active = state.active_session_count();
 
         terminal.draw(|f| {
             let size = f.area();
@@ -383,21 +383,29 @@ fn render_footer(
 
     let sessions_str = format!("Sessions: {}", active);
 
-    let footer = Line::from(vec![
-        Span::styled(" [q] quit  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[↑↓] scroll  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
-        Span::styled(format!("{:>width$}", sessions_str, width = area.width as usize - 30), Style::default().fg(Color::Cyan)),
-    ]);
-
-    let footer_area = area.inner(Margin {
+    // Use Layout to split footer into left (keys) and right (sessions)
+    let footer_inner = area.inner(Margin {
         vertical: 0,
         horizontal: 1,
     });
-    f.render_widget(
-        ratatui::widgets::Paragraph::new(footer),
-        footer_area,
-    );
+    let [left, right] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(sessions_str.len() as u16 + 2),
+    ])
+    .areas(footer_inner);
+
+    let left_line = Line::from(vec![
+        Span::styled("[q] quit  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[↑↓] scroll  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
+    ]);
+
+    let right_line = Line::from(vec![
+        Span::styled(sessions_str, Style::default().fg(Color::Cyan)),
+    ]);
+
+    f.render_widget(ratatui::widgets::Paragraph::new(left_line), left);
+    f.render_widget(ratatui::widgets::Paragraph::new(right_line).right_aligned(), right);
 }
 
 // ---------------------------------------------------------------------------
