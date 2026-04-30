@@ -68,6 +68,10 @@ async fn run_tui_loop(
     let tick_interval = Duration::from_millis(500);
     let poll_timeout = Duration::from_millis(100);
 
+    // sysinfo System instance — must persist across frames so cpu_usage()
+    // can compute a delta between refresh calls (first call always returns 0).
+    let mut sys_system: Option<sysinfo::System> = None;
+
     // Main loop
     loop {
         // Draw the UI
@@ -81,8 +85,9 @@ async fn run_tui_loop(
             }
         }
 
-        // Load session count for footer
+        // Load session count + process stats for footer
         let active = state.active_session_count();
+        let stats = process_stats(&mut sys_system);
 
         terminal.draw(|f| {
             let size = f.area();
@@ -97,13 +102,18 @@ async fn run_tui_loop(
             render_header(f, chunks[0], serve_url);
             render_table(f, chunks[1], &repos, &mut table_state);
             render_detail(f, chunks[2], &repos, &table_state, &state);
-            render_footer(f, chunks[3], &repos, &table_state, active);
+            render_footer(f, chunks[3], &repos, &table_state, active, &stats);
         })?;
 
         // Poll for key events
         let mut should_quit = false;
         while event::poll(poll_timeout)? {
             if let Event::Key(key) = event::read()? {
+                // On Windows, crossterm emits both Press and Release events.
+                // Only act on Press to avoid double-stepping (scroll by 2).
+                if key.kind != event::KeyEventKind::Press {
+                    continue;
+                }
                 if is_quit_key(key) {
                     should_quit = true;
                     break;
@@ -373,6 +383,7 @@ fn render_footer(
     repos: &[(String, super::RepoStatusInfo)],
     table_state: &TableState,
     active: u64,
+    stats: &ProcessStats,
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
@@ -381,7 +392,6 @@ fn render_footer(
         String::new()
     };
 
-    let stats = process_stats();
     let sessions_str = format!("Sessions: {}", active);
     let mem_str = format!("RAM: {}", stats.memory);
     let cpu_str = format!("CPU: {}", stats.cpu);
@@ -423,19 +433,24 @@ fn render_footer(
 
 /// Get current process memory (RSS) and CPU usage as human-readable strings.
 /// Uses `sysinfo` crate — cross-platform (Windows, Linux, macOS).
+///
+/// **Important:** `sys_system` must be reused across calls. `cpu_usage()` computes
+/// a delta between refresh calls; a fresh `System` always returns 0%.
 struct ProcessStats {
     memory: String,
     cpu: String,
 }
 
-fn process_stats() -> ProcessStats {
+fn process_stats(sys_system: &mut Option<sysinfo::System>) -> ProcessStats {
     use sysinfo::{ProcessesToUpdate, System};
 
-    let mut sys = System::new();
     let pid = match sysinfo::get_current_pid() {
         Ok(p) => p,
         Err(_) => return ProcessStats { memory: "—".into(), cpu: "—".into() },
     };
+
+    // Create System instance on first call, reuse on subsequent calls.
+    let sys = sys_system.get_or_insert_with(System::new);
 
     // Refresh only our process (memory + cpu)
     sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
