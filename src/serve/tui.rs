@@ -393,7 +393,7 @@ fn render_footer(
     };
 
     let sessions_str = format!("Sessions: {}", active);
-    let mem_str = format!("RAM: {}", stats.memory);
+    let mem_str = format!("Mem: {}", stats.memory);
     let cpu_str = format!("CPU: {}", stats.cpu);
 
     // Right side: CPU | RAM | Sessions
@@ -431,14 +431,48 @@ fn render_footer(
 // Cell styling helpers
 // ---------------------------------------------------------------------------
 
-/// Get current process memory (RSS) and CPU usage as human-readable strings.
-/// Uses `sysinfo` crate — cross-platform (Windows, Linux, macOS).
+/// Get current process memory (private) and CPU usage as human-readable strings.
+/// Uses `sysinfo` crate for CPU, and platform-specific API for memory.
 ///
 /// **Important:** `sys_system` must be reused across calls. `cpu_usage()` computes
 /// a delta between refresh calls; a fresh `System` always returns 0%.
+///
+/// **Memory note:** On Windows we report "Private Bytes" (heap + stack, excluding
+/// mmap'd files like LMDB). This matches Task Manager's "Private Working Set" and
+/// is the meaningful metric for actual RAM consumption. RSS would include the full
+/// LMDB map_size (often 1+ GB of mmap'd pages) which is misleading.
 struct ProcessStats {
     memory: String,
     cpu: String,
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+/// Get the process private bytes (heap + stack, no mmap) in a cross-platform way.
+/// On Windows: uses PROCESS_MEMORY_COUNTERS.PrivateUsage via sysinfo's virtual_memory()
+///             which on Windows returns private bytes, not true virtual memory.
+/// On Linux/macOS: falls back to RSS from sysinfo (less misleading on those platforms).
+fn private_bytes(proc: &sysinfo::Process) -> u64 {
+    // sysinfo's virtual_memory() on Windows returns "Private Bytes" from
+    // PROCESS_MEMORY_COUNTERS.PrivateUsage — exactly what Task Manager shows.
+    // On Linux it returns VIRT (total virtual) which is less useful,
+    // so we fall back to RSS on non-Windows platforms.
+    #[cfg(target_os = "windows")]
+    {
+        proc.virtual_memory()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        proc.memory()
+    }
 }
 
 fn process_stats(sys_system: &mut Option<sysinfo::System>) -> ProcessStats {
@@ -457,12 +491,7 @@ fn process_stats(sys_system: &mut Option<sysinfo::System>) -> ProcessStats {
 
     let (memory, cpu) = match sys.process(pid) {
         Some(proc) => {
-            let bytes = proc.memory();
-            let mem = if bytes >= 1024 * 1024 {
-                format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0))
-            } else {
-                format!("{:.0} KB", bytes as f64 / 1024.0)
-            };
+            let mem = format_bytes(private_bytes(proc));
             let cpu = format!("{:.0}%", proc.cpu_usage());
             (mem, cpu)
         }
