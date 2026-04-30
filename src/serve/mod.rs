@@ -1601,7 +1601,7 @@ pub async fn run_serve(
     let tui_url = serve_url.clone();
 
     let has_tty = tui::is_tty();
-    let _tui_handle = if has_tty {
+    let tui_handle: Option<tokio::task::JoinHandle<()>> = if has_tty {
         Some(tokio::spawn(async move {
             if let Err(e) = tui::run_tui(tui_state, tui_cancel, tui_url).await {
                 tracing::error!("TUI error: {}", e);
@@ -1652,7 +1652,6 @@ pub async fn run_serve(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        let _before = reaper_state.repos.len();
                         reaper_state.evict_idle_repos();
                         // Dashboard refresh handled by TUI auto-refresh (TTY) or not needed (non-TTY)
                     }
@@ -1694,6 +1693,13 @@ pub async fn run_serve(
             // This is expected when MCP clients hold open SSE sessions.
             info!("⚠️  Shutdown deadline reached — forcing exit (open sessions dropped)");
         }
+    }
+
+    // Wait for the TUI task to finish cleanup (restore terminal).
+    // The TUI's Drop guard restores the terminal, so we need to give it
+    // a moment before the process exits.
+    if let Some(handle) = tui_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
     }
 
     Ok(())

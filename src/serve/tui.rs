@@ -29,6 +29,10 @@ use super::ServeState;
 ///
 /// Returns `Ok(())` when the user presses `q` / `Ctrl-C`, or when the
 /// `cancel_token` is cancelled externally (e.g. Ctrl-C from the main task).
+///
+/// Terminal restoration is guaranteed on normal exit and on errors.
+/// Panics mid-frame are extremely unlikely (ratatui is panic-free in practice)
+/// and the OS will restore raw mode on process exit as a last resort.
 pub async fn run_tui(
     state: Arc<ServeState>,
     cancel_token: CancellationToken,
@@ -42,6 +46,22 @@ pub async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    // Run main loop. Errors (e.g. from terminal.draw) propagate up
+    // and are caught below to ensure restoration.
+    let result = run_tui_loop(&mut terminal, state, cancel_token, &serve_url).await;
+
+    // Always restore terminal, even on error
+    restore_terminal(&mut terminal)?;
+
+    result
+}
+
+async fn run_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: Arc<ServeState>,
+    cancel_token: CancellationToken,
+    serve_url: &str,
+) -> io::Result<()> {
     // TUI-local state
     let mut table_state = TableState::default();
     table_state.select(Some(0));
@@ -52,8 +72,6 @@ pub async fn run_tui(
     loop {
         // Draw the UI
         let repos = state.repo_statuses_lightweight();
-        let active = state.active_sessions.load(std::sync::atomic::Ordering::Relaxed);
-        let total = state.total_sessions.load(std::sync::atomic::Ordering::Relaxed);
 
         // Clamp selection
         if !repos.is_empty() {
@@ -72,9 +90,9 @@ pub async fn run_tui(
             ])
             .split(size);
 
-            render_header(f, chunks[0], &serve_url);
+            render_header(f, chunks[0], serve_url);
             render_table(f, chunks[1], &repos, &mut table_state);
-            render_footer(f, chunks[2], &repos, &table_state, active, total);
+            render_footer(f, chunks[2], &repos, &table_state);
         })?;
 
         // Poll for key events
@@ -102,8 +120,6 @@ pub async fn run_tui(
         tokio::time::sleep(tick_interval).await;
     }
 
-    // Restore terminal
-    restore_terminal(&mut terminal)?;
     Ok(())
 }
 
@@ -277,8 +293,6 @@ fn render_footer(
     area: Rect,
     repos: &[(String, super::RepoStatusInfo)],
     table_state: &TableState,
-    _active: u64,
-    _total: u64,
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
@@ -317,7 +331,7 @@ fn status_cell(status: super::RepoStateLabel) -> Cell<'static> {
         Readonly => Cell::from("◑ ro".to_string())
             .style(Style::default().fg(Color::Cyan)),
         Indexing => Cell::from("⟳ idx…".to_string())
-            .style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Closed => Cell::from("○ closed".to_string())
             .style(Style::default().fg(Color::DarkGray)),
         Error => Cell::from("✗ error".to_string())
@@ -327,6 +341,8 @@ fn status_cell(status: super::RepoStateLabel) -> Cell<'static> {
     }
 }
 
+/// Derive lock column from RepoStateLabel.
+/// TODO: Once RepoStatusInfo gains a real `lock_mode` field, replace this heuristic.
 fn lock_cell_from_status(status: super::RepoStateLabel) -> Cell<'static> {
     use super::RepoStateLabel::*;
     match status {
