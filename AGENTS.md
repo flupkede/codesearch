@@ -1,228 +1,163 @@
-# Setup git flow: feature → develop → master
+# AGENTS.md — features/fixes branch plan
 
-**Branch:** `chore/setup-develop-branch`
-**Status:** Wachten tot `feature/serve-tui` gemerged is
-**Eigenaar:** OpenCode (of handmatig)
-
----
-
-## 1. Doel
-
-Overstappen van een single-branch flow (alle PRs → `master`) naar een
-develop-based flow:
-
-```
-feature/xxx ─PR→ develop ─PR→ master (release)
-                    │
-                    └─► CI runs hier
-                    
-master ─tag v1.x.x→ GitHub Release
-```
-
-`master` blijft de release branch (geen rename naar `main`). `develop` wordt de
-actieve dev branch waar alle CI op draait. Releases gebeuren via PR
-`develop → master` + tag.
+## Branch: `features/fixes`
+**Base:** `develop`
+**Goal:** Fix idle eviction bug + improve search quality to reduce agent grep fallback
 
 ---
 
-## 2. Voorwaarde (plan A — clean cut)
+## Fix 1: Idle eviction — `get_or_open_stores` touches ALL repos on fan-out
 
-**Voordat deze branch wordt uitgevoerd:** alle open feature branches die nog
-bezig zijn moeten eerst gemerged of gesloten worden. Concreet:
+### Problem
 
-- `feature/serve-tui` — wachten tot OpenCode klaar is en gemerged
-- Eventueel andere actieve branches verifiëren met `git branch -r`
+`get_or_open_stores()` calls `touch_access()` unconditionally (lines 456, 470 in `src/serve/mod.rs`).
+When `get_chunk` is called without `project`/`group` (`allow_unscoped=true`), `resolve_repo_stores_multi`
+fans out to ALL repos via `get_or_open_stores()` — resetting the idle timer on every repo.
 
-Stale branches die niet meer relevant zijn worden verwijderd voor de
-overstap (zie sectie 6).
+Result: repos are never idle, reaper never evicts. The 30-minute timeout is effectively disabled
+whenever any agent uses `get_chunk` without explicit project scope.
 
----
+Same issue affects `status` tool with explicit project/group (goes through `get_or_open_stores`),
+though the unscoped `status` path uses `repo_statuses_lightweight()` which is safe.
 
-## 3. Stappen
+### Fix: Add `touch: bool` parameter to `get_or_open_stores`
 
-### 3.1 Maak `develop` branch vanuit master
+**File:** `src/serve/mod.rs`
 
-```bash
-git checkout master
-git pull origin master
-git checkout -b develop
-git push -u origin develop
-```
+1. Change signature: `pub(crate) async fn get_or_open_stores(&self, alias: &str, touch: bool)`
+2. Only call `self.touch_access(alias)` when `touch == true`
+3. Update all call sites:
+   - `warmup_repo` (line 456) → `touch: false` (warmup should NOT reset idle timer)
+   - `get_or_open_stores` fast path (line 470) → keep `touch: true` (direct query access)
+   - `resolve_repo_stores_multi` fan-out (line 3113 in `src/mcp/mod.rs`) → `touch: false`
+   - `resolve_repo_stores_multi` single project (line 3130) → `touch: true`
+   - `resolve_repo_stores_multi` group members (line 3141) → `touch: false`
+   - Lazy FSW transition (line ~487) → `touch: true` (first real query)
+   - `spawn_fsw_for_warm` (line ~722) → `touch: false`
+   - `reindex_handler` (lines 1166, 1211) → `touch: true`
+   - Test call sites → `touch: true`
 
-### 3.2 Update GitHub default branch naar develop
+4. After `get_chunk` candidate detection resolves to a single repo, explicitly call
+   `serve_state.touch_access(&resolved_alias)` for just that repo.
 
-Via REST API met PAT (vermijd gh CLI vanwege bedrijfsnetwerk traagheid):
+5. After group fan-out search completes, touch only repos that contributed results
+   (or touch all group members — acceptable since the agent explicitly requested the group).
 
-```powershell
-$t = (Get-Content "$env:APPDATA\Claude\claude_desktop_config.json" | ConvertFrom-Json).mcpServers.github.env.GITHUB_PERSONAL_ACCESS_TOKEN
-Invoke-RestMethod -Uri "https://api.github.com/repos/flupkede/codesearch" -Method PATCH `
-  -Headers @{ Authorization = "Bearer $t"; "Content-Type" = "application/json" } `
-  -Body (@{ default_branch = "develop" } | ConvertTo-Json)
-```
-
-Verifieer:
-```powershell
-(Invoke-RestMethod -Uri "https://api.github.com/repos/flupkede/codesearch" -Headers @{ Authorization = "Bearer $t" }).default_branch
-# → "develop"
-```
-
-### 3.3 Branch protection rules
-
-Voor `master` (release branch — strikter):
-- Required: PR before merge
-- Required: status checks (build, test) als die bestaan
-- Allowed source: alleen `develop`
-- Geen direct push
-
-Voor `develop` (active dev — minder strikt):
-- Required: PR before merge
-- Status checks aanbevolen, niet verplicht in v1
-- Direct push uit voorzichtigheid disabled
-
-API call (master):
-```powershell
-$rules = @{
-  required_status_checks = $null
-  enforce_admins = $false
-  required_pull_request_reviews = @{
-    required_approving_review_count = 0
-    dismiss_stale_reviews = $false
-  }
-  restrictions = $null
-  allow_deletions = $false
-  allow_force_pushes = $false
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod -Uri "https://api.github.com/repos/flupkede/codesearch/branches/master/protection" `
-  -Method PUT -Headers @{ Authorization = "Bearer $t"; "Content-Type" = "application/json" } -Body $rules
-```
-
-Hetzelfde voor `develop` met aangepaste regels.
-
-### 3.4 CI workflow update
-
-Check `.github/workflows/`:
-- Als er een `ci.yml` of `build.yml` bestaat met trigger op `master`,
-  vervang door `develop` (of beide) in de `on:` sectie:
-
-```yaml
-on:
-  push:
-    branches: [develop, master]
-  pull_request:
-    branches: [develop]
-```
-
-Geen wijziging als er nog geen workflows bestaan — dan slaan we deze stap over.
-
-### 3.5 Release proces documenteren
-
-Voeg toe aan `README.md` of een nieuwe `RELEASE.md`:
-
-```markdown
-## Release Process
-
-1. PR `develop → master` aanmaken
-2. Review en merge
-3. Tag op master:
-   git checkout master && git pull
-   git tag -a v1.x.x -m "Release v1.x.x"
-   git push origin v1.x.x
-4. GitHub Release aanmaken op de tag
-```
-
-### 3.6 Update CONTRIBUTING / docs
-
-In `README.md` (of nieuwe `CONTRIBUTING.md`) een sectie toevoegen:
-
-```markdown
-## Development workflow
-
-- Maak feature branches vanuit `develop`: `git checkout -b feature/xxx develop`
-- PR naar `develop`
-- `master` is de release branch — alleen via PR `develop → master`
-- Branch naming: `feature/xxx`, `fix/xxx`, `chore/xxx`, `docs/xxx`
-```
+### Validation
+- `cargo check && cargo clippy --all-targets -- -D warnings`
+- `cargo test --lib`
+- Manual: start serve with 3+ repos, call `get_chunk` without project, verify reaper log
+  shows idle ages increasing (not resetting) for untouched repos
 
 ---
 
-## 4. Verifieer na uitvoer
+## Fix 2: Search quality — reduce agent grep fallback
 
-- [ ] `develop` branch bestaat lokaal en op GitHub
-- [ ] GitHub repo settings tonen `develop` als default branch
-- [ ] Nieuwe PR via web UI defaultent naar `develop` als target
-- [ ] `master` branch protection actief — direct push faalt
-- [ ] CI draait op push naar `develop` (als CI bestaat)
-- [ ] README documenteert de nieuwe flow
+### Problem
+
+Agents fall back to `grep` when `codesearch_search` returns poor or zero results.
+Root causes:
+
+1. **Top-N cutoff too aggressive** — retrieval pool is `limit * 3`, fusion drops relevant results
+2. **Exact identifier boost too weak** — `EXACT_MATCH_RRF_K = 5.0` doesn't sufficiently
+   prioritize exact code matches over semantic similarity
+3. **No auto-fallback** — when semantic search returns few results, no automatic literal retry
+4. **minilm-l6 weak on code** — embedding model is NL-trained, code identifiers get poor vectors.
+   Not fixable without model change, but compensated by stronger FTS fusion.
+
+### Fix 2a: Increase retrieval pool
+
+**File:** `src/mcp/mod.rs`
+
+Change all `limit * 3` to `limit * 5` in the semantic search pipeline.
+This gives the RRF fusion more candidates to work with, reducing the chance
+that a relevant result falls outside the retrieval window.
+
+Affected locations (all in `src/mcp/mod.rs`):
+- Line 3698: `store.search(&query_embedding, limit * 3)` → `limit * 5`
+- Line 3753: `fts_store.search(&request.query, limit * 3, ...)` → `limit * 5`
+- Line 3864: `fts_store.search(&request.query, limit * 3, ...)` → `limit * 5`
+- Line 3925: `store.search(&query_embedding, limit * 3)` → `limit * 5`
+- Line 3955: `fts_store.search(&request.query, limit * 3, ...)` → `limit * 5`
+- Line 4108: `fts_store.search(&request.query, limit * 3, ...)` → `limit * 5`
+
+Also in `src/search/mod.rs` (CLI search path) — same pattern.
+
+Leave `search_exact` at `limit * 2` (exact matches are already high-precision).
+Leave `search_phrase` at `limit * 3` (phrase search is already precise).
+
+### Fix 2b: Stronger exact identifier boost
+
+**File:** `src/rerank/mod.rs`
+
+Change `EXACT_MATCH_RRF_K` from `5.0` to `2.0`.
+
+Lower K = steeper rank curve = exact matches get proportionally higher RRF scores.
+At K=5, an exact match at rank 1 gets score `1/(5+1) = 0.167`.
+At K=2, an exact match at rank 1 gets score `1/(2+1) = 0.333` — 2x stronger signal.
+
+This ensures that when an agent searches for `"evict_idle_repos"`, the chunk containing
+that exact identifier dominates the fusion result even if the embedding similarity is low.
+
+### Fix 2c: Auto-fallback to literal search
+
+**File:** `src/mcp/mod.rs`, in `semantic_search()` (line ~3620)
+
+After the hybrid search completes and results are built:
+
+```rust
+// If semantic/hybrid returned fewer than 3 results and query looks like code,
+// auto-fallback to literal search and merge results.
+if results.len() < 3 && has_identifiers {
+    // Try literal FTS search as fallback
+    let literal_results = fts_store.search(&request.query, limit, None)?;
+    // Deduplicate by chunk_id and append
+    for lr in literal_results {
+        if !results.iter().any(|r| r.id == lr.chunk_id) {
+            // Convert FtsResult to SearchResult and append
+        }
+    }
+}
+```
+
+Implementation details:
+- Only trigger when `results.len() < 3` AND `has_identifiers` (code-like query)
+- Use `with_fts_store_read_for` to run the fallback FTS search
+- Deduplicate by `chunk_id` before merging
+- Cap total results at `limit`
+- Log when fallback triggers: `tracing::debug!("Auto-fallback: semantic returned {} results, trying literal", results.len())`
+
+### Fix 2d: Increase `search_exact` retrieval for identifiers
+
+**File:** `src/mcp/mod.rs`
+
+Change `search_exact(ident, limit * 2, ...)` to `search_exact(ident, limit * 3, ...)`
+in the identifier boost paths (lines 3762, 3876, 3968, 4120).
+
+More exact candidates = better chance the right chunk survives RRF fusion.
+
+### Validation
+- `cargo check && cargo clippy --all-targets -- -D warnings`
+- `cargo test --lib`
+- Manual test queries that previously required grep fallback:
+  - `codesearch search "evict_idle_repos"` — should find the function
+  - `codesearch search "touch_access"` — should find the method
+  - `codesearch search "Database cleared"` — should find the log message (already fixed by AND mode)
+  - `codesearch search "EXACT_MATCH_RRF_K"` — should find the constant
 
 ---
 
-## 5. Stale branches opruimen
+## Execution order
 
-Voor de overstap: identificeer en verwijder branches die niet meer relevant zijn.
-Lijst van branches die mogelijk stale zijn (op basis van naam en eerdere PR's):
+1. **Fix 1** — idle eviction (`touch` parameter)
+2. **Fix 2a** — retrieval pool `limit * 5`
+3. **Fix 2b** — `EXACT_MATCH_RRF_K` = 2.0
+4. **Fix 2c** — auto-fallback to literal
+5. **Fix 2d** — `search_exact` retrieval `limit * 3`
+6. Validate all together
+7. Commit
 
-```
-feat/mcp-literal-search-tool          (vervangen door eerdere fixes)
-feat/mcp-rebrand-hybrid-search        (gemerged via #15)
-feature/LMDBResilience_GitAware_IndexCompact.md
-feature/auto-regex-confidence
-feature/branch_switch_failing_index
-feature/cleanup
-feature/fix-get-chunk-collision       (gemerged via #28)
-feature/fix-serve-multi-repo          (gepruned)
-feature/fix-serve-multi-repo-2        (gemerged via #25)
-feature/fix-serve-shutdown
-feature/improve_search_results
-feature/mcp-navigation-extras
-feature/post-pr8-fixes
-feature/resolve_git_worktree_correction
-feature/strict-scope-and-schema-version
-feature/update_readme
-feature/upgrade_tree_sitter
-features/5-quiet-actually-quiet
-```
+## Commits
 
-Aanpak:
-1. Voor elke branch: check of laatste commit in master zit (`git log master --grep="<branch-naam>"`
-   of `git branch --merged master`)
-2. Als gemerged: `git branch -d <name>` lokaal + `git push origin --delete <name>`
-3. Als niet gemerged en niet meer relevant: bevestig met user voor verwijderen
-
-Dit is **handmatig werk**, niet automatiseren — risico om recent werk te verliezen.
-
----
-
-## 6. Niet in scope
-
-- Conventional Commits enforcement (commitlint) — apart traject
-- Semantic versioning automation (release-please) — apart traject
-- Changelog generation — apart traject
-- Rename `master` → `main` — bewust niet, conform user voorkeur
-- Verplichte CI status checks — wachten tot CI workflow zelf gestabiliseerd is
-
----
-
-## 7. Risico's
-
-| Risico | Mitigatie |
-|--------|-----------|
-| Bestaande feature branches gerebaset op verouderde master | Plan A: alle open branches eerst mergen naar master, dan develop opzetten |
-| Open PRs richten naar master ipv develop na switch | Bestaande PRs handmatig her-targeten via GitHub UI of API (`PATCH /repos/.../pulls/N` met `base: develop`) |
-| Branch protection blokkeert legitieme master commits | Admin override blijft mogelijk; protection geldt voor PR flow |
-| Lokale clones bij andere users hebben oude default | `git remote set-head origin -a` om het bij te werken |
-
----
-
-## 8. Commit message voorstel
-
-```
-chore: setup develop branch and git flow
-
-- Add develop branch as default for new feature work
-- master remains release branch (no rename to main)
-- Branch protection on master: PR only, source must be develop
-- Branch protection on develop: PR required
-- Update CI triggers (if applicable) to develop
-- Document release process: develop → master + tag
-```
+One commit per fix, or group 2a-2d into a single "search quality" commit.
+Prefer: 2 commits total (Fix 1 + Fix 2).

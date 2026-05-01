@@ -235,7 +235,18 @@ pub fn config_dir() -> Result<PathBuf> {
 
 pub fn config_path() -> Result<PathBuf> {
     if let Ok(override_path) = std::env::var(crate::constants::REPOS_CONFIG_ENV) {
-        return Ok(PathBuf::from(override_path));
+        let path = PathBuf::from(&override_path);
+        // Validate the env-var override points to a .json file to prevent
+        // path traversal / arbitrary file read (CodeQL: uncontrolled data in path).
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("json") {
+            return Ok(path);
+        }
+        anyhow::bail!(
+            "{} must point to a .json file, got: {}",
+            crate::constants::REPOS_CONFIG_ENV,
+            override_path
+        );
     }
     Ok(config_dir()?.join(REPOS_CONFIG_FILE))
 }
