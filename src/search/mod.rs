@@ -10,9 +10,9 @@ use crate::chunker::SemanticChunker;
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
-use crate::{info_print, warn_print};
 use crate::rerank::{rrf_fusion, vector_only, FusedResult, NeuralReranker, DEFAULT_RRF_K};
 use crate::vectordb::VectorStore;
+use crate::{info_print, warn_print};
 
 /// Configuration options for search operations
 #[derive(Debug, Clone)]
@@ -495,7 +495,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         options.max_results
     } else if has_identifiers {
         // Identifier queries: fetch fewer results as exact matches are prioritized
-        std::cmp::max(options.max_results * 3, 100)
+        std::cmp::max(options.max_results * 5, 100)
     } else {
         // Semantic queries: need more candidates for good fusion
         std::cmp::max(options.max_results * 5, 200)
