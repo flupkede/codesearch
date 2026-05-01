@@ -5,8 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ## [1.0.74] - 2026-05-01
 
 ### Fixed
@@ -89,6 +87,6 @@ repositories.
 - `codesearch serve` keeps one writer per database (LMDB invariant). Concurrent
   reindex from a second process is rejected.
 
-[Unreleased]: https://github.com/flupkede/codesearch/compare/v1.0.74...develop
+[1.0.75]: https://github.com/flupkede/codesearch/compare/v1.0.74...v1.0.75
 [1.0.74]: https://github.com/flupkede/codesearch/compare/v1.0.72...v1.0.74
 [1.0.72]: https://github.com/flupkede/codesearch/releases/tag/v1.0.72
