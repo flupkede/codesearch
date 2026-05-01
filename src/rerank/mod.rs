@@ -16,7 +16,7 @@ pub use neural::NeuralReranker;
 pub const DEFAULT_RRF_K: f32 = 20.0;
 
 /// RRF k parameter for exact matches (lower = stronger boost)
-pub const EXACT_MATCH_RRF_K: f32 = 5.0;
+pub const EXACT_MATCH_RRF_K: f32 = 2.0;
 
 /// Fused search result combining vector and FTS scores
 #[derive(Debug, Clone)]
