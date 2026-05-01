@@ -195,6 +195,13 @@ impl ServeState {
             },
         };
 
+        // Canonicalize to resolve symlinks and prevent path traversal.
+        // CodeQL: path derives from env var (CODESEARCH_REPOS_CONFIG) — validate before use.
+        let config_path = match std::fs::canonicalize(&config_path) {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // file doesn't exist yet — nothing to reload
+        };
+
         let mtime = std::fs::metadata(&config_path)
             .and_then(|m| m.modified())
             .ok();
