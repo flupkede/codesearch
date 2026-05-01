@@ -1731,10 +1731,12 @@ pub async fn run_serve(
                 .map_err(std::io::Error::other)
         };
 
-    // Build session manager with extended keep_alive (default is 5 min which kills
-    // idle MCP sessions too aggressively). 30 minutes matches our repo idle eviction.
+    // Build session manager without keep_alive timeout. The default rmcp timeout
+    // (5 min) kills idle sessions too aggressively for a local long-running serve.
+    // We run single-user local, so abandoned sessions cost nothing — let TCP
+    // liveness determine when a session is truly dead.
     let mut session_manager = LocalSessionManager::default();
-    session_manager.session_config.keep_alive = Some(std::time::Duration::from_secs(30 * 60));
+    session_manager.session_config.keep_alive = None;
     let session_manager = Arc::new(session_manager);
     let config = StreamableHttpServerConfig::default();
 
