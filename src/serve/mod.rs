@@ -1652,189 +1652,7 @@ async fn log_mcp_requests(
     response
 }
 
-/// State for the MCP session reconnect middleware.
-///
-/// Holds a reqwest client and the local MCP URL so the middleware can
-/// perform an internal `initialize` + retry when it detects a stale session.
-#[derive(Clone)]
-struct ReconnectState {
-    client: reqwest::Client,
-    mcp_url: String,
-}
 
-/// Middleware that transparently reconnects MCP clients with stale session IDs.
-///
-/// When the server restarts (or after laptop suspend), all in-memory MCP sessions are lost.
-/// Clients that still hold a stale session ID get a 404 "Session not found" from rmcp,
-/// which most MCP client libraries don't handle gracefully — they appear connected but
-/// can't send any requests.
-///
-/// Strategy (full transparent retry):
-/// 1. Buffer the request body.
-/// 2. If it's an `initialize` with a stale session ID → strip the header so rmcp
-///    creates a fresh session (client is explicitly re-initializing).
-/// 3. For all other requests → pass through to rmcp normally.
-/// 4. If rmcp returns 404 (stale session detected):
-///    a. Send an internal `initialize` request to ourselves (no session header).
-///    b. Extract the new session ID from the initialize response header.
-///    c. Retry the original request with the new session ID.
-///    d. Forward the retry response to the client with the new session ID header
-///    so the client updates its stored session ID automatically.
-async fn auto_reconnect_stale_sessions(
-    axum::extract::State(reconnect): axum::extract::State<ReconnectState>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    const MCP_SESSION_HEADER: &str = "mcp-session-id";
-
-    let path = req.uri().path().to_string();
-    let is_mcp = path == crate::constants::MCP_ENDPOINT_PATH;
-    let has_session = req.headers().contains_key(MCP_SESSION_HEADER);
-
-    // Only intercept POST to /mcp with a session ID
-    if !is_mcp || !has_session || req.method() != axum::http::Method::POST {
-        return next.run(req).await;
-    }
-
-    // Buffer the body so we can replay it on retry
-    let (mut parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!("Failed to buffer MCP request body: {}", e);
-            return axum::response::Response::builder()
-                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(axum::body::Body::from("Internal error"))
-                .unwrap();
-        }
-    };
-
-    // If this is an initialize request with a stale session ID, strip the header
-    // so rmcp treats it as a fresh connection (client is explicitly re-initializing).
-    let is_initialize = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .ok()
-        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s == "initialize"))
-        .unwrap_or(false);
-
-    if is_initialize {
-        tracing::info!("🔄 MCP client re-initializing — stripping stale session ID");
-        parts.headers.remove(axum::http::header::HeaderName::from_static(MCP_SESSION_HEADER));
-        let req = axum::http::Request::from_parts(parts, axum::body::Body::from(body_bytes));
-        return next.run(req).await;
-    }
-
-    // Pass through to rmcp
-    let stale_session_id = parts
-        .headers
-        .get(MCP_SESSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned());
-    let req = axum::http::Request::from_parts(parts, axum::body::Body::from(body_bytes.clone()));
-    let response = next.run(req).await;
-
-    // If rmcp returned 404, the session is stale — perform transparent reconnect
-    if response.status() != axum::http::StatusCode::NOT_FOUND {
-        return response;
-    }
-
-    tracing::info!(
-        "🔄 MCP stale session detected (404) — auto-reconnecting transparently"
-    );
-
-    // Step 1: Send an initialize request to ourselves to get a fresh session ID.
-    // We use a minimal MCP initialize payload (the server doesn't validate client info).
-    let init_payload = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": { "name": "codesearch-reconnect", "version": "1.0" }
-        }
-    });
-
-    let init_response = match reconnect
-        .client
-        .post(&reconnect.mcp_url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        .json(&init_payload)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("Auto-reconnect: initialize request failed: {}", e);
-            return axum::response::Response::builder()
-                .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
-                .body(axum::body::Body::from("MCP reconnect failed"))
-                .unwrap();
-        }
-    };
-
-    // Extract the new session ID from the initialize response header
-    let new_session_id = init_response
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned());
-
-    let Some(new_session_id) = new_session_id else {
-        tracing::warn!("Auto-reconnect: initialize succeeded but no session ID in response");
-        return axum::response::Response::builder()
-            .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
-            .body(axum::body::Body::from("MCP reconnect: no session ID"))
-            .unwrap();
-    };
-
-    tracing::info!(
-        "🔄 Auto-reconnect: new session {} (replaced stale {})",
-        &new_session_id[..8.min(new_session_id.len())],
-        stale_session_id.as_deref().map(|s| &s[..8.min(s.len())]).unwrap_or("?")
-    );
-
-    // Step 2: Retry the original request with the new session ID
-    let retry_response = match reconnect
-        .client
-        .post(&reconnect.mcp_url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream")
-        .header("mcp-session-id", &new_session_id)
-        .body(body_bytes.to_vec())
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("Auto-reconnect: retry request failed: {}", e);
-            return axum::response::Response::builder()
-                .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
-                .body(axum::body::Body::from("MCP reconnect retry failed"))
-                .unwrap();
-        }
-    };
-
-    // Convert reqwest response back to axum response, injecting the new session ID header
-    // so the client updates its stored session ID automatically.
-    let status = retry_response.status();
-    let mut builder = axum::response::Response::builder().status(status);
-    for (name, value) in retry_response.headers() {
-        builder = builder.header(name, value);
-    }
-    // Always include the new session ID so the client can update its stored value
-    builder = builder.header("mcp-session-id", &new_session_id);
-
-    let body_bytes = retry_response.bytes().await.unwrap_or_default();
-    builder
-        .body(axum::body::Body::from(body_bytes))
-        .unwrap_or_else(|_| {
-            axum::response::Response::builder()
-                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(axum::body::Body::from("Response build error"))
-                .unwrap()
-        })
-}
 
 /// Run the MCP serve mode.
 ///
@@ -1915,13 +1733,13 @@ pub async fn run_serve(
 
     let mcp_service = StreamableHttpService::new(service_factory, session_manager, config);
 
-    // Build reconnect middleware state (reqwest client + local MCP URL for internal retries)
-    let reconnect_state = ReconnectState {
-        client: reqwest::Client::new(),
-        mcp_url: format!("http://{}{}", addr, MCP_ENDPOINT_PATH),
-    };
-
-    // Build axum router with request logging + stale session recovery
+    // Build axum router with request logging.
+    // Stale-session recovery is handled client-side by the stdio proxy's retry
+    // loop in `McpProxyService` (see src/mcp/mod.rs). Remote MCP clients that
+    // are not spec-compliant must reconnect themselves — we do not attempt a
+    // server-side transparent reconnect because that path opened a session leak
+    // and could not actually reach OpenCode (TCP keep-alive failure happens
+    // before the request hits this middleware).
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
@@ -1932,10 +1750,6 @@ pub async fn run_serve(
         )
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(log_mcp_requests))
-        .layer(axum::middleware::from_fn_with_state(
-            reconnect_state,
-            auto_reconnect_stale_sessions,
-        ))
         .with_state(serve_state.clone());
 
     // Bind TCP listener BEFORE spawning background warmup, so we know the port is live.

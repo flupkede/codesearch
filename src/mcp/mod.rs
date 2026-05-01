@@ -2241,15 +2241,59 @@ struct McpProxyService {
     /// Shared peer handle — hot-swapped on reconnect.
     /// `None` means we're reconnecting to serve; tool calls return a retry-able error.
     peer: std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>>,
+    /// Signal to the main loop in `run_mcp_client` that the current peer is dead
+    /// and a fresh `connect_to_serve` should be attempted. Sent from `call_tool` /
+    /// `list_tools` when rmcp returns a transport-level error so we can recover
+    /// from server restarts and TCP keep-alive failures without bubbling the error
+    /// up to Claude Desktop.
+    disconnect_tx: tokio::sync::mpsc::Sender<()>,
 }
 
 impl McpProxyService {
     #[allow(dead_code)]
     fn new(peer: rmcp::service::Peer<RoleClient>) -> Self {
+        // Direct constructor used by tests / single-shot scenarios.
+        // No reconnect plumbing — the dummy channel is never read.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         Self {
             peer: std::sync::Arc::new(tokio::sync::RwLock::new(Some(peer))),
+            disconnect_tx: tx,
         }
     }
+
+    /// Force a reconnect: clear the shared peer and signal the main loop in
+    /// `run_mcp_client` to call `connect_to_serve` again. Brief sleep gives
+    /// the main loop time to actually reconnect before the caller retries.
+    async fn force_reconnect(&self) {
+        *self.peer.write().await = None;
+        let _ = self.disconnect_tx.send(()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            crate::mcp::PROXY_RETRY_BACKOFF_MS,
+        ))
+        .await;
+    }
+}
+
+/// Maximum number of attempts when forwarding a request to serve.
+/// Each retry includes a forced reconnect, so this also bounds reconnect attempts
+/// per individual tool call.
+const PROXY_MAX_RETRY_ATTEMPTS: u32 = 3;
+
+/// Backoff between proxy retries, also used as the post-reconnect settle delay.
+const PROXY_RETRY_BACKOFF_MS: u64 = 500;
+
+/// Heuristic: does this error message describe a transport-level failure
+/// (broken TCP, server gone, stale keep-alive, stale session) that warrants
+/// a forced reconnect + retry, as opposed to a real tool-level error that
+/// the caller should see?
+fn is_transport_error_msg(msg: &str) -> bool {
+    msg.contains("Transport send error")
+        || msg.contains("error sending request")
+        || msg.contains("Transport error")
+        || msg.contains("connection closed")
+        || msg.contains("error decoding response body")
+        || msg.contains("Session not found")
+        || msg.contains("404")
 }
 
 /// Reconnect-related constants for the MCP proxy.
@@ -2277,17 +2321,48 @@ impl ServerHandler for McpProxyService {
         request: Option<PaginatedRequestParams>,
         _cx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let peer = self.peer.read().await.clone();
-        match peer {
-            Some(p) => p
-                .list_tools(request)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None)),
-            None => Err(McpError::internal_error(
-                "codesearch serve is reconnecting — please retry in a moment".to_string(),
-                None,
-            )),
+        let mut last_err: Option<String> = None;
+        for attempt in 0..PROXY_MAX_RETRY_ATTEMPTS {
+            let peer = self.peer.read().await.clone();
+            match peer {
+                Some(p) => match p.list_tools(request.clone()).await {
+                    Ok(r) => return Ok(r),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !is_transport_error_msg(&msg)
+                            || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
+                        {
+                            return Err(McpError::internal_error(msg, None));
+                        }
+                        tracing::warn!(
+                            "list_tools attempt {}/{} failed (transport): {} — forcing reconnect",
+                            attempt + 1,
+                            PROXY_MAX_RETRY_ATTEMPTS,
+                            msg
+                        );
+                        last_err = Some(msg);
+                        self.force_reconnect().await;
+                    }
+                },
+                None => {
+                    if attempt < PROXY_MAX_RETRY_ATTEMPTS - 1 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            PROXY_RETRY_BACKOFF_MS,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    return Err(McpError::internal_error(
+                        "codesearch serve is reconnecting — please retry in a moment".to_string(),
+                        None,
+                    ));
+                }
+            }
         }
+        Err(McpError::internal_error(
+            last_err.unwrap_or_else(|| "transport error after retries".to_string()),
+            None,
+        ))
     }
 
     async fn call_tool(
@@ -2295,17 +2370,49 @@ impl ServerHandler for McpProxyService {
         request: CallToolRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let peer = self.peer.read().await.clone();
-        match peer {
-            Some(p) => p
-                .call_tool(request)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None)),
-            None => Err(McpError::internal_error(
-                "codesearch serve is reconnecting — please retry in a moment".to_string(),
-                None,
-            )),
+        let mut last_err: Option<String> = None;
+        for attempt in 0..PROXY_MAX_RETRY_ATTEMPTS {
+            let peer = self.peer.read().await.clone();
+            match peer {
+                Some(p) => match p.call_tool(request.clone()).await {
+                    Ok(r) => return Ok(r),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !is_transport_error_msg(&msg)
+                            || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
+                        {
+                            return Err(McpError::internal_error(msg, None));
+                        }
+                        tracing::warn!(
+                            "call_tool('{}') attempt {}/{} failed (transport): {} — forcing reconnect",
+                            request.name,
+                            attempt + 1,
+                            PROXY_MAX_RETRY_ATTEMPTS,
+                            msg
+                        );
+                        last_err = Some(msg);
+                        self.force_reconnect().await;
+                    }
+                },
+                None => {
+                    if attempt < PROXY_MAX_RETRY_ATTEMPTS - 1 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            PROXY_RETRY_BACKOFF_MS,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    return Err(McpError::internal_error(
+                        "codesearch serve is reconnecting — please retry in a moment".to_string(),
+                        None,
+                    ));
+                }
+            }
         }
+        Err(McpError::internal_error(
+            last_err.unwrap_or_else(|| "transport error after retries".to_string()),
+            None,
+        ))
     }
 }
 
@@ -6780,6 +6887,7 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
     // even before the serve connection is established.
     let proxy = McpProxyService {
         peer: peer_state.clone(),
+        disconnect_tx: disconnect_tx.clone(),
     };
     let server = proxy
         .serve(stdio())
