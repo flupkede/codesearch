@@ -14,24 +14,24 @@ mod tui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::response::Json as AxumJson;
 use colored::Colorize;
 use dashmap::{DashMap, DashSet};
 use rmcp::transport::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    streamable_http_server::session::local::LocalSessionManager,
+    streamable_http_server::session::local::LocalSessionManager, StreamableHttpServerConfig,
+    StreamableHttpService,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::constants::{
-    DEFAULT_SERVE_PORT, HEALTH_PATH, MCP_ENDPOINT_PATH, SERVE_PORT_ENV, DB_DIR_NAME,
-    REPO_IDLE_TIMEOUT_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
+    DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, MCP_ENDPOINT_PATH, REAPER_INTERVAL_SECS,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV,
 };
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{IndexManager, SharedStores};
@@ -79,7 +79,12 @@ fn format_tool_call_ago(tool_name: &str, elapsed: std::time::Duration) -> String
     } else if secs < 3600 {
         format!("{} ({}m ago)", tool_name, secs / 60)
     } else {
-        format!("{} ({}h {}m ago)", tool_name, secs / 3600, (secs % 3600) / 60)
+        format!(
+            "{} ({}h {}m ago)",
+            tool_name,
+            secs / 3600,
+            (secs % 3600) / 60
+        )
     }
 }
 
@@ -190,9 +195,14 @@ impl ServeState {
             },
         };
 
-        let mtime = std::fs::metadata(&config_path).and_then(|m| m.modified()).ok();
+        let mtime = std::fs::metadata(&config_path)
+            .and_then(|m| m.modified())
+            .ok();
 
-        let current_mtime = *self.config_mtime.read().map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))?;
+        let current_mtime = *self
+            .config_mtime
+            .read()
+            .map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))?;
         if mtime == current_mtime {
             return Ok(()); // no change
         }
@@ -201,16 +211,26 @@ impl ServeState {
         let new_config = match ReposConfig::load_from(&config_path) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("Failed to reload repos config: {}. Keeping current config.", e);
-                *self.config_mtime.write().map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))? = mtime;
+                tracing::warn!(
+                    "Failed to reload repos config: {}. Keeping current config.",
+                    e
+                );
+                *self
+                    .config_mtime
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))? = mtime;
                 return Ok(());
             }
         };
 
         // Compute removed aliases under read lock (don't hold it long)
         let removed: Vec<String> = {
-            let old = self.config.read().map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))?;
-            old.repos.keys()
+            let old = self
+                .config
+                .read()
+                .map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))?;
+            old.repos
+                .keys()
                 .filter(|k| !new_config.repos.contains_key(*k))
                 .cloned()
                 .collect()
@@ -230,12 +250,19 @@ impl ServeState {
         // Note: these are two separate writes, so a concurrent reader could observe
         // the new config with the old mtime (or vice versa). This causes at most a
         // spurious extra reload on the next call, which is benign.
-        *self.config.write().map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))? = new_config;
-        *self.config_mtime.write().map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))? = mtime;
+        *self
+            .config
+            .write()
+            .map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))? = new_config;
+        *self
+            .config_mtime
+            .write()
+            .map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))? = mtime;
 
         #[cfg(test)]
         {
-            self.reload_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.reload_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         Ok(())
@@ -248,7 +275,11 @@ impl ServeState {
     fn stop_fsw(&self, alias: &str) -> Option<Arc<SharedStores>> {
         if let Some(mut entry) = self.repos.get_mut(alias) {
             match entry.value_mut() {
-                RepoState::Write { cancel_token, stores, .. } => {
+                RepoState::Write {
+                    cancel_token,
+                    stores,
+                    ..
+                } => {
                     cancel_token.cancel();
                     tracing::info!("Stopped FSW for '{}'", alias);
                     return Some(stores.clone());
@@ -275,7 +306,11 @@ impl ServeState {
             let config = match self.config.read() {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!("Cannot restart FSW for '{}': config lock poisoned: {}", alias, e);
+                    tracing::error!(
+                        "Cannot restart FSW for '{}': config lock poisoned: {}",
+                        alias,
+                        e
+                    );
                     return;
                 }
             };
@@ -309,7 +344,9 @@ impl ServeState {
                         &project_path,
                         &db_path_bg,
                         &stores_bg,
-                    ).await {
+                    )
+                    .await
+                    {
                         tracing::error!("Post-reindex refresh for '{}' failed: {}", alias_bg, e);
                     }
 
@@ -361,8 +398,12 @@ impl ServeState {
         }
 
         let path = {
-            let config = self.config.read().map_err(|e| format!("Mutex poisoned: {}", e))?;
-            config.resolve(alias)
+            let config = self
+                .config
+                .read()
+                .map_err(|e| format!("Mutex poisoned: {}", e))?;
+            config
+                .resolve(alias)
                 .ok_or_else(|| format!("Unknown alias '{}'", alias))?
         };
 
@@ -386,27 +427,24 @@ impl ServeState {
                 info!("Warmup '{}': opened in write mode", alias);
                 s
             }
-            Err(_) => {
-                match SharedStores::new_readonly(&db_path, dims) {
-                    Ok(s) => {
-                        info!("Warmup '{}': opened in readonly mode", alias);
-                        let stores_arc = Arc::new(s);
-                        self.repos.insert(
-                            alias.to_string(),
-                            RepoState::Readonly {
-                                stores: stores_arc.clone(),
-                            },
-                        );
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!("Warmup '{}': failed to open: {}", alias, e);
-                        self.repos
-                            .insert(alias.to_string(), RepoState::Conflicted);
-                        return Err(Self::conflicted_msg(alias));
-                    }
+            Err(_) => match SharedStores::new_readonly(&db_path, dims) {
+                Ok(s) => {
+                    info!("Warmup '{}': opened in readonly mode", alias);
+                    let stores_arc = Arc::new(s);
+                    self.repos.insert(
+                        alias.to_string(),
+                        RepoState::Readonly {
+                            stores: stores_arc.clone(),
+                        },
+                    );
+                    return Ok(());
                 }
-            }
+                Err(e) => {
+                    warn!("Warmup '{}': failed to open: {}", alias, e);
+                    self.repos.insert(alias.to_string(), RepoState::Conflicted);
+                    return Err(Self::conflicted_msg(alias));
+                }
+            },
         };
 
         // Build vector index from existing data
@@ -446,35 +484,44 @@ impl ServeState {
             }
         });
 
-        // Store as Warm — FSW will be started lazily on first query
-        self.repos.insert(
-            alias.to_string(),
-            RepoState::Warm {
-                stores: stores_arc,
-            },
-        );
-        self.touch_access(alias);
+        // Store as Warm — FSW will be started lazily on first query.
+        // Do NOT touch_access: warmup is background activity, not a real query.
+        // The idle timer should only reset when a user/agent actually queries this repo.
+        self.repos
+            .insert(alias.to_string(), RepoState::Warm { stores: stores_arc });
         Ok(())
     }
 
     /// Try to open a repo by alias. Returns a clone of the Arc<SharedStores>
     /// if successful, or an error string if conflicted/unknown.
+    ///
+    /// `touch`: when true, records the access time for idle-eviction tracking.
+    /// Pass false for fan-out paths (e.g., multi-repo status, get_chunk candidate
+    /// scanning) that should NOT reset the idle timer on every repo.
     pub(crate) async fn get_or_open_stores(
         &self,
         alias: &str,
+        touch: bool,
     ) -> std::result::Result<Arc<SharedStores>, String> {
         let _ = self.reload_if_changed();
 
         // Fast path: already opened
         if let Some(entry) = self.repos.get(alias) {
-            self.touch_access(alias);
+            if touch {
+                self.touch_access(alias);
+            }
             return match entry.value() {
                 RepoState::Write { stores, .. } | RepoState::Readonly { stores } => {
                     Ok(stores.clone())
                 }
                 RepoState::Warm { stores } => {
-                    // Lazy FSW start: transition Warm → Write on first actual query
+                    // Lazy FSW start: transition Warm → Write only on real query access.
+                    // Fan-out/candidate-detection callers pass touch=false and must not
+                    // trigger Warm → Write or start FSW.
                     let stores = stores.clone();
+                    if !touch {
+                        return Ok(stores);
+                    }
                     drop(entry); // release DashMap read guard before mutation
 
                     // Only one caller should do the transition; use a compare-and-swap pattern.
@@ -486,8 +533,12 @@ impl ServeState {
                         if let RepoState::Warm { stores } = mut_entry.value() {
                             let stores = stores.clone();
                             let path = {
-                                let config = self.config.read().map_err(|e| format!("Mutex poisoned: {}", e))?;
-                                config.resolve(alias)
+                                let config = self
+                                    .config
+                                    .read()
+                                    .map_err(|e| format!("Mutex poisoned: {}", e))?;
+                                config
+                                    .resolve(alias)
                                     .ok_or_else(|| format!("Unknown alias '{}'", alias))?
                             };
 
@@ -511,8 +562,12 @@ impl ServeState {
 
         // Slow path: need to open
         let path = {
-            let config = self.config.read().map_err(|e| format!("Mutex poisoned: {}", e))?;
-            config.resolve(alias)
+            let config = self
+                .config
+                .read()
+                .map_err(|e| format!("Mutex poisoned: {}", e))?;
+            config
+                .resolve(alias)
                 .ok_or_else(|| format!("Unknown alias '{}'", alias))?
         };
 
@@ -548,12 +603,14 @@ impl ServeState {
                                 stores: stores_arc.clone(),
                             },
                         );
+                        if touch {
+                            self.touch_access(alias);
+                        }
                         return Ok(stores_arc);
                     }
                     Err(e) => {
                         warn!("Failed to open repo '{}': {}", alias, e);
-                        self.repos
-                            .insert(alias.to_string(), RepoState::Conflicted);
+                        self.repos.insert(alias.to_string(), RepoState::Conflicted);
                         return Err(Self::conflicted_msg(alias));
                     }
                 }
@@ -600,11 +657,7 @@ impl ServeState {
                     tokio::spawn(async move {
                         // Pre-start FSW so changes during initial refresh aren't lost
                         if let Err(e) = im_for_task.start_watching().await {
-                            tracing::warn!(
-                                "Could not pre-start FSW for '{}': {}",
-                                alias_clone,
-                                e
-                            );
+                            tracing::warn!("Could not pre-start FSW for '{}': {}", alias_clone, e);
                         }
 
                         // Initial incremental refresh
@@ -615,11 +668,7 @@ impl ServeState {
                         )
                         .await
                         {
-                            tracing::error!(
-                                "Initial refresh for '{}' failed: {}",
-                                alias_clone,
-                                e
-                            );
+                            tracing::error!("Initial refresh for '{}' failed: {}", alias_clone, e);
                         }
 
                         if token_for_task.is_cancelled() {
@@ -628,11 +677,7 @@ impl ServeState {
 
                         // Main file watcher loop — runs until cancel_token fires
                         if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
-                            tracing::error!(
-                                "File watcher for '{}' stopped: {}",
-                                alias_clone,
-                                e
-                            );
+                            tracing::error!("File watcher for '{}' stopped: {}", alias_clone, e);
                         }
                     });
 
@@ -659,6 +704,9 @@ impl ServeState {
                 cancel_token,
             },
         );
+        if touch {
+            self.touch_access(alias);
+        }
         Ok(stores_arc)
     }
 
@@ -697,7 +745,11 @@ impl ServeState {
                     }
 
                     if let Err(e) = im_for_task.start_watching().await {
-                        tracing::warn!("Lazy FSW start for '{}': pre-start failed: {}", alias_bg, e);
+                        tracing::warn!(
+                            "Lazy FSW start for '{}': pre-start failed: {}",
+                            alias_bg,
+                            e
+                        );
                     }
 
                     if token_for_task.is_cancelled() {
@@ -711,7 +763,8 @@ impl ServeState {
                 Err(e) => {
                     tracing::warn!(
                         "Lazy FSW for '{}': IndexManager init failed: {} — live updates disabled",
-                        alias_bg, e
+                        alias_bg,
+                        e
                     );
                 }
             }
@@ -782,33 +835,44 @@ impl ServeState {
     /// Triggers reload_if_changed first.
     pub(crate) fn config_snapshot(&self) -> ReposConfig {
         let _ = self.reload_if_changed();
-        self.config.read()
+        self.config
+            .read()
             .map(|guard| guard.clone())
             .unwrap_or_default()
     }
 
     /// Resolve a group name to its constituent aliases.
     /// Returns an error if the group doesn't exist.
-    pub(crate) fn resolve_group_aliases(&self, group: &str) -> std::result::Result<Vec<String>, String> {
+    pub(crate) fn resolve_group_aliases(
+        &self,
+        group: &str,
+    ) -> std::result::Result<Vec<String>, String> {
         let _ = self.reload_if_changed();
         let config = match self.config.read() {
             Ok(c) => c,
             Err(e) => return Err(format!("Config lock poisoned: {}", e)),
         };
-        config.groups.get(group)
+        config
+            .groups
+            .get(group)
             .cloned()
             .ok_or_else(|| format!("Unknown group '{}'", group))
     }
 
     /// Record that a repo was just accessed (query or reindex).
-    /// Called from `get_or_open_stores`, `warmup_repo`, and `reindex_handler`.
-    fn touch_access(&self, alias: &str) {
-        self.last_access.insert(alias.to_string(), std::time::Instant::now());
+    /// Called from `get_or_open_stores(touch=true)`, and `reindex_handler`.
+    /// NOT called from `warmup_repo` — background warmup is not a real query.
+    pub(crate) fn touch_access(&self, alias: &str) {
+        self.last_access
+            .insert(alias.to_string(), std::time::Instant::now());
     }
 
     /// Record a tool call for a specific repo (for dashboard display).
     pub(crate) fn record_tool_call(&self, alias: &str, tool_name: &str) {
-        self.last_tool_call.insert(alias.to_string(), (tool_name.to_string(), std::time::Instant::now()));
+        self.last_tool_call.insert(
+            alias.to_string(),
+            (tool_name.to_string(), std::time::Instant::now()),
+        );
     }
 
     /// Record that changes were made to a repo (index/reindex).
@@ -816,7 +880,9 @@ impl ServeState {
     pub(crate) fn record_changes(&self, alias: &str, count: u64) {
         self.repo_changes
             .entry(alias.to_string())
-            .and_modify(|c| { c.fetch_add(count, Ordering::Relaxed); })
+            .and_modify(|c| {
+                c.fetch_add(count, Ordering::Relaxed);
+            })
             .or_insert_with(|| AtomicU64::new(count));
     }
 
@@ -872,25 +938,34 @@ impl ServeState {
 
             let changes = match self.repos.get(alias) {
                 Some(entry) => match entry.value() {
-                    RepoState::Write { stores, .. } | RepoState::Warm { stores } | RepoState::Readonly { stores } => {
+                    RepoState::Write { stores, .. }
+                    | RepoState::Warm { stores }
+                    | RepoState::Readonly { stores } => {
                         stores.changes_count.load(Ordering::Relaxed)
                     }
                     RepoState::Conflicted => 0,
                 },
-                None => self.repo_changes.get(alias)
+                None => self
+                    .repo_changes
+                    .get(alias)
                     .map(|c| c.load(Ordering::Relaxed))
                     .unwrap_or(0),
             };
 
-            let last_tool = self.last_tool_call.get(alias)
+            let last_tool = self
+                .last_tool_call
+                .get(alias)
                 .map(|e| (e.value().0.clone(), e.value().1.elapsed()))
                 .map(|(name, ago)| format_tool_call_ago(&name, ago));
 
-            result.push((alias.clone(), RepoStatusInfo {
-                status: label,
-                changes,
-                last_tool_call: last_tool,
-            }));
+            result.push((
+                alias.clone(),
+                RepoStatusInfo {
+                    status: label,
+                    changes,
+                    last_tool_call: last_tool,
+                },
+            ));
         }
         result
     }
@@ -933,12 +1008,19 @@ impl ServeState {
         eprintln!("{}", top.bright_black());
 
         // Header
-        eprintln!("{} {:<w_alias$} {} {:<w_status$} {} {:>7} {} {:<24} {}",
-            "│".bright_black(), "Project".bold(), "│".bright_black(),
-            "Status".bold(), "│".bright_black(),
-            "Changes".bold(), "│".bright_black(),
-            "Last Tool Call".bold(), "│".bright_black(),
-            w_alias = alias_w, w_status = status_w,
+        eprintln!(
+            "{} {:<w_alias$} {} {:<w_status$} {} {:>7} {} {:<24} {}",
+            "│".bright_black(),
+            "Project".bold(),
+            "│".bright_black(),
+            "Status".bold(),
+            "│".bright_black(),
+            "Changes".bold(),
+            "│".bright_black(),
+            "Last Tool Call".bold(),
+            "│".bright_black(),
+            w_alias = alias_w,
+            w_status = status_w,
         );
 
         eprintln!("{}", mid.bright_black());
@@ -961,11 +1043,17 @@ impl ServeState {
             // Replace the plain text with the colored version
             let status_display = status_padded.replace(status_plain, &status_colored.to_string());
             let tool_str = info.last_tool_call.as_deref().unwrap_or("—");
-            eprintln!("{} {:<w_alias$} {} {} {} {:>7} {} {:<24} {}",
-                "│".bright_black(), alias, "│".bright_black(),
-                status_display, "│".bright_black(),
-                info.changes, "│".bright_black(),
-                tool_str, "│".bright_black(),
+            eprintln!(
+                "{} {:<w_alias$} {} {} {} {:>7} {} {:<24} {}",
+                "│".bright_black(),
+                alias,
+                "│".bright_black(),
+                status_display,
+                "│".bright_black(),
+                info.changes,
+                "│".bright_black(),
+                tool_str,
+                "│".bright_black(),
                 w_alias = alias_w,
             );
         }
@@ -973,27 +1061,46 @@ impl ServeState {
         eprintln!("{}", bot.bright_black());
 
         // Overall status
-        let has_error = repos.iter().any(|(_, r)| matches!(r.status, RepoStateLabel::Error));
+        let has_error = repos
+            .iter()
+            .any(|(_, r)| matches!(r.status, RepoStateLabel::Error));
         let health = if has_error {
             "Error".red().bold().to_string()
         } else {
             "Healthy".green().bold().to_string()
         };
 
-        let open_count = repos.iter().filter(|(_, r)| matches!(r.status, RepoStateLabel::Open)).count();
-        let warm_count = repos.iter().filter(|(_, r)| matches!(r.status, RepoStateLabel::Warm)).count();
-        let closed_count = repos.iter().filter(|(_, r)| matches!(r.status, RepoStateLabel::Closed | RepoStateLabel::NoIndex)).count();
+        let open_count = repos
+            .iter()
+            .filter(|(_, r)| matches!(r.status, RepoStateLabel::Open))
+            .count();
+        let warm_count = repos
+            .iter()
+            .filter(|(_, r)| matches!(r.status, RepoStateLabel::Warm))
+            .count();
+        let closed_count = repos
+            .iter()
+            .filter(|(_, r)| matches!(r.status, RepoStateLabel::Closed | RepoStateLabel::NoIndex))
+            .count();
 
         eprintln!();
-        eprintln!("  {} {}   {} {}   {} {}   {} {}",
-            "Status:".dimmed(), health,
-            "Open:".dimmed(), format!("{}", open_count).green(),
-            "Warm:".dimmed(), format!("{}", warm_count).yellow(),
-            "Closed:".dimmed(), format!("{}", closed_count).dimmed(),
+        eprintln!(
+            "  {} {}   {} {}   {} {}   {} {}",
+            "Status:".dimmed(),
+            health,
+            "Open:".dimmed(),
+            format!("{}", open_count).green(),
+            "Warm:".dimmed(),
+            format!("{}", warm_count).yellow(),
+            "Closed:".dimmed(),
+            format!("{}", closed_count).dimmed(),
         );
-        eprintln!("  {} {}   {} {}",
-            "Active Sessions:".dimmed(), format!("{}", active).cyan(),
-            "Total Since Start:".dimmed(), format!("{}", total).dimmed(),
+        eprintln!(
+            "  {} {}   {} {}",
+            "Active Sessions:".dimmed(),
+            format!("{}", active).cyan(),
+            "Total Since Start:".dimmed(),
+            format!("{}", total).dimmed(),
         );
         eprintln!();
     }
@@ -1019,7 +1126,8 @@ impl ServeState {
         let now = std::time::Instant::now();
 
         // Collect aliases to evict (can't mutate DashMap while iterating)
-        let to_evict: Vec<String> = self.last_access
+        let to_evict: Vec<String> = self
+            .last_access
             .iter()
             .filter(|entry| {
                 let alias = entry.key();
@@ -1034,7 +1142,8 @@ impl ServeState {
 
         // Log reaper status even when nothing to evict (for debugging idle eviction)
         if !self.last_access.is_empty() {
-            let idle_ages: Vec<(String, u64)> = self.last_access
+            let idle_ages: Vec<(String, u64)> = self
+                .last_access
                 .iter()
                 .map(|e| (e.key().clone(), now.duration_since(*e.value()).as_secs()))
                 .collect();
@@ -1101,10 +1210,16 @@ async fn reindex_handler(
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
-) -> (axum::http::StatusCode, axum::response::Json<serde_json::Value>) {
+) -> (
+    axum::http::StatusCode,
+    axum::response::Json<serde_json::Value>,
+) {
     use axum::http::StatusCode;
 
-    let force = params.get("force").map(|v| v == "true" || v == "1").unwrap_or(false);
+    let force = params
+        .get("force")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
     // Resolve the project path for this alias
     let project_path = {
@@ -1163,7 +1278,7 @@ async fn reindex_handler(
             Some(s) => s,
             None => {
                 // FSW not running -- try opening normally
-                match state.get_or_open_stores(&alias).await {
+                match state.get_or_open_stores(&alias, true).await {
                     Ok(s) => s,
                     Err(e) => {
                         state.active_reindexes.remove(&guard_alias);
@@ -1182,16 +1297,13 @@ async fn reindex_handler(
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
         tokio::spawn(async move {
-            tracing::info!("Force reindex for '{}': clearing stores and reindexing", alias_bg);
+            tracing::info!(
+                "Force reindex for '{}': clearing stores and reindexing",
+                alias_bg
+            );
 
             // 2. Clear data and reindex
-            match IndexManager::force_reindex_with_stores(
-                &project_path,
-                &db_path,
-                &stores,
-            )
-            .await
-            {
+            match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores).await {
                 Ok(()) => {
                     tracing::info!("Force reindex complete for '{}'", alias_bg);
                 }
@@ -1206,9 +1318,8 @@ async fn reindex_handler(
             g_state.active_reindexes.remove(&g_alias);
         });
     } else {
-
         // Incremental refresh: ensure the repo is opened, then refresh
-        let stores = match state.get_or_open_stores(&alias).await {
+        let stores = match state.get_or_open_stores(&alias, true).await {
             Ok(s) => s,
             Err(e) => {
                 state.active_reindexes.remove(&guard_alias);
@@ -1225,7 +1336,10 @@ async fn reindex_handler(
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
         tokio::spawn(async move {
-            tracing::info!("🔄 Incremental reindex triggered for '{}' via HTTP API", alias_bg);
+            tracing::info!(
+                "🔄 Incremental reindex triggered for '{}' via HTTP API",
+                alias_bg
+            );
             match IndexManager::perform_incremental_refresh_with_stores(
                 &project_path,
                 &db_path,
@@ -1273,7 +1387,10 @@ struct AddRepoRequest {
 async fn add_repo_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
     axum::extract::Json(body): axum::extract::Json<AddRepoRequest>,
-) -> (axum::http::StatusCode, axum::response::Json<serde_json::Value>) {
+) -> (
+    axum::http::StatusCode,
+    axum::response::Json<serde_json::Value>,
+) {
     use axum::http::StatusCode;
 
     // Canonicalize the path
@@ -1349,13 +1466,8 @@ async fn add_repo_handler(
     let alias_bg = alias.clone();
     let state_bg = state.clone();
 
-    match crate::index::index_quiet(
-        Some(index_path.clone()),
-        false,
-        body.global,
-        cancel_token,
-    )
-    .await
+    match crate::index::index_quiet(Some(index_path.clone()), false, body.global, cancel_token)
+        .await
     {
         Ok(()) => {
             tracing::info!("Index created for '{}' ({})", alias, index_path.display());
@@ -1404,7 +1516,10 @@ async fn add_repo_handler(
 async fn remove_repo_handler(
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
-) -> (axum::http::StatusCode, axum::response::Json<serde_json::Value>) {
+) -> (
+    axum::http::StatusCode,
+    axum::response::Json<serde_json::Value>,
+) {
     use axum::http::StatusCode;
 
     // 1. Resolve project path from config
@@ -1463,7 +1578,11 @@ async fn remove_repo_handler(
         };
         config.unregister_alias(&alias);
         if let Err(e) = config.save() {
-            tracing::warn!("Failed to save repos config after removing '{}': {}", alias, e);
+            tracing::warn!(
+                "Failed to save repos config after removing '{}': {}",
+                alias,
+                e
+            );
         }
     }
 
@@ -1533,21 +1652,36 @@ async fn log_mcp_requests(
     response
 }
 
-/// Middleware that auto-reconnects MCP clients with stale session IDs.
+/// State for the MCP session reconnect middleware.
+///
+/// Holds a reqwest client and the local MCP URL so the middleware can
+/// perform an internal `initialize` + retry when it detects a stale session.
+#[derive(Clone)]
+struct ReconnectState {
+    client: reqwest::Client,
+    mcp_url: String,
+}
+
+/// Middleware that transparently reconnects MCP clients with stale session IDs.
 ///
 /// When the server restarts (or after laptop suspend), all in-memory MCP sessions are lost.
 /// Clients that still hold a stale session ID get a 404 "Session not found" from rmcp,
 /// which most MCP client libraries don't handle gracefully — they appear connected but
 /// can't send any requests.
 ///
-/// Strategy: For POST /mcp, buffer the body and inspect the JSON-RPC method.
-/// - If it's an `initialize` request with a session ID → strip the header so rmcp
-///   creates a fresh session (the client is trying to re-initialize with a stale ID).
-/// - For all other requests → pass through unchanged (session should still be valid
-///   if the client was properly initialized).
-/// - If the pass-through results in 404, we can't retry (axum middleware limitation),
-///   but we transform the 404 into a JSON-RPC error that the client can act on.
+/// Strategy (full transparent retry):
+/// 1. Buffer the request body.
+/// 2. If it's an `initialize` with a stale session ID → strip the header so rmcp
+///    creates a fresh session (client is explicitly re-initializing).
+/// 3. For all other requests → pass through to rmcp normally.
+/// 4. If rmcp returns 404 (stale session detected):
+///    a. Send an internal `initialize` request to ourselves (no session header).
+///    b. Extract the new session ID from the initialize response header.
+///    c. Retry the original request with the new session ID.
+///    d. Forward the retry response to the client with the new session ID header
+///    so the client updates its stored session ID automatically.
 async fn auto_reconnect_stale_sessions(
+    axum::extract::State(reconnect): axum::extract::State<ReconnectState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -1557,12 +1691,12 @@ async fn auto_reconnect_stale_sessions(
     let is_mcp = path == crate::constants::MCP_ENDPOINT_PATH;
     let has_session = req.headers().contains_key(MCP_SESSION_HEADER);
 
-    // Only process POST to MCP endpoint with a session ID
+    // Only intercept POST to /mcp with a session ID
     if !is_mcp || !has_session || req.method() != axum::http::Method::POST {
         return next.run(req).await;
     }
 
-    // Buffer the body to inspect the JSON-RPC method
+    // Buffer the body so we can replay it on retry
     let (mut parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
         Ok(bytes) => bytes,
@@ -1575,21 +1709,131 @@ async fn auto_reconnect_stale_sessions(
         }
     };
 
-    // Check if this is an initialize request
+    // If this is an initialize request with a stale session ID, strip the header
+    // so rmcp treats it as a fresh connection (client is explicitly re-initializing).
     let is_initialize = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
         .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s == "initialize"))
         .unwrap_or(false);
 
     if is_initialize {
-        // Client is re-initializing with a stale session ID.
-        // Strip the header so rmcp treats it as a fresh connection.
         tracing::info!("🔄 MCP client re-initializing — stripping stale session ID");
         parts.headers.remove(axum::http::header::HeaderName::from_static(MCP_SESSION_HEADER));
+        let req = axum::http::Request::from_parts(parts, axum::body::Body::from(body_bytes));
+        return next.run(req).await;
     }
 
-    let req = axum::http::Request::from_parts(parts, axum::body::Body::from(body_bytes));
-    next.run(req).await
+    // Pass through to rmcp
+    let stale_session_id = parts
+        .headers
+        .get(MCP_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    let req = axum::http::Request::from_parts(parts, axum::body::Body::from(body_bytes.clone()));
+    let response = next.run(req).await;
+
+    // If rmcp returned 404, the session is stale — perform transparent reconnect
+    if response.status() != axum::http::StatusCode::NOT_FOUND {
+        return response;
+    }
+
+    tracing::info!(
+        "🔄 MCP stale session detected (404) — auto-reconnecting transparently"
+    );
+
+    // Step 1: Send an initialize request to ourselves to get a fresh session ID.
+    // We use a minimal MCP initialize payload (the server doesn't validate client info).
+    let init_payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "codesearch-reconnect", "version": "1.0" }
+        }
+    });
+
+    let init_response = match reconnect
+        .client
+        .post(&reconnect.mcp_url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .json(&init_payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Auto-reconnect: initialize request failed: {}", e);
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                .body(axum::body::Body::from("MCP reconnect failed"))
+                .unwrap();
+        }
+    };
+
+    // Extract the new session ID from the initialize response header
+    let new_session_id = init_response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+
+    let Some(new_session_id) = new_session_id else {
+        tracing::warn!("Auto-reconnect: initialize succeeded but no session ID in response");
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+            .body(axum::body::Body::from("MCP reconnect: no session ID"))
+            .unwrap();
+    };
+
+    tracing::info!(
+        "🔄 Auto-reconnect: new session {} (replaced stale {})",
+        &new_session_id[..8.min(new_session_id.len())],
+        stale_session_id.as_deref().map(|s| &s[..8.min(s.len())]).unwrap_or("?")
+    );
+
+    // Step 2: Retry the original request with the new session ID
+    let retry_response = match reconnect
+        .client
+        .post(&reconnect.mcp_url)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("mcp-session-id", &new_session_id)
+        .body(body_bytes.to_vec())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Auto-reconnect: retry request failed: {}", e);
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                .body(axum::body::Body::from("MCP reconnect retry failed"))
+                .unwrap();
+        }
+    };
+
+    // Convert reqwest response back to axum response, injecting the new session ID header
+    // so the client updates its stored session ID automatically.
+    let status = retry_response.status();
+    let mut builder = axum::response::Response::builder().status(status);
+    for (name, value) in retry_response.headers() {
+        builder = builder.header(name, value);
+    }
+    // Always include the new session ID so the client can update its stored value
+    builder = builder.header("mcp-session-id", &new_session_id);
+
+    let body_bytes = retry_response.bytes().await.unwrap_or_default();
+    builder
+        .body(axum::body::Body::from(body_bytes))
+        .unwrap_or_else(|_| {
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::from("Response build error"))
+                .unwrap()
+        })
 }
 
 /// Run the MCP serve mode.
@@ -1652,14 +1896,15 @@ pub async fn run_serve(
     // Create the MCP service factory — each session gets a fresh CodesearchService
     // that uses serve_state for repo routing.
     let state_for_factory = serve_state.clone();
-    let service_factory = move || -> std::result::Result<crate::mcp::CodesearchService, std::io::Error> {
-        let session_id = state_for_factory.session_connected();
-        info!("🔌 MCP client connected (session #{})", session_id);
-        // We create a minimal service; actual repo routing is handled inside
-        // the tool handlers via serve_state.
-        crate::mcp::CodesearchService::new_for_serve(state_for_factory.clone())
-            .map_err(std::io::Error::other)
-    };
+    let service_factory =
+        move || -> std::result::Result<crate::mcp::CodesearchService, std::io::Error> {
+            let session_id = state_for_factory.session_connected();
+            info!("🔌 MCP client connected (session #{})", session_id);
+            // We create a minimal service; actual repo routing is handled inside
+            // the tool handlers via serve_state.
+            crate::mcp::CodesearchService::new_for_serve(state_for_factory.clone())
+                .map_err(std::io::Error::other)
+        };
 
     // Build session manager with extended keep_alive (default is 5 min which kills
     // idle MCP sessions too aggressively). 30 minutes matches our repo idle eviction.
@@ -1668,21 +1913,29 @@ pub async fn run_serve(
     let session_manager = Arc::new(session_manager);
     let config = StreamableHttpServerConfig::default();
 
-    let mcp_service = StreamableHttpService::new(
-        service_factory,
-        session_manager,
-        config,
-    );
+    let mcp_service = StreamableHttpService::new(service_factory, session_manager, config);
+
+    // Build reconnect middleware state (reqwest client + local MCP URL for internal retries)
+    let reconnect_state = ReconnectState {
+        client: reqwest::Client::new(),
+        mcp_url: format!("http://{}{}", addr, MCP_ENDPOINT_PATH),
+    };
 
     // Build axum router with request logging + stale session recovery
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
-        .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
+        .route(
+            "/repos/:alias/reindex",
+            axum::routing::post(reindex_handler),
+        )
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(log_mcp_requests))
-        .layer(axum::middleware::from_fn(auto_reconnect_stale_sessions))
+        .layer(axum::middleware::from_fn_with_state(
+            reconnect_state,
+            auto_reconnect_stale_sessions,
+        ))
         .with_state(serve_state.clone());
 
     // Bind TCP listener BEFORE spawning background warmup, so we know the port is live.
@@ -1759,11 +2012,10 @@ pub async fn run_serve(
     // 3 seconds after the cancel_token is cancelled. This gives in-flight HTTP
     // requests time to complete while preventing a permanent hang on open sessions.
     let cancel_for_deadline = cancel_token.clone();
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            cancel_token.cancelled().await;
-            info!("🛑 codesearch serve shutting down...");
-        });
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        cancel_token.cancelled().await;
+        info!("🛑 codesearch serve shutting down...");
+    });
 
     tokio::select! {
         result = server => {
@@ -1810,16 +2062,22 @@ mod tests {
         std::fs::create_dir(&repo_path).unwrap();
 
         let mut config = ReposConfig::default();
-        config.register_with_alias(repo_path.clone(), Some("testalias".to_string())).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
 
         let state = state_with_config(config);
 
         // First call: DB missing → error, NOT cached as Conflicted
-        let err = match state.get_or_open_stores("testalias").await {
+        let err = match state.get_or_open_stores("testalias", true).await {
             Err(e) => e,
             Ok(_) => panic!("expected error for missing DB"),
         };
-        assert!(err.contains("Database not found"), "expected 'not found', got: {}", err);
+        assert!(
+            err.contains("Database not found"),
+            "expected 'not found', got: {}",
+            err
+        );
         assert!(!state.repos.contains_key("testalias"));
 
         // Create a minimal DB so next call succeeds
@@ -1835,7 +2093,7 @@ mod tests {
         drop(_stores);
 
         // Second call: should succeed without restart
-        let res = state.get_or_open_stores("testalias").await;
+        let res = state.get_or_open_stores("testalias", true).await;
         assert!(res.is_ok(), "expected ok after recreating DB, got: Err");
     }
 
@@ -1846,15 +2104,25 @@ mod tests {
         std::fs::create_dir(&repo_path).unwrap();
 
         let mut config = ReposConfig::default();
-        config.register_with_alias(repo_path.clone(), Some("testalias".to_string())).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
 
         let state = state_with_config(config);
-        let err = match state.get_or_open_stores("testalias").await {
+        let err = match state.get_or_open_stores("testalias", true).await {
             Err(e) => e,
             Ok(_) => panic!("expected error for missing DB"),
         };
-        assert!(err.contains("codesearch index add"), "error should mention 'index add': {}", err);
-        assert!(err.contains("codesearch index rm"), "error should mention 'index rm': {}", err);
+        assert!(
+            err.contains("codesearch index add"),
+            "error should mention 'index add': {}",
+            err
+        );
+        assert!(
+            err.contains("codesearch index rm"),
+            "error should mention 'index rm': {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -1873,15 +2141,21 @@ mod tests {
         let _lock = SharedStores::new(&db_path, 384).unwrap();
 
         let mut config = ReposConfig::default();
-        config.register_with_alias(repo_path.clone(), Some("testalias".to_string())).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
 
         let state = state_with_config(config);
-        let err = match state.get_or_open_stores("testalias").await {
+        let err = match state.get_or_open_stores("testalias", true).await {
             Err(e) => e,
             Ok(_) => panic!("expected conflict error"),
         };
         assert!(err.contains("Stop"), "error should mention 'Stop': {}", err);
-        assert!(err.contains("retry"), "error should mention 'retry': {}", err);
+        assert!(
+            err.contains("retry"),
+            "error should mention 'retry': {}",
+            err
+        );
     }
 
     #[test]
@@ -1893,7 +2167,9 @@ mod tests {
         std::fs::create_dir(&repo_a).unwrap();
 
         let mut config = ReposConfig::default();
-        config.register_with_alias(repo_a.clone(), Some("a".to_string())).unwrap();
+        config
+            .register_with_alias(repo_a.clone(), Some("a".to_string()))
+            .unwrap();
         config.save_to(&config_file).unwrap();
 
         let state = ServeState::new(config, Some(config_file.clone()));
@@ -1903,7 +2179,9 @@ mod tests {
         let repo_b = tmp.path().join("repo-b");
         std::fs::create_dir(&repo_b).unwrap();
         let mut config2 = ReposConfig::load_from(&config_file).unwrap();
-        config2.register_with_alias(repo_b, Some("b".to_string())).unwrap();
+        config2
+            .register_with_alias(repo_b, Some("b".to_string()))
+            .unwrap();
 
         // Small sleep to ensure mtime changes on Windows
         std::thread::sleep(std::time::Duration::from_millis(150));
@@ -1932,12 +2210,14 @@ mod tests {
         drop(_stores);
 
         let mut config = ReposConfig::default();
-        config.register_with_alias(repo_path.clone(), Some("x".to_string())).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some("x".to_string()))
+            .unwrap();
         config.save_to(&config_file).unwrap();
 
         let state = ServeState::new(config, Some(config_file.clone()));
         // Open alias x so it lands in DashMap
-        let _ = state.get_or_open_stores("x").await.unwrap();
+        let _ = state.get_or_open_stores("x", true).await.unwrap();
         assert!(state.repos.contains_key("x"));
 
         // Rewrite config without x
@@ -1948,11 +2228,15 @@ mod tests {
         config2.save_to(&config_file).unwrap();
 
         // Next query for x should fail as unknown
-        let err = match state.get_or_open_stores("x").await {
+        let err = match state.get_or_open_stores("x", true).await {
             Err(e) => e,
             Ok(_) => panic!("expected unknown alias after removal"),
         };
-        assert!(err.contains("Unknown alias"), "expected unknown alias, got: {}", err);
+        assert!(
+            err.contains("Unknown alias"),
+            "expected unknown alias, got: {}",
+            err
+        );
         assert!(!state.repos.contains_key("x"));
     }
 
@@ -1965,7 +2249,9 @@ mod tests {
         std::fs::create_dir(&repo_path).unwrap();
 
         let mut config = ReposConfig::default();
-        config.register_with_alias(repo_path, Some("a".to_string())).unwrap();
+        config
+            .register_with_alias(repo_path, Some("a".to_string()))
+            .unwrap();
         config.save_to(&config_file).unwrap();
 
         let state = ServeState::new(config, Some(config_file.clone()));
@@ -1991,7 +2277,9 @@ mod tests {
         std::fs::create_dir(&repo_path).unwrap();
 
         let mut config = ReposConfig::default();
-        config.register_with_alias(repo_path.clone(), Some("testalias".to_string())).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
 
         let config_file = tmp.path().join("repos.json");
         config.save_to(&config_file).unwrap();
@@ -1999,8 +2287,14 @@ mod tests {
         let state = Arc::new(ServeState::new(config, Some(config_file)));
 
         let app = axum::Router::new()
-            .route(crate::constants::HEALTH_PATH, axum::routing::get(health_handler))
-            .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
+            .route(
+                crate::constants::HEALTH_PATH,
+                axum::routing::get(health_handler),
+            )
+            .route(
+                "/repos/:alias/reindex",
+                axum::routing::post(reindex_handler),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2021,9 +2315,20 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "expected 404 from our handler");
-        let body: serde_json::Value = resp.json().await.expect("handler should return JSON body for 404");
-        assert!(body.get("error").is_some(), "expected JSON error body, got: {}", body);
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "expected 404 from our handler"
+        );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("handler should return JSON body for 404");
+        assert!(
+            body.get("error").is_some(),
+            "expected JSON error body, got: {}",
+            body
+        );
 
         // POST to known alias → 202 Accepted or 500 (DB missing), but NOT axum's built-in 404
         // The key assertion is that the route IS registered (we get our handler's response, not axum's empty 404)
@@ -2035,11 +2340,17 @@ mod tests {
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.expect("handler should return JSON body");
         assert!(
-            status == reqwest::StatusCode::ACCEPTED || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            status == reqwest::StatusCode::ACCEPTED
+                || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "expected 202 or 500 from our handler (not axum's 404), got {}: {}",
-            status, body
+            status,
+            body
         );
-        assert!(body.get("status").is_some(), "expected JSON with 'status' field, got: {}", body);
+        assert!(
+            body.get("status").is_some(),
+            "expected JSON with 'status' field, got: {}",
+            body
+        );
     }
 
     #[test]
@@ -2051,7 +2362,9 @@ mod tests {
         std::fs::create_dir(&repo_path).unwrap();
 
         let mut config = ReposConfig::default();
-        config.register_with_alias(repo_path.clone(), Some("a".to_string())).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some("a".to_string()))
+            .unwrap();
         config.save_to(&config_file).unwrap();
 
         let state = ServeState::new(config, Some(config_file.clone()));
@@ -2073,7 +2386,9 @@ mod tests {
         std::fs::create_dir(&repo_path).unwrap();
 
         let mut config = ReposConfig::default();
-        config.register_with_alias(repo_path.clone(), Some("testalias".to_string())).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
 
         let config_file = tmp.path().join("repos.json");
         config.save_to(&config_file).unwrap();
@@ -2081,7 +2396,10 @@ mod tests {
         let state = Arc::new(ServeState::new(config, Some(config_file)));
 
         let app = axum::Router::new()
-            .route("/repos/:alias/reindex", axum::routing::post(reindex_handler))
+            .route(
+                "/repos/:alias/reindex",
+                axum::routing::post(reindex_handler),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2103,8 +2421,10 @@ mod tests {
             .unwrap();
         let status1 = resp1.status();
         assert!(
-            status1 == reqwest::StatusCode::ACCEPTED || status1 == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "first request should be 202 or 500, got {}", status1
+            status1 == reqwest::StatusCode::ACCEPTED
+                || status1 == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "first request should be 202 or 500, got {}",
+            status1
         );
 
         // If the first request was accepted (202), the reindex is running in background.
