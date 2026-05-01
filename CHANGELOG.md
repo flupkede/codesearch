@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.74] - 2026-05-01
+
+### Fixed
+
+- **MCP session keep_alive timeout removed**: the previous 30-minute idle timeout
+  was killing sessions mid-working-day. Sessions now live until TCP dies, which
+  is the correct behaviour for a local single-user long-running serve process.
+
+## [1.0.72] - 2026-05-01
+
 First stable release of codesearch — a Rust-based hybrid (vector + BM25 + AST)
 code search MCP server, optimised for AI coding agents working across many
 repositories.
@@ -79,4 +89,6 @@ repositories.
 - `codesearch serve` keeps one writer per database (LMDB invariant). Concurrent
   reindex from a second process is rejected.
 
-[Unreleased]: https://github.com/flupkede/codesearch/compare/master...develop
+[Unreleased]: https://github.com/flupkede/codesearch/compare/v1.0.74...develop
+[1.0.74]: https://github.com/flupkede/codesearch/compare/v1.0.72...v1.0.74
+[1.0.72]: https://github.com/flupkede/codesearch/releases/tag/v1.0.72
