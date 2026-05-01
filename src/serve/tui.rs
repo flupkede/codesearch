@@ -443,13 +443,25 @@ fn cpu_usage_str(sys_system: &mut Option<sysinfo::System>) -> String {
     };
 
     // Create System instance on first call, reuse on subsequent calls.
-    let sys = sys_system.get_or_insert_with(System::new);
+    // Refresh CPUs once on creation so sys.cpus().len() is populated.
+    let sys = sys_system.get_or_insert_with(|| {
+        let mut s = System::new();
+        s.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
+        s
+    });
 
     // Refresh only our process (cpu)
     sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
 
     match sys.process(pid) {
-        Some(proc) => format!("{:.0}%", proc.cpu_usage()),
+        Some(proc) => {
+            // sysinfo reports cpu_usage() as total across all logical CPUs
+            // (e.g. 474% on a 15-core machine). Divide by CPU count to get
+            // a 0-100% value that makes sense to humans.
+            let num_cpus = sys.cpus().len().max(1) as f32;
+            let pct = proc.cpu_usage() / num_cpus;
+            format!("{:.0}%", pct)
+        }
         None => "—".into(),
     }
 }
