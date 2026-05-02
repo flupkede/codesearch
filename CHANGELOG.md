@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.82] - 2026-05-02
+
+### Fixed
+
+- `codesearch index list` now actually lists all repositories registered in
+  `~/.codesearch/repos.json` instead of only checking the current directory.
+  A loose `.codesearch.db` in an unregistered directory is shown separately
+  under "Local (unregistered)". Both TODO markers removed.
+
 ## [1.0.77] - 2026-05-01
 
 ### Removed

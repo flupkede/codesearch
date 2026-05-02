@@ -1024,25 +1024,42 @@ async fn index_with_options(
 }
 
 /// List all indexed repositories
-#[allow(dead_code)] // Reserved for 'list' command implementation
+#[allow(dead_code)]
 pub async fn list() -> Result<()> {
+    use crate::db_discovery::repos::ReposConfig;
+
     println!("{}", "📚 Indexed Repositories".bright_cyan().bold());
     println!("{}", "=".repeat(60));
 
-    // TODO: Scan all repositories in ~/.codesearch/repos.json
-    // For now just check current directory
+    let config = ReposConfig::load().unwrap_or_default();
 
-    // Check current directory
-    let current_dir = std::env::current_dir()?;
-    let current_db = current_dir.join(".codesearch.db");
+    if config.repos.is_empty() {
+        println!("\n  No repositories registered.");
+    } else {
+        let mut entries: Vec<_> = config.repos.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
 
-    if current_db.exists() {
-        println!("\n{}", "Current Directory:".bright_green());
-        print_repo_stats(&current_dir, &current_db)?;
+        for (alias, project_path) in &entries {
+            println!();
+            println!("  {}", alias.bright_green());
+            let db_path = project_path.join(".codesearch.db");
+            print_repo_stats(project_path, &db_path)?;
+        }
+
+        println!();
+        println!("  {} repositories registered.", entries.len());
     }
 
-    // TODO: Track indexed repositories globally in ~/.codesearch/repos.json
-    // For now, just show current directory
+    // Show a loose local DB if the user is standing in one that is not registered
+    let current_dir = std::env::current_dir()?;
+    let current_db = current_dir.join(".codesearch.db");
+    let current_alias = config.alias_for_path(&current_dir);
+
+    if current_db.exists() && current_alias.is_none() {
+        println!();
+        println!("{}", "Local (unregistered):".bright_yellow());
+        print_repo_stats(&current_dir, &current_db)?;
+    }
 
     Ok(())
 }
@@ -1425,50 +1442,51 @@ pub async fn remove_from_index(
     Ok(())
 }
 
-/// Show index status (local or global)
+/// Show index status — lists all repos registered in repos.json plus any
+/// loose local DB in the current directory that is not yet registered.
 pub async fn list_index_status() -> Result<()> {
-    println!("{}", "📋 Index Status".bright_cyan().bold());
+    use crate::db_discovery::repos::ReposConfig;
+
+    println!("{}", "📚 Indexed Repositories".bright_cyan().bold());
     println!("{}", "=".repeat(60));
 
-    // Try to find the database
-    let db_info = find_best_database(Some(Path::new(".")))?;
+    let config = ReposConfig::load().unwrap_or_default();
 
-    if let Some(db) = db_info {
-        println!("\n{}", "💾 Database:".cyan());
-        println!("   Path: {}", db.db_path.display());
-
-        if db.is_global {
-            println!("   Type: {}", "Global".bright_green());
-        } else {
-            println!("   Type: {}", "Local".bright_green());
-        }
-
-        // Show if this is from a parent directory
-        if !db.is_current && !db.is_global {
-            println!("   {}", "(from parent directory)".dimmed());
-        }
-
-        // Get stats
-        if let Ok(stats) = get_db_stats(&db.db_path).await {
-            println!("   Status: {}", "✅ Indexed".green());
-            println!("   Chunks: {}", stats.chunk_count);
-            println!("   Size: {:.2} MB", stats.size_mb);
-            if stats.bloat_ratio.map(|r| r > 0.0).unwrap_or(false) {
-                println!("   Bloat Ratio: {:.2}%", stats.bloat_ratio.unwrap_or(0.0));
-            }
-        } else {
-            println!("   Status: {}", "⚠️  Could not read database".yellow());
-        }
+    if config.repos.is_empty() {
+        println!("\n  No repositories registered.");
+        println!("\n  Register one with:");
+        println!("    codesearch index add          # register current directory");
+        println!("    codesearch index add <path>   # register a specific path");
     } else {
-        println!("\n{}", "No index found for this project.".dimmed());
-        println!("\nCreate an index with:");
-        println!("  codesearch index add          # Create local index");
-        println!("  codesearch index add -g       # Create global index");
+        let mut entries: Vec<_> = config.repos.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+
+        for (alias, project_path) in &entries {
+            println!();
+            println!("  {}", alias.bright_green());
+            let db_path = project_path.join(".codesearch.db");
+            print_repo_stats(project_path, &db_path)?;
+        }
+
+        println!();
+        println!("  {} repositories registered.", entries.len());
+    }
+
+    // Show a loose local DB if the user is standing in one that is not registered
+    let current_dir = std::env::current_dir()?;
+    let current_db = current_dir.join(".codesearch.db");
+    let current_alias = config.alias_for_path(&current_dir);
+
+    if current_db.exists() && current_alias.is_none() {
+        println!();
+        println!("{}", "Local (unregistered):".bright_yellow());
+        print_repo_stats(&current_dir, &current_db)?;
+        println!("  Register with: codesearch index add");
     }
 
     Ok(())
 }
-
+#[allow(dead_code)]
 async fn get_db_stats(db_path: &Path) -> Result<DbStats> {
     use crate::vectordb::VectorStore;
 
@@ -1506,6 +1524,7 @@ async fn get_db_stats(db_path: &Path) -> Result<DbStats> {
     })
 }
 
+#[allow(dead_code)]
 struct DbStats {
     chunk_count: usize,
     size_mb: f64,
