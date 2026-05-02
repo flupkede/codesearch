@@ -1,191 +1,68 @@
-# AGENTS.md — features/improve_doctor
+# AGENTS.md — features/serve-single-instance
 
 ## Goal
 
-Extend `codesearch doctor` with two new modes:
+Prevent `codesearch serve` from starting a second instance when one is already
+running. Currently the process fails with a cryptic OS-level `AddrInUse` error.
+The fix detects a running instance before binding the port and exits cleanly
+with a clear message.
 
-1. `codesearch doctor --all` — runs all checks on every repo in `~/.codesearch/repos.json`
-   and prints a consolidated report.
-2. `codesearch doctor --repo <alias>` — runs all checks on a specific registered alias,
-   from any working directory.
-
-Current behaviour (no flags): checks the current directory only — this stays unchanged.
-
----
-
-## CLI changes
-
-### File: `src/cli/mod.rs`
-
-Find the `Doctor` variant in the `Commands` enum and add two new optional args:
-
-```rust
-/// Run diagnostics on the index
-Doctor {
-    /// Apply automatic fixes where possible
-    #[arg(long)]
-    fix: bool,
-
-    /// Output results as JSON
-    #[arg(long)]
-    json: bool,
-
-    /// Run diagnostics on all registered repositories (from repos.json)
-    #[arg(long)]
-    all: bool,
-
-    /// Run diagnostics on a specific registered alias (e.g. --repo example-org)
-    #[arg(long, value_name = "ALIAS")]
-    repo: Option<String>,
-},
-```
-
-Then in the `match` arm that calls `crate::cli::doctor::run(fix, json)`,
-pass the new args:
-
-```rust
-Commands::Doctor { fix, json, all, repo } => {
-    crate::cli::doctor::run(fix, json, all, repo).await
-}
-```
-
-### File: `src/cli/doctor.rs`
-
-Change the signature of `pub async fn run`:
-
-```rust
-pub async fn run(fix: bool, json: bool, all: bool, repo: Option<String>) -> Result<()>
-```
+Note: Ctrl-C is intentionally NOT a quit key in the TUI (removed in a previous
+commit — crossterm raw mode delivers it as a key event, bypassing the OS handler).
+Use `q` to quit the TUI.
 
 ---
 
 ## Implementation
 
-### New helper: `run_for_path`
+### File: `src/serve/mod.rs`
 
-Extract the existing body of `run()` (from `let project_path = Path::new(".")` down to
-`Ok(())`) into a new private async function:
-
-```rust
-async fn run_for_path(
-    project_path: &Path,
-    fix: bool,
-    json: bool,
-) -> Result<(usize, usize)>  // returns (warnings, errors)
-```
-
-This function runs all checks for a single project path and returns the warning/error
-counts. It should NOT call `anyhow::bail!` on errors — instead return `Ok((0, errors))`.
-The caller decides whether to bail.
-
-### Updated `run()`
+At the very start of `run_serve()`, before the `TcpListener::bind` call,
+add a health-check probe:
 
 ```rust
-pub async fn run(fix: bool, json: bool, all: bool, repo: Option<String>) -> Result<()> {
-    use crate::db_discovery::repos::ReposConfig;
-
-    // --repo <alias> mode
-    if let Some(alias) = repo {
-        let config = ReposConfig::load().unwrap_or_default();
-        match config.repos.get(&alias) {
-            Some(path) => {
-                let (_, errors) = run_for_path(path, fix, json).await?;
-                if errors > 0 {
-                    anyhow::bail!("Doctor found {} error(s) in '{}'", errors, alias);
-                }
-                return Ok(());
-            }
-            None => {
-                anyhow::bail!(
-                    "Unknown alias '{}'. Run 'codesearch index list' to see registered repos.",
-                    alias
-                );
-            }
-        }
-    }
-
-    // --all mode
-    if all {
-        let config = ReposConfig::load().unwrap_or_default();
-        if config.repos.is_empty() {
-            println!("No repositories registered.");
-            return Ok(());
-        }
-
-        let mut total_warnings = 0usize;
-        let mut total_errors = 0usize;
-        let mut entries: Vec<_> = config.repos.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-
-        for (alias, path) in &entries {
-            println!();
-            println!("{}", format!("── {} ──", alias).bright_cyan().bold());
-            let (w, e) = run_for_path(path, fix, json).await.unwrap_or((0, 1));
-            total_warnings += w;
-            total_errors += e;
-        }
-
-        println!();
-        println!("{}", "═".repeat(60));
-        println!(
-            "  All repos: {} warnings, {} errors across {} repositories",
-            total_warnings,
-            total_errors,
-            entries.len()
+// Single-instance guard: probe the health endpoint before trying to bind.
+// If a serve is already running on this port, exit cleanly instead of
+// crashing with a cryptic AddrInUse OS error.
+let probe_url = format!("http://{}:{}/health", host, port);
+if let Ok(resp) = reqwest::Client::new()
+    .get(&probe_url)
+    .timeout(std::time::Duration::from_millis(500))
+    .send()
+    .await
+{
+    if resp.status().is_success() {
+        eprintln!(
+            "codesearch serve is already running at http://{}:{}\n\
+             Use 'q' in the TUI window to stop it, or kill the process manually.",
+            host, port
         );
-
-        if total_errors > 0 {
-            anyhow::bail!("Doctor found errors in one or more repositories");
-        }
-        return Ok(());
+        std::process::exit(1);
     }
-
-    // Default: current directory (existing behaviour unchanged)
-    let (_, errors) = run_for_path(Path::new("."), fix, json).await?;
-    if errors > 0 {
-        anyhow::bail!("Doctor found {} error(s)", errors);
-    }
-    Ok(())
 }
 ```
 
----
+Notes:
+- `reqwest` is already a dependency — no new deps needed.
+- Timeout of 500ms is enough: if serve is up it answers in <10ms;
+  if nothing is listening the OS rejects the connection immediately.
+- Use `std::process::exit(1)` not `anyhow::bail!` — this is an intentional
+  early-exit, not an unexpected error.
+- The message says `q` (not Ctrl-C) because Ctrl-C is not a TUI quit key.
 
-## Output examples
+### Where to insert
 
-### `codesearch doctor --repo example-org`
+Find the function `pub async fn run_serve(` in `src/serve/mod.rs`.
+The probe goes after the port/host are resolved but before
+`tokio::net::TcpListener::bind(addr).await?`.
 
-```
-🔍 Codesearch Doctor
-============================================================
-  ✅ Database found
-  ✅ Database structure
-  ✅ Model consistency
-  ✅ Git root placement
-  ⚠️  File integrity — 3 stale files
-  ...
-
-Summary
-============================================================
-  1 warning, 0 errors
-```
-
-### `codesearch doctor --all`
+Approximate location (search for `TcpListener::bind` — first non-test occurrence):
 
 ```
-── myorg_mcp ──
-🔍 Codesearch Doctor
-  ✅ Database found
-  ...
-
-── ExampleRepo ──
-🔍 Codesearch Doctor
-  ✅ Database found
-  ...
-
-══════════════════════════════════════════════════════════════
-  All repos: 2 warnings, 0 errors across 12 repositories
+src/serve/mod.rs line ~1769: let listener = tokio::net::TcpListener::bind(addr).await?;
 ```
+
+Insert the probe block 5-10 lines above that.
 
 ---
 
@@ -193,40 +70,35 @@ Summary
 
 - [ ] `cargo check` clean
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` clean
-- [ ] `cargo test --lib --bins` — all existing doctor tests pass, no changes to
-      test logic needed (tests call `run_for_path` directly or mock the path)
-- [ ] Manual: `codesearch doctor` (no flags) — behaviour unchanged
-- [ ] Manual: `codesearch doctor --repo codesearch-git` — checks only that alias
-- [ ] Manual: `codesearch doctor --all` — checks all 12 repos, consolidated summary
-- [ ] Manual: `codesearch doctor --repo nonexistent` — clear error message
+- [ ] `cargo test --lib --bins` — all tests pass (the two test occurrences of
+      `TcpListener::bind("127.0.0.1:0")` are on random ports and unaffected)
+- [ ] Manual: start serve, open second terminal, run `codesearch serve` again →
+      prints clear message and exits with code 1
+- [ ] Manual: no serve running, `codesearch serve` starts normally
 
 ## CHANGELOG
 
 Add under a new version section:
 
 ```markdown
-### Added
+### Fixed
 
-- `codesearch doctor --repo <alias>` — run diagnostics on a specific registered
-  alias from any working directory.
-- `codesearch doctor --all` — run diagnostics on all repos in `repos.json` with
-  a consolidated warning/error summary.
+- `codesearch serve` now detects a running instance before binding the port
+  and exits with a clear message instead of crashing with a cryptic
+  `AddrInUse` OS error.
 ```
 
 ## Branch flow
 
 ```powershell
-git push origin features/improve_doctor
-# PR features/improve_doctor → develop
-# merge, then run ..\release.ps1
+git push origin features/serve-single-instance
+# PR features/serve-single-instance → develop → merge → release.ps1
 ```
 
 ## Done when
 
-- [ ] `run_for_path` extracted and working
-- [ ] `--repo` mode implemented and tested
-- [ ] `--all` mode implemented and tested
-- [ ] Default mode (no flags) unchanged
+- [ ] Health-check probe added to `run_serve()`
 - [ ] Quality gates pass
+- [ ] Manual smoke tests pass
 - [ ] CHANGELOG updated
 - [ ] PR opened against `develop`
