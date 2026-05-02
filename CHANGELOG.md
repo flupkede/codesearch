@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.81] - 2026-05-02
+
+### Fixed
+
+- **Idle eviction now covers warmed-but-never-queried repos**: `warmup_repo`
+  starts the idle timer at warmup so background-warmed aliases (KRKA.Aprimo,
+  DPS, BAYR.Aprimo and others showing `Last Tool Call = -` indefinitely) are
+  evicted by the idle reaper instead of holding LMDB envs and embedder state
+  forever.
+- **Ctrl-C no longer quits the TUI**: crossterm's raw mode delivers Ctrl-C as
+  a key event, bypassing the OS-level handler. Treating it as quit was a
+  foot-gun: a stray Ctrl-C in the wrong terminal would tear down the whole
+  serve. Use `q` only.
+
+### Changed
+
+- **`unsafe` blocks documented**: SAFETY comments added to the three LMDB
+  env-open `unsafe` blocks in `src/embed/cache.rs` and `src/vectordb/store.rs`.
+
 ## [1.0.77] - 2026-05-01
 
 ### Removed
