@@ -1,153 +1,232 @@
-# AGENTS.md — feature/index-list-fix
+# AGENTS.md — features/improve_doctor
 
 ## Goal
 
-Fix `codesearch index list` so it actually lists all registered repositories
-from `~/.codesearch/repos.json` instead of only checking the current directory.
+Extend `codesearch doctor` with two new modes:
 
-The command currently has two `TODO` comments and prints almost nothing useful
-for a user who has registered repos via `serve` or `codesearch index add`.
+1. `codesearch doctor --all` — runs all checks on every repo in `~/.codesearch/repos.json`
+   and prints a consolidated report.
+2. `codesearch doctor --repo <alias>` — runs all checks on a specific registered alias,
+   from any working directory.
 
-## Why this matters
+Current behaviour (no flags): checks the current directory only — this stays unchanged.
 
-A user who downloads a release runs `codesearch index list` to discover what
-is registered. Today they get an empty output unless they happen to be standing
-in a registered repo. This is the primary "what do I have?" entry point and it
-must work.
+---
 
-## Files to change
+## CLI changes
 
-- `src/index/mod.rs` — replace the body of `pub async fn list()`
+### File: `src/cli/mod.rs`
 
-No other files need changes. No new dependencies.
+Find the `Doctor` variant in the `Commands` enum and add two new optional args:
 
-## Required behaviour
+```rust
+/// Run diagnostics on the index
+Doctor {
+    /// Apply automatic fixes where possible
+    #[arg(long)]
+    fix: bool,
 
-```
-$ codesearch index list
-📚 Indexed Repositories
-============================================================
+    /// Output results as JSON
+    #[arg(long)]
+    json: bool,
 
-  codesearch-git    \\?\C:\WorkArea\AI\codesearch\codesearch.git
-                    1727 chunks in 54 files
+    /// Run diagnostics on all registered repositories (from repos.json)
+    #[arg(long)]
+    all: bool,
 
-  husq-aprimo       \\?\C:\Users\develterf\source\repos\HUSQ.Aprimo
-                    Could not open database (locked by serve)
-
-  investing         C:\WorkArea\AI\investing
-                    2369 chunks in 227 files
-
-  ... (one entry per registered repo, sorted alphabetically by alias)
-
-12 repositories registered.
+    /// Run diagnostics on a specific registered alias (e.g. --repo husq-aprimo)
+    #[arg(long, value_name = "ALIAS")]
+    repo: Option<String>,
+},
 ```
 
-If the current directory has a `.codesearch.db` that is **not** registered in
-`repos.json`, append a separate "Local (unregistered)" section at the end so
-the user sees their loose DB too.
+Then in the `match` arm that calls `crate::cli::doctor::run(fix, json)`,
+pass the new args:
 
-If `repos.json` does not exist or is empty, print `No repositories registered.`
-and continue to the local-DB check.
+```rust
+Commands::Doctor { fix, json, all, repo } => {
+    crate::cli::doctor::run(fix, json, all, repo).await
+}
+```
+
+### File: `src/cli/doctor.rs`
+
+Change the signature of `pub async fn run`:
+
+```rust
+pub async fn run(fix: bool, json: bool, all: bool, repo: Option<String>) -> Result<()>
+```
+
+---
 
 ## Implementation
 
-Use `crate::db_discovery::repos::ReposConfig` (already imported elsewhere in
-`src/index/mod.rs`). It exposes:
+### New helper: `run_for_path`
 
-- `ReposConfig::load() -> Result<Self>` — reads `~/.codesearch/repos.json`
-- `config.repos: HashMap<String, PathBuf>` — alias → project path
-
-Pseudocode:
+Extract the existing body of `run()` (from `let project_path = Path::new(".")` down to
+`Ok(())`) into a new private async function:
 
 ```rust
-pub async fn list() -> Result<()> {
+async fn run_for_path(
+    project_path: &Path,
+    fix: bool,
+    json: bool,
+) -> Result<(usize, usize)>  // returns (warnings, errors)
+```
+
+This function runs all checks for a single project path and returns the warning/error
+counts. It should NOT call `anyhow::bail!` on errors — instead return `Ok((0, errors))`.
+The caller decides whether to bail.
+
+### Updated `run()`
+
+```rust
+pub async fn run(fix: bool, json: bool, all: bool, repo: Option<String>) -> Result<()> {
     use crate::db_discovery::repos::ReposConfig;
 
-    println!("{}", "📚 Indexed Repositories".bright_cyan().bold());
-    println!("{}", "=".repeat(60));
+    // --repo <alias> mode
+    if let Some(alias) = repo {
+        let config = ReposConfig::load().unwrap_or_default();
+        match config.repos.get(&alias) {
+            Some(path) => {
+                let (_, errors) = run_for_path(path, fix, json).await?;
+                if errors > 0 {
+                    anyhow::bail!("Doctor found {} error(s) in '{}'", errors, alias);
+                }
+                return Ok(());
+            }
+            None => {
+                anyhow::bail!(
+                    "Unknown alias '{}'. Run 'codesearch index list' to see registered repos.",
+                    alias
+                );
+            }
+        }
+    }
 
-    let config = ReposConfig::load().unwrap_or_default();
+    // --all mode
+    if all {
+        let config = ReposConfig::load().unwrap_or_default();
+        if config.repos.is_empty() {
+            println!("No repositories registered.");
+            return Ok(());
+        }
 
-    if config.repos.is_empty() {
-        println!("\n  No repositories registered.");
-    } else {
+        let mut total_warnings = 0usize;
+        let mut total_errors = 0usize;
         let mut entries: Vec<_> = config.repos.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
 
-        for (alias, project_path) in &entries {
+        for (alias, path) in &entries {
             println!();
-            println!("  {}", alias.bright_green());
-            let db_path = project_path.join(".codesearch.db");
-            print_repo_stats(project_path, &db_path)?;
+            println!("{}", format!("── {} ──", alias).bright_cyan().bold());
+            let (w, e) = run_for_path(path, fix, json).await.unwrap_or((0, 1));
+            total_warnings += w;
+            total_errors += e;
         }
 
         println!();
-        println!("{} repositories registered.", entries.len());
+        println!("{}", "═".repeat(60));
+        println!(
+            "  All repos: {} warnings, {} errors across {} repositories",
+            total_warnings,
+            total_errors,
+            entries.len()
+        );
+
+        if total_errors > 0 {
+            anyhow::bail!("Doctor found errors in one or more repositories");
+        }
+        return Ok(());
     }
 
-    // Also show a loose local DB if the user is standing in one
-    let current_dir = std::env::current_dir()?;
-    let current_db = current_dir.join(".codesearch.db");
-    let current_alias = config.alias_for_path(&current_dir);
-
-    if current_db.exists() && current_alias.is_none() {
-        println!();
-        println!("{}", "Local (unregistered):".bright_yellow());
-        print_repo_stats(&current_dir, &current_db)?;
+    // Default: current directory (existing behaviour unchanged)
+    let (_, errors) = run_for_path(Path::new("."), fix, json).await?;
+    if errors > 0 {
+        anyhow::bail!("Doctor found {} error(s)", errors);
     }
-
     Ok(())
 }
 ```
 
-Notes:
-- `print_repo_stats` already handles "could not open database" gracefully
-  (returns the dimmed message). Don't change it.
-- `alias_for_path` already exists on `ReposConfig` (chunk 1751 in serve_hub
-  index — see `src/db_discovery/repos.rs:221`).
-- Remove both `TODO` comments — they are now resolved.
-- Keep the `#[allow(dead_code)]` on `print_repo_stats` removed if you can —
-  it's now actively used. If clippy complains, leave the attribute.
+---
+
+## Output examples
+
+### `codesearch doctor --repo husq-aprimo`
+
+```
+🔍 Codesearch Doctor
+============================================================
+  ✅ Database found
+  ✅ Database structure
+  ✅ Model consistency
+  ✅ Git root placement
+  ⚠️  File integrity — 3 stale files
+  ...
+
+Summary
+============================================================
+  1 warning, 0 errors
+```
+
+### `codesearch doctor --all`
+
+```
+── aprimo_mcp ──
+🔍 Codesearch Doctor
+  ✅ Database found
+  ...
+
+── BRU.Aprimo ──
+🔍 Codesearch Doctor
+  ✅ Database found
+  ...
+
+══════════════════════════════════════════════════════════════
+  All repos: 2 warnings, 0 errors across 12 repositories
+```
+
+---
 
 ## Quality gates
 
 - [ ] `cargo check` clean
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` clean
-- [ ] `cargo test --lib --bins` — all tests pass (no test changes expected)
-- [ ] Manual: `codesearch index list` prints all 12+ registered aliases
-- [ ] Manual: standing in a registered repo, that alias is shown (not duplicated
-      as "Local (unregistered)")
-- [ ] Manual: standing in a directory with a stale `.codesearch.db` not in
-      `repos.json`, it appears under "Local (unregistered)"
+- [ ] `cargo test --lib --bins` — all existing doctor tests pass, no changes to
+      test logic needed (tests call `run_for_path` directly or mock the path)
+- [ ] Manual: `codesearch doctor` (no flags) — behaviour unchanged
+- [ ] Manual: `codesearch doctor --repo codesearch-git` — checks only that alias
+- [ ] Manual: `codesearch doctor --all` — checks all 12 repos, consolidated summary
+- [ ] Manual: `codesearch doctor --repo nonexistent` — clear error message
 
 ## CHANGELOG
 
-Add under a new `## [1.0.82] - 2026-05-02` section (or whatever version the
-hook bumps to):
+Add under a new version section:
 
 ```markdown
-### Fixed
+### Added
 
-- `codesearch index list` now actually lists all repositories registered in
-  `~/.codesearch/repos.json` instead of only checking the current directory.
-  A loose `.codesearch.db` in an unregistered directory is shown separately
-  under "Local (unregistered)".
+- `codesearch doctor --repo <alias>` — run diagnostics on a specific registered
+  alias from any working directory.
+- `codesearch doctor --all` — run diagnostics on all repos in `repos.json` with
+  a consolidated warning/error summary.
 ```
 
 ## Branch flow
 
-When done:
-
 ```powershell
-git push origin feature/index-list-fix
-# then from claude.ai or similar: open PR feature/index-list-fix → develop
-# merge, then run release.ps1 in C:\WorkArea\AI\codesearch
+git push origin features/improve_doctor
+# PR features/improve_doctor → develop
+# merge, then run ..\release.ps1
 ```
 
 ## Done when
 
-- [ ] `pub async fn list()` rewritten and both TODOs removed
+- [ ] `run_for_path` extracted and working
+- [ ] `--repo` mode implemented and tested
+- [ ] `--all` mode implemented and tested
+- [ ] Default mode (no flags) unchanged
 - [ ] Quality gates pass
-- [ ] Manual smoke tests pass
-- [ ] CHANGELOG.md updated
+- [ ] CHANGELOG updated
 - [ ] PR opened against `develop`
