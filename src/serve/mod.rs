@@ -492,10 +492,14 @@ impl ServeState {
         });
 
         // Store as Warm — FSW will be started lazily on first query.
-        // Do NOT touch_access: warmup is background activity, not a real query.
-        // The idle timer should only reset when a user/agent actually queries this repo.
         self.repos
             .insert(alias.to_string(), RepoState::Warm { stores: stores_arc });
+
+        // Start the idle timer at warmup. A real query will reset it via
+        // touch_access; without this, repos that are warmed but never queried
+        // would never appear in `last_access` and therefore never be evicted
+        // by `evict_idle_repos`, holding LMDB envs and embedder state forever.
+        self.touch_access(alias);
         Ok(())
     }
 
