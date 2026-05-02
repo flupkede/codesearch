@@ -143,6 +143,9 @@ pub(crate) struct ServeState {
     active_sessions: AtomicU64,
     /// Total MCP sessions since serve started.
     total_sessions: AtomicU64,
+    /// Shared sysinfo instance for CPU measurement — must persist across calls
+    /// so cpu_usage() can compute a delta (first call always returns 0%).
+    sysinfo_system: std::sync::Mutex<sysinfo::System>,
     /// Test-only counter for reload invocations that actually swapped config.
     #[cfg(test)]
     reload_count: std::sync::atomic::AtomicUsize,
@@ -160,6 +163,8 @@ impl std::fmt::Debug for ServeState {
 
 impl ServeState {
     fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
         Self {
             repos: DashMap::new(),
             last_access: DashMap::new(),
@@ -171,6 +176,7 @@ impl ServeState {
             last_tool_call: DashMap::new(),
             active_sessions: AtomicU64::new(0),
             total_sessions: AtomicU64::new(0),
+            sysinfo_system: std::sync::Mutex::new(sys),
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -918,7 +924,6 @@ impl ServeState {
     }
 
     /// Get the current number of active sessions.
-    #[allow(dead_code)]
     pub(crate) fn active_session_count(&self) -> u64 {
         self.active_sessions.load(Ordering::Relaxed)
     }
@@ -1255,9 +1260,9 @@ async fn status_handler(
         })
         .collect();
 
-    // CPU usage — lightweight single-sample read
+    // CPU usage — reuse shared System instance so cpu_usage() can compute delta
     let cpu = {
-        use sysinfo::{ProcessesToUpdate, System};
+        use sysinfo::ProcessesToUpdate;
         let pid = match sysinfo::get_current_pid() {
             Ok(p) => p,
             Err(_) => {
@@ -1269,8 +1274,17 @@ async fn status_handler(
                 }));
             }
         };
-        let mut sys = System::new();
-        sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
+        let mut sys = match state.sysinfo_system.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                return AxumJson(json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "repos": repo_json,
+                    "active_sessions": active_sessions,
+                    "cpu_percent": "—",
+                }));
+            }
+        };
         sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
         match sys.process(pid) {
             Some(proc) => {
