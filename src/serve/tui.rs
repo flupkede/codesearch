@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 use ratatui::Terminal;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use tokio_util::sync::CancellationToken;
@@ -27,7 +27,7 @@ use super::ServeState;
 
 /// Run the fullscreen TUI.  Spawns as a tokio task from `run_serve`.
 ///
-/// Returns `Ok(())` when the user presses `q` / `Ctrl-C`, or when the
+/// Returns `Ok(())` when the user presses `q`, or when the
 /// `cancel_token` is cancelled externally (e.g. Ctrl-C from the main task).
 ///
 /// Terminal restoration is guaranteed on normal exit and on errors.
@@ -154,11 +154,12 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io
 // ---------------------------------------------------------------------------
 
 fn is_quit_key(key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Char('q') => true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
-        _ => false,
-    }
+    // Ctrl-C is intentionally NOT a quit key here. crossterm's raw mode delivers
+    // it as a key event (ENABLE_PROCESSED_INPUT off on Windows / ISIG off on Unix),
+    // so the OS-level ctrlc::set_handler in main.rs is bypassed while the TUI runs.
+    // Treating Ctrl-C as quit was a foot-gun: a stray Ctrl-C in the wrong terminal
+    // would tear down the whole serve process. Use `q` instead.
+    matches!(key.code, KeyCode::Char('q'))
 }
 
 fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) {

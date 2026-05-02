@@ -283,6 +283,12 @@ impl VectorStore {
         // one repo has been resized.  Use the max of persisted, env-var, and
         // default to never shrink below what was previously allocated.
         let map_size_mb = resolve_map_size(db_path);
+        // SAFETY: heed's `EnvOpenOptions::open` is unsafe because the caller must
+        // ensure no other process maps this LMDB environment with incompatible options
+        // at the same time. codesearch enforces single-writer-per-DB at the application
+        // level (one `serve` process per machine, and the CLI rejects concurrent
+        // reindex). The map_size is reconciled across opens via `resolve_map_size`
+        // above, so we never reopen with a smaller map than was previously persisted.
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size_mb * 1024 * 1024)
@@ -361,6 +367,13 @@ impl VectorStore {
         // Open LMDB environment in read-only mode
         // Use same map-size resolution as new() for consistency
         let map_size_mb = resolve_map_size(db_path);
+        // SAFETY: heed's `EnvOpenOptions::open` is unsafe because of LMDB's mmap
+        // contract; see the SAFETY comment on the read-write `new()` above. This
+        // open is read-only (`EnvFlags::READ_ONLY`), so it cannot conflict with a
+        // concurrent writer's map_size, only with stale handles after a resize —
+        // which is acceptable because the writer's resize logic explicitly
+        // rebuilds the env (see `resize_map` below) before any reader is invited
+        // to reopen.
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(map_size_mb * 1024 * 1024)

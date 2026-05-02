@@ -308,6 +308,11 @@ impl PersistentEmbeddingCache {
             )
         })?;
 
+        // SAFETY: heed's `EnvOpenOptions::open` is unsafe because the caller must
+        // ensure no other process maps this LMDB environment with incompatible options
+        // (different map_size or flags) at the same time. The cache directory is
+        // process-private under the user's codesearch state directory, and we open it
+        // exactly once per process via this constructor.
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(512 * 1024 * 1024) // 512MB — plenty for cache
