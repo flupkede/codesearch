@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.81] - 2026-05-02
 
+### Added
+
+- **`codesearch serve tui`** — standalone sub-action that opens the ratatui TUI
+  connected to a running serve instance via HTTP polling. The TUI can be opened
+  and closed independently of the server.
+- **`codesearch serve --no-tui`** — start serve headless even when a TTY is
+  available. Typical workflow: `codesearch serve --no-tui` in one terminal,
+  `codesearch serve tui` in another.
+- **`GET /status` endpoint** on serve returns a JSON snapshot of all repo
+  states, sessions, and CPU usage — usable for external monitoring and the
+  standalone TUI.
+
 ### Fixed
 
 - **Idle eviction now covers warmed-but-never-queried repos**: `warmup_repo`

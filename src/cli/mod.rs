@@ -110,6 +110,16 @@ pub struct Cli {
     pub model: Option<String>,
 }
 
+/// Action for the `serve` command.
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
+pub enum ServeAction {
+    /// Start the serve process (default)
+    #[default]
+    Start,
+    /// Open a standalone TUI connected to a running serve instance
+    Tui,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Search the codebase using natural language
@@ -227,6 +237,10 @@ pub enum Commands {
 
     /// Run a background MCP server with live file watching and multi-repo support
     Serve {
+        /// Action: `start` (default) or `tui`
+        #[arg(default_value = "start")]
+        action: ServeAction,
+
         /// Port to listen on (default: 39725, override with CODESEARCH_SERVE_PORT)
         #[arg(short, long)]
         port: Option<u16>,
@@ -255,6 +269,14 @@ pub enum Commands {
             default_missing_value = "true"
         )]
         create_index: bool,
+
+        /// Disable the embedded TUI even when a TTY is available
+        #[arg(long)]
+        no_tui: bool,
+
+        /// For `tui` action: serve URL to connect to
+        #[arg(long, default_value = "http://127.0.0.1:39725")]
+        url: String,
     },
 
     /// Show statistics about the vector database
@@ -469,23 +491,33 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         }
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Serve {
+            action,
             port,
             register,
             quiet,
             verbose,
             create_index: _,
+            no_tui,
+            url,
         } => {
-            // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
-            // regardless of whether a database exists in the current directory.
-            // This is a central log for the multi-repo serve process, separate from
-            // per-database logs written by the MCP client (codesearch.log.YYYY-MM-DD).
-            let effective_quiet = (cli.quiet || quiet) && !verbose;
-            if let Err(e) =
-                crate::logger::init_serve_logger(log_level, effective_quiet)
-            {
-                eprintln!("Warning: failed to initialize serve logger: {}", e);
+            match action {
+                crate::cli::ServeAction::Tui => {
+                    crate::serve::run_tui_standalone(url).await
+                }
+                crate::cli::ServeAction::Start => {
+                    // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
+                    // regardless of whether a database exists in the current directory.
+                    // This is a central log for the multi-repo serve process, separate from
+                    // per-database logs written by the MCP client (codesearch.log.YYYY-MM-DD).
+                    let effective_quiet = (cli.quiet || quiet) && !verbose;
+                    if let Err(e) =
+                        crate::logger::init_serve_logger(log_level, effective_quiet)
+                    {
+                        eprintln!("Warning: failed to initialize serve logger: {}", e);
+                    }
+                    crate::serve::run_serve(port, register, no_tui, cancel_token.clone()).await
+                }
             }
-            crate::serve::run_serve(port, register, cancel_token.clone()).await
         }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
         Commands::Doctor { fix, json, all, repo } => crate::cli::doctor::run(fix, json, all, repo).await,

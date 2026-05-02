@@ -11,6 +11,7 @@
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
 mod tui;
+mod tui_remote;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -31,7 +32,7 @@ use tracing::{info, warn};
 
 use crate::constants::{
     DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, MCP_ENDPOINT_PATH, REAPER_INTERVAL_SECS,
-    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{IndexManager, SharedStores};
@@ -1217,6 +1218,78 @@ async fn health_handler() -> AxumJson<serde_json::Value> {
     }))
 }
 
+/// Status handler: GET /status
+///
+/// Returns a JSON snapshot of all repo states, active sessions, and CPU usage.
+/// Used by the standalone TUI (`codesearch serve tui`) to poll server state.
+async fn status_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> AxumJson<serde_json::Value> {
+    let repos = state.repo_statuses_lightweight();
+    let active_sessions = state.active_session_count();
+
+    let repo_json: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|(alias, info)| {
+            let status_str = match info.status {
+                RepoStateLabel::Open => "open",
+                RepoStateLabel::Warm => "warm",
+                RepoStateLabel::Readonly => "readonly",
+                RepoStateLabel::Closed => "closed",
+                RepoStateLabel::Indexing => "indexing",
+                RepoStateLabel::Error => "error",
+                RepoStateLabel::NoIndex => "no_index",
+            };
+            let lock_mode = match info.status {
+                RepoStateLabel::Open | RepoStateLabel::Indexing => "write",
+                RepoStateLabel::Warm | RepoStateLabel::Readonly => "read",
+                _ => "—",
+            };
+            json!({
+                "alias": alias,
+                "status": status_str,
+                "lock_mode": lock_mode,
+                "changes": info.changes,
+                "last_tool_call": info.last_tool_call,
+            })
+        })
+        .collect();
+
+    // CPU usage — lightweight single-sample read
+    let cpu = {
+        use sysinfo::{ProcessesToUpdate, System};
+        let pid = match sysinfo::get_current_pid() {
+            Ok(p) => p,
+            Err(_) => {
+                return AxumJson(json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "repos": repo_json,
+                    "active_sessions": active_sessions,
+                    "cpu_percent": "—",
+                }));
+            }
+        };
+        let mut sys = System::new();
+        sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        match sys.process(pid) {
+            Some(proc) => {
+                let num_cpus = sys.cpus().len().max(1) as f32;
+                let pct = proc.cpu_usage() / num_cpus;
+                format!("{:.0}%", pct)
+            }
+            None => "—".to_string(),
+        }
+    };
+
+    AxumJson(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "repos": repo_json,
+        "active_sessions": active_sessions,
+        "cpu_percent": cpu,
+    }))
+}
+
 /// Reindex handler: POST /repos/{alias}/reindex
 ///
 /// Query params:
@@ -1673,12 +1746,45 @@ async fn log_mcp_requests(
 
 
 
+/// Run the standalone TUI that connects to a running serve instance via HTTP.
+///
+/// This is the entry point for `codesearch serve tui`.
+pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
+    if !tui::is_tty() {
+        eprintln!("Error: No TTY detected. The standalone TUI requires an interactive terminal.");
+        std::process::exit(1);
+    }
+
+    // Check if serve is reachable
+    let health_url = format!("{}{}", serve_url, HEALTH_PATH);
+    match reqwest::get(&health_url).await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(_) => {
+            eprintln!(
+                "Error: Serve at {} returned an error. Is it running?",
+                serve_url
+            );
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!(
+                "Error: No serve running at {}. Start with: codesearch serve",
+                serve_url
+            );
+            std::process::exit(1);
+        }
+    }
+
+    tui_remote::run_remote_tui(serve_url).await
+}
+
 /// Run the MCP serve mode.
 ///
 /// This is the entry point called from CLI when `codesearch serve` is invoked.
 pub async fn run_serve(
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
+    no_tui: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let effective_port = port.unwrap_or_else(|| {
@@ -1763,6 +1869,7 @@ pub async fn run_serve(
     // before the request hits this middleware).
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
+        .route(STATUS_PATH, axum::routing::get(status_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
         .route(
@@ -1788,7 +1895,11 @@ pub async fn run_serve(
     let tui_state = serve_state.clone();
     let tui_url = serve_url.clone();
 
-    let tui_handle = tui::maybe_spawn_tui(tui_state, tui_cancel, tui_url);
+    let tui_handle = if !no_tui {
+        tui::maybe_spawn_tui(tui_state, tui_cancel, tui_url)
+    } else {
+        None
+    };
 
     // ── Background pre-warming (NO FSW) ──
     // Open all registered repos sequentially: opens DB, builds vector index,
