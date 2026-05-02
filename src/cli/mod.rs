@@ -282,6 +282,14 @@ pub enum Commands {
         /// Output as JSON for scripting/CI
         #[arg(long)]
         json: bool,
+
+        /// Run diagnostics on all registered repositories (from repos.json)
+        #[arg(long)]
+        all: bool,
+
+        /// Run diagnostics on a specific registered alias (e.g. --repo husq-aprimo)
+        #[arg(long, value_name = "ALIAS")]
+        repo: Option<String>,
     },
 
     /// Download embedding models
@@ -480,7 +488,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             crate::serve::run_serve(port, register, cancel_token.clone()).await
         }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
-        Commands::Doctor { fix, json } => crate::cli::doctor::run(fix, json).await,
+        Commands::Doctor { fix, json, all, repo } => crate::cli::doctor::run(fix, json, all, repo).await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
         Commands::Mcp { path, create_index, mode } => {
             // Logger is initialized inside run_mcp_server() once db_path is known.

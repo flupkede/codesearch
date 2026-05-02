@@ -5,7 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-<<<<<<< HEAD
 ## [1.0.81] - 2026-05-02
 
 ### Fixed
@@ -24,16 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`unsafe` blocks documented**: SAFETY comments added to the three LMDB
   env-open `unsafe` blocks in `src/embed/cache.rs` and `src/vectordb/store.rs`.
-=======
-## [1.0.82] - 2026-05-02
-
-### Fixed
-
-- `codesearch index list` now actually lists all repositories registered in
-  `~/.codesearch/repos.json` instead of only checking the current directory.
-  A loose `.codesearch.db` in an unregistered directory is shown separately
-  under "Local (unregistered)". Both TODO markers removed.
->>>>>>> b5319c2eb68c6d26c72710aab2ff8d3a36cdef85
 
 ## [1.0.77] - 2026-05-01
 
