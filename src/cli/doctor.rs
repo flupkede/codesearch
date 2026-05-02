@@ -485,10 +485,9 @@ fn check_embedding_cache(_db_path: &Path, model_name: &str) -> CheckResult {
     }
 }
 
-/// Run all checks and return results
-pub async fn run(fix: bool, json: bool) -> Result<()> {
-    let project_path = Path::new(".");
-
+/// Run all checks for a single project path.
+/// Returns (warnings, errors). Does not bail — caller decides.
+async fn run_for_path(project_path: &Path, fix: bool, json: bool) -> Result<(usize, usize)> {
     // Find database (single call)
     let db_info = match find_best_database(Some(project_path))? {
         Some(info) => info,
@@ -503,13 +502,11 @@ pub async fn run(fix: bool, json: bool) -> Result<()> {
             } else {
                 print_results(&results, false);
             }
-            anyhow::bail!("No database found");
+            return Ok((0, 1));
         }
     };
 
     let db_path = db_info.db_path;
-    // Use absolute project_path from database info — ensures FileWalker paths
-    // match the normalized absolute paths stored in FileMetaStore by the indexer
     let project_path = db_info.project_path;
 
     // Read model name for cache check
@@ -572,7 +569,6 @@ pub async fn run(fix: bool, json: bool) -> Result<()> {
         .count();
 
     if json {
-        // JSON mode: single root object with checks + summary
         let output = serde_json::json!({
             "checks": results,
             "summary": {
@@ -582,13 +578,11 @@ pub async fn run(fix: bool, json: bool) -> Result<()> {
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        // Normal mode: print summary
         println!();
         println!("{}", "Summary".bold());
         println!("{}", "=".repeat(60));
         println!("  {} warnings, {} errors", warnings, errors);
 
-        // Add hints based on issues found
         if warnings > 0 || errors > 0 {
             if results
                 .iter()
@@ -614,10 +608,77 @@ pub async fn run(fix: bool, json: bool) -> Result<()> {
         }
     }
 
+    Ok((warnings, errors))
+}
+
+/// Run diagnostics — default: current directory.
+/// --repo <alias>: specific registered repo.
+/// --all: all repos in repos.json.
+pub async fn run(fix: bool, json: bool, all: bool, repo: Option<String>) -> Result<()> {
+    use crate::db_discovery::repos::ReposConfig;
+
+    // --repo <alias> mode
+    if let Some(alias) = repo {
+        let config = ReposConfig::load().unwrap_or_default();
+        match config.repos.get(&alias) {
+            Some(path) => {
+                let path = path.clone();
+                let (_, errors) = run_for_path(&path, fix, json).await?;
+                if errors > 0 {
+                    anyhow::bail!("Doctor found {} error(s) in '{}'", errors, alias);
+                }
+                return Ok(());
+            }
+            None => {
+                anyhow::bail!(
+                    "Unknown alias '{}'. Run 'codesearch index list' to see registered repos.",
+                    alias
+                );
+            }
+        }
+    }
+
+    // --all mode
+    if all {
+        let config = ReposConfig::load().unwrap_or_default();
+        if config.repos.is_empty() {
+            println!("No repositories registered.");
+            return Ok(());
+        }
+
+        let mut total_warnings = 0usize;
+        let mut total_errors = 0usize;
+        let mut entries: Vec<_> = config.repos.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+
+        for (alias, path) in &entries {
+            println!();
+            println!("{}", format!("── {} ──", alias).bright_cyan().bold());
+            let (w, e) = run_for_path(path, fix, json).await.unwrap_or((0, 1));
+            total_warnings += w;
+            total_errors += e;
+        }
+
+        println!();
+        println!("{}", "═".repeat(60));
+        println!(
+            "  All repos: {} warnings, {} errors across {} repositories",
+            total_warnings,
+            total_errors,
+            entries.len()
+        );
+
+        if total_errors > 0 {
+            anyhow::bail!("Doctor found errors in one or more repositories");
+        }
+        return Ok(());
+    }
+
+    // Default: current directory
+    let (_, errors) = run_for_path(Path::new("."), fix, json).await?;
     if errors > 0 {
         anyhow::bail!("Doctor found {} error(s)", errors);
     }
-
     Ok(())
 }
 
