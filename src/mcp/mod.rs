@@ -5135,7 +5135,22 @@ impl CodesearchService {
             request.chunk_id,
             request.project,
         );
-        // Resolve project/group routing — allow unscoped for smart candidate detection
+
+        // In multi-repo serve mode, require explicit project or group scope.
+        // Unscoped get_chunk would fan-out over all repos, opening all DBs unnecessarily.
+        // Consistent with search/find/explore which also require scope.
+        if request.project.is_none() && request.group.is_none() {
+            if let Some(ref serve_state) = self.serve_state {
+                let config = serve_state.config_snapshot();
+                if config.repos.len() > 1 {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        self.format_scope_error(),
+                    )]));
+                }
+            }
+        }
+
+        // Resolve project/group routing — allow unscoped only for single-repo mode
         let ctx = match self
             .resolve_routing(&request.project, &request.group, true, "get_chunk")
             .await

@@ -614,9 +614,8 @@ impl ServeState {
                                 stores: stores_arc.clone(),
                             },
                         );
-                        if touch {
-                            self.touch_access(alias);
-                        }
+                        // Always update last_access so the reaper can evict.
+                        self.touch_access(alias);
                         return Ok(stores_arc);
                     }
                     Err(e) => {
@@ -651,7 +650,17 @@ impl ServeState {
 
         let stores_arc = Arc::new(stores);
 
-        // Try to create IndexManager for live file watching.
+        // Fan-out / candidate-detection callers pass touch=false.
+        // Open as Warm only — no FSW, no IndexManager overhead.
+        // Always update last_access so the reaper can evict this repo after idle timeout.
+        if !touch {
+            self.repos
+                .insert(alias.to_string(), RepoState::Warm { stores: stores_arc.clone() });
+            self.touch_access(alias);
+            return Ok(stores_arc);
+        }
+
+        // Explicit project query (touch=true) — start FSW, full Write mode.
         // On failure, still store as Write — searches keep working, live updates disabled.
         let (index_manager_opt, cancel_token) = {
             let alias_clone = alias.to_string();
@@ -715,9 +724,8 @@ impl ServeState {
                 cancel_token,
             },
         );
-        if touch {
-            self.touch_access(alias);
-        }
+        // touch=true is guaranteed here (fan-out returns early above as Warm).
+        self.touch_access(alias);
         Ok(stores_arc)
     }
 
