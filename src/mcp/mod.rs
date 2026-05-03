@@ -5419,7 +5419,10 @@ impl CodesearchService {
                     indexer.language()
                 ),
                 available_languages: registry.available_languages(),
-                hint_for_agent: "Install the `-with-csharp` release variant, or set CODESEARCH_SCIP_CSHARP to the helper path.".to_string(),
+                hint_for_agent: format!(
+                    "Install the `-with-csharp` release variant, or set {} to the helper path.",
+                    crate::constants::SCIP_CSHARP_HELPER_ENV
+                ),
             };
             return Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string(&error).unwrap_or_else(|_| error.error.clone()),

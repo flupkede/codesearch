@@ -3,8 +3,6 @@
 //! Uses the `scip` crate from Sourcegraph to decode SCIP index files.
 //! The parsed index is converted to a map of symbol name → references.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -13,6 +11,7 @@ use protobuf::Message;
 
 /// A reference extracted from a SCIP index.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ScipReference {
     /// File path relative to the project root.
     pub file: PathBuf,
@@ -25,9 +24,11 @@ pub struct ScipReference {
 }
 
 /// Parsed SCIP index: map from canonical symbol string to its references.
+#[allow(dead_code)]
 pub type ScipIndex = HashMap<String, Vec<ScipReference>>;
 
 /// Role flags from SCIP (mirrors the protobuf enum values).
+#[allow(dead_code)]
 mod roles {
     pub const DEFINITION: u32 = 1;
     pub const READ_ACCESS: u32 = 2;
@@ -37,6 +38,7 @@ mod roles {
 }
 
 /// Parse a SCIP protobuf byte slice into a symbol → references map.
+#[allow(dead_code)]
 pub fn parse_scip(data: &[u8]) -> Result<ScipIndex> {
     let index = scip::types::Index::parse_from_bytes(data)
         .with_context(|| "Failed to parse SCIP protobuf")?;

@@ -19,27 +19,28 @@ use super::{RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 // ── Constants ─────────────────────────────────────────────────────
 
 /// LMDB database name for the SCIP symbol table.
-const SCIP_DB_NAME: &str = "scip_symbols";
+const SCIP_DB_NAME: &str = crate::constants::SCIP_SYMBOLS_DB_NAME;
 
 /// LMDB database name for the rebuild timestamp.
 const SCIP_META_DB_NAME: &str = "scip_meta";
 
 /// Key in the meta database that stores the last rebuild timestamp (UNIX epoch seconds).
-const META_REBUILD_TS: &str = "last_rebuild_ts";
+const META_REBUILD_TS: &str = crate::constants::SCIP_REBUILD_TIMESTAMP_KEY;
 
 /// Key in the meta database storing the count of indexed symbols.
 #[allow(dead_code)]
 const META_SYMBOL_COUNT: &str = "symbol_count";
 
 /// Environment variable override for the helper binary path.
-const HELPER_ENV_VAR: &str = "CODESEARCH_SCIP_CSHARP";
+const HELPER_ENV_VAR: &str = crate::constants::SCIP_CSHARP_HELPER_ENV;
 
 /// Helper binary name (without extension).
-const HELPER_BIN_NAME: &str = "scip-csharp";
+const HELPER_BIN_NAME: &str = crate::constants::SCIP_CSHARP_HELPER_NAME;
 
 /// Debounce period for .cs file changes (seconds).
 #[allow(dead_code)]
-pub const CSHARP_REBUILD_DEBOUNCE_SECS: u64 = 60;
+pub const CSHARP_REBUILD_DEBOUNCE_SECS: u64 =
+    crate::constants::SCIP_CSHARP_DEBOUNCE_MS / 1000;
 
 // ── Serialized reference type (stored in LMDB via bincode) ────────
 
