@@ -1,0 +1,15 @@
+#!/bin/sh
+# post-checkout hook — auto-create AGENTS.md from AGENTS.develop.md on branch switch.
+# Runs after: git checkout, git switch, git checkout -b
+#
+# Only copies if AGENTS.md does not yet exist — never overwrites an existing work plan.
+# Install once per machine: git config core.hooksPath .githooks
+
+AGENTS_DEVELOP="AGENTS.develop.md"
+AGENTS_MD="AGENTS.md"
+
+# $3 is 1 for branch checkout, 0 for file checkout — only act on branch switches
+if [ "$3" = "1" ] && [ -f "$AGENTS_DEVELOP" ] && [ ! -f "$AGENTS_MD" ]; then
+    cp "$AGENTS_DEVELOP" "$AGENTS_MD"
+    echo "[hook] Created AGENTS.md from AGENTS.develop.md"
+fi
