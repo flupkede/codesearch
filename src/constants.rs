@@ -155,6 +155,10 @@ pub const HEALTH_PATH: &str = "/health";
 /// MCP endpoint path served by `codesearch serve` (streamable HTTP).
 pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 
+/// Status endpoint path served by `codesearch serve`.
+/// Returns JSON snapshot of all repo states, sessions, and CPU usage.
+pub const STATUS_PATH: &str = "/status";
+
 /// How long an open repo may remain idle (no queries) before it is evicted.
 /// Eviction closes the DB handles, stops the FSW, and releases memory.
 /// The repo is automatically re-opened on the next query.
