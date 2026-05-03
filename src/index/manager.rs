@@ -16,9 +16,13 @@
 #![allow(dead_code)]
 
 use crate::cache::{normalize_path, normalize_path_str};
-use crate::constants::{DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, WRITER_LOCK_FILE};
+use crate::constants::{
+    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, SCIP_CSHARP_DEBOUNCE_MS,
+    WRITER_LOCK_FILE,
+};
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
+use crate::symbols::{RebuildScope, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
 use crate::watch::{FileEvent, FileWatcher, GitHeadWatcher};
 use std::collections::HashSet;
@@ -229,6 +233,8 @@ pub struct IndexManager {
     git_head_watcher: Option<GitHeadWatcher>,
     /// Shared stores for concurrent access
     stores: Arc<SharedStores>,
+    /// Per-language symbol indexer registry (C# etc.)
+    symbol_registry: Arc<SymbolIndexerRegistry>,
 }
 
 impl IndexManager {
@@ -294,6 +300,7 @@ impl IndexManager {
             watcher,
             git_head_watcher: Some(git_head_watcher),
             stores,
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
 
@@ -389,6 +396,7 @@ impl IndexManager {
             watcher,
             git_head_watcher: Some(git_head_watcher),
             stores,
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
 
@@ -749,6 +757,7 @@ impl IndexManager {
         let watcher = self.watcher.clone();
         let stores = self.stores.clone();
         let git_head_watcher = self.git_head_watcher.clone();
+        let symbol_registry = self.symbol_registry.clone();
 
         info!("🚀 Starting background file watcher...");
 
@@ -774,6 +783,12 @@ impl IndexManager {
             let mut files_to_remove: HashSet<PathBuf> = HashSet::new();
             let mut last_event_time = std::time::Instant::now();
             let flush_duration = std::time::Duration::from_millis(FSW_BATCH_FLUSH_MS);
+
+            // Symbol indexer debounce: .cs files are buffered separately and
+            // flushed after SCIP_CSHARP_DEBOUNCE_MS of quiet time.
+            let mut cs_files_changed: HashSet<PathBuf> = HashSet::new();
+            let mut cs_last_event_time: Option<std::time::Instant> = None;
+            let cs_debounce = std::time::Duration::from_millis(SCIP_CSHARP_DEBOUNCE_MS);
 
             loop {
                 // Check if shutdown was requested
@@ -830,19 +845,37 @@ impl IndexManager {
                             FileEvent::Modified(p) => {
                                 // If file was marked for removal, cancel that
                                 files_to_remove.remove(&p);
-                                files_to_index.insert(p);
+                                files_to_index.insert(p.clone());
+                                // Track .cs files for symbol rebuild debounce
+                                if p.extension().and_then(|e| e.to_str()) == Some("cs") {
+                                    cs_files_changed.insert(p);
+                                    cs_last_event_time = Some(now);
+                                }
                             }
                             FileEvent::Deleted(p) => {
                                 // If file was marked for indexing, cancel that
                                 files_to_index.remove(&p);
-                                files_to_remove.insert(p);
+                                files_to_remove.insert(p.clone());
+                                // Track .cs deletions too (symbol index needs rebuild)
+                                if p.extension().and_then(|e| e.to_str()) == Some("cs") {
+                                    cs_files_changed.insert(p);
+                                    cs_last_event_time = Some(now);
+                                }
                             }
                             FileEvent::Renamed(old_p, new_p) => {
                                 // Remove old path, index new path
                                 files_to_index.remove(&old_p);
-                                files_to_remove.insert(old_p);
+                                files_to_remove.insert(old_p.clone());
                                 files_to_remove.remove(&new_p);
-                                files_to_index.insert(new_p);
+                                files_to_index.insert(new_p.clone());
+                                // Track .cs renames for symbol rebuild
+                                let old_is_cs = old_p.extension().and_then(|e| e.to_str()) == Some("cs");
+                                let new_is_cs = new_p.extension().and_then(|e| e.to_str()) == Some("cs");
+                                if old_is_cs || new_is_cs {
+                                    if old_is_cs { cs_files_changed.insert(old_p); }
+                                    if new_is_cs { cs_files_changed.insert(new_p); }
+                                    cs_last_event_time = Some(now);
+                                }
                             }
                         }
                     }
@@ -874,6 +907,48 @@ impl IndexManager {
 
                     // Reset timer
                     last_event_time = now;
+                }
+
+                // Check if we should flush the .cs symbol rebuild debounce
+                if !cs_files_changed.is_empty() {
+                    if let Some(cs_last) = cs_last_event_time {
+                        let elapsed = now.duration_since(cs_last);
+                        if elapsed >= cs_debounce {
+                            let changed_count = cs_files_changed.len();
+                            cs_files_changed.clear();
+                            cs_last_event_time = None;
+
+                            info!(
+                                "🔬 {} .cs file(s) changed, triggering symbol index rebuild (after {}s debounce)",
+                                changed_count,
+                                cs_debounce.as_secs()
+                            );
+
+                            // Trigger rebuild in a blocking task (the trait method is sync)
+                            let reg = symbol_registry.clone();
+                            let rp = path.clone();
+                            let dp = db_path.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(indexer) = reg.get("csharp") {
+                                    if indexer.is_available() {
+                                        match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
+                                            Ok(summary) => {
+                                                info!(
+                                                    "✅ Symbol rebuild complete: {} symbols, {} refs in {}ms",
+                                                    summary.symbols_indexed,
+                                                    summary.references_stored,
+                                                    summary.duration_ms
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!("⚠️ Symbol rebuild failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
 
                 // Sleep to avoid busy-waiting, but wake up immediately on shutdown

@@ -37,7 +37,7 @@ use crate::constants::{
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{IndexManager, SharedStores};
 use crate::mcp::types::HealthResponse;
-
+use crate::symbols::{RebuildScope, SymbolIndexerRegistry};
 /// Lightweight repo status derived from DashMap state only (no DB opens).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepoStateLabel {
@@ -1327,6 +1327,11 @@ async fn reindex_handler(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
+    let symbols = params
+        .get("symbols")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
     // Resolve the project path for this alias
     let project_path = {
         let config = match state.config.read() {
@@ -1441,6 +1446,7 @@ async fn reindex_handler(
 
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
+        let do_symbols = symbols;
         tokio::spawn(async move {
             tracing::info!(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
@@ -1460,6 +1466,41 @@ async fn reindex_handler(
                     tracing::error!("❌ Reindex failed for '{}': {}", alias_bg, e);
                 }
             }
+
+            // Optional symbol index rebuild
+            if do_symbols {
+                // Create a fresh registry for the blocking task (cheap — just detection state).
+                let bg_reg = Arc::new(SymbolIndexerRegistry::new());
+                tracing::info!("🔬 Symbol reindex triggered for '{}' via HTTP API", alias_bg);
+                let rp = project_path.clone();
+                let dp = db_path.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let Some(indexer) = bg_reg.get("csharp") else {
+                        return Err(anyhow::anyhow!("No C# symbol indexer registered"));
+                    };
+                    if !indexer.is_available() {
+                        return Err(anyhow::anyhow!("scip-csharp helper not available"));
+                    }
+                    indexer.rebuild(&rp, &dp, RebuildScope::Full)
+                }).await {
+                    Ok(Ok(summary)) => {
+                        tracing::info!(
+                            "✅ Symbol rebuild complete for '{}': {} symbols, {} refs in {}ms",
+                            alias_bg,
+                            summary.symbols_indexed,
+                            summary.references_stored,
+                            summary.duration_ms
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_bg, e);
+                    }
+                    Err(e) => {
+                        tracing::error!("❌ Symbol rebuild task panicked for '{}': {}", alias_bg, e);
+                    }
+                }
+            }
+
             g_state.active_reindexes.remove(&g_alias);
         });
     }
