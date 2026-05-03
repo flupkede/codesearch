@@ -28,6 +28,7 @@ const SCIP_META_DB_NAME: &str = "scip_meta";
 const META_REBUILD_TS: &str = "last_rebuild_ts";
 
 /// Key in the meta database storing the count of indexed symbols.
+#[allow(dead_code)]
 const META_SYMBOL_COUNT: &str = "symbol_count";
 
 /// Environment variable override for the helper binary path.
@@ -37,6 +38,7 @@ const HELPER_ENV_VAR: &str = "CODESEARCH_SCIP_CSHARP";
 const HELPER_BIN_NAME: &str = "scip-csharp";
 
 /// Debounce period for .cs file changes (seconds).
+#[allow(dead_code)]
 pub const CSHARP_REBUILD_DEBOUNCE_SECS: u64 = 60;
 
 // ── Serialized reference type (stored in LMDB via bincode) ────────
@@ -148,6 +150,7 @@ impl CSharpSymbolIndexer {
     }
 
     /// Find the solution file in a repo directory.
+    #[allow(dead_code)]
     fn find_solution(repo_path: &Path) -> Option<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(repo_path) {
             for entry in entries.flatten() {
@@ -161,6 +164,7 @@ impl CSharpSymbolIndexer {
     }
 
     /// Find the .csproj containing a given file.
+    #[allow(dead_code)]
     fn find_csproj_for_file(repo_path: &Path, file_path: &Path) -> Option<PathBuf> {
         let mut dir = file_path.parent()?;
         loop {

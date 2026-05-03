@@ -58,6 +58,7 @@ pub struct SymbolIndexError {
 
 /// Which files/projects to reindex.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum RebuildScope {
     /// Reindex the entire solution/project tree.
     Full,
@@ -70,6 +71,7 @@ pub enum RebuildScope {
 
 /// Summary returned after a rebuild completes.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RebuildSummary {
     /// Number of symbols indexed.
     pub symbols_indexed: usize,
@@ -92,6 +94,7 @@ pub trait SymbolIndexer: Send + Sync {
 
     /// Run the indexer for this language over the repo. Writes results to LMDB.
     /// Idempotent: safe to re-run after file changes.
+    #[allow(dead_code)]
     fn rebuild(
         &self,
         repo_path: &Path,

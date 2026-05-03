@@ -133,6 +133,39 @@ pub struct StatusRequest {
     pub group: Option<String>,
 }
 
+/// Symbol impact analysis request — returns transitive call-sites of a symbol
+/// with file/line precision, using language-specific semantic analysis (SCIP).
+///
+/// Input variants:
+/// - By name: `{ "symbol_name": "FieldDefinition.Validate", "project": "myrepo" }`
+/// - By position: `{ "file": "src/Validation/FieldDefinition.cs", "line": 42, "project": "myrepo" }`
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct FindImpactRequest {
+    /// Symbol name to look up (e.g. `"FieldDefinition.Validate"`).
+    /// Used when you know the name. Mutually exclusive with `file`+`line`.
+    pub symbol_name: Option<String>,
+
+    /// File path for position-based lookup (relative to project root or absolute).
+    /// Must be combined with `line`.
+    pub file: Option<String>,
+
+    /// 1-based line number for position-based lookup.
+    /// Must be combined with `file`.
+    pub line: Option<u32>,
+
+    /// Language filter (e.g. `"csharp"`). If omitted, auto-detects from file extension
+    /// or searches all installed language adapters.
+    pub language: Option<String>,
+
+    /// Route to a specific project (requires `codesearch serve`).
+    #[serde(default)]
+    pub project: Option<String>,
+
+    /// Route to all projects in a group (requires `codesearch serve`).
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Internal parameter types (used by consolidated tools to dispatch to implementations)
 // ═══════════════════════════════════════════════════════════════════

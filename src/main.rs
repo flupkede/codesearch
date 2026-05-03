@@ -14,6 +14,7 @@ mod output;
 mod rerank;
 mod search;
 mod serve;
+mod symbols;
 mod vectordb;
 mod watch;
 

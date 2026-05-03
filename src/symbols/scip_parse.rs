@@ -3,6 +3,8 @@
 //! Uses the `scip` crate from Sourcegraph to decode SCIP index files.
 //! The parsed index is converted to a map of symbol name → references.
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

@@ -5317,6 +5317,148 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
+    /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
+    ///
+    /// Uses language-specific semantic analysis (SCIP) to find all references to a symbol,
+    /// enabling agents to plan refactors with IDE-class accuracy instead of text-matching
+    /// grep heuristics. Currently supports C# only; architecture is language-agnostic.
+    #[tool(
+        description = "Symbol impact analysis — find all references to a symbol using language-specific semantic analysis (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors with IDE-class accuracy.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nCurrently supports C# only. Requires the `scip-csharp` helper to be installed (bundled in `-with-csharp` release variants).\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+    )]
+    async fn find_impact(
+        &self,
+        Parameters(request): Parameters<FindImpactRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            "📥 find_impact(symbol_name={:?}, file={:?}, line={:?}, language={:?}, project={:?})",
+            request.symbol_name,
+            request.file,
+            request.line,
+            request.language,
+            request.project,
+        );
+
+        // Validate input: must provide either symbol_name or file+line
+        let has_name = request.symbol_name.as_ref().is_some_and(|s| !s.trim().is_empty());
+        let has_position = request.file.is_some() && request.line.is_some();
+        if !has_name && !has_position {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Must provide either `symbol_name` or both `file` and `line` for position-based lookup.".to_string(),
+            )]));
+        }
+
+        // Resolve project/group routing
+        let ctx = match self
+            .resolve_routing(&request.project, &request.group, false, "find_impact")
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        // Determine project root and db_path for the symbol index
+        let (_project_root, db_path) = if let Some(ref alias) = ctx.project_alias {
+            let root = ctx.alias_roots.get(alias)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.project_path.clone());
+            // The symbol index DB lives alongside the vector DB
+            let db = root.join(crate::constants::DB_DIR_NAME);
+            (root, db)
+        } else {
+            // Single-repo / stdio mode: use the service's own paths
+            (self.project_path.clone(), self.db_path.clone())
+        };
+
+        // Create the symbol indexer registry
+        let registry = crate::symbols::SymbolIndexerRegistry::new();
+
+        // Determine which language to use
+        let language = request.language.clone().or_else(|| {
+            // Auto-detect from file extension
+            request.file.as_ref().and_then(|f| {
+                let ext = Path::new(f).extension()?.to_str()?.to_lowercase();
+                match ext.as_str() {
+                    "cs" => Some("csharp".to_string()),
+                    _ => None,
+                }
+            })
+        });
+
+        let indexer: &dyn crate::symbols::SymbolIndexer = match language {
+            Some(ref lang) => match registry.get(lang) {
+                Some(i) => i,
+                None => {
+                    let available = registry.available_languages();
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "No symbol indexer for language '{}'. Available languages: {:?}",
+                        lang, available
+                    ))]));
+                }
+            },
+            None => {
+                // No language specified and couldn't auto-detect — try all installed
+                let installed = registry.installed_languages();
+                if installed.is_empty() {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        "No symbol indexers installed. Install the `scip-csharp` helper for C# support.".to_string(),
+                    )]));
+                }
+                // Use the first installed language (MVP: only C#)
+                match registry.get(&installed[0]) {
+                    Some(i) => i,
+                    None => unreachable!("installed_languages() returned a language with no indexer"),
+                }
+            }
+        };
+
+        // Check if the helper is available
+        if !indexer.is_available() {
+            let error = crate::symbols::SymbolIndexError {
+                error: format!(
+                    "Symbol indexer for '{}' is not available. The helper binary is not installed.",
+                    indexer.language()
+                ),
+                available_languages: registry.available_languages(),
+                hint_for_agent: "Install the `-with-csharp` release variant, or set CODESEARCH_SCIP_CSHARP to the helper path.".to_string(),
+            };
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&error).unwrap_or_else(|_| error.error.clone()),
+            )]));
+        }
+
+        // Perform the lookup
+        let result = if has_name {
+            indexer.find_references(&db_path, request.symbol_name.as_ref().unwrap())
+        } else {
+            // Position-based lookup
+            let file = Path::new(request.file.as_ref().unwrap());
+            indexer.find_references_by_position(&db_path, file, request.line.unwrap())
+        };
+
+        match result {
+            Ok(references) => {
+                let age = indexer.index_age(&db_path);
+                let impact = crate::symbols::FindImpactResult {
+                    symbol: request.symbol_name.clone().unwrap_or_else(|| {
+                        format!("{}:{}", request.file.as_deref().unwrap_or("?"), request.line.unwrap_or(0))
+                    }),
+                    references,
+                    index_age_seconds: age,
+                    language: indexer.language().to_string(),
+                    scope: ctx.project_alias
+                        .map(|a| format!("project:{}", a))
+                        .unwrap_or_else(|| "local".to_string()),
+                };
+                let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Symbol lookup failed: {}",
+                e
+            ))])),
+        }
+    }
+
     async fn find_imports(
         &self,
         Parameters(request): Parameters<FindImportsRequest>,
@@ -6782,6 +6924,7 @@ TOOLS:
 | find          | Symbol navigation: `kind="definition"` (default), `"usages"`, `"imports"`, `"dependents"` |
 | explore       | File exploration: `kind="outline"` (default) or `"similar"` |
 | get_chunk     | Read full chunk content by chunk_id                  |
+| find_impact   | Symbol impact analysis: find all references using semantic analysis (SCIP) |
 | status        | Index/project info: `kind="index"` (default) or `"projects"` |
 
 Indexing is done via CLI: `codesearch index`. The MCP server cannot index.
