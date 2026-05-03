@@ -10,15 +10,6 @@ namespace ScipCsharp;
 /// </summary>
 public sealed class SymbolIndexer
 {
-    private static readonly SymbolKind[] SymbolKindsOfInterest =
-    [
-        SymbolKind.Method,
-        SymbolKind.Property,
-        SymbolKind.Field,
-        SymbolKind.NamedType,
-        SymbolKind.Event,
-    ];
-
     public async Task<ScipIndex> IndexAsync(MSBuildWorkspace workspace, string? projectFilter)
     {
         var index = new ScipIndex();
@@ -30,7 +21,7 @@ public sealed class SymbolIndexer
             var filterName = Path.GetFileNameWithoutExtension(projectFilter);
             projects = projects.Where(p =>
                 string.Equals(p.Name, filterName, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(Path.GetFileName(p.FilePath), projectFilter, StringComparison.OrdinalIgnoreCase));
+                string.Equals(Path.GetFileName(p.FilePath), projectFilter, StringComparison.OrdinalIgnoreCase)).ToList();
         }
 
         // Collect all symbols across all projects
@@ -54,7 +45,7 @@ public sealed class SymbolIndexer
                 Console.Error.WriteLine($"[WARN] Compilation error in {project.Name}: {diag}");
             }
 
-            CollectSymbols(compilation.GlobalNamespace, symbolMap, projectRoot);
+            CollectSymbols(compilation.GlobalNamespace, symbolMap);
         }
 
         Console.Error.WriteLine($"Collected {symbolMap.Count} symbols");
@@ -145,22 +136,22 @@ public sealed class SymbolIndexer
         return index;
     }
 
-    private void CollectSymbols(INamespaceSymbol ns, Dictionary<ISymbol, string> map, string? projectRoot)
+    private void CollectSymbols(INamespaceSymbol ns, Dictionary<ISymbol, string> map)
     {
         foreach (var child in ns.GetMembers())
         {
             if (child is INamespaceSymbol childNs)
             {
-                CollectSymbols(childNs, map, projectRoot);
+                CollectSymbols(childNs, map);
             }
             else if (child is INamedTypeSymbol type)
             {
-                CollectTypeSymbols(type, map, projectRoot);
+                CollectTypeSymbols(type, map);
             }
         }
     }
 
-    private void CollectTypeSymbols(INamedTypeSymbol type, Dictionary<ISymbol, string> map, string? projectRoot)
+    private void CollectTypeSymbols(INamedTypeSymbol type, Dictionary<ISymbol, string> map)
     {
         // Skip compiler-generated types (anonymous types, display classes, etc.)
         if (type.IsImplicitlyDeclared || type.Name.Contains('<') || type.Name.StartsWith("<"))
@@ -217,7 +208,7 @@ public sealed class SymbolIndexer
             }
             else if (member is INamedTypeSymbol nestedType)
             {
-                CollectTypeSymbols(nestedType, map, projectRoot);
+                CollectTypeSymbols(nestedType, map);
             }
         }
     }
