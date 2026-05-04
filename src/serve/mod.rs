@@ -14,7 +14,7 @@ mod tui;
 mod tui_remote;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -1304,12 +1304,50 @@ async fn status_handler(
     }))
 }
 
+/// Trigger a symbol index rebuild for a repo (C# etc.).
+///
+/// Creates a fresh `SymbolIndexerRegistry`, looks up the C# indexer,
+/// and runs `rebuild()` in a blocking task.
+async fn trigger_symbol_rebuild(alias: &str, project_path: &Path, db_path: &Path) {
+    let bg_reg = Arc::new(SymbolIndexerRegistry::new());
+    tracing::info!("🔬 Symbol reindex triggered for '{}' via HTTP API", alias);
+    let rp = project_path.to_path_buf();
+    let dp = db_path.to_path_buf();
+    let alias_owned = alias.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let Some(indexer) = bg_reg.get("csharp") else {
+            return Err(anyhow::anyhow!("No C# symbol indexer registered"));
+        };
+        if !indexer.is_available() {
+            return Err(anyhow::anyhow!("scip-csharp helper not available"));
+        }
+        indexer.rebuild(&rp, &dp, RebuildScope::Full)
+    }).await {
+        Ok(Ok(summary)) => {
+            tracing::info!(
+                "✅ Symbol rebuild complete for '{}': {} symbols, {} refs in {}ms",
+                alias_owned,
+                summary.symbols_indexed,
+                summary.references_stored,
+                summary.duration_ms
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, e);
+        }
+        Err(e) => {
+            tracing::error!("❌ Symbol rebuild task panicked for '{}': {}", alias_owned, e);
+        }
+    }
+}
+
 /// Reindex handler: POST /repos/{alias}/reindex
 ///
 /// Query params:
 /// - `force=true` — close the repo, delete the DB, full reindex, reopen.
 ///   Required when the caller wants a clean rebuild (e.g. `codesearch index -f`).
 ///   Without force, performs an incremental refresh only.
+/// - `symbols=true` — also rebuild the symbol index (C# SCIP) after text reindex.
 ///
 /// Returns 202 Accepted immediately; the reindex runs in the background.
 async fn reindex_handler(
@@ -1378,6 +1416,8 @@ async fn reindex_handler(
     let guard_alias = alias_bg.clone();
     let guard_state = state.clone();
 
+    let do_symbols = symbols;
+
     if force {
         // Force rebuild: stop FSW -> clear data in-place -> full reindex -> restart FSW.
         // The FSW must be stopped before clearing the FileMetaStore, otherwise it
@@ -1426,6 +1466,11 @@ async fn reindex_handler(
             // 3. Restart FSW with fresh IndexManager
             g_state.restart_fsw(&g_alias, stores).await;
 
+            // 4. Optional symbol index rebuild
+            if do_symbols {
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path).await;
+            }
+
             g_state.active_reindexes.remove(&g_alias);
         });
     } else {
@@ -1446,7 +1491,6 @@ async fn reindex_handler(
 
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
-        let do_symbols = symbols;
         tokio::spawn(async move {
             tracing::info!(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
@@ -1469,36 +1513,7 @@ async fn reindex_handler(
 
             // Optional symbol index rebuild
             if do_symbols {
-                // Create a fresh registry for the blocking task (cheap — just detection state).
-                let bg_reg = Arc::new(SymbolIndexerRegistry::new());
-                tracing::info!("🔬 Symbol reindex triggered for '{}' via HTTP API", alias_bg);
-                let rp = project_path.clone();
-                let dp = db_path.clone();
-                match tokio::task::spawn_blocking(move || {
-                    let Some(indexer) = bg_reg.get("csharp") else {
-                        return Err(anyhow::anyhow!("No C# symbol indexer registered"));
-                    };
-                    if !indexer.is_available() {
-                        return Err(anyhow::anyhow!("scip-csharp helper not available"));
-                    }
-                    indexer.rebuild(&rp, &dp, RebuildScope::Full)
-                }).await {
-                    Ok(Ok(summary)) => {
-                        tracing::info!(
-                            "✅ Symbol rebuild complete for '{}': {} symbols, {} refs in {}ms",
-                            alias_bg,
-                            summary.symbols_indexed,
-                            summary.references_stored,
-                            summary.duration_ms
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_bg, e);
-                    }
-                    Err(e) => {
-                        tracing::error!("❌ Symbol rebuild task panicked for '{}': {}", alias_bg, e);
-                    }
-                }
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path).await;
             }
 
             g_state.active_reindexes.remove(&g_alias);

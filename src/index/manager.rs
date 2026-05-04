@@ -813,6 +813,8 @@ impl IndexManager {
                             // branch switch — the full refresh already handled everything
                             files_to_index.clear();
                             files_to_remove.clear();
+                            cs_files_changed.clear();
+                            cs_last_event_time = None;
                         }
                     }
                 }
