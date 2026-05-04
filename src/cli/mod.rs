@@ -450,12 +450,18 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             // Subcommand path (preferred)
             if let Some(cmd) = command {
                 match cmd {
-                    IndexCommands::Add { path: add_path, global, alias } => {
-                        crate::index::add_to_index(add_path, global, alias, cancel_token.clone()).await
+                    IndexCommands::Add {
+                        path: add_path,
+                        global,
+                        alias,
+                    } => {
+                        crate::index::add_to_index(add_path, global, alias, cancel_token.clone())
+                            .await
                     }
-                    IndexCommands::Remove { path: rm_path, keep_config } => {
-                        crate::index::remove_from_index(rm_path, keep_config).await
-                    }
+                    IndexCommands::Remove {
+                        path: rm_path,
+                        keep_config,
+                    } => crate::index::remove_from_index(rm_path, keep_config).await,
                     IndexCommands::List => crate::index::list_index_status().await,
                 }
             } else {
@@ -470,7 +476,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
                 if add || is_add_cmd {
                     let effective_path = if is_add_cmd { None } else { path };
-                    crate::index::add_to_index(effective_path, global, alias, cancel_token.clone()).await
+                    crate::index::add_to_index(effective_path, global, alias, cancel_token.clone())
+                        .await
                 } else if remove || is_rm_cmd {
                     let effective_path = if is_rm_cmd { None } else { path };
                     crate::index::remove_from_index(effective_path, keep_config).await
@@ -501,18 +508,14 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             url,
         } => {
             match action {
-                crate::cli::ServeAction::Tui => {
-                    crate::serve::run_tui_standalone(url).await
-                }
+                crate::cli::ServeAction::Tui => crate::serve::run_tui_standalone(url).await,
                 crate::cli::ServeAction::Start => {
                     // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
                     // regardless of whether a database exists in the current directory.
                     // This is a central log for the multi-repo serve process, separate from
                     // per-database logs written by the MCP client (codesearch.log.YYYY-MM-DD).
                     let effective_quiet = (cli.quiet || quiet) && !verbose;
-                    if let Err(e) =
-                        crate::logger::init_serve_logger(log_level, effective_quiet)
-                    {
+                    if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
                         eprintln!("Warning: failed to initialize serve logger: {}", e);
                     }
                     crate::serve::run_serve(port, register, no_tui, cancel_token.clone()).await
@@ -520,15 +523,25 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             }
         }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
-        Commands::Doctor { fix, json, all, repo } => crate::cli::doctor::run(fix, json, all, repo).await,
+        Commands::Doctor {
+            fix,
+            json,
+            all,
+            repo,
+        } => crate::cli::doctor::run(fix, json, all, repo).await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp { path, create_index, mode } => {
+        Commands::Mcp {
+            path,
+            create_index,
+            mode,
+        } => {
             // Logger is initialized inside run_mcp_server() once db_path is known.
             // This handles both the "DB already exists" and "auto-create DB" paths correctly.
             //
             // MCP stdio transport uses stdout for JSON-RPC — always force file-only
             // logging to keep the channel clean, regardless of the global --quiet flag.
-            crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token).await
+            crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token)
+                .await
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
@@ -712,14 +725,17 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
         }
         GroupsCommands::Add { name, aliases } => {
             if aliases.is_empty() {
-                return Err(anyhow::anyhow!("--aliases is required and must specify at least one alias."));
+                return Err(anyhow::anyhow!(
+                    "--aliases is required and must specify at least one alias."
+                ));
             }
             let mut config = crate::db_discovery::load_repos_config()?;
             // Validate that all aliases exist
             for alias in &aliases {
                 if !config.repos.contains_key(alias) {
                     return Err(anyhow::anyhow!(
-                        "alias '{}' is not registered. Use 'codesearch index add' first.", alias
+                        "alias '{}' is not registered. Use 'codesearch index add' first.",
+                        alias
                     ));
                 }
             }
@@ -784,8 +800,15 @@ mod tests {
 
     #[test]
     fn test_cli_index_add_accepts_alias_flag() {
-        let cli = Cli::try_parse_from(["codesearch", "index", "add", "/tmp/foo", "--alias", "myrepo"])
-            .expect("cli parse should succeed");
+        let cli = Cli::try_parse_from([
+            "codesearch",
+            "index",
+            "add",
+            "/tmp/foo",
+            "--alias",
+            "myrepo",
+        ])
+        .expect("cli parse should succeed");
         match cli.command {
             Commands::Index {
                 command: Some(IndexCommands::Add { alias: Some(a), .. }),
@@ -801,7 +824,10 @@ mod tests {
             .expect("cli parse should succeed");
         match cli.command {
             Commands::Index {
-                command: Some(IndexCommands::Remove { keep_config: true, .. }),
+                command:
+                    Some(IndexCommands::Remove {
+                        keep_config: true, ..
+                    }),
                 ..
             } => (),
             _ => panic!("expected Index::Remove subcommand with keep_config"),

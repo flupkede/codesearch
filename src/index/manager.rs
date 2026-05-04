@@ -617,7 +617,9 @@ impl IndexManager {
         // Track changes for dashboard/TUI
         let total_changes = (changed_files.len() + deleted_files.len()) as u64;
         if total_changes > 0 {
-            stores.changes_count.fetch_add(total_changes, std::sync::atomic::Ordering::Relaxed);
+            stores
+                .changes_count
+                .fetch_add(total_changes, std::sync::atomic::Ordering::Relaxed);
         }
 
         let elapsed = start.elapsed();
@@ -702,9 +704,8 @@ impl IndexManager {
         // Write back the preserved metadata (with updated timestamp).
         {
             let mut metadata_to_write = preserved_metadata.clone();
-            metadata_to_write["indexed_at"] = serde_json::Value::String(
-                chrono::Utc::now().to_rfc3339(),
-            );
+            metadata_to_write["indexed_at"] =
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339());
             std::fs::write(
                 &metadata_path,
                 serde_json::to_string_pretty(&metadata_to_write)?,
@@ -871,11 +872,17 @@ impl IndexManager {
                                 files_to_remove.remove(&new_p);
                                 files_to_index.insert(new_p.clone());
                                 // Track .cs renames for symbol rebuild
-                                let old_is_cs = old_p.extension().and_then(|e| e.to_str()) == Some("cs");
-                                let new_is_cs = new_p.extension().and_then(|e| e.to_str()) == Some("cs");
+                                let old_is_cs =
+                                    old_p.extension().and_then(|e| e.to_str()) == Some("cs");
+                                let new_is_cs =
+                                    new_p.extension().and_then(|e| e.to_str()) == Some("cs");
                                 if old_is_cs || new_is_cs {
-                                    if old_is_cs { cs_files_changed.insert(old_p); }
-                                    if new_is_cs { cs_files_changed.insert(new_p); }
+                                    if old_is_cs {
+                                        cs_files_changed.insert(old_p);
+                                    }
+                                    if new_is_cs {
+                                        cs_files_changed.insert(new_p);
+                                    }
                                     cs_last_event_time = Some(now);
                                 }
                             }
@@ -1087,7 +1094,9 @@ impl IndexManager {
         // Track changes for dashboard/TUI
         let batch_changes = (files_to_index.len() + files_to_remove.len()) as u64;
         if batch_changes > 0 {
-            stores.changes_count.fetch_add(batch_changes, std::sync::atomic::Ordering::Relaxed);
+            stores
+                .changes_count
+                .fetch_add(batch_changes, std::sync::atomic::Ordering::Relaxed);
         }
 
         let elapsed = start.elapsed();
@@ -1341,7 +1350,13 @@ impl IndexManager {
 
         // Call the quiet index function from the parent module (no CLI output)
         // For incremental refresh, we use force=false which enables incremental mode
-        super::index_quiet(Some(path.to_path_buf()), false, false, CancellationToken::new()).await?;
+        super::index_quiet(
+            Some(path.to_path_buf()),
+            false,
+            false,
+            CancellationToken::new(),
+        )
+        .await?;
 
         let elapsed = start.elapsed();
         info!(

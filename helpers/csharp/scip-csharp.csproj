@@ -16,4 +16,9 @@
     <PackageReference Include="Microsoft.Build.Locator" Version="1.9.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
+    <None Include="tests/**/*.cs" />
+  </ItemGroup>
+
 </Project>

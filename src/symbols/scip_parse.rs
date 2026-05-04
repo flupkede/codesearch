@@ -84,8 +84,8 @@ const SUPPORTED_INDEX_VERSION: &str = "1.0";
 /// The JSON format is produced by `scip-csharp` and mirrors the SCIP schema
 /// with snake_case field names. Line numbers in the JSON are already 1-based.
 pub fn parse_json_index(data: &[u8]) -> Result<ScipIndex> {
-    let index: JsonIndex = serde_json::from_slice(data)
-        .with_context(|| "Failed to parse symbol index JSON")?;
+    let index: JsonIndex =
+        serde_json::from_slice(data).with_context(|| "Failed to parse symbol index JSON")?;
 
     if index.metadata.version != SUPPORTED_INDEX_VERSION {
         anyhow::bail!(
@@ -121,7 +121,9 @@ pub fn parse_json_index(data: &[u8]) -> Result<ScipIndex> {
             };
 
             // Use explicit kind from JSON if present, otherwise derive from roles
-            let kind = occurrence.kind.as_deref()
+            let kind = occurrence
+                .kind
+                .as_deref()
                 .filter(|k| !k.is_empty())
                 .map(|k| k.to_string())
                 .unwrap_or_else(|| role_to_kind(occurrence.symbol_roles as u32));

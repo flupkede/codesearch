@@ -46,8 +46,7 @@ const HELPER_BIN_NAME: &str = crate::constants::SCIP_CSHARP_HELPER_NAME;
 
 /// Debounce period for .cs file changes (seconds).
 #[allow(dead_code)]
-pub const CSHARP_REBUILD_DEBOUNCE_SECS: u64 =
-    crate::constants::SCIP_CSHARP_DEBOUNCE_MS / 1000;
+pub const CSHARP_REBUILD_DEBOUNCE_SECS: u64 = crate::constants::SCIP_CSHARP_DEBOUNCE_MS / 1000;
 
 // ── Serialized reference type (stored in LMDB via bincode) ────────
 
@@ -65,8 +64,7 @@ struct StoredReference {
 
 /// Serialize references with a leading version byte.
 fn serialize_refs(refs: &[StoredReference]) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(refs)
-        .with_context(|| "bincode serialize failed")?;
+    let payload = bincode::serialize(refs).with_context(|| "bincode serialize failed")?;
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(STORED_REFERENCE_SCHEMA_VERSION);
     buf.extend_from_slice(&payload);
@@ -87,8 +85,7 @@ fn deserialize_refs(bytes: &[u8]) -> Result<Vec<StoredReference>> {
             STORED_REFERENCE_SCHEMA_VERSION
         );
     }
-    bincode::deserialize(&bytes[1..])
-        .with_context(|| "bincode deserialize failed")
+    bincode::deserialize(&bytes[1..]).with_context(|| "bincode deserialize failed")
 }
 
 // ── Key-list serialization (for position + simple-name indexes) ─────
@@ -98,8 +95,7 @@ const KEYS_LIST_SCHEMA_VERSION: u8 = 1;
 
 /// Serialize a list of symbol keys with a leading version byte.
 fn serialize_keys_v1(keys: &[String]) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(keys)
-        .with_context(|| "bincode serialize keys failed")?;
+    let payload = bincode::serialize(keys).with_context(|| "bincode serialize keys failed")?;
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(KEYS_LIST_SCHEMA_VERSION);
     buf.extend_from_slice(&payload);
@@ -120,8 +116,7 @@ fn deserialize_keys_v1(bytes: &[u8]) -> Result<Vec<String>> {
             KEYS_LIST_SCHEMA_VERSION
         );
     }
-    bincode::deserialize(&bytes[1..])
-        .with_context(|| "bincode deserialize keys failed")
+    bincode::deserialize(&bytes[1..]).with_context(|| "bincode deserialize keys failed")
 }
 
 // ── Simple-name extraction ─────────────────────────────────────────
@@ -136,11 +131,7 @@ fn extract_simple_name(scip_symbol: &str) -> String {
     // Strip trailing parens/period (e.g. "Validate()." → "Validate")
     let cleaned = scip_symbol.trim_end_matches('.').trim_end_matches("()");
     // Take last segment after '#' or '.'
-    let last_segment = cleaned
-        .rsplit(['#', '.'])
-        .next()
-        .unwrap_or(cleaned)
-        .trim();
+    let last_segment = cleaned.rsplit(['#', '.']).next().unwrap_or(cleaned).trim();
     // Strip method parameters (e.g. "Add(int, int)" → "Add")
     last_segment
         .split('(')
@@ -220,7 +211,10 @@ impl CSharpSymbolIndexer {
                 } else {
                     HELPER_BIN_NAME.to_string()
                 };
-                let local_path = exe_dir.join(crate::constants::HELPERS_SUBDIR).join("csharp").join(&bin_name);
+                let local_path = exe_dir
+                    .join(crate::constants::HELPERS_SUBDIR)
+                    .join("csharp")
+                    .join(&bin_name);
                 if local_path.exists() {
                     tracing::debug!("scip-csharp helper found at {}", local_path.display());
                     return Some(local_path);
@@ -230,10 +224,7 @@ impl CSharpSymbolIndexer {
 
         // 3. $PATH lookup (use `which` on Unix, `where` on Windows)
         let lookup_cmd = if cfg!(windows) { "where" } else { "which" };
-        if let Ok(output) = Command::new(lookup_cmd)
-            .arg(HELPER_BIN_NAME)
-            .output()
-        {
+        if let Ok(output) = Command::new(lookup_cmd).arg(HELPER_BIN_NAME).output() {
             if output.status.success() {
                 let path_str = String::from_utf8_lossy(&output.stdout)
                     .lines()
@@ -314,7 +305,12 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         "csharp"
     }
 
-    fn rebuild(&self, repo_path: &Path, db_path: &Path, scope: RebuildScope) -> Result<RebuildSummary> {
+    fn rebuild(
+        &self,
+        repo_path: &Path,
+        db_path: &Path,
+        scope: RebuildScope,
+    ) -> Result<RebuildSummary> {
         let helper = self.detect_helper().ok_or_else(|| {
             anyhow::anyhow!(
                 "scip-csharp helper not found. Install the -with-csharp release variant \
@@ -329,10 +325,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let (solution, project) = match &scope {
             RebuildScope::Full => {
                 let sln = Self::find_solution(repo_path).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No .sln file found in {}",
-                        repo_path.display()
-                    )
+                    anyhow::anyhow!("No .sln file found in {}", repo_path.display())
                 })?;
                 (sln, None)
             }
@@ -364,8 +357,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // Invoke helper
         let mut cmd = Command::new(&helper);
         cmd.arg("index")
-            .arg("--solution").arg(&solution)
-            .arg("--output").arg(&output_path);
+            .arg("--solution")
+            .arg(&solution)
+            .arg("--output")
+            .arg(&output_path);
 
         if let Some(ref proj) = project {
             cmd.arg("--filter-project").arg(proj);
@@ -373,7 +368,8 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         tracing::info!("Running scip-csharp: {:?}", cmd);
 
-        let output = cmd.output()
+        let output = cmd
+            .output()
             .with_context(|| format!("Failed to execute scip-csharp at {}", helper.display()))?;
 
         if !output.status.success() {
@@ -398,12 +394,12 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let mut wtxn = env.write_txn()?;
 
         // Create/open databases — Str keys, Bytes values for symbol data
-        let symbols_db: Database<Str, Bytes> = env
-            .create_database(&mut wtxn, Some(SCIP_DB_NAME))?;
+        let symbols_db: Database<Str, Bytes> =
+            env.create_database(&mut wtxn, Some(SCIP_DB_NAME))?;
 
         // Meta DB: Str keys, Str values
-        let meta_db: Database<Str, Str> = env
-            .create_database(&mut wtxn, Some(SCIP_META_DB_NAME))?;
+        let meta_db: Database<Str, Str> =
+            env.create_database(&mut wtxn, Some(SCIP_META_DB_NAME))?;
 
         // Clear previous data
         symbols_db.clear(&mut wtxn)?;
@@ -438,8 +434,8 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // of a multi-line definition will not match. This is an intentional trade-off
         // for O(1) lookup — multi-line definitions are rare in C# (mostly constructors
         // with long signatures), and the start-line is the canonical anchor.
-        let positions_db: Database<Str, Bytes> = env
-            .create_database(&mut wtxn, Some(SCIP_POSITION_DB_NAME))?;
+        let positions_db: Database<Str, Bytes> =
+            env.create_database(&mut wtxn, Some(SCIP_POSITION_DB_NAME))?;
         positions_db.clear(&mut wtxn)?;
 
         let mut positions: HashMap<String, Vec<String>> = HashMap::new();
@@ -450,7 +446,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                     r.file.to_string_lossy().replace('\\', "/"),
                     r.start_line
                 );
-                positions.entry(pos_key).or_default().push(symbol_name.clone());
+                positions
+                    .entry(pos_key)
+                    .or_default()
+                    .push(symbol_name.clone());
             }
         }
 
@@ -460,16 +459,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             positions_db.put(&mut wtxn, key.as_str(), &bytes)?;
         }
 
-        tracing::debug!(
-            "scip-csharp position index: {} entries",
-            positions.len()
-        );
+        tracing::debug!("scip-csharp position index: {} entries", positions.len());
 
         // ── Build simple-name index ───────────────────────────────────
         // scip_simple_names: simple_name -> [full_symbol_keys]
         // Enables O(1) fuzzy lookup by extracting the last segment of each symbol.
-        let simple_names_db: Database<Str, Bytes> = env
-            .create_database(&mut wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))?;
+        let simple_names_db: Database<Str, Bytes> =
+            env.create_database(&mut wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))?;
         simple_names_db.clear(&mut wtxn)?;
 
         let mut simple_names: HashMap<String, Vec<String>> = HashMap::new();
@@ -500,7 +496,11 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             .unwrap_or_default()
             .as_secs();
         meta_db.put(&mut wtxn, META_REBUILD_TS, now.to_string().as_str())?;
-        meta_db.put(&mut wtxn, META_SYMBOL_COUNT, total_symbols.to_string().as_str())?;
+        meta_db.put(
+            &mut wtxn,
+            META_SYMBOL_COUNT,
+            total_symbols.to_string().as_str(),
+        )?;
 
         wtxn.commit()?;
 
@@ -526,24 +526,30 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         let symbols_db: Database<Str, Bytes> = env
             .open_database(&rtxn, Some(SCIP_DB_NAME))?
-            .ok_or_else(|| anyhow::anyhow!("SCIP symbol database not found. Run a rebuild first."))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("SCIP symbol database not found. Run a rebuild first.")
+            })?;
 
         // Exact match first
         if let Some(bytes) = symbols_db.get(&rtxn, symbol)? {
             let stored = deserialize_refs(bytes)?;
-            return Ok(stored.into_iter().map(|r| SymbolReference {
-                file: r.file,
-                start_line: r.start_line,
-                end_line: r.end_line,
-                kind: r.kind,
-            }).collect());
+            return Ok(stored
+                .into_iter()
+                .map(|r| SymbolReference {
+                    file: r.file,
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    kind: r.kind,
+                })
+                .collect());
         }
 
         // Fuzzy via simple-name index (O(1) lookup instead of full-table scan)
-        let simple_names_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))? {
-            Some(db) => db,
-            None => return Ok(vec![]),
-        };
+        let simple_names_db: Database<Str, Bytes> =
+            match env.open_database(&rtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))? {
+                Some(db) => db,
+                None => return Ok(vec![]),
+            };
 
         let simple = extract_simple_name(symbol);
         let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple as &str)? {
@@ -566,7 +572,12 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         }
     }
 
-    fn find_references_by_position(&self, db_path: &Path, file: &Path, line: u32) -> Result<Vec<SymbolReference>> {
+    fn find_references_by_position(
+        &self,
+        db_path: &Path,
+        file: &Path,
+        line: u32,
+    ) -> Result<Vec<SymbolReference>> {
         let env = self.open_scip_env(db_path)?;
         let rtxn = env.read_txn()?;
 
@@ -575,11 +586,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             .ok_or_else(|| anyhow::anyhow!("Position index not found. Run a rebuild first."))?;
 
         // Normalize file path to forward-slash (Windows compat)
-        let pos_key = format!(
-            "{}:{}",
-            file.to_string_lossy().replace('\\', "/"),
-            line
-        );
+        let pos_key = format!("{}:{}", file.to_string_lossy().replace('\\', "/"), line);
 
         let candidate_keys: Vec<String> = match positions_db.get(&rtxn, &pos_key as &str)? {
             Some(b) => deserialize_keys_v1(b)?,
@@ -606,11 +613,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             Err(_) => return u64::MAX,
         };
 
-        let meta_db: Database<Str, Str> =
-            match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
-                Ok(Some(db)) => db,
-                _ => return u64::MAX,
-            };
+        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
+            Ok(Some(db)) => db,
+            _ => return u64::MAX,
+        };
 
         let ts_str: &str = match meta_db.get(&rtxn, META_REBUILD_TS) {
             Ok(Some(s)) => s,
@@ -697,9 +703,18 @@ mod tests {
 
     #[test]
     fn test_extract_simple_name() {
-        assert_eq!(extract_simple_name("csharp App . FieldDefinition#Validate()."), "Validate");
-        assert_eq!(extract_simple_name("csharp SmallSolution.Library . Calculator#Add(int, int)."), "Add");
-        assert_eq!(extract_simple_name("csharp . . . Namespace.TopLevel"), "TopLevel");
+        assert_eq!(
+            extract_simple_name("csharp App . FieldDefinition#Validate()."),
+            "Validate"
+        );
+        assert_eq!(
+            extract_simple_name("csharp SmallSolution.Library . Calculator#Add(int, int)."),
+            "Add"
+        );
+        assert_eq!(
+            extract_simple_name("csharp . . . Namespace.TopLevel"),
+            "TopLevel"
+        );
         assert_eq!(extract_simple_name("csharp . . . Foo"), "Foo");
         assert_eq!(extract_simple_name(""), "");
     }

@@ -103,11 +103,7 @@ pub trait SymbolIndexer: Send + Sync {
     ) -> Result<RebuildSummary>;
 
     /// Return the symbol's references from the LMDB store.
-    fn find_references(
-        &self,
-        db_path: &Path,
-        symbol: &str,
-    ) -> Result<Vec<SymbolReference>>;
+    fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>>;
 
     /// Look up references by file-position instead of symbol name.
     /// Resolves the position to a canonical SCIP symbol first.
@@ -150,7 +146,10 @@ impl SymbolIndexerRegistry {
 
     /// List languages that have a registered adapter.
     pub fn available_languages(&self) -> Vec<String> {
-        self.indexers.iter().map(|i| i.language().to_string()).collect()
+        self.indexers
+            .iter()
+            .map(|i| i.language().to_string())
+            .collect()
     }
 
     /// List languages where the helper is actually installed.
@@ -161,7 +160,6 @@ impl SymbolIndexerRegistry {
             .map(|i| i.language().to_string())
             .collect()
     }
-
 }
 
 impl Default for SymbolIndexerRegistry {

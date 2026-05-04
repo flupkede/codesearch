@@ -437,7 +437,11 @@ impl GitHeadWatcher {
         match output {
             Ok(output) if output.status.success() => {
                 let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if hash.is_empty() { None } else { Some(hash) }
+                if hash.is_empty() {
+                    None
+                } else {
+                    Some(hash)
+                }
             }
             Ok(output) => {
                 tracing::debug!(
@@ -570,7 +574,11 @@ mod tests {
         run_git(repo_path, &["add", "."]).unwrap();
         run_git(repo_path, &["commit", "-m", "advance head"]).unwrap();
 
-        let change = watcher.check().await.unwrap().expect("expected head change");
+        let change = watcher
+            .check()
+            .await
+            .unwrap()
+            .expect("expected head change");
         assert_eq!(change.old_head, change.new_head);
         assert_ne!(change.old_commit, change.new_commit);
         assert!(change.old_commit.is_some());

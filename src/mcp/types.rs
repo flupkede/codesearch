@@ -476,9 +476,9 @@ pub fn validate_project_group(
 ) -> Result<(), String> {
     match (project, group) {
         // Both project and group are mutually exclusive.
-        (Some(_), Some(_)) => {
-            Err("Cannot specify both `project` and `group` — they are mutually exclusive.".to_string())
-        }
+        (Some(_), Some(_)) => Err(
+            "Cannot specify both `project` and `group` — they are mutually exclusive.".to_string(),
+        ),
         // Either project or group is set but empty/whitespace.
         // The pattern binds `p` from whichever side is Some — both arms share the same guard.
         (Some(p), None) | (None, Some(p)) if p.trim().is_empty() => {
@@ -504,20 +504,33 @@ mod tests {
 
     #[test]
     fn test_validate_both_set_rejected() {
-        let err = validate_project_group(&Some("foo".into()), &Some("bar".into()), true).unwrap_err();
-        assert!(err.contains("mutually exclusive"), "Expected mutual exclusion error, got: {}", err);
+        let err =
+            validate_project_group(&Some("foo".into()), &Some("bar".into()), true).unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "Expected mutual exclusion error, got: {}",
+            err
+        );
     }
 
     #[test]
     fn test_validate_project_requires_serve() {
         let err = validate_project_group(&Some("myrepo".into()), &None, false).unwrap_err();
-        assert!(err.contains("serve"), "Expected serve-required error, got: {}", err);
+        assert!(
+            err.contains("serve"),
+            "Expected serve-required error, got: {}",
+            err
+        );
     }
 
     #[test]
     fn test_validate_group_requires_serve() {
         let err = validate_project_group(&None, &Some("mygroup".into()), false).unwrap_err();
-        assert!(err.contains("serve"), "Expected serve-required error, got: {}", err);
+        assert!(
+            err.contains("serve"),
+            "Expected serve-required error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -533,12 +546,20 @@ mod tests {
     #[test]
     fn test_validate_empty_project_rejected() {
         let err = validate_project_group(&Some("".into()), &None, true).unwrap_err();
-        assert!(err.contains("must not be empty"), "Expected empty error, got: {}", err);
+        assert!(
+            err.contains("must not be empty"),
+            "Expected empty error, got: {}",
+            err
+        );
     }
 
     #[test]
     fn test_validate_empty_group_rejected() {
         let err = validate_project_group(&None, &Some("  ".into()), true).unwrap_err();
-        assert!(err.contains("must not be empty"), "Expected empty error, got: {}", err);
+        assert!(
+            err.contains("must not be empty"),
+            "Expected empty error, got: {}",
+            err
+        );
     }
 }

@@ -89,17 +89,15 @@ async fn run_remote_tui_loop(
     loop {
         // Fetch status from serve
         match reqwest::get(&status_url).await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<StatusResponse>().await {
-                    Ok(data) => {
-                        remote_state.data = Some(data);
-                        remote_state.connection_errors = 0;
-                    }
-                    Err(_) => {
-                        remote_state.connection_errors += 1;
-                    }
+            Ok(resp) if resp.status().is_success() => match resp.json::<StatusResponse>().await {
+                Ok(data) => {
+                    remote_state.data = Some(data);
+                    remote_state.connection_errors = 0;
                 }
-            }
+                Err(_) => {
+                    remote_state.connection_errors += 1;
+                }
+            },
             _ => {
                 remote_state.connection_errors += 1;
             }
@@ -147,12 +145,11 @@ async fn run_remote_tui_loop(
                     } else {
                         "Connecting..."
                     };
-                    let connecting = ratatui::widgets::Paragraph::new(Line::from(vec![
-                        Span::styled(
+                    let connecting =
+                        ratatui::widgets::Paragraph::new(Line::from(vec![Span::styled(
                             format!(" {} ", msg),
                             Style::default().fg(Color::Yellow),
-                        ),
-                    ]));
+                        )]));
                     f.render_widget(connecting, chunks[1]);
                     render_footer(f, chunks[3], &[], &table_state, 0, "—");
                 }
@@ -239,31 +236,19 @@ fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) {
 // Rendering — mirrors the embedded TUI in tui.rs
 // ---------------------------------------------------------------------------
 
-fn render_header(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    serve_url: &str,
-    version: &str,
-) {
+fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str, version: &str) {
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
 
     let title_line = Line::from(vec![
         Span::styled(
             format!(" codesearch serve v{} · ", version),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            serve_url.to_string(),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(
-            format!("  {} ", now),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            "[remote]".to_string(),
-            Style::default().fg(Color::Magenta),
-        ),
+        Span::styled(serve_url.to_string(), Style::default().fg(Color::White)),
+        Span::styled(format!("  {} ", now), Style::default().fg(Color::DarkGray)),
+        Span::styled("[remote]".to_string(), Style::default().fg(Color::Magenta)),
     ]);
 
     let block = Block::default()
@@ -272,15 +257,8 @@ fn render_header(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let centered = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(inner);
-    f.render_widget(
-        ratatui::widgets::Paragraph::new(title_line),
-        centered[0],
-    );
+    let centered = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    f.render_widget(ratatui::widgets::Paragraph::new(title_line), centered[0]);
 }
 
 fn render_table(
@@ -309,15 +287,10 @@ fn render_table(
         .iter()
         .map(|repo| {
             let status_cell = status_cell(&repo.status);
-            let changes_cell = Cell::from(format!("{}", repo.changes))
-                .style(Style::default().fg(Color::White));
-            let tool_cell = Cell::from(
-                repo.last_tool_call
-                    .as_deref()
-                    .unwrap_or("—")
-                    .to_string(),
-            )
-            .style(Style::default().fg(Color::DarkGray));
+            let changes_cell =
+                Cell::from(format!("{}", repo.changes)).style(Style::default().fg(Color::White));
+            let tool_cell = Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
+                .style(Style::default().fg(Color::DarkGray));
             let lock_cell = lock_cell(&repo.lock_mode);
 
             Row::new(vec![
@@ -356,12 +329,7 @@ fn render_table(
     f.render_stateful_widget(table, area, table_state);
 }
 
-fn render_detail(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    repos: &[RepoInfo],
-    table_state: &TableState,
-) {
+fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_state: &TableState) {
     if repos.is_empty() {
         return;
     }
@@ -388,7 +356,9 @@ fn render_detail(
         Span::styled(" ▶ ", Style::default().fg(Color::Yellow)),
         Span::styled(
             repo.alias.clone(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
         Span::styled(status_label, Style::default().fg(Color::Cyan)),
@@ -416,14 +386,17 @@ fn render_detail(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let detail_chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let detail_chunks =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
 
-    f.render_widget(ratatui::widgets::Paragraph::new(detail_line), detail_chunks[0]);
-    f.render_widget(ratatui::widgets::Paragraph::new(info_line), detail_chunks[1]);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(detail_line),
+        detail_chunks[0],
+    );
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(info_line),
+        detail_chunks[1],
+    );
 }
 
 fn render_footer(
@@ -450,11 +423,9 @@ fn render_footer(
         vertical: 0,
         horizontal: 1,
     });
-    let [left, right] = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(right_len as u16 + 2),
-    ])
-    .areas(footer_inner);
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(right_len as u16 + 2)])
+            .areas(footer_inner);
 
     let left_line = Line::from(vec![
         Span::styled("[q] quit  ", Style::default().fg(Color::DarkGray)),
@@ -481,22 +452,23 @@ fn render_footer(
 
 fn status_cell(status: &str) -> Cell<'static> {
     match status {
-        "open" => Cell::from("✓ ready".to_string())
-            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        "warm" => Cell::from("◐ warm".to_string())
-            .style(Style::default().fg(Color::Yellow)),
-        "readonly" => Cell::from("◑ ro".to_string())
-            .style(Style::default().fg(Color::Cyan)),
-        "indexing" => Cell::from("⟳ idx…".to_string())
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        "closed" => Cell::from("○ closed".to_string())
-            .style(Style::default().fg(Color::Gray)),
+        "open" => Cell::from("✓ ready".to_string()).style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "warm" => Cell::from("◐ warm".to_string()).style(Style::default().fg(Color::Yellow)),
+        "readonly" => Cell::from("◑ ro".to_string()).style(Style::default().fg(Color::Cyan)),
+        "indexing" => Cell::from("⟳ idx…".to_string()).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "closed" => Cell::from("○ closed".to_string()).style(Style::default().fg(Color::Gray)),
         "error" => Cell::from("✗ error".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        "no_index" => Cell::from("— no idx".to_string())
-            .style(Style::default().fg(Color::Gray)),
-        _ => Cell::from(status.to_string())
-            .style(Style::default().fg(Color::White)),
+        "no_index" => Cell::from("— no idx".to_string()).style(Style::default().fg(Color::Gray)),
+        _ => Cell::from(status.to_string()).style(Style::default().fg(Color::White)),
     }
 }
 

@@ -200,16 +200,12 @@ fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str) {
     let title_line = Line::from(vec![
         Span::styled(
             format!(" codesearch serve v{} · ", version),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            serve_url.to_string(),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(
-            format!("  {} ", now),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(serve_url.to_string(), Style::default().fg(Color::White)),
+        Span::styled(format!("  {} ", now), Style::default().fg(Color::DarkGray)),
     ]);
 
     let block = Block::default()
@@ -219,15 +215,8 @@ fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str) {
     f.render_widget(block, area);
 
     // Center the title line vertically (area is 3 rows, title is 1 row)
-    let centered = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(inner);
-    f.render_widget(
-        ratatui::widgets::Paragraph::new(title_line),
-        centered[0],
-    );
+    let centered = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    f.render_widget(ratatui::widgets::Paragraph::new(title_line), centered[0]);
 }
 
 fn render_table(
@@ -256,15 +245,10 @@ fn render_table(
         .iter()
         .map(|(alias, info)| {
             let status_cell = status_cell(info.status);
-            let changes_cell = Cell::from(format!("{}", info.changes))
-                .style(Style::default().fg(Color::White));
-            let tool_cell = Cell::from(
-                info.last_tool_call
-                    .as_deref()
-                    .unwrap_or("—")
-                    .to_string(),
-            )
-            .style(Style::default().fg(Color::DarkGray));
+            let changes_cell =
+                Cell::from(format!("{}", info.changes)).style(Style::default().fg(Color::White));
+            let tool_cell = Cell::from(info.last_tool_call.as_deref().unwrap_or("—").to_string())
+                .style(Style::default().fg(Color::DarkGray));
             // We don't have lock info in lightweight status, show status-derived value
             let lock_cell = lock_cell_from_status(info.status);
 
@@ -322,7 +306,8 @@ fn render_detail(
 
     let (alias, info) = &repos[idx];
     let config = state.config_snapshot();
-    let path = config.resolve(alias)
+    let path = config
+        .resolve(alias)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "—".to_string());
 
@@ -346,7 +331,12 @@ fn render_detail(
 
     let detail_line = Line::from(vec![
         Span::styled(" ▶ ", Style::default().fg(Color::Yellow)),
-        Span::styled(alias.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            alias.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  ", Style::default()),
         Span::styled(status_label, Style::default().fg(Color::Cyan)),
         Span::styled("  ", Style::default()),
@@ -357,7 +347,10 @@ fn render_detail(
     let tool_str = info.last_tool_call.as_deref().unwrap_or("—");
     let info_line = Line::from(vec![
         Span::styled("   changes:", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!(" {}  ", info.changes), Style::default().fg(Color::White)),
+        Span::styled(
+            format!(" {}  ", info.changes),
+            Style::default().fg(Color::White),
+        ),
         Span::styled("last:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!(" {}", tool_str), Style::default().fg(Color::White)),
     ]);
@@ -368,14 +361,17 @@ fn render_detail(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let detail_chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let detail_chunks =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
 
-    f.render_widget(ratatui::widgets::Paragraph::new(detail_line), detail_chunks[0]);
-    f.render_widget(ratatui::widgets::Paragraph::new(info_line), detail_chunks[1]);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(detail_line),
+        detail_chunks[0],
+    );
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(info_line),
+        detail_chunks[1],
+    );
 }
 
 fn render_footer(
@@ -403,11 +399,9 @@ fn render_footer(
         vertical: 0,
         horizontal: 1,
     });
-    let [left, right] = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(right_len as u16 + 2),
-    ])
-    .areas(footer_inner);
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(right_len as u16 + 2)])
+            .areas(footer_inner);
 
     let left_line = Line::from(vec![
         Span::styled("[q] quit  ", Style::default().fg(Color::DarkGray)),
@@ -422,7 +416,10 @@ fn render_footer(
     ]);
 
     f.render_widget(ratatui::widgets::Paragraph::new(left_line), left);
-    f.render_widget(ratatui::widgets::Paragraph::new(right_line).right_aligned(), right);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(right_line).right_aligned(),
+        right,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -470,20 +467,22 @@ fn cpu_usage_str(sys_system: &mut Option<sysinfo::System>) -> String {
 fn status_cell(status: super::RepoStateLabel) -> Cell<'static> {
     use super::RepoStateLabel::*;
     match status {
-        Open => Cell::from("✓ ready".to_string())
-            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Warm => Cell::from("◐ warm".to_string())
-            .style(Style::default().fg(Color::Yellow)),
-        Readonly => Cell::from("◑ ro".to_string())
-            .style(Style::default().fg(Color::Cyan)),
-        Indexing => Cell::from("⟳ idx…".to_string())
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Closed => Cell::from("○ closed".to_string())
-            .style(Style::default().fg(Color::Gray)),
+        Open => Cell::from("✓ ready".to_string()).style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Warm => Cell::from("◐ warm".to_string()).style(Style::default().fg(Color::Yellow)),
+        Readonly => Cell::from("◑ ro".to_string()).style(Style::default().fg(Color::Cyan)),
+        Indexing => Cell::from("⟳ idx…".to_string()).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Closed => Cell::from("○ closed".to_string()).style(Style::default().fg(Color::Gray)),
         Error => Cell::from("✗ error".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        NoIndex => Cell::from("— no idx".to_string())
-            .style(Style::default().fg(Color::Gray)),
+        NoIndex => Cell::from("— no idx".to_string()).style(Style::default().fg(Color::Gray)),
     }
 }
 

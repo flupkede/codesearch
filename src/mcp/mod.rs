@@ -2191,9 +2191,9 @@ use crate::embed::{EmbeddingService, ModelType};
 use crate::file::Language;
 use crate::fts::FtsStore;
 use crate::index::{IndexManager, SharedStores};
-use crate::symbols::SymbolIndexerRegistry;
 use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_RRF_K};
 use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
+use crate::symbols::SymbolIndexerRegistry;
 use crate::vectordb::VectorStore;
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -2330,8 +2330,7 @@ impl ServerHandler for McpProxyService {
                     Ok(r) => return Ok(r),
                     Err(e) => {
                         let msg = e.to_string();
-                        if !is_transport_error_msg(&msg)
-                            || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
+                        if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
                         {
                             return Err(McpError::internal_error(msg, None));
                         }
@@ -2379,8 +2378,7 @@ impl ServerHandler for McpProxyService {
                     Ok(r) => return Ok(r),
                     Err(e) => {
                         let msg = e.to_string();
-                        if !is_transport_error_msg(&msg)
-                            || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
+                        if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
                         {
                             return Err(McpError::internal_error(msg, None));
                         }
@@ -5347,7 +5345,10 @@ impl CodesearchService {
         );
 
         // Validate input: must provide either symbol_name or file+line
-        let has_name = request.symbol_name.as_ref().is_some_and(|s| !s.trim().is_empty());
+        let has_name = request
+            .symbol_name
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
         let has_position = request.file.is_some() && request.line.is_some();
         if !has_name && !has_position {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -5366,7 +5367,9 @@ impl CodesearchService {
 
         // Determine project root and db_path for the symbol index
         let (project_root, db_path) = if let Some(ref alias) = ctx.project_alias {
-            let root = ctx.alias_roots.get(alias)
+            let root = ctx
+                .alias_roots
+                .get(alias)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| self.project_path.clone());
             // The symbol index DB lives alongside the vector DB
@@ -5414,7 +5417,9 @@ impl CodesearchService {
                 // Use the first installed language (MVP: only C#)
                 match registry.get(&installed[0]) {
                     Some(i) => i,
-                    None => unreachable!("installed_languages() returned a language with no indexer"),
+                    None => {
+                        unreachable!("installed_languages() returned a language with no indexer")
+                    }
                 }
             }
         };
@@ -5454,12 +5459,17 @@ impl CodesearchService {
                 let age = indexer.index_age(&db_path);
                 let impact = crate::symbols::FindImpactResult {
                     symbol: request.symbol_name.clone().unwrap_or_else(|| {
-                        format!("{}:{}", request.file.as_deref().unwrap_or("?"), request.line.unwrap_or(0))
+                        format!(
+                            "{}:{}",
+                            request.file.as_deref().unwrap_or("?"),
+                            request.line.unwrap_or(0)
+                        )
                     }),
                     references,
                     index_age_seconds: age,
                     language: indexer.language().to_string(),
-                    scope: ctx.project_alias
+                    scope: ctx
+                        .project_alias
                         .map(|a| format!("project:{}", a))
                         .unwrap_or_else(|| "local".to_string()),
                 };

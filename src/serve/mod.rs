@@ -674,8 +674,12 @@ impl ServeState {
         // Open as Warm only — no FSW, no IndexManager overhead.
         // Always update last_access so the reaper can evict this repo after idle timeout.
         if !touch {
-            self.repos
-                .insert(alias.to_string(), RepoState::Warm { stores: stores_arc.clone() });
+            self.repos.insert(
+                alias.to_string(),
+                RepoState::Warm {
+                    stores: stores_arc.clone(),
+                },
+            );
             self.touch_access(alias);
             return Ok(stores_arc);
         }
@@ -1339,7 +1343,9 @@ async fn trigger_symbol_rebuild(
             return Err(anyhow::anyhow!("scip-csharp helper not available"));
         }
         indexer.rebuild(&rp, &dp, RebuildScope::Full)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(summary)) => {
             tracing::info!(
                 "✅ Symbol rebuild complete for '{}': {} symbols, {} refs in {}ms",
@@ -1353,7 +1359,11 @@ async fn trigger_symbol_rebuild(
             tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, e);
         }
         Err(e) => {
-            tracing::error!("❌ Symbol rebuild task panicked for '{}': {}", alias_owned, e);
+            tracing::error!(
+                "❌ Symbol rebuild task panicked for '{}': {}",
+                alias_owned,
+                e
+            );
         }
     }
 }
@@ -1485,7 +1495,13 @@ async fn reindex_handler(
 
             // 4. Optional symbol index rebuild
             if do_symbols {
-                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, g_state.symbol_registry.clone()).await;
+                trigger_symbol_rebuild(
+                    &alias_bg,
+                    &project_path,
+                    &db_path,
+                    g_state.symbol_registry.clone(),
+                )
+                .await;
             }
 
             g_state.active_reindexes.remove(&g_alias);
@@ -1530,7 +1546,13 @@ async fn reindex_handler(
 
             // Optional symbol index rebuild
             if do_symbols {
-                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, g_state.symbol_registry.clone()).await;
+                trigger_symbol_rebuild(
+                    &alias_bg,
+                    &project_path,
+                    &db_path,
+                    g_state.symbol_registry.clone(),
+                )
+                .await;
             }
 
             g_state.active_reindexes.remove(&g_alias);
@@ -1830,8 +1852,6 @@ async fn log_mcp_requests(
 
     response
 }
-
-
 
 /// Run the standalone TUI that connects to a running serve instance via HTTP.
 ///

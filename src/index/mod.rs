@@ -19,7 +19,7 @@ use crate::vectordb::VectorStore;
 
 // Index manager module
 mod manager;
-pub use manager::{IndexManager, SharedStores, is_database_locked};
+pub use manager::{is_database_locked, IndexManager, SharedStores};
 
 /// Get the database path and project path for a given directory
 /// Uses automatic database discovery to find indexes in parent/global directories
@@ -97,7 +97,9 @@ fn get_db_path_smart(
                 let db_project_normalized = normalize_path(&db_info.project_path);
                 let canonical_path_str = normalize_path(&canonical_path);
                 let db_is_for_this_project = db_project_normalized == canonical_path_str
-                    || canonical_path.as_path().starts_with(Path::new(&*db_project_normalized));
+                    || canonical_path
+                        .as_path()
+                        .starts_with(Path::new(&*db_project_normalized));
 
                 if !db_is_for_this_project {
                     anyhow::bail!(
@@ -1222,8 +1224,7 @@ pub async fn add_to_index(
         // If an alias is provided and this is a local DB in the current dir,
         // register it in repos.json (for legacy DB's that predate auto-registration).
         if alias.is_some() && db.is_current && !db.is_global {
-            let mut config = crate::db_discovery::repos::ReposConfig::load()
-                .unwrap_or_default();
+            let mut config = crate::db_discovery::repos::ReposConfig::load().unwrap_or_default();
             if let Some(existing) = config.alias_for_path(&canonical_path) {
                 println!("   Already registered as '{}'.", existing);
             } else {
@@ -1326,8 +1327,7 @@ pub async fn add_to_index(
             }
         };
 
-        let mut config = crate::db_discovery::repos::ReposConfig::load()
-            .unwrap_or_default();
+        let mut config = crate::db_discovery::repos::ReposConfig::load().unwrap_or_default();
 
         if let Some(existing) = config.alias_for_path(&canonical_path) {
             eprintln!("ℹ️ Already registered as '{}'.", existing);
@@ -1355,10 +1355,7 @@ pub async fn add_to_index(
 }
 
 /// Remove the index (local or global, auto-detected)
-pub async fn remove_from_index(
-    path: Option<PathBuf>,
-    keep_config: bool,
-) -> Result<()> {
+pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Result<()> {
     let project_path = path.clone().unwrap_or_else(|| PathBuf::from("."));
     let canonical_path = project_path.canonicalize()?;
 
@@ -1396,8 +1393,7 @@ pub async fn remove_from_index(
 
     // Auto-unregister from repos.json unless --keep-config
     if !keep_config {
-        let mut config = crate::db_discovery::repos::ReposConfig::load()
-            .unwrap_or_default();
+        let mut config = crate::db_discovery::repos::ReposConfig::load().unwrap_or_default();
         if config.unregister_path(&canonical_path) {
             if let Err(e) = config.save() {
                 eprintln!("⚠️ Failed to update repos config: {}", e);
@@ -1417,7 +1413,9 @@ pub async fn remove_from_index(
         );
         println!("   Removing local index...");
         if let Err(e) = fs::remove_dir_all(&local_db) {
-            eprintln!("⚠️ Database files may be locked by a running codesearch serve. Stop it and retry.");
+            eprintln!(
+                "⚠️ Database files may be locked by a running codesearch serve. Stop it and retry."
+            );
             return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
         }
         println!("   {}", "✅ Local index removed".green());
@@ -1429,7 +1427,9 @@ pub async fn remove_from_index(
     if has_local {
         println!("\n{}", "Removing local index...".cyan());
         if let Err(e) = fs::remove_dir_all(&local_db) {
-            eprintln!("⚠️ Database files may be locked by a running codesearch serve. Stop it and retry.");
+            eprintln!(
+                "⚠️ Database files may be locked by a running codesearch serve. Stop it and retry."
+            );
             return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
         }
         println!("{}", "✅ Local index removed!".green());
@@ -1558,10 +1558,18 @@ async fn try_delegate_reindex_to_serve(
         .get(format!("{}/health", base_url))
         .send()
         .await
-        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
+        .map_err(|e| {
+            format!(
+                "serve not reachable at {} ({}). Is 'codesearch serve' running?",
+                base_url, e
+            )
+        })?;
 
     if !health_resp.status().is_success() {
-        return Err(format!("serve health check returned {}", health_resp.status()));
+        return Err(format!(
+            "serve health check returned {}",
+            health_resp.status()
+        ));
     }
 
     // 2. Resolve the project path to an alias by loading repos config
@@ -1622,7 +1630,10 @@ async fn try_delegate_reindex_to_serve(
     } else {
         let status = reindex_resp.status();
         let body = reindex_resp.text().await.unwrap_or_default();
-        Err(format!("serve returned {} for alias '{}': {}", status, alias, body))
+        Err(format!(
+            "serve returned {} for alias '{}': {}",
+            status, alias, body
+        ))
     }
 }
 
@@ -1655,10 +1666,18 @@ pub(crate) async fn try_delegate_add_to_serve(
         .get(format!("{}/health", base_url))
         .send()
         .await
-        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
+        .map_err(|e| {
+            format!(
+                "serve not reachable at {} ({}). Is 'codesearch serve' running?",
+                base_url, e
+            )
+        })?;
 
     if !health_resp.status().is_success() {
-        return Err(format!("serve health check returned {}", health_resp.status()));
+        return Err(format!(
+            "serve health check returned {}",
+            health_resp.status()
+        ));
     }
 
     // 2. Resolve path
@@ -1690,10 +1709,12 @@ pub(crate) async fn try_delegate_add_to_serve(
         let resp_body: serde_json::Value = add_resp.json().await.unwrap_or_default();
         let assigned_alias = resp_body["alias"]
             .as_str()
-            .unwrap_or_else(|| project_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown"))
+            .unwrap_or_else(|| {
+                project_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+            })
             .to_string();
         Ok((assigned_alias, project_path))
     } else {
@@ -1729,10 +1750,18 @@ pub(crate) async fn try_delegate_rm_to_serve(
         .get(format!("{}/health", base_url))
         .send()
         .await
-        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
+        .map_err(|e| {
+            format!(
+                "serve not reachable at {} ({}). Is 'codesearch serve' running?",
+                base_url, e
+            )
+        })?;
 
     if !health_resp.status().is_success() {
-        return Err(format!("serve health check returned {}", health_resp.status()));
+        return Err(format!(
+            "serve health check returned {}",
+            health_resp.status()
+        ));
     }
 
     // 2. Resolve the project path to an alias
@@ -1771,6 +1800,9 @@ pub(crate) async fn try_delegate_rm_to_serve(
     } else {
         let status = delete_resp.status();
         let text = delete_resp.text().await.unwrap_or_default();
-        Err(format!("serve returned {} for alias '{}': {}", status, alias, text))
+        Err(format!(
+            "serve returned {} for alias '{}': {}",
+            status, alias, text
+        ))
     }
 }

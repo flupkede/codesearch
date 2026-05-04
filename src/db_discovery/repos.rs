@@ -191,7 +191,10 @@ impl ReposConfig {
 
     pub fn add_group(&mut self, name: String, aliases: Vec<String>) -> Result<()> {
         if aliases.is_empty() {
-            return Err(anyhow::anyhow!("Group '{}' must contain at least one alias", name));
+            return Err(anyhow::anyhow!(
+                "Group '{}' must contain at least one alias",
+                name
+            ));
         }
 
         for alias in &aliases {
@@ -252,10 +255,7 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 fn unique_alias_for_path(existing: &HashMap<String, PathBuf>, path: &Path) -> String {
-    let base_raw = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("repo");
+    let base_raw = path.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
     let base = sanitize_alias(base_raw);
     let base = if base.is_empty() {
         "repo".to_string()
