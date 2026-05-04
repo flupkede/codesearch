@@ -137,11 +137,8 @@ fn test_indexer_returns_empty_when_db_missing() {
 
     let indexer = CSharpSymbolIndexer::new();
 
-    // Verify it reports as unavailable (no helper binary in test environment)
-    assert!(
-        !indexer.is_available(),
-        "Indexer should not be available without helper"
-    );
+    // Note: is_available() may return true if the helper binary exists
+    // (e.g. in CI where it was just built). Don't assert unavailability.
 
     // Test index_age with no LMDB data — should return u64::MAX
     let age = indexer.index_age(&db_path);
