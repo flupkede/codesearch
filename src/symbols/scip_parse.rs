@@ -29,7 +29,6 @@ pub type ScipIndex = HashMap<String, Vec<ScipReference>>;
 
 #[derive(Deserialize)]
 struct JsonIndex {
-    #[allow(dead_code)]
     metadata: JsonMetadata,
     documents: Vec<JsonDocument>,
     #[allow(dead_code)]
@@ -38,7 +37,6 @@ struct JsonIndex {
 
 #[derive(Deserialize)]
 struct JsonMetadata {
-    #[allow(dead_code)]
     version: String,
     #[allow(dead_code)]
     tool_info: String,
@@ -77,6 +75,10 @@ mod roles {
     pub const IMPLEMENTATION: u32 = 256;
 }
 
+/// The only scip-csharp index version this parser understands.
+/// Bump together with the helper whenever the JSON schema changes.
+const SUPPORTED_INDEX_VERSION: &str = "1.0";
+
 /// Parse a JSON byte slice into a symbol -> references map.
 ///
 /// The JSON format is produced by `scip-csharp` and mirrors the SCIP schema
@@ -84,6 +86,15 @@ mod roles {
 pub fn parse_json_index(data: &[u8]) -> Result<ScipIndex> {
     let index: JsonIndex = serde_json::from_slice(data)
         .with_context(|| "Failed to parse symbol index JSON")?;
+
+    if index.metadata.version != SUPPORTED_INDEX_VERSION {
+        anyhow::bail!(
+            "Unsupported scip-csharp index version: '{}' (expected '{}'). \
+             The scip-csharp helper may need to be rebuilt.",
+            index.metadata.version,
+            SUPPORTED_INDEX_VERSION
+        );
+    }
 
     let mut result: ScipIndex = HashMap::new();
 
@@ -214,5 +225,20 @@ mod tests {
 
         let index = parse_json_index(json.as_bytes()).unwrap();
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_index_rejects_unknown_version() {
+        let json = r#"{
+            "metadata": {"version": "2.0", "tool_info": "x"},
+            "documents": [],
+            "external_symbols": []
+        }"#;
+        let err = parse_json_index(json.as_bytes()).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported"),
+            "expected 'Unsupported' in error, got: {}",
+            err
+        );
     }
 }

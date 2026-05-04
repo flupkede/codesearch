@@ -44,6 +44,10 @@ pub const CSHARP_REBUILD_DEBOUNCE_SECS: u64 =
 
 // ── Serialized reference type (stored in LMDB via bincode) ────────
 
+/// Schema version byte prepended to all bincode payloads stored in LMDB.
+/// Bump whenever `StoredReference` (or any other stored struct) changes shape.
+const STORED_REFERENCE_SCHEMA_VERSION: u8 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredReference {
     file: PathBuf,
@@ -52,13 +56,44 @@ struct StoredReference {
     kind: String,
 }
 
+/// Serialize references with a leading version byte.
+fn serialize_refs(refs: &[StoredReference]) -> Result<Vec<u8>> {
+    let payload = bincode::serialize(refs)
+        .with_context(|| "bincode serialize failed")?;
+    let mut buf = Vec::with_capacity(1 + payload.len());
+    buf.push(STORED_REFERENCE_SCHEMA_VERSION);
+    buf.extend_from_slice(&payload);
+    Ok(buf)
+}
+
+/// Deserialize references, validating the version byte first.
+fn deserialize_refs(bytes: &[u8]) -> Result<Vec<StoredReference>> {
+    if bytes.is_empty() {
+        anyhow::bail!("Empty stored value");
+    }
+    let version = bytes[0];
+    if version != STORED_REFERENCE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "Unsupported stored reference schema version {} (expected {}). \
+             Run `codesearch reindex --symbols` to rebuild.",
+            version,
+            STORED_REFERENCE_SCHEMA_VERSION
+        );
+    }
+    bincode::deserialize(&bytes[1..])
+        .with_context(|| "bincode deserialize failed")
+}
+
 // ── CSharpSymbolIndexer ───────────────────────────────────────────
 
 /// C# adapter: locates the Roslyn helper, invokes it, parses SCIP, stores
 /// references in LMDB.
 pub struct CSharpSymbolIndexer {
-    /// Cached path to the helper binary (None = not yet detected).
-    helper_path: std::sync::Mutex<Option<PathBuf>>,
+    /// Cached detection result.
+    /// `None` = not yet attempted.
+    /// `Some(None)` = attempted, helper not found.
+    /// `Some(Some(path))` = found at given path.
+    helper_path: std::sync::Mutex<Option<Option<PathBuf>>>,
 }
 
 impl Default for CSharpSymbolIndexer {
@@ -80,20 +115,19 @@ impl CSharpSymbolIndexer {
     /// 1. `CODESEARCH_SCIP_CSHARP` env var
     /// 2. `<codesearch-exe-dir>/helpers/csharp/scip-csharp[.exe]`
     /// 3. `$PATH` lookup
+    ///
+    /// Results are cached — both positive (found) and negative (not found).
     pub fn detect_helper(&self) -> Option<PathBuf> {
-        // Fast path: already detected
         {
             let lock = self.helper_path.lock().unwrap();
-            if lock.is_some() {
-                return lock.clone();
+            if let Some(cached) = lock.as_ref() {
+                return cached.clone();
             }
         }
 
         let resolved = self.resolve_helper_path();
-        if resolved.is_some() {
-            let mut lock = self.helper_path.lock().unwrap();
-            *lock = resolved.clone();
-        }
+        let mut lock = self.helper_path.lock().unwrap();
+        *lock = Some(resolved.clone()); // cache both Some and None
         resolved
     }
 
@@ -323,7 +357,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 })
                 .collect();
 
-            let value_bytes = bincode::serialize(&stored)
+            let value_bytes = serialize_refs(&stored)
                 .with_context(|| format!("Failed to serialize references for {}", symbol_name))?;
 
             symbols_db.put(&mut wtxn, symbol_name.as_str(), &value_bytes)?;
@@ -367,8 +401,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         // Exact match first
         if let Some(bytes) = symbols_db.get(&rtxn, symbol)? {
-            let stored: Vec<StoredReference> = bincode::deserialize(bytes)
-                .with_context(|| "Failed to deserialize stored references")?;
+            let stored = deserialize_refs(bytes)?;
             return Ok(stored.into_iter().map(|r| SymbolReference {
                 file: r.file,
                 start_line: r.start_line,
@@ -384,8 +417,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             let (key, value) = result?;
             // Check if the symbol name is contained in the key
             if key.contains(symbol) || fuzzy_symbol_match(symbol, key) {
-                let stored: Vec<StoredReference> = bincode::deserialize(value)
-                    .with_context(|| "Failed to deserialize stored references")?;
+                let stored = match deserialize_refs(value) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
                 let refs: Vec<SymbolReference> = stored.into_iter().map(|r| SymbolReference {
                     file: r.file,
                     start_line: r.start_line,
@@ -416,7 +451,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let iter = symbols_db.iter(&rtxn)?;
         for result in iter {
             let (key, value) = result?;
-            let stored: Vec<StoredReference> = match bincode::deserialize(value) {
+            let stored: Vec<StoredReference> = match deserialize_refs(value) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -502,4 +537,46 @@ fn fuzzy_symbol_match(query: &str, candidate: &str) -> bool {
 
     // All parts of the query must appear in the candidate
     query_parts.iter().all(|part| candidate.contains(part))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serialize_refs_includes_version_byte() {
+        let refs = vec![StoredReference {
+            file: PathBuf::from("a.cs"),
+            start_line: 1,
+            end_line: 1,
+            kind: "definition".into(),
+        }];
+        let bytes = serialize_refs(&refs).unwrap();
+        assert_eq!(bytes[0], STORED_REFERENCE_SCHEMA_VERSION);
+        // Verify the rest is valid bincode
+        let decoded: Vec<StoredReference> = bincode::deserialize(&bytes[1..]).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].kind, "definition");
+    }
+
+    #[test]
+    fn test_deserialize_refs_rejects_unknown_version() {
+        let bytes = vec![99u8, 0, 0, 0];
+        let err = deserialize_refs(&bytes).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported"),
+            "expected 'Unsupported' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_deserialize_refs_rejects_empty() {
+        let err = deserialize_refs(&[]).unwrap_err();
+        assert!(
+            err.to_string().contains("Empty"),
+            "expected 'Empty' in error, got: {}",
+            err
+        );
+    }
 }
