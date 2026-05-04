@@ -146,6 +146,10 @@ pub(crate) struct ServeState {
     /// Shared sysinfo instance for CPU measurement — must persist across calls
     /// so cpu_usage() can compute a delta (first call always returns 0%).
     sysinfo_system: std::sync::Mutex<sysinfo::System>,
+    /// Shared symbol indexer registry — used by HTTP reindex handler and MCP
+    /// `find_impact` to reuse helper-detection cache instead of creating fresh
+    /// instances per request.
+    symbol_registry: Arc<SymbolIndexerRegistry>,
     /// Test-only counter for reload invocations that actually swapped config.
     #[cfg(test)]
     reload_count: std::sync::atomic::AtomicUsize,
@@ -177,9 +181,18 @@ impl ServeState {
             active_sessions: AtomicU64::new(0),
             total_sessions: AtomicU64::new(0),
             sysinfo_system: std::sync::Mutex::new(sys),
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Return a clone of the shared symbol indexer registry Arc.
+    /// Used by MCP sessions (CodesearchService::new_for_serve) and
+    /// HTTP reindex handler (trigger_symbol_rebuild) to reuse
+    /// helper-detection cache instead of creating fresh instances per request.
+    pub(crate) fn symbol_registry(&self) -> Arc<SymbolIndexerRegistry> {
+        Arc::clone(&self.symbol_registry)
     }
 
     /// Build an actionable conflict error message.
@@ -1308,14 +1321,18 @@ async fn status_handler(
 ///
 /// Creates a fresh `SymbolIndexerRegistry`, looks up the C# indexer,
 /// and runs `rebuild()` in a blocking task.
-async fn trigger_symbol_rebuild(alias: &str, project_path: &Path, db_path: &Path) {
-    let bg_reg = Arc::new(SymbolIndexerRegistry::new());
+async fn trigger_symbol_rebuild(
+    alias: &str,
+    project_path: &Path,
+    db_path: &Path,
+    registry: Arc<SymbolIndexerRegistry>,
+) {
     tracing::info!("🔬 Symbol reindex triggered for '{}' via HTTP API", alias);
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
     let alias_owned = alias.to_string();
     match tokio::task::spawn_blocking(move || {
-        let Some(indexer) = bg_reg.get("csharp") else {
+        let Some(indexer) = registry.get("csharp") else {
             return Err(anyhow::anyhow!("No C# symbol indexer registered"));
         };
         if !indexer.is_available() {
@@ -1468,7 +1485,7 @@ async fn reindex_handler(
 
             // 4. Optional symbol index rebuild
             if do_symbols {
-                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path).await;
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, g_state.symbol_registry.clone()).await;
             }
 
             g_state.active_reindexes.remove(&g_alias);
@@ -1513,7 +1530,7 @@ async fn reindex_handler(
 
             // Optional symbol index rebuild
             if do_symbols {
-                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path).await;
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, g_state.symbol_registry.clone()).await;
             }
 
             g_state.active_reindexes.remove(&g_alias);

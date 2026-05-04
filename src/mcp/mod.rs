@@ -2191,6 +2191,7 @@ use crate::embed::{EmbeddingService, ModelType};
 use crate::file::Language;
 use crate::fts::FtsStore;
 use crate::index::{IndexManager, SharedStores};
+use crate::symbols::SymbolIndexerRegistry;
 use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_RRF_K};
 use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
 use crate::vectordb::VectorStore;
@@ -2476,6 +2477,10 @@ pub struct CodesearchService {
     shared_stores: Option<Arc<SharedStores>>,
     // Serve-mode state (set when running inside `codesearch serve`)
     serve_state: Option<Arc<crate::serve::ServeState>>,
+    // Shared symbol indexer registry — reused across MCP sessions to preserve
+    // helper-detection cache. In serve mode, cloned from ServeState; in
+    // standalone mode, a locally owned Arc.
+    symbol_registry: Arc<SymbolIndexerRegistry>,
 }
 
 impl std::fmt::Debug for CodesearchService {
@@ -3289,6 +3294,7 @@ impl CodesearchService {
             embedding_service: Mutex::new(None),
             shared_stores,
             serve_state: None,
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
 
@@ -3297,6 +3303,7 @@ impl CodesearchService {
     /// In serve mode, the service does not have a single local DB; instead
     /// it routes requests to the repo identified by `project`/`group`.
     pub(crate) fn new_for_serve(serve_state: Arc<crate::serve::ServeState>) -> Result<Self> {
+        let symbol_registry = serve_state.symbol_registry();
         Ok(Self {
             tool_router: Self::tool_router(),
             db_path: PathBuf::from("serve://multi-repo"),
@@ -3306,6 +3313,7 @@ impl CodesearchService {
             embedding_service: Mutex::new(None),
             shared_stores: None,
             serve_state: Some(serve_state),
+            symbol_registry,
         })
     }
 
@@ -5369,8 +5377,8 @@ impl CodesearchService {
             (self.project_path.clone(), self.db_path.clone())
         };
 
-        // Create the symbol indexer registry
-        let registry = crate::symbols::SymbolIndexerRegistry::new();
+        // Use the shared symbol indexer registry
+        let registry = &self.symbol_registry;
 
         // Determine which language to use
         let language = request.language.clone().or_else(|| {

@@ -184,26 +184,21 @@ pub const MCP_MODE_ENV: &str = "CODESEARCH_MCP_MODE";
 pub const MCP_HEALTH_PROBE_TIMEOUT_MS: u64 = 500;
 
 /// Environment variable to override the scip-csharp helper path.
-#[allow(dead_code)]
 pub const SCIP_CSHARP_HELPER_ENV: &str = "CODESEARCH_SCIP_CSHARP";
 
 /// Helper binary name for the C# symbol indexer (without extension).
-#[allow(dead_code)]
 pub const SCIP_CSHARP_HELPER_NAME: &str = "scip-csharp";
 
 /// Subdirectory within the codesearch install dir where language helpers live.
 pub const HELPERS_SUBDIR: &str = "helpers";
 
 /// Debounce time in milliseconds for .cs file changes triggering a symbol rebuild.
-#[allow(dead_code)]
 pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 
 /// LMDB database name for the SCIP symbols table.
-#[allow(dead_code)]
 pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
 
 /// LMDB metadata key for the last rebuild timestamp.
-#[allow(dead_code)]
 pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
 
 /// File extensions that should never be indexed, regardless of content.
