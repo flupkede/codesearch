@@ -4,6 +4,7 @@
 //! to produce a JSON symbol index from a .sln/.csproj, parses the
 //! output, and stores references in LMDB.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +24,9 @@ const SCIP_DB_NAME: &str = crate::constants::SCIP_SYMBOLS_DB_NAME;
 
 /// LMDB database name for the rebuild timestamp.
 const SCIP_META_DB_NAME: &str = "scip_meta";
+
+/// LMDB database name for the position-to-symbols index.
+const SCIP_POSITION_DB_NAME: &str = crate::constants::SCIP_POSITION_DB_NAME;
 
 /// Key in the meta database that stores the last rebuild timestamp (UNIX epoch seconds).
 const META_REBUILD_TS: &str = crate::constants::SCIP_REBUILD_TIMESTAMP_KEY;
@@ -82,6 +86,39 @@ fn deserialize_refs(bytes: &[u8]) -> Result<Vec<StoredReference>> {
     }
     bincode::deserialize(&bytes[1..])
         .with_context(|| "bincode deserialize failed")
+}
+
+// ── Key-list serialization (for position + simple-name indexes) ─────
+
+/// Schema version byte for key-list payloads (Vec<String>).
+const KEYS_LIST_SCHEMA_VERSION: u8 = 1;
+
+/// Serialize a list of symbol keys with a leading version byte.
+fn serialize_keys_v1(keys: &[String]) -> Result<Vec<u8>> {
+    let payload = bincode::serialize(keys)
+        .with_context(|| "bincode serialize keys failed")?;
+    let mut buf = Vec::with_capacity(1 + payload.len());
+    buf.push(KEYS_LIST_SCHEMA_VERSION);
+    buf.extend_from_slice(&payload);
+    Ok(buf)
+}
+
+/// Deserialize a list of symbol keys, validating the version byte first.
+fn deserialize_keys_v1(bytes: &[u8]) -> Result<Vec<String>> {
+    if bytes.is_empty() {
+        anyhow::bail!("Empty stored key list");
+    }
+    let version = bytes[0];
+    if version != KEYS_LIST_SCHEMA_VERSION {
+        anyhow::bail!(
+            "Unsupported key list schema version {} (expected {}). \
+             Run `codesearch reindex --symbols` to rebuild.",
+            version,
+            KEYS_LIST_SCHEMA_VERSION
+        );
+    }
+    bincode::deserialize(&bytes[1..])
+        .with_context(|| "bincode deserialize keys failed")
 }
 
 // ── CSharpSymbolIndexer ───────────────────────────────────────────
@@ -236,7 +273,7 @@ impl CSharpSymbolIndexer {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(64 * 1024 * 1024) // 64MB — symbol indexes are small
-                .max_dbs(4)
+                .max_dbs(5)
                 .open(&scip_dir)?
         };
         Ok(env)
@@ -365,6 +402,36 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             total_symbols += 1;
         }
 
+        // ── Build position index ──────────────────────────────────────
+        // scip_positions: "<file>:<line>" -> [symbol_keys]
+        // Maps each definition occurrence to the symbols defined at that position.
+        let positions_db: Database<Str, Bytes> = env
+            .create_database(&mut wtxn, Some(SCIP_POSITION_DB_NAME))?;
+        positions_db.clear(&mut wtxn)?;
+
+        let mut positions: HashMap<String, Vec<String>> = HashMap::new();
+        for (symbol_name, references) in index.iter() {
+            for r in references.iter().filter(|r| r.kind == "definition") {
+                let pos_key = format!(
+                    "{}:{}",
+                    r.file.to_string_lossy().replace('\\', "/"),
+                    r.start_line
+                );
+                positions.entry(pos_key).or_default().push(symbol_name.clone());
+            }
+        }
+
+        for (key, keys) in &positions {
+            let bytes = serialize_keys_v1(keys)
+                .with_context(|| format!("Failed to serialize position key: {}", key))?;
+            positions_db.put(&mut wtxn, key.as_str(), &bytes)?;
+        }
+
+        tracing::debug!(
+            "scip-csharp position index: {} entries",
+            positions.len()
+        );
+
         // Write metadata as string values
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -440,45 +507,30 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let env = self.open_scip_env(db_path)?;
         let rtxn = env.read_txn()?;
 
-        let symbols_db: Database<Str, Bytes> = env
-            .open_database(&rtxn, Some(SCIP_DB_NAME))?
-            .ok_or_else(|| anyhow::anyhow!("SCIP symbol database not found. Run a rebuild first."))?;
+        let positions_db: Database<Str, Bytes> = env
+            .open_database(&rtxn, Some(SCIP_POSITION_DB_NAME))?
+            .ok_or_else(|| anyhow::anyhow!("Position index not found. Run a rebuild first."))?;
 
-        // Walk all symbols looking for one defined at the given position
-        let file_str = file.to_string_lossy();
-        let mut best_match: Option<(&str, Vec<SymbolReference>)> = None;
+        // Normalize file path to forward-slash (Windows compat)
+        let pos_key = format!(
+            "{}:{}",
+            file.to_string_lossy().replace('\\', "/"),
+            line
+        );
 
-        let iter = symbols_db.iter(&rtxn)?;
-        for result in iter {
-            let (key, value) = result?;
-            let stored: Vec<StoredReference> = match deserialize_refs(value) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+        let candidate_keys: Vec<String> = match positions_db.get(&rtxn, &pos_key as &str)? {
+            Some(b) => deserialize_keys_v1(b)?,
+            None => return Ok(vec![]),
+        };
 
-            // Check if any reference in this symbol matches the file+line
-            for r in &stored {
-                if r.file.to_string_lossy() == *file_str
-                    && r.kind == "definition"
-                    && line >= r.start_line
-                    && line <= r.end_line
-                {
-                    let refs: Vec<SymbolReference> = stored.into_iter().map(|r| SymbolReference {
-                        file: r.file,
-                        start_line: r.start_line,
-                        end_line: r.end_line,
-                        kind: r.kind,
-                    }).collect();
-                    // Prefer the most specific (shortest key) match
-                    if best_match.as_ref().is_none_or(|(k, _)| key.len() < k.len()) {
-                        best_match = Some((key, refs));
-                    }
-                    break;
-                }
-            }
+        // Pick shortest (most specific) symbol defined at this position
+        let chosen = candidate_keys.iter().min_by_key(|k| k.len()).cloned();
+        drop(rtxn);
+
+        match chosen {
+            Some(k) => self.find_references(db_path, &k),
+            None => Ok(vec![]),
         }
-
-        Ok(best_match.map(|(_, refs)| refs).unwrap_or_default())
     }
 
     fn index_age(&self, db_path: &Path) -> u64 {

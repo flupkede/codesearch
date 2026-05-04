@@ -201,6 +201,10 @@ pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
 /// LMDB metadata key for the last rebuild timestamp.
 pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
 
+/// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
+/// Used for O(1) position-based symbol lookup.
+pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
+
 /// File extensions that should never be indexed, regardless of content.
 /// These are generated/compiled/binary-adjacent files with no semantic code value.
 pub const ALWAYS_SKIP_EXTENSIONS: &[&str] = &[
