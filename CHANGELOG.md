@@ -14,14 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   IDE-class accuracy instead of relying on text-matching grep heuristics.
   Supports name-based lookup (`symbol_name`) and position-based lookup
   (`file` + `line`). Currently supports **C#** via the `scip-csharp` helper.
+- **Dedicated C# README** — all C#-specific goal, operation, installation, and
+  testing instructions now live in `README_CSharp.md`; the main README only
+  links there so non-C# users can skip the extra detail.
 - **C# semantic analysis helper (`scip-csharp`)** — a small .NET 10 CLI tool
   that wraps Roslyn's `SymbolFinder.FindReferencesAsync()` and produces a
   symbol reference index. Framework-dependent, ~5–15 MB. Bundled in the new
   `-with-csharp` release variants, or available via `$PATH` / env var override.
 - **`-with-csharp` release variants** — pre-built release archives that include
-  the `scip-csharp` helper alongside the codesearch binary. Available for all
-  three platforms (Windows, Linux, macOS). The existing "kale" archives are
-  unchanged and remain available for users who don't need C# symbol references.
+  the `scip-csharp` helper alongside the codesearch binary. There are now 6
+  release archives total: 3 plain `codesearch` packages and 3
+  `codesearch-with-csharp` packages (Windows, Linux, macOS). The plain
+  packages are unchanged for users who don't need C# symbol references.
 - **`.cs` file watcher debounce** — 60-second quiet period after `.cs` file
   changes triggers an automatic symbol index rebuild. Buffer is cleared on git
   branch switches to avoid stale rebuilds.

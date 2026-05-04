@@ -372,34 +372,9 @@ Located at `~/.codesearch/repos.json`. Managed by `codesearch index add/rm`. Con
 
 ## C# Semantic Search
 
-codesearch supports IDE-class "Find All References" for C# via an optional `scip-csharp` helper that wraps Roslyn's `SymbolFinder`. This enables the `find_impact` MCP tool, which returns transitive call-sites of any symbol with file/line precision.
+All C#-specific setup, operation, installation, and testing lives in [README_CSharp.md](README_CSharp.md).
 
-### Two release variants
-
-| Variant | Includes `scip-csharp` | Use when |
-|---------|------------------------|----------|
-| `codesearch-<platform>` | No | You don't need C# symbol references |
-| `codesearch-<platform>-with-csharp` | Yes (in `helpers/csharp/`) | You work with C# repos |
-
-The `-with-csharp` variant bundles the `scip-csharp` helper as a framework-dependent .NET 10 binary (~5–15 MB). It requires the .NET 10 runtime to be installed on the host machine. If you already have .NET 10 (which C# developers do), there is no additional setup.
-
-### How it works
-
-1. When a C# repo is registered, codesearch detects `.sln`/`.csproj` files
-2. The `scip-csharp` helper runs Roslyn analysis and produces a symbol reference index
-3. References are stored in LMDB (`scip_symbols` table)
-4. `.cs` file changes trigger a debounced rebuild (60s quiet period)
-5. `find_impact` queries the index and returns references
-
-### Helper detection
-
-codesearch looks for `scip-csharp` in this order:
-
-1. Path specified by `CODESEARCH_SCIP_CSHARP` environment variable (user override)
-2. `<codesearch-exe-dir>/helpers/csharp/scip-csharp[.exe]` (bundled in `-with-csharp` releases)
-3. `$PATH` lookup of `scip-csharp` (if installed via `dotnet tool install --global`)
-
-If the helper is not found, `find_impact` returns a structured error with installation instructions. All other tools (search, find, explore, get_chunk, status) continue to work normally.
+If you do not work with C# repos, you can skip it entirely.
 
 ## Supported Languages
 
