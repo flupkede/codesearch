@@ -395,9 +395,9 @@ The `-with-csharp` variant bundles the `scip-csharp` helper as a framework-depen
 
 codesearch looks for `scip-csharp` in this order:
 
-1. `<codesearch-exe-dir>/helpers/csharp/scip-csharp[.exe]` (bundled in `-with-csharp` releases)
-2. `$PATH` lookup of `scip-csharp` (if installed via `dotnet tool install --global`)
-3. Path specified by `CODESEARCH_SCIP_CSHARP` environment variable
+1. Path specified by `CODESEARCH_SCIP_CSHARP` environment variable (user override)
+2. `<codesearch-exe-dir>/helpers/csharp/scip-csharp[.exe]` (bundled in `-with-csharp` releases)
+3. `$PATH` lookup of `scip-csharp` (if installed via `dotnet tool install --global`)
 
 If the helper is not found, `find_impact` returns a structured error with installation instructions. All other tools (search, find, explore, get_chunk, status) continue to work normally.
 

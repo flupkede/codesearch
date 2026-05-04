@@ -192,7 +192,6 @@ pub const SCIP_CSHARP_HELPER_ENV: &str = "CODESEARCH_SCIP_CSHARP";
 pub const SCIP_CSHARP_HELPER_NAME: &str = "scip-csharp";
 
 /// Subdirectory within the codesearch install dir where language helpers live.
-#[allow(dead_code)]
 pub const HELPERS_SUBDIR: &str = "helpers";
 
 /// Debounce time in milliseconds for .cs file changes triggering a symbol rebuild.

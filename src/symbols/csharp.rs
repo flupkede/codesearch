@@ -1,7 +1,7 @@
 //! C# symbol indexer adapter.
 //!
 //! Detects the `scip-csharp` helper binary, invokes it as a subprocess
-//! to produce a SCIP protobuf index from a .sln/.csproj, parses the
+//! to produce a JSON symbol index from a .sln/.csproj, parses the
 //! output, and stores references in LMDB.
 
 use std::path::{Path, PathBuf};
@@ -76,7 +76,7 @@ impl CSharpSymbolIndexer {
 
     /// Locate the scip-csharp helper binary.
     ///
-    /// Search order:
+    /// Search order (env var first so users can override):
     /// 1. `CODESEARCH_SCIP_CSHARP` env var
     /// 2. `<codesearch-exe-dir>/helpers/csharp/scip-csharp[.exe]`
     /// 3. `$PATH` lookup
@@ -118,7 +118,7 @@ impl CSharpSymbolIndexer {
                 } else {
                     HELPER_BIN_NAME.to_string()
                 };
-                let local_path = exe_dir.join("helpers").join("csharp").join(&bin_name);
+                let local_path = exe_dir.join(crate::constants::HELPERS_SUBDIR).join("csharp").join(&bin_name);
                 if local_path.exists() {
                     tracing::debug!("scip-csharp helper found at {}", local_path.display());
                     return Some(local_path);
@@ -254,7 +254,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let temp_dir = std::env::temp_dir().join("codesearch-scip");
         std::fs::create_dir_all(&temp_dir)?;
         let output_path = temp_dir.join(format!(
-            "index-{}-{:x}.scip",
+            "index-{}-{:x}.json",
             repo_path.file_name().unwrap_or_default().to_string_lossy(),
             start.elapsed().as_nanos()
         ));
@@ -266,7 +266,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             .arg("--output").arg(&output_path);
 
         if let Some(ref proj) = project {
-            cmd.arg("--project").arg(proj);
+            cmd.arg("--filter-project").arg(proj);
         }
 
         tracing::info!("Running scip-csharp: {:?}", cmd);
@@ -280,11 +280,16 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             // Don't bail — partial output is acceptable per AGENTS.md spec
         }
 
-        // Parse the SCIP output
-        let scip_data = std::fs::read(&output_path)
-            .with_context(|| format!("Failed to read SCIP output at {}", output_path.display()))?;
+        // Parse the JSON output
+        let index_data = std::fs::read(&output_path)
+            .with_context(|| format!("Failed to read symbol index at {}", output_path.display()))?;
 
-        let index = scip_parse::parse_scip(&scip_data)?;
+        let index_result = scip_parse::parse_json_index(&index_data);
+
+        // Cleanup temp file regardless of parse success
+        let _ = std::fs::remove_file(&output_path);
+
+        let index = index_result?;
 
         // Open LMDB and write
         let env = self.open_scip_env(db_path)?;
@@ -333,9 +338,6 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         meta_db.put(&mut wtxn, META_SYMBOL_COUNT, total_symbols.to_string().as_str())?;
 
         wtxn.commit()?;
-
-        // Cleanup temp file
-        let _ = std::fs::remove_file(&output_path);
 
         let duration_ms = start.elapsed().as_millis() as u64;
 

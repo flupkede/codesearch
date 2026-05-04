@@ -96,9 +96,6 @@ rmcp = { version = "1.5.0", features = ["server", "client", "transport-io", "tra
 schemars = { version = "1.1.0", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 sysinfo = { version = "0.38.4", default-features = true }
-# SCIP protobuf bindings for symbol indexing
-scip = "0.5"
-protobuf = "3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

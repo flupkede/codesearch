@@ -1,17 +1,16 @@
-//! Thin wrapper around SCIP protobuf parsing.
+//! Thin wrapper around JSON symbol index parsing.
 //!
-//! Uses the `scip` crate from Sourcegraph to decode SCIP index files.
-//! The parsed index is converted to a map of symbol name → references.
+//! Parses the JSON output produced by the `scip-csharp` helper.
+//! The parsed index is converted to a map of symbol name -> references.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use protobuf::Message;
+use serde::Deserialize;
 
-/// A reference extracted from a SCIP index.
+/// A reference extracted from a symbol index.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ScipReference {
     /// File path relative to the project root.
     pub file: PathBuf,
@@ -19,16 +18,57 @@ pub struct ScipReference {
     pub start_line: u32,
     /// 1-based end line (inclusive).
     pub end_line: u32,
-    /// Kind: "definition", "reference", "implementation", etc.
+    /// Kind: "definition", "reference", "call", etc.
     pub kind: String,
 }
 
-/// Parsed SCIP index: map from canonical symbol string to its references.
-#[allow(dead_code)]
+/// Parsed symbol index: map from canonical symbol string to its references.
 pub type ScipIndex = HashMap<String, Vec<ScipReference>>;
 
+// ── JSON deserialization types (mirror C# ScipModels.cs) ─────────
+
+#[derive(Deserialize)]
+struct JsonIndex {
+    #[allow(dead_code)]
+    metadata: JsonMetadata,
+    documents: Vec<JsonDocument>,
+    #[allow(dead_code)]
+    external_symbols: Vec<JsonSymbolInfo>,
+}
+
+#[derive(Deserialize)]
+struct JsonMetadata {
+    #[allow(dead_code)]
+    version: String,
+    #[allow(dead_code)]
+    tool_info: String,
+}
+
+#[derive(Deserialize)]
+struct JsonDocument {
+    relative_path: String,
+    occurrences: Vec<JsonOccurrence>,
+}
+
+#[derive(Deserialize)]
+struct JsonOccurrence {
+    range: Vec<i64>,
+    symbol: String,
+    #[allow(dead_code)]
+    symbol_roles: i64,
+    /// "definition" or "reference" (or empty string).
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JsonSymbolInfo {
+    #[allow(dead_code)]
+    symbol: String,
+    #[allow(dead_code)]
+    documentation: Vec<String>,
+}
+
 /// Role flags from SCIP (mirrors the protobuf enum values).
-#[allow(dead_code)]
 mod roles {
     pub const DEFINITION: u32 = 1;
     pub const READ_ACCESS: u32 = 2;
@@ -37,17 +77,18 @@ mod roles {
     pub const IMPLEMENTATION: u32 = 256;
 }
 
-/// Parse a SCIP protobuf byte slice into a symbol → references map.
-#[allow(dead_code)]
-pub fn parse_scip(data: &[u8]) -> Result<ScipIndex> {
-    let index = scip::types::Index::parse_from_bytes(data)
-        .with_context(|| "Failed to parse SCIP protobuf")?;
+/// Parse a JSON byte slice into a symbol -> references map.
+///
+/// The JSON format is produced by `scip-csharp` and mirrors the SCIP schema
+/// with snake_case field names. Line numbers in the JSON are already 1-based.
+pub fn parse_json_index(data: &[u8]) -> Result<ScipIndex> {
+    let index: JsonIndex = serde_json::from_slice(data)
+        .with_context(|| "Failed to parse symbol index JSON")?;
 
     let mut result: ScipIndex = HashMap::new();
 
-    // Process documents
     for document in &index.documents {
-        let doc_path = document.relative_path.clone();
+        let doc_path = &document.relative_path;
 
         for occurrence in &document.occurrences {
             let symbol_name = &occurrence.symbol;
@@ -56,21 +97,26 @@ pub fn parse_scip(data: &[u8]) -> Result<ScipIndex> {
             }
 
             let range = &occurrence.range;
-            if range.len() < 3 {
+            if range.len() < 2 {
                 continue;
             }
 
-            let start_line = (range[0] + 1) as u32; // SCIP lines are 0-based
+            // C# helper outputs 1-based lines already
+            let start_line = range[0] as u32;
             let end_line = if range.len() >= 4 {
-                (range[2] + 1) as u32
+                range[2] as u32
             } else {
                 start_line
             };
 
-            let kind = role_to_kind(occurrence.symbol_roles as u32);
+            // Use explicit kind from JSON if present, otherwise derive from roles
+            let kind = occurrence.kind.as_deref()
+                .filter(|k| !k.is_empty())
+                .map(|k| k.to_string())
+                .unwrap_or_else(|| role_to_kind(occurrence.symbol_roles as u32));
 
             let reference = ScipReference {
-                file: PathBuf::from(&doc_path),
+                file: PathBuf::from(doc_path),
                 start_line,
                 end_line,
                 kind,
@@ -80,11 +126,6 @@ pub fn parse_scip(data: &[u8]) -> Result<ScipIndex> {
                 .entry(symbol_name.clone())
                 .or_default()
                 .push(reference);
-        }
-
-        // Also track external symbols (defined outside this index)
-        for ext_symbol in &document.symbols {
-            let _ = ext_symbol; // Available for future use
         }
     }
 
@@ -120,5 +161,58 @@ mod tests {
         assert_eq!(role_to_kind(256), "implementation");
         assert_eq!(role_to_kind(0), "reference");
         assert_eq!(role_to_kind(1 | 2), "definition"); // definition takes priority
+    }
+
+    #[test]
+    fn test_parse_json_index_basic() {
+        let json = r#"{
+            "metadata": {"version": "1.0", "tool_info": "scip-csharp"},
+            "documents": [{
+                "relative_path": "src/Program.cs",
+                "occurrences": [{
+                    "range": [10, 0, 10, 5],
+                    "symbol": "csharp App . Program.Main().",
+                    "symbol_roles": 1,
+                    "kind": "definition"
+                }, {
+                    "range": [20, 4],
+                    "symbol": "csharp App . Program.Main().",
+                    "symbol_roles": 0,
+                    "kind": "reference"
+                }]
+            }],
+            "external_symbols": []
+        }"#;
+
+        let index = parse_json_index(json.as_bytes()).unwrap();
+        assert_eq!(index.len(), 1);
+
+        let refs = &index["csharp App . Program.Main()."];
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].start_line, 10);
+        assert_eq!(refs[0].end_line, 10);
+        assert_eq!(refs[0].kind, "definition");
+        assert_eq!(refs[1].start_line, 20);
+        assert_eq!(refs[1].kind, "reference");
+    }
+
+    #[test]
+    fn test_parse_json_index_empty_symbol_skipped() {
+        let json = r#"{
+            "metadata": {"version": "1.0", "tool_info": "test"},
+            "documents": [{
+                "relative_path": "src/A.cs",
+                "occurrences": [{
+                    "range": [1, 0],
+                    "symbol": "",
+                    "symbol_roles": 0,
+                    "kind": ""
+                }]
+            }],
+            "external_symbols": []
+        }"#;
+
+        let index = parse_json_index(json.as_bytes()).unwrap();
+        assert!(index.is_empty());
     }
 }
