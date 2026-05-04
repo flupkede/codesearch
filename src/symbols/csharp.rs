@@ -434,6 +434,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // ── Build position index ──────────────────────────────────────
         // scip_positions: "<file>:<line>" -> [symbol_keys]
         // Maps each definition occurrence to the symbols defined at that position.
+        // NOTE: only `start_line` is indexed, so queries for lines in the *middle*
+        // of a multi-line definition will not match. This is an intentional trade-off
+        // for O(1) lookup — multi-line definitions are rare in C# (mostly constructors
+        // with long signatures), and the start-line is the canonical anchor.
         let positions_db: Database<Str, Bytes> = env
             .create_database(&mut wtxn, Some(SCIP_POSITION_DB_NAME))?;
         positions_db.clear(&mut wtxn)?;

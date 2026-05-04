@@ -1319,7 +1319,7 @@ async fn status_handler(
 
 /// Trigger a symbol index rebuild for a repo (C# etc.).
 ///
-/// Creates a fresh `SymbolIndexerRegistry`, looks up the C# indexer,
+/// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the C# indexer,
 /// and runs `rebuild()` in a blocking task.
 async fn trigger_symbol_rebuild(
     alias: &str,
