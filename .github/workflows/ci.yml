@@ -54,7 +54,7 @@ jobs:
       - name: Build scip-csharp helper
         run: |
           cd helpers/csharp
-          dotnet publish -c Release --no-self-contained -o bin/Release/net10.0
+          dotnet publish scip-csharp.csproj -c Release --no-self-contained -o bin/Release/net10.0
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:

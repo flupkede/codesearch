@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 
-use codesearch::symbols::scip_parse;
 use codesearch::symbols::csharp::CSharpSymbolIndexer;
+use codesearch::symbols::scip_parse;
 use codesearch::symbols::{RebuildScope, SymbolIndexer};
 use tempfile::TempDir;
 
@@ -95,12 +95,20 @@ fn test_parse_json_index_from_sample() {
         .expect("Failed to parse sample JSON");
 
     // Should have symbols for Calculator class and its methods
-    assert!(index.len() >= 3, "Expected at least 3 symbols, got {}", index.len());
+    assert!(
+        index.len() >= 3,
+        "Expected at least 3 symbols, got {}",
+        index.len()
+    );
 
     // Verify Calculator.Add has both a definition and a reference
     let add_symbol = "csharp SmallSolution.Library . Calculator#Add(int, int).";
     let add_refs = index.get(add_symbol).expect("Calculator.Add should exist");
-    assert_eq!(add_refs.len(), 2, "Calculator.Add should have 2 occurrences (1 def + 1 ref)");
+    assert_eq!(
+        add_refs.len(),
+        2,
+        "Calculator.Add should have 2 occurrences (1 def + 1 ref)"
+    );
 
     let definitions: Vec<_> = add_refs.iter().filter(|r| r.kind == "definition").collect();
     let references: Vec<_> = add_refs.iter().filter(|r| r.kind == "reference").collect();
@@ -114,7 +122,10 @@ fn test_parse_json_index_from_sample() {
     assert!(def.file.to_string_lossy().contains("Calculator.cs"));
 
     let reference = &references[0];
-    assert_eq!(reference.start_line, 10, "Add reference in Main.cs should be on line 10");
+    assert_eq!(
+        reference.start_line, 10,
+        "Add reference in Main.cs should be on line 10"
+    );
     assert!(reference.file.to_string_lossy().contains("Main.cs"));
 }
 
@@ -127,7 +138,10 @@ fn test_indexer_returns_empty_when_db_missing() {
     let indexer = CSharpSymbolIndexer::new();
 
     // Verify it reports as unavailable (no helper binary in test environment)
-    assert!(!indexer.is_available(), "Indexer should not be available without helper");
+    assert!(
+        !indexer.is_available(),
+        "Indexer should not be available without helper"
+    );
 
     // Test index_age with no LMDB data — should return u64::MAX
     let age = indexer.index_age(&db_path);
@@ -159,8 +173,20 @@ fn test_parse_json_index_multiple_symbols_same_file() {
     // Method1 should have 1 definition + 1 reference
     let method1_refs = index.get("csharp . . A#Method1().").unwrap();
     assert_eq!(method1_refs.len(), 2);
-    assert_eq!(method1_refs.iter().filter(|r| r.kind == "definition").count(), 1);
-    assert_eq!(method1_refs.iter().filter(|r| r.kind == "reference").count(), 1);
+    assert_eq!(
+        method1_refs
+            .iter()
+            .filter(|r| r.kind == "definition")
+            .count(),
+        1
+    );
+    assert_eq!(
+        method1_refs
+            .iter()
+            .filter(|r| r.kind == "reference")
+            .count(),
+        1
+    );
 
     // Method2 should have 1 definition only
     let method2_refs = index.get("csharp . . A#Method2().").unwrap();
@@ -266,7 +292,9 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
     assert_eq!(defs.len(), 1, "Expected 1 definition for Calculator.Add");
 
     // Fuzzy query: "Add" should resolve to Calculator.Add
-    let fuzzy_refs = indexer.find_references(db_path, "Add").expect("fuzzy find_references failed");
+    let fuzzy_refs = indexer
+        .find_references(db_path, "Add")
+        .expect("fuzzy find_references failed");
     assert!(
         !fuzzy_refs.is_empty(),
         "Fuzzy lookup for 'Add' should resolve to Calculator.Add"
@@ -275,11 +303,7 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
     // Position-based lookup: find what's defined on Calculator.cs line 8
     // Note: paths are solution-relative as produced by the helper
     let pos_refs = indexer
-        .find_references_by_position(
-            db_path,
-            &PathBuf::from("Library/Calculator.cs"),
-            8,
-        )
+        .find_references_by_position(db_path, &PathBuf::from("Library/Calculator.cs"), 8)
         .expect("find_references_by_position failed");
     assert!(
         !pos_refs.is_empty(),
