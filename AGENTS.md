@@ -2,211 +2,895 @@
 
 ## Goal
 
-Add symbol-aware reference lookups to codesearch. New MCP tool `find_impact(symbol)` returns transitive call-sites of a symbol with file/line precision, enabling agents to plan refactors with IDE-class accuracy instead of relying on text-matching grep heuristics.
+Add symbol-aware reference lookups to codesearch. New MCP tool `find_impact(symbol)` should return file/line-precise references so agents can plan refactors with IDE-level accuracy instead of grep heuristics.
 
-MVP scope is **C# only**. Architecture is language-agnostic: a per-language adapter behind a uniform `SymbolIndexer` trait so future branches can plug in Python (scip-python), TypeScript (scip-typescript), Rust (scip-rust), etc. without redesigning.
+MVP scope is **C# only**. The architecture stays language-agnostic through a per-language `SymbolIndexer` adapter so future languages can plug in without redesigning.
 
-This branch addresses the most concrete feature gap with SocratiCode and Serena. Codesearch keeps its lightweight Rust-binary identity; semantic analysis for C# happens in a small, optional .NET helper bundled with the release.
+## Todo
+
+# Symbol-references merge-preparation — 7-fase blocker-fix
+
+**Status:** 🔴 Blokkerend (review identificeerde 13 blockers / 30 majors / 49 minors)  
+**Prioriteit:** Vóór PR-merge naar develop  
+**Spec:** [`REVIEW_features-symbol-references.md`](./REVIEW_features-symbol-references.md) — Eindverdict + top-down validatie zijn de bron-van-waarheid  
+**Eigenaar:** OpenCode (uitvoerder) / Claude (planner)  
+**Branch:** `features/symbol-references` (geen sub-branch — fixes direct op de feature branch zodat PR-history coherent blijft)
 
 ---
+
+## 1. Probleem
+
+De feature branch `features/symbol-references` voegt C# semantic search toe via een SCIP-pijplijn (Roslyn helper → JSON → LMDB → MCP). De review is gedaan in 9 chunks plus een onafhankelijke top-down validatie. Resultaat van de top-down pass: de blocker-telling van 13 oversimplificeert — feitelijk zijn er **~6-7 onafhankelijke onderwerpen**, omdat de "4 cache-blockers" eigenlijk **2 onderliggende issues op 2 problematische sites** zijn (site A in IndexManager is correct geïmplementeerd).
+
+### 1.1 Blocker-clusters (na top-down validatie)
+
+| Cluster | # blockers | Hoofdprobleem |
+|---|---|---|
+| Cache-architectuur (Issue α) | 2 (was: 4) | Sites B en C in `serve/mod.rs` + `mcp/mod.rs` maken eigen `SymbolIndexerRegistry` ipv IndexManager's bestaande gedeelde `Arc` te hergebruiken |
+| `detect_helper` failure-cache (Issue β) | 1 | `Mutex<Option<PathBuf>>` cachet alleen `Some`, niet `None` → elke `is_available()` bij ontbrekende helper triggert verse PATH-lookup + subprocess |
+| O(N) hot-paths | 2 | `find_references` (fuzzy fallback) + `find_references_by_position` doen full LMDB-scan + bincode-deserialize-all per query |
+| JSON version-validatie | 1 | `metadata.version` in `scip_parse::JsonMetadata` heeft `#[allow(dead_code)]`, nooit gevalideerd → silent breakage bij helper-bump |
+| Test-coverage C#-pijplijn | 6 | `tests/symbols_csharp_test.rs` zijn unit-tests vermomd als integration; `IndexerTests.cs` test `SymbolIndexer` niet; `OutputWriter`-test gebruikt nooit `OutputWriter`; lege test-body; misleidende namen; fixture ongebruikt |
+
+Plus één 🟠 die als blocker behandeld wordt:
+
+| Cluster | # majors | Hoofdprobleem |
+|---|---|---|
+| Bincode schema-versie | 1 | Eén refactor van `StoredReference` corrumpeert bestaande LMDB-state stilletjes (geen version byte) |
+
+### 1.2 Bewijs
+
+Direct geverifieerd in de top-down inspectie van het review:
+
+- **Issue α**: `git show features/symbol-references:src/mcp/mod.rs` toont `let registry = crate::symbols::SymbolIndexerRegistry::new();` in `find_impact`. `git show features/symbol-references:src/serve/mod.rs` toont `let bg_reg = Arc::new(SymbolIndexerRegistry::new());` in `trigger_symbol_rebuild`. IndexManager doet het correct: `symbol_registry: Arc::new(SymbolIndexerRegistry::new())` éénmalig in constructor, gedeeld via `Arc::clone`.
+
+- **Issue β**: in `csharp.rs::detect_helper`, regel `if resolved.is_some() { ... cache }` — bij `None` blijft de mutex leeg, dus volgende call doet opnieuw `resolve_helper_path()`.
+
+- **O(N) hot-paths**: `csharp.rs::find_references` en `find_references_by_position` doen beide `let iter = symbols_db.iter(&rtxn)?; for result in iter { ... bincode::deserialize(value) ... }`. Position-variant deserialiseert élke entry zonder eerst op key te filteren — dus **duurder dan** de fuzzy-variant.
+
+- **JSON version**: `scip_parse.rs::JsonMetadata` heeft `#[allow(dead_code)] version: String` en `parse_json_index()` raakt het veld nooit aan.
+
+- **Test-coverage**: `tests/symbols_csharp_test.rs` invoket nooit `scip-csharp` als subprocess, schrijft nooit naar LMDB. `helpers/csharp/tests/IndexerTests.cs` bevat alleen `ScipModelTests` (test models, niet `SymbolIndexer`). De fixture `helpers/csharp/tests/Fixtures/SmallSolution/` bestaat maar wordt door geen enkele test geladen.
+
+## 2. Oplossing
+
+Een **gefaseerde aanpak** waarbij elke fase een geïsoleerd, testbaar onderwerp is. De volgorde is gekozen op:
+
+- **Effort/risk-ratio**: laagste effort + hoogste risk-reduction eerst (fases 1-3, samen ~1u)
+- **Architectural impact**: refactors die meerdere callsites raken vroeg (fase 4)
+- **Hot-path optimization**: pas na correctheid (fases 5-6)
+- **Test-infrastructuur**: laatste, dekt alle voorgaande fases impliciet (fase 7)
+
+Eén commit per fase voor reviewability. Geen sub-branch — fixes direct op `features/symbol-references` om de PR-history coherent te houden.
+
+### 2.1 Dataflow na de fix
+
+```
+WRITE-paden (rebuild → LMDB) — onveranderd:
+
+  [1] Watcher (.cs change)              [2] HTTP /reindex?symbols=true
+        ↓                                       ↓
+   IndexManager.symbol_registry          serve handler reuses
+   - Arc::new(Registry::new())           IndexManager.symbol_registry  ◄── FASE 4
+     (single source of truth)              (geen eigen Registry::new())
+   - debounce 60s
+        ↓                                       ↓
+        └────────► CSharpSymbolIndexer::rebuild() ◄────────┘
+                    ├── detect_helper() — Mutex<Option<Option<PathBuf>>>  ◄── FASE 2
+                    │   (cachet zowel success als failure)
+                    ├── scip-csharp subprocess → JSON
+                    ├── parse_json_index() — bail bij version != "1.0"  ◄── FASE 1
+                    └── LMDB:
+                         ├── symbols_db: Str → [v1 | bincode(refs)]  ◄── FASE 3
+                         ├── scip_positions: Str → [v1 | bincode([keys])]  ◄── FASE 5
+                         ├── scip_simple_names: Str → [v1 | bincode([keys])]  ◄── FASE 6
+                         └── meta_db: ts + counts
+
+READ-pad — onveranderd qua API, sneller intern:
+
+  MCP find_impact request
+        ↓
+   CodesearchService.symbol_registry  ◄── FASE 4 (geen Registry::new() meer)
+        ↓
+   indexer.find_references()            indexer.find_references_by_position()
+   - Exact match: O(1)                  - O(1) lookup in scip_positions  ◄── FASE 5
+   - Fuzzy: O(1) via                    - Pick shortest match
+     scip_simple_names  ◄── FASE 6      - Fall through naar find_references
+```
+
+## 3. Concrete wijzigingen per fase
+
+### Fase 1: JSON version-validatie (~10 min)
+
+**Bestand:** `src/symbols/scip_parse.rs`
+
+Verwijder `#[allow(dead_code)]` op `JsonMetadata.version` en voeg validatie toe in `parse_json_index()`:
+
+```rust
+const SUPPORTED_INDEX_VERSION: &str = "1.0";
+
+pub fn parse_json_index(data: &[u8]) -> Result<ScipIndex> {
+    let index: JsonIndex = serde_json::from_slice(data)
+        .with_context(|| "Failed to parse symbol index JSON")?;
+
+    if index.metadata.version != SUPPORTED_INDEX_VERSION {
+        bail!(
+            "Unsupported scip-csharp index version: '{}' (expected '{}'). \
+             The scip-csharp helper may need to be rebuilt.",
+            index.metadata.version, SUPPORTED_INDEX_VERSION
+        );
+    }
+    // ... bestaande logica blijft hetzelfde ...
+}
+```
+
+**Test in `scip_parse.rs::tests`:**
+
+```rust
+#[test]
+fn test_parse_json_index_rejects_unknown_version() {
+    let json = r#"{"metadata":{"version":"2.0","tool_info":"x"},"documents":[],"external_symbols":[]}"#;
+    let err = parse_json_index(json.as_bytes()).unwrap_err();
+    assert!(err.to_string().contains("Unsupported"), "got: {}", err);
+}
+```
+
+### Fase 2: `detect_helper` failure-cache (~15 min)
+
+**Bestand:** `src/symbols/csharp.rs`
+
+Verander de cache-type zodat zowel `Some` als `None` resultaten gecached worden:
+
+```rust
+pub struct CSharpSymbolIndexer {
+    /// Cached detection result.
+    /// None = not yet attempted.
+    /// Some(None) = attempted, helper not found.
+    /// Some(Some(path)) = found at given path.
+    helper_path: std::sync::Mutex<Option<Option<PathBuf>>>,
+}
+
+impl CSharpSymbolIndexer {
+    pub fn new() -> Self {
+        Self {
+            helper_path: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn detect_helper(&self) -> Option<PathBuf> {
+        {
+            let lock = self.helper_path.lock().unwrap();
+            if let Some(cached) = lock.as_ref() {
+                return cached.clone();
+            }
+        }
+
+        let resolved = self.resolve_helper_path();
+        let mut lock = self.helper_path.lock().unwrap();
+        *lock = Some(resolved.clone()); // cache zowel Some als None
+        resolved
+    }
+    // resolve_helper_path() blijft onveranderd
+}
+```
+
+**Geen breaking change** voor de trait. Geen extra unit-test nodig — observable effect is dat `tracing::debug!` precies één keer logt bij ontbrekende helper.
+
+### Fase 3: Bincode schema-versie (~30 min)
+
+**Bestand:** `src/symbols/csharp.rs`
+
+Prefix elke LMDB-value met een version byte. Bij read: bail met heldere error inclusief rebuild-instructie als versie onbekend.
+
+```rust
+const STORED_REFERENCE_SCHEMA_VERSION: u8 = 1;
+
+fn serialize_refs(refs: &[StoredReference]) -> Result<Vec<u8>> {
+    let payload = bincode::serialize(refs)
+        .with_context(|| "bincode serialize failed")?;
+    let mut buf = Vec::with_capacity(1 + payload.len());
+    buf.push(STORED_REFERENCE_SCHEMA_VERSION);
+    buf.extend_from_slice(&payload);
+    Ok(buf)
+}
+
+fn deserialize_refs(bytes: &[u8]) -> Result<Vec<StoredReference>> {
+    if bytes.is_empty() {
+        bail!("Empty stored value");
+    }
+    let version = bytes[0];
+    if version != STORED_REFERENCE_SCHEMA_VERSION {
+        bail!(
+            "Unsupported stored reference schema version {} (expected {}). \
+             Run `codesearch reindex --symbols` to rebuild.",
+            version, STORED_REFERENCE_SCHEMA_VERSION
+        );
+    }
+    bincode::deserialize(&bytes[1..])
+        .with_context(|| "bincode deserialize failed")
+}
+```
+
+Vervang alle `bincode::serialize(&stored)` → `serialize_refs(&stored)?` en alle `bincode::deserialize(value)` → `deserialize_refs(value)?` in:
+- `rebuild()` (write path)
+- `find_references()` (read paths — exact + fuzzy)
+- `find_references_by_position()` (read paths)
+
+**Migratie:** bestaande LMDB-state is incompatibel maar feature is in review (geen productiegebruik). Eerste rebuild herstelt automatisch. Documenteer in CHANGELOG.
+
+**Tests:** twee unit-tests in `csharp.rs::tests` (nieuw module aan het einde van de file):
+
+```rust
+#[test]
+fn test_serialize_refs_includes_version_byte() {
+    let refs = vec![StoredReference {
+        file: PathBuf::from("a.cs"), start_line: 1, end_line: 1, kind: "definition".into()
+    }];
+    let bytes = serialize_refs(&refs).unwrap();
+    assert_eq!(bytes[0], STORED_REFERENCE_SCHEMA_VERSION);
+}
+
+#[test]
+fn test_deserialize_refs_rejects_unknown_version() {
+    let bytes = vec![99u8, 0, 0, 0];
+    let err = deserialize_refs(&bytes).unwrap_err();
+    assert!(err.to_string().contains("Unsupported"));
+}
+```
+
+### Fase 4: Cache-architectuur refactor — Issue α (~1u 30min)
+
+**Bestanden:** `src/serve/mod.rs`, `src/serve/state.rs` (of waar `AppState` gedefinieerd staat), `src/mcp/mod.rs`.
+
+**Aanpak:** maak `Arc<SymbolIndexerRegistry>` deel van de gedeelde service-state, zodat IndexManager's bestaande registry hergebruikt wordt door HTTP- en MCP-handlers.
+
+**4.1 `src/serve/mod.rs` + state**
+
+Voeg `symbol_registry: Arc<SymbolIndexerRegistry>` toe aan `AppState` (of de equivalente service-state struct). In `serve()`-startup: clone het uit de IndexManager:
+
+```rust
+// Bij service-state constructie:
+let symbol_registry = Arc::clone(&index_manager.symbol_registry);
+let state = AppState {
+    // ... bestaande fields ...
+    symbol_registry,
+};
+```
+
+Pas `trigger_symbol_rebuild` aan om de registry als parameter te accepteren in plaats van een eigen instantie te maken:
+
+```rust
+async fn trigger_symbol_rebuild(
+    alias: &str,
+    project_path: &Path,
+    db_path: &Path,
+    registry: Arc<SymbolIndexerRegistry>,  // NEW: from AppState
+) {
+    // body unchanged, gebruik `registry` ipv `bg_reg`
+}
+```
+
+Update HTTP handler-callsites om `state.symbol_registry.clone()` mee te geven.
+
+**4.2 `src/mcp/mod.rs`**
+
+`CodesearchService` moet de registry kennen. Voeg `symbol_registry: Arc<SymbolIndexerRegistry>` toe aan de service struct, zet bij constructie (de service heeft al een referentie naar `IndexManager` of equivalente shared state — gebruik dezelfde route).
+
+In `find_impact`:
+
+```rust
+// VOOR:
+let registry = crate::symbols::SymbolIndexerRegistry::new();
+// NA:
+let registry = &self.symbol_registry;
+```
+
+**4.3 `src/index/manager.rs`**
+
+Geen wijziging aan de constructor (dat is site A en is correct). Eventueel een `pub` modifier op `symbol_registry` als die nu private is, om externe access toe te staan.
+
+**4.4 Verwijder `#[allow(dead_code)]` op constants**
+
+In `src/constants.rs`: na fase 4 worden `SCIP_CSHARP_HELPER_ENV`, `SCIP_CSHARP_HELPER_NAME`, `HELPERS_SUBDIR`, `SCIP_CSHARP_DEBOUNCE_MS`, `SCIP_SYMBOLS_DB_NAME`, `SCIP_REBUILD_TIMESTAMP_KEY` allemaal vanuit `csharp.rs` referenced via `crate::constants::...`. Verwijder de `#[allow(dead_code)]` attributes.
+
+**Verificatie:** `grep -rn "SymbolIndexerRegistry::new" src/` moet **exact 4 hits** retourneren na de refactor — één per canonieke aanmaak-site: `IndexManager::new()`, `IndexManager::new_for_path()`, `ServeState::new()` (serve-modus), `CodesearchService::new()` (standalone MCP-modus). Per-request instantiatie in `find_impact` en `trigger_symbol_rebuild` moet verdwenen zijn.
+
+
+### Fase 5: `find_references_by_position` keyset-filter (~2u)
+
+**Bestanden:** `src/symbols/csharp.rs` (+ nieuwe LMDB-tabel constant in `constants.rs`).
+
+**Probleem:** huidige implementatie deserialiseert élke entry zonder eerst op key te filteren — duurder dan de fuzzy-fallback van `find_references`.
+
+**Oplossing:** secundaire LMDB-tabel `scip_positions` mappend `(file:line)` op `[symbol_keys]`. Tijdens `rebuild` wordt voor elke definition-occurrence een entry geschreven. Bij position-lookup: O(1) get + dan deserialize alléén voor matching keys.
+
+**Schema:**
+
+```rust
+// In src/constants.rs
+pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
+
+// In csharp.rs:
+// scip_positions: Str -> Bytes
+//   key: "<file>:<line>" (forward-slash genormaliseerd, 1-based line)
+//   value: serialize_refs-equivalent voor Vec<String> — symbol-keys op die positie
+```
+
+Tijdens `rebuild()` (na de bestaande symbols_db.put loop):
+
+```rust
+let positions_db: Database<Str, Bytes> = env
+    .create_database(&mut wtxn, Some(crate::constants::SCIP_POSITION_DB_NAME))?;
+positions_db.clear(&mut wtxn)?;
+
+// Build position index
+let mut positions: HashMap<String, Vec<String>> = HashMap::new();
+for (symbol_name, references) in index.iter() {
+    for r in references.iter().filter(|r| r.kind == "definition") {
+        let pos_key = format!(
+            "{}:{}",
+            r.file.to_string_lossy().replace('\\', "/"),
+            r.start_line
+        );
+        positions.entry(pos_key).or_default().push(symbol_name.clone());
+    }
+}
+
+for (key, keys) in &positions {
+    let bytes = serialize_keys_v1(keys)?;  // simpele version-byte + bincode wrapper
+    positions_db.put(&mut wtxn, key, &bytes)?;
+}
+```
+
+Update `find_references_by_position()`:
+
+```rust
+fn find_references_by_position(&self, db_path: &Path, file: &Path, line: u32) -> Result<Vec<SymbolReference>> {
+    let env = self.open_scip_env(db_path)?;
+    let rtxn = env.read_txn()?;
+
+    let positions_db: Database<Str, Bytes> = env
+        .open_database(&rtxn, Some(crate::constants::SCIP_POSITION_DB_NAME))?
+        .ok_or_else(|| anyhow::anyhow!("Position index not found. Rebuild required."))?;
+
+    let pos_key = format!(
+        "{}:{}",
+        file.to_string_lossy().replace('\\', "/"),
+        line
+    );
+    let candidate_keys: Vec<String> = match positions_db.get(&rtxn, &pos_key)? {
+        Some(b) => deserialize_keys_v1(b)?,
+        None => return Ok(vec![]),
+    };
+
+    // Pick shortest (most specific) symbol on this line
+    let chosen = candidate_keys.iter().min_by_key(|k| k.len()).cloned();
+    drop(rtxn);
+    match chosen {
+        Some(k) => self.find_references(db_path, &k),
+        None => Ok(vec![]),
+    }
+}
+```
+
+### Fase 6: `find_references` fuzzy secondaire index (~2u 30min)
+
+**Bestanden:** `src/symbols/csharp.rs` (+ nieuwe LMDB-tabel constant).
+
+**Probleem:** fuzzy fallback doet O(N) full-table scan + bincode-deserialize-all.
+
+**Oplossing:** secundaire `scip_simple_names: simple_name -> [full_keys]` waar `simple_name` is afgeleid van het canonieke SCIP symbool — laatste segment na `#` of `.`, e.g. `Validate` voor `csharp App . FieldDefinition#Validate().`.
+
+**Schema:**
+
+```rust
+// In src/constants.rs
+pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
+```
+
+**Helper:**
+
+```rust
+fn extract_simple_name(scip_symbol: &str) -> String {
+    // Strip trailing parens (e.g. "Validate()." → "Validate")
+    let cleaned = scip_symbol.trim_end_matches('.').trim_end_matches("()");
+    // Take last segment after '#' or '.'
+    cleaned
+        .rsplit(|c| c == '#' || c == '.')
+        .next()
+        .unwrap_or(cleaned)
+        .trim()
+        .to_string()
+}
+```
+
+Vul tijdens `rebuild()` zoals fase 5: bouw een `HashMap<String, Vec<String>>` van simple_name → keys, schrijf naar `scip_simple_names`.
+
+Vervang de O(N) iter-loop in `find_references()`:
+
+```rust
+fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>> {
+    let env = self.open_scip_env(db_path)?;
+    let rtxn = env.read_txn()?;
+
+    let symbols_db: Database<Str, Bytes> = env
+        .open_database(&rtxn, Some(SCIP_DB_NAME))?
+        .ok_or_else(|| anyhow::anyhow!("SCIP symbol database not found. Run a rebuild first."))?;
+
+    // Exact match (fast path)
+    if let Some(bytes) = symbols_db.get(&rtxn, symbol)? {
+        let stored = deserialize_refs(bytes)?;
+        return Ok(stored.into_iter().map(into_symbol_ref).collect());
+    }
+
+    // Fuzzy via simple-name index
+    let simple_names_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(crate::constants::SCIP_SIMPLE_NAMES_DB_NAME))? {
+        Some(db) => db,
+        None => return Ok(vec![]),
+    };
+
+    let simple = extract_simple_name(symbol);
+    let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple)? {
+        Some(b) => deserialize_keys_v1(b)?,
+        None => return Ok(vec![]),
+    };
+
+    let chosen = candidates.iter()
+        .filter(|k| fuzzy_symbol_match(symbol, k))
+        .min_by_key(|k| k.len())
+        .cloned();
+
+    drop(rtxn);
+    match chosen {
+        Some(k) => self.find_references(db_path, &k),
+        None => Ok(vec![]),
+    }
+}
+```
+
+### Fase 7: Integration test + CI (~1d)
+
+**Bestanden:** `tests/symbols_csharp_test.rs`, `Cargo.toml`, `.github/workflows/release.yml` (of dedicated test workflow).
+
+**Stappen:**
+
+1. **Cargo feature toevoegen** in `Cargo.toml`:
+
+   ```toml
+   [features]
+   default = []
+   csharp_helper_integration = []
+   ```
+
+2. **Schrijf één integration-test** gemarkeerd met `#[cfg_attr(...)]`:
+
+   ```rust
+   #[test]
+   #[cfg_attr(not(feature = "csharp_helper_integration"), ignore)]
+   fn test_csharp_pipeline_smallsolution_roundtrip() {
+       use codesearch::symbols::{SymbolIndexer, csharp::CSharpSymbolIndexer, RebuildScope};
+       use std::path::PathBuf;
+
+       // Locate fixture
+       let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+           .join("helpers/csharp/tests/Fixtures/SmallSolution");
+       assert!(fixture_root.join("SmallSolution.sln").exists(),
+           "Fixture not found at {}", fixture_root.display());
+
+       // Locate helper (CODESEARCH_SCIP_CSHARP env var or relative to target/)
+       let helper = std::env::var("CODESEARCH_SCIP_CSHARP")
+           .map(PathBuf::from)
+           .or_else(|_| {
+               let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                   .join("helpers/csharp/bin/Release/net10.0/scip-csharp");
+               if candidate.exists() { Ok(candidate) } else { Err(()) }
+           })
+           .expect("scip-csharp helper not found. Set CODESEARCH_SCIP_CSHARP or build helper.");
+       std::env::set_var("CODESEARCH_SCIP_CSHARP", &helper);
+
+       // Setup tempdir for LMDB
+       let tmp = tempfile::tempdir().unwrap();
+       let db_path = tmp.path();
+
+       // Rebuild
+       let indexer = CSharpSymbolIndexer::new();
+       assert!(indexer.is_available(), "Helper detection failed");
+       let summary = indexer.rebuild(&fixture_root, db_path, RebuildScope::Full)
+           .expect("rebuild failed");
+       assert!(summary.symbols_indexed > 0, "No symbols indexed");
+
+       // Query: Calculator.Add should have ≥2 occurrences (definition + 1 reference)
+       let refs = indexer.find_references(
+           db_path,
+           "csharp SmallSolution.Library . Calculator#Add(int, int)."
+       ).expect("find_references failed");
+       assert!(refs.len() >= 2, "Expected ≥2 refs for Calculator.Add, got {}", refs.len());
+
+       // Position-based lookup
+       let pos_refs = indexer.find_references_by_position(
+           db_path,
+           &PathBuf::from("Library/Calculator.cs"),
+           8  // line of Add definition (verify against fixture)
+       ).expect("find_references_by_position failed");
+       assert!(!pos_refs.is_empty(), "Position lookup returned empty");
+   }
+   ```
+
+3. **Cleanup misleidende tests** in `tests/symbols_csharp_test.rs`:
+   - Verwijder `test_parse_json_index_fuzzy_symbol_match` (lege body — heeft geen waarde)
+   - Verwijder `test_symbol_reference_conversion` (struct-test zonder waarde)
+   - Hernoem `test_lmdb_round_trip` → `test_indexer_returns_empty_when_db_missing` (eerlijke naam voor wat het test)
+
+4. **CI-job toevoegen** voor de feature-flagged test. Aparte job in `.github/workflows/release.yml` (of nieuwe `.github/workflows/integration-tests.yml`):
+
+   ```yaml
+   csharp-integration-tests:
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v4
+       - uses: actions/setup-dotnet@v4
+         with:
+           dotnet-version: '10.0.x'
+       - name: Build helper
+         run: |
+           cd helpers/csharp
+           dotnet publish -c Release --no-self-contained -o bin/Release/net10.0
+       - uses: dtolnay/rust-toolchain@stable
+       - name: Run integration tests
+         run: |
+           export CODESEARCH_SCIP_CSHARP="$PWD/helpers/csharp/bin/Release/net10.0/scip-csharp"
+           cargo test --features csharp_helper_integration -- --include-ignored
+   ```
+
+   Maakt een aparte job zodat kale Rust-CI niet trager wordt door dotnet-build (60-90s extra).
+
+## 4. Schema / DTOs
+
+Twee nieuwe LMDB-tabellen + één version-byte protocol op alle waarde-encodings:
+
+```rust
+// src/constants.rs
+pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
+pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
+
+// src/symbols/csharp.rs (private)
+const STORED_REFERENCE_SCHEMA_VERSION: u8 = 1;
+const KEYS_LIST_SCHEMA_VERSION: u8 = 1;
+```
+
+**Tabellen:**
+
+| Tabel | Key | Value | Schrijver | Lezer |
+|---|---|---|---|---|
+| `scip_symbols` (bestaand) | full SCIP key | `[v=1, bincode(Vec<StoredReference>)]` | `rebuild` | `find_references` exact + fuzzy |
+| `scip_positions` (nieuw) | `<file>:<line>` (forward-slash, 1-based) | `[v=1, bincode(Vec<String>)]` | `rebuild` | `find_references_by_position` |
+| `scip_simple_names` (nieuw) | last segment of canonical symbol | `[v=1, bincode(Vec<String>)]` | `rebuild` | `find_references` fuzzy fallback |
+| `scip_meta` (bestaand) | `last_rebuild_ts`, `symbol_count` | `Str` | `rebuild` | `index_age` |
+
+Beide nieuwe tabellen worden vol-overschreven bij elke `rebuild()` (met `clear()` vóór de schrijf-loop).
+
+## 5. Tests
+
+**Unit tests** (`cargo test`, default features, snel):
+
+- `scip_parse::tests::test_parse_json_index_rejects_unknown_version` — fase 1
+- `csharp::tests::test_serialize_refs_includes_version_byte` — fase 3
+- `csharp::tests::test_deserialize_refs_rejects_unknown_version` — fase 3
+- `csharp::tests::test_extract_simple_name` — fase 6 (verifieert bv. `extract_simple_name("csharp App . Foo#Bar().")` == `"Bar"`)
+
+**Integration tests** (`cargo test --features csharp_helper_integration -- --include-ignored`, langzaam, opt-in):
+
+- `tests::test_csharp_pipeline_smallsolution_roundtrip` — fase 7 (subprocess + LMDB + alle drie de query-paths)
+
+**Handmatige tests** (na voltooiing, op echte client repo):
+
+1. Build feature branch + helper, `cargo build` (niet `--release`). Verifieer geen `#[allow(dead_code)]` warnings meer in `constants.rs`.
+2. Run `codesearch serve` op een Aprimo client repo. Eerste MCP `find_impact`-call moet werken zonder PATH-spam in tracing logs.
+3. Tweede en derde call: latency moet sub-100ms zijn (was: seconden bij O(N) fuzzy fallback).
+4. Verifieer position-lookup: `{"file": "src/X.cs", "line": 42}` returnt direct, geen full scan in logs.
+5. `grep -rn "SymbolIndexerRegistry::new" src/` moet exact 4 hits zijn (IndexManager::new, IndexManager::new_for_path, ServeState::new, CodesearchService::new).
+
+## 6. Edge cases
+
+| Scenario | Verwacht gedrag |
+|---|---|
+| Helper niet geïnstalleerd, eerste `is_available()` call | Returnt `false`, log één keer op `tracing::debug`, gecached. Vervolg-calls = 0 detectie-werk. |
+| Helper geïnstalleerd later (dev-flow), restart codesearch nodig | Acceptabel voor v1. TTL-cache als follow-up. |
+| LMDB bevat oude bincode (v0, geen version byte) | `deserialize_refs` faalt met heldere error met rebuild-instructie. User runt `?force=true&symbols=true`. |
+| Rebuild parallel via watcher én HTTP `?symbols=true` | Geen guard nu. Issue α-fix verandert dit niet. Follow-up: per-repo mutex. |
+| Helper schrijft `version: "2.0"` (toekomstige bump) | `parse_json_index` faalt met heldere error. User updatet codesearch. |
+| Position-lookup op file zonder definities | Lege Vec, geen error. |
+| Position-lookup op pathseparator-mismatch (Windows backslash input) | `replace('\\', "/")` op de query-kant. Test met expliciete backslash input. |
+| Simple-name lookup met prefix-collision (bv. `Validate` matcht 5 symbolen) | Filter via `fuzzy_symbol_match`, kies shortest key. Documenteer in code-comment. |
+| Helper crashes mid-rebuild | Bestaande `if !output.status.success()` warning + `read(output_path)` fail. Verbetering uit chunk 5 niet in scope hier (volg-up). |
+| `extract_simple_name("")` | Returns `""`. Caller filtert lege simple-names tijdens index-build. |
+
+## 7. Definition of Done
+
+- [ ] **Fase 1:** JSON version-validatie geïmplementeerd, unit-test groen
+- [ ] **Fase 2:** `detect_helper` cachet ook negatieve resultaten (handmatig getest met ontbrekende helper)
+- [ ] **Fase 3:** bincode payload heeft version byte, alle serialize/deserialize sites geüpdate, twee unit-tests groen
+- [ ] **Fase 4:** Sites B en C in `serve/mod.rs` en `mcp/mod.rs` hergebruiken `IndexManager.symbol_registry` via service-state
+- [ ] **Fase 4:** `grep -rn "SymbolIndexerRegistry::new" src/` returnt exact 4 hits (IndexManager×2, ServeState, CodesearchService)
+- [ ] **Fase 4:** `#[allow(dead_code)]` weg van alle 6 SCIP-constants in `constants.rs`
+- [ ] **Fase 5:** `scip_positions` LMDB-tabel werkt; `find_references_by_position` doet O(1) lookup (verifieer met tracing op fixture-repo)
+- [ ] **Fase 6:** `scip_simple_names` LMDB-tabel werkt; `find_references` fuzzy fallback doet O(1) lookup
+- [ ] **Fase 7:** Cargo feature `csharp_helper_integration` toegevoegd; integration-test groen onder die feature lokaal
+- [ ] **Fase 7:** CI-job voor de feature toegevoegd, eerste run groen op GitHub Actions
+- [ ] **Fase 7:** 3 misleidende/lege tests in `tests/symbols_csharp_test.rs` opgeruimd
+- [ ] `cargo check` zonder warnings
+- [ ] `cargo clippy` zonder warnings (of expliciet gemotiveerde `#[allow]`)
+- [ ] `cargo test` (default features) groen
+- [ ] CHANGELOG.md bijgewerkt onder `[Unreleased]` met de 7 blocker-fixes
+- [ ] AGENTS.md status-sectie bijgewerkt: alle fases ✅
+- [ ] `REVIEW_features-symbol-references.md` heeft een afsluitende sectie "Fixes toegepast" die per fase linkt naar de commit-SHA
+- [ ] Handmatige eindtest op een echte Aprimo client repo: 2e en 3e MCP `find_impact` call < 100ms
+
+## 8. Niet in scope
+
+Deze plan-doc dekt alléén de blockers + de bincode-major. Niet meegenomen:
+
+- 49 minors uit de review — apart in volgende `AGENTS_*.md`
+- Andere majors: rebuild scope altijd `Full`, sequentiele text+symbol rebuild, git rev-parse subprocess per poll, LMDB `map_size` hardcoded → apart follow-up
+- `scip_parse.rs` hernoemen naar `helper_output.rs` — cosmetisch, na merge
+- AGENTS.md merge-strategie naar develop (`merge=ours` hook) — apart proces-onderwerp
+- Performance-tuning van de C# helper zelf (parallel `FindReferencesAsync`) — hoort in helper-code, geen Rust-side fix
+- Multi-language support (Python/TS adapters) — toekomstige feature
+- ONNX arena allocator memory bloat — bekende upstream limitatie, niet deze branch
+- Rate-limiting op `?symbols=true` — apart correctness-en-DOS-onderwerp
+- `find_csproj_for_file` redundant condition fix — minor uit chunk 5, post-merge
+
+Reden voor scope-discipline: deze branch is in PR-review. Scope-creep zou de PR oneindig vertragen. Eerst blockers weg, dan mergen, dan follow-ups in volgende iteratie.
+
+## 9. Implementatietijd (schatting)
+
+| Fase | Schatting | Cumulatief |
+|---|---|---|
+| Fase 1 — JSON version-validatie | 10 min | 0u 10min |
+| Fase 2 — detect_helper failure-cache | 15 min | 0u 25min |
+| Fase 3 — Bincode schema-versie | 30 min | 0u 55min |
+| Fase 4 — Cache-architectuur refactor | 1u 30min | 2u 25min |
+| Fase 5 — Position keyset-filter | 2u | 4u 25min |
+| Fase 6 — Simple-name secondaire index | 2u 30min | 6u 55min |
+| Fase 7 — Integration test + CI | 1d (8u) | 14u 55min |
+| **Totaal** | **~15 uur (1.5-2 werkdagen)** |  |
+
+Schatting includeert tests-schrijven, niet uitgebreide code-review. CI-tweaks voor fase 7 kunnen 1-2 uur extra kosten afhankelijk van .NET 10 setup-snelheid.
+
+## 10. Review-opmerkingen
+
+- **Issue α was eerst geclassificeerd als 4 blockers, niet 2.** OpenCode kan in twijfel raken bij de discrepantie met het review-document. Dit plan reflecteert de **top-down validatie** (sectie "Top-down architecturale inspectie" in REVIEW), niet de eerste chunked telling.
+- **Site A in `IndexManager` is correct — niet aanraken.** Het patroon `Arc::new(SymbolIndexerRegistry::new())` éénmalig in de constructor, gedeeld via `Arc::clone`, is goed. Sites B en C moeten dat patroon volgen, niet hun eigen instantie maken.
+- **Fase 4 raakt service-architectuur** — verifieer met sanity-check na refactor: `grep -rn "SymbolIndexerRegistry::new" src/` moet exact 4 hits retourneren (IndexManager::new, IndexManager::new_for_path, ServeState::new, CodesearchService::new). Per-request instantiatie moet verdwenen zijn.
+- **Fase 5 en 6 zijn LMDB-schema-wijzigingen** — gecombineerd met fase 3's version byte zal eerste run na fix automatisch een full rebuild forceren omdat oude bincode-values geen version byte hebben. Documenteer dat in CHANGELOG zodat users niet schrikken.
+- **Fase 6's `extract_simple_name`** is heuristisch — voor gewone C#-symbolen werkt "laatste segment na `#` of `.`" goed, maar generic types (`Container<T>`) en explicit interface implementations (`Foo.IBar.Method`) kunnen vreemd zijn. Begin met de simpele heuristiek; itereer als test fixtures iets onthullen. Voeg in de fuzzy-fallback altijd een `fuzzy_symbol_match`-filter toe als safety net.
+- **Fase 7's `dotnet publish` in CI** kan tot 60-90s extra builddtijd kosten. Aparte job (parallel) zodat kale Rust-CI niet trager wordt — zie de YAML-snippet in fase 7.
+- **Niet alle blockers vereisen aparte commits.** Fase 1+2+3 kunnen één commit zijn ("fix: address review blockers — version validation, helper failure cache, schema versioning"). Fase 4-7 elk hun eigen commit voor reviewability.
+- **Branch-strategie:** als de review-PR al open is op GitHub, push na elke fase voor incrementele review-feedback. Anders alle fases lokaal en in één keer pushen.
+- **Het is OK om fase 5 en 6 te swappen** als test-data laat zien dat fuzzy-lookups in de praktijk vaker voorkomen dan position-lookups. De gekozen volgorde (5 voor 6) komt uit het feit dat position-lookup correctness-kritischer is (chunk 5's bevinding dat het duurder is dan fuzzy is verrassend en suggereert dat het minder vaak gebruikt is dan ontworpen).
+
+## 11. Commit messages (per fase)
+
+**Fase 1:**
+
+```
+fix(symbols): validate scip-csharp index JSON version
+
+Adds explicit check for metadata.version == "1.0" in parse_json_index.
+Previously the field was parsed but #[allow(dead_code)], silently
+accepting any version including breaking-change futures.
+
+Refs: REVIEW_features-symbol-references.md (blocker chunk 5)
+```
+
+**Fase 2:**
+
+```
+fix(symbols): cache detect_helper negative results
+
+CSharpSymbolIndexer.detect_helper now caches both Some and None.
+Previously failures triggered fresh PATH-lookup + subprocess on every
+is_available() call — degrading every MCP find_impact request when
+helper is missing.
+
+Refs: REVIEW_features-symbol-references.md (blocker chunk 5)
+```
+
+**Fase 3:**
+
+```
+fix(symbols): add schema version byte to stored references
+
+Prefixes bincode payload with u8 version. Reads bail with rebuild
+instruction on unknown version. Prevents silent LMDB corruption when
+StoredReference shape evolves.
+
+BREAKING (internal): existing scip LMDB state requires rebuild.
+First reindex after upgrade triggers automatic rebuild.
+
+Refs: REVIEW_features-symbol-references.md (major chunk 5, escalated to blocker)
+```
+
+**Fase 4:**
+
+```
+refactor(symbols): share SymbolIndexerRegistry across services
+
+Move Arc<SymbolIndexerRegistry> ownership from per-call to
+service-state. find_impact (mcp/mod.rs) and trigger_symbol_rebuild
+(serve/mod.rs) now reuse IndexManager's registry instead of creating
+fresh instances per request, restoring helper-detection cache effectiveness.
+
+Removes #[allow(dead_code)] on six constants in constants.rs that are
+now actively referenced from csharp.rs.
+
+Refs: REVIEW_features-symbol-references.md (blockers chunks 6, 7 — top-down clustered)
+```
+
+**Fase 5:**
+
+```
+perf(symbols): O(1) position lookup via secondary LMDB index
+
+Adds scip_positions table mapping (file, line) -> [symbol_keys].
+find_references_by_position now does a direct lookup instead of
+iterating all symbols and deserializing every value.
+
+Refs: REVIEW_features-symbol-references.md (blocker chunk 5)
+```
+
+**Fase 6:**
+
+```
+perf(symbols): O(1) fuzzy lookup via simple-name index
+
+Adds scip_simple_names table mapping last-segment identifier ->
+[full_keys]. find_references fuzzy fallback now consults this index
+instead of iterating all symbols.
+
+Refs: REVIEW_features-symbol-references.md (blocker chunk 5)
+```
+
+**Fase 7:**
+
+```
+test(symbols): add gated integration test for C# pipeline
+
+Adds tests/symbols_csharp_test.rs::test_csharp_pipeline_smallsolution_roundtrip
+behind cargo feature `csharp_helper_integration`. Exercises full pipeline:
+scip-csharp subprocess → JSON → LMDB → find_references + find_references_by_position.
+
+CI runs feature-flagged tests in a separate job that builds the helper
+via dotnet publish on Linux.
+
+Removes 3 misleading tests from prior commits (empty body, struct-only
+construction test, "lmdb_round_trip" that did no roundtrip).
+
+Refs: REVIEW_features-symbol-references.md (blockers chunks 3, 9)
+```
+
+---
+
+**Bron:** [`REVIEW_features-symbol-references.md`](./REVIEW_features-symbol-references.md) — sectie "Eindverdict" + "Top-down architecturale inspectie".
+
+
+## Implemented Features
+
+- None yet — this branch is still the C# symbol-references implementation plan.
 
 ## Architecture
 
 ### Per-language adapter pattern
 
-```
-src/symbols/
-├── mod.rs            # SymbolIndexer trait + dispatch
-├── csharp.rs         # C# adapter: locates helper, invokes subprocess, parses SCIP, stores in LMDB
-└── scip_parse.rs     # thin wrapper around the `scip` crate (SCIP protobuf bindings)
-```
-
-The trait shape:
+`src/symbols/` hosts the adapter layer:
 
 ```rust
 trait SymbolIndexer: Send + Sync {
-    /// Run the indexer for this language over the repo. Writes results to LMDB.
-    /// Idempotent: safe to re-run after file changes.
     async fn rebuild(&self, repo: &Repo, scope: RebuildScope) -> Result<RebuildSummary>;
-
-    /// Return the symbol's references from the LMDB store.
     fn find_references(&self, repo: &Repo, symbol: &CanonicalSymbol) -> Result<Vec<Reference>>;
 }
 
 enum RebuildScope {
-    Full,                   // entire solution / project tree
-    Project(PathBuf),       // single .csproj or equivalent
-    Files(Vec<PathBuf>),    // future: per-file (out of MVP scope)
+    Full,
+    Project(PathBuf),
+    Files(Vec<PathBuf>),
 }
 ```
 
-Future languages register additional `SymbolIndexer` impls in `src/symbols/mod.rs`. For MVP only `csharp.rs` exists.
+`mod.rs` owns dispatch, `csharp.rs` owns the C# adapter, and `scip_parse.rs` wraps the `scip` crate.
 
 ### C# helper
 
-`helpers/csharp/` is a small C# project that wraps Roslyn's `SymbolFinder.FindReferencesAsync()` and writes a SCIP protobuf file. It is invoked by codesearch as a subprocess on a debounced rebuild trigger.
+`helpers/csharp/` is a small stateless CLI wrapper around Roslyn `SymbolFinder.FindReferencesAsync()`. It runs as a subprocess and writes SCIP output.
 
 CLI shape:
 
-```
+```text
 scip-csharp index --solution path\to\X.sln --output path\to\index.scip [--project path\to\Y.csproj]
 ```
 
 Behavior:
-1. `MSBuildLocator.RegisterDefaults()` to discover MSBuild
-2. `MSBuildWorkspace.Create()` and load solution (or single project if `--project` given)
-3. Walk symbols of interest (methods, properties, classes, interfaces, fields)
-4. For each, `SymbolFinder.FindReferencesAsync(symbol, workspace.CurrentSolution)`
-5. Serialize to SCIP protobuf (sourcegraph/scip schema)
-6. Write to `--output`
+- register MSBuild with `MSBuildLocator`
+- load the solution or project with `MSBuildWorkspace`
+- collect methods, properties, classes, interfaces, and fields
+- serialize results to SCIP
+- exit 0 even on partial compilation; warnings are acceptable, crashes are not
 
-Error handling: compilation errors anywhere in the solution must NOT abort the indexer. Roslyn will produce partial semantic info for what does compile — emit those references, log warnings for the rest, exit code 0. Codesearch reads the partial index; gaps are acceptable, crashes are not.
+### Storage and query flow
 
-### LMDB storage
-
-New LMDB table per repo: `scip_symbols`. Keyed by canonical SCIP symbol string (`csharp . . . FieldDefinition#Validate().`), value is a serialized list of `(file_path, start_line, end_line, kind)` tuples.
-
-Symbol resolution at query time: agent passes a name like `FieldDefinition.Validate` or a `file:line` position. Adapter resolves to canonical SCIP symbol, looks up references in LMDB, returns the list.
+- LMDB table: `scip_symbols`
+- key: canonical SCIP symbol string
+- value: serialized references (`file_path`, `start_line`, `end_line`, `kind`)
+- query input can be `FieldDefinition.Validate` or `file:line`; resolve to canonical SCIP symbol first, then look up references
 
 ### Rebuild trigger
 
-The existing file watcher (`src/watch/`) fires on file changes. Add a debounced trigger for `.cs` file changes: 60-second quiet period, then call the C# helper with `RebuildScope::Project` (find the `.csproj` containing the changed file) or `RebuildScope::Full` (multiple projects affected, or first run).
+The watcher should debounce `.cs` changes for 60 seconds, then rebuild via the helper using `RebuildScope::Project` when possible, otherwise `RebuildScope::Full`.
 
-The rebuild runs in a background thread. BM25 and vector search are unaffected. `find_impact` queries hitting an in-progress rebuild return the existing (older) index with `index_age_seconds` exposed in the response so the agent can reason about staleness if needed.
+Rebuilds run in the background. BM25/vector search keep working, and `find_impact` may return the older index with `index_age_seconds` while a rebuild is in progress.
 
 ### MCP tool: `find_impact`
 
-New tool exposed via `src/mcp/`. Input variants:
+Inputs:
+- `{ "symbol_name": "FieldDefinition.Validate", "project": "boin-aprimo" }`
+- `{ "file": "src/Validation/FieldDefinition.cs", "line": 42, "project": "boin-aprimo" }`
 
-```json
-{ "symbol_name": "FieldDefinition.Validate", "project": "boin-aprimo" }
-{ "file": "src/Validation/FieldDefinition.cs", "line": 42, "project": "boin-aprimo" }
-```
-
-Response:
+Response shape:
 
 ```json
 {
   "symbol": "csharp . . . FieldDefinition#Validate().",
-  "references": [
-    { "file": "src/Importer/RecordImporter.cs", "start_line": 87, "end_line": 87, "kind": "call" },
-    { "file": "src/Tests/ValidationTests.cs", "start_line": 23, "end_line": 23, "kind": "call" },
-    ...
-  ],
+  "references": [{ "file": "...", "start_line": 87, "end_line": 87, "kind": "call" }],
   "index_age_seconds": 12,
   "language": "csharp",
   "scope": "project:boin-aprimo"
 }
 ```
 
-Errors: if the helper isn't installed, the symbol index is missing, or the language isn't supported, return a structured error with `available_languages` and `hint_for_agent` similar to the existing `scope_required` pattern in multi-repo serve.
+If the helper is missing, the index is unavailable, or the language is unsupported, return a structured error with `available_languages` and `hint_for_agent`.
 
----
-
-## Files to create
-
-### Helper (C#)
-
-| File | Purpose |
-|------|---------|
-| `helpers/csharp/scip-csharp.csproj` | net10.0, references Microsoft.CodeAnalysis (>= 4.13), Microsoft.Build.Locator, Google.Protobuf |
-| `helpers/csharp/Program.cs` | CLI entrypoint; argument parsing |
-| `helpers/csharp/SymbolIndexer.cs` | Roslyn workspace + SymbolFinder logic |
-| `helpers/csharp/ScipWriter.cs` | SCIP protobuf serialization |
-| `helpers/csharp/Scip.proto` | Vendored from sourcegraph/scip (or referenced via NuGet if available) |
-| `helpers/csharp/README.md` | Internal dev docs only — explains how to build/test the helper for contributors. NOT user-facing. |
-| `helpers/csharp/tests/Fixtures/SmallSolution/` | Minimal C# solution used for snapshot tests |
-| `helpers/csharp/tests/IndexerTests.cs` | Snapshot tests using the fixture |
-
-### Rust
-
-| File | Purpose |
-|------|---------|
-| `src/symbols/mod.rs` | `SymbolIndexer` trait, language dispatch, common types |
-| `src/symbols/csharp.rs` | C# adapter (helper detection, subprocess invocation, SCIP parsing → LMDB) |
-| `src/symbols/scip_parse.rs` | Thin wrapper around the `scip` crate |
-| `tests/symbols_csharp_test.rs` | Integration test: small fixture solution → assert references |
-
----
-
-## Files to modify
-
-| File | Change |
-|------|--------|
-| `Cargo.toml` | Add `scip = "..."` dependency (Sourcegraph's Rust SCIP bindings). Pin to a known-stable version. |
-| `src/lib.rs` | `pub mod symbols;` |
-| `src/mcp/mod.rs` (or wherever tool registration lives) | Register `find_impact` |
-| `src/serve/mod.rs` | Wire `find_impact` through MCP service layer |
-| `src/watch/mod.rs` | Add `.cs` change handler with 60s debounce → triggers `csharp::rebuild` |
-| `src/cli/mod.rs` | Add `codesearch reindex <alias> --symbols` flag for forced symbol-index rebuild |
-| `.github/workflows/release.yml` | Extend matrix to produce `-with-csharp` variants per platform (see "CI / Release changes" below) |
-| `README.md` | New top-level section: "C# semantic search" — explains the two release variants and what to download |
-| `CHANGELOG.md` | Entry for `find_impact` MCP tool, C# helper, new release variants |
-
----
 
 ## CI / Release changes
 
-Existing release workflow produces 3 archives (windows zip, linux tar.gz, macos tar.gz). After this branch: **6 archives** — the existing 3 (kale, unchanged) plus 3 `-with-csharp` variants per platform.
+Release output grows from 3 archives to 6: the existing platform archives plus `-with-csharp` variants for Windows, Linux, and macOS.
 
-Naming:
-```
-codesearch-windows-x86_64.zip                   (existing, unchanged)
-codesearch-windows-x86_64-with-csharp.zip       (new)
-codesearch-linux-x86_64.tar.gz                  (existing, unchanged)
-codesearch-linux-x86_64-with-csharp.tar.gz      (new)
-codesearch-macos-arm64.tar.gz                   (existing, unchanged)
-codesearch-macos-arm64-with-csharp.tar.gz       (new)
-```
+Each platform job should:
+1. install .NET 10 (`actions/setup-dotnet@v4`)
+2. publish `helpers/csharp` framework-dependent (`--no-self-contained`)
+3. stage the Rust binary plus helper output into `helpers/csharp/`
+4. pack the `-with-csharp` archive next to the existing one
 
-Per-platform job adds:
-1. `actions/setup-dotnet@v4` with `dotnet-version: '10.0.x'`
-2. `dotnet publish helpers/csharp -c Release -r {rid} --no-self-contained -o helpers-publish`
-3. Stage Rust binary + `helpers-publish/*` into `helpers/csharp/` subdirectory
-4. Pack as `-with-csharp` archive next to the existing kale archive
-
-`--no-self-contained` is intentional: the helper is framework-dependent and small (~5-15 MB total), relying on the user's installed .NET 10 runtime. Self-contained would add 60-80 MB per platform for no real-world benefit, since C# users have .NET 10 anyway.
-
-The macOS-arm64 job remains opt-in via `include_macos: false` workflow input. When skipped, only the kale macOS archive is missing — same behavior as today.
-
----
+macOS arm64 stays opt-in via `include_macos: false`.
 
 ## Helper detection at runtime
 
-Codesearch looks for the helper in this order:
+Lookup order:
+1. `<codesearch-exe-dir>/helpers/csharp/scip-csharp[.exe]`
+2. `PATH` lookup for `scip-csharp`
+3. `CODESEARCH_SCIP_CSHARP`
 
-1. `<codesearch-exe-dir>/helpers/csharp/scip-csharp[.exe]` (when running from a `-with-csharp` release archive)
-2. `$PATH` lookup of `scip-csharp` (when user installed via `dotnet tool install --global` or similar)
-3. Configurable override via `CODESEARCH_SCIP_CSHARP` environment variable
-
-If none found and a C# repo is registered: log one clear message at warn level, leave `find_impact` unavailable for that repo's C# language, but do NOT fail the overall indexing. BM25/vector search continues to work.
-
----
+If nothing is found and a C# repo is registered, log one warning and keep the rest of codesearch working.
 
 ## Quality gates
 
-- [ ] `cargo check` clean
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` clean
-- [ ] `cargo test --lib --bins` all pass
-- [ ] `dotnet test helpers/csharp/` all pass (snapshot tests on the small fixture solution)
-- [ ] CI release workflow produces all 6 archives on a tag push
-- [ ] Manual: extract `codesearch-windows-x86_64-with-csharp.zip`, register a real Aprimo client repo, run `find_impact` for a known method, verify the reference list matches Visual Studio's "Find All References"
-- [ ] Manual: edit a `.cs` file, wait > 60s, observe SCIP rebuild triggered in logs, query `find_impact`, verify the new reference appears
-- [ ] Manual: extract the kale variant (no helper), register a C# repo, verify a clean warning message and that BM25/vector search still works
-
----
+- `cargo check` clean
+- `cargo clippy --all-targets --all-features -- -D warnings` clean
+- `cargo test --lib --bins` pass
+- `dotnet test helpers/csharp/` pass
+- CI produces all 6 archives
+- manual `find_impact` validation against Visual Studio references
+- manual rebuild trigger validation after `.cs` edits
+- manual warning-path validation on the kale variant
 
 ## Out of scope
 
-- Languages other than C#. Trait is in place; future branches add adapters.
-- LSP-based live mode. SCIP-only is the deliberate choice (planning discussion: IDE already runs Roslyn; second LSP is wasteful).
-- Stack Graphs, Kythe, or Glean integration.
-- Interactive HTML graph viewer. Decided against — no measurable user value.
-- Per-symbol incremental SCIP merge. Per-project is the smallest practical rebuild unit.
-- Native AOT compile of the helper. Roslyn AOT is unstable; framework-dependent build is the right MVP choice.
-- Cross-language reference graphs (e.g. Python service calling C# REST endpoint). Each language's adapter is independent for now.
-
----
+- languages other than C#
+- LSP-based live mode
+- Stack Graphs, Kythe, or Glean
+- interactive HTML graph viewer
+- per-symbol incremental SCIP merge
+- native AOT for the helper
+- cross-language reference graphs
 
 ## Branch flow
 
@@ -215,38 +899,16 @@ If none found and a C# repo is registered: log one clear message at warn level, 
 # implement, test, commit incrementally
 git push origin features/symbol-references
 
-# When done: PR features/symbol-references → develop
+# when done: PR features/symbol-references → develop
 ```
-
----
-
-## Done when
-
-- [ ] C# helper builds and produces valid SCIP output on the fixture solution
-- [ ] Codesearch detects the helper, invokes it on register/rebuild, parses SCIP, stores references in LMDB
-- [ ] `find_impact` MCP tool returns correct references for known C# symbols on a real repo
-- [ ] File watcher triggers debounced helper rebuilds on `.cs` changes
-- [ ] CI produces all 6 release archives
-- [ ] README has a "C# semantic search" section explaining the release variants
-- [ ] CHANGELOG entry written
-- [ ] Manual test passes on a real Aprimo client repo: query → SCIP-derived references → matches IDE behavior
-- [ ] PR opened against `develop`
-
----
 
 ## Notes for OpenCode
 
-This is a multi-language change (Rust + C#). Two build systems coexist in this repo. `cargo` and `dotnet` do not interfere.
+- This is a Rust + C# change; `cargo` and `dotnet` do not interfere.
+- Rust uses the Sourcegraph `scip` crate for protobuf decoding.
+- C# uses `Microsoft.CodeAnalysis` >= 4.13, `Microsoft.Build.Locator`, and `Google.Protobuf`.
+- Roslyn may yield partial output on compilation failures; that is expected.
+- `scip-csharp` is stateless and runs once per indexing request.
+- Symbol resolution should try exact match first, then a pragmatic fuzzy match.
 
-Key library choices, pinned for stability:
-- Rust side: the [`scip` crate](https://crates.io/crates/scip) from Sourcegraph for protobuf decoding. It is the canonical Rust binding for the SCIP schema.
-- C# side: `Microsoft.CodeAnalysis` >= 4.13 (covers C# 14 / .NET 10 syntax). `Microsoft.Build.Locator` is required to register MSBuild before loading any workspace, otherwise `MSBuildWorkspace.Create()` throws.
-- `Google.Protobuf` for SCIP protobuf serialization on the C# side.
-
-Roslyn compilation requires the target solution to be buildable. If `dotnet build` on the user's solution fails, the helper produces partial output for the parts that do compile. Document this in the helper's README and in error messages — partial output is expected behavior, not a bug.
-
-The `scip-csharp` CLI is stateless: each invocation does one indexing run and exits. No daemon, no IPC. Codesearch invokes it as a subprocess. This keeps the helper simple and easy to reason about.
-
-Symbol resolution from a name like `FieldDefinition.Validate` to a canonical SCIP symbol string requires walking the SCIP index's `external_symbols` and `documents.occurrences` tables. Implement this lookup pragmatically — exact-match first, then fuzzy-match if no exact hit. Document the heuristic clearly in `symbols/csharp.rs`.
-
-When in doubt about scope, prefer simpler. This branch is meant to ship; gold-plating any of the sub-systems extends it past usefulness.
+When in doubt, prefer the simpler ship-ready path.
