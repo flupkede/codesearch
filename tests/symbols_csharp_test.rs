@@ -273,16 +273,17 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
     );
 
     // Position-based lookup: find what's defined on Calculator.cs line 8
+    // Note: paths are solution-relative as produced by the helper
     let pos_refs = indexer
         .find_references_by_position(
             db_path,
-            &PathBuf::from("src/Library/Calculator.cs"),
+            &PathBuf::from("Library/Calculator.cs"),
             8,
         )
         .expect("find_references_by_position failed");
     assert!(
         !pos_refs.is_empty(),
-        "Position lookup for Calculator.cs:8 should return references"
+        "Position lookup for Library/Calculator.cs:8 should return references"
     );
     // The definition at line 8 should be Calculator.Add
     let pos_defs: Vec<_> = pos_refs.iter().filter(|r| r.kind == "definition").collect();
