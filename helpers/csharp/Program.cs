@@ -4,7 +4,7 @@ namespace ScipCsharp;
 
 /// <summary>
 /// CLI entrypoint for scip-csharp.
-/// Usage: scip-csharp index --solution &lt;path&gt; --output &lt;path&gt; [--project &lt;path&gt;]
+/// Usage: scip-csharp index --solution &lt;path&gt; --output &lt;path&gt; [--filter-project &lt;path&gt;]
 /// </summary>
 public static class Program
 {
