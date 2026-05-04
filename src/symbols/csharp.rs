@@ -28,6 +28,9 @@ const SCIP_META_DB_NAME: &str = "scip_meta";
 /// LMDB database name for the position-to-symbols index.
 const SCIP_POSITION_DB_NAME: &str = crate::constants::SCIP_POSITION_DB_NAME;
 
+/// LMDB database name for the simple-name-to-symbols index.
+const SCIP_SIMPLE_NAMES_DB_NAME: &str = crate::constants::SCIP_SIMPLE_NAMES_DB_NAME;
+
 /// Key in the meta database that stores the last rebuild timestamp (UNIX epoch seconds).
 const META_REBUILD_TS: &str = crate::constants::SCIP_REBUILD_TIMESTAMP_KEY;
 
@@ -119,6 +122,32 @@ fn deserialize_keys_v1(bytes: &[u8]) -> Result<Vec<String>> {
     }
     bincode::deserialize(&bytes[1..])
         .with_context(|| "bincode deserialize keys failed")
+}
+
+// ── Simple-name extraction ─────────────────────────────────────────
+
+/// Extracts the last segment of a canonical SCIP symbol as a simple name.
+///
+/// Examples:
+/// - `"csharp App . FieldDefinition#Validate()."` → `"Validate"`
+/// - `"csharp SmallSolution.Library . Calculator#Add(int, int)."` → `"Add"`
+/// - `"csharp . . . Namespace.TopLevel"` → `"TopLevel"`
+fn extract_simple_name(scip_symbol: &str) -> String {
+    // Strip trailing parens/period (e.g. "Validate()." → "Validate")
+    let cleaned = scip_symbol.trim_end_matches('.').trim_end_matches("()");
+    // Take last segment after '#' or '.'
+    let last_segment = cleaned
+        .rsplit(['#', '.'])
+        .next()
+        .unwrap_or(cleaned)
+        .trim();
+    // Strip method parameters (e.g. "Add(int, int)" → "Add")
+    last_segment
+        .split('(')
+        .next()
+        .unwrap_or(last_segment)
+        .trim()
+        .to_string()
 }
 
 // ── CSharpSymbolIndexer ───────────────────────────────────────────
@@ -273,7 +302,7 @@ impl CSharpSymbolIndexer {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(64 * 1024 * 1024) // 64MB — symbol indexes are small
-                .max_dbs(5)
+                .max_dbs(6)
                 .open(&scip_dir)?
         };
         Ok(env)
@@ -432,6 +461,35 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             positions.len()
         );
 
+        // ── Build simple-name index ───────────────────────────────────
+        // scip_simple_names: simple_name -> [full_symbol_keys]
+        // Enables O(1) fuzzy lookup by extracting the last segment of each symbol.
+        let simple_names_db: Database<Str, Bytes> = env
+            .create_database(&mut wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))?;
+        simple_names_db.clear(&mut wtxn)?;
+
+        let mut simple_names: HashMap<String, Vec<String>> = HashMap::new();
+        for (symbol_name, _references) in index.iter() {
+            let simple = extract_simple_name(symbol_name);
+            if !simple.is_empty() {
+                simple_names
+                    .entry(simple)
+                    .or_default()
+                    .push(symbol_name.clone());
+            }
+        }
+
+        for (key, keys) in &simple_names {
+            let bytes = serialize_keys_v1(keys)
+                .with_context(|| format!("Failed to serialize simple name key: {}", key))?;
+            simple_names_db.put(&mut wtxn, key.as_str(), &bytes)?;
+        }
+
+        tracing::debug!(
+            "scip-csharp simple-name index: {} entries",
+            simple_names.len()
+        );
+
         // Write metadata as string values
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -477,30 +535,31 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             }).collect());
         }
 
-        // Fuzzy match: try to find a symbol that contains the query
-        let mut candidates = Vec::new();
-        let iter = symbols_db.iter(&rtxn)?;
-        for result in iter {
-            let (key, value) = result?;
-            // Check if the symbol name is contained in the key
-            if key.contains(symbol) || fuzzy_symbol_match(symbol, key) {
-                let stored = match deserialize_refs(value) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let refs: Vec<SymbolReference> = stored.into_iter().map(|r| SymbolReference {
-                    file: r.file,
-                    start_line: r.start_line,
-                    end_line: r.end_line,
-                    kind: r.kind,
-                }).collect();
-                candidates.push((key.to_string(), refs));
-            }
-        }
+        // Fuzzy via simple-name index (O(1) lookup instead of full-table scan)
+        let simple_names_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))? {
+            Some(db) => db,
+            None => return Ok(vec![]),
+        };
 
-        // Return the best (shortest key = most specific) match
-        candidates.sort_by(|a, b| a.0.len().cmp(&b.0.len()));
-        Ok(candidates.into_iter().next().map(|(_, refs)| refs).unwrap_or_default())
+        let simple = extract_simple_name(symbol);
+        let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple as &str)? {
+            Some(b) => deserialize_keys_v1(b)?,
+            None => return Ok(vec![]),
+        };
+
+        // Filter candidates through fuzzy_symbol_match as safety net,
+        // then pick shortest (most specific) key.
+        let chosen = candidates
+            .iter()
+            .filter(|k| fuzzy_symbol_match(symbol, k))
+            .min_by_key(|k| k.len())
+            .cloned();
+        drop(rtxn);
+
+        match chosen {
+            Some(k) => self.find_references(db_path, &k),
+            None => Ok(vec![]),
+        }
     }
 
     fn find_references_by_position(&self, db_path: &Path, file: &Path, line: u32) -> Result<Vec<SymbolReference>> {
@@ -630,5 +689,14 @@ mod tests {
             "expected 'Empty' in error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_extract_simple_name() {
+        assert_eq!(extract_simple_name("csharp App . FieldDefinition#Validate()."), "Validate");
+        assert_eq!(extract_simple_name("csharp SmallSolution.Library . Calculator#Add(int, int)."), "Add");
+        assert_eq!(extract_simple_name("csharp . . . Namespace.TopLevel"), "TopLevel");
+        assert_eq!(extract_simple_name("csharp . . . Foo"), "Foo");
+        assert_eq!(extract_simple_name(""), "");
     }
 }

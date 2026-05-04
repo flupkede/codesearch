@@ -205,6 +205,10 @@ pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
 /// Used for O(1) position-based symbol lookup.
 pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
 
+/// LMDB table mapping simple names (last segment of SCIP symbol)
+/// to `[full_symbol_keys]`. Used for O(1) fuzzy symbol lookup.
+pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
+
 /// File extensions that should never be indexed, regardless of content.
 /// These are generated/compiled/binary-adjacent files with no semantic code value.
 pub const ALWAYS_SKIP_EXTENSIONS: &[&str] = &[
