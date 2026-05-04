@@ -202,11 +202,10 @@ impl FileWatcher {
                             // Convert to our event type
                             use notify::EventKind;
                             match event.kind {
-                                EventKind::Create(_) | EventKind::Modify(_) => {
-                                    // For creates/modifies, only process indexable files
-                                    if self.is_watchable(&path) && raw_path.exists() {
-                                        events.push(FileEvent::Modified(path));
-                                    }
+                                EventKind::Create(_) | EventKind::Modify(_)
+                                    if self.is_watchable(&path) && raw_path.exists() =>
+                                {
+                                    events.push(FileEvent::Modified(path));
                                 }
                                 EventKind::Remove(_) => {
                                     // For removals, don't filter by extension - directory
@@ -277,11 +276,10 @@ impl FileWatcher {
 
                         use notify::EventKind;
                         match event.kind {
-                            EventKind::Create(_) | EventKind::Modify(_) => {
-                                // For creates/modifies, only process indexable files
-                                if self.is_watchable(&path) && raw_path.exists() {
-                                    events.push(FileEvent::Modified(path));
-                                }
+                            EventKind::Create(_) | EventKind::Modify(_)
+                                if self.is_watchable(&path) && raw_path.exists() =>
+                            {
+                                events.push(FileEvent::Modified(path));
                             }
                             EventKind::Remove(_) => {
                                 // For removals, don't filter by extension - directory

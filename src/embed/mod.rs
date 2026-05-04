@@ -141,7 +141,7 @@ impl EmbeddingService {
             }
 
             // Merge with cache hits, preserving original order
-            for ((original_idx, _), embedded_chunk) in misses.iter().zip(embedded.into_iter()) {
+            for ((original_idx, _), embedded_chunk) in misses.iter().zip(embedded) {
                 results.push((*original_idx, embedded_chunk));
             }
         }

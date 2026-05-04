@@ -106,7 +106,7 @@ impl BatchEmbedder {
                 .embed_batch(texts)?;
 
             // Combine chunks with embeddings
-            for (chunk, embedding) in chunk_batch.iter().zip(embeddings.into_iter()) {
+            for (chunk, embedding) in chunk_batch.iter().zip(embeddings) {
                 embedded_chunks.push(EmbeddedChunk::new(chunk.clone(), embedding));
             }
         }

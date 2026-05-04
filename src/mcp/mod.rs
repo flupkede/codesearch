@@ -2989,11 +2989,7 @@ fn regex_has_disjunctive_or(pattern: &str) -> bool {
             ')' => {
                 depth_paren = depth_paren.saturating_sub(1);
             }
-            '|' => {
-                if depth_paren == 0 {
-                    return true;
-                }
-            }
+            '|' => return depth_paren == 0,
             _ => {}
         }
         i += 1;
