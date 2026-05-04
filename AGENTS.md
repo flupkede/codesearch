@@ -10,7 +10,7 @@ MVP scope is **C# only**. The architecture stays language-agnostic through a per
 
 # Symbol-references merge-preparation — 7-fase blocker-fix
 
-**Status:** 🔴 Blokkerend (review identificeerde 13 blockers / 30 majors / 49 minors)  
+**Status:** ✅ Alle 7 fases geïmplementeerd, reviews gepasseerd ( resterende DoD-items vereisen push/handmatige test)  
 **Prioriteit:** Vóór PR-merge naar develop  
 **Spec:** [`REVIEW_features-symbol-references.md`](./REVIEW_features-symbol-references.md) — Eindverdict + top-down validatie zijn de bron-van-waarheid  
 **Eigenaar:** OpenCode (uitvoerder) / Claude (planner)  
@@ -607,23 +607,23 @@ Beide nieuwe tabellen worden vol-overschreven bij elke `rebuild()` (met `clear()
 
 ## 7. Definition of Done
 
-- [ ] **Fase 1:** JSON version-validatie geïmplementeerd, unit-test groen
-- [ ] **Fase 2:** `detect_helper` cachet ook negatieve resultaten (handmatig getest met ontbrekende helper)
-- [ ] **Fase 3:** bincode payload heeft version byte, alle serialize/deserialize sites geüpdate, twee unit-tests groen
-- [ ] **Fase 4:** Sites B en C in `serve/mod.rs` en `mcp/mod.rs` hergebruiken `IndexManager.symbol_registry` via service-state
-- [ ] **Fase 4:** `grep -rn "SymbolIndexerRegistry::new" src/` returnt exact 4 hits (IndexManager×2, ServeState, CodesearchService)
-- [ ] **Fase 4:** `#[allow(dead_code)]` weg van alle 6 SCIP-constants in `constants.rs`
-- [ ] **Fase 5:** `scip_positions` LMDB-tabel werkt; `find_references_by_position` doet O(1) lookup (verifieer met tracing op fixture-repo)
-- [ ] **Fase 6:** `scip_simple_names` LMDB-tabel werkt; `find_references` fuzzy fallback doet O(1) lookup
-- [ ] **Fase 7:** Cargo feature `csharp_helper_integration` toegevoegd; integration-test groen onder die feature lokaal
-- [ ] **Fase 7:** CI-job voor de feature toegevoegd, eerste run groen op GitHub Actions
-- [ ] **Fase 7:** 3 misleidende/lege tests in `tests/symbols_csharp_test.rs` opgeruimd
-- [ ] `cargo check` zonder warnings
-- [ ] `cargo clippy` zonder warnings (of expliciet gemotiveerde `#[allow]`)
-- [ ] `cargo test` (default features) groen
-- [ ] CHANGELOG.md bijgewerkt onder `[Unreleased]` met de 7 blocker-fixes
-- [ ] AGENTS.md status-sectie bijgewerkt: alle fases ✅
-- [ ] `REVIEW_features-symbol-references.md` heeft een afsluitende sectie "Fixes toegepast" die per fase linkt naar de commit-SHA
+- [x] **Fase 1:** JSON version-validatie geïmplementeerd, unit-test groen
+- [x] **Fase 2:** `detect_helper` cachet ook negatieve resultaten (handmatig getest met ontbrekende helper)
+- [x] **Fase 3:** bincode payload heeft version byte, alle serialize/deserialize sites geüpdate, twee unit-tests groen
+- [x] **Fase 4:** Sites B en C in `serve/mod.rs` en `mcp/mod.rs` hergebruiken `IndexManager.symbol_registry` via service-state
+- [x] **Fase 4:** `grep -rn "SymbolIndexerRegistry::new" src/` returnt exact 4 hits (IndexManager×2, ServeState, CodesearchService)
+- [x] **Fase 4:** `#[allow(dead_code)]` weg van alle 6 SCIP-constants in `constants.rs`
+- [x] **Fase 5:** `scip_positions` LMDB-tabel werkt; `find_references_by_position` doet O(1) lookup (verifieer met tracing op fixture-repo)
+- [x] **Fase 6:** `scip_simple_names` LMDB-tabel werkt; `find_references` fuzzy fallback doet O(1) lookup
+- [x] **Fase 7:** Cargo feature `csharp_helper_integration` toegevoegd; integration-test groen onder die feature lokaal
+- [ ] **Fase 7:** CI-job voor de feature toegevoegd, eerste run groen op GitHub Actions *(na push te verifiëren)*
+- [x] **Fase 7:** 3 misleidende/lege tests in `tests/symbols_csharp_test.rs` opgeruimd
+- [x] `cargo check` zonder warnings
+- [x] `cargo clippy` zonder warnings (of expliciet gemotiveerde `#[allow]`)
+- [x] `cargo test` (default features) groen
+- [x] CHANGELOG.md bijgewerkt onder `[Unreleased]` met de 7 blocker-fixes
+- [x] AGENTS.md status-sectie bijgewerkt: alle fases ✅
+- [ ] `REVIEW_features-symbol-references.md` heeft een afsluitende sectie "Fixes toegepast" die per fase linkt naar de commit-SHA *(nog te doen)*
 - [ ] Handmatige eindtest op een echte Aprimo client repo: 2e en 3e MCP `find_impact` call < 100ms
 
 ## 8. Niet in scope

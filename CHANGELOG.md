@@ -33,6 +33,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`POST /repos/:alias/reindex?force=true&symbols=true`) for forced symbol
   index rebuilds.
 
+### Fixed
+
+- **JSON version validation** — `parse_json_index()` now rejects scip-csharp
+  index versions other than `"1.0"`, preventing silent breakage when the
+  helper is updated to an incompatible format.
+- **Helper detection failure cache** — `detect_helper()` now caches
+  "helper not found" results, eliminating repeated PATH lookups and
+  subprocess probes on every MCP `find_impact` request when the helper
+  is missing.
+- **Bincode schema versioning** — all LMDB payloads now include a
+  version byte. Reading data from a future schema version produces a
+  clear error with rebuild instructions instead of silent corruption.
+- **Shared `SymbolIndexerRegistry`** — `find_impact` (MCP) and
+  `trigger_symbol_rebuild` (HTTP) now reuse the shared registry from
+  `ServeState` instead of creating fresh instances per request,
+  restoring cache effectiveness.
+- **O(1) position lookup** — `find_references_by_position` now uses a
+  secondary `scip_positions` LMDB table instead of iterating and
+  deserializing every symbol in the database.
+- **O(1) fuzzy lookup** — `find_references` fuzzy fallback now uses a
+  secondary `scip_simple_names` LMDB table instead of a full-table
+  scan with bincode deserialization.
+- **Removed `#[allow(dead_code)]`** on 5 SCIP constants in
+  `constants.rs` that are now actively referenced from `csharp.rs`.
+
+### Breaking
+
+- **LMDB format change** — existing `scip` LMDB databases require a
+  full rebuild after this upgrade. The first `find_impact` call (or
+  explicit `reindex?symbols=true`) will trigger an automatic rebuild.
+  No manual data migration is needed.
+
 ### Changed
 
 - **Architecture is language-agnostic**: the `SymbolIndexer` trait and

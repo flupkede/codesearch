@@ -302,7 +302,7 @@ impl CSharpSymbolIndexer {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(64 * 1024 * 1024) // 64MB — symbol indexes are small
-                .max_dbs(6)
+                .max_dbs(8)
                 .open(&scip_dir)?
         };
         Ok(env)
