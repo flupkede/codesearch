@@ -90,8 +90,10 @@ impl CSharpSymbolIndexer {
         }
 
         let resolved = self.resolve_helper_path();
-        let mut lock = self.helper_path.lock().unwrap();
-        *lock = resolved.clone();
+        if resolved.is_some() {
+            let mut lock = self.helper_path.lock().unwrap();
+            *lock = resolved.clone();
+        }
         resolved
     }
 

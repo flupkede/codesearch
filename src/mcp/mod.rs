@@ -5357,7 +5357,7 @@ impl CodesearchService {
         };
 
         // Determine project root and db_path for the symbol index
-        let (_project_root, db_path) = if let Some(ref alias) = ctx.project_alias {
+        let (project_root, db_path) = if let Some(ref alias) = ctx.project_alias {
             let root = ctx.alias_roots.get(alias)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| self.project_path.clone());
@@ -5434,8 +5434,11 @@ impl CodesearchService {
             indexer.find_references(&db_path, request.symbol_name.as_ref().unwrap())
         } else {
             // Position-based lookup
-            let file = Path::new(request.file.as_ref().unwrap());
-            indexer.find_references_by_position(&db_path, file, request.line.unwrap())
+            let file = self.normalize_symbol_query_path(
+                &project_root,
+                Path::new(request.file.as_ref().unwrap()),
+            );
+            indexer.find_references_by_position(&db_path, &file, request.line.unwrap())
         };
 
         match result {
@@ -5460,6 +5463,16 @@ impl CodesearchService {
                 e
             ))])),
         }
+    }
+
+    fn normalize_symbol_query_path(&self, project_root: &Path, file: &Path) -> PathBuf {
+        if file.is_absolute() {
+            if let Ok(relative) = file.strip_prefix(project_root) {
+                return PathBuf::from(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+
+        PathBuf::from(file.to_string_lossy().replace('\\', "/"))
     }
 
     async fn find_imports(

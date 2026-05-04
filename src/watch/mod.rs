@@ -3,6 +3,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,13 +22,24 @@ fn normalize_event_path(path: &Path) -> PathBuf {
 
 /// Change information from git HEAD file.
 ///
-/// Contains both the old and new HEAD content when a branch switch is detected.
+/// Contains both the old and new HEAD content and resolved commit hashes when
+/// a branch switch or branch tip move is detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadChange {
     /// Previous HEAD content (e.g., "ref: refs/heads/main\n")
     pub old_head: String,
     /// New HEAD content (e.g., "ref: refs/heads/feature\n")
     pub new_head: String,
+    /// Previous resolved commit hash, if it could be determined.
+    pub old_commit: Option<String>,
+    /// New resolved commit hash, if it could be determined.
+    pub new_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedHeadState {
+    head_content: String,
+    resolved_commit: Option<String>,
 }
 
 /// Types of file system events we care about
@@ -303,10 +315,12 @@ impl Drop for FileWatcher {
 /// then polls cheaply by reading a single file and comparing content.
 #[derive(Clone)]
 pub struct GitHeadWatcher {
+    /// Git repository root used to resolve `git rev-parse HEAD`.
+    git_root: PathBuf,
     /// Resolved path to the HEAD file (e.g. /repo/.git/HEAD or worktree target)
     head_path: PathBuf,
-    /// Cached last HEAD content for change detection (thread-safe)
-    last_head_content: Arc<Mutex<Option<String>>>,
+    /// Cached last HEAD state for change detection (thread-safe)
+    last_head_state: Arc<Mutex<Option<CachedHeadState>>>,
 }
 
 impl GitHeadWatcher {
@@ -321,8 +335,9 @@ impl GitHeadWatcher {
         let head_path = Self::resolve_head_path(&git_root);
         tracing::debug!("👀 Git HEAD watcher: {}", head_path.display());
         Self {
+            git_root,
             head_path,
-            last_head_content: Arc::new(Mutex::new(None)),
+            last_head_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -373,27 +388,74 @@ impl GitHeadWatcher {
                 )
             })?;
 
-        let mut last = self.last_head_content.lock().await;
+        let current_commit = self.get_current_commit_hash();
+        let current_state = CachedHeadState {
+            head_content: current_content.clone(),
+            resolved_commit: current_commit.clone(),
+        };
+
+        let mut last = self.last_head_state.lock().await;
 
         let result = match &*last {
-            Some(prev) if prev != &current_content => Some(HeadChange {
-                old_head: prev.clone(),
-                new_head: current_content.clone(),
-            }),
+            Some(prev)
+                if prev.head_content != current_state.head_content
+                    || prev.resolved_commit != current_state.resolved_commit =>
+            {
+                Some(HeadChange {
+                    old_head: prev.head_content.clone(),
+                    new_head: current_state.head_content.clone(),
+                    old_commit: prev.resolved_commit.clone(),
+                    new_commit: current_state.resolved_commit.clone(),
+                })
+            }
             None => {
                 // First check — initialize, report no change
-                *last = Some(current_content);
+                *last = Some(current_state);
                 return Ok(None);
             }
             _ => None,
         };
 
         if result.is_some() {
-            tracing::info!("🔀 Git HEAD changed (branch switch or HEAD moved)");
-            *last = Some(current_content);
+            tracing::info!("🔀 Git HEAD changed (branch switch, HEAD moved, or commit advanced)");
+            *last = Some(current_state);
         }
 
         Ok(result)
+    }
+
+    /// Resolve the current commit hash for HEAD.
+    ///
+    /// Returns `None` when git is unavailable or the repo state cannot be
+    /// resolved. HEAD content changes are still detected independently.
+    fn get_current_commit_hash(&self) -> Option<String> {
+        let output = Command::new("git")
+            .current_dir(&self.git_root)
+            .args(["rev-parse", "HEAD"])
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if hash.is_empty() { None } else { Some(hash) }
+            }
+            Ok(output) => {
+                tracing::debug!(
+                    "Failed to resolve HEAD commit hash in {}: {}",
+                    self.git_root.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to execute git rev-parse in {}: {}",
+                    self.git_root.display(),
+                    e
+                );
+                None
+            }
+        }
     }
 
     /// Get the current HEAD reference (branch name or commit hash).
@@ -409,7 +471,22 @@ impl GitHeadWatcher {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<()> {
+        let output = Command::new("git").args(args).current_dir(cwd).output()?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn test_is_watchable() {
@@ -461,5 +538,42 @@ mod tests {
         let events = watcher.poll_events();
 
         assert!(!events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_git_head_watcher_detects_commit_advance_without_head_change() {
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path();
+
+        run_git(repo_path, &["init"]).unwrap();
+        run_git(repo_path, &["config", "user.name", "Test User"]).unwrap();
+        run_git(repo_path, &["config", "user.email", "test@example.com"]).unwrap();
+
+        fs::create_dir_all(repo_path.join("src")).unwrap();
+        fs::write(
+            repo_path.join("src/main.rs"),
+            "fn main() { println!(\"hello\"); }\n",
+        )
+        .unwrap();
+        run_git(repo_path, &["add", "."]).unwrap();
+        run_git(repo_path, &["commit", "-m", "initial"]).unwrap();
+
+        let watcher = GitHeadWatcher::new(repo_path.to_path_buf());
+
+        assert!(watcher.check().await.unwrap().is_none());
+
+        fs::write(
+            repo_path.join("src/main.rs"),
+            "fn main() { println!(\"hello again\"); }\n",
+        )
+        .unwrap();
+        run_git(repo_path, &["add", "."]).unwrap();
+        run_git(repo_path, &["commit", "-m", "advance head"]).unwrap();
+
+        let change = watcher.check().await.unwrap().expect("expected head change");
+        assert_eq!(change.old_head, change.new_head);
+        assert_ne!(change.old_commit, change.new_commit);
+        assert!(change.old_commit.is_some());
+        assert!(change.new_commit.is_some());
     }
 }
