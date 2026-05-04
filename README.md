@@ -23,6 +23,7 @@ graph TB
     Router --> Find[find tool]
     Router --> Explore[explore tool]
     Router --> GetChunk[get_chunk tool]
+    Router --> FindImpact[find_impact tool]
     Router --> Status[status tool]
 
     Search -->|mode=semantic| Semantic[Vector ANN + BM25 + RRF Fusion]
@@ -40,6 +41,9 @@ graph TB
     Tantivy --> TantivyIdx[(Tantivy Index)]
 
     GetChunk --> LMDB
+
+    FindImpact -->|C# symbols| CSharpHelper[scip-csharp helper]
+    CSharpHelper -->|SCIP index| ScipLMDB[(LMDB scip_symbols)]
 
     subgraph "Serve Mode (multi-repo)"
         ServeRouter[HTTP Router] -->|project/group routing| Repo1[Repo A]
@@ -59,8 +63,11 @@ Download pre-built binaries from [Releases](https://github.com/flupkede/codesear
 | Platform | Download |
 |----------|----------|
 | Windows x86_64 | `codesearch-windows-x86_64.zip` |
+| Windows x86_64 + C# | `codesearch-windows-x86_64-with-csharp.zip` |
 | Linux x86_64 | `codesearch-linux-x86_64.tar.gz` |
+| Linux x86_64 + C# | `codesearch-linux-x86_64-with-csharp.tar.gz` |
 | macOS ARM64 | `codesearch-macos-arm64.tar.gz` |
+| macOS ARM64 + C# | `codesearch-macos-arm64-with-csharp.tar.gz` |
 
 Or build from source:
 
@@ -235,6 +242,22 @@ codesearch serve
 
 In multi-repo mode: auto-routes when chunk_id is unique; returns candidates list when ambiguous.
 
+### `find_impact` — Symbol Reference Impact
+
+Find all call-sites and references to a symbol with file/line precision, powered by per-language semantic analysis. Currently supports **C#** (via the bundled `scip-csharp` helper).
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `symbol_name` | string | Symbol name (e.g. `"FieldDefinition.Validate"`) |
+| `file` | string | File path for position-based lookup |
+| `line` | int | Line number for position-based lookup |
+| `language` | string | Language hint (auto-detected from file extension) |
+| `project` / `group` | string | Multi-repo routing |
+
+Returns a list of references with `file`, `start_line`, `end_line`, and `kind` (e.g. `"call"`, `"definition"`). Exposes `index_age_seconds` so agents can reason about staleness.
+
+> **Note:** Requires the `-with-csharp` release variant or a separately installed `scip-csharp` helper. See [C# Semantic Search](#c-semantic-search).
+
 ### `status` — Index Info
 
 | Parameter | Type | Description |
@@ -327,6 +350,7 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
+| `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
 
 ### `.codesearchignore`
@@ -345,6 +369,37 @@ node_modules/
 ### `repos.json`
 
 Located at `~/.codesearch/repos.json`. Managed by `codesearch index add/rm`. Contains repo aliases → paths and group definitions. See [Serve Mode](#serve-mode-multi-repo).
+
+## C# Semantic Search
+
+codesearch supports IDE-class "Find All References" for C# via an optional `scip-csharp` helper that wraps Roslyn's `SymbolFinder`. This enables the `find_impact` MCP tool, which returns transitive call-sites of any symbol with file/line precision.
+
+### Two release variants
+
+| Variant | Includes `scip-csharp` | Use when |
+|---------|------------------------|----------|
+| `codesearch-<platform>` | No | You don't need C# symbol references |
+| `codesearch-<platform>-with-csharp` | Yes (in `helpers/csharp/`) | You work with C# repos |
+
+The `-with-csharp` variant bundles the `scip-csharp` helper as a framework-dependent .NET 10 binary (~5–15 MB). It requires the .NET 10 runtime to be installed on the host machine. If you already have .NET 10 (which C# developers do), there is no additional setup.
+
+### How it works
+
+1. When a C# repo is registered, codesearch detects `.sln`/`.csproj` files
+2. The `scip-csharp` helper runs Roslyn analysis and produces a symbol reference index
+3. References are stored in LMDB (`scip_symbols` table)
+4. `.cs` file changes trigger a debounced rebuild (60s quiet period)
+5. `find_impact` queries the index and returns references
+
+### Helper detection
+
+codesearch looks for `scip-csharp` in this order:
+
+1. `<codesearch-exe-dir>/helpers/csharp/scip-csharp[.exe]` (bundled in `-with-csharp` releases)
+2. `$PATH` lookup of `scip-csharp` (if installed via `dotnet tool install --global`)
+3. Path specified by `CODESEARCH_SCIP_CSHARP` environment variable
+
+If the helper is not found, `find_impact` returns a structured error with installation instructions. All other tools (search, find, explore, get_chunk, status) continue to work normally.
 
 ## Supported Languages
 

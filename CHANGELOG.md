@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`find_impact` MCP tool** — returns transitive call-sites and references for
+  a symbol with file/line precision, enabling agents to plan refactors with
+  IDE-class accuracy instead of relying on text-matching grep heuristics.
+  Supports name-based lookup (`symbol_name`) and position-based lookup
+  (`file` + `line`). Currently supports **C#** via the `scip-csharp` helper.
+- **C# semantic analysis helper (`scip-csharp`)** — a small .NET 10 CLI tool
+  that wraps Roslyn's `SymbolFinder.FindReferencesAsync()` and produces a
+  symbol reference index. Framework-dependent, ~5–15 MB. Bundled in the new
+  `-with-csharp` release variants, or available via `$PATH` / env var override.
+- **`-with-csharp` release variants** — pre-built release archives that include
+  the `scip-csharp` helper alongside the codesearch binary. Available for all
+  three platforms (Windows, Linux, macOS). The existing "kale" archives are
+  unchanged and remain available for users who don't need C# symbol references.
+- **`.cs` file watcher debounce** — 60-second quiet period after `.cs` file
+  changes triggers an automatic symbol index rebuild. Buffer is cleared on git
+  branch switches to avoid stale rebuilds.
+- **`symbols=true` query parameter** on the serve reindex endpoint
+  (`POST /repos/:alias/reindex?force=true&symbols=true`) for forced symbol
+  index rebuilds.
+
+### Changed
+
+- **Architecture is language-agnostic**: the `SymbolIndexer` trait and
+  per-language adapter pattern are in place. Future branches can add Python
+  (scip-python), TypeScript (scip-typescript), Rust (scip-rust), etc. without
+  redesigning.
+
 ## [1.0.81] - 2026-05-02
 
 ### Added
