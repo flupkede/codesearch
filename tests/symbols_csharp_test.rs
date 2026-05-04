@@ -2,12 +2,15 @@
 //!
 //! Tests the JSON parsing → LMDB storage → query round-trip
 //! without requiring the actual scip-csharp helper binary.
+//!
+//! Integration tests that invoke the helper subprocess are gated behind
+//! the `csharp_helper_integration` cargo feature.
 
 use std::path::PathBuf;
 
 use codesearch::symbols::scip_parse;
-use codesearch::symbols::{SymbolIndexer, SymbolReference};
 use codesearch::symbols::csharp::CSharpSymbolIndexer;
+use codesearch::symbols::{RebuildScope, SymbolIndexer};
 use tempfile::TempDir;
 
 /// Sample JSON mimicking the output of scip-csharp for a small C# project.
@@ -116,20 +119,7 @@ fn test_parse_json_index_from_sample() {
 }
 
 #[test]
-fn test_parse_json_index_fuzzy_symbol_match() {
-    // Test that the indexer can find references with partial symbol names
-    let _index = scip_parse::parse_json_index(SAMPLE_INDEX_JSON.as_bytes())
-        .expect("Failed to parse sample JSON");
-
-    // The fuzzy matching is in csharp.rs, not in scip_parse.
-    // This test validates the parsed index is complete enough for fuzzy matching.
-}
-
-#[test]
-fn test_lmdb_round_trip() {
-    // This test simulates: parse JSON → store in LMDB → query
-    // We create a fake DB path, write parsed data, then read it back.
-
+fn test_indexer_returns_empty_when_db_missing() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let db_path = temp_dir.path().join("test-db");
     std::fs::create_dir_all(&db_path).expect("Failed to create db dir");
@@ -141,29 +131,12 @@ fn test_lmdb_round_trip() {
 
     // Test index_age with no LMDB data — should return u64::MAX
     let age = indexer.index_age(&db_path);
-    // If the SCIP env doesn't exist yet, age is MAX
-    // But open_scip_env creates the dir, so let's just verify it doesn't panic
+    // open_scip_env creates the dir, so just verify it doesn't panic
     let _ = age;
 
     // Test find_references with no data — should return error
     let result = indexer.find_references(&db_path, "Calculator.Add");
     assert!(result.is_err(), "Should fail when no SCIP data exists");
-}
-
-#[test]
-fn test_symbol_reference_conversion() {
-    // Verify SymbolReference struct has the expected shape
-    let reference = SymbolReference {
-        file: PathBuf::from("src/Calculator.cs"),
-        start_line: 8,
-        end_line: 8,
-        kind: "definition".to_string(),
-    };
-
-    assert_eq!(reference.file.to_string_lossy(), "src/Calculator.cs");
-    assert_eq!(reference.start_line, 8);
-    assert_eq!(reference.end_line, 8);
-    assert_eq!(reference.kind, "definition");
 }
 
 #[test]
@@ -217,4 +190,105 @@ fn test_parse_json_index_role_fallback() {
     assert_eq!(refs[0].kind, "definition");
     // symbol_roles=0 should map to "reference" via role_to_kind
     assert_eq!(refs[1].kind, "reference");
+}
+
+// ── Integration tests (require scip-csharp helper) ─────────────────
+
+/// Full pipeline integration test: scip-csharp subprocess → JSON → LMDB → query.
+///
+/// Requires the `csharp_helper_integration` feature flag AND either:
+/// - `CODESEARCH_SCIP_CSHARP` env var pointing to the helper binary, or
+/// - the helper binary at `helpers/csharp/bin/Release/net10.0/scip-csharp`
+#[test]
+#[cfg_attr(not(feature = "csharp_helper_integration"), ignore)]
+fn test_csharp_pipeline_smallsolution_roundtrip() {
+    // Locate fixture
+    let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("helpers/csharp/tests/Fixtures/SmallSolution");
+    assert!(
+        fixture_root.join("SmallSolution.sln").exists(),
+        "Fixture not found at {}",
+        fixture_root.display()
+    );
+
+    // Locate helper binary
+    let helper = std::env::var("CODESEARCH_SCIP_CSHARP")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("helpers/csharp/bin/Release/net10.0/scip-csharp");
+            if candidate.exists() {
+                Ok(candidate)
+            } else {
+                Err(())
+            }
+        })
+        .expect(
+            "scip-csharp helper not found. Set CODESEARCH_SCIP_CSHARP env var \
+             or build the helper via `dotnet publish`.",
+        );
+    std::env::set_var("CODESEARCH_SCIP_CSHARP", &helper);
+
+    // Setup tempdir for LMDB
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path();
+
+    // Rebuild
+    let indexer = CSharpSymbolIndexer::new();
+    assert!(
+        indexer.is_available(),
+        "Helper detection failed — binary at {}",
+        helper.display()
+    );
+    let summary = indexer
+        .rebuild(&fixture_root, db_path, RebuildScope::Full)
+        .expect("rebuild failed");
+    assert!(
+        summary.symbols_indexed > 0,
+        "No symbols indexed from fixture"
+    );
+
+    // Query: exact match for Calculator.Add should have >=2 occurrences
+    let add_refs = indexer
+        .find_references(
+            db_path,
+            "csharp SmallSolution.Library . Calculator#Add(int, int).",
+        )
+        .expect("find_references failed");
+    assert!(
+        add_refs.len() >= 2,
+        "Expected >=2 refs for Calculator.Add, got {}",
+        add_refs.len()
+    );
+
+    // Verify definition is in Calculator.cs
+    let defs: Vec<_> = add_refs.iter().filter(|r| r.kind == "definition").collect();
+    assert_eq!(defs.len(), 1, "Expected 1 definition for Calculator.Add");
+
+    // Fuzzy query: "Add" should resolve to Calculator.Add
+    let fuzzy_refs = indexer.find_references(db_path, "Add").expect("fuzzy find_references failed");
+    assert!(
+        !fuzzy_refs.is_empty(),
+        "Fuzzy lookup for 'Add' should resolve to Calculator.Add"
+    );
+
+    // Position-based lookup: find what's defined on Calculator.cs line 8
+    let pos_refs = indexer
+        .find_references_by_position(
+            db_path,
+            &PathBuf::from("src/Library/Calculator.cs"),
+            8,
+        )
+        .expect("find_references_by_position failed");
+    assert!(
+        !pos_refs.is_empty(),
+        "Position lookup for Calculator.cs:8 should return references"
+    );
+    // The definition at line 8 should be Calculator.Add
+    let pos_defs: Vec<_> = pos_refs.iter().filter(|r| r.kind == "definition").collect();
+    assert_eq!(
+        pos_defs.len(),
+        1,
+        "Expected 1 definition at Calculator.cs:8"
+    );
 }

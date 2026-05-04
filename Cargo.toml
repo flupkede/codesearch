@@ -124,3 +124,4 @@ inherits = "release"
 default = []
 cuda = ["ort/cuda"]        # Enable CUDA GPU acceleration (requires cuDNN)
 tensorrt = ["ort/tensorrt"] # Enable TensorRT acceleration (NVIDIA only)
+csharp_helper_integration = []  # Enable integration tests that require the scip-csharp helper binary

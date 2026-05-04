@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, "feature/**"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo build --release
+      - run: cargo test --lib -- --nocapture
+      - run: cargo test --test '*' -- --nocapture --skip ignore
+      - run: cargo fmt -- --check
+      - run: cargo clippy -- -D warnings
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo test --lib -- --nocapture
+      - run: cargo test --test '*' -- --nocapture --skip ignore
+
+  csharp-integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build scip-csharp helper
+        run: |
+          cd helpers/csharp
+          dotnet publish -c Release --no-self-contained -o bin/Release/net10.0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run C# integration tests
+        run: |
+          export CODESEARCH_SCIP_CSHARP="$PWD/helpers/csharp/bin/Release/net10.0/scip-csharp"
+          cargo test --features csharp_helper_integration -- --include-ignored --nocapture
