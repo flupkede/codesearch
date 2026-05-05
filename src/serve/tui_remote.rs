@@ -282,8 +282,9 @@ fn render_table(
         .iter()
         .map(|r| {
             let extra = match r.csharp_index.as_str() {
-                "ready" => 4,   // " C#·"
-                "error" => 4,   // " C#!"
+                "ready" => 4,    // " C#·"
+                "error" => 4,    // " C#!"
+                "indexing" => 5, // " C#⟳" or " C#·"
                 _ => 0,
             };
             r.alias.len() + extra
@@ -317,6 +318,22 @@ fn render_table(
                 "error" => {
                     Cell::from(format!("{} C#!", repo.alias))
                         .style(Style::default().fg(Color::Red))
+                }
+                "indexing" => {
+                    // Pulsing C# indicator during indexing
+                    let bright = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        % 1000
+                        < 500;
+                    if bright {
+                        Cell::from(format!("{} C#⟳", repo.alias))
+                            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    } else {
+                        Cell::from(format!("{} C#·", repo.alias))
+                            .style(Style::default().fg(Color::DarkGray))
+                    }
                 }
                 _ => {
                     Cell::from(repo.alias.clone()).style(Style::default().fg(Color::White))
@@ -412,11 +429,29 @@ fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_s
     let csharp_str = match repo.csharp_index.as_str() {
         "ready" => "  C#·",
         "error" => "  C#!",
+        "indexing" => {
+            let bright = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                % 1000
+                < 500;
+            if bright { "  C#⟳" } else { "  C#·" }
+        }
         _ => "",
     };
     let csharp_color = match repo.csharp_index.as_str() {
         "ready" => Color::Green,
         "error" => Color::Red,
+        "indexing" => {
+            let bright = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                % 1000
+                < 500;
+            if bright { Color::Yellow } else { Color::DarkGray }
+        }
         _ => Color::DarkGray,
     };
     let info_line = Line::from(vec![

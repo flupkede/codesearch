@@ -59,6 +59,8 @@ pub(crate) enum CSharpIndexStatus {
     Ready,
     /// Index exists but had errors or is stale.
     Error,
+    /// Symbol index is currently being built.
+    Indexing,
 }
 
 /// Lightweight repo status derived from DashMap state only (no DB opens).
@@ -1321,6 +1323,7 @@ async fn status_handler(
                 CSharpIndexStatus::None => "none",
                 CSharpIndexStatus::Ready => "ready",
                 CSharpIndexStatus::Error => "error",
+                CSharpIndexStatus::Indexing => "indexing",
             };
             json!({
                 "alias": alias,
@@ -1389,6 +1392,9 @@ async fn trigger_symbol_rebuild(
     state: &Arc<ServeState>,
 ) {
     tracing::info!("🔬 Symbol reindex triggered for '{}' via HTTP API", alias);
+    state
+        .csharp_index_status
+        .insert(alias.to_string(), CSharpIndexStatus::Indexing);
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
     let alias_owned = alias.to_string();

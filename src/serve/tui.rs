@@ -241,6 +241,7 @@ fn render_table(
             let extra = match info.csharp_index {
                 super::CSharpIndexStatus::Ready => 4,   // " C#·"
                 super::CSharpIndexStatus::Error => 4,   // " C#!"
+                super::CSharpIndexStatus::Indexing => 5, // " C#⟳" or " C#·"
                 super::CSharpIndexStatus::None => 0,
             };
             a.len() + extra
@@ -277,6 +278,23 @@ fn render_table(
                     // Red C# indicator for errored index
                     Cell::from(format!("{} C#!", alias))
                         .style(Style::default().fg(Color::Red))
+                }
+                super::CSharpIndexStatus::Indexing => {
+                    // Pulsing C# indicator during indexing:
+                    // alternate between bright yellow and dim every ~500ms
+                    let bright = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        % 1000
+                        < 500;
+                    if bright {
+                        Cell::from(format!("{} C#⟳", alias))
+                            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    } else {
+                        Cell::from(format!("{} C#·", alias))
+                            .style(Style::default().fg(Color::DarkGray))
+                    }
                 }
                 super::CSharpIndexStatus::None => {
                     Cell::from(alias.clone()).style(Style::default().fg(Color::White))
@@ -389,11 +407,30 @@ fn render_detail(
         super::CSharpIndexStatus::None => "",
         super::CSharpIndexStatus::Ready => "  C#·",
         super::CSharpIndexStatus::Error => "  C#!",
+        super::CSharpIndexStatus::Indexing => {
+            // Pulsing indicator in detail view too
+            let bright = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                % 1000
+                < 500;
+            if bright { "  C#⟳" } else { "  C#·" }
+        }
     };
     let csharp_color = match info.csharp_index {
         super::CSharpIndexStatus::Ready => Color::Green,
         super::CSharpIndexStatus::Error => Color::Red,
         super::CSharpIndexStatus::None => Color::DarkGray,
+        super::CSharpIndexStatus::Indexing => {
+            let bright = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                % 1000
+                < 500;
+            if bright { Color::Yellow } else { Color::DarkGray }
+        }
     };
     let info_line = Line::from(vec![
         Span::styled("   changes:", Style::default().fg(Color::DarkGray)),
