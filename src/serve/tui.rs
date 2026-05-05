@@ -225,7 +225,14 @@ fn render_table(
     repos: &[(String, super::RepoStatusInfo)],
     table_state: &mut TableState,
 ) {
-    let header_cells = ["Alias", "Status", "Changes", "Calls", "Last Tool Call", "Lock"];
+    let header_cells = [
+        "Alias",
+        "Status",
+        "Changes",
+        "Calls",
+        "Last Tool Call",
+        "Lock",
+    ];
     let header = Row::new(
         header_cells
             .iter()
@@ -239,8 +246,8 @@ fn render_table(
         .map(|(a, info)| {
             // Account for C# indicator suffix
             let extra = match info.csharp_index {
-                super::CSharpIndexStatus::Ready => 4,   // " C#·"
-                super::CSharpIndexStatus::Error => 4,   // " C#!"
+                super::CSharpIndexStatus::Ready => 4,    // " C#·"
+                super::CSharpIndexStatus::Error => 4,    // " C#!"
                 super::CSharpIndexStatus::Indexing => 5, // " C#⟳" or " C#·"
                 super::CSharpIndexStatus::None => 0,
             };
@@ -271,13 +278,11 @@ fn render_table(
             let alias_cell = match info.csharp_index {
                 super::CSharpIndexStatus::Ready => {
                     // Green C# indicator for healthy index
-                    Cell::from(format!("{} C#·", alias))
-                        .style(Style::default().fg(Color::White))
+                    Cell::from(format!("{} C#·", alias)).style(Style::default().fg(Color::White))
                 }
                 super::CSharpIndexStatus::Error => {
                     // Red C# indicator for errored index
-                    Cell::from(format!("{} C#!", alias))
-                        .style(Style::default().fg(Color::Red))
+                    Cell::from(format!("{} C#!", alias)).style(Style::default().fg(Color::Red))
                 }
                 super::CSharpIndexStatus::Indexing => {
                     // Pulsing C# indicator during indexing:
@@ -289,8 +294,11 @@ fn render_table(
                         % 1000
                         < 500;
                     if bright {
-                        Cell::from(format!("{} C#⟳", alias))
-                            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                        Cell::from(format!("{} C#⟳", alias)).style(
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
                     } else {
                         Cell::from(format!("{} C#·", alias))
                             .style(Style::default().fg(Color::DarkGray))
@@ -415,7 +423,11 @@ fn render_detail(
                 .as_millis()
                 % 1000
                 < 500;
-            if bright { "  C#⟳" } else { "  C#·" }
+            if bright {
+                "  C#⟳"
+            } else {
+                "  C#·"
+            }
         }
     };
     let csharp_color = match info.csharp_index {
@@ -429,7 +441,11 @@ fn render_detail(
                 .as_millis()
                 % 1000
                 < 500;
-            if bright { Color::Yellow } else { Color::DarkGray }
+            if bright {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }
         }
     };
     let info_line = Line::from(vec![

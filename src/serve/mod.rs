@@ -1042,7 +1042,10 @@ impl ServeState {
                 .unwrap_or_else(|| {
                     // Probe: helper available + index exists → Ready
                     let registry = &self.symbol_registry;
-                    let has_helper = registry.get("csharp").map(|i| i.is_available()).unwrap_or(false);
+                    let has_helper = registry
+                        .get("csharp")
+                        .map(|i| i.is_available())
+                        .unwrap_or(false);
                     if has_helper && registry.has_index_for("csharp", &db_path) {
                         CSharpIndexStatus::Ready
                     } else {
@@ -1568,13 +1571,7 @@ async fn reindex_handler(
 
             // 4. Optional symbol index rebuild
             if do_symbols {
-                trigger_symbol_rebuild(
-                    &alias_bg,
-                    &project_path,
-                    &db_path,
-                    &g_state,
-                )
-                .await;
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
             }
 
             g_state.active_reindexes.remove(&g_alias);
@@ -1619,13 +1616,7 @@ async fn reindex_handler(
 
             // Optional symbol index rebuild
             if do_symbols {
-                trigger_symbol_rebuild(
-                    &alias_bg,
-                    &project_path,
-                    &db_path,
-                    &g_state,
-                )
-                .await;
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
             }
 
             g_state.active_reindexes.remove(&g_alias);

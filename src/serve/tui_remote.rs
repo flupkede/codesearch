@@ -269,7 +269,14 @@ fn render_table(
     repos: &[RepoInfo],
     table_state: &mut TableState,
 ) {
-    let header_cells = ["Alias", "Status", "Changes", "Calls", "Last Tool Call", "Lock"];
+    let header_cells = [
+        "Alias",
+        "Status",
+        "Changes",
+        "Calls",
+        "Last Tool Call",
+        "Lock",
+    ];
     let header = Row::new(
         header_cells
             .iter()
@@ -311,13 +318,10 @@ fn render_table(
 
             // Alias cell with optional C# indicator
             let alias_cell = match repo.csharp_index.as_str() {
-                "ready" => {
-                    Cell::from(format!("{} C#·", repo.alias))
-                        .style(Style::default().fg(Color::White))
-                }
+                "ready" => Cell::from(format!("{} C#·", repo.alias))
+                    .style(Style::default().fg(Color::White)),
                 "error" => {
-                    Cell::from(format!("{} C#!", repo.alias))
-                        .style(Style::default().fg(Color::Red))
+                    Cell::from(format!("{} C#!", repo.alias)).style(Style::default().fg(Color::Red))
                 }
                 "indexing" => {
                     // Pulsing C# indicator during indexing
@@ -328,16 +332,17 @@ fn render_table(
                         % 1000
                         < 500;
                     if bright {
-                        Cell::from(format!("{} C#⟳", repo.alias))
-                            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                        Cell::from(format!("{} C#⟳", repo.alias)).style(
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
                     } else {
                         Cell::from(format!("{} C#·", repo.alias))
                             .style(Style::default().fg(Color::DarkGray))
                     }
                 }
-                _ => {
-                    Cell::from(repo.alias.clone()).style(Style::default().fg(Color::White))
-                }
+                _ => Cell::from(repo.alias.clone()).style(Style::default().fg(Color::White)),
             };
 
             // Red alias if the repo has errors
@@ -436,7 +441,11 @@ fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_s
                 .as_millis()
                 % 1000
                 < 500;
-            if bright { "  C#⟳" } else { "  C#·" }
+            if bright {
+                "  C#⟳"
+            } else {
+                "  C#·"
+            }
         }
         _ => "",
     };
@@ -450,7 +459,11 @@ fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_s
                 .as_millis()
                 % 1000
                 < 500;
-            if bright { Color::Yellow } else { Color::DarkGray }
+            if bright {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }
         }
         _ => Color::DarkGray,
     };
