@@ -219,6 +219,17 @@ fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str) {
     f.render_widget(ratatui::widgets::Paragraph::new(title_line), centered[0]);
 }
 
+/// Returns true during the "bright" phase of a ~1s pulse cycle (500ms bright, 500ms dim).
+/// Used to animate the C# indicator while symbol indexing is in progress.
+fn pulse_bright() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        % 1000
+        < 500
+}
+
 fn render_table(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -285,16 +296,9 @@ fn render_table(
                     Cell::from(format!("{} C#!", alias)).style(Style::default().fg(Color::Red))
                 }
                 super::CSharpIndexStatus::Indexing => {
-                    // Pulsing C# indicator during indexing:
-                    // alternate between bright yellow and dim every ~500ms
-                    let bright = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                        % 1000
-                        < 500;
-                    if bright {
-                        Cell::from(format!("{} C#⟳", alias)).style(
+                    // Pulsing C# indicator during indexing
+                    if pulse_bright() {
+                        Cell::from(format!("{} C#\u{27F3}", alias)).style(
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
@@ -416,15 +420,8 @@ fn render_detail(
         super::CSharpIndexStatus::Ready => "  C#·",
         super::CSharpIndexStatus::Error => "  C#!",
         super::CSharpIndexStatus::Indexing => {
-            // Pulsing indicator in detail view too
-            let bright = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                % 1000
-                < 500;
-            if bright {
-                "  C#⟳"
+            if pulse_bright() {
+                "  C#\u{27F3}"
             } else {
                 "  C#·"
             }
@@ -435,13 +432,7 @@ fn render_detail(
         super::CSharpIndexStatus::Error => Color::Red,
         super::CSharpIndexStatus::None => Color::DarkGray,
         super::CSharpIndexStatus::Indexing => {
-            let bright = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                % 1000
-                < 500;
-            if bright {
+            if pulse_bright() {
                 Color::Yellow
             } else {
                 Color::DarkGray

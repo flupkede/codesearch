@@ -263,6 +263,16 @@ fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str, version: &
     f.render_widget(ratatui::widgets::Paragraph::new(title_line), centered[0]);
 }
 
+/// Returns true during the "bright" phase of a ~1s pulse cycle (500ms bright, 500ms dim).
+fn pulse_bright() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        % 1000
+        < 500
+}
+
 fn render_table(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -325,14 +335,8 @@ fn render_table(
                 }
                 "indexing" => {
                     // Pulsing C# indicator during indexing
-                    let bright = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                        % 1000
-                        < 500;
-                    if bright {
-                        Cell::from(format!("{} C#⟳", repo.alias)).style(
+                    if pulse_bright() {
+                        Cell::from(format!("{} C#\u{27F3}", repo.alias)).style(
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
@@ -435,14 +439,8 @@ fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_s
         "ready" => "  C#·",
         "error" => "  C#!",
         "indexing" => {
-            let bright = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                % 1000
-                < 500;
-            if bright {
-                "  C#⟳"
+            if pulse_bright() {
+                "  C#\u{27F3}"
             } else {
                 "  C#·"
             }
@@ -453,13 +451,7 @@ fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_s
         "ready" => Color::Green,
         "error" => Color::Red,
         "indexing" => {
-            let bright = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                % 1000
-                < 500;
-            if bright {
+            if pulse_bright() {
                 Color::Yellow
             } else {
                 Color::DarkGray
