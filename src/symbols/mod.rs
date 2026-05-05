@@ -119,6 +119,10 @@ pub trait SymbolIndexer: Send + Sync {
 
     /// Whether the helper binary for this language is available.
     fn is_available(&self) -> bool;
+
+    /// Whether a symbol index exists for the given database path.
+    /// Returns `true` if the LMDB symbol tables have been populated.
+    fn has_index(&self, db_path: &Path) -> bool;
 }
 
 // ── Language dispatch ─────────────────────────────────────────────
@@ -157,6 +161,23 @@ impl SymbolIndexerRegistry {
         self.indexers
             .iter()
             .filter(|i| i.is_available())
+            .map(|i| i.language().to_string())
+            .collect()
+    }
+
+    /// Check whether a specific language has a built index for the given db_path.
+    pub fn has_index_for(&self, language: &str, db_path: &Path) -> bool {
+        self.get(language)
+            .map(|i| i.has_index(db_path))
+            .unwrap_or(false)
+    }
+
+    /// List languages that have a built index for the given db_path.
+    #[allow(dead_code)]
+    pub fn indexed_languages(&self, db_path: &Path) -> Vec<String> {
+        self.indexers
+            .iter()
+            .filter(|i| i.has_index(db_path))
             .map(|i| i.language().to_string())
             .collect()
     }

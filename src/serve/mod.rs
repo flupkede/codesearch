@@ -38,7 +38,7 @@ use crate::db_discovery::repos::ReposConfig;
 use crate::index::{IndexManager, SharedStores};
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{RebuildScope, SymbolIndexerRegistry};
-/// Lightweight repo status derived from DashMap state only (no DB opens).
+/// Lightweight repo status label derived from DashMap state only (no DB opens).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepoStateLabel {
     Open,
@@ -48,6 +48,26 @@ pub(crate) enum RepoStateLabel {
     Indexing,
     Error,
     NoIndex,
+}
+
+/// Status of the C# symbol index for a repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CSharpIndexStatus {
+    /// No C# helper detected or no index built.
+    None,
+    /// Helper available and index built successfully.
+    Ready,
+    /// Index exists but had errors or is stale.
+    Error,
+}
+
+/// Lightweight repo status derived from DashMap state only (no DB opens).
+pub(crate) struct RepoStatusInfo {
+    pub(crate) status: RepoStateLabel,
+    pub(crate) changes: u64,
+    pub(crate) last_tool_call: Option<String>,
+    pub(crate) tool_call_count: u64,
+    pub(crate) csharp_index: CSharpIndexStatus,
 }
 
 impl RepoStateLabel {
@@ -63,13 +83,6 @@ impl RepoStateLabel {
             Self::NoIndex => "No Index".dimmed(),
         }
     }
-}
-
-/// Lightweight status info for a single repo (no DB I/O).
-pub(crate) struct RepoStatusInfo {
-    pub(crate) status: RepoStateLabel,
-    pub(crate) changes: u64,
-    pub(crate) last_tool_call: Option<String>,
 }
 
 /// Format a tool call name and elapsed time into a human-readable string.
@@ -150,6 +163,10 @@ pub(crate) struct ServeState {
     /// `find_impact` to reuse helper-detection cache instead of creating fresh
     /// instances per request.
     symbol_registry: Arc<SymbolIndexerRegistry>,
+    /// Per-repo total tool call count.
+    tool_call_counts: DashMap<String, AtomicU64>,
+    /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
+    csharp_index_status: DashMap<String, CSharpIndexStatus>,
     /// Test-only counter for reload invocations that actually swapped config.
     #[cfg(test)]
     reload_count: std::sync::atomic::AtomicUsize,
@@ -182,6 +199,8 @@ impl ServeState {
             total_sessions: AtomicU64::new(0),
             sysinfo_system: std::sync::Mutex::new(sys),
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
+            tool_call_counts: DashMap::new(),
+            csharp_index_status: DashMap::new(),
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -916,6 +935,13 @@ impl ServeState {
             alias.to_string(),
             (tool_name.to_string(), std::time::Instant::now()),
         );
+        // Increment total call count
+        self.tool_call_counts
+            .entry(alias.to_string())
+            .and_modify(|c| {
+                c.fetch_add(1, Ordering::Relaxed);
+            })
+            .or_insert_with(|| AtomicU64::new(1));
     }
 
     /// Record that changes were made to a repo (index/reindex).
@@ -1000,12 +1026,36 @@ impl ServeState {
                 .map(|e| (e.value().0.clone(), e.value().1.elapsed()))
                 .map(|(name, ago)| format_tool_call_ago(&name, ago));
 
+            let tool_call_count = self
+                .tool_call_counts
+                .get(alias)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+
+            // C# index status: check cached value first, then probe
+            let csharp_index = self
+                .csharp_index_status
+                .get(alias)
+                .map(|e| *e.value())
+                .unwrap_or_else(|| {
+                    // Probe: helper available + index exists → Ready
+                    let registry = &self.symbol_registry;
+                    let has_helper = registry.get("csharp").map(|i| i.is_available()).unwrap_or(false);
+                    if has_helper && registry.has_index_for("csharp", &db_path) {
+                        CSharpIndexStatus::Ready
+                    } else {
+                        CSharpIndexStatus::None
+                    }
+                });
+
             result.push((
                 alias.clone(),
                 RepoStatusInfo {
                     status: label,
                     changes,
                     last_tool_call: last_tool,
+                    tool_call_count,
+                    csharp_index,
                 },
             ));
         }
@@ -1267,12 +1317,19 @@ async fn status_handler(
                 RepoStateLabel::Warm | RepoStateLabel::Readonly => "read",
                 _ => "—",
             };
+            let csharp_str = match info.csharp_index {
+                CSharpIndexStatus::None => "none",
+                CSharpIndexStatus::Ready => "ready",
+                CSharpIndexStatus::Error => "error",
+            };
             json!({
                 "alias": alias,
                 "status": status_str,
                 "lock_mode": lock_mode,
                 "changes": info.changes,
                 "last_tool_call": info.last_tool_call,
+                "tool_call_count": info.tool_call_count,
+                "csharp_index": csharp_str,
             })
         })
         .collect();
@@ -1324,17 +1381,18 @@ async fn status_handler(
 /// Trigger a symbol index rebuild for a repo (C# etc.).
 ///
 /// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the C# indexer,
-/// and runs `rebuild()` in a blocking task.
+/// and runs `rebuild()` in a blocking task. Updates the C# index status on success/failure.
 async fn trigger_symbol_rebuild(
     alias: &str,
     project_path: &Path,
     db_path: &Path,
-    registry: Arc<SymbolIndexerRegistry>,
+    state: &Arc<ServeState>,
 ) {
     tracing::info!("🔬 Symbol reindex triggered for '{}' via HTTP API", alias);
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
     let alias_owned = alias.to_string();
+    let registry = state.symbol_registry.clone();
     match tokio::task::spawn_blocking(move || {
         let Some(indexer) = registry.get("csharp") else {
             return Err(anyhow::anyhow!("No C# symbol indexer registered"));
@@ -1354,9 +1412,15 @@ async fn trigger_symbol_rebuild(
                 summary.references_stored,
                 summary.duration_ms
             );
+            state
+                .csharp_index_status
+                .insert(alias_owned, CSharpIndexStatus::Ready);
         }
         Ok(Err(e)) => {
             tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, e);
+            state
+                .csharp_index_status
+                .insert(alias_owned, CSharpIndexStatus::Error);
         }
         Err(e) => {
             tracing::error!(
@@ -1364,6 +1428,9 @@ async fn trigger_symbol_rebuild(
                 alias_owned,
                 e
             );
+            state
+                .csharp_index_status
+                .insert(alias_owned, CSharpIndexStatus::Error);
         }
     }
 }
@@ -1499,7 +1566,7 @@ async fn reindex_handler(
                     &alias_bg,
                     &project_path,
                     &db_path,
-                    g_state.symbol_registry.clone(),
+                    &g_state,
                 )
                 .await;
             }
@@ -1550,7 +1617,7 @@ async fn reindex_handler(
                     &alias_bg,
                     &project_path,
                     &db_path,
-                    g_state.symbol_registry.clone(),
+                    &g_state,
                 )
                 .await;
             }

@@ -636,6 +636,15 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         now.saturating_sub(stored_ts)
     }
 
+    fn has_index(&self, db_path: &Path) -> bool {
+        let scip_dir = db_path.join("scip");
+        if !scip_dir.exists() {
+            return false;
+        }
+        // Quick check: if index_age is finite, the index exists
+        self.index_age(db_path) != u64::MAX
+    }
+
     fn is_available(&self) -> bool {
         self.detect_helper().is_some()
     }

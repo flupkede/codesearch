@@ -39,6 +39,8 @@ struct RepoInfo {
     lock_mode: String,
     changes: u64,
     last_tool_call: Option<String>,
+    tool_call_count: u64,
+    csharp_index: String,
 }
 
 #[derive(Debug, Default)]
@@ -267,7 +269,7 @@ fn render_table(
     repos: &[RepoInfo],
     table_state: &mut TableState,
 ) {
-    let header_cells = ["Alias", "Status", "Changes", "Last Tool Call", "Lock"];
+    let header_cells = ["Alias", "Status", "Changes", "Calls", "Last Tool Call", "Lock"];
     let header = Row::new(
         header_cells
             .iter()
@@ -278,7 +280,14 @@ fn render_table(
 
     let max_alias_w = repos
         .iter()
-        .map(|r| r.alias.len())
+        .map(|r| {
+            let extra = match r.csharp_index.as_str() {
+                "ready" => 4,   // " C#·"
+                "error" => 4,   // " C#!"
+                _ => 0,
+            };
+            r.alias.len() + extra
+        })
         .max()
         .unwrap_or(10)
         .max(10);
@@ -289,14 +298,43 @@ fn render_table(
             let status_cell = status_cell(&repo.status);
             let changes_cell =
                 Cell::from(format!("{}", repo.changes)).style(Style::default().fg(Color::White));
+            let calls_cell = if repo.tool_call_count > 0 {
+                Cell::from(format!("{}", repo.tool_call_count))
+                    .style(Style::default().fg(Color::Cyan))
+            } else {
+                Cell::from("—".to_string()).style(Style::default().fg(Color::DarkGray))
+            };
             let tool_cell = Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
                 .style(Style::default().fg(Color::DarkGray));
             let lock_cell = lock_cell(&repo.lock_mode);
 
+            // Alias cell with optional C# indicator
+            let alias_cell = match repo.csharp_index.as_str() {
+                "ready" => {
+                    Cell::from(format!("{} C#·", repo.alias))
+                        .style(Style::default().fg(Color::White))
+                }
+                "error" => {
+                    Cell::from(format!("{} C#!", repo.alias))
+                        .style(Style::default().fg(Color::Red))
+                }
+                _ => {
+                    Cell::from(repo.alias.clone()).style(Style::default().fg(Color::White))
+                }
+            };
+
+            // Red alias if the repo has errors
+            let alias_cell = if repo.status == "error" {
+                alias_cell.style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            } else {
+                alias_cell
+            };
+
             Row::new(vec![
-                Cell::from(repo.alias.clone()).style(Style::default().fg(Color::White)),
+                alias_cell,
                 status_cell,
                 changes_cell,
+                calls_cell,
                 tool_cell,
                 lock_cell,
             ])
@@ -309,6 +347,7 @@ fn render_table(
             Constraint::Min(max_alias_w as u16 + 2),
             Constraint::Length(12),
             Constraint::Length(9),
+            Constraint::Length(7),
             Constraint::Min(24),
             Constraint::Length(7),
         ],
@@ -370,14 +409,30 @@ fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_s
     ]);
 
     let tool_str = repo.last_tool_call.as_deref().unwrap_or("—");
+    let csharp_str = match repo.csharp_index.as_str() {
+        "ready" => "  C#·",
+        "error" => "  C#!",
+        _ => "",
+    };
+    let csharp_color = match repo.csharp_index.as_str() {
+        "ready" => Color::Green,
+        "error" => Color::Red,
+        _ => Color::DarkGray,
+    };
     let info_line = Line::from(vec![
         Span::styled("   changes:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(" {}  ", repo.changes),
             Style::default().fg(Color::White),
         ),
+        Span::styled("calls:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {}  ", repo.tool_call_count),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("last:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!(" {}", tool_str), Style::default().fg(Color::White)),
+        Span::styled(csharp_str, Style::default().fg(csharp_color)),
     ]);
 
     let block = Block::default()

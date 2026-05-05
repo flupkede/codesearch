@@ -225,7 +225,7 @@ fn render_table(
     repos: &[(String, super::RepoStatusInfo)],
     table_state: &mut TableState,
 ) {
-    let header_cells = ["Alias", "Status", "Changes", "Last Tool Call", "Lock"];
+    let header_cells = ["Alias", "Status", "Changes", "Calls", "Last Tool Call", "Lock"];
     let header = Row::new(
         header_cells
             .iter()
@@ -236,7 +236,15 @@ fn render_table(
 
     let max_alias_w = repos
         .iter()
-        .map(|(a, _)| a.len())
+        .map(|(a, info)| {
+            // Account for C# indicator suffix
+            let extra = match info.csharp_index {
+                super::CSharpIndexStatus::Ready => 4,   // " C#·"
+                super::CSharpIndexStatus::Error => 4,   // " C#!"
+                super::CSharpIndexStatus::None => 0,
+            };
+            a.len() + extra
+        })
         .max()
         .unwrap_or(10)
         .max(10);
@@ -247,15 +255,46 @@ fn render_table(
             let status_cell = status_cell(info.status);
             let changes_cell =
                 Cell::from(format!("{}", info.changes)).style(Style::default().fg(Color::White));
+            let calls_cell = if info.tool_call_count > 0 {
+                Cell::from(format!("{}", info.tool_call_count))
+                    .style(Style::default().fg(Color::Cyan))
+            } else {
+                Cell::from("—".to_string()).style(Style::default().fg(Color::DarkGray))
+            };
             let tool_cell = Cell::from(info.last_tool_call.as_deref().unwrap_or("—").to_string())
                 .style(Style::default().fg(Color::DarkGray));
             // We don't have lock info in lightweight status, show status-derived value
             let lock_cell = lock_cell_from_status(info.status);
 
+            // Alias cell with optional C# indicator
+            let alias_cell = match info.csharp_index {
+                super::CSharpIndexStatus::Ready => {
+                    // Green C# indicator for healthy index
+                    Cell::from(format!("{} C#·", alias))
+                        .style(Style::default().fg(Color::White))
+                }
+                super::CSharpIndexStatus::Error => {
+                    // Red C# indicator for errored index
+                    Cell::from(format!("{} C#!", alias))
+                        .style(Style::default().fg(Color::Red))
+                }
+                super::CSharpIndexStatus::None => {
+                    Cell::from(alias.clone()).style(Style::default().fg(Color::White))
+                }
+            };
+
+            // Red alias if the repo has errors
+            let alias_cell = if matches!(info.status, super::RepoStateLabel::Error) {
+                alias_cell.style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            } else {
+                alias_cell
+            };
+
             Row::new(vec![
-                Cell::from(alias.clone()).style(Style::default().fg(Color::White)),
+                alias_cell,
                 status_cell,
                 changes_cell,
+                calls_cell,
                 tool_cell,
                 lock_cell,
             ])
@@ -268,6 +307,7 @@ fn render_table(
             Constraint::Min(max_alias_w as u16 + 2),
             Constraint::Length(12),
             Constraint::Length(9),
+            Constraint::Length(7),
             Constraint::Min(24),
             Constraint::Length(7),
         ],
@@ -343,16 +383,32 @@ fn render_detail(
         Span::styled(display_path, Style::default().fg(Color::DarkGray)),
     ]);
 
-    // Second line: changes + last tool call
+    // Second line: changes + tool calls + last tool call
     let tool_str = info.last_tool_call.as_deref().unwrap_or("—");
+    let csharp_str = match info.csharp_index {
+        super::CSharpIndexStatus::None => "",
+        super::CSharpIndexStatus::Ready => "  C#·",
+        super::CSharpIndexStatus::Error => "  C#!",
+    };
+    let csharp_color = match info.csharp_index {
+        super::CSharpIndexStatus::Ready => Color::Green,
+        super::CSharpIndexStatus::Error => Color::Red,
+        super::CSharpIndexStatus::None => Color::DarkGray,
+    };
     let info_line = Line::from(vec![
         Span::styled("   changes:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(" {}  ", info.changes),
             Style::default().fg(Color::White),
         ),
+        Span::styled("calls:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {}  ", info.tool_call_count),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("last:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!(" {}", tool_str), Style::default().fg(Color::White)),
+        Span::styled(csharp_str, Style::default().fg(csharp_color)),
     ]);
 
     let block = Block::default()
