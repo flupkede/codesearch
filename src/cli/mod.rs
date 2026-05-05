@@ -369,7 +369,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     if cli.model.is_some() && model_type.is_none() {
         eprintln!(
             "Unknown model: '{}'. Available models:",
-            cli.model.as_ref().unwrap()
+            cli.model.as_deref().unwrap_or_default()
         );
         eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
         eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
