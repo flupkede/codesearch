@@ -315,7 +315,7 @@ fn render_table(
     let rows: Vec<Row> = repos
         .iter()
         .map(|repo| {
-            let status_cell = status_cell(&repo.status);
+            let status_cell = status_cell(&repo.status, &repo.csharp_index);
             // Keep left edge stable: fixed-width, right-aligned, capped at 5 chars.
             let changes_str = if repo.changes > 99999 {
                 " 99k+".to_string()
@@ -554,14 +554,22 @@ fn render_footer(
 // Cell styling helpers
 // ---------------------------------------------------------------------------
 
-fn status_cell(status: &str) -> Cell<'static> {
+fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
     match status {
         "open" => Cell::from("✓ ready  ".to_string()).style(
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        "warm" => Cell::from("◐ warm   ".to_string()).style(Style::default().fg(Color::Yellow)),
+        "warm" => match csharp {
+            "ready" => Cell::from("◐ warm+C#".to_string())
+                .style(Style::default().fg(Color::Green)),
+            "indexing" => Cell::from("◐ warm C#…".to_string())
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            "error" => Cell::from("◐ warm C#!".to_string())
+                .style(Style::default().fg(Color::Red)),
+            _ => Cell::from("◐ warm   ".to_string()).style(Style::default().fg(Color::Yellow)),
+        },
         "readonly" => Cell::from("◑ ro     ".to_string()).style(Style::default().fg(Color::Cyan)),
         "indexing" => Cell::from("⟳ idx…  ".to_string()).style(
             Style::default()
