@@ -435,8 +435,11 @@ impl CSharpSymbolIndexer {
 
         let temp_dir = std::env::temp_dir().join("codesearch-scip");
         std::fs::create_dir_all(&temp_dir)?;
+        // Include PID + nanoseconds to avoid collision when multiple find-refs
+        // calls are in flight concurrently for different symbols on the same repo.
         let output_path = temp_dir.join(format!(
-            "refs-{:x}.json",
+            "refs-{}-{:x}.json",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -786,7 +789,6 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         } else {
             // ── Incremental merge (Opt 3) ──────────────────────────
             // Determine which files appear in the new index (by definition occurrences).
-            // Only clear position entries for those files; leave other projects intact.
             let affected_files: HashSet<String> = index
                 .values()
                 .flat_map(|refs| {
@@ -802,27 +804,49 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 affected_files
             );
 
-            // Collect position keys belonging to affected files
+            // Step 1: Collect stale symbol keys from position index.
+            // Position entries give us the reverse mapping file → [symbol_keys].
+            // We use this to know exactly which scip_symbols entries to remove,
+            // preventing stale entries from renamed/deleted symbols accumulating.
+            let mut stale_symbol_keys: HashSet<String> = HashSet::new();
             let mut pos_keys_to_delete: Vec<String> = Vec::new();
             {
                 let pos_iter = positions_db.iter(&wtxn)?;
                 for result in pos_iter {
-                    let (key, _) = result?;
+                    let (key, val) = result?;
                     // Position key format: "<file>:<line>"
                     let file_part = key.split(':').next().unwrap_or("");
                     if affected_files.contains(file_part) {
                         pos_keys_to_delete.push(key.to_string());
+                        // Collect symbol keys for this position so we can delete them
+                        if let Ok(sym_keys) = deserialize_keys_v1(val) {
+                            stale_symbol_keys.extend(sym_keys);
+                        }
                     }
                 }
             }
+
+            // Step 2: Delete stale position entries.
             for key in &pos_keys_to_delete {
                 positions_db.delete(&mut wtxn, key.as_str())?;
             }
 
+            // Step 3: Delete stale symbol entries (prevents accumulation of
+            // renamed/deleted symbols across incremental rebuilds).
+            for key in &stale_symbol_keys {
+                symbols_db.delete(&mut wtxn, key.as_str())?;
+            }
+
+            tracing::debug!(
+                "Incremental: removed {} stale position entries, {} stale symbol entries",
+                pos_keys_to_delete.len(),
+                stale_symbol_keys.len()
+            );
+
             // Clear ref cache — definitions changed, cached refs may be stale.
             ref_cache_db.clear(&mut wtxn)?;
 
-            // Do NOT clear symbols_db or simple_names_db — we merge below.
+            // Do NOT clear symbols_db or simple_names_db here — we merge below.
         }
 
         // ── Write symbol entries (definitions only after Opt 2) ────
@@ -910,7 +934,15 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             all_simple_names.len()
         );
 
-        // Write metadata
+        // Write metadata.
+        // For incremental rebuilds `total_symbols` only counts the merged project —
+        // use the full simple-name cardinality (= unique symbol count) instead.
+        let reported_symbol_count = if is_incremental {
+            all_simple_names.values().map(|v| v.len()).sum::<usize>()
+        } else {
+            total_symbols
+        };
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -919,7 +951,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         meta_db.put(
             &mut wtxn,
             META_SYMBOL_COUNT,
-            total_symbols.to_string().as_str(),
+            reported_symbol_count.to_string().as_str(),
         )?;
 
         wtxn.commit()?;
@@ -1115,10 +1147,18 @@ mod tests {
             extract_simple_name("csharp Lib . Calculator#Add(int, int)."),
             "Add"
         );
+        // Type-level key ends with '#' (no member suffix)
         assert_eq!(
             extract_simple_name("csharp App . MyService#"),
             "MyService"
         );
+        // Namespace-qualified type (no '#' in SCIP key)
+        assert_eq!(
+            extract_simple_name("csharp . . Namespace.TopLevel#"),
+            "TopLevel"
+        );
+        // Empty input
+        assert_eq!(extract_simple_name(""), "");
     }
 
     #[test]

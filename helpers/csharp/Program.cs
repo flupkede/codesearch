@@ -113,8 +113,7 @@ public static class Program
         {
             result = await resolver.FindRefsAsync(
                 workspace.CurrentSolution,
-                parsed.Value.Symbol,
-                parsed.Value.ProjectFilter).ConfigureAwait(false);
+                parsed.Value.Symbol).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -139,6 +138,14 @@ public static class Program
     /// </summary>
     private static bool TryRegisterMsBuild([System.Diagnostics.CodeAnalysis.NotNullWhen(false)] out string? errorMessage)
     {
+        // Guard against double-registration in case the function is ever called twice
+        // in the same process lifetime (e.g. future test harnesses, daemon mode).
+        if (MSBuildLocator.IsRegistered)
+        {
+            errorMessage = null;
+            return true;
+        }
+
         try
         {
             var instances = MSBuildLocator

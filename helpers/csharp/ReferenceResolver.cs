@@ -17,21 +17,18 @@ public sealed class ReferenceResolver
 {
     /// <summary>
     /// Resolve all references for a single SCIP symbol key within the solution.
+    ///
+    /// Always compiles ALL projects in the solution so that:
+    /// (a) the target symbol can be located regardless of which project owns it, and
+    /// (b) <see cref="SymbolFinder.FindReferencesAsync"/> has full cross-project visibility.
     /// </summary>
     /// <param name="solution">Fully loaded Roslyn solution.</param>
     /// <param name="scipKey">Canonical SCIP key, e.g. "csharp App . FieldDefinition#Validate()."</param>
-    /// <param name="projectFilter">Optional project name / .csproj filename to limit compilation scope.</param>
-    public async Task<FindRefsOutput> FindRefsAsync(
-        Solution solution,
-        string scipKey,
-        string? projectFilter)
+    public async Task<FindRefsOutput> FindRefsAsync(Solution solution, string scipKey)
     {
         var output = new FindRefsOutput { Symbol = scipKey };
 
         // Build symbol map (fast — no FindReferencesAsync, just compilation + symbol walk).
-        // We build from all projects so the SCIP key can always be resolved regardless of
-        // which project owns the symbol. The projectFilter only limits the initial compilation
-        // scope; FindReferencesAsync below still searches the full solution.
         var symbolMap = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
 
         Console.Error.WriteLine($"find-refs: building symbol map from solution...");
