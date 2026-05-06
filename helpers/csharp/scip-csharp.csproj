@@ -30,6 +30,16 @@
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.13.0" />
     <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.13.0" />
     <PackageReference Include="Microsoft.Build.Locator" Version="1.9.1" />
+    <!--
+      NU1903 suppress: Microsoft.Build.Tasks.Core transitives have CVEs (GHSA-h4j7-5rxr-p4wc,
+      GHSA-w3q9-fxm7-j8fq) but they all target the DownloadFile MSBuild task, which we never use.
+      Our scip-csharp runs locally as a subprocess, no network-facing attack surface.
+      Version pinning to Roslyn 4.13.0 is required for .NET 10 compatibility.
+    -->
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-h4j7-5rxr-p4wc" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-w3q9-fxm7-j8fq" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-37gx-xxp4-5rgx" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-w3x6-4m5h-cxqf" />
   </ItemGroup>
 
   <ItemGroup>

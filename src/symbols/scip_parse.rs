@@ -79,6 +79,57 @@ mod roles {
 /// Bump together with the helper whenever the JSON schema changes.
 const SUPPORTED_INDEX_VERSION: &str = "1.0";
 
+// ── find-refs output format ───────────────────────────────────────
+
+/// Result of `scip-csharp find-refs` — references for a single symbol.
+pub struct FindRefsResult {
+    /// Reference locations (kind = "reference"). Does not include definitions.
+    pub references: Vec<ScipReference>,
+}
+
+#[derive(Deserialize)]
+struct JsonFindRefsOutput {
+    version: String,
+    #[allow(dead_code)]
+    symbol: String,
+    references: Vec<JsonFindRefsOccurrence>,
+}
+
+#[derive(Deserialize)]
+struct JsonFindRefsOccurrence {
+    file: String,
+    start_line: u32,
+    end_line: u32,
+    kind: String,
+}
+
+/// Parse the JSON output of `scip-csharp find-refs` into a list of references.
+pub fn parse_find_refs_output(data: &[u8]) -> Result<FindRefsResult> {
+    let output: JsonFindRefsOutput =
+        serde_json::from_slice(data).with_context(|| "Failed to parse find-refs JSON")?;
+
+    if output.version != SUPPORTED_INDEX_VERSION {
+        anyhow::bail!(
+            "Unsupported find-refs version: '{}' (expected '{}').",
+            output.version,
+            SUPPORTED_INDEX_VERSION
+        );
+    }
+
+    let references = output
+        .references
+        .into_iter()
+        .map(|r| ScipReference {
+            file: PathBuf::from(&r.file),
+            start_line: r.start_line,
+            end_line: r.end_line,
+            kind: r.kind,
+        })
+        .collect();
+
+    Ok(FindRefsResult { references })
+}
+
 /// Parse a JSON byte slice into a symbol -> references map.
 ///
 /// The JSON format is produced by `scip-csharp` and mirrors the SCIP schema

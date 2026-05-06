@@ -36,3 +36,22 @@ public sealed class ScipSymbolInfo
     public string Symbol { get; init; } = "";
     public List<string> Documentation { get; init; } = [];
 }
+
+/// <summary>
+/// Output model for the `find-refs` subcommand.
+/// Contains references resolved ad-hoc for a single SCIP symbol.
+/// </summary>
+public sealed class FindRefsOutput
+{
+    public string Version { get; init; } = "1.0";
+    public string Symbol { get; set; } = "";
+    public List<FindRefsOccurrence> References { get; init; } = [];
+}
+
+public sealed class FindRefsOccurrence
+{
+    public string File { get; set; } = "";
+    public int StartLine { get; set; }
+    public int EndLine { get; set; }
+    public string Kind { get; set; } = "reference";
+}

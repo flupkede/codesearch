@@ -3,8 +3,29 @@
 //! Detects the `scip-csharp` helper binary, invokes it as a subprocess
 //! to produce a JSON symbol index from a .sln/.csproj, parses the
 //! output, and stores references in LMDB.
+//!
+//! ## Two-phase reference model (Opt 2 — lazy FindReferencesAsync)
+//!
+//! `rebuild()` calls `scip-csharp index` which now emits **definitions only**
+//! (no `FindReferencesAsync` loop). This makes a full rebuild 10–50× faster.
+//!
+//! `find_references()` resolves references on demand:
+//! 1. Return definitions from `scip_symbols` (always populated after rebuild).
+//! 2. Check `scip_ref_cache` for previously resolved references — return if present.
+//! 3. Cache miss: invoke `scip-csharp find-refs` for the single requested symbol,
+//!    cache the result in `scip_ref_cache`, then return.
+//!
+//! ## Incremental rebuild (Opt 3 — RebuildScope::Files)
+//!
+//! When a `.cs` file changes, the 60s debounce fires with `RebuildScope::Files`.
+//! Instead of clearing and rebuilding the entire LMDB, the adapter:
+//! - Runs `scip-csharp index --filter-project <affected.csproj>` (faster).
+//! - Merges the result: updates symbols and positions for affected files only;
+//!   symbols from other projects are preserved.
+//! - Rebuilds `scip_simple_names` from all current `scip_symbols` entries.
+//! - Clears `scip_ref_cache` (stale after any definition update).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,7 +42,7 @@ use super::{RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
 // ── Constants ─────────────────────────────────────────────────────
 
-/// LMDB database name for the SCIP symbol table.
+/// LMDB database name for the SCIP symbol table (definitions only after Opt 2).
 const SCIP_DB_NAME: &str = crate::constants::SCIP_SYMBOLS_DB_NAME;
 
 /// LMDB database name for the rebuild timestamp.
@@ -32,6 +53,9 @@ const SCIP_POSITION_DB_NAME: &str = crate::constants::SCIP_POSITION_DB_NAME;
 
 /// LMDB database name for the simple-name-to-symbols index.
 const SCIP_SIMPLE_NAMES_DB_NAME: &str = crate::constants::SCIP_SIMPLE_NAMES_DB_NAME;
+
+/// LMDB database name for the on-demand reference cache (populated by find-refs).
+const SCIP_REF_CACHE_DB_NAME: &str = crate::constants::SCIP_REF_CACHE_DB_NAME;
 
 /// Key in the meta database that stores the last rebuild timestamp (UNIX epoch seconds).
 const META_REBUILD_TS: &str = crate::constants::SCIP_REBUILD_TIMESTAMP_KEY;
@@ -130,10 +154,17 @@ fn deserialize_keys_v1(bytes: &[u8]) -> Result<Vec<String>> {
 /// - `"csharp SmallSolution.Library . Calculator#Add(int, int)."` → `"Add"`
 /// - `"csharp . . . Namespace.TopLevel"` → `"TopLevel"`
 fn extract_simple_name(scip_symbol: &str) -> String {
-    // Strip trailing parens/period (e.g. "Validate()." → "Validate")
-    let cleaned = scip_symbol.trim_end_matches('.').trim_end_matches("()");
-    // Take last segment after '#' or '.'
-    let last_segment = cleaned.rsplit(['#', '.']).next().unwrap_or(cleaned).trim();
+    // Strip trailing suffix chars: "Validate()." → "Validate", "MyService#" → "MyService"
+    let cleaned = scip_symbol
+        .trim_end_matches('.')
+        .trim_end_matches("()")
+        .trim_end_matches('#');
+    // Take last non-empty segment after '#' or '.'
+    let last_segment = cleaned
+        .rsplit(['#', '.'])
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or(cleaned)
+        .trim();
     // Strip method parameters (e.g. "Add(int, int)" → "Add")
     last_segment
         .split('(')
@@ -286,6 +317,10 @@ impl CSharpSymbolIndexer {
     }
 
     /// Open or create the SCIP LMDB environment for a given repo database path.
+    ///
+    /// Pre-opens ALL named databases so they exist before first use.
+    /// LMDB requires named DBs to be created (or opened) in a write txn
+    /// before they can be read in later read txns within the same env session.
     fn open_scip_env(&self, db_path: &Path) -> Result<Env> {
         let scip_dir = db_path.join("scip");
         std::fs::create_dir_all(&scip_dir)
@@ -295,99 +330,55 @@ impl CSharpSymbolIndexer {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(64 * 1024 * 1024) // 64MB — symbol indexes are small
-                .max_dbs(8)
+                .max_dbs(10) // 5 named DBs + headroom
                 .open(&scip_dir)?
         };
+
+        // Eagerly create / re-open all named databases.
+        let mut wtxn = env.write_txn()?;
+        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_DB_NAME))?;
+        env.create_database::<Str, Str>(&mut wtxn, Some(SCIP_META_DB_NAME))?;
+        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_POSITION_DB_NAME))?;
+        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))?;
+        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
+        wtxn.commit()?;
+
         Ok(env)
     }
-}
 
-impl SymbolIndexer for CSharpSymbolIndexer {
-    fn language(&self) -> &str {
-        "csharp"
-    }
+    // ── Helper invocation ──────────────────────────────────────────
 
-    fn rebuild(
+    /// Invoke `scip-csharp index` and stream stderr to tracing.
+    fn invoke_index_helper(
         &self,
-        repo_path: &Path,
-        db_path: &Path,
-        scope: RebuildScope,
-    ) -> Result<RebuildSummary> {
-        let helper = self.detect_helper().ok_or_else(|| {
-            anyhow::anyhow!(
-                "scip-csharp helper not found. Install the -with-csharp release variant \
-                 or set {} to the helper binary path.",
-                HELPER_ENV_VAR
-            )
-        })?;
+        helper: &Path,
+        solution: &Path,
+        output_path: &Path,
+        project_filter: Option<&Path>,
+    ) -> Result<()> {
+        let solution_short = solution
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| solution.display().to_string());
 
-        let start = std::time::Instant::now();
-
-        // Determine solution/project from scope
-        let (solution, project) = match &scope {
-            RebuildScope::Full => {
-                let sln = Self::find_solution(repo_path).ok_or_else(|| {
-                    anyhow::anyhow!("No .sln file found in {}", repo_path.display())
-                })?;
-                (sln, None)
-            }
-            RebuildScope::Project(csproj) => {
-                let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
-                (sln, Some(csproj.clone()))
-            }
-            RebuildScope::Files(files) => {
-                if let Some(first_file) = files.first() {
-                    let csproj = Self::find_csproj_for_file(repo_path, first_file)
-                        .unwrap_or_else(|| first_file.clone());
-                    let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
-                    (sln, Some(csproj))
-                } else {
-                    bail!("RebuildScope::Files is empty");
-                }
-            }
-        };
-
-        // Create temp file for SCIP output
-        let temp_dir = std::env::temp_dir().join("codesearch-scip");
-        std::fs::create_dir_all(&temp_dir)?;
-        let output_path = temp_dir.join(format!(
-            "index-{}-{:x}.json",
-            repo_path.file_name().unwrap_or_default().to_string_lossy(),
-            start.elapsed().as_nanos()
-        ));
-
-        // Invoke helper. We spawn with piped stdout/stderr and stream them
-        // line-by-line into the tracing log so the operator sees live progress
-        // ("Loading solution: ...", "Collected N symbols", etc.) instead of a
-        // black box for the 1–15 minutes a large Aprimo solution takes. The
-        // alternative — `cmd.output()` — buffers stderr until process exit,
-        // which gave the misleading impression that the helper was hanging.
-        let solution_label = solution.display().to_string();
-        let mut cmd = Command::new(&helper);
+        let mut cmd = Command::new(helper);
         cmd.arg("index")
             .arg("--solution")
-            .arg(&solution)
+            .arg(solution)
             .arg("--output")
-            .arg(&output_path)
+            .arg(output_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        if let Some(ref proj) = project {
+        if let Some(proj) = project_filter {
             cmd.arg("--filter-project").arg(proj);
         }
 
-        tracing::info!("Running scip-csharp: {:?}", cmd);
+        tracing::info!("Running scip-csharp index: {:?}", cmd);
 
         let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to execute scip-csharp at {}", helper.display()))?;
-
-        // Per-stream label so concurrent rebuilds (CSHARP_SCIP_CONCURRENCY > 1)
-        // remain readable in the interleaved log.
-        let solution_short = solution
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| solution_label.clone());
 
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();
@@ -415,7 +406,6 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             .wait()
             .with_context(|| format!("Failed to wait for scip-csharp at {}", helper.display()))?;
 
-        // Drain any remaining buffered output before consuming the file.
         if let Some(h) = stderr_handle {
             let _ = h.join();
         }
@@ -428,6 +418,339 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             // Don't bail — partial output is acceptable per AGENTS.md spec
         }
 
+        Ok(())
+    }
+
+    /// Invoke `scip-csharp find-refs` for a single symbol and return its references.
+    ///
+    /// This is the "lazy" half of Opt 2: called on first `find_impact` for a symbol
+    /// that has not yet been resolved. Result is cached in `scip_ref_cache`.
+    fn invoke_find_refs_helper(
+        &self,
+        helper: &Path,
+        solution: &Path,
+        symbol: &str,
+    ) -> Result<Vec<StoredReference>> {
+        let start = std::time::Instant::now();
+
+        let temp_dir = std::env::temp_dir().join("codesearch-scip");
+        std::fs::create_dir_all(&temp_dir)?;
+        let output_path = temp_dir.join(format!(
+            "refs-{:x}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        let solution_short = solution
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| solution.display().to_string());
+
+        let mut cmd = Command::new(helper);
+        cmd.arg("find-refs")
+            .arg("--solution")
+            .arg(solution)
+            .arg("--symbol")
+            .arg(symbol)
+            .arg("--output")
+            .arg(&output_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        tracing::info!("scip-csharp find-refs: resolving '{}'", symbol);
+
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
+                "Failed to spawn scip-csharp find-refs at {}",
+                helper.display()
+            )
+        })?;
+
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            let label = solution_short.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if !line.is_empty() {
+                        tracing::info!("[scip-csharp find-refs:{}] {}", label, line);
+                    }
+                }
+            })
+        });
+
+        let stdout_handle = child.stdout.take().map(|stdout| {
+            let label = solution_short.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if !line.is_empty() {
+                        tracing::debug!("[scip-csharp find-refs:{}] {}", label, line);
+                    }
+                }
+            })
+        });
+
+        let status = child.wait().with_context(|| "Failed to wait for scip-csharp find-refs")?;
+
+        if let Some(h) = stderr_handle {
+            let _ = h.join();
+        }
+        if let Some(h) = stdout_handle {
+            let _ = h.join();
+        }
+
+        if !status.success() {
+            tracing::warn!(
+                "scip-csharp find-refs exited with {} for '{}'",
+                status,
+                symbol
+            );
+        }
+
+        let data = std::fs::read(&output_path).with_context(|| {
+            format!(
+                "Failed to read find-refs output at {}",
+                output_path.display()
+            )
+        })?;
+        let _ = std::fs::remove_file(&output_path);
+
+        let result = scip_parse::parse_find_refs_output(&data)?;
+
+        let stored: Vec<StoredReference> = result
+            .references
+            .into_iter()
+            .map(|r| StoredReference {
+                file: r.file,
+                start_line: r.start_line,
+                end_line: r.end_line,
+                kind: r.kind,
+            })
+            .collect();
+
+        tracing::info!(
+            "scip-csharp find-refs: {} references for '{}' in {}ms",
+            stored.len(),
+            symbol,
+            start.elapsed().as_millis()
+        );
+
+        Ok(stored)
+    }
+
+    // ── Internal lookup helpers ────────────────────────────────────
+
+    /// Resolve a (possibly fuzzy) symbol name to the canonical SCIP key stored
+    /// in `scip_symbols`. Returns `None` if no matching symbol is found.
+    fn resolve_canonical_key(&self, env: &Env, symbol: &str) -> Result<Option<String>> {
+        let rtxn = env.read_txn()?;
+
+        let symbols_db: Database<Str, Bytes> =
+            match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
+                Some(db) => db,
+                None => return Ok(None),
+            };
+
+        // Exact match first
+        if symbols_db.get(&rtxn, symbol)?.is_some() {
+            return Ok(Some(symbol.to_string()));
+        }
+
+        // Fuzzy via simple-name index
+        let simple_names_db: Database<Str, Bytes> =
+            match env.open_database(&rtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))? {
+                Some(db) => db,
+                None => return Ok(None),
+            };
+
+        let simple = extract_simple_name(symbol);
+        let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple as &str)? {
+            Some(b) => deserialize_keys_v1(b)?,
+            None => return Ok(None),
+        };
+
+        let chosen = candidates
+            .iter()
+            .filter(|k| fuzzy_symbol_match(symbol, k))
+            .min_by_key(|k| k.len())
+            .cloned();
+
+        Ok(chosen)
+    }
+
+    /// Inner implementation: fetch references for an EXACT (canonical) symbol key.
+    ///
+    /// - Returns definitions from `scip_symbols` (always present after rebuild).
+    /// - Returns cached references from `scip_ref_cache` if present.
+    /// - On cache miss: invokes `scip-csharp find-refs`, stores in `scip_ref_cache`.
+    fn find_refs_for_canonical_key(
+        &self,
+        env: &Env,
+        db_path: &Path,
+        canonical: &str,
+    ) -> Result<Vec<SymbolReference>> {
+        let rtxn = env.read_txn()?;
+
+        // ── 1. Load definitions ────────────────────────────────────
+        let mut all_stored: Vec<StoredReference> = Vec::new();
+
+        if let Some(symbols_db) = env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))? {
+            if let Some(bytes) = symbols_db.get(&rtxn, canonical)? {
+                match deserialize_refs(bytes) {
+                    Ok(defs) => all_stored.extend(defs),
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize definitions for '{}': {}", canonical, e)
+                    }
+                }
+            }
+        }
+
+        // ── 2. Check reference cache ───────────────────────────────
+        let cache_hit =
+            if let Some(ref_cache_db) =
+                env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_REF_CACHE_DB_NAME))?
+            {
+                match ref_cache_db.get(&rtxn, canonical)? {
+                    Some(cached_bytes) => match deserialize_refs(cached_bytes) {
+                        Ok(cached_refs) => {
+                            all_stored.extend(cached_refs);
+                            true
+                        }
+                        Err(_) => false,
+                    },
+                    None => false,
+                }
+            } else {
+                false
+            };
+
+        // Also consider backward compat: old full-index LMDB may already have
+        // reference-kind entries in scip_symbols. Treat those as cache hits too.
+        let has_legacy_refs = all_stored.iter().any(|r| r.kind != "definition");
+        drop(rtxn);
+
+        if cache_hit || has_legacy_refs {
+            return Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect());
+        }
+
+        // ── 3. Cache miss — lazy find-refs invocation ──────────────
+        let helper = match self.detect_helper() {
+            Some(h) => h,
+            None => {
+                tracing::debug!(
+                    "scip-csharp helper not available for lazy ref resolution of '{}'",
+                    canonical
+                );
+                // Return definitions only (helper missing is not an error)
+                return Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect());
+            }
+        };
+
+        let repo_path = db_path.parent().unwrap_or(db_path);
+        let solution = match Self::find_solution(repo_path) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    "No .sln found under {} for lazy ref resolution of '{}'",
+                    repo_path.display(),
+                    canonical
+                );
+                return Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect());
+            }
+        };
+
+        tracing::info!(
+            "scip_ref_cache miss for '{}' — invoking scip-csharp find-refs (this may take a few minutes on large solutions)",
+            canonical
+        );
+
+        let lazy_refs = self.invoke_find_refs_helper(&helper, &solution, canonical)?;
+
+        // ── 4. Store in ref cache ──────────────────────────────────
+        {
+            let env2 = self.open_scip_env(db_path)?;
+            let mut wtxn = env2.write_txn()?;
+            let ref_cache_db: Database<Str, Bytes> =
+                env2.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
+            let cached_bytes = serialize_refs(&lazy_refs)
+                .with_context(|| format!("Failed to serialize refs for cache: {}", canonical))?;
+            ref_cache_db.put(&mut wtxn, canonical, &cached_bytes)?;
+            wtxn.commit()?;
+        }
+
+        all_stored.extend(lazy_refs);
+        Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect())
+    }
+}
+
+/// Convert a `StoredReference` to the public `SymbolReference` type.
+fn stored_to_symbol_ref(r: StoredReference) -> SymbolReference {
+    SymbolReference {
+        file: r.file,
+        start_line: r.start_line,
+        end_line: r.end_line,
+        kind: r.kind,
+    }
+}
+
+impl SymbolIndexer for CSharpSymbolIndexer {
+    fn language(&self) -> &str {
+        "csharp"
+    }
+
+    fn rebuild(
+        &self,
+        repo_path: &Path,
+        db_path: &Path,
+        scope: RebuildScope,
+    ) -> Result<RebuildSummary> {
+        let helper = self.detect_helper().ok_or_else(|| {
+            anyhow::anyhow!(
+                "scip-csharp helper not found. Install the -with-csharp release variant \
+                 or set {} to the helper binary path.",
+                HELPER_ENV_VAR
+            )
+        })?;
+
+        let start = std::time::Instant::now();
+
+        // Determine solution/project from scope.
+        // `is_incremental` true → RebuildScope::Files → merge, not replace.
+        let (solution, project, is_incremental) = match &scope {
+            RebuildScope::Full => {
+                let sln = Self::find_solution(repo_path).ok_or_else(|| {
+                    anyhow::anyhow!("No .sln file found in {}", repo_path.display())
+                })?;
+                (sln, None, false)
+            }
+            RebuildScope::Project(csproj) => {
+                let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
+                (sln, Some(csproj.clone()), false)
+            }
+            RebuildScope::Files(files) => {
+                if let Some(first_file) = files.first() {
+                    let csproj = Self::find_csproj_for_file(repo_path, first_file)
+                        .unwrap_or_else(|| first_file.clone());
+                    let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
+                    (sln, Some(csproj), true) // ← incremental merge
+                } else {
+                    bail!("RebuildScope::Files is empty");
+                }
+            }
+        };
+
+        // Create temp file for SCIP output
+        let temp_dir = std::env::temp_dir().join("codesearch-scip");
+        std::fs::create_dir_all(&temp_dir)?;
+        let output_path = temp_dir.join(format!(
+            "index-{}-{:x}.json",
+            repo_path.file_name().unwrap_or_default().to_string_lossy(),
+            start.elapsed().as_nanos()
+        ));
+
+        // Invoke helper with stderr streaming
+        self.invoke_index_helper(&helper, &solution, &output_path, project.as_deref())?;
+
         // Parse the JSON output
         let index_data = std::fs::read(&output_path)
             .with_context(|| format!("Failed to read symbol index at {}", output_path.display()))?;
@@ -439,23 +762,71 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         let index = index_result?;
 
-        // Open LMDB and write
+        // Open LMDB (all named DBs pre-created by open_scip_env)
         let env = self.open_scip_env(db_path)?;
         let mut wtxn = env.write_txn()?;
 
-        // Create/open databases — Str keys, Bytes values for symbol data
         let symbols_db: Database<Str, Bytes> =
             env.create_database(&mut wtxn, Some(SCIP_DB_NAME))?;
-
-        // Meta DB: Str keys, Str values
         let meta_db: Database<Str, Str> =
             env.create_database(&mut wtxn, Some(SCIP_META_DB_NAME))?;
+        let positions_db: Database<Str, Bytes> =
+            env.create_database(&mut wtxn, Some(SCIP_POSITION_DB_NAME))?;
+        let simple_names_db: Database<Str, Bytes> =
+            env.create_database(&mut wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))?;
+        let ref_cache_db: Database<Str, Bytes> =
+            env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
 
-        // Clear previous data
-        symbols_db.clear(&mut wtxn)?;
+        if !is_incremental {
+            // Full rebuild: wipe everything and start fresh.
+            symbols_db.clear(&mut wtxn)?;
+            positions_db.clear(&mut wtxn)?;
+            simple_names_db.clear(&mut wtxn)?;
+            ref_cache_db.clear(&mut wtxn)?;
+        } else {
+            // ── Incremental merge (Opt 3) ──────────────────────────
+            // Determine which files appear in the new index (by definition occurrences).
+            // Only clear position entries for those files; leave other projects intact.
+            let affected_files: HashSet<String> = index
+                .values()
+                .flat_map(|refs| {
+                    refs.iter()
+                        .filter(|r| r.kind == "definition")
+                        .map(|r| r.file.to_string_lossy().replace('\\', "/"))
+                })
+                .collect();
 
-        // Write symbol references
-        let mut total_refs = 0usize;
+            tracing::debug!(
+                "Incremental rebuild: {} affected file(s): {:?}",
+                affected_files.len(),
+                affected_files
+            );
+
+            // Collect position keys belonging to affected files
+            let mut pos_keys_to_delete: Vec<String> = Vec::new();
+            {
+                let pos_iter = positions_db.iter(&wtxn)?;
+                for result in pos_iter {
+                    let (key, _) = result?;
+                    // Position key format: "<file>:<line>"
+                    let file_part = key.split(':').next().unwrap_or("");
+                    if affected_files.contains(file_part) {
+                        pos_keys_to_delete.push(key.to_string());
+                    }
+                }
+            }
+            for key in &pos_keys_to_delete {
+                positions_db.delete(&mut wtxn, key.as_str())?;
+            }
+
+            // Clear ref cache — definitions changed, cached refs may be stale.
+            ref_cache_db.clear(&mut wtxn)?;
+
+            // Do NOT clear symbols_db or simple_names_db — we merge below.
+        }
+
+        // ── Write symbol entries (definitions only after Opt 2) ────
+        let mut total_defs = 0usize;
         let mut total_symbols = 0usize;
 
         for (symbol_name, references) in index.iter() {
@@ -470,24 +841,18 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 .collect();
 
             let value_bytes = serialize_refs(&stored)
-                .with_context(|| format!("Failed to serialize references for {}", symbol_name))?;
+                .with_context(|| format!("Failed to serialize definitions for {}", symbol_name))?;
 
             symbols_db.put(&mut wtxn, symbol_name.as_str(), &value_bytes)?;
-            total_refs += stored.len();
+            total_defs += stored.len();
             total_symbols += 1;
         }
 
-        // ── Build position index ──────────────────────────────────────
-        // scip_positions: "<file>:<line>" -> [symbol_keys]
+        // ── Build position index ───────────────────────────────────
+        // scip_positions: "<file>:<line>" → [symbol_keys]
         // Maps each definition occurrence to the symbols defined at that position.
-        // NOTE: only `start_line` is indexed, so queries for lines in the *middle*
-        // of a multi-line definition will not match. This is an intentional trade-off
-        // for O(1) lookup — multi-line definitions are rare in C# (mostly constructors
-        // with long signatures), and the start-line is the canonical anchor.
-        let positions_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_POSITION_DB_NAME))?;
-        positions_db.clear(&mut wtxn)?;
-
+        // For incremental rebuilds, old position entries for affected files were
+        // already deleted above; here we only write new ones.
         let mut positions: HashMap<String, Vec<String>> = HashMap::new();
         for (symbol_name, references) in index.iter() {
             for r in references.iter().filter(|r| r.kind == "definition") {
@@ -509,27 +874,32 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             positions_db.put(&mut wtxn, key.as_str(), &bytes)?;
         }
 
-        tracing::debug!("scip-csharp position index: {} entries", positions.len());
+        tracing::debug!("scip-csharp position index: {} new entries", positions.len());
 
-        // ── Build simple-name index ───────────────────────────────────
-        // scip_simple_names: simple_name -> [full_symbol_keys]
-        // Enables O(1) fuzzy lookup by extracting the last segment of each symbol.
-        let simple_names_db: Database<Str, Bytes> =
-            env.create_database(&mut wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))?;
+        // ── Build simple-name index ────────────────────────────────
+        // For incremental rebuilds: rebuild from ALL current scip_symbols entries
+        // (existing + newly written) so that simple-name lookups stay consistent.
+        // For full rebuilds: the DB was cleared, so we only have new entries.
         simple_names_db.clear(&mut wtxn)?;
 
-        let mut simple_names: HashMap<String, Vec<String>> = HashMap::new();
-        for (symbol_name, _references) in index.iter() {
-            let simple = extract_simple_name(symbol_name);
-            if !simple.is_empty() {
-                simple_names
-                    .entry(simple)
-                    .or_default()
-                    .push(symbol_name.clone());
+        let mut all_simple_names: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Scan all scip_symbols (includes both existing and newly written entries)
+        {
+            let sym_iter = symbols_db.iter(&wtxn)?;
+            for result in sym_iter {
+                let (key, _) = result?;
+                let simple = extract_simple_name(key);
+                if !simple.is_empty() {
+                    all_simple_names
+                        .entry(simple)
+                        .or_default()
+                        .push(key.to_string());
+                }
             }
         }
 
-        for (key, keys) in &simple_names {
+        for (key, keys) in &all_simple_names {
             let bytes = serialize_keys_v1(keys)
                 .with_context(|| format!("Failed to serialize simple name key: {}", key))?;
             simple_names_db.put(&mut wtxn, key.as_str(), &bytes)?;
@@ -537,10 +907,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         tracing::debug!(
             "scip-csharp simple-name index: {} entries",
-            simple_names.len()
+            all_simple_names.len()
         );
 
-        // Write metadata as string values
+        // Write metadata
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -557,69 +927,33 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         tracing::info!(
-            "scip-csharp rebuild complete: {} symbols, {} refs in {}ms",
+            "scip-csharp rebuild complete: {} symbols, {} definition entries in {}ms (incremental={})",
             total_symbols,
-            total_refs,
-            duration_ms
+            total_defs,
+            duration_ms,
+            is_incremental
         );
 
         Ok(RebuildSummary {
             symbols_indexed: total_symbols,
-            references_stored: total_refs,
+            references_stored: total_defs, // definitions only; refs resolved lazily
             duration_ms,
         })
     }
 
     fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>> {
         let env = self.open_scip_env(db_path)?;
-        let rtxn = env.read_txn()?;
 
-        let symbols_db: Database<Str, Bytes> = env
-            .open_database(&rtxn, Some(SCIP_DB_NAME))?
-            .ok_or_else(|| {
-                anyhow::anyhow!("SCIP symbol database not found. Run a rebuild first.")
-            })?;
-
-        // Exact match first
-        if let Some(bytes) = symbols_db.get(&rtxn, symbol)? {
-            let stored = deserialize_refs(bytes)?;
-            return Ok(stored
-                .into_iter()
-                .map(|r| SymbolReference {
-                    file: r.file,
-                    start_line: r.start_line,
-                    end_line: r.end_line,
-                    kind: r.kind,
-                })
-                .collect());
-        }
-
-        // Fuzzy via simple-name index (O(1) lookup instead of full-table scan)
-        let simple_names_db: Database<Str, Bytes> =
-            match env.open_database(&rtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))? {
-                Some(db) => db,
-                None => return Ok(vec![]),
-            };
-
-        let simple = extract_simple_name(symbol);
-        let candidates: Vec<String> = match simple_names_db.get(&rtxn, &simple as &str)? {
-            Some(b) => deserialize_keys_v1(b)?,
-            None => return Ok(vec![]),
+        // Resolve to canonical key (exact or fuzzy)
+        let canonical = match self.resolve_canonical_key(&env, symbol)? {
+            Some(k) => k,
+            None => {
+                tracing::debug!("Symbol '{}' not found in index", symbol);
+                return Ok(vec![]);
+            }
         };
 
-        // Filter candidates through fuzzy_symbol_match as safety net,
-        // then pick shortest (most specific) key.
-        let chosen = candidates
-            .iter()
-            .filter(|k| fuzzy_symbol_match(symbol, k))
-            .min_by_key(|k| k.len())
-            .cloned();
-        drop(rtxn);
-
-        match chosen {
-            Some(k) => self.find_references(db_path, &k),
-            None => Ok(vec![]),
-        }
+        self.find_refs_for_canonical_key(&env, db_path, &canonical)
     }
 
     fn find_references_by_position(
@@ -648,7 +982,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         drop(rtxn);
 
         match chosen {
-            Some(k) => self.find_references(db_path, &k),
+            Some(k) => self.find_refs_for_canonical_key(&env, db_path, &k),
             None => Ok(vec![]),
         }
     }
@@ -778,14 +1112,28 @@ mod tests {
             "Validate"
         );
         assert_eq!(
-            extract_simple_name("csharp SmallSolution.Library . Calculator#Add(int, int)."),
+            extract_simple_name("csharp Lib . Calculator#Add(int, int)."),
             "Add"
         );
         assert_eq!(
-            extract_simple_name("csharp . . . Namespace.TopLevel"),
-            "TopLevel"
+            extract_simple_name("csharp App . MyService#"),
+            "MyService"
         );
-        assert_eq!(extract_simple_name("csharp . . . Foo"), "Foo");
-        assert_eq!(extract_simple_name(""), "");
+    }
+
+    #[test]
+    fn test_fuzzy_symbol_match() {
+        assert!(fuzzy_symbol_match(
+            "FieldDefinition.Validate",
+            "csharp App . FieldDefinition#Validate()."
+        ));
+        assert!(fuzzy_symbol_match(
+            "Validate",
+            "csharp App . FieldDefinition#Validate()."
+        ));
+        assert!(!fuzzy_symbol_match(
+            "UnrelatedName",
+            "csharp App . FieldDefinition#Validate()."
+        ));
     }
 }

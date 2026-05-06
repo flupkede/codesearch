@@ -209,6 +209,12 @@ pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
 /// to `[full_symbol_keys]`. Used for O(1) fuzzy symbol lookup.
 pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
 
+/// LMDB table caching on-demand reference results from `scip-csharp find-refs`.
+/// Key: full SCIP symbol key. Value: `[v1, bincode(Vec<StoredReference>)]` (same
+/// format as `scip_symbols`). Populated on first `find_impact` call for a symbol;
+/// cleared when the definition index is rebuilt. Gives O(1) lookup on 2nd+ calls.
+pub const SCIP_REF_CACHE_DB_NAME: &str = "scip_ref_cache";
+
 /// Environment variable controlling phase-2 C# SCIP rebuild concurrency.
 /// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].
 pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";

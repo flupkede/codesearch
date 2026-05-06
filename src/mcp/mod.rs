@@ -5438,17 +5438,35 @@ impl CodesearchService {
             )]));
         }
 
-        // Perform the lookup
-        let result = if has_name {
-            indexer.find_references(&db_path, request.symbol_name.as_ref().unwrap())
-        } else {
-            // Position-based lookup
-            let file = self.normalize_symbol_query_path(
+        // Perform the lookup.
+        //
+        // `find_references` may invoke `scip-csharp find-refs` on a cache miss
+        // (lazy Opt-2 reference resolution). That subprocess can take several minutes
+        // on a large solution, so we use `block_in_place` to avoid blocking the async
+        // executor thread. `block_in_place` is safe here: we are inside a
+        // multi-threaded tokio runtime and do not hold any async locks.
+        let file_for_pos = if !has_name {
+            Some(self.normalize_symbol_query_path(
                 &project_root,
                 Path::new(request.file.as_ref().unwrap()),
-            );
-            indexer.find_references_by_position(&db_path, &file, request.line.unwrap())
+            ))
+        } else {
+            None
         };
+        let symbol_name_for_lookup = request.symbol_name.clone();
+        let line_for_lookup = request.line;
+        let result = tokio::task::block_in_place(|| {
+            if has_name {
+                indexer
+                    .find_references(&db_path, symbol_name_for_lookup.as_ref().unwrap())
+            } else {
+                indexer.find_references_by_position(
+                    &db_path,
+                    &file_for_pos.unwrap(),
+                    line_for_lookup.unwrap(),
+                )
+            }
+        });
 
         match result {
             Ok(references) => {
