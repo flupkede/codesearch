@@ -73,6 +73,7 @@ pub(crate) struct RepoStatusInfo {
     pub(crate) last_tool_call: Option<String>,
     pub(crate) tool_call_count: u64,
     pub(crate) csharp_index: CSharpIndexStatus,
+    pub(crate) csharp_error: Option<String>,
 }
 
 impl RepoStateLabel {
@@ -172,6 +173,8 @@ pub(crate) struct ServeState {
     tool_call_counts: DashMap<String, AtomicU64>,
     /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
     csharp_index_status: DashMap<String, CSharpIndexStatus>,
+    /// Per-repo C# symbol index last error message (set when status is Error, cleared on success).
+    csharp_index_error: DashMap<String, String>,
     /// Debounced deadline for persisting repos config metadata (unix millis).
     persist_deadline_unix_ms: AtomicU64,
     /// Ensures only one debounce worker task runs.
@@ -210,6 +213,7 @@ impl ServeState {
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
             tool_call_counts: DashMap::new(),
             csharp_index_status: DashMap::new(),
+            csharp_index_error: DashMap::new(),
             persist_deadline_unix_ms: AtomicU64::new(0),
             persist_worker_started: AtomicBool::new(false),
             #[cfg(test)]
@@ -1389,6 +1393,14 @@ impl ServeState {
                     }
                 });
 
+            let csharp_error = if matches!(csharp_index, CSharpIndexStatus::Error) {
+                self.csharp_index_error
+                    .get(alias)
+                    .map(|e: dashmap::mapref::one::Ref<String, String>| e.value().clone())
+            } else {
+                None
+            };
+
             result.push((
                 alias.clone(),
                 RepoStatusInfo {
@@ -1397,6 +1409,7 @@ impl ServeState {
                     last_tool_call: last_tool,
                     tool_call_count,
                     csharp_index,
+                    csharp_error,
                 },
             ));
         }
@@ -1785,6 +1798,7 @@ async fn trigger_symbol_rebuild(
             state
                 .csharp_index_status
                 .insert(alias_owned.clone(), CSharpIndexStatus::Ready);
+            state.csharp_index_error.remove(&alias_owned);
 
             if let Ok(mut cfg) = state.config.write() {
                 cfg.touch_last_scip(&alias_owned, ServeState::now_unix_secs());
@@ -1793,6 +1807,9 @@ async fn trigger_symbol_rebuild(
         }
         Ok(Err(e)) => {
             tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, e);
+            state
+                .csharp_index_error
+                .insert(alias_owned.clone(), e.to_string());
             state
                 .csharp_index_status
                 .insert(alias_owned, CSharpIndexStatus::Error);
@@ -1803,6 +1820,9 @@ async fn trigger_symbol_rebuild(
                 alias_owned,
                 e
             );
+            state
+                .csharp_index_error
+                .insert(alias_owned.clone(), format!("Task panicked: {}", e));
             state
                 .csharp_index_status
                 .insert(alias_owned, CSharpIndexStatus::Error);

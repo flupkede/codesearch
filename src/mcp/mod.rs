@@ -3716,7 +3716,7 @@ impl CodesearchService {
 
     /// Unified search tool — dispatches to semantic or literal search based on `mode`.
     #[tool(
-        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
+        description = "PRIMARY code search tool. ALWAYS use `mode=\"semantic\"` (default) first.\n\nSemantic search understands code CONCEPTS — it finds relevant code even when the query uses different words than the code. It combines vector embeddings + BM25 + identifier matching into one ranked result set.\n\nUse `mode=\"literal\"` ONLY when you need exact pattern matching that semantic cannot handle:\n  - Regex patterns: set `regex=true` for operators/brackets/punctuation (`foo = null`, `Vec<T>`, `a::b`)\n  - Exact multi-word phrases: set `phrase=true`\n  - Plain identifier lookups: leave both false\n\n⚠ Do NOT default to literal mode. Semantic is the core capability of codesearch.\n\nParameters:\n- `query` (required): natural language, code snippet, symbol name, or regex\n- `mode`: \"semantic\" (default) | \"literal\"\n- `limit`: max results (default 10 semantic, 20 literal)\n- `compact`: return metadata only (default true, semantic only)\n- `filter_path`: restrict to files under this path prefix (semantic only)\n- `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\"\n- `project` or `group`: REQUIRED in multi-repo mode\n\nReturns metadata only (`compact=true`). Use `get_chunk` to read full code."
     )]
     async fn search(
         &self,
@@ -3768,7 +3768,7 @@ impl CodesearchService {
 
     /// Unified symbol navigation — dispatches based on `kind`.
     #[tool(
-        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
+        description = "Symbol navigation — follow code STRUCTURE (not content search).\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nNOTE: For REFACTOR impact analysis with IDE-class precision, prefer `find_impact` over `find(kind=\"usages\")` — `find_impact` uses SCIP semantic analysis and returns transitive call-sites.\n\nIMPORTANT (multi-repo): always specify either `project` or `group`."
     )]
     async fn find(
         &self,
@@ -5325,7 +5325,7 @@ impl CodesearchService {
     /// enabling agents to plan refactors with IDE-class accuracy instead of text-matching
     /// grep heuristics. Currently supports C# only; architecture is language-agnostic.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol using language-specific semantic analysis (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors with IDE-class accuracy.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nCurrently supports C# only. Requires the `scip-csharp` helper to be installed (bundled in `-with-csharp` release variants).\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "REFACTOR IMPACT ANALYSIS — find ALL references to a symbol with file/line precision.\n\nUses language-specific semantic analysis (SCIP/Roslyn) for IDE-class accuracy.\nReturns transitive call-sites: direct callers AND callers of those callers.\n\nThis is the RIGHT tool when the user asks:\n  - \"What breaks if I change this method?\"\n  - \"Who calls this function?\"\n  - \"I want to rename/refactor this — what's affected?\"\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nCurrently supports C# only. Requires the `scip-csharp` helper (bundled in `-with-csharp` release variants).\n\nIMPORTANT: always specify `project`. Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -6963,19 +6963,40 @@ impl ServerHandler for CodesearchService {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("codesearch", env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                r#"codesearch — semantic + lexical code search MCP server.
+                r#"codesearch — semantic code search with symbol-level analysis.
 
-TOOLS:
-| Tool          | Use for                                              |
-|---------------|------------------------------------------------------|
-| search        | Code search: `mode="semantic"` (default) or `mode="literal"` |
-| find          | Symbol navigation: `kind="definition"` (default), `"usages"`, `"imports"`, `"dependents"` |
-| explore       | File exploration: `kind="outline"` (default) or `"similar"` |
-| get_chunk     | Read full chunk content by chunk_id                  |
-| find_impact   | Symbol impact analysis: find all references using semantic analysis (SCIP) |
-| status        | Index/project info: `kind="index"` (default) or `"projects"` |
+TWO SEARCH DIMENSIONS:
+  - CODE search (search tool): finds code by MEANING and TEXT content
+  - SYMBOL search (find_impact): finds code by STRUCTURE — callers, references, definitions
 
-Indexing is done via CLI: `codesearch index`. The MCP server cannot index.
+TOOL SELECTION PRIORITY (always try in this order, top first):
+
+  1. search(mode="semantic") — DEFAULT. Always start here.
+     Semantic search understands concepts, synonyms, and code structure.
+     Combines vector embeddings + BM25 + identifier matching.
+     Works for: "how does auth work", "error handling", "JWT validation".
+     
+  2. find_impact — REFACTOR PLANNING & CALL GRAPH.
+     When you need: "who calls this?", "what breaks if I change this?", "rename impact".
+     Returns file/line-precise references with IDE-class accuracy (SCIP/Roslyn).
+     C# only (for now). Give it a symbol name or file:line position.
+     Use this BEFORE search when the task is about changing/removing a specific symbol.
+     
+  3. search(mode="literal") — EXACT pattern matching ONLY.
+     Use ONLY when: regex patterns, exact syntax (`Vec<T>`, `foo = null`), structural search.
+     Set regex=true for operators/brackets. Set phrase=true for exact phrases.
+     ⚠ NEVER use literal as first search. Always try semantic first.
+
+  4. find — symbol NAVIGATION. definition/usages/imports/dependents.
+  5. explore — file OVERVIEW. outline (symbols) or similar (like this chunk).
+  6. get_chunk — read chunk content by chunk_id.
+  7. status — index health, project listing.
+
+KEY RULES:
+  - semantic search is the CORE. Don't skip it "because literal is safer".
+  - For C# projects: combine search + find_impact for full coverage.
+    search finds the code, find_impact maps the call graph.
+  - find_impact is DEEPER than find(kind="usages") — it returns transitive callers.
 
 Mode: {mode}
 Current project: {project}

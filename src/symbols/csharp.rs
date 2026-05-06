@@ -292,7 +292,7 @@ impl CSharpSymbolIndexer {
 
     /// Find the .csproj containing a given file.
     #[allow(dead_code)]
-    fn find_csproj_for_file(repo_path: &Path, file_path: &Path) -> Option<PathBuf> {
+    pub fn find_csproj_for_file(repo_path: &Path, file_path: &Path) -> Option<PathBuf> {
         let mut dir = file_path.parent()?;
         loop {
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -586,6 +586,7 @@ impl CSharpSymbolIndexer {
     /// - Returns definitions from `scip_symbols` (always present after rebuild).
     /// - Returns cached references from `scip_ref_cache` if present.
     /// - On cache miss: invokes `scip-csharp find-refs`, stores in `scip_ref_cache`.
+    ///
     /// Inner implementation: fetch references for an EXACT (canonical) symbol key.
     ///
     /// Opens its own LMDB environment so the caller's env handle (if any) is not

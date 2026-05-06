@@ -13,6 +13,24 @@ namespace ScipCsharp;
 /// </summary>
 public static class Program
 {
+    /// <summary>
+    /// File extensions that Roslyn/MSBuild cannot load and would crash the BuildHost.
+    /// These are skipped when loading a solution.
+    /// </summary>
+    private static readonly HashSet<string> UnsupportedProjectExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".deployproj",
+        ".shproj",
+        ".vbproj",
+        ".fsproj",
+        ".esproj",
+        ".sqlproj",
+        ".dbproj",
+        ".modelproj",
+        ".vcxproj",
+        ".pyproj",
+    };
+
     public static async Task<int> Main(string[] args)
     {
         if (args.Length == 0 || args[0] is "help" or "--help" or "-h")
@@ -38,16 +56,14 @@ public static class Program
 
         if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
-        var workspace = MSBuildWorkspace.Create();
-        workspace.WorkspaceFailed += (_, e) =>
-            Console.Error.WriteLine($"[WARN] Workspace error: {e.Diagnostic}");
+        var workspace = CreateTolerantWorkspace();
 
         try
         {
             if (!string.IsNullOrEmpty(parsed.Value.SolutionPath))
             {
                 Console.Error.WriteLine($"Loading solution: {parsed.Value.SolutionPath}");
-                await workspace.OpenSolutionAsync(parsed.Value.SolutionPath).ConfigureAwait(false);
+                await OpenSolutionFilteredAsync(workspace, parsed.Value.SolutionPath).ConfigureAwait(false);
             }
             else if (!string.IsNullOrEmpty(parsed.Value.ProjectPath))
             {
@@ -102,14 +118,12 @@ public static class Program
 
         if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
-        var workspace = MSBuildWorkspace.Create();
-        workspace.WorkspaceFailed += (_, e) =>
-            Console.Error.WriteLine($"[WARN] Workspace error: {e.Diagnostic}");
+        var workspace = CreateTolerantWorkspace();
 
         try
         {
             Console.Error.WriteLine($"find-refs: loading solution: {parsed.Value.SolutionPath}");
-            await workspace.OpenSolutionAsync(parsed.Value.SolutionPath).ConfigureAwait(false);
+            await OpenSolutionFilteredAsync(workspace, parsed.Value.SolutionPath).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -150,6 +164,218 @@ public static class Program
         return 0;
     }
 
+    // ── Workspace creation ───────────────────────────────────────────
+
+    /// <summary>
+    /// Creates an <see cref="MSBuildWorkspace"/> that logs workspace diagnostics as warnings
+    /// instead of throwing, so unsupported project types (.deployproj, .shproj, etc.) are
+    /// skipped gracefully instead of crashing the entire solution load.
+    /// </summary>
+    private static MSBuildWorkspace CreateTolerantWorkspace()
+    {
+        var properties = new Dictionary<string, string>
+        {
+            // Tell Roslyn to skip projects it cannot load instead of crashing.
+            { "BuildingInsideVisualStudio", "true" },
+        };
+
+        // If MSBUILD_EXE_PATH is set, pass it to the workspace so the BuildHost
+        // uses the same MSBuild we registered via MSBuildLocator (typically the .NET SDK).
+        // This prevents the BuildHost from falling back to a VS-installed MSBuild
+        // that may be incompatible (e.g. .NET Framework 4.8 vs .NET 10).
+        var msbuildExePath = Environment.GetEnvironmentVariable("MSBUILD_EXE_PATH");
+        if (!string.IsNullOrEmpty(msbuildExePath) && File.Exists(msbuildExePath))
+        {
+            properties["MSBUILD_EXE_PATH"] = msbuildExePath;
+        }
+
+        var workspace = MSBuildWorkspace.Create(properties);
+        workspace.WorkspaceFailed += (_, e) =>
+            Console.Error.WriteLine($"[WARN] Workspace error: {e.Diagnostic}");
+        return workspace;
+    }
+
+    // ── Solution filtering ───────────────────────────────────────────
+
+    /// <summary>
+    /// Opens a solution but first checks if it contains unsupported project types.
+    /// If unsupported projects are found, creates a filtered temporary .sln that
+    /// excludes them, then opens that instead.
+    /// If the filtered solution still fails to load (e.g. BuildHost crash), falls
+    /// back to loading individual .csproj files from the solution.
+    /// </summary>
+    private static async Task OpenSolutionFilteredAsync(MSBuildWorkspace workspace, string solutionPath)
+    {
+        var solutionDir = Path.GetDirectoryName(solutionPath) ?? ".";
+        var lines = await File.ReadAllLinesAsync(solutionPath).ConfigureAwait(false);
+
+        // Parse project entries from .sln: Project("{GUID}") = "Name", "RelativePath", "{GUID}"
+        var projectEntries = ParseSolutionProjects(lines);
+
+        // Separate supported vs unsupported projects
+        var supported = projectEntries
+            .Where(p => !UnsupportedProjectExtensions.Contains(Path.GetExtension(p.RelativePath)))
+            .ToList();
+        var unsupported = projectEntries
+            .Where(p => UnsupportedProjectExtensions.Contains(Path.GetExtension(p.RelativePath)))
+            .ToList();
+
+        // Log skipped projects
+        foreach (var skip in unsupported)
+        {
+            Console.Error.WriteLine($"[INFO] Skipping unsupported project type: {skip.RelativePath}");
+        }
+
+        if (supported.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Solution contains no supported project types " +
+                $"(found {unsupported.Count} unsupported: {string.Join(", ", unsupported.Select(u => u.RelativePath))})");
+        }
+
+        // Try opening the filtered solution first
+        var skipIndices = unsupported.Select(u => u.LineIndex).ToHashSet();
+        var filteredContent = BuildFilteredSolution(lines, skipIndices);
+        var tempSlnName = $"{Path.GetFileNameWithoutExtension(solutionPath)}-filtered-{Guid.NewGuid():N}.sln";
+        var tempSlnPath = Path.Combine(solutionDir, tempSlnName);
+        await File.WriteAllTextAsync(tempSlnPath, filteredContent).ConfigureAwait(false);
+
+        try
+        {
+            await workspace.OpenSolutionAsync(tempSlnPath).ConfigureAwait(false);
+            Console.Error.WriteLine($"Loaded {workspace.CurrentSolution.Projects.Count()} project(s) from filtered solution");
+            return; // Success!
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[WARN] Filtered solution still failed ({ex.GetType().Name}: {ex.Message}); " +
+                $"falling back to loading {supported.Count} individual .csproj files.");
+        }
+        finally
+        {
+            try { File.Delete(tempSlnPath); } catch { /* best effort */ }
+        }
+
+        // Fallback: open each supported .csproj individually.
+        // CloseSolution() clears any partially-loaded projects from the failed solution attempt.
+        workspace.CloseSolution();
+        var loaded = 0;
+        foreach (var entry in supported)
+        {
+            var csprojPath = Path.GetFullPath(Path.Combine(solutionDir, entry.RelativePath));
+            if (!File.Exists(csprojPath))
+            {
+                Console.Error.WriteLine($"[WARN] Project file not found: {csprojPath}");
+                continue;
+            }
+
+            try
+            {
+                await workspace.OpenProjectAsync(csprojPath).ConfigureAwait(false);
+                loaded++;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[WARN] Failed to load project '{entry.RelativePath}': {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        Console.Error.WriteLine($"Loaded {loaded}/{supported.Count} project(s) individually");
+    }
+
+    /// <summary>
+    /// Parses project entries from .sln file lines.
+    /// Skips solution folders (GUID {2150E333-...}) which have no file path.
+    /// </summary>
+    private static List<(int LineIndex, string RelativePath)> ParseSolutionProjects(string[] lines)
+    {
+        var result = new List<(int, string)>();
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i].Trim();
+            if (!line.StartsWith("Project(", StringComparison.Ordinal)) continue;
+
+            var parts = SplitProjectLine(line);
+            if (parts is null || parts.Length < 2) continue;
+
+            var relativePath = parts[1];
+            // Solution folders have the folder name as both "Name" and "Path" (no extension).
+            // Skip entries that don't look like file paths.
+            if (!Path.HasExtension(relativePath)) continue;
+
+            result.Add((i, relativePath));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Builds a new .sln content string with the specified project line indices removed.
+    /// Removes both the Project() line and its corresponding EndProject line.
+    /// </summary>
+    private static string BuildFilteredSolution(string[] lines, HashSet<int> skipLineIndices)
+    {
+        var result = new List<string>(lines.Length);
+        var skipping = false;
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (skipLineIndices.Contains(i))
+            {
+                skipping = true;
+                continue; // skip the Project() line
+            }
+
+            if (skipping)
+            {
+                // Look for the EndProject that closes this project block
+                if (lines[i].Trim() == "EndProject")
+                {
+                    skipping = false;
+                    continue; // skip the EndProject line too
+                }
+                // Shouldn't happen — project lines are always followed by EndProject,
+                // but skip any intermediate lines just in case.
+                continue;
+            }
+
+            result.Add(lines[i]);
+        }
+
+        return string.Join(Environment.NewLine, result);
+    }
+
+    /// <summary>
+    /// Splits a .sln Project() line into its quoted segments.
+    /// Returns null if the line doesn't match the expected format.
+    /// </summary>
+    private static string[]? SplitProjectLine(string line)
+    {
+        var eqIdx = line.IndexOf('=');
+        if (eqIdx < 0) return null;
+
+        var afterEq = line.AsSpan()[(eqIdx + 1)..];
+        var segments = new List<string>();
+        int start = -1;
+
+        for (int i = 0; i < afterEq.Length; i++)
+        {
+            if (afterEq[i] == '"')
+            {
+                if (start < 0)
+                    start = i + 1;
+                else
+                {
+                    segments.Add(afterEq.Slice(start, i - start).ToString());
+                    start = -1;
+                }
+            }
+        }
+
+        return segments.Count >= 2 ? segments.ToArray() : null;
+    }
+
     // ── MSBuild registration ─────────────────────────────────────────
 
     /// <summary>
@@ -170,7 +396,6 @@ public static class Program
         {
             var instances = MSBuildLocator
                 .QueryVisualStudioInstances()
-                .OrderByDescending(i => i.Version)
                 .ToList();
 
             if (instances.Count == 0)
@@ -182,10 +407,25 @@ public static class Program
                 return false;
             }
 
-            var instance = instances[0];
+            // Prefer .NET SDK instances over Visual Studio instances.
+            // The VS BuildHost (net472) crashes with TypeInitializationException
+            // when loading solutions that contain certain project types.
+            var sdkInstance = instances
+                .FirstOrDefault(i => i.DiscoveryType == DiscoveryType.DotNetSdk);
+            var instance = sdkInstance ?? instances.OrderByDescending(i => i.Version).First();
+
             Console.Error.WriteLine(
                 $"MSBuild: registering '{instance.Name}' v{instance.Version} at {instance.MSBuildPath}");
             MSBuildLocator.RegisterInstance(instance);
+
+            // Set MSBUILD_EXE_PATH so the Roslyn BuildHost uses the same MSBuild
+            // binary we just registered, instead of discovering a different (possibly
+            // incompatible) one from Visual Studio.
+            if (!string.IsNullOrEmpty(instance.MSBuildPath) && File.Exists(instance.MSBuildPath))
+            {
+                Environment.SetEnvironmentVariable("MSBUILD_EXE_PATH", instance.MSBuildPath);
+            }
+
             errorMessage = null;
             return true;
         }

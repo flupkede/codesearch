@@ -36,6 +36,16 @@ pub enum IndexCommands {
 
     /// Show index status (local or global)
     List,
+
+    /// Rebuild symbol index (C# via scip-csharp) for a repository
+    Symbol {
+        /// Repository alias (required — use "index list" to see aliases)
+        alias: String,
+
+        /// Force full symbol rebuild (ignores cached state)
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
 }
 
 /// Cache subcommands
@@ -209,6 +219,10 @@ pub enum Commands {
         #[arg(short = 'f', long, alias = "full")]
         force: bool,
 
+        /// Also rebuild symbol index (C# via scip-csharp) after text reindex
+        #[arg(long)]
+        symbols: bool,
+
         // Backward-compat flags (predate subcommands)
         /// Add a repository to the index (creates local or global index)
         #[arg(long)]
@@ -361,6 +375,81 @@ pub enum Commands {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Symbol reindex via HTTP API
+// ---------------------------------------------------------------------------
+
+/// Base URL for the codesearch serve instance.
+/// Override via `CODESEARCH_SERVE_PORT` env var.
+fn serve_base_url() -> String {
+    let port = std::env::var("CODESEARCH_SERVE_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(39725);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Trigger a symbol reindex by calling the running serve instance's HTTP API.
+async fn trigger_symbol_reindex_via_api(alias: &str, force: bool) -> Result<()> {
+    use colored::Colorize;
+
+    let base = serve_base_url();
+    let url = if force {
+        format!("{base}/repos/{alias}/reindex?force=true&symbols=true")
+    } else {
+        format!("{base}/repos/{alias}/reindex?symbols=true")
+    };
+
+    println!(
+        "  {} symbol reindex for '{}' via {url}",
+        "⟳".yellow(),
+        alias.bright_green()
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+
+    let resp = client.post(&url).send().await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            if status.as_u16() == 202 {
+                println!(
+                    "  {} symbol reindex accepted — rebuilding in background",
+                    "✓".green()
+                );
+                Ok(())
+            } else if status.as_u16() == 404 {
+                anyhow::bail!(
+                    "Unknown alias '{}' — use `codesearch index list` to see registered repos",
+                    alias
+                );
+            } else if status.as_u16() == 409 {
+                anyhow::bail!("Reindex already in progress for '{}'", alias);
+            } else {
+                anyhow::bail!(
+                    "Serve returned HTTP {}: {}",
+                    status.as_u16(),
+                    body.trim()
+                );
+            }
+        }
+        Err(e) => {
+            if e.is_connect() {
+                anyhow::bail!(
+                    "Cannot connect to codesearch serve at {}.\n  Is `codesearch serve` running?",
+                    base
+                );
+            } else {
+                anyhow::bail!("HTTP request failed: {}", e);
+            }
+        }
+    }
+}
+
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     let cli = Cli::parse();
 
@@ -440,6 +529,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             path,
             dry_run,
             force,
+            symbols,
             add,
             global,
             alias,
@@ -463,6 +553,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         keep_config,
                     } => crate::index::remove_from_index(rm_path, keep_config).await,
                     IndexCommands::List => crate::index::list_index_status().await,
+                    IndexCommands::Symbol { alias, force } => {
+                        trigger_symbol_reindex_via_api(&alias, force).await
+                    }
                 }
             } else {
                 // Flag-based backward-compat path
@@ -483,6 +576,27 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     crate::index::remove_from_index(effective_path, keep_config).await
                 } else if list || is_list_cmd {
                     crate::index::list_index_status().await
+                } else if symbols {
+                    // --symbols without subcommand: resolve path to alias, use HTTP API
+                    use crate::db_discovery::repos::ReposConfig;
+                    let config = ReposConfig::load().unwrap_or_default();
+                    let target_path = path.as_deref().unwrap_or_else(|| {
+                        std::path::Path::new(".")
+                    });
+                    let resolved_alias = config.alias_for_path(target_path)
+                        .or_else(|| {
+                            // Try the directory name as alias fallback
+                            target_path.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string())
+                        });
+                    match resolved_alias {
+                        Some(a) => trigger_symbol_reindex_via_api(&a, force).await,
+                        None => anyhow::bail!(
+                            "Cannot resolve alias for path '{}'. Use `codesearch index symbol <alias>` instead.",
+                            target_path.display()
+                        ),
+                    }
                 } else {
                     crate::index::index(
                         path,

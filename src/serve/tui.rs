@@ -94,7 +94,7 @@ async fn run_tui_loop(
             let chunks = Layout::vertical([
                 Constraint::Length(3), // header
                 Constraint::Min(4),    // body (table)
-                Constraint::Length(3), // detail panel (selected repo info)
+                Constraint::Length(4), // detail panel (selected repo info + optional error)
                 Constraint::Length(1), // footer
             ])
             .split(size);
@@ -232,17 +232,6 @@ fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str) {
     f.render_widget(ratatui::widgets::Paragraph::new(title_line), centered[0]);
 }
 
-/// Returns true during the "bright" phase of a ~1s pulse cycle (500ms bright, 500ms dim).
-/// Used to animate the C# indicator while symbol indexing is in progress.
-fn pulse_bright() -> bool {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        % 1000
-        < 500
-}
-
 fn render_table(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -267,16 +256,7 @@ fn render_table(
 
     let max_alias_w = repos
         .iter()
-        .map(|(a, info)| {
-            // Account for C# indicator suffix
-            let extra = match info.csharp_index {
-                super::CSharpIndexStatus::Ready => 4,    // " C#·"
-                super::CSharpIndexStatus::Error => 4,    // " C#!"
-                super::CSharpIndexStatus::Indexing => 4, // " C#·"
-                super::CSharpIndexStatus::None => 0,
-            };
-            a.len() + extra
-        })
+        .map(|(a, _)| a.len())
         .max()
         .unwrap_or(10)
         .max(10);
@@ -303,33 +283,8 @@ fn render_table(
             // We don't have lock info in lightweight status, show status-derived value
             let lock_cell = lock_cell_from_status(info.status);
 
-            // Alias cell with optional C# indicator
-            let alias_cell = match info.csharp_index {
-                super::CSharpIndexStatus::Ready => {
-                    // Green C# indicator for healthy index
-                    Cell::from(format!("{} C#·", alias)).style(Style::default().fg(Color::White))
-                }
-                super::CSharpIndexStatus::Error => {
-                    // Red C# indicator for errored index
-                    Cell::from(format!("{} C#!", alias)).style(Style::default().fg(Color::Red))
-                }
-                super::CSharpIndexStatus::Indexing => {
-                    // Pulsing C# indicator during indexing (color only, fixed text width)
-                    if pulse_bright() {
-                        Cell::from(format!("{} C#·", alias)).style(
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        Cell::from(format!("{} C#·", alias))
-                            .style(Style::default().fg(Color::DarkGray))
-                    }
-                }
-                super::CSharpIndexStatus::None => {
-                    Cell::from(alias.clone()).style(Style::default().fg(Color::White))
-                }
-            };
+            // Alias cell — plain name, no C# indicator
+            let alias_cell = Cell::from(alias.clone()).style(Style::default().fg(Color::White));
 
             // Red alias if the repo has errors
             let alias_cell = if matches!(info.status, super::RepoStateLabel::Error) {
@@ -353,7 +308,7 @@ fn render_table(
         rows,
         [
             Constraint::Length(max_alias_w as u16 + 2),
-            Constraint::Length(12),
+            Constraint::Length(14),
             Constraint::Length(7),
             Constraint::Length(7),
             Constraint::Min(24),
@@ -407,14 +362,27 @@ fn render_detail(
         path
     };
 
-    let status_label = match info.status {
-        super::RepoStateLabel::Open => "Open",
-        super::RepoStateLabel::Warm => "Warm (no FSW)",
-        super::RepoStateLabel::Readonly => "Readonly",
-        super::RepoStateLabel::Closed => "Closed",
-        super::RepoStateLabel::Indexing => "Indexing…",
-        super::RepoStateLabel::Error => "Error",
-        super::RepoStateLabel::NoIndex => "No Index",
+    let (status_label, status_color) = match info.status {
+        super::RepoStateLabel::Open => match info.csharp_index {
+            super::CSharpIndexStatus::Ready => ("Open C#·".to_string(), Color::Green),
+            super::CSharpIndexStatus::Indexing => ("Index C#…".to_string(), Color::Yellow),
+            super::CSharpIndexStatus::Error => ("Open C#!".to_string(), Color::Red),
+            super::CSharpIndexStatus::None => ("Open".to_string(), Color::Green),
+        },
+        super::RepoStateLabel::Warm => match info.csharp_index {
+            super::CSharpIndexStatus::Ready => ("Warm C#·".to_string(), Color::Yellow),
+            super::CSharpIndexStatus::Indexing => ("Index C#…".to_string(), Color::Yellow),
+            super::CSharpIndexStatus::Error => ("Warm C#!".to_string(), Color::Red),
+            super::CSharpIndexStatus::None => ("Warm".to_string(), Color::Yellow),
+        },
+        super::RepoStateLabel::Readonly => ("Readonly".to_string(), Color::Cyan),
+        super::RepoStateLabel::Closed => ("Closed".to_string(), Color::Gray),
+        super::RepoStateLabel::Indexing => match info.csharp_index {
+            super::CSharpIndexStatus::Indexing => ("Index C#…".to_string(), Color::Yellow),
+            _ => ("Indexing…".to_string(), Color::Yellow),
+        },
+        super::RepoStateLabel::Error => ("Error".to_string(), Color::Red),
+        super::RepoStateLabel::NoIndex => ("No Index".to_string(), Color::Gray),
     };
 
     let detail_line = Line::from(vec![
@@ -426,31 +394,13 @@ fn render_detail(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
-        Span::styled(status_label, Style::default().fg(Color::Cyan)),
+        Span::styled(status_label, Style::default().fg(status_color)),
         Span::styled("  ", Style::default()),
         Span::styled(display_path, Style::default().fg(Color::DarkGray)),
     ]);
 
     // Second line: changes + tool calls + last tool call
     let tool_str = info.last_tool_call.as_deref().unwrap_or("—");
-    let csharp_str = match info.csharp_index {
-        super::CSharpIndexStatus::None => "",
-        super::CSharpIndexStatus::Ready => "  C#·",
-        super::CSharpIndexStatus::Error => "  C#!",
-        super::CSharpIndexStatus::Indexing => "  C#·",
-    };
-    let csharp_color = match info.csharp_index {
-        super::CSharpIndexStatus::Ready => Color::Green,
-        super::CSharpIndexStatus::Error => Color::Red,
-        super::CSharpIndexStatus::None => Color::DarkGray,
-        super::CSharpIndexStatus::Indexing => {
-            if pulse_bright() {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            }
-        }
-    };
     let info_line = Line::from(vec![
         Span::styled("   changes:", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -464,8 +414,29 @@ fn render_detail(
         ),
         Span::styled("last:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!(" {}", tool_str), Style::default().fg(Color::White)),
-        Span::styled(csharp_str, Style::default().fg(csharp_color)),
     ]);
+
+    // Error line: shown only when C# index has an error
+    let error_line = if matches!(info.csharp_index, super::CSharpIndexStatus::Error) {
+        let err_msg = info
+            .csharp_error
+            .as_deref()
+            .unwrap_or("Unknown error");
+        // Truncate error message to fit the area
+        let max_err_len = (area.width as usize).saturating_sub(12);
+        let display_err = if err_msg.len() > max_err_len && max_err_len > 3 {
+            format!("{}...", &err_msg[..max_err_len - 3])
+        } else {
+            err_msg.to_string()
+        };
+        Some(Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled("⚠ ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(display_err, Style::default().fg(Color::Red)),
+        ]))
+    } else {
+        None
+    };
 
     let block = Block::default()
         .borders(Borders::TOP)
@@ -473,8 +444,16 @@ fn render_detail(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let detail_chunks =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+    let constraints = if error_line.is_some() {
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![Constraint::Length(1), Constraint::Length(1)]
+    };
+    let detail_chunks = Layout::vertical(constraints).split(inner);
 
     f.render_widget(
         ratatui::widgets::Paragraph::new(detail_line),
@@ -484,6 +463,12 @@ fn render_detail(
         ratatui::widgets::Paragraph::new(info_line),
         detail_chunks[1],
     );
+    if let Some(err_line) = error_line {
+        f.render_widget(
+            ratatui::widgets::Paragraph::new(err_line),
+            detail_chunks[2],
+        );
+    }
 }
 
 fn render_footer(
@@ -588,31 +573,44 @@ fn status_cell(status: super::RepoStateLabel, csharp: super::CSharpIndexStatus) 
     use super::CSharpIndexStatus as CS;
     use super::RepoStateLabel::*;
     match status {
-        Open => Cell::from("✓ ready  ".to_string()).style(
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Warm => match csharp {
-            CS::Ready => Cell::from("◐ warm+C#".to_string())
-                .style(Style::default().fg(Color::Green)),
-            CS::Indexing => Cell::from("◐ warm C#…".to_string())
+        Open => match csharp {
+            CS::Ready => Cell::from("✓ ready C#·  ".to_string())
+                .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            CS::Indexing => Cell::from("⟳ idx C#…   ".to_string())
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            CS::Error => Cell::from("◐ warm C#!".to_string())
-                .style(Style::default().fg(Color::Red)),
-            CS::None => Cell::from("◐ warm   ".to_string())
+            CS::Error => Cell::from("✓ ready C#!  ".to_string())
+                .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            CS::None => Cell::from("✓ ready      ".to_string())
+                .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        },
+        Warm => match csharp {
+            CS::Ready => Cell::from("◐ warm C#·   ".to_string())
+                .style(Style::default().fg(Color::Yellow)),
+            CS::Indexing => Cell::from("⟳ idx C#…   ".to_string())
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            CS::Error => Cell::from("◐ warm C#!   ".to_string())
+                .style(Style::default().fg(Color::Yellow)),
+            CS::None => Cell::from("◐ warm       ".to_string())
                 .style(Style::default().fg(Color::Yellow)),
         },
-        Readonly => Cell::from("◑ ro     ".to_string()).style(Style::default().fg(Color::Cyan)),
-        Indexing => Cell::from("⟳ idx…  ".to_string()).style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Closed => Cell::from("○ closed ".to_string()).style(Style::default().fg(Color::Gray)),
-        Error => Cell::from("✗ error  ".to_string())
+        Readonly => Cell::from("◑ ro         ".to_string()).style(Style::default().fg(Color::Cyan)),
+        Indexing => match csharp {
+            CS::Ready => Cell::from("⟳ idx… C#·  ".to_string())
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            CS::Indexing => Cell::from("⟳ idx C#…   ".to_string())
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            CS::Error => Cell::from("⟳ idx… C#!  ".to_string())
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            CS::None => Cell::from("⟳ indexing…  ".to_string()).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        },
+        Closed => Cell::from("○ closed     ".to_string()).style(Style::default().fg(Color::Gray)),
+        Error => Cell::from("✗ error      ".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        NoIndex => Cell::from("— no idx ".to_string()).style(Style::default().fg(Color::Gray)),
+        NoIndex => Cell::from("— no idx     ".to_string()).style(Style::default().fg(Color::Gray)),
     }
 }
 

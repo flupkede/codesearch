@@ -924,16 +924,19 @@ impl IndexManager {
                         let elapsed = now.duration_since(cs_last);
                         if elapsed >= cs_debounce {
                             let changed_count = cs_files_changed.len();
-                            cs_files_changed.clear();
+                            let cs_changed: Vec<PathBuf> = cs_files_changed.drain().collect();
                             cs_last_event_time = None;
 
                             info!(
-                                "🔬 {} .cs file(s) changed, triggering symbol index rebuild (after {}s debounce)",
+                                "🔬 {} .cs file(s) changed, triggering incremental symbol rebuild (after {}s debounce)",
                                 changed_count,
                                 cs_debounce.as_secs()
                             );
 
-                            // Trigger rebuild in a blocking task (the trait method is sync)
+                            // Group changed files by .csproj so we can index per project.
+                            // Each group triggers a separate incremental rebuild with
+                            // --filter-project, which is much faster than rebuilding
+                            // the entire solution.
                             let reg = symbol_registry.clone();
                             let rp = path.clone();
                             let dp = db_path.clone();
@@ -945,8 +948,35 @@ impl IndexManager {
                                         );
                                         return;
                                     }
-                                    if indexer.is_available() {
-                                        match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
+                                    if !indexer.is_available() {
+                                        info!("🔬 symbol rebuild skipped: helper not available");
+                                        return;
+                                    }
+
+                                    // Group files by their containing .csproj
+                                    let mut groups: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
+                                        std::collections::HashMap::new();
+                                    let mut ungrouped: Vec<PathBuf> = Vec::new();
+
+                                    for file in &cs_changed {
+                                        if let Some(csproj) =
+                                            crate::symbols::csharp::CSharpSymbolIndexer::find_csproj_for_file(&rp, file)
+                                        {
+                                            groups.entry(csproj).or_default().push(file.clone());
+                                        } else {
+                                            ungrouped.push(file.clone());
+                                        }
+                                    }
+
+                                    // If any files couldn't be mapped to a .csproj,
+                                    // fall back to a full solution rebuild
+                                    if !ungrouped.is_empty() {
+                                        info!(
+                                            "🔬 {} file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                            ungrouped.len()
+                                        );
+                                        let scope = RebuildScope::Files(cs_changed);
+                                        match indexer.rebuild(&rp, &dp, scope) {
                                             Ok(summary) => {
                                                 info!(
                                                     "✅ Symbol rebuild complete: {} symbols, {} refs in {}ms",
@@ -957,6 +987,46 @@ impl IndexManager {
                                             }
                                             Err(e) => {
                                                 warn!("⚠️ Symbol rebuild failed: {}", e);
+                                            }
+                                        }
+                                        return;
+                                    }
+
+                                    // Rebuild each project group separately
+                                    let total_groups = groups.len();
+                                    for (i, (csproj, files)) in groups.into_iter().enumerate() {
+                                        let csproj_name = csproj
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default();
+                                        info!(
+                                            "🔬 incremental rebuild [{}/{}]: {} ({} file(s))",
+                                            i + 1,
+                                            total_groups,
+                                            csproj_name,
+                                            files.len()
+                                        );
+                                        let scope = RebuildScope::Files(files);
+                                        match indexer.rebuild(&rp, &dp, scope) {
+                                            Ok(summary) => {
+                                                info!(
+                                                    "✅ [{}/{}] Symbol rebuild complete ({}): {} symbols, {} refs in {}ms",
+                                                    i + 1,
+                                                    total_groups,
+                                                    csproj_name,
+                                                    summary.symbols_indexed,
+                                                    summary.references_stored,
+                                                    summary.duration_ms
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "⚠️ [{}/{}] Symbol rebuild failed ({}): {}",
+                                                    i + 1,
+                                                    total_groups,
+                                                    csproj_name,
+                                                    e
+                                                );
                                             }
                                         }
                                     }
