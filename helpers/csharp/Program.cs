@@ -62,10 +62,22 @@ public static class Program
         }
         catch (Exception ex)
         {
+            // Some solutions contain unsupported project types (e.g. .deployproj, .shproj) that
+            // crash the Roslyn BuildHost.  Log a warning and continue with whatever projects did
+            // load — if at least one C# project is available we can still produce a useful index.
             await Console.Error.WriteLineAsync(
-                $"Failed to load: {ex.GetType().Name}: {ex.Message}{Environment.NewLine}{ex.StackTrace}")
+                $"[WARN] Solution load partially failed ({ex.GetType().Name}: {ex.Message}); " +
+                $"continuing with {workspace.CurrentSolution.Projects.Count()} loaded project(s).")
                 .ConfigureAwait(false);
-            return 1;
+
+            if (!workspace.CurrentSolution.Projects.Any())
+            {
+                await Console.Error.WriteLineAsync(
+                    "No projects loaded — cannot produce index. Full error:")
+                    .ConfigureAwait(false);
+                await Console.Error.WriteLineAsync(ex.StackTrace).ConfigureAwait(false);
+                return 1;
+            }
         }
 
         var indexer = new SymbolIndexer();
@@ -102,9 +114,17 @@ public static class Program
         catch (Exception ex)
         {
             await Console.Error.WriteLineAsync(
-                $"find-refs: failed to load solution: {ex.GetType().Name}: {ex.Message}{Environment.NewLine}{ex.StackTrace}")
+                $"find-refs: [WARN] Solution load partially failed ({ex.GetType().Name}: {ex.Message}); " +
+                $"continuing with {workspace.CurrentSolution.Projects.Count()} loaded project(s).")
                 .ConfigureAwait(false);
-            return 1;
+
+            if (!workspace.CurrentSolution.Projects.Any())
+            {
+                await Console.Error.WriteLineAsync(
+                    $"find-refs: no projects loaded — cannot resolve refs. Full error:{Environment.NewLine}{ex.StackTrace}")
+                    .ConfigureAwait(false);
+                return 1;
+            }
         }
 
         var resolver = new ReferenceResolver();
