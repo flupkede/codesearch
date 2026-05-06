@@ -27,7 +27,11 @@ Add symbol-aware reference lookups to codesearch via `find_impact` MCP tool. Ret
 - **CI** — separate `csharp-integration-tests` job in `.github/workflows/ci.yml`
 - **Sequential phase-2 startup** — Phase 1 warms repos sequentially, Phase 2 runs gated C# SCIP rebuilds ordered by `last_changed_unix` under `Semaphore(concurrency)` via `CSHARP_SCIP_CONCURRENCY` env (default **2**, clamp [1,4])
 - **`repos_meta` tracking** — `RepoMeta` (last_changed_unix, last_scip_indexed_unix) persisted in `repos.json` with debounced save (10s window)
-- **TUI C# indicator** — pulsing yellow/dark-gray during indexing, green ready, red error; footer shows helper availability; Calls column with tool call count
+- **TUI C# indicator** — in status column: green `C#·` ready, yellow `C#…` indexing, red `C#!` error; footer shows helper availability; Calls column with tool call count
+- **Selective ref cache invalidation** — incremental rebuilds only purge cached refs for affected symbols, not entire cache
+- **Phase 3 pre-warm** — after Phase 2 definitions, `scip-csharp batch-find-refs` resolves all uncached symbols in a single workspace session; controlled by `CSHARP_PREWARM_ENABLED` env (default: true)
+- **`index symbol` CLI** — `codesearch index symbol [-f] <alias>` for symbol-only rebuild; `--symbols` flag on `index -f` for combined text+symbol rebuild
+- **Watcher .csproj grouping** — changed .cs files grouped by .csproj, incremental rebuild per project instead of full solution
 
 ## Architecture
 
@@ -57,9 +61,29 @@ Add symbol-aware reference lookups to codesearch via `find_impact` MCP tool. Ret
 
 Missing helper disables `find_impact` for C# only — all other features keep working.
 
+### Startup phases
+
+| Phase | What | Trigger |
+|---|---|---|
+| Phase 1 | Sequential text/vector warmup | `run_phase_1_warmup_all()` |
+| Phase 2 | C# SCIP definitions-only rebuild | `run_phase_2_csharp_scip()`, gated by `Semaphore(CSHARP_SCIP_CONCURRENCY)` |
+| Phase 3 | Batch reference cache pre-warm | `run_phase_3_prewarm()`, gated by `CSHARP_PREWARM_ENABLED` (default: true) |
+
+### scip-csharp subcommands
+
+| Subcommand | Purpose |
+|---|---|
+| `index` | Compile solution, emit definitions only (fast) |
+| `find-refs` | Resolve references for ONE symbol on demand (lazy) |
+| `batch-find-refs` | Resolve references for ALL symbols in one workspace session (Phase 3 pre-warm) |
+
 ### `SymbolIndexerRegistry` ownership
 
 4 `Arc::new(SymbolIndexerRegistry::new())` sites: `IndexManager::new()`, `IndexManager::new_for_path()`, `ServeState::new()`, `CodesearchService::new_with_stores()`. `CodesearchService::new_for_serve()` clones from `ServeState`.
+
+### `SymbolIndexer` trait
+
+The trait includes `as_any()` for downcasting to concrete types (needed for Phase 3 pre-warm which calls `CSharpSymbolIndexer::prewarm_ref_cache()`).
 
 ## Current commit state (2026-05-06)
 
@@ -71,18 +95,17 @@ Latest commits on `features/symbol-references`:
 - `becc518` fix: IncludeAllContentForSelfExtract + MSBuild registration (stage 4)
 - `4ed0a3f` fix: applies_to + non-C# repos red TUI (stage 3)
 
-**Status**: `cargo check` + `cargo clippy` clean, 392 tests pass, `dotnet build` clean.
-**Deployed**: NOT YET — user must run `..\copy-to-common.ps1` to deploy to `~/.local/bin/`.
+**Status**: `cargo check` + `cargo clippy` clean, `dotnet build` clean.
+**Deployed**: Run `..\copy-to-common.ps1` to deploy to `~/.local/bin/`.
 
 ## Remaining work
 
-- [ ] Deploy: run `..\copy-to-common.ps1` (builds + copies both exes to runtime location)
 - [ ] Verify on live Aprimo repo: 1st `find_impact` call triggers lazy find-refs, 2nd+ call < 100ms (cache hit)
 - [ ] CI green on `csharp-integration-tests` job *(first run after push)*
-- [ ] Minor: filter `kind == "reference"` in `parse_find_refs_output` (defensive against future C# side emitting self-reference definitions)
 - [ ] Minor: warn if `--filter-project` passed to `find-refs` CLI (currently silently ignored)
 - [ ] Minor: `FindRefsOutput.Symbol` should be `init` not `set` (consistency)
-- [ ] Known limitation: first `find_impact` on un-cached symbol triggers full workspace open (2-5 min on large solution); subsequent calls instant. Daemon mode (persistent workspace) would fix this but is out of scope.
+- [ ] Known limitation: first `find_impact` on un-cached symbol triggers full workspace open (2-5 min on large solution); Phase 3 pre-warm mitigates this by batch-resolving all symbols at startup. Daemon mode (persistent workspace) would fully eliminate it but is out of scope.
+- [ ] Standalone `index symbol` — local symbol index without serve running (currently requires HTTP API)
 
 ## Notes for OpenCode
 

@@ -4,34 +4,94 @@ using Microsoft.CodeAnalysis.FindSymbols;
 namespace ScipCsharp;
 
 /// <summary>
-/// Resolves references for a single SCIP symbol on demand.
+/// Resolves references for SCIP symbols on demand.
 ///
-/// Used by the `find-refs` subcommand: the workspace is already loaded (same
-/// startup cost as `index`), but instead of calling FindReferencesAsync for
-/// every symbol in the solution, we call it once for the requested symbol only.
+/// Used by the `find-refs` and `batch-find-refs` subcommands: the workspace is already
+/// loaded (same startup cost as `index`), but instead of calling FindReferencesAsync for
+/// every symbol in the solution, we call it only for the requested symbol(s).
 ///
-/// The Rust host caches the result in LMDB so subsequent find_impact calls for
-/// the same symbol are instant (O(1) LMDB read).
+/// The Rust host caches results in LMDB so subsequent find_impact calls for the
+/// same symbol are instant (O(1) LMDB read).
 /// </summary>
 public sealed class ReferenceResolver
 {
     /// <summary>
     /// Resolve all references for a single SCIP symbol key within the solution.
-    ///
-    /// Always compiles ALL projects in the solution so that:
-    /// (a) the target symbol can be located regardless of which project owns it, and
-    /// (b) <see cref="SymbolFinder.FindReferencesAsync"/> has full cross-project visibility.
     /// </summary>
-    /// <param name="solution">Fully loaded Roslyn solution.</param>
-    /// <param name="scipKey">Canonical SCIP key, e.g. "csharp App . FieldDefinition#Validate()."</param>
     public async Task<FindRefsOutput> FindRefsAsync(Solution solution, string scipKey)
     {
         var output = new FindRefsOutput { Symbol = scipKey };
 
-        // Build symbol map (fast — no FindReferencesAsync, just compilation + symbol walk).
+        var (symbolMap, projectRoot) = await BuildSymbolMapAsync(solution).ConfigureAwait(false);
+
+        var targetSymbol = FindSymbolByKey(symbolMap, scipKey);
+        if (targetSymbol is null)
+        {
+            Console.Error.WriteLine($"[WARN] find-refs: symbol not found in map: {scipKey}");
+            return output;
+        }
+
+        Console.Error.WriteLine($"find-refs: resolving references for {scipKey}...");
+
+        var refs = await ResolveReferencesAsync(targetSymbol, solution, projectRoot).ConfigureAwait(false);
+        output.References.AddRange(refs);
+
+        Console.Error.WriteLine($"find-refs: found {output.References.Count} reference(s)");
+        return output;
+    }
+
+    /// <summary>
+    /// Resolve references for multiple SCIP symbol keys in a single workspace session.
+    /// Builds the symbol map once, then iterates through all requested symbols.
+    /// </summary>
+    public async Task<BatchFindRefsOutput> BatchFindRefsAsync(Solution solution, IReadOnlyList<string> scipKeys)
+    {
+        var results = new BatchFindRefsOutput();
+
+        var (symbolMap, projectRoot) = await BuildSymbolMapAsync(solution).ConfigureAwait(false);
+
+        // Build reverse map: scip_key → ISymbol for O(1) lookup
+        var keyToSymbol = new Dictionary<string, ISymbol>();
+        foreach (var kv in symbolMap)
+        {
+            keyToSymbol[kv.Value] = kv.Key;
+        }
+
+        Console.Error.WriteLine($"batch-find-refs: resolving references for {scipKeys.Count} symbol(s)...");
+
+        for (int i = 0; i < scipKeys.Count; i++)
+        {
+            var scipKey = scipKeys[i];
+            var output = new FindRefsOutput { Symbol = scipKey };
+
+            if (!keyToSymbol.TryGetValue(scipKey, out var targetSymbol))
+            {
+                Console.Error.WriteLine($"batch-find-refs: [{i + 1}/{scipKeys.Count}] symbol not found: {scipKey}");
+                results.Results.Add(output);
+                continue;
+            }
+
+            var refs = await ResolveReferencesAsync(targetSymbol, solution, projectRoot).ConfigureAwait(false);
+            output.References.AddRange(refs);
+
+            Console.Error.WriteLine($"batch-find-refs: [{i + 1}/{scipKeys.Count}] {scipKey} → {refs.Count} ref(s)");
+            results.Results.Add(output);
+        }
+
+        var totalRefs = results.Results.Sum(r => r.References.Count);
+        Console.Error.WriteLine($"batch-find-refs: complete — {scipKeys.Count} symbols, {totalRefs} total references");
+        return results;
+    }
+
+    /// <summary>
+    /// Builds the symbol map by compiling all projects in the solution.
+    /// Returns the map and the common project root for relative path computation.
+    /// </summary>
+    private async Task<(Dictionary<ISymbol, string> SymbolMap, string? ProjectRoot)> BuildSymbolMapAsync(Solution solution)
+    {
         var symbolMap = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
 
-        Console.Error.WriteLine($"find-refs: building symbol map from solution...");
+        Console.Error.WriteLine("find-refs: building symbol map from solution...");
         foreach (var project in solution.Projects)
         {
             var compilation = await project.GetCompilationAsync().ConfigureAwait(false);
@@ -44,33 +104,29 @@ public sealed class ReferenceResolver
         }
         Console.Error.WriteLine($"find-refs: symbol map built ({symbolMap.Count} symbols)");
 
-        // Find the ISymbol that matches the requested SCIP key.
-        // SymbolIndexer.SymbolToScipName is the canonical key generator,
-        // so an exact string comparison is sufficient.
-        ISymbol? targetSymbol = null;
-        foreach (var kv in symbolMap)
-        {
-            if (kv.Value == scipKey)
-            {
-                targetSymbol = kv.Key;
-                break;
-            }
-        }
-
-        if (targetSymbol is null)
-        {
-            Console.Error.WriteLine($"[WARN] find-refs: symbol not found in map: {scipKey}");
-            return output;
-        }
-
-        // Find project root for relative path computation (mirrors SymbolIndexer.IndexAsync).
         var projectRoot = SymbolIndexer.FindCommonRoot(
             solution.Projects
                 .Select(p => p.FilePath)
                 .Where(p => p is not null)
                 .Cast<string>());
 
-        Console.Error.WriteLine($"find-refs: resolving references for {scipKey}...");
+        return (symbolMap, projectRoot);
+    }
+
+    private static ISymbol? FindSymbolByKey(Dictionary<ISymbol, string> symbolMap, string scipKey)
+    {
+        foreach (var kv in symbolMap)
+        {
+            if (kv.Value == scipKey)
+                return kv.Key;
+        }
+        return null;
+    }
+
+    private static async Task<List<FindRefsOccurrence>> ResolveReferencesAsync(
+        ISymbol targetSymbol, Solution solution, string? projectRoot)
+    {
+        var results = new List<FindRefsOccurrence>();
 
         try
         {
@@ -87,7 +143,7 @@ public sealed class ReferenceResolver
                 if (relPath is null) continue;
 
                 var lineSpan = loc.GetLineSpan();
-                output.References.Add(new FindRefsOccurrence
+                results.Add(new FindRefsOccurrence
                 {
                     File = relPath,
                     StartLine = lineSpan.StartLinePosition.Line + 1,
@@ -99,11 +155,10 @@ public sealed class ReferenceResolver
         catch (Exception ex)
         {
             Console.Error.WriteLine(
-                $"[WARN] find-refs: FindReferencesAsync failed for {scipKey}: " +
+                $"[WARN] FindReferencesAsync failed for {targetSymbol.Name}: " +
                 $"{ex.GetType().Name}: {ex.Message}");
         }
 
-        Console.Error.WriteLine($"find-refs: found {output.References.Count} reference(s)");
-        return output;
+        return results;
     }
 }

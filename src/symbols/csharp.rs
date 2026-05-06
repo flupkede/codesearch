@@ -23,7 +23,14 @@
 //! - Merges the result: updates symbols and positions for affected files only;
 //!   symbols from other projects are preserved.
 //! - Rebuilds `scip_simple_names` from all current `scip_symbols` entries.
-//! - Clears `scip_ref_cache` (stale after any definition update).
+//! - Selectively invalidates `scip_ref_cache` for affected symbols only.
+//!
+//! ## Phase 3 pre-warm (background ref cache filling)
+//!
+//! After startup Phase 2 completes (definitions indexed), Phase 3 runs
+//! `scip-csharp batch-find-refs` to resolve references for all symbols
+//! in one workspace session. This amortizes the 30-60s workspace open cost
+//! across thousands of symbols, making subsequent `find_impact` calls instant.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -38,7 +45,7 @@ use heed::{Database, Env, EnvOpenOptions};
 use serde::{Deserialize, Serialize};
 
 use super::scip_parse;
-use super::{RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
+use super::{PrewarmSummary, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -698,6 +705,329 @@ impl CSharpSymbolIndexer {
         all_stored.extend(lazy_refs);
         Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect())
     }
+
+    /// Collect all symbol keys from `scip_symbols` in the given LMDB store.
+    ///
+    /// Used by Phase 3 pre-warm to enumerate symbols that need reference resolution.
+    #[allow(dead_code)]
+    pub fn collect_all_symbol_keys(&self, db_path: &Path) -> Result<Vec<String>> {
+        let env = self.open_scip_env(db_path)?;
+        let rtxn = env.read_txn()?;
+
+        let symbols_db: Database<Str, Bytes> = env
+            .open_database(&rtxn, Some(SCIP_DB_NAME))?
+            .ok_or_else(|| anyhow::anyhow!("scip_symbols database not found"))?;
+
+        let mut keys = Vec::new();
+        let iter = symbols_db.iter(&rtxn)?;
+        for result in iter {
+            let (key, _) = result?;
+            keys.push(key.to_string());
+        }
+
+        Ok(keys)
+    }
+
+    /// Collect all symbol keys that do NOT already have cached references.
+    ///
+    /// Used by Phase 3 to skip symbols whose refs are already in the cache.
+    pub fn collect_uncached_symbol_keys(&self, db_path: &Path) -> Result<Vec<String>> {
+        let env = self.open_scip_env(db_path)?;
+        let rtxn = env.read_txn()?;
+
+        let symbols_db: Database<Str, Bytes> = env
+            .open_database(&rtxn, Some(SCIP_DB_NAME))?
+            .ok_or_else(|| anyhow::anyhow!("scip_symbols database not found"))?;
+
+        let ref_cache_db: Option<Database<Str, Bytes>> =
+            env.open_database(&rtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
+
+        let mut uncached = Vec::new();
+        let iter = symbols_db.iter(&rtxn)?;
+        for result in iter {
+            let (key, _) = result?;
+            let cached = match ref_cache_db {
+                Some(db) => db.get(&rtxn, key)?.is_some(),
+                None => false,
+            };
+            if !cached {
+                uncached.push(key.to_string());
+            }
+        }
+
+        Ok(uncached)
+    }
+
+    /// Pre-warm the reference cache by batch-resolving all uncached symbols.
+    ///
+    /// Invokes `scip-csharp batch-find-refs` with the uncached symbol keys.
+    /// The helper opens the workspace once, resolves all symbols, and writes
+    /// results to a temp JSON file. We then parse and cache each result.
+    ///
+    /// Returns the number of symbols resolved and cached.
+    pub fn prewarm_ref_cache(
+        &self,
+        repo_path: &Path,
+        db_path: &Path,
+        max_symbols: usize,
+    ) -> Result<PrewarmSummary> {
+        let helper = match self.detect_helper() {
+            Some(h) => h,
+            None => {
+                return Ok(PrewarmSummary {
+                    total_symbols: 0,
+                    resolved: 0,
+                    cached: 0,
+                    duration_ms: 0,
+                });
+            }
+        };
+
+        let solution = match Self::find_solution(repo_path) {
+            Some(s) => s,
+            None => {
+                tracing::debug!("prewarm: no .sln found under {}", repo_path.display());
+                return Ok(PrewarmSummary {
+                    total_symbols: 0,
+                    resolved: 0,
+                    cached: 0,
+                    duration_ms: 0,
+                });
+            }
+        };
+
+        let start = std::time::Instant::now();
+
+        // Collect uncached symbols
+        let uncached = self.collect_uncached_symbol_keys(db_path)?;
+        if uncached.is_empty() {
+            tracing::info!("prewarm: all symbols already cached, nothing to do");
+            return Ok(PrewarmSummary {
+                total_symbols: 0,
+                resolved: 0,
+                cached: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let total_available = uncached.len();
+        let symbols_to_resolve = if uncached.len() > max_symbols {
+            tracing::info!(
+                "prewarm: limiting to {} of {} uncached symbols",
+                max_symbols,
+                total_available
+            );
+            uncached[..max_symbols].to_vec()
+        } else {
+            uncached
+        };
+
+        tracing::info!(
+            "prewarm: resolving {} symbols (of {} total uncached) for {}",
+            symbols_to_resolve.len(),
+            total_available,
+            repo_path.file_name().unwrap_or_default().to_string_lossy()
+        );
+
+        // Write symbol keys to temp file for batch-find-refs
+        let temp_dir = std::env::temp_dir().join("codesearch-scip");
+        std::fs::create_dir_all(&temp_dir)?;
+        let symbols_file = temp_dir.join(format!(
+            "symbols-{}-{:x}.txt",
+            repo_path.file_name().unwrap_or_default().to_string_lossy(),
+            start.elapsed().as_nanos()
+        ));
+        std::fs::write(&symbols_file, symbols_to_resolve.join("\n"))?;
+
+        let output_path = temp_dir.join(format!(
+            "batch-refs-{}-{:x}.json",
+            std::process::id(),
+            start.elapsed().as_nanos()
+        ));
+
+        // Invoke batch-find-refs
+        self.invoke_batch_find_refs_helper(
+            &helper,
+            &solution,
+            &symbols_file,
+            &output_path,
+        )?;
+
+        // Clean up symbols file
+        let _ = std::fs::remove_file(&symbols_file);
+
+        // Parse and cache results
+        let cached = self.parse_and_cache_batch_refs(db_path, &output_path)?;
+
+        // Clean up output file
+        let _ = std::fs::remove_file(&output_path);
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            "prewarm: resolved {} symbols, cached {} refs in {}ms",
+            symbols_to_resolve.len(),
+            cached,
+            duration_ms
+        );
+
+        Ok(PrewarmSummary {
+            total_symbols: total_available,
+            resolved: symbols_to_resolve.len(),
+            cached,
+            duration_ms,
+        })
+    }
+
+    /// Invoke `scip-csharp batch-find-refs` to resolve multiple symbols in one session.
+    fn invoke_batch_find_refs_helper(
+        &self,
+        helper: &Path,
+        solution: &Path,
+        symbols_file: &Path,
+        output_path: &Path,
+    ) -> Result<()> {
+        let solution_short = solution
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| solution.display().to_string());
+
+        let mut cmd = Command::new(helper);
+        cmd.arg("batch-find-refs")
+            .arg("--solution")
+            .arg(solution)
+            .arg("--symbols-file")
+            .arg(symbols_file)
+            .arg("--output")
+            .arg(output_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        tracing::info!(
+            "scip-csharp batch-find-refs: resolving symbols from {}",
+            symbols_file.display()
+        );
+
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
+                "Failed to spawn scip-csharp batch-find-refs at {}",
+                helper.display()
+            )
+        })?;
+
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            let label = solution_short.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if !line.is_empty() {
+                        tracing::info!("[scip-csharp batch-find-refs:{}] {}", label, line);
+                    }
+                }
+            })
+        });
+
+        let stdout_handle = child.stdout.take().map(|stdout| {
+            let label = solution_short.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if !line.is_empty() {
+                        tracing::debug!("[scip-csharp batch-find-refs:{}] {}", label, line);
+                    }
+                }
+            })
+        });
+
+        let status = child
+            .wait()
+            .with_context(|| "Failed to wait for scip-csharp batch-find-refs")?;
+
+        if let Some(h) = stderr_handle {
+            let _ = h.join();
+        }
+        if let Some(h) = stdout_handle {
+            let _ = h.join();
+        }
+
+        if !status.success() {
+            tracing::warn!(
+                "scip-csharp batch-find-refs exited with {} for {}",
+                status,
+                solution_short
+            );
+            // Don't bail — partial output is acceptable
+        }
+
+        Ok(())
+    }
+
+    /// Parse batch-find-refs output and cache results in LMDB.
+    ///
+    /// Returns the number of symbols that had their refs cached.
+    fn parse_and_cache_batch_refs(&self, db_path: &Path, output_path: &Path) -> Result<usize> {
+        let content = std::fs::read_to_string(output_path).with_context(|| {
+            format!(
+                "Failed to read batch-find-refs output: {}",
+                output_path.display()
+            )
+        })?;
+
+        #[derive(serde::Deserialize)]
+        struct BatchOutput {
+            results: Vec<SymbolResult>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct SymbolResult {
+            symbol: String,
+            references: Vec<RefEntry>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct RefEntry {
+            file: String,
+            #[serde(rename = "start_line")]
+            start_line: u32,
+            #[serde(rename = "end_line")]
+            end_line: u32,
+            kind: String,
+        }
+
+        let batch: BatchOutput =
+            serde_json::from_str(&content).with_context(|| "Failed to parse batch-find-refs output")?;
+
+        let env = self.open_scip_env(db_path)?;
+        let mut wtxn = env.write_txn()?;
+        let ref_cache_db: Database<Str, Bytes> =
+            env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
+
+        let mut cached_count = 0usize;
+        for result in &batch.results {
+            // Filter: only cache "reference" kind (defensive against definitions)
+            let refs: Vec<StoredReference> = result
+                .references
+                .iter()
+                .filter(|r| r.kind == "reference")
+                .map(|r| StoredReference {
+                    file: PathBuf::from(&r.file),
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    kind: r.kind.clone(),
+                })
+                .collect();
+
+            if refs.is_empty() {
+                continue;
+            }
+
+            let bytes = serialize_refs(&refs).with_context(|| {
+                format!("Failed to serialize batch refs for {}", result.symbol)
+            })?;
+            ref_cache_db.put(&mut wtxn, result.symbol.as_str(), &bytes)?;
+            cached_count += 1;
+        }
+
+        wtxn.commit()?;
+        Ok(cached_count)
+    }
 }
 
 /// Convert a `StoredReference` to the public `SymbolReference` type.
@@ -889,8 +1219,20 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 purge_count
             );
 
-            // Clear ref cache — stale after any definition change.
-            ref_cache_db.clear(&mut wtxn)?;
+            // Selective ref cache invalidation: only purge cached references for
+            // symbols whose definitions changed. Symbols from non-affected files
+            // keep their cached references (avoids re-opening Roslyn unnecessarily).
+            let mut cache_invalidated = 0usize;
+            for stale_key in &stale_symbol_keys {
+                if ref_cache_db.delete(&mut wtxn, stale_key.as_str())? {
+                    cache_invalidated += 1;
+                }
+            }
+            tracing::debug!(
+                "Incremental: selectively invalidated {} ref cache entries (of {} stale symbols)",
+                cache_invalidated,
+                stale_symbol_keys.len()
+            );
 
             // symbols_db and simple_names_db are merged below, not cleared here.
         }
@@ -1151,6 +1493,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     /// and flip the TUI C# indicator red.
     fn applies_to(&self, repo_path: &Path) -> bool {
         Self::find_solution(repo_path).is_some()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

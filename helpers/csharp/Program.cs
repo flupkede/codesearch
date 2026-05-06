@@ -43,6 +43,7 @@ public static class Program
         {
             "index" => await RunIndexAsync(args[1..]).ConfigureAwait(false),
             "find-refs" => await RunFindRefsAsync(args[1..]).ConfigureAwait(false),
+            "batch-find-refs" => await RunBatchFindRefsAsync(args[1..]).ConfigureAwait(false),
             _ => await UnknownCommand(args[0]).ConfigureAwait(false),
         };
     }
@@ -161,6 +162,64 @@ public static class Program
 
         Console.Error.WriteLine($"find-refs: output written to {parsed.Value.OutputPath}");
         Console.Error.WriteLine($"find-refs: {result.References.Count} reference(s)");
+        return 0;
+    }
+
+    // ── batch-find-refs subcommand ──────────────────────────────────
+
+    private static async Task<int> RunBatchFindRefsAsync(string[] args)
+    {
+        var parsed = ParseBatchFindRefsArgs(args);
+        if (parsed is null) return 1;
+
+        if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
+
+        var workspace = CreateTolerantWorkspace();
+
+        try
+        {
+            Console.Error.WriteLine($"batch-find-refs: loading solution: {parsed.Value.SolutionPath}");
+            await OpenSolutionFilteredAsync(workspace, parsed.Value.SolutionPath).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await Console.Error.WriteLineAsync(
+                $"batch-find-refs: [WARN] Solution load partially failed ({ex.GetType().Name}: {ex.Message}); " +
+                $"continuing with {workspace.CurrentSolution.Projects.Count()} loaded project(s).")
+                .ConfigureAwait(false);
+
+            if (!workspace.CurrentSolution.Projects.Any())
+            {
+                await Console.Error.WriteLineAsync(
+                    $"batch-find-refs: no projects loaded — cannot resolve refs. Full error:{Environment.NewLine}{ex.StackTrace}")
+                    .ConfigureAwait(false);
+                return 1;
+            }
+        }
+
+        Console.Error.WriteLine($"batch-find-refs: loaded {parsed.Value.Symbols.Count} symbol(s) from input");
+
+        var resolver = new ReferenceResolver();
+        BatchFindRefsOutput result;
+        try
+        {
+            result = await resolver.BatchFindRefsAsync(
+                workspace.CurrentSolution,
+                parsed.Value.Symbols).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await Console.Error.WriteLineAsync(
+                $"batch-find-refs: resolver failed: {ex.GetType().Name}: {ex.Message}{Environment.NewLine}{ex.StackTrace}")
+                .ConfigureAwait(false);
+            return 1;
+        }
+
+        await OutputWriter.WriteBatchRefsAsync(result, parsed.Value.OutputPath).ConfigureAwait(false);
+
+        var totalRefs = result.Results.Sum(r => r.References.Count);
+        Console.Error.WriteLine($"batch-find-refs: output written to {parsed.Value.OutputPath}");
+        Console.Error.WriteLine($"batch-find-refs: {result.Results.Count} symbols, {totalRefs} total reference(s)");
         return 0;
     }
 
@@ -529,6 +588,75 @@ public static class Program
         return (solutionPath!, symbol!, outputPath!, projectFilter);
     }
 
+    private static (string SolutionPath, IReadOnlyList<string> Symbols, string OutputPath)?
+        ParseBatchFindRefsArgs(string[] args)
+    {
+        string? solutionPath = null;
+        string? symbolsFile = null;
+        string? symbolsInline = null;
+        string? outputPath = null;
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--solution":
+                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--solution requires a value"); return null; }
+                    solutionPath = args[++i];
+                    break;
+                case "--symbols-file":
+                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--symbols-file requires a value"); return null; }
+                    symbolsFile = args[++i];
+                    break;
+                case "--symbols":
+                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--symbols requires a value"); return null; }
+                    symbolsInline = args[++i];
+                    break;
+                case "--output":
+                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--output requires a value"); return null; }
+                    outputPath = args[++i];
+                    break;
+                default:
+                    Console.Error.WriteLine($"Unknown argument: {args[i]}");
+                    return null;
+            }
+        }
+
+        if (string.IsNullOrEmpty(solutionPath)) { Console.Error.WriteLine("batch-find-refs: --solution is required"); return null; }
+        if (string.IsNullOrEmpty(outputPath)) { Console.Error.WriteLine("batch-find-refs: --output is required"); return null; }
+
+        IReadOnlyList<string> symbols;
+        if (!string.IsNullOrEmpty(symbolsFile))
+        {
+            if (!File.Exists(symbolsFile))
+            {
+                Console.Error.WriteLine($"batch-find-refs: symbols file not found: {symbolsFile}");
+                return null;
+            }
+            symbols = File.ReadAllLines(symbolsFile)
+                .Select(l => l.Trim())
+                .Where(l => !string.IsNullOrEmpty(l) && !l.StartsWith('#'))
+                .ToList();
+        }
+        else if (!string.IsNullOrEmpty(symbolsInline))
+        {
+            symbols = symbolsInline.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        }
+        else
+        {
+            Console.Error.WriteLine("batch-find-refs: --symbols-file or --symbols is required");
+            return null;
+        }
+
+        if (symbols.Count == 0)
+        {
+            Console.Error.WriteLine("batch-find-refs: no symbols to resolve");
+            return null;
+        }
+
+        return (solutionPath!, symbols, outputPath!);
+    }
+
     // ── Usage ────────────────────────────────────────────────────────
 
     [ExcludeFromCodeCoverage]
@@ -540,6 +668,8 @@ public static class Program
         Console.WriteLine("  scip-csharp index --solution <path> --output <path> [--filter-project <name>]");
         Console.WriteLine("  scip-csharp index --project <path> --output <path>");
         Console.WriteLine("  scip-csharp find-refs --solution <path> --symbol <scip-key> --output <path>");
+        Console.WriteLine("  scip-csharp batch-find-refs --solution <path> --symbols-file <path> --output <path>");
+        Console.WriteLine("  scip-csharp batch-find-refs --solution <path> --symbols <key1;key2;...> --output <path>");
         Console.WriteLine();
         Console.WriteLine("Options (index):");
         Console.WriteLine("  --solution <path>         Path to .sln file");
@@ -552,6 +682,12 @@ public static class Program
         Console.WriteLine("  --symbol <scip-key>       SCIP symbol key to resolve references for");
         Console.WriteLine("  --output <path>           Output JSON file path");
         Console.WriteLine("  --filter-project <name>   Limit compilation scope (references still searched globally)");
+        Console.WriteLine();
+        Console.WriteLine("Options (batch-find-refs):");
+        Console.WriteLine("  --solution <path>         Path to .sln file");
+        Console.WriteLine("  --symbols-file <path>     File with one SCIP key per line");
+        Console.WriteLine("  --symbols <key1;key2>     Semicolon-separated SCIP keys");
+        Console.WriteLine("  --output <path>           Output JSON file path");
     }
 
     [ExcludeFromCodeCoverage]

@@ -40,7 +40,7 @@ use crate::constants::{
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{IndexManager, SharedStores};
 use crate::mcp::types::HealthResponse;
-use crate::symbols::{RebuildScope, SymbolIndexerRegistry};
+use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
 /// Lightweight repo status label derived from DashMap state only (no DB opens).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepoStateLabel {
@@ -561,6 +561,128 @@ impl ServeState {
             let _ = handle.await;
         }
         info!("phase-2 complete");
+    }
+
+    /// Phase 3: background pre-warm of reference cache for C# repos.
+    ///
+    /// After Phase 2 finishes indexing definitions, Phase 3 runs
+    /// `scip-csharp batch-find-refs` for each repo to resolve references
+    /// for all uncached symbols in a single workspace session.
+    /// This amortizes the 30-60s workspace open cost across thousands of
+    /// symbols, making subsequent `find_impact` calls instant (LMDB cache hit).
+    ///
+    /// Controlled by `CSHARP_PREWARM_ENABLED` env (default: "true").
+    /// Set to "false" to skip Phase 3 entirely (useful on memory-constrained machines).
+    pub(crate) async fn run_phase_3_prewarm(self: &Arc<Self>) {
+        let enabled = std::env::var("CSHARP_PREWARM_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
+        if !enabled {
+            info!("phase-3: pre-warm disabled by CSHARP_PREWARM_ENABLED=false");
+            return;
+        }
+
+        let aliases = self.aliases();
+        let mut candidates: Vec<String> = Vec::new();
+
+        for alias in &aliases {
+            let path = match self.config.read().ok().and_then(|c| c.resolve(alias)) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Only pre-warm repos that have a ready C# index
+            let status = self
+                .csharp_index_status
+                .get(alias)
+                .map(|g| *g.value())
+                .unwrap_or(CSharpIndexStatus::None);
+
+            if !matches!(status, CSharpIndexStatus::Ready) {
+                info!("phase-3: skip '{}' — C# status is {:?}", alias, status);
+                continue;
+            }
+
+            // Check that the repo is applicable
+            let applies = self
+                .symbol_registry
+                .get("csharp")
+                .map(|i| i.applies_to(&path))
+                .unwrap_or(false);
+
+            if !applies {
+                continue;
+            }
+
+            candidates.push(alias.clone());
+        }
+
+        if candidates.is_empty() {
+            info!("phase-3: 0 candidates for pre-warm");
+            return;
+        }
+
+        info!("phase-3: pre-warming {} repo(s)", candidates.len());
+
+        let concurrency = Self::csharp_scip_concurrency();
+        let sem = Arc::new(Semaphore::new(concurrency));
+        let mut handles = Vec::with_capacity(candidates.len());
+
+        for alias in candidates {
+            let sem = sem.clone();
+            let state = self.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+
+                info!("phase-3: pre-warming '{}'", alias);
+
+                let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let db_path = path.join(DB_DIR_NAME);
+
+                let registry = state.symbol_registry.clone();
+                let alias_owned = alias.clone();
+
+                match tokio::task::spawn_blocking(move || {
+                    let Some(indexer) = registry.get("csharp") else {
+                        return Err(anyhow::anyhow!("No C# indexer"));
+                    };
+                    // Downcast to CSharpSymbolIndexer to access prewarm_ref_cache
+                    let csharp_indexer = indexer
+                        .as_any()
+                        .downcast_ref::<csharp::CSharpSymbolIndexer>()
+                        .ok_or_else(|| anyhow::anyhow!("Failed to downcast to CSharpSymbolIndexer"))?;
+                    csharp_indexer.prewarm_ref_cache(&path, &db_path, 5000)
+                })
+                .await
+                {
+                    Ok(Ok(summary)) => {
+                        info!(
+                            "phase-3: pre-warm complete for '{}': {} resolved, {} cached in {}ms",
+                            alias_owned, summary.resolved, summary.cached, summary.duration_ms
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("phase-3: pre-warm failed for '{}': {}", alias_owned, e);
+                    }
+                    Err(e) => {
+                        tracing::warn!("phase-3: pre-warm task panicked for '{}': {}", alias_owned, e);
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+        info!("phase-3 complete");
     }
 
     /// Build an actionable conflict error message.
@@ -2466,6 +2588,7 @@ pub async fn run_serve(
         tokio::spawn(async move {
             phase_state.run_phase_1_warmup_all().await;
             phase_state.run_phase_2_csharp_scip().await;
+            phase_state.run_phase_3_prewarm().await;
         });
     }
 

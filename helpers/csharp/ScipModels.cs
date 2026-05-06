@@ -55,3 +55,13 @@ public sealed class FindRefsOccurrence
     public int EndLine { get; set; }
     public string Kind { get; set; } = "reference";
 }
+
+/// <summary>
+/// Output model for the `batch-find-refs` subcommand.
+/// Contains references resolved for multiple SCIP symbols in a single workspace session.
+/// </summary>
+public sealed class BatchFindRefsOutput
+{
+    public string Version { get; init; } = "1.0";
+    public List<FindRefsOutput> Results { get; init; } = [];
+}
