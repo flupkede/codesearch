@@ -74,7 +74,7 @@ cargo build --release
 
 ```bash
 # Register and index a repo (adds to ~/.codesearch/repos.json)
-codesearch index add /path/to/my-project --alias my-project
+codesearch index add /path/to/my-project
 
 # Incremental update (only changed files)
 codesearch index /path/to/my-project
