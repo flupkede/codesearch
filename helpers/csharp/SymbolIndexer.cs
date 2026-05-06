@@ -28,8 +28,16 @@ public sealed class SymbolIndexer
         var symbolMap = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
         var projectRoot = FindCommonRoot(projects.Select(p => p.FilePath).Where(p => p != null).Cast<string>());
 
-        foreach (var project in projects)
+        // Materialize project list once so we can log progress (i / total).
+        var projectList = projects as IReadOnlyList<Project> ?? projects.ToList();
+        var totalProjects = projectList.Count;
+        Console.Error.WriteLine($"Compiling {totalProjects} project(s)...");
+
+        var compileSw = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < totalProjects; i++)
         {
+            var project = projectList[i];
+            Console.Error.WriteLine($"  [{i + 1}/{totalProjects}] Compiling: {project.Name}");
             var compilation = await project.GetCompilationAsync().ConfigureAwait(false);
             if (compilation is null)
             {
@@ -47,11 +55,19 @@ public sealed class SymbolIndexer
 
             CollectSymbols(compilation.GlobalNamespace, symbolMap);
         }
+        compileSw.Stop();
+        Console.Error.WriteLine($"Compiled {totalProjects} project(s) in {compileSw.Elapsed.TotalSeconds:F1}s");
 
-        Console.Error.WriteLine($"Collected {symbolMap.Count} symbols");
+        Console.Error.WriteLine($"Collected {symbolMap.Count} symbols, resolving references...");
 
         // For each symbol, find all references across the solution
         var occurrenceMap = new Dictionary<string, List<ScipOccurrence>>();
+        var totalSymbols = symbolMap.Count;
+        // Progress is reported every ~5 % so a 30 minute run prints ~20 lines —
+        // enough signal that work is happening, no log spam.
+        var progressEvery = Math.Max(1, totalSymbols / 20);
+        var processed = 0;
+        var refSw = System.Diagnostics.Stopwatch.StartNew();
 
         foreach (var (symbol, scipName) in symbolMap)
         {
@@ -112,7 +128,19 @@ public sealed class SymbolIndexer
             {
                 Console.Error.WriteLine($"[WARN] FindReferences failed for {scipName}: {ex.Message}");
             }
+
+            processed++;
+            if (processed % progressEvery == 0 || processed == totalSymbols)
+            {
+                var pct = (processed * 100.0) / totalSymbols;
+                Console.Error.WriteLine(
+                    $"  references: {processed}/{totalSymbols} ({pct:F0}%) " +
+                    $"[{refSw.Elapsed.TotalSeconds:F0}s elapsed]");
+            }
         }
+        refSw.Stop();
+        Console.Error.WriteLine(
+            $"Resolved references for {totalSymbols} symbols in {refSw.Elapsed.TotalSeconds:F1}s");
 
         // Build documents
         foreach (var (relPath, occurrences) in occurrenceMap)

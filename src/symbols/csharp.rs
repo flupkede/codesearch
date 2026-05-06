@@ -5,8 +5,10 @@
 //! output, and stores references in LMDB.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -354,13 +356,21 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             start.elapsed().as_nanos()
         ));
 
-        // Invoke helper
+        // Invoke helper. We spawn with piped stdout/stderr and stream them
+        // line-by-line into the tracing log so the operator sees live progress
+        // ("Loading solution: ...", "Collected N symbols", etc.) instead of a
+        // black box for the 1–15 minutes a large Aprimo solution takes. The
+        // alternative — `cmd.output()` — buffers stderr until process exit,
+        // which gave the misleading impression that the helper was hanging.
+        let solution_label = solution.display().to_string();
         let mut cmd = Command::new(&helper);
         cmd.arg("index")
             .arg("--solution")
             .arg(&solution)
             .arg("--output")
-            .arg(&output_path);
+            .arg(&output_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         if let Some(ref proj) = project {
             cmd.arg("--filter-project").arg(proj);
@@ -368,13 +378,53 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         tracing::info!("Running scip-csharp: {:?}", cmd);
 
-        let output = cmd
-            .output()
+        let mut child = cmd
+            .spawn()
             .with_context(|| format!("Failed to execute scip-csharp at {}", helper.display()))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("scip-csharp exited with {}: {}", output.status, stderr);
+        // Per-stream label so concurrent rebuilds (CSHARP_SCIP_CONCURRENCY > 1)
+        // remain readable in the interleaved log.
+        let solution_short = solution
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| solution_label.clone());
+
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            let label = solution_short.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if !line.is_empty() {
+                        tracing::info!("[scip-csharp:{}] {}", label, line);
+                    }
+                }
+            })
+        });
+
+        let stdout_handle = child.stdout.take().map(|stdout| {
+            let label = solution_short.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if !line.is_empty() {
+                        tracing::debug!("[scip-csharp:{}] {}", label, line);
+                    }
+                }
+            })
+        });
+
+        let status = child
+            .wait()
+            .with_context(|| format!("Failed to wait for scip-csharp at {}", helper.display()))?;
+
+        // Drain any remaining buffered output before consuming the file.
+        if let Some(h) = stderr_handle {
+            let _ = h.join();
+        }
+        if let Some(h) = stdout_handle {
+            let _ = h.join();
+        }
+
+        if !status.success() {
+            tracing::warn!("scip-csharp exited with {} for {}", status, solution_short);
             // Don't bail — partial output is acceptable per AGENTS.md spec
         }
 
