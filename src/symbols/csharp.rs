@@ -586,31 +586,45 @@ impl CSharpSymbolIndexer {
     /// - Returns definitions from `scip_symbols` (always present after rebuild).
     /// - Returns cached references from `scip_ref_cache` if present.
     /// - On cache miss: invokes `scip-csharp find-refs`, stores in `scip_ref_cache`.
+    /// Inner implementation: fetch references for an EXACT (canonical) symbol key.
+    ///
+    /// Opens its own LMDB environment so the caller's env handle (if any) is not
+    /// held concurrently with the internal write txn that caches lazy results.
+    /// This avoids the "two Env objects on the same path" footgun.
     fn find_refs_for_canonical_key(
         &self,
-        env: &Env,
         db_path: &Path,
         canonical: &str,
     ) -> Result<Vec<SymbolReference>> {
-        let rtxn = env.read_txn()?;
+        // One env for the whole function; read phase and write phase reuse it.
+        let env = self.open_scip_env(db_path)?;
 
-        // ── 1. Load definitions ────────────────────────────────────
         let mut all_stored: Vec<StoredReference> = Vec::new();
+        let cache_hit;
+        let has_legacy_refs;
 
-        if let Some(symbols_db) = env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))? {
-            if let Some(bytes) = symbols_db.get(&rtxn, canonical)? {
-                match deserialize_refs(bytes) {
-                    Ok(defs) => all_stored.extend(defs),
-                    Err(e) => {
-                        tracing::warn!("Failed to deserialize definitions for '{}': {}", canonical, e)
+        // ── Read phase ─────────────────────────────────────────────
+        {
+            let rtxn = env.read_txn()?;
+
+            // 1. Load definitions from scip_symbols
+            if let Some(symbols_db) =
+                env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))?
+            {
+                if let Some(bytes) = symbols_db.get(&rtxn, canonical)? {
+                    match deserialize_refs(bytes) {
+                        Ok(defs) => all_stored.extend(defs),
+                        Err(e) => tracing::warn!(
+                            "Failed to deserialize definitions for '{}': {}",
+                            canonical,
+                            e
+                        ),
                     }
                 }
             }
-        }
 
-        // ── 2. Check reference cache ───────────────────────────────
-        let cache_hit =
-            if let Some(ref_cache_db) =
+            // 2. Check reference cache
+            cache_hit = if let Some(ref_cache_db) =
                 env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_REF_CACHE_DB_NAME))?
             {
                 match ref_cache_db.get(&rtxn, canonical)? {
@@ -627,16 +641,16 @@ impl CSharpSymbolIndexer {
                 false
             };
 
-        // Also consider backward compat: old full-index LMDB may already have
-        // reference-kind entries in scip_symbols. Treat those as cache hits too.
-        let has_legacy_refs = all_stored.iter().any(|r| r.kind != "definition");
-        drop(rtxn);
+            // Backward compat: old full-index LMDB has reference-kind entries in
+            // scip_symbols (pre-Opt2). Treat those as cache hits — no helper call needed.
+            has_legacy_refs = all_stored.iter().any(|r| r.kind != "definition");
+        } // rtxn dropped here
 
         if cache_hit || has_legacy_refs {
             return Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect());
         }
 
-        // ── 3. Cache miss — lazy find-refs invocation ──────────────
+        // ── Cache miss — lazy find-refs invocation ─────────────────
         let helper = match self.detect_helper() {
             Some(h) => h,
             None => {
@@ -644,7 +658,6 @@ impl CSharpSymbolIndexer {
                     "scip-csharp helper not available for lazy ref resolution of '{}'",
                     canonical
                 );
-                // Return definitions only (helper missing is not an error)
                 return Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect());
             }
         };
@@ -663,18 +676,18 @@ impl CSharpSymbolIndexer {
         };
 
         tracing::info!(
-            "scip_ref_cache miss for '{}' — invoking scip-csharp find-refs (this may take a few minutes on large solutions)",
+            "scip_ref_cache miss for '{}' — invoking scip-csharp find-refs \
+             (may take several minutes on large solutions; result cached after first call)",
             canonical
         );
 
         let lazy_refs = self.invoke_find_refs_helper(&helper, &solution, canonical)?;
 
-        // ── 4. Store in ref cache ──────────────────────────────────
+        // ── Write phase — cache the resolved references ────────────
         {
-            let env2 = self.open_scip_env(db_path)?;
-            let mut wtxn = env2.write_txn()?;
+            let mut wtxn = env.write_txn()?;
             let ref_cache_db: Database<Str, Bytes> =
-                env2.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
+                env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
             let cached_bytes = serialize_refs(&lazy_refs)
                 .with_context(|| format!("Failed to serialize refs for cache: {}", canonical))?;
             ref_cache_db.put(&mut wtxn, canonical, &cached_bytes)?;
@@ -780,6 +793,21 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let ref_cache_db: Database<Str, Bytes> =
             env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
 
+        // Collect affected files (non-empty only for incremental/Files scope).
+        // Declared outside the if/else so the write loop below can also reference it.
+        let affected_files: HashSet<String> = if is_incremental {
+            index
+                .values()
+                .flat_map(|refs| {
+                    refs.iter()
+                        .filter(|r| r.kind == "definition")
+                        .map(|r| r.file.to_string_lossy().replace('\\', "/"))
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
         if !is_incremental {
             // Full rebuild: wipe everything and start fresh.
             symbols_db.clear(&mut wtxn)?;
@@ -788,37 +816,24 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             ref_cache_db.clear(&mut wtxn)?;
         } else {
             // ── Incremental merge (Opt 3) ──────────────────────────
-            // Determine which files appear in the new index (by definition occurrences).
-            let affected_files: HashSet<String> = index
-                .values()
-                .flat_map(|refs| {
-                    refs.iter()
-                        .filter(|r| r.kind == "definition")
-                        .map(|r| r.file.to_string_lossy().replace('\\', "/"))
-                })
-                .collect();
-
             tracing::debug!(
                 "Incremental rebuild: {} affected file(s): {:?}",
                 affected_files.len(),
                 affected_files
             );
 
-            // Step 1: Collect stale symbol keys from position index.
-            // Position entries give us the reverse mapping file → [symbol_keys].
-            // We use this to know exactly which scip_symbols entries to remove,
-            // preventing stale entries from renamed/deleted symbols accumulating.
+            // Step 1: Collect stale symbol keys from the position index (reverse map
+            // file:line → [symbol_keys]). This tells us exactly which scip_symbols
+            // entries to inspect for affected-file definitions.
             let mut stale_symbol_keys: HashSet<String> = HashSet::new();
             let mut pos_keys_to_delete: Vec<String> = Vec::new();
             {
                 let pos_iter = positions_db.iter(&wtxn)?;
                 for result in pos_iter {
                     let (key, val) = result?;
-                    // Position key format: "<file>:<line>"
-                    let file_part = key.split(':').next().unwrap_or("");
+                    let file_part = key.split(':').next().unwrap_or(""); // "<file>:<line>"
                     if affected_files.contains(file_part) {
                         pos_keys_to_delete.push(key.to_string());
-                        // Collect symbol keys for this position so we can delete them
                         if let Ok(sym_keys) = deserialize_keys_v1(val) {
                             stale_symbol_keys.extend(sym_keys);
                         }
@@ -826,27 +841,57 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 }
             }
 
-            // Step 2: Delete stale position entries.
+            // Step 2: Delete stale position entries for affected files.
             for key in &pos_keys_to_delete {
                 positions_db.delete(&mut wtxn, key.as_str())?;
             }
 
-            // Step 3: Delete stale symbol entries (prevents accumulation of
-            // renamed/deleted symbols across incremental rebuilds).
+            // Step 3: Clean up scip_symbols for symbols NOT appearing in the new index.
+            //
+            // For symbols that DO appear in the new index, the write loop below
+            // merges old (non-affected) + new definitions — handling partial classes.
+            // For symbols that no longer exist (e.g. deleted/renamed):
+            //   - Keep entries that still have definitions in non-affected files.
+            //   - Delete entries where all definitions were in affected files.
+            let mut purge_count = 0usize;
             for key in &stale_symbol_keys {
-                symbols_db.delete(&mut wtxn, key.as_str())?;
+                if index.contains_key(key.as_str()) {
+                    continue; // handled in write loop below
+                }
+                if let Some(bytes) = symbols_db.get(&wtxn, key.as_str())? {
+                    if let Ok(existing) = deserialize_refs(bytes) {
+                        let survivors: Vec<StoredReference> = existing
+                            .into_iter()
+                            .filter(|r| {
+                                r.kind == "definition"
+                                    && !affected_files
+                                        .contains(&r.file.to_string_lossy().replace('\\', "/"))
+                            })
+                            .collect();
+                        if survivors.is_empty() {
+                            symbols_db.delete(&mut wtxn, key.as_str())?;
+                            purge_count += 1;
+                        } else {
+                            // Partial class: keep definitions from non-affected files.
+                            let b = serialize_refs(&survivors).with_context(|| {
+                                format!("Failed to re-serialize survivors for {}", key)
+                            })?;
+                            symbols_db.put(&mut wtxn, key.as_str(), &b)?;
+                        }
+                    }
+                }
             }
 
             tracing::debug!(
-                "Incremental: removed {} stale position entries, {} stale symbol entries",
+                "Incremental: removed {} position entries, purged {} fully-deleted symbols",
                 pos_keys_to_delete.len(),
-                stale_symbol_keys.len()
+                purge_count
             );
 
-            // Clear ref cache — definitions changed, cached refs may be stale.
+            // Clear ref cache — stale after any definition change.
             ref_cache_db.clear(&mut wtxn)?;
 
-            // Do NOT clear symbols_db or simple_names_db here — we merge below.
+            // symbols_db and simple_names_db are merged below, not cleared here.
         }
 
         // ── Write symbol entries (definitions only after Opt 2) ────
@@ -854,7 +899,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let mut total_symbols = 0usize;
 
         for (symbol_name, references) in index.iter() {
-            let stored: Vec<StoredReference> = references
+            let new_stored: Vec<StoredReference> = references
                 .iter()
                 .map(|r| StoredReference {
                     file: r.file.clone(),
@@ -863,6 +908,32 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                     kind: r.kind.clone(),
                 })
                 .collect();
+
+            // For incremental merges: preserve definition entries from non-affected
+            // files (supports C# partial classes spanning two projects).
+            let stored = if is_incremental {
+                if let Some(bytes) = symbols_db.get(&wtxn, symbol_name.as_str())? {
+                    if let Ok(existing) = deserialize_refs(bytes) {
+                        let mut merged: Vec<StoredReference> = existing
+                            .into_iter()
+                            .filter(|r| {
+                                r.kind == "definition"
+                                    && !affected_files.contains(
+                                        &r.file.to_string_lossy().replace('\\', "/"),
+                                    )
+                            })
+                            .collect();
+                        merged.extend(new_stored);
+                        merged
+                    } else {
+                        new_stored
+                    }
+                } else {
+                    new_stored
+                }
+            } else {
+                new_stored
+            };
 
             let value_bytes = serialize_refs(&stored)
                 .with_context(|| format!("Failed to serialize definitions for {}", symbol_name))?;
@@ -974,18 +1045,22 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     }
 
     fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>> {
-        let env = self.open_scip_env(db_path)?;
-
-        // Resolve to canonical key (exact or fuzzy)
-        let canonical = match self.resolve_canonical_key(&env, symbol)? {
-            Some(k) => k,
-            None => {
-                tracing::debug!("Symbol '{}' not found in index", symbol);
-                return Ok(vec![]);
+        // Resolve to canonical key in a short-lived env scope, then drop it before
+        // entering find_refs_for_canonical_key (which opens its own env).
+        // This ensures no two Env handles are live on the same path simultaneously.
+        let canonical = {
+            let env = self.open_scip_env(db_path)?;
+            match self.resolve_canonical_key(&env, symbol)? {
+                Some(k) => k,
+                None => {
+                    tracing::debug!("Symbol '{}' not found in index", symbol);
+                    return Ok(vec![]);
+                }
             }
+            // env dropped here
         };
 
-        self.find_refs_for_canonical_key(&env, db_path, &canonical)
+        self.find_refs_for_canonical_key(db_path, &canonical)
     }
 
     fn find_references_by_position(
@@ -1012,9 +1087,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // Pick shortest (most specific) symbol defined at this position
         let chosen = candidate_keys.iter().min_by_key(|k| k.len()).cloned();
         drop(rtxn);
+        drop(env); // must drop before find_refs_for_canonical_key opens its own env
 
         match chosen {
-            Some(k) => self.find_refs_for_canonical_key(&env, db_path, &k),
+            Some(k) => self.find_refs_for_canonical_key(db_path, &k),
             None => Ok(vec![]),
         }
     }

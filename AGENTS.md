@@ -7,17 +7,27 @@ Add symbol-aware reference lookups to codesearch via `find_impact` MCP tool. Ret
 ## Implemented Features
 
 - **`find_impact` MCP tool** — returns transitive call-sites for a symbol (name-based or position-based), C# via `scip-csharp` helper
-- **`scip-csharp` helper** — .NET 10 CLI wrapping Roslyn `SymbolFinder.FindReferencesAsync()`, runs as subprocess
+- **`scip-csharp` helper** — .NET 10 CLI wrapping Roslyn. **Two subcommands**:
+  - `index` — compile solution, emit **definitions only** (no FindReferencesAsync at rebuild time = 10–50× faster)
+  - `find-refs --symbol <key>` — resolve references for ONE symbol on demand (lazy, result cached in `scip_ref_cache`)
+- **Opt 1 — external-type filter** — `CollectTypeSymbols` skips all types with no `IsInSource` location (framework/NuGet), 10-100× fewer symbols on large solutions
+- **Opt 2 — lazy reference resolution** — rebuild stores definitions only; `find_references()` checks `scip_ref_cache` first, calls `scip-csharp find-refs` on cache miss, then caches result; `block_in_place` in MCP handler for blocking subprocess
+- **Opt 3 — incremental merge** — `RebuildScope::Files`: uses position index as reverse map to collect stale symbol keys, merges new definitions (partial-class safe: keeps defs from non-affected files), rebuilds `simple_names` from all current symbols
 - **O(1) position lookup** — `scip_positions` LMDB table maps `(file:line)` → `[symbol_keys]`
 - **O(1) fuzzy lookup** — `scip_simple_names` LMDB table maps last-segment identifier → `[full_keys]`
+- **`scip_ref_cache` LMDB table** — key: SCIP symbol key; value: bincode(Vec<StoredReference>); populated on first `find_impact` per symbol, cleared on any rebuild
 - **Bincode schema versioning** — version byte prefix on all LMDB payloads, clear error on mismatch
 - **JSON version validation** — rejects scip-csharp index versions other than `"1.0"`
+- **Backward compat** — old LMDB indexes (pre-Opt2, with references in `scip_symbols`) still work; `has_legacy_refs` check bypasses lazy invocation
 - **Helper failure cache** — `detect_helper()` caches both found and not-found results (`Mutex<Option<Option<PathBuf>>>`)
 - **Shared `SymbolIndexerRegistry`** — `ServeState`, `CodesearchService`, and `IndexManager` each own one `Arc<Registry>`; no per-request instantiation
 - **`.cs` watcher debounce** — 60s quiet period triggers automatic symbol rebuild
-- **`-with-csharp` release variants** — 6 release archives (3 plain + 3 with helper)
+- **`-with-csharp` release variants** — 6 release archives (3 plain + 3 with self-contained helper)
 - **Gated integration test** — `csharp_helper_integration` cargo feature for full-pipeline testing
 - **CI** — separate `csharp-integration-tests` job in `.github/workflows/ci.yml`
+- **Sequential phase-2 startup** — Phase 1 warms repos sequentially, Phase 2 runs gated C# SCIP rebuilds ordered by `last_changed_unix` under `Semaphore(concurrency)` via `CSHARP_SCIP_CONCURRENCY` env (default **2**, clamp [1,4])
+- **`repos_meta` tracking** — `RepoMeta` (last_changed_unix, last_scip_indexed_unix) persisted in `repos.json` with debounced save (10s window)
+- **TUI C# indicator** — pulsing yellow/dark-gray during indexing, green ready, red error; footer shows helper availability; Calls column with tool call count
 
 ## Architecture
 
@@ -33,18 +43,11 @@ Add symbol-aware reference lookups to codesearch via `find_impact` MCP tool. Ret
 
 | Table | Key | Value |
 |---|---|---|
-| `scip_symbols` | full SCIP key | `[v1, bincode(Vec<StoredReference>)]` |
+| `scip_symbols` | full SCIP key | `[v1, bincode(Vec<StoredReference>)]` — **definitions only** after Opt 2 |
 | `scip_positions` | `<file>:<line>` (forward-slash) | `[v1, bincode(Vec<String>)]` |
 | `scip_simple_names` | last segment of canonical symbol | `[v1, bincode(Vec<String>)]` |
+| `scip_ref_cache` | full SCIP key | `[v1, bincode(Vec<StoredReference>)]` — lazy-resolved references |
 | `scip_meta` | `last_rebuild_ts`, `symbol_count` | `Str` |
-
-### MCP tool: `find_impact`
-
-Inputs:
-- `{ "symbol_name": "FieldDefinition.Validate", "project": "alias" }`
-- `{ "file": "src/X.cs", "line": 42, "project": "alias" }`
-
-Returns references with `file`, `start_line`, `end_line`, `kind` + `index_age_seconds`.
 
 ### Helper detection lookup order
 
@@ -56,33 +59,50 @@ Missing helper disables `find_impact` for C# only — all other features keep wo
 
 ### `SymbolIndexerRegistry` ownership
 
-Exactly 4 `Arc::new(SymbolIndexerRegistry::new())` sites:
-1. `IndexManager::new()` (watcher path)
-2. `IndexManager::new_for_path()` (direct path)
-3. `ServeState::new()` (serve HTTP path)
-4. `CodesearchService::new_with_stores()` (standalone MCP/stdio path)
+4 `Arc::new(SymbolIndexerRegistry::new())` sites: `IndexManager::new()`, `IndexManager::new_for_path()`, `ServeState::new()`, `CodesearchService::new_with_stores()`. `CodesearchService::new_for_serve()` clones from `ServeState`.
 
-`CodesearchService::new_for_serve()` clones from `ServeState`.
+## Current commit state (2026-05-06)
 
-## Remaining post-merge work
+Latest commits on `features/symbol-references`:
+- `35bbf36` fix: review remarks (double-Env, partial-class merge, META_SYMBOL_COUNT, temp collision)
+- `bb8c1c8` feat: Opt1+2+3 — filter external types, lazy refs, incremental merge
+- `6fc7861` feat: live progress streaming from scip-csharp (stage 6)
+- `88a8f01` fix: ordering + concurrency default=2 (stage 5)
+- `becc518` fix: IncludeAllContentForSelfExtract + MSBuild registration (stage 4)
+- `4ed0a3f` fix: applies_to + non-C# repos red TUI (stage 3)
 
-- [ ] CI green on GitHub Actions for `csharp-integration-tests` job *(first run after push)*
-- [ ] `REVIEW_features-symbol-references.md` afsluitende sectie "Fixes toegepast" met commit-SHAs
-- [ ] Handmatige eindtest op echte Aprimo client repo: 2e/3e `find_impact` call < 100ms
-- [ ] 49 minors uit review — apart in volgende iteratie
-- [ ] Follow-up majors: rebuild scope, sequential text+symbol rebuild, git rev-parse subprocess, LMDB `map_size`, per-repo mutex for parallel rebuilds
+**Status**: `cargo check` + `cargo clippy` clean, 392 tests pass, `dotnet build` clean.
+**Deployed**: NOT YET — user must run `..\copy-to-common.ps1` to deploy to `~/.local/bin/`.
 
-## CI / Release
+## Remaining work
 
-Release output: 6 archives (3 plain + 3 `-with-csharp`). Each `-with-csharp` job installs .NET 10, publishes `helpers/csharp`, stages helper alongside binary.
-
-Quality gates: `cargo check`, `cargo clippy`, `cargo test --lib --bins`, `dotnet test helpers/csharp/`, CI green.
+- [ ] Deploy: run `..\copy-to-common.ps1` (builds + copies both exes to runtime location)
+- [ ] Verify on live Aprimo repo: 1st `find_impact` call triggers lazy find-refs, 2nd+ call < 100ms (cache hit)
+- [ ] CI green on `csharp-integration-tests` job *(first run after push)*
+- [ ] Minor: filter `kind == "reference"` in `parse_find_refs_output` (defensive against future C# side emitting self-reference definitions)
+- [ ] Minor: warn if `--filter-project` passed to `find-refs` CLI (currently silently ignored)
+- [ ] Minor: `FindRefsOutput.Symbol` should be `init` not `set` (consistency)
+- [ ] Known limitation: first `find_impact` on un-cached symbol triggers full workspace open (2-5 min on large solution); subsequent calls instant. Daemon mode (persistent workspace) would fix this but is out of scope.
 
 ## Notes for OpenCode
 
-- Rust + C# change; `cargo` and `dotnet` do not interfere
+- **Validation**: `cargo check` and `cargo clippy` for iteration. **No `--release` builds — always dev/debug.** Run `cargo test --lib` or `cargo test --bin` only when logic changes affect tests — otherwise it's wasted time.
+- `scip-csharp` is self-contained single-file .NET 10 publish (no runtime required on target)
 - `scip-csharp` is stateless, runs once per indexing request
 - Roslyn may yield partial output on compilation failures — acceptable
 - Symbol resolution: exact match first, then fuzzy via `scip_simple_names`
 - Position lookup matches `start_line` only (not `[start_line, end_line]` range)
-- `copy-to-common.ps1` builds helper via `dotnet publish` and copies to `~/.local/bin/helpers/csharp/`
+
+### Runtime vs build locations
+
+- **Runtime**: `C:\Users\develterf\.local\bin\` — contains `codesearch.exe` and `helpers/csharp/scip-csharp.exe`. This is where `codesearch serve` runs from.
+- **Build**: `target/release/` — this folder lives **outside the repo** (set via `CARGO_TARGET_DIR`). For compilation only. Never run codesearch from this location.
+- The helper detection uses `<codesearch-exe-dir>/helpers/csharp/scip-csharp.exe` — so the helper must live next to the codesearch binary at runtime.
+- **Logs**: `~\.codesearch\logs\` — codesearch writes structured logs here during serve. Check these for startup errors, rebuild failures, and helper detection messages.
+
+### Deploying to runtime
+
+- `..\copy-to-common.ps1` — builds and copies **both** `codesearch.exe` and `scip-csharp.exe` to `~/.local/bin/` (the common execution dir). Use this to update the runtime binaries. **No `--release` builds — always dev/debug.**
+- The helper is built via: `dotnet publish helpers/csharp/scip-csharp.csproj -r win-x64 --self-contained -c Release`
+- Helper output must be **single-file only**: `scip-csharp.exe` (+ optional `.pdb`). The `.csproj` has `PublishSingleFile=true` which bundles everything into one exe.
+- Do NOT copy framework DLLs, `BuildHost-*` dirs, or `.dll.config` files to the runtime location — only the single `.exe` is needed.
