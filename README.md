@@ -80,8 +80,11 @@ cargo build --release
 ### Index a repository
 
 ```bash
-# Register and index a repo (adds to ~/.codesearch/repos.json)
-codesearch index add /path/to/my-project --alias my-project
+# Register and index the current repo (adds to ~/.codesearch/repos.json)
+codesearch index add
+
+# Register and index a repo from outside the repo folder
+codesearch index add /path/to/my-project
 
 # Incremental update (only changed files)
 codesearch index /path/to/my-project
@@ -95,6 +98,9 @@ codesearch index rm /path/to/my-project
 # List registered repos
 codesearch index list
 ```
+
+`codesearch index add` is intended to be run from inside the repo you want to register.
+If you're launching it from somewhere else, pass the repo path explicitly.
 
 First-time indexing takes 2–5 minutes. Subsequent runs are incremental (10–30s). Branch switches trigger automatic re-indexing.
 

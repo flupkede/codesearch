@@ -107,7 +107,15 @@ async fn run_tui_loop(
                 .get("csharp")
                 .map(|i| i.is_available())
                 .unwrap_or(false);
-            render_footer(f, chunks[3], &repos, &table_state, active, &cpu, csharp_helper);
+            render_footer(
+                f,
+                chunks[3],
+                &repos,
+                &table_state,
+                active,
+                &cpu,
+                csharp_helper,
+            );
         })?;
 
         // Poll for key events
@@ -264,7 +272,7 @@ fn render_table(
             let extra = match info.csharp_index {
                 super::CSharpIndexStatus::Ready => 4,    // " C#·"
                 super::CSharpIndexStatus::Error => 4,    // " C#!"
-                super::CSharpIndexStatus::Indexing => 5, // " C#⟳" or " C#·"
+                super::CSharpIndexStatus::Indexing => 4, // " C#·"
                 super::CSharpIndexStatus::None => 0,
             };
             a.len() + extra
@@ -277,13 +285,18 @@ fn render_table(
         .iter()
         .map(|(alias, info)| {
             let status_cell = status_cell(info.status);
-            let changes_cell =
-                Cell::from(format!("{:>4}", info.changes)).style(Style::default().fg(Color::White));
+            // Keep left edge stable: fixed-width, left-aligned value.
+            let changes_str = if info.changes > 99999 {
+                " 99k+".to_string()
+            } else {
+                format!("{:>5}", info.changes)
+            };
+            let changes_cell = Cell::from(changes_str).style(Style::default().fg(Color::White));
             let calls_cell = if info.tool_call_count > 0 {
-                Cell::from(format!("{}", info.tool_call_count))
+                Cell::from(format!("{:>5}", info.tool_call_count))
                     .style(Style::default().fg(Color::Cyan))
             } else {
-                Cell::from("—".to_string()).style(Style::default().fg(Color::DarkGray))
+                Cell::from("    -".to_string()).style(Style::default().fg(Color::DarkGray))
             };
             let tool_cell = Cell::from(info.last_tool_call.as_deref().unwrap_or("—").to_string())
                 .style(Style::default().fg(Color::DarkGray));
@@ -301,9 +314,9 @@ fn render_table(
                     Cell::from(format!("{} C#!", alias)).style(Style::default().fg(Color::Red))
                 }
                 super::CSharpIndexStatus::Indexing => {
-                    // Pulsing C# indicator during indexing
+                    // Pulsing C# indicator during indexing (color only, fixed text width)
                     if pulse_bright() {
-                        Cell::from(format!("{} C#\u{27F3}", alias)).style(
+                        Cell::from(format!("{} C#·", alias)).style(
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
@@ -339,9 +352,9 @@ fn render_table(
     let table = Table::new(
         rows,
         [
-            Constraint::Min(max_alias_w as u16 + 2),
+            Constraint::Length(max_alias_w as u16 + 2),
             Constraint::Length(12),
-            Constraint::Length(9),
+            Constraint::Length(7),
             Constraint::Length(7),
             Constraint::Min(24),
             Constraint::Length(7),
@@ -424,13 +437,7 @@ fn render_detail(
         super::CSharpIndexStatus::None => "",
         super::CSharpIndexStatus::Ready => "  C#·",
         super::CSharpIndexStatus::Error => "  C#!",
-        super::CSharpIndexStatus::Indexing => {
-            if pulse_bright() {
-                "  C#\u{27F3}"
-            } else {
-                "  C#·"
-            }
-        }
+        super::CSharpIndexStatus::Indexing => "  C#·",
     };
     let csharp_color = match info.csharp_index {
         super::CSharpIndexStatus::Ready => Color::Green,
@@ -499,7 +506,7 @@ fn render_footer(
     let cpu_str = format!("CPU: {}", cpu);
 
     // Right side: CPU | Sessions
-    let right_len = cpu_str.len() + sessions_str.len() + 3; // 3 = " │ "
+    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len(); // C# label + " │ "
 
     let footer_inner = area.inner(Margin {
         vertical: 0,

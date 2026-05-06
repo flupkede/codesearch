@@ -209,6 +209,14 @@ pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
 /// to `[full_symbol_keys]`. Used for O(1) fuzzy symbol lookup.
 pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
 
+/// Environment variable controlling phase-2 C# SCIP rebuild concurrency.
+/// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].
+pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";
+
+/// Debounce window (seconds) for persisting repos.json metadata updates.
+/// Coalesces bursts of file changes into a single write.
+pub const PERSIST_DEBOUNCE_SECS: u64 = 10;
+
 /// File extensions that should never be indexed, regardless of content.
 /// These are generated/compiled/binary-adjacent files with no semantic code value.
 pub const ALWAYS_SKIP_EXTENSIONS: &[&str] = &[

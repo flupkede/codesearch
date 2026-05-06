@@ -303,7 +303,7 @@ fn render_table(
             let extra = match r.csharp_index.as_str() {
                 "ready" => 4,    // " C#·"
                 "error" => 4,    // " C#!"
-                "indexing" => 5, // " C#⟳" or " C#·"
+                "indexing" => 4, // " C#·"
                 _ => 0,
             };
             r.alias.len() + extra
@@ -316,13 +316,18 @@ fn render_table(
         .iter()
         .map(|repo| {
             let status_cell = status_cell(&repo.status);
-            let changes_cell =
-                Cell::from(format!("{:>4}", repo.changes)).style(Style::default().fg(Color::White));
+            // Keep left edge stable: fixed-width, right-aligned, capped at 5 chars.
+            let changes_str = if repo.changes > 99999 {
+                " 99k+".to_string()
+            } else {
+                format!("{:>5}", repo.changes)
+            };
+            let changes_cell = Cell::from(changes_str).style(Style::default().fg(Color::White));
             let calls_cell = if repo.tool_call_count > 0 {
-                Cell::from(format!("{}", repo.tool_call_count))
+                Cell::from(format!("{:>5}", repo.tool_call_count))
                     .style(Style::default().fg(Color::Cyan))
             } else {
-                Cell::from("—".to_string()).style(Style::default().fg(Color::DarkGray))
+                Cell::from("    -".to_string()).style(Style::default().fg(Color::DarkGray))
             };
             let tool_cell = Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
                 .style(Style::default().fg(Color::DarkGray));
@@ -336,9 +341,9 @@ fn render_table(
                     Cell::from(format!("{} C#!", repo.alias)).style(Style::default().fg(Color::Red))
                 }
                 "indexing" => {
-                    // Pulsing C# indicator during indexing
+                    // Pulsing C# indicator during indexing (color only, fixed text width)
                     if pulse_bright() {
-                        Cell::from(format!("{} C#\u{27F3}", repo.alias)).style(
+                        Cell::from(format!("{} C#·", repo.alias)).style(
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
@@ -372,9 +377,9 @@ fn render_table(
     let table = Table::new(
         rows,
         [
-            Constraint::Min(max_alias_w as u16 + 2),
+            Constraint::Length(max_alias_w as u16 + 2),
             Constraint::Length(12),
-            Constraint::Length(9),
+            Constraint::Length(7),
             Constraint::Length(7),
             Constraint::Min(24),
             Constraint::Length(7),
@@ -440,13 +445,7 @@ fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_s
     let csharp_str = match repo.csharp_index.as_str() {
         "ready" => "  C#·",
         "error" => "  C#!",
-        "indexing" => {
-            if pulse_bright() {
-                "  C#\u{27F3}"
-            } else {
-                "  C#·"
-            }
-        }
+        "indexing" => "  C#·",
         _ => "",
     };
     let csharp_color = match repo.csharp_index.as_str() {
@@ -515,7 +514,7 @@ fn render_footer(
     let sessions_str = format!("Sessions: {}", active);
     let cpu_str = format!("CPU: {}", cpu);
 
-    let right_len = cpu_str.len() + sessions_str.len() + 3;
+    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len();
 
     let footer_inner = area.inner(Margin {
         vertical: 0,
