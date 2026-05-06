@@ -30,6 +30,7 @@ struct StatusResponse {
     repos: Vec<RepoInfo>,
     active_sessions: u64,
     cpu_percent: String,
+    csharp_helper: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -138,6 +139,7 @@ async fn run_remote_tui_loop(
                         &table_state,
                         data.active_sessions,
                         &data.cpu_percent,
+                        data.csharp_helper,
                     );
                 }
                 None => {
@@ -153,7 +155,7 @@ async fn run_remote_tui_loop(
                             Style::default().fg(Color::Yellow),
                         )]));
                     f.render_widget(connecting, chunks[1]);
-                    render_footer(f, chunks[3], &[], &table_state, 0, "—");
+                    render_footer(f, chunks[3], &[], &table_state, 0, "—", false);
                 }
             }
         })?;
@@ -501,6 +503,7 @@ fn render_footer(
     table_state: &TableState,
     active: u64,
     cpu: &str,
+    csharp_helper: bool,
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
@@ -528,7 +531,14 @@ fn render_footer(
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
     ]);
 
+    let csharp_indicator = if csharp_helper {
+        Span::styled("C# │ ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("C# │ ", Style::default().fg(Color::DarkGray))
+    };
+
     let right_line = Line::from(vec![
+        csharp_indicator,
         Span::styled(cpu_str, Style::default().fg(Color::Green)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(sessions_str, Style::default().fg(Color::Cyan)),
@@ -547,23 +557,23 @@ fn render_footer(
 
 fn status_cell(status: &str) -> Cell<'static> {
     match status {
-        "open" => Cell::from("✓ ready".to_string()).style(
+        "open" => Cell::from("✓ ready  ".to_string()).style(
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        "warm" => Cell::from("◐ warm".to_string()).style(Style::default().fg(Color::Yellow)),
-        "readonly" => Cell::from("◑ ro".to_string()).style(Style::default().fg(Color::Cyan)),
-        "indexing" => Cell::from("⟳ idx…".to_string()).style(
+        "warm" => Cell::from("◐ warm   ".to_string()).style(Style::default().fg(Color::Yellow)),
+        "readonly" => Cell::from("◑ ro     ".to_string()).style(Style::default().fg(Color::Cyan)),
+        "indexing" => Cell::from("⟳ idx…  ".to_string()).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        "closed" => Cell::from("○ closed".to_string()).style(Style::default().fg(Color::Gray)),
-        "error" => Cell::from("✗ error".to_string())
+        "closed" => Cell::from("○ closed ".to_string()).style(Style::default().fg(Color::Gray)),
+        "error" => Cell::from("✗ error  ".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        "no_index" => Cell::from("— no idx".to_string()).style(Style::default().fg(Color::Gray)),
-        _ => Cell::from(status.to_string()).style(Style::default().fg(Color::White)),
+        "no_index" => Cell::from("— no idx ".to_string()).style(Style::default().fg(Color::Gray)),
+        _ => Cell::from(format!("{:<8}", status)).style(Style::default().fg(Color::White)),
     }
 }
 

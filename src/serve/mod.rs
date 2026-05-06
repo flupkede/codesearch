@@ -1376,11 +1376,18 @@ async fn status_handler(
         }
     };
 
+    let csharp_helper = state
+        .symbol_registry
+        .get("csharp")
+        .map(|i| i.is_available())
+        .unwrap_or(false);
+
     AxumJson(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "repos": repo_json,
         "active_sessions": active_sessions,
         "cpu_percent": cpu,
+        "csharp_helper": csharp_helper,
     }))
 }
 

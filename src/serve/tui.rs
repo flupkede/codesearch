@@ -102,7 +102,12 @@ async fn run_tui_loop(
             render_header(f, chunks[0], serve_url);
             render_table(f, chunks[1], &repos, &mut table_state);
             render_detail(f, chunks[2], &repos, &table_state, &state);
-            render_footer(f, chunks[3], &repos, &table_state, active, &cpu);
+            let csharp_helper = state
+                .symbol_registry
+                .get("csharp")
+                .map(|i| i.is_available())
+                .unwrap_or(false);
+            render_footer(f, chunks[3], &repos, &table_state, active, &cpu, csharp_helper);
         })?;
 
         // Poll for key events
@@ -481,6 +486,7 @@ fn render_footer(
     table_state: &TableState,
     active: u64,
     cpu: &str,
+    csharp_helper: bool,
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
@@ -509,7 +515,14 @@ fn render_footer(
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
     ]);
 
+    let csharp_indicator = if csharp_helper {
+        Span::styled("C# │ ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("C# │ ", Style::default().fg(Color::DarkGray))
+    };
+
     let right_line = Line::from(vec![
+        csharp_indicator,
         Span::styled(cpu_str, Style::default().fg(Color::Green)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(sessions_str, Style::default().fg(Color::Cyan)),
@@ -567,22 +580,22 @@ fn cpu_usage_str(sys_system: &mut Option<sysinfo::System>) -> String {
 fn status_cell(status: super::RepoStateLabel) -> Cell<'static> {
     use super::RepoStateLabel::*;
     match status {
-        Open => Cell::from("✓ ready".to_string()).style(
+        Open => Cell::from("✓ ready  ".to_string()).style(
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Warm => Cell::from("◐ warm".to_string()).style(Style::default().fg(Color::Yellow)),
-        Readonly => Cell::from("◑ ro".to_string()).style(Style::default().fg(Color::Cyan)),
-        Indexing => Cell::from("⟳ idx…".to_string()).style(
+        Warm => Cell::from("◐ warm   ".to_string()).style(Style::default().fg(Color::Yellow)),
+        Readonly => Cell::from("◑ ro     ".to_string()).style(Style::default().fg(Color::Cyan)),
+        Indexing => Cell::from("⟳ idx…  ".to_string()).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Closed => Cell::from("○ closed".to_string()).style(Style::default().fg(Color::Gray)),
-        Error => Cell::from("✗ error".to_string())
+        Closed => Cell::from("○ closed ".to_string()).style(Style::default().fg(Color::Gray)),
+        Error => Cell::from("✗ error  ".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        NoIndex => Cell::from("— no idx".to_string()).style(Style::default().fg(Color::Gray)),
+        NoIndex => Cell::from("— no idx ".to_string()).style(Style::default().fg(Color::Gray)),
     }
 }
 
