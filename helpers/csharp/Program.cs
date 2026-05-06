@@ -26,8 +26,38 @@ public static class Program
         if (parsed is null)
             return 1;
 
-        // Register MSBuild before any workspace operations
-        Microsoft.Build.Locator.MSBuildLocator.RegisterDefaults();
+        // Register MSBuild before any workspace operations.
+        //
+        // We pick the latest installed instance explicitly so we can log
+        // exactly which MSBuild we're using — when this fails (e.g. self-
+        // extract layout issues, missing SDK on host), we want to see the
+        // real path in the logs instead of a cryptic `Path.Combine` NRE.
+        try
+        {
+            var instances = Microsoft.Build.Locator.MSBuildLocator
+                .QueryVisualStudioInstances()
+                .OrderByDescending(i => i.Version)
+                .ToList();
+            if (instances.Count == 0)
+            {
+                await Console.Error.WriteLineAsync(
+                    "No MSBuild instance discovered on this machine. " +
+                    "Install the .NET SDK (matching the helper's TargetFramework) " +
+                    "or set MSBUILD_EXE_PATH.").ConfigureAwait(false);
+                return 1;
+            }
+            var instance = instances[0];
+            Console.Error.WriteLine(
+                $"MSBuild: registering '{instance.Name}' v{instance.Version} at {instance.MSBuildPath}");
+            Microsoft.Build.Locator.MSBuildLocator.RegisterInstance(instance);
+        }
+        catch (Exception ex)
+        {
+            await Console.Error.WriteLineAsync(
+                $"Failed to register MSBuild: {ex.GetType().Name}: {ex.Message}{Environment.NewLine}{ex.StackTrace}")
+                .ConfigureAwait(false);
+            return 1;
+        }
 
         var workspace = Microsoft.CodeAnalysis.MSBuild.MSBuildWorkspace.Create();
         workspace.WorkspaceFailed += (_, e) =>
@@ -55,7 +85,12 @@ public static class Program
         }
         catch (Exception ex)
         {
-            await Console.Error.WriteLineAsync($"Failed to load: {ex.Message}").ConfigureAwait(false);
+            // Log full type, message and stack trace so cryptic MSBuild errors
+            // (e.g. ArgumentNullException for a Path.Combine arg deep inside
+            // the loader) are diagnosable without needing a debugger attach.
+            await Console.Error.WriteLineAsync(
+                $"Failed to load: {ex.GetType().Name}: {ex.Message}{Environment.NewLine}{ex.StackTrace}")
+                .ConfigureAwait(false);
             return 1;
         }
 

@@ -11,6 +11,17 @@
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!--
+      IncludeAllContentForSelfExtract is REQUIRED. Microsoft.Build.Locator and
+      Microsoft.CodeAnalysis.MSBuild use Assembly.Location to discover MSBuild
+      assemblies on disk. In a single-file publish, Assembly.Location is empty
+      for bundled assemblies, which causes MSBuildWorkspace.OpenSolutionAsync()
+      to throw `ArgumentNullException: Value cannot be null. (Parameter 'path1')`
+      from a Path.Combine call inside MSBuild's loader. Forcing all content
+      (managed + native) to self-extract gives every assembly a real on-disk
+      path. Trade-off: slightly slower first-run startup; correctness wins.
+    -->
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
 
