@@ -74,8 +74,8 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Publish C# helper
-        run: dotnet publish helpers/csharp -c Release -r ${{ matrix.dotnet_rid }} --no-self-contained -o helpers-publish
+      - name: Publish C# helper (self-contained single-file)
+        run: dotnet publish helpers/csharp -c Release -r ${{ matrix.dotnet_rid }} --self-contained -p:PublishSingleFile=true -o helpers-publish
 
       - name: Package kale (Windows)
         if: runner.os == 'Windows'
@@ -150,8 +150,8 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Publish C# helper
-        run: dotnet publish helpers/csharp -c Release -r osx-arm64 --no-self-contained -o helpers-publish
+      - name: Publish C# helper (self-contained single-file)
+        run: dotnet publish helpers/csharp -c Release -r osx-arm64 --self-contained -p:PublishSingleFile=true -o helpers-publish
 
       - name: Package kale
         run: tar czf codesearch-macos-arm64.tar.gz -C target/aarch64-apple-darwin/release codesearch
