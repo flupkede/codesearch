@@ -706,28 +706,6 @@ impl CSharpSymbolIndexer {
         Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect())
     }
 
-    /// Collect all symbol keys from `scip_symbols` in the given LMDB store.
-    ///
-    /// Used by Phase 3 pre-warm to enumerate symbols that need reference resolution.
-    #[allow(dead_code)]
-    pub fn collect_all_symbol_keys(&self, db_path: &Path) -> Result<Vec<String>> {
-        let env = self.open_scip_env(db_path)?;
-        let rtxn = env.read_txn()?;
-
-        let symbols_db: Database<Str, Bytes> = env
-            .open_database(&rtxn, Some(SCIP_DB_NAME))?
-            .ok_or_else(|| anyhow::anyhow!("scip_symbols database not found"))?;
-
-        let mut keys = Vec::new();
-        let iter = symbols_db.iter(&rtxn)?;
-        for result in iter {
-            let (key, _) = result?;
-            keys.push(key.to_string());
-        }
-
-        Ok(keys)
-    }
-
     /// Collect all symbol keys that do NOT already have cached references.
     ///
     /// Used by Phase 3 to skip symbols whose refs are already in the cache.
@@ -830,19 +808,22 @@ impl CSharpSymbolIndexer {
         );
 
         // Write symbol keys to temp file for batch-find-refs
+        // Use a single nonce for both temp files to avoid a race between two
+        // start.elapsed() calls that produce different values.
+        let nonce = start.elapsed().as_nanos();
         let temp_dir = std::env::temp_dir().join("codesearch-scip");
         std::fs::create_dir_all(&temp_dir)?;
         let symbols_file = temp_dir.join(format!(
             "symbols-{}-{:x}.txt",
             repo_path.file_name().unwrap_or_default().to_string_lossy(),
-            start.elapsed().as_nanos()
+            nonce
         ));
         std::fs::write(&symbols_file, symbols_to_resolve.join("\n"))?;
 
         let output_path = temp_dir.join(format!(
             "batch-refs-{}-{:x}.json",
             std::process::id(),
-            start.elapsed().as_nanos()
+            nonce
         ));
 
         // Invoke batch-find-refs
@@ -1014,10 +995,8 @@ impl CSharpSymbolIndexer {
                 })
                 .collect();
 
-            if refs.is_empty() {
-                continue;
-            }
-
+            // Cache even if empty — symbols with 0 references must be marked as
+            // "resolved" so collect_uncached_symbol_keys() won't retry them forever.
             let bytes = serialize_refs(&refs).with_context(|| {
                 format!("Failed to serialize batch refs for {}", result.symbol)
             })?;

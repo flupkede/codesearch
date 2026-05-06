@@ -579,7 +579,7 @@ fn status_cell(status: super::RepoStateLabel, csharp: super::CSharpIndexStatus) 
             CS::Indexing => Cell::from("⟳ idx C#…   ".to_string())
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             CS::Error => Cell::from("✓ ready C#!  ".to_string())
-                .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             CS::None => Cell::from("✓ ready      ".to_string())
                 .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         },

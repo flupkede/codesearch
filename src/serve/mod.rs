@@ -33,9 +33,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::constants::{
-    CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
-    HEALTH_PATH, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
-    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
+    CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT,
+    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH,
+    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
+    REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{IndexManager, SharedStores};
@@ -574,13 +575,13 @@ impl ServeState {
     /// Controlled by `CSHARP_PREWARM_ENABLED` env (default: "true").
     /// Set to "false" to skip Phase 3 entirely (useful on memory-constrained machines).
     pub(crate) async fn run_phase_3_prewarm(self: &Arc<Self>) {
-        let enabled = std::env::var("CSHARP_PREWARM_ENABLED")
+        let enabled = std::env::var(CSHARP_PREWARM_ENABLED_ENV)
             .unwrap_or_else(|_| "true".to_string())
             .parse::<bool>()
             .unwrap_or(true);
 
         if !enabled {
-            info!("phase-3: pre-warm disabled by CSHARP_PREWARM_ENABLED=false");
+            info!("phase-3: pre-warm disabled by {}=false", CSHARP_PREWARM_ENABLED_ENV);
             return;
         }
 
@@ -659,7 +660,7 @@ impl ServeState {
                         .as_any()
                         .downcast_ref::<csharp::CSharpSymbolIndexer>()
                         .ok_or_else(|| anyhow::anyhow!("Failed to downcast to CSharpSymbolIndexer"))?;
-                    csharp_indexer.prewarm_ref_cache(&path, &db_path, 5000)
+                    csharp_indexer.prewarm_ref_cache(&path, &db_path, CSHARP_PREWARM_MAX_SYMBOLS)
                 })
                 .await
                 {

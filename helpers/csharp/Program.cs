@@ -57,7 +57,7 @@ public static class Program
 
         if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
-        var workspace = CreateTolerantWorkspace();
+        using var workspace = CreateTolerantWorkspace();
 
         try
         {
@@ -119,7 +119,7 @@ public static class Program
 
         if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
-        var workspace = CreateTolerantWorkspace();
+        using var workspace = CreateTolerantWorkspace();
 
         try
         {
@@ -174,7 +174,7 @@ public static class Program
 
         if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
 
-        var workspace = CreateTolerantWorkspace();
+        using var workspace = CreateTolerantWorkspace();
 
         try
         {
@@ -498,6 +498,20 @@ public static class Program
 
     // ── Argument parsers ─────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads the next argument value or prints an error and returns null.
+    /// Shared by all subcommand parsers to avoid the `if (i+1 >= args.Length)` boilerplate.
+    /// </summary>
+    private static string? RequireValue(string[] args, ref int i, string flag)
+    {
+        if (i + 1 >= args.Length)
+        {
+            Console.Error.WriteLine($"{flag} requires a value");
+            return null;
+        }
+        return args[++i];
+    }
+
     private static (string? SolutionPath, string? ProjectPath, string OutputPath, string? ProjectFilter)?
         ParseIndexArgs(string[] args)
     {
@@ -511,20 +525,20 @@ public static class Program
             switch (args[i])
             {
                 case "--solution":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--solution requires a value"); return null; }
-                    solutionPath = args[++i];
+                    solutionPath = RequireValue(args, ref i, "--solution");
+                    if (solutionPath is null) return null;
                     break;
                 case "--project":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--project requires a value"); return null; }
-                    projectPath = args[++i];
+                    projectPath = RequireValue(args, ref i, "--project");
+                    if (projectPath is null) return null;
                     break;
                 case "--output":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--output requires a value"); return null; }
-                    outputPath = args[++i];
+                    outputPath = RequireValue(args, ref i, "--output");
+                    if (outputPath is null) return null;
                     break;
                 case "--filter-project":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--filter-project requires a value"); return null; }
-                    projectFilter = args[++i];
+                    projectFilter = RequireValue(args, ref i, "--filter-project");
+                    if (projectFilter is null) return null;
                     break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
@@ -560,20 +574,20 @@ public static class Program
             switch (args[i])
             {
                 case "--solution":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--solution requires a value"); return null; }
-                    solutionPath = args[++i];
+                    solutionPath = RequireValue(args, ref i, "--solution");
+                    if (solutionPath is null) return null;
                     break;
                 case "--symbol":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--symbol requires a value"); return null; }
-                    symbol = args[++i];
+                    symbol = RequireValue(args, ref i, "--symbol");
+                    if (symbol is null) return null;
                     break;
                 case "--output":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--output requires a value"); return null; }
-                    outputPath = args[++i];
+                    outputPath = RequireValue(args, ref i, "--output");
+                    if (outputPath is null) return null;
                     break;
                 case "--filter-project":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--filter-project requires a value"); return null; }
-                    projectFilter = args[++i];
+                    projectFilter = RequireValue(args, ref i, "--filter-project");
+                    if (projectFilter is null) return null;
                     break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");
@@ -601,20 +615,20 @@ public static class Program
             switch (args[i])
             {
                 case "--solution":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--solution requires a value"); return null; }
-                    solutionPath = args[++i];
+                    solutionPath = RequireValue(args, ref i, "--solution");
+                    if (solutionPath is null) return null;
                     break;
                 case "--symbols-file":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--symbols-file requires a value"); return null; }
-                    symbolsFile = args[++i];
+                    symbolsFile = RequireValue(args, ref i, "--symbols-file");
+                    if (symbolsFile is null) return null;
                     break;
                 case "--symbols":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--symbols requires a value"); return null; }
-                    symbolsInline = args[++i];
+                    symbolsInline = RequireValue(args, ref i, "--symbols");
+                    if (symbolsInline is null) return null;
                     break;
                 case "--output":
-                    if (i + 1 >= args.Length) { Console.Error.WriteLine("--output requires a value"); return null; }
-                    outputPath = args[++i];
+                    outputPath = RequireValue(args, ref i, "--output");
+                    if (outputPath is null) return null;
                     break;
                 default:
                     Console.Error.WriteLine($"Unknown argument: {args[i]}");

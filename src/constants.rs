@@ -224,6 +224,16 @@ pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";
 /// is also expected to live within that range.
 pub const CSHARP_SCIP_CONCURRENCY_DEFAULT: usize = 2;
 
+/// Environment variable controlling Phase 3 pre-warm of reference cache.
+/// When "true" (default), `run_phase_3_prewarm()` batch-resolves all uncached
+/// symbol references after Phase 2 completes. Set to "false" on memory-constrained
+/// machines to skip the workspace-open cost.
+pub const CSHARP_PREWARM_ENABLED_ENV: &str = "CSHARP_PREWARM_ENABLED";
+
+/// Maximum number of symbols to resolve per repo in Phase 3 pre-warm.
+/// Limits the batch size to avoid excessive memory usage on large solutions.
+pub const CSHARP_PREWARM_MAX_SYMBOLS: usize = 5000;
+
 /// Debounce window (seconds) for persisting repos.json metadata updates.
 /// Coalesces bursts of file changes into a single write.
 pub const PERSIST_DEBOUNCE_SECS: u64 = 10;
