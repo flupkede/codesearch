@@ -648,6 +648,17 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     fn is_available(&self) -> bool {
         self.detect_helper().is_some()
     }
+
+    /// C# adapter is only applicable when a top-level `.sln` file exists.
+    ///
+    /// Mirrors `ServeState::has_solution_file()` (the phase-2 gate) and the
+    /// Full-scope precondition in `rebuild()`. Without this, callers that
+    /// invoke `rebuild()` on non-C# repos (e.g. POST /reindex?symbols=true on
+    /// a Rust repo) would surface a misleading "No .sln file found" error
+    /// and flip the TUI C# indicator red.
+    fn applies_to(&self, repo_path: &Path) -> bool {
+        Self::find_solution(repo_path).is_some()
+    }
 }
 
 /// Fuzzy matching heuristic for symbol names.

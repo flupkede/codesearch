@@ -1726,6 +1726,24 @@ async fn trigger_symbol_rebuild(
     db_path: &Path,
     state: &Arc<ServeState>,
 ) {
+    // Skip non-applicable repos BEFORE touching status — otherwise the TUI
+    // would flip C#-indicator red on Rust/Python repos that simply have no
+    // .sln. The phase-2 gate (`evaluate_csharp_rebuild`) already filters
+    // these out, but other callers (POST /reindex?symbols=true,
+    // .cs watcher debounce, future paths) bypass that gate.
+    let applies = state
+        .symbol_registry
+        .get("csharp")
+        .map(|i| i.applies_to(project_path))
+        .unwrap_or(false);
+    if !applies {
+        tracing::info!(
+            "🔬 symbol reindex skipped for '{}': not applicable (no .sln)",
+            alias
+        );
+        return;
+    }
+
     tracing::info!("🔬 symbol reindex triggered for '{}'", alias);
     state
         .csharp_index_status

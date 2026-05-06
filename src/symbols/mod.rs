@@ -123,6 +123,19 @@ pub trait SymbolIndexer: Send + Sync {
     /// Whether a symbol index exists for the given database path.
     /// Returns `true` if the LMDB symbol tables have been populated.
     fn has_index(&self, db_path: &Path) -> bool;
+
+    /// Whether this indexer is applicable to the given repo.
+    ///
+    /// Returns `false` when the repo lacks the language-specific entrypoint
+    /// (e.g. no `.sln`/`.csproj` for the C# indexer). Callers should skip
+    /// `rebuild()` — and avoid setting any error status — when this returns
+    /// `false`, so non-applicable repos don't get flagged red in the TUI.
+    ///
+    /// Default: `true` (assume applicable). Adapters override when they have
+    /// a cheap, deterministic applicability test.
+    fn applies_to(&self, _repo_path: &Path) -> bool {
+        true
+    }
 }
 
 // ── Language dispatch ─────────────────────────────────────────────

@@ -939,6 +939,12 @@ impl IndexManager {
                             let dp = db_path.clone();
                             tokio::task::spawn_blocking(move || {
                                 if let Some(indexer) = reg.get("csharp") {
+                                    if !indexer.applies_to(&rp) {
+                                        info!(
+                                            "🔬 symbol rebuild skipped: not applicable (no .sln)"
+                                        );
+                                        return;
+                                    }
                                     if indexer.is_available() {
                                         match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
                                             Ok(summary) => {
