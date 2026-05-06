@@ -213,6 +213,11 @@ pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
 /// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].
 pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";
 
+/// Default value for `CSHARP_SCIP_CONCURRENCY` when the env var is unset
+/// or unparseable. Clamped to `[1, 4]` at the call site, so this default
+/// is also expected to live within that range.
+pub const CSHARP_SCIP_CONCURRENCY_DEFAULT: usize = 2;
+
 /// Debounce window (seconds) for persisting repos.json metadata updates.
 /// Coalesces bursts of file changes into a single write.
 pub const PERSIST_DEBOUNCE_SECS: u64 = 10;

@@ -33,9 +33,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::constants::{
-    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, MCP_ENDPOINT_PATH,
-    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS,
-    SERVE_PORT_ENV, STATUS_PATH,
+    CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
+    HEALTH_PATH, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::ReposConfig;
 use crate::index::{IndexManager, SharedStores};
@@ -239,12 +239,13 @@ impl ServeState {
             .as_millis() as u64
     }
 
-    /// Read CSHARP_SCIP_CONCURRENCY from env, default 1, clamp [1,4].
+    /// Read CSHARP_SCIP_CONCURRENCY from env, default
+    /// `CSHARP_SCIP_CONCURRENCY_DEFAULT` (currently 2), clamped to [1, 4].
     fn csharp_scip_concurrency() -> usize {
         let raw = std::env::var(CSHARP_SCIP_CONCURRENCY_ENV)
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1);
+            .unwrap_or(CSHARP_SCIP_CONCURRENCY_DEFAULT);
         raw.clamp(1, 4)
     }
 
@@ -338,6 +339,14 @@ impl ServeState {
     }
 
     /// Returns (needs_rebuild, reason) for C# SCIP phase-2 evaluation.
+    ///
+    /// Always bootstraps `last_changed_unix` when missing — even for repos
+    /// that have no index yet — so phase-2 can sort *all* candidates by
+    /// recency. Without this, every first-build candidate has
+    /// `last_changed_unix = 0`, making `candidates.sort_by(last_changed)`
+    /// effectively a no-op and the actual processing order dictated by
+    /// HashMap iteration of `config.repos`. That's why a stale repo could
+    /// land first instead of the most-recently-touched one.
     fn evaluate_csharp_rebuild(
         self: &Arc<Self>,
         alias: &str,
@@ -364,10 +373,8 @@ impl ServeState {
             return (false, "indexing already in flight");
         }
 
-        if !indexer.has_index(db_path) {
-            return (true, "no index, first build");
-        }
-
+        // Bootstrap last_changed_unix UP FRONT (before the has_index branch),
+        // so the sort key is meaningful for both first-builds and refreshes.
         let (last_changed, last_scip, touched_bootstrap) = {
             let mut cfg = match self.config.write() {
                 Ok(c) => c,
@@ -391,6 +398,10 @@ impl ServeState {
 
         if touched_bootstrap {
             self.schedule_persist_repos_config();
+        }
+
+        if !indexer.has_index(db_path) {
+            return (true, "no index, first build");
         }
 
         if last_changed > last_scip {
