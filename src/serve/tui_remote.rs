@@ -315,7 +315,7 @@ fn render_table(
         .map(|repo| {
             let status_cell = status_cell(&repo.status);
             let changes_cell =
-                Cell::from(format!("{}", repo.changes)).style(Style::default().fg(Color::White));
+                Cell::from(format!("{:>4}", repo.changes)).style(Style::default().fg(Color::White));
             let calls_cell = if repo.tool_call_count > 0 {
                 Cell::from(format!("{}", repo.tool_call_count))
                     .style(Style::default().fg(Color::Cyan))

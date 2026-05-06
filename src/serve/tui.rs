@@ -273,7 +273,7 @@ fn render_table(
         .map(|(alias, info)| {
             let status_cell = status_cell(info.status);
             let changes_cell =
-                Cell::from(format!("{}", info.changes)).style(Style::default().fg(Color::White));
+                Cell::from(format!("{:>4}", info.changes)).style(Style::default().fg(Color::White));
             let calls_cell = if info.tool_call_count > 0 {
                 Cell::from(format!("{}", info.tool_call_count))
                     .style(Style::default().fg(Color::Cyan))
