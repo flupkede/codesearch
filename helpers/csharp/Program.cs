@@ -707,7 +707,7 @@ public static class Program
     [ExcludeFromCodeCoverage]
     private static async Task<int> UnknownCommand(string cmd)
     {
-        await Console.Error.WriteLineAsync($"Unknown command: '{cmd}'. Use 'index' or 'find-refs'.").ConfigureAwait(false);
+        await Console.Error.WriteLineAsync($"Unknown command: '{cmd}'. Use 'index', 'find-refs', or 'batch-find-refs'.").ConfigureAwait(false);
         return 1;
     }
 }

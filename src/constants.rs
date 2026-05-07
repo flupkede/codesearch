@@ -227,6 +227,10 @@ pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
 /// cleared when the definition index is rebuilt. Gives O(1) lookup on 2nd+ calls.
 pub const SCIP_REF_CACHE_DB_NAME: &str = "scip_ref_cache";
 
+/// Language identifier for the C# symbol indexer.
+/// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
+pub const LANG_CSHARP: &str = "csharp";
+
 /// Environment variable controlling phase-2 C# SCIP rebuild concurrency.
 /// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].
 pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";

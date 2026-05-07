@@ -34,7 +34,7 @@ use tracing::{info, warn};
 
 use crate::constants::{
     CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT,
-    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH,
+    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, LANG_CSHARP,
     MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
     REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
 };
@@ -389,7 +389,7 @@ impl ServeState {
             return (false, "no .sln");
         }
 
-        let Some(indexer) = self.symbol_registry.get("csharp") else {
+        let Some(indexer) = self.symbol_registry.get(LANG_CSHARP) else {
             return (false, "helper not available");
         };
         if !indexer.is_available() {
@@ -636,7 +636,7 @@ impl ServeState {
             // Check that the repo is applicable
             let applies = self
                 .symbol_registry
-                .get("csharp")
+                .get(LANG_CSHARP)
                 .map(|i| i.applies_to(&path))
                 .unwrap_or(false);
 
@@ -679,7 +679,7 @@ impl ServeState {
                 let alias_owned = alias.clone();
 
                 match tokio::task::spawn_blocking(move || {
-                    let Some(indexer) = registry.get("csharp") else {
+                    let Some(indexer) = registry.get(LANG_CSHARP) else {
                         return Err(anyhow::anyhow!("No C# indexer"));
                     };
                     // Downcast to CSharpSymbolIndexer to access prewarm_ref_cache
@@ -1536,10 +1536,10 @@ impl ServeState {
                     // Probe: helper available + index exists → Ready
                     let registry = &self.symbol_registry;
                     let has_helper = registry
-                        .get("csharp")
+                        .get(LANG_CSHARP)
                         .map(|i| i.is_available())
                         .unwrap_or(false);
-                    if has_helper && registry.has_index_for("csharp", &db_path) {
+                    if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
                         CSharpIndexStatus::Ready
                     } else {
                         CSharpIndexStatus::None
@@ -1880,7 +1880,7 @@ async fn status_handler(
 
     let csharp_helper = state
         .symbol_registry
-        .get("csharp")
+        .get(LANG_CSHARP)
         .map(|i| i.is_available())
         .unwrap_or(false);
 
@@ -1910,7 +1910,7 @@ async fn trigger_symbol_rebuild(
     // .cs watcher debounce, future paths) bypass that gate.
     let applies = state
         .symbol_registry
-        .get("csharp")
+        .get(LANG_CSHARP)
         .map(|i| i.applies_to(project_path))
         .unwrap_or(false);
     if !applies {
@@ -1930,7 +1930,7 @@ async fn trigger_symbol_rebuild(
     let alias_owned = alias.to_string();
     let registry = state.symbol_registry.clone();
     match tokio::task::spawn_blocking(move || {
-        let Some(indexer) = registry.get("csharp") else {
+        let Some(indexer) = registry.get(LANG_CSHARP) else {
             return Err(anyhow::anyhow!("No C# symbol indexer registered"));
         };
         if !indexer.is_available() {

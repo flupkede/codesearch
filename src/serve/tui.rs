@@ -582,7 +582,7 @@ fn status_cell(status: super::RepoStateLabel, csharp: super::CSharpIndexStatus) 
         Open => match csharp {
             CS::Ready => Cell::from("✓ ready C#·  ".to_string())
                 .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            CS::Indexing => Cell::from("⟳ idx C#…   ".to_string())
+            CS::Indexing => Cell::from("⟳ idx C#…    ".to_string())
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             CS::Error => Cell::from("✓ ready C#!  ".to_string())
                 .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
@@ -592,7 +592,7 @@ fn status_cell(status: super::RepoStateLabel, csharp: super::CSharpIndexStatus) 
         Warm => match csharp {
             CS::Ready => Cell::from("◐ warm C#·   ".to_string())
                 .style(Style::default().fg(Color::Yellow)),
-            CS::Indexing => Cell::from("⟳ idx C#…   ".to_string())
+            CS::Indexing => Cell::from("⟳ idx C#…    ".to_string())
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             CS::Error => Cell::from("◐ warm C#!   ".to_string())
                 .style(Style::default().fg(Color::Yellow)),
@@ -601,11 +601,11 @@ fn status_cell(status: super::RepoStateLabel, csharp: super::CSharpIndexStatus) 
         },
         Readonly => Cell::from("◑ ro         ".to_string()).style(Style::default().fg(Color::Cyan)),
         Indexing => match csharp {
-            CS::Ready => Cell::from("⟳ idx… C#·  ".to_string())
+            CS::Ready => Cell::from("⟳ idx… C#·   ".to_string())
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            CS::Indexing => Cell::from("⟳ idx C#…   ".to_string())
+            CS::Indexing => Cell::from("⟳ idx C#…    ".to_string())
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            CS::Error => Cell::from("⟳ idx… C#!  ".to_string())
+            CS::Error => Cell::from("⟳ idx… C#!   ".to_string())
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             CS::None => Cell::from("⟳ indexing…  ".to_string()).style(
                 Style::default()

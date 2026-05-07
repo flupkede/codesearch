@@ -5385,7 +5385,7 @@ impl CodesearchService {
             request.file.as_ref().and_then(|f| {
                 let ext = Path::new(f).extension()?.to_str()?.to_lowercase();
                 match ext.as_str() {
-                    "cs" => Some("csharp".to_string()),
+                    "cs" => Some(crate::constants::LANG_CSHARP.to_string()),
                     _ => None,
                 }
             })

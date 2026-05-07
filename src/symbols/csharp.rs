@@ -81,6 +81,22 @@ const HELPER_BIN_NAME: &str = crate::constants::SCIP_CSHARP_HELPER_NAME;
 #[allow(dead_code)]
 pub const CSHARP_REBUILD_DEBOUNCE_SECS: u64 = crate::constants::SCIP_CSHARP_DEBOUNCE_MS / 1000;
 
+// ── Temp-file RAII guard ──────────────────────────────────────────
+
+/// Deletes `self.0` when dropped, even on early `?` returns.
+///
+/// Prefer this over manual `remove_file` calls around fallible operations:
+/// if an intermediate step fails and the function returns early, the temp file
+/// is still cleaned up, preventing accumulation of stale `.json` files in the
+/// system temp directory.
+struct TempFileGuard(std::path::PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 // ── Serialized reference type (stored in LMDB via bincode) ────────
 
 /// Schema version byte prepended to all bincode payloads stored in LMDB.
@@ -284,7 +300,6 @@ impl CSharpSymbolIndexer {
     }
 
     /// Find the solution file in a repo directory.
-    #[allow(dead_code)]
     fn find_solution(repo_path: &Path) -> Option<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(repo_path) {
             for entry in entries.flatten() {
@@ -298,7 +313,6 @@ impl CSharpSymbolIndexer {
     }
 
     /// Find the .csproj containing a given file.
-    #[allow(dead_code)]
     pub fn find_csproj_for_file(repo_path: &Path, file_path: &Path) -> Option<PathBuf> {
         let mut dir = file_path.parent()?;
         loop {
@@ -818,15 +832,25 @@ impl CSharpSymbolIndexer {
             repo_path.file_name().unwrap_or_default().to_string_lossy(),
             nonce
         ));
-        std::fs::write(&symbols_file, symbols_to_resolve.join("\n"))?;
+        // Filter symbols: SCIP keys must not contain newlines (they're used as the line separator).
+        // Defensive — Roslyn-derived keys are always single-line, but guard against edge cases.
+        let clean_symbols: Vec<&str> = symbols_to_resolve
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !s.contains('\n'))
+            .collect();
+        std::fs::write(&symbols_file, clean_symbols.join("\n"))?;
+        // Guard ensures cleanup on all exit paths (success, early-? returns, panics).
+        let _symbols_guard = TempFileGuard(symbols_file.clone());
 
         let output_path = temp_dir.join(format!(
             "batch-refs-{}-{:x}.json",
             std::process::id(),
             nonce
         ));
+        let _output_guard = TempFileGuard(output_path.clone());
 
-        // Invoke batch-find-refs
+        // Invoke batch-find-refs — symbols_file and output_path are cleaned up by guards
         self.invoke_batch_find_refs_helper(
             &helper,
             &solution,
@@ -834,14 +858,9 @@ impl CSharpSymbolIndexer {
             &output_path,
         )?;
 
-        // Clean up symbols file
-        let _ = std::fs::remove_file(&symbols_file);
-
         // Parse and cache results
         let cached = self.parse_and_cache_batch_refs(db_path, &output_path)?;
-
-        // Clean up output file
-        let _ = std::fs::remove_file(&output_path);
+        // Guards drop here (or on early-? return above) and delete both temp files.
 
         let duration_ms = start.elapsed().as_millis() as u64;
         tracing::info!(

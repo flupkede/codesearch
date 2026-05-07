@@ -17,8 +17,8 @@
 
 use crate::cache::{normalize_path, normalize_path_str};
 use crate::constants::{
-    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, SCIP_CSHARP_DEBOUNCE_MS,
-    WRITER_LOCK_FILE,
+    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP,
+    SCIP_CSHARP_DEBOUNCE_MS, WRITER_LOCK_FILE,
 };
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
@@ -980,7 +980,7 @@ impl IndexManager {
                             let dp = db_path.clone();
                             let notifier = csharp_notifier.clone();
                             tokio::task::spawn_blocking(move || {
-                                if let Some(indexer) = reg.get("csharp") {
+                                if let Some(indexer) = reg.get(LANG_CSHARP) {
                                     if !indexer.applies_to(&rp) {
                                         info!(
                                             "🔬 symbol rebuild skipped: not applicable (no .sln)"
