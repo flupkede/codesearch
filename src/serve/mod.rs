@@ -1566,6 +1566,8 @@ impl ServeState {
                 },
             ));
         }
+        // Sort alphabetically by alias for consistent display in TUI
+        result.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
         result
     }
 
