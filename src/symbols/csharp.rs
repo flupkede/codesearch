@@ -466,6 +466,7 @@ impl CSharpSymbolIndexer {
                 .unwrap_or_default()
                 .as_nanos()
         ));
+        let _output_guard = TempFileGuard(output_path.clone());
 
         let solution_short = solution
             .file_name()
@@ -537,7 +538,6 @@ impl CSharpSymbolIndexer {
                 output_path.display()
             )
         })?;
-        let _ = std::fs::remove_file(&output_path);
 
         let result = scip_parse::parse_find_refs_output(&data)?;
 
@@ -1111,6 +1111,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             repo_path.file_name().unwrap_or_default().to_string_lossy(),
             start.elapsed().as_nanos()
         ));
+        let _output_guard = TempFileGuard(output_path.clone());
 
         // Invoke helper with stderr streaming
         self.invoke_index_helper(&helper, &solution, &output_path, project.as_deref())?;
@@ -1119,12 +1120,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let index_data = std::fs::read(&output_path)
             .with_context(|| format!("Failed to read symbol index at {}", output_path.display()))?;
 
-        let index_result = scip_parse::parse_json_index(&index_data);
-
-        // Cleanup temp file regardless of parse success
-        let _ = std::fs::remove_file(&output_path);
-
-        let index = index_result?;
+        let index = scip_parse::parse_json_index(&index_data)?;
 
         // Open LMDB (all named DBs pre-created by open_scip_env)
         let env = self.open_scip_env(db_path)?;

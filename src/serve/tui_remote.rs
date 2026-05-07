@@ -303,7 +303,7 @@ fn render_table(
             let extra = match r.csharp_index.as_str() {
                 "ready" => 4,    // " C#·"
                 "error" => 4,    // " C#!"
-                "indexing" => 4, // " C#·"
+                "indexing" => 4, // " C#…"
                 _ => 0,
             };
             r.alias.len() + extra
@@ -343,13 +343,13 @@ fn render_table(
                 "indexing" => {
                     // Pulsing C# indicator during indexing (color only, fixed text width)
                     if pulse_bright() {
-                        Cell::from(format!("{} C#·", repo.alias)).style(
+                        Cell::from(format!("{} C#…", repo.alias)).style(
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),
                         )
                     } else {
-                        Cell::from(format!("{} C#·", repo.alias))
+                        Cell::from(format!("{} C#…", repo.alias))
                             .style(Style::default().fg(Color::DarkGray))
                     }
                 }
@@ -445,7 +445,7 @@ fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_s
     let csharp_str = match repo.csharp_index.as_str() {
         "ready" => "  C#·",
         "error" => "  C#!",
-        "indexing" => "  C#·",
+        "indexing" => "  C#…",
         _ => "",
     };
     let csharp_color = match repo.csharp_index.as_str() {
@@ -556,31 +556,31 @@ fn render_footer(
 
 fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
     match status {
-        "open" => Cell::from("✓ ready  ".to_string()).style(
+        "open" => Cell::from("✓ ready   ".to_string()).style(
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
         "warm" => match csharp {
-            "ready" => Cell::from("◐ warm+C#".to_string())
+            "ready" => Cell::from("◐ warm+C# ".to_string())
                 .style(Style::default().fg(Color::Green)),
             "indexing" => Cell::from("◐ warm C#…".to_string())
                 .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             "error" => Cell::from("◐ warm C#!".to_string())
                 .style(Style::default().fg(Color::Red)),
-            _ => Cell::from("◐ warm   ".to_string()).style(Style::default().fg(Color::Yellow)),
+            _ => Cell::from("◐ warm    ".to_string()).style(Style::default().fg(Color::Yellow)),
         },
-        "readonly" => Cell::from("◑ ro     ".to_string()).style(Style::default().fg(Color::Cyan)),
-        "indexing" => Cell::from("⟳ idx…  ".to_string()).style(
+        "readonly" => Cell::from("◑ ro      ".to_string()).style(Style::default().fg(Color::Cyan)),
+        "indexing" => Cell::from("⟳ idx…   ".to_string()).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        "closed" => Cell::from("○ closed ".to_string()).style(Style::default().fg(Color::Gray)),
-        "error" => Cell::from("✗ error  ".to_string())
+        "closed" => Cell::from("○ closed  ".to_string()).style(Style::default().fg(Color::Gray)),
+        "error" => Cell::from("✗ error   ".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        "no_index" => Cell::from("— no idx ".to_string()).style(Style::default().fg(Color::Gray)),
-        _ => Cell::from(format!("{:<8}", status)).style(Style::default().fg(Color::White)),
+        "no_index" => Cell::from("— no idx  ".to_string()).style(Style::default().fg(Color::Gray)),
+        _ => Cell::from(format!("{:<10}", status)).style(Style::default().fg(Color::White)),
     }
 }
 

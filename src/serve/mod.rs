@@ -410,7 +410,7 @@ impl ServeState {
         let (last_changed, last_scip, touched_bootstrap) = {
             let mut cfg = match self.config.write() {
                 Ok(c) => c,
-                Err(_) => return (false, "fresh, last_scip>=last_changed"),
+                Err(_) => return (false, "config lock poisoned"),
             };
             let mut meta = cfg.meta(alias);
             let mut touched = false;
@@ -519,7 +519,7 @@ impl ServeState {
         info!("🔥 Phase 1 warmup complete");
     }
 
-    /// Phase 2: queued C# SCIP rebuilds, sorted by recency, gated by semaphore.
+    /// Phase 2: semaphore-bounded concurrent C# SCIP rebuilds, sorted by recency.
     pub(crate) async fn run_phase_2_csharp_scip(self: &Arc<Self>) {
         let aliases = self.aliases();
         let mut candidates: Vec<(String, i64)> = Vec::new();
