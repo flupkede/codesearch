@@ -1225,17 +1225,59 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 purge_count
             );
 
-            // Selective ref cache invalidation: only purge cached references for
-            // symbols whose definitions changed. Symbols from non-affected files
-            // keep their cached references (avoids re-opening Roslyn unnecessarily).
+            // Selective ref cache invalidation:
+            //
+            // Pass 1 — definition-site: purge cached refs for symbols whose *definition*
+            // is in an affected file. (Original logic — symbols in `stale_symbol_keys`.)
+            //
+            // Pass 2 — reference-site: also purge any cache entry that has a *reference*
+            // in an affected file, even if the symbol's definition lives elsewhere.
+            // Without this pass, moving/deleting call sites leaves stale `start_line` /
+            // `end_line` values in the cache until the next full rebuild.
             let mut cache_invalidated = 0usize;
+
+            // Pass 1
             for stale_key in &stale_symbol_keys {
                 if ref_cache_db.delete(&mut wtxn, stale_key.as_str())? {
                     cache_invalidated += 1;
                 }
             }
+
+            // Pass 2 — scan all cached entries for reference-site staleness
+            {
+                let mut ref_site_stale_keys: Vec<String> = Vec::new();
+                let cache_iter = ref_cache_db.iter(&wtxn)?;
+                for result in cache_iter {
+                    let (key, val) = result?;
+                    // Skip entries already invalidated by Pass 1
+                    if stale_symbol_keys.contains(key) {
+                        continue;
+                    }
+                    if let Ok(refs) = deserialize_refs(val) {
+                        let has_stale_ref = refs.iter().any(|r| {
+                            affected_files
+                                .contains(&r.file.to_string_lossy().replace('\\', "/"))
+                        });
+                        if has_stale_ref {
+                            ref_site_stale_keys.push(key.to_string());
+                        }
+                    }
+                }
+                for key in &ref_site_stale_keys {
+                    if ref_cache_db.delete(&mut wtxn, key.as_str())? {
+                        cache_invalidated += 1;
+                    }
+                }
+                if !ref_site_stale_keys.is_empty() {
+                    tracing::debug!(
+                        "Incremental: reference-site invalidated {} additional cache entries",
+                        ref_site_stale_keys.len()
+                    );
+                }
+            }
+
             tracing::debug!(
-                "Incremental: selectively invalidated {} ref cache entries (of {} stale symbols)",
+                "Incremental: invalidated {} ref cache entries total ({} definition-site + reference-site scan)",
                 cache_invalidated,
                 stale_symbol_keys.len()
             );
