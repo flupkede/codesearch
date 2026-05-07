@@ -1,17 +1,38 @@
 # codesearch
 
-**Cross-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid search, symbol navigation, and multi-repository orchestration.**
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+[![MCP server](https://img.shields.io/badge/MCP-server-8a2be2.svg)](https://modelcontextprotocol.io/)
+[![GitHub release](https://img.shields.io/github/v/release/flupkede/codesearch?include_prereleases)](https://github.com/flupkede/codesearch/releases)
+[![GitHub stars](https://img.shields.io/github/stars/flupkede/codesearch?style=social)](https://github.com/flupkede/codesearch/stargazers)
 
-codesearch gives AI agents (OpenCode, Claude Code, Cursor, etc.) deep codebase understanding through 5 unified MCP tools. It runs entirely locally — no API calls, no cloud dependencies. Index once, search semantically across multiple repositories simultaneously.
+**Multi-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid retrieval, symbol navigation, and cross-repository orchestration. Fully local, fully offline, no GPU, no Docker.**
+
+codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) deep codebase understanding through 5 unified MCP tools. Index once, search semantically across multiple repositories simultaneously.
 
 ## Why codesearch?
 
-- **Multi-repo search**: Fan-out queries across repository groups
+- **Multi-repo serve mode**: Fan-out queries across repository groups with cross-repo RRF ranking
 - **Hybrid retrieval**: Vector embeddings + BM25 full-text search fused with Reciprocal Rank Fusion
-- **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents
+- **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents — in the same tool
 - **AST-aware chunking**: Tree-sitter parsing for 9 languages — chunks align to functions/classes, not arbitrary line ranges
 - **Token-efficient**: Returns metadata by default; agents fetch full code only when needed via `get_chunk`
+- **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only, no runtime model downloads (works behind enterprise proxies)
 - **Zero config for single repos**: `codesearch index && codesearch mcp` — done
+
+## How does this compare?
+
+The MCP code-search ecosystem grew rapidly in late 2025 / early 2026 and many projects share the same baseline stack (Rust + tree-sitter + BM25 + embeddings + MCP). codesearch's deliberate focus is:
+
+| Focus area | codesearch | Typical alternative |
+|---|---|---|
+| Repository scope | Multi-repo serve with cross-repo RRF | Usually single repo at a time |
+| Footprint | ~hundreds of MB, CPU-only, no Docker | GB-scale, GPU, Docker, or cloud |
+| Enterprise / offline | No runtime fetches; static binary | Often pulls models at first run |
+| Symbol navigation | `find` (def/usages/imports/dependents) co-located with semantic search | Often a separate code-graph tool |
+| Token cost per call | `compact=true` by default; chunks fetched on demand | Frequently dumps full snippets |
+
+Other projects in the same niche may go deeper on call-graph traversal, polished standalone CLIs, or memory/knowledge-graph features. codesearch is intentionally narrower — it picks "lightweight, multi-repo, MCP-native, fully offline" and stays on that lane.
 
 ## Architecture
 
