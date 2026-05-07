@@ -71,6 +71,10 @@ const META_REBUILD_TS: &str = crate::constants::SCIP_REBUILD_TIMESTAMP_KEY;
 #[allow(dead_code)]
 const META_SYMBOL_COUNT: &str = "symbol_count";
 
+/// Key in the meta database storing the absolute repo path (set during rebuild,
+/// used by find_refs_for_canonical_key to locate the .sln for lazy ref resolution).
+const META_REPO_PATH: &str = "repo_path";
+
 /// Environment variable override for the helper binary path.
 const HELPER_ENV_VAR: &str = crate::constants::SCIP_CSHARP_HELPER_ENV;
 
@@ -684,8 +688,26 @@ impl CSharpSymbolIndexer {
             }
         };
 
-        let repo_path = db_path.parent().unwrap_or(db_path);
-        let solution = match Self::find_solution(repo_path) {
+        // Resolve repo_path: read from LMDB meta (written during rebuild),
+        // fall back to db_path.parent() for backward compat with old indexes.
+        let repo_path = {
+            let rtxn = env.read_txn()?;
+            let meta_db: Database<Str, Str> =
+                env.open_database(&rtxn, Some(SCIP_META_DB_NAME))?
+                    .unwrap_or_else(|| {
+                        panic!("scip_meta DB should exist (created during open_scip_env)")
+                    });
+            match meta_db.get(&rtxn, META_REPO_PATH)? {
+                Some(path_str) => PathBuf::from(path_str),
+                None => {
+                    tracing::debug!(
+                        "META_REPO_PATH not found in scip_meta, falling back to db_path.parent()"
+                    );
+                    db_path.parent().unwrap_or(db_path).to_path_buf()
+                }
+            }
+        };
+        let solution = match Self::find_solution(&repo_path) {
             Some(s) => s,
             None => {
                 tracing::warn!(
@@ -1429,6 +1451,11 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             &mut wtxn,
             META_SYMBOL_COUNT,
             reported_symbol_count.to_string().as_str(),
+        )?;
+        meta_db.put(
+            &mut wtxn,
+            META_REPO_PATH,
+            repo_path.to_string_lossy().as_ref(),
         )?;
 
         wtxn.commit()?;

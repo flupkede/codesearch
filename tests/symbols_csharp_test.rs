@@ -145,9 +145,13 @@ fn test_indexer_returns_empty_when_db_missing() {
     // open_scip_env creates the dir, so just verify it doesn't panic
     let _ = age;
 
-    // Test find_references with no data — should return error
+    // Test find_references with no data — should return Ok(empty) because
+    // resolve_canonical_key returns None when no LMDB tables exist.
     let result = indexer.find_references(&db_path, "Calculator.Add");
-    assert!(result.is_err(), "Should fail when no SCIP data exists");
+    assert!(
+        result.is_ok() && result.unwrap().is_empty(),
+        "Should return Ok(empty) when no SCIP data exists"
+    );
 }
 
 #[test]

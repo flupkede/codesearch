@@ -1062,15 +1062,25 @@ impl IndexManager {
                                         };
                                         match indexer.rebuild(&rp, &dp, scope) {
                                             Ok(summary) => {
-                                                info!(
-                                                    "✅ [{}/{}] Symbol rebuild complete ({}): {} symbols, {} refs in {}ms",
-                                                    i + 1,
-                                                    total_groups,
-                                                    csproj_name,
-                                                    summary.symbols_indexed,
-                                                    summary.references_stored,
-                                                    summary.duration_ms
-                                                );
+                                                if summary.symbols_indexed == 0 {
+                                                    warn!(
+                                                        "⚠️ [{}/{}] Symbol rebuild returned 0 symbols for '{}' — \
+                                                         project may have failed to load. Check scip-csharp logs above.",
+                                                        i + 1,
+                                                        total_groups,
+                                                        csproj_name
+                                                    );
+                                                } else {
+                                                    info!(
+                                                        "✅ [{}/{}] Symbol rebuild complete ({}): {} symbols, {} refs in {}ms",
+                                                        i + 1,
+                                                        total_groups,
+                                                        csproj_name,
+                                                        summary.symbols_indexed,
+                                                        summary.references_stored,
+                                                        summary.duration_ms
+                                                    );
+                                                }
                                             }
                                             Err(e) => {
                                                 warn!(

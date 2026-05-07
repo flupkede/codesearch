@@ -22,6 +22,15 @@ public sealed class SymbolIndexer
             projects = projects.Where(p =>
                 string.Equals(p.Name, filterName, StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(Path.GetFileName(p.FilePath), projectFilter, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            if (!projects.Any())
+            {
+                var loadedNames = string.Join(", ", solution.Projects.Select(p => p.Name));
+                Console.Error.WriteLine(
+                    $"[WARN] --filter-project '{projectFilter}' matched zero loaded projects. " +
+                    $"Loaded projects: [{loadedNames}]. " +
+                    $"The target project likely failed to load (check workspace errors above).");
+            }
         }
 
         // Collect all symbols across all projects

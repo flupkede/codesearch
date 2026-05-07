@@ -98,6 +98,81 @@ Latest commits on `features/symbol-references`:
 **Status**: `cargo check` + `cargo clippy` clean, `dotnet build` clean.
 **Deployed**: Run `..\copy-to-common.ps1` to deploy to `~/.local/bin/`.
 
+## Known Bugs (field-tested 2026-05-07 on HUSQ.Aprimo)
+
+### Bug 1 — `.gitignore` not respected by file watcher / vector indexer (HIGH)
+
+Standard `.gitignore` patterns (`obj/`, `bin/`, `[Bb]in/`, `[Oo]bj/`) are ignored. Build artifacts
+are indexed as if they were source files:
+
+```
+✅ Indexed obj/project.assets.json           ← NuGet restore manifest (28–65 chunks of JSON noise)
+✅ Indexed bin/Debug/net8.0/*.deps.json       ← dependency graph (10–15 chunks)
+✅ Indexed obj/Debug/net8.0/*.sourcelink.json
+✅ Indexed obj/Debug/net8.0/*.AssemblyInfo.cs ← auto-generated, noise
+✅ Indexed .claude/settings.local.json        ← IDE tool config, not source
+```
+
+**Fix:** Respect `.gitignore` in the FSW and vector indexer (parse via `ignore` crate, already a
+dependency). This would also eliminate the MSBuildWorkspace duplicate-compile workaround (Bug 2).
+
+---
+
+### Bug 2 — MSBuildWorkspace picks up `obj/` generated files as duplicate Compile items (HIGH)
+
+When scip-csharp loads an SDK-style project via MSBuildWorkspace, auto-generated files in
+`obj/Debug/` and `obj/Release/` (e.g. `.NETCoreApp,Version=v8.0.AssemblyAttributes.cs`) are
+included as explicit Compile items. The SDK-style project also auto-includes all `.cs` files —
+resulting in duplicates:
+
+```
+[WARN] Msbuild failed: Dlw.Aprimo.Core.csproj
+       Duplicate 'Compile' items: obj\Debug\net8.0\.NETCoreApp,Version=v8.0.AssemblyAttributes.cs
+```
+
+Because `Dlw.Aprimo.Core.csproj` fails to load, all downstream projects that reference it also
+fail — blocking symbol indexing for the entire dependency chain.
+
+`dotnet build` handles this correctly internally via `$(BaseIntermediateOutputPath)` exclusions.
+MSBuildWorkspace does not apply the same logic.
+
+**Workaround (client-side):** Add `Directory.Build.props` at the solution root:
+```xml
+<Project>
+  <ItemGroup>
+    <Compile Remove="obj\**" />
+  </ItemGroup>
+</Project>
+```
+Safe for regular builds — dotnet build already excludes obj/ internally. No per-.csproj changes needed.
+
+**Proper fix (in scip-csharp):** Pass `DesignTimeBuild=true` + `SkipCompilerExecution=true` MSBuild
+properties when opening the workspace, or explicitly set `DisableDefaultCompileItems` / use
+`WorkspaceDiagnosticKind` to suppress generated-file inclusion. This removes the client-side
+workaround requirement entirely.
+
+---
+
+### Bug 3 — `--filter-project` selects wrong project when workspace fails to load (MEDIUM)
+
+When a project fails to load (cascade from Bug 2), changed `.cs` files in that project are
+silently reassigned to a sibling project that *did* compile. Result: the correct project is never
+rebuilt, without any warning:
+
+```
+# 6 files changed in Dlw.Aprimo.Dam — but Dam.csproj failed to load:
+🔬 6 modified .cs files → --filter-project Dlw.Aprimo.ExternalPortal.csproj  ← wrong
+```
+
+Debugging this required reading serve logs — no user-visible indication that Dam files were missed.
+
+**Fix:** When mapping changed `.cs` files to projects, if the owning project failed to load:
+1. Log a clear warning: `WARN: Dlw.Aprimo.Dam.csproj failed to load — N file(s) not symbol-indexed`
+2. Do NOT reassign those files to a different project
+3. Optionally: still attempt a partial SCIP run for the failed project (Roslyn may yield partial output)
+
+---
+
 ## Remaining work
 
 - [ ] Verify on live Aprimo repo: 1st `find_impact` call triggers lazy find-refs, 2nd+ call < 100ms (cache hit)

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
 use std::collections::HashSet;
@@ -65,15 +66,62 @@ pub struct FileWatcher {
     root: PathBuf,
     debouncer: Option<Debouncer<RecommendedWatcher, FileIdMap>>,
     receiver: Option<Receiver<DebounceEventResult>>,
+    /// Compiled .gitignore matcher for the repo root (None if no .gitignore found).
+    gitignore: Option<Gitignore>,
 }
 
 impl FileWatcher {
     /// Create a new file watcher for the given root directory
     pub fn new(root: PathBuf) -> Self {
+        let gitignore = Self::build_gitignore(&root);
         Self {
             root,
             debouncer: None,
             receiver: None,
+            gitignore,
+        }
+    }
+
+    /// Build a `Gitignore` matcher from the repo root's `.gitignore` and
+    /// `.git/info/exclude`. Returns `None` if neither file exists.
+    fn build_gitignore(root: &Path) -> Option<Gitignore> {
+        let mut builder = GitignoreBuilder::new(root);
+
+        let mut added_any = false;
+
+        // Add .git/info/exclude if present
+        let exclude_path = root.join(".git").join("info").join("exclude");
+        if exclude_path.exists() {
+            if let Some(e) = builder.add(&exclude_path) {
+                tracing::debug!("Failed to add .git/info/exclude: {}", e);
+            } else {
+                added_any = true;
+            }
+        }
+
+        // Add .gitignore if present
+        let gitignore_path = root.join(".gitignore");
+        if gitignore_path.exists() {
+            if let Some(e) = builder.add(&gitignore_path) {
+                tracing::debug!("Failed to add .gitignore: {}", e);
+            } else {
+                added_any = true;
+            }
+        }
+
+        if !added_any {
+            return None;
+        }
+
+        match builder.build() {
+            Ok(gi) => {
+                tracing::debug!("Loaded .gitignore rules for {}", root.display());
+                Some(gi)
+            }
+            Err(e) => {
+                tracing::debug!("Failed to build gitignore matcher: {}", e);
+                None
+            }
         }
     }
 
@@ -134,9 +182,20 @@ impl FileWatcher {
         false
     }
 
+    /// Check if a path is matched by .gitignore rules (relative to repo root).
+    fn is_gitignored(&self, path: &Path) -> bool {
+        if let Some(ref gi) = self.gitignore {
+            let relative = path.strip_prefix(&self.root).unwrap_or(path);
+            gi.matched(relative, false).is_ignore()
+        } else {
+            false
+        }
+    }
+
     /// Check if a path should be watched.
     /// Uses the same logic as FileWalker so FSW and index agree on what is indexable:
     /// - Not in an ignored directory (ALWAYS_EXCLUDED)
+    /// - Not matched by .gitignore rules
     /// - Not a skip extension (ALWAYS_SKIP_EXTENSIONS)
     /// - Not a skip filename suffix (ALWAYS_SKIP_FILENAME_SUFFIXES)
     /// - Not 0 bytes
@@ -144,6 +203,14 @@ impl FileWatcher {
     fn is_watchable(&self, path: &Path) -> bool {
         if self.is_in_ignored_dir(path) {
             return false;
+        }
+
+        // Check .gitignore rules (relative to repo root)
+        if let Some(ref gi) = self.gitignore {
+            let relative = path.strip_prefix(&self.root).unwrap_or(path);
+            if gi.matched(relative, false).is_ignore() {
+                return false;
+            }
         }
 
         // Skip hardcoded extensions (e.g. .tmp, .map, .lock)
@@ -268,10 +335,13 @@ impl FileWatcher {
                         // Normalize path: strip UNC prefix, convert backslashes
                         let path = normalize_event_path(raw_path);
 
-                        // Skip ignored directories and duplicates
-                        if self.is_in_ignored_dir(&path) || seen_paths.contains(&path) {
-                            continue;
-                        }
+                            // Skip ignored directories and duplicates
+                            if self.is_in_ignored_dir(&path)
+                                || self.is_gitignored(&path)
+                                || seen_paths.contains(&path)
+                            {
+                                continue;
+                            }
                         seen_paths.insert(path.clone());
 
                         use notify::EventKind;
@@ -521,6 +591,53 @@ mod tests {
         // SHOULD watch (special files)
         assert!(watcher.is_watchable(Path::new("/tmp/Dockerfile")));
         assert!(watcher.is_watchable(Path::new("/tmp/Makefile")));
+    }
+
+    #[test]
+    fn test_gitignore_rules_respected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Create .gitignore with obj/, bin/, .claude/ patterns
+        fs::write(
+            root.join(".gitignore"),
+            "obj/\nbin/\n.claude/\n*.deps.json\n",
+        )
+        .unwrap();
+
+        let watcher = FileWatcher::new(root.to_path_buf());
+        assert!(
+            watcher.gitignore.is_some(),
+            "Should have loaded .gitignore"
+        );
+
+        // Should NOT watch (gitignored patterns)
+        assert!(
+            !watcher.is_watchable(&root.join("obj/project.assets.json")),
+            "obj/ should be gitignored"
+        );
+        assert!(
+            !watcher.is_watchable(&root.join("bin/Debug/net8.0/app.deps.json")),
+            "bin/ should be gitignored"
+        );
+        assert!(
+            !watcher.is_watchable(&root.join(".claude/settings.local.json")),
+            ".claude/ should be gitignored"
+        );
+        assert!(
+            !watcher.is_watchable(&root.join("src/app.deps.json")),
+            "*.deps.json should be gitignored"
+        );
+
+        // SHOULD watch (non-ignored code files)
+        assert!(
+            watcher.is_watchable(&root.join("src/Program.cs")),
+            "src/Program.cs should be watchable"
+        );
+        assert!(
+            watcher.is_watchable(&root.join("README.md")),
+            "README.md should be watchable"
+        );
     }
 
     #[test]

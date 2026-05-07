@@ -236,6 +236,13 @@ public static class Program
         {
             // Tell Roslyn to skip projects it cannot load instead of crashing.
             { "BuildingInsideVisualStudio", "true" },
+            // Design-time build: prevents auto-generated files in obj/ (e.g.
+            // .AssemblyAttributes.cs, .AssemblyInfo.cs) from being included as
+            // explicit Compile items. Without this, SDK-style projects produce
+            // duplicate Compile items (auto-include + obj/ generated), which
+            // causes MSBuildWorkspace to fail loading the project.
+            { "DesignTimeBuild", "true" },
+            { "SkipCompilerExecution", "true" },
         };
 
         // If MSBUILD_EXE_PATH is set, pass it to the workspace so the BuildHost
