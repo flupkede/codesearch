@@ -19,6 +19,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::constants::LANG_CSHARP;
 use super::ServeState;
 
 // ---------------------------------------------------------------------------
@@ -104,7 +105,7 @@ async fn run_tui_loop(
             render_detail(f, chunks[2], &repos, &table_state, &state);
             let csharp_helper = state
                 .symbol_registry
-                .get("csharp")
+                .get(LANG_CSHARP)
                 .map(|i| i.is_available())
                 .unwrap_or(false);
             render_footer(

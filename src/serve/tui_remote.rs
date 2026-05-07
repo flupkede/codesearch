@@ -571,7 +571,7 @@ fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
             _ => Cell::from("◐ warm    ".to_string()).style(Style::default().fg(Color::Yellow)),
         },
         "readonly" => Cell::from("◑ ro      ".to_string()).style(Style::default().fg(Color::Cyan)),
-        "indexing" => Cell::from("⟳ idx…   ".to_string()).style(
+        "indexing" => Cell::from("⟳ idx…    ".to_string()).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
