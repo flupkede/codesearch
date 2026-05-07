@@ -953,6 +953,7 @@ impl CSharpSymbolIndexer {
 
         #[derive(serde::Deserialize)]
         struct BatchOutput {
+            version: String,
             results: Vec<SymbolResult>,
         }
 
@@ -974,6 +975,17 @@ impl CSharpSymbolIndexer {
 
         let batch: BatchOutput =
             serde_json::from_str(&content).with_context(|| "Failed to parse batch-find-refs output")?;
+
+        // Reject outputs from unknown helper versions to avoid silently misinterpreting
+        // a changed schema (same contract enforced on index and find-refs paths).
+        if batch.version != scip_parse::SUPPORTED_INDEX_VERSION {
+            anyhow::bail!(
+                "Unsupported batch-find-refs version: '{}' (expected '{}'). \
+                 Update codesearch and scip-csharp together.",
+                batch.version,
+                scip_parse::SUPPORTED_INDEX_VERSION
+            );
+        }
 
         let env = self.open_scip_env(db_path)?;
         let mut wtxn = env.write_txn()?;

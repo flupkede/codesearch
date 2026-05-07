@@ -75,9 +75,9 @@ mod roles {
     pub const IMPLEMENTATION: u32 = 256;
 }
 
-/// The only scip-csharp index version this parser understands.
-/// Bump together with the helper whenever the JSON schema changes.
-const SUPPORTED_INDEX_VERSION: &str = "1.0";
+/// The only scip-csharp output version this parser understands (index, find-refs, batch-find-refs).
+/// Bump together with the helper whenever any JSON schema changes.
+pub const SUPPORTED_INDEX_VERSION: &str = "1.0";
 
 // ── find-refs output format ───────────────────────────────────────
 
