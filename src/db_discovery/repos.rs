@@ -321,14 +321,21 @@ fn unique_alias_for_path(existing: &HashMap<String, PathBuf>, path: &Path) -> St
     }
 }
 
+/// Sanitize a raw alias string for use as a repo identifier.
+///
+/// Preserves the original casing and dots (e.g. "HUSQ.Aprimo" stays "HUSQ.Aprimo")
+/// to match the directory/repo name. Only removes characters that are problematic
+/// in identifiers: spaces become dashes, and characters outside `[a-zA-Z0-9._-]`
+/// are dropped. Collapses consecutive dashes and trims leading/trailing dashes.
 fn sanitize_alias(raw: &str) -> String {
     let mut out = String::new();
     for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            out.push(ch.to_ascii_lowercase());
-        } else if ch == ' ' || ch == '.' {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else if ch == ' ' {
             out.push('-');
         }
+        // All other characters (brackets, accents, etc.) are silently dropped
     }
 
     while out.contains("--") {
@@ -369,7 +376,16 @@ mod tests {
 
     #[test]
     fn test_sanitize_alias() {
-        assert_eq!(sanitize_alias("My Repo.Name"), "my-repo-name");
+        assert_eq!(sanitize_alias("My Repo.Name"), "My-Repo.Name");
+        // Preserves case and dots
+        assert_eq!(sanitize_alias("HUSQ.Aprimo"), "HUSQ.Aprimo");
+        assert_eq!(sanitize_alias("KRKA.Aprimo"), "KRKA.Aprimo");
+        // Spaces become dashes
+        assert_eq!(sanitize_alias("my repo"), "my-repo");
+        // Special characters dropped
+        assert_eq!(sanitize_alias("repo@v2!"), "repov2");
+        // Collapses double dashes
+        assert_eq!(sanitize_alias("a--b"), "a-b");
     }
 
     #[test]
