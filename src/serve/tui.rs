@@ -233,6 +233,17 @@ fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str) {
     f.render_widget(ratatui::widgets::Paragraph::new(title_line), centered[0]);
 }
 
+/// Returns true during the "bright" phase of a ~1s pulse cycle (500ms bright, 500ms dim).
+/// Used to animate status indicators while indexing is in progress.
+fn pulse_bright() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        % 1000
+        < 500
+}
+
 fn render_table(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -366,21 +377,33 @@ fn render_detail(
     let (status_label, status_color) = match info.status {
         super::RepoStateLabel::Open => match info.csharp_index {
             super::CSharpIndexStatus::Ready => ("Open C#·".to_string(), Color::Green),
-            super::CSharpIndexStatus::Indexing => ("Index C#…".to_string(), Color::Yellow),
+            super::CSharpIndexStatus::Indexing => {
+                let c = if pulse_bright() { Color::Yellow } else { Color::DarkGray };
+                ("Index C#…".to_string(), c)
+            }
             super::CSharpIndexStatus::Error => ("Open C#!".to_string(), Color::Red),
             super::CSharpIndexStatus::None => ("Open".to_string(), Color::Green),
         },
         super::RepoStateLabel::Warm => match info.csharp_index {
             super::CSharpIndexStatus::Ready => ("Warm C#·".to_string(), Color::Yellow),
-            super::CSharpIndexStatus::Indexing => ("Index C#…".to_string(), Color::Yellow),
+            super::CSharpIndexStatus::Indexing => {
+                let c = if pulse_bright() { Color::Yellow } else { Color::DarkGray };
+                ("Index C#…".to_string(), c)
+            }
             super::CSharpIndexStatus::Error => ("Warm C#!".to_string(), Color::Red),
             super::CSharpIndexStatus::None => ("Warm".to_string(), Color::Yellow),
         },
         super::RepoStateLabel::Readonly => ("Readonly".to_string(), Color::Cyan),
         super::RepoStateLabel::Closed => ("Closed".to_string(), Color::Gray),
         super::RepoStateLabel::Indexing => match info.csharp_index {
-            super::CSharpIndexStatus::Indexing => ("Index C#…".to_string(), Color::Yellow),
-            _ => ("Indexing…".to_string(), Color::Yellow),
+            super::CSharpIndexStatus::Indexing => {
+                let c = if pulse_bright() { Color::Yellow } else { Color::DarkGray };
+                ("Index C#…".to_string(), c)
+            }
+            _ => {
+                let c = if pulse_bright() { Color::Yellow } else { Color::DarkGray };
+                ("Indexing…".to_string(), c)
+            }
         },
         super::RepoStateLabel::Error => ("Error".to_string(), Color::Red),
         super::RepoStateLabel::NoIndex => ("No Index".to_string(), Color::Gray),
@@ -579,12 +602,20 @@ fn cpu_usage_str(sys_system: &mut Option<sysinfo::System>) -> String {
 fn status_cell(status: super::RepoStateLabel, csharp: super::CSharpIndexStatus) -> Cell<'static> {
     use super::CSharpIndexStatus as CS;
     use super::RepoStateLabel::*;
+    let bright = pulse_bright();
     match status {
         Open => match csharp {
             CS::Ready => Cell::from("✓ ready C#·  ".to_string())
                 .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            CS::Indexing => Cell::from("⟳ idx C#…    ".to_string())
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            CS::Indexing => {
+                if bright {
+                    Cell::from("⟳ idx C#…    ".to_string())
+                        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                } else {
+                    Cell::from("⟳ idx C#…    ".to_string())
+                        .style(Style::default().fg(Color::DarkGray))
+                }
+            }
             CS::Error => Cell::from("✓ ready C#!  ".to_string())
                 .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             CS::None => Cell::from("✓ ready      ".to_string())
@@ -593,27 +624,49 @@ fn status_cell(status: super::RepoStateLabel, csharp: super::CSharpIndexStatus) 
         Warm => match csharp {
             CS::Ready => Cell::from("◐ warm C#·   ".to_string())
                 .style(Style::default().fg(Color::Yellow)),
-            CS::Indexing => Cell::from("⟳ idx C#…    ".to_string())
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            CS::Indexing => {
+                if bright {
+                    Cell::from("⟳ idx C#…    ".to_string())
+                        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                } else {
+                    Cell::from("⟳ idx C#…    ".to_string())
+                        .style(Style::default().fg(Color::DarkGray))
+                }
+            }
             CS::Error => Cell::from("◐ warm C#!   ".to_string())
                 .style(Style::default().fg(Color::Yellow)),
             CS::None => Cell::from("◐ warm       ".to_string())
                 .style(Style::default().fg(Color::Yellow)),
         },
         Readonly => Cell::from("◑ ro         ".to_string()).style(Style::default().fg(Color::Cyan)),
-        Indexing => match csharp {
-            CS::Ready => Cell::from("⟳ idx… C#·   ".to_string())
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            CS::Indexing => Cell::from("⟳ idx C#…    ".to_string())
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            CS::Error => Cell::from("⟳ idx… C#!   ".to_string())
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            CS::None => Cell::from("⟳ indexing…  ".to_string()).style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        },
+        Indexing => {
+            if bright {
+                match csharp {
+                    CS::Ready => Cell::from("⟳ idx… C#·   ".to_string())
+                        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    CS::Indexing => Cell::from("⟳ idx C#…    ".to_string())
+                        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    CS::Error => Cell::from("⟳ idx… C#!   ".to_string())
+                        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    CS::None => Cell::from("⟳ indexing…  ".to_string()).style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                }
+            } else {
+                match csharp {
+                    CS::Ready => Cell::from("⟳ idx… C#·   ".to_string())
+                        .style(Style::default().fg(Color::DarkGray)),
+                    CS::Indexing => Cell::from("⟳ idx C#…    ".to_string())
+                        .style(Style::default().fg(Color::DarkGray)),
+                    CS::Error => Cell::from("⟳ idx… C#!   ".to_string())
+                        .style(Style::default().fg(Color::DarkGray)),
+                    CS::None => Cell::from("⟳ indexing…  ".to_string())
+                        .style(Style::default().fg(Color::DarkGray)),
+                }
+            }
+        }
         Closed => Cell::from("○ closed     ".to_string()).style(Style::default().fg(Color::Gray)),
         Error => Cell::from("✗ error      ".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
