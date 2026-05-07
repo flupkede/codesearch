@@ -3,6 +3,9 @@ use clap::{builder::BoolishValueParser, ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
+use crate::constants::{
+    DEFAULT_SERVE_URL, REPO_REINDEX_PATH_PREFIX, REPO_REINDEX_PATH_SUFFIX, SERVE_PORT_ENV,
+};
 use crate::embed::ModelType;
 use crate::search::SearchOptions;
 
@@ -289,7 +292,7 @@ pub enum Commands {
         no_tui: bool,
 
         /// For `tui` action: serve URL to connect to
-        #[arg(long, default_value = "http://127.0.0.1:39725")]
+        #[arg(long, default_value = DEFAULT_SERVE_URL)]
         url: String,
     },
 
@@ -380,12 +383,13 @@ pub enum Commands {
 // ---------------------------------------------------------------------------
 
 /// Base URL for the codesearch serve instance.
-/// Override via `CODESEARCH_SERVE_PORT` env var.
+/// Override via `CODESEARCH_SERVE_PORT` env var (see `constants::SERVE_PORT_ENV`).
 fn serve_base_url() -> String {
-    let port = std::env::var("CODESEARCH_SERVE_PORT")
+    use crate::constants::DEFAULT_SERVE_PORT;
+    let port = std::env::var(SERVE_PORT_ENV)
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(39725);
+        .unwrap_or(DEFAULT_SERVE_PORT);
     format!("http://127.0.0.1:{port}")
 }
 
@@ -395,9 +399,9 @@ async fn trigger_symbol_reindex_via_api(alias: &str, force: bool) -> Result<()> 
 
     let base = serve_base_url();
     let url = if force {
-        format!("{base}/repos/{alias}/reindex?force=true&symbols=true")
+        format!("{base}{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}?force=true&symbols=true")
     } else {
-        format!("{base}/repos/{alias}/reindex?symbols=true")
+        format!("{base}{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}?symbols=true")
     };
 
     println!(

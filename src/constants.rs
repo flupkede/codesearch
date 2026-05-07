@@ -149,6 +149,18 @@ pub const DEFAULT_SERVE_PORT: u16 = 39725;
 /// Environment variable to override the serve port.
 pub const SERVE_PORT_ENV: &str = "CODESEARCH_SERVE_PORT";
 
+/// Default base URL for connecting to a local `codesearch serve` instance.
+/// Used as the clap `--url` default and in `serve_base_url()`.
+/// Must stay in sync with `DEFAULT_SERVE_PORT`.
+pub const DEFAULT_SERVE_URL: &str = "http://127.0.0.1:39725";
+
+/// Path prefix for the per-repo reindex HTTP API route.
+/// Full path: `{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}`.
+pub const REPO_REINDEX_PATH_PREFIX: &str = "/repos/";
+
+/// Path suffix for the per-repo reindex HTTP API route.
+pub const REPO_REINDEX_PATH_SUFFIX: &str = "/reindex";
+
 /// Health-check path served by `codesearch serve`.
 pub const HEALTH_PATH: &str = "/health";
 
