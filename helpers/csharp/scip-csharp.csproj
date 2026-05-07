@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>scip-csharp</AssemblyName>
+    <RootNamespace>ScipCsharp</RootNamespace>
+    <!-- Self-contained single-file: RuntimeIdentifier is set per publish invocation -->
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!--
+      IncludeAllContentForSelfExtract is REQUIRED. Microsoft.Build.Locator and
+      Microsoft.CodeAnalysis.MSBuild use Assembly.Location to discover MSBuild
+      assemblies on disk. In a single-file publish, Assembly.Location is empty
+      for bundled assemblies, which causes MSBuildWorkspace.OpenSolutionAsync()
+      to throw `ArgumentNullException: Value cannot be null. (Parameter 'path1')`
+      from a Path.Combine call inside MSBuild's loader. Forcing all content
+      (managed + native) to self-extract gives every assembly a real on-disk
+      path. Trade-off: slightly slower first-run startup; correctness wins.
+    -->
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis" Version="4.13.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.13.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.13.0" />
+    <PackageReference Include="Microsoft.Build.Locator" Version="1.9.1" />
+    <!--
+      NU1903 suppress: Microsoft.Build.Tasks.Core transitives have CVEs (GHSA-h4j7-5rxr-p4wc,
+      GHSA-w3q9-fxm7-j8fq) but they all target the DownloadFile MSBuild task, which we never use.
+      Our scip-csharp runs locally as a subprocess, no network-facing attack surface.
+      Version pinning to Roslyn 4.13.0 is required for .NET 10 compatibility.
+    -->
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-h4j7-5rxr-p4wc" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-w3q9-fxm7-j8fq" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-37gx-xxp4-5rgx" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-w3x6-4m5h-cxqf" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
+    <None Include="tests/**/*.cs" />
+  </ItemGroup>
+
+</Project>

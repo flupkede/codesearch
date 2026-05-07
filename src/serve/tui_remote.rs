@@ -30,6 +30,7 @@ struct StatusResponse {
     repos: Vec<RepoInfo>,
     active_sessions: u64,
     cpu_percent: String,
+    csharp_helper: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -39,6 +40,8 @@ struct RepoInfo {
     lock_mode: String,
     changes: u64,
     last_tool_call: Option<String>,
+    tool_call_count: u64,
+    csharp_index: String,
 }
 
 #[derive(Debug, Default)]
@@ -89,17 +92,15 @@ async fn run_remote_tui_loop(
     loop {
         // Fetch status from serve
         match reqwest::get(&status_url).await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<StatusResponse>().await {
-                    Ok(data) => {
-                        remote_state.data = Some(data);
-                        remote_state.connection_errors = 0;
-                    }
-                    Err(_) => {
-                        remote_state.connection_errors += 1;
-                    }
+            Ok(resp) if resp.status().is_success() => match resp.json::<StatusResponse>().await {
+                Ok(data) => {
+                    remote_state.data = Some(data);
+                    remote_state.connection_errors = 0;
                 }
-            }
+                Err(_) => {
+                    remote_state.connection_errors += 1;
+                }
+            },
             _ => {
                 remote_state.connection_errors += 1;
             }
@@ -138,6 +139,7 @@ async fn run_remote_tui_loop(
                         &table_state,
                         data.active_sessions,
                         &data.cpu_percent,
+                        data.csharp_helper,
                     );
                 }
                 None => {
@@ -147,14 +149,13 @@ async fn run_remote_tui_loop(
                     } else {
                         "Connecting..."
                     };
-                    let connecting = ratatui::widgets::Paragraph::new(Line::from(vec![
-                        Span::styled(
+                    let connecting =
+                        ratatui::widgets::Paragraph::new(Line::from(vec![Span::styled(
                             format!(" {} ", msg),
                             Style::default().fg(Color::Yellow),
-                        ),
-                    ]));
+                        )]));
                     f.render_widget(connecting, chunks[1]);
-                    render_footer(f, chunks[3], &[], &table_state, 0, "—");
+                    render_footer(f, chunks[3], &[], &table_state, 0, "—", false);
                 }
             }
         })?;
@@ -239,31 +240,19 @@ fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) {
 // Rendering — mirrors the embedded TUI in tui.rs
 // ---------------------------------------------------------------------------
 
-fn render_header(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    serve_url: &str,
-    version: &str,
-) {
+fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str, version: &str) {
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
 
     let title_line = Line::from(vec![
         Span::styled(
             format!(" codesearch serve v{} · ", version),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            serve_url.to_string(),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(
-            format!("  {} ", now),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            "[remote]".to_string(),
-            Style::default().fg(Color::Magenta),
-        ),
+        Span::styled(serve_url.to_string(), Style::default().fg(Color::White)),
+        Span::styled(format!("  {} ", now), Style::default().fg(Color::DarkGray)),
+        Span::styled("[remote]".to_string(), Style::default().fg(Color::Magenta)),
     ]);
 
     let block = Block::default()
@@ -272,15 +261,18 @@ fn render_header(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let centered = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(inner);
-    f.render_widget(
-        ratatui::widgets::Paragraph::new(title_line),
-        centered[0],
-    );
+    let centered = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    f.render_widget(ratatui::widgets::Paragraph::new(title_line), centered[0]);
+}
+
+/// Returns true during the "bright" phase of a ~1s pulse cycle (500ms bright, 500ms dim).
+fn pulse_bright() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        % 1000
+        < 500
 }
 
 fn render_table(
@@ -289,7 +281,14 @@ fn render_table(
     repos: &[RepoInfo],
     table_state: &mut TableState,
 ) {
-    let header_cells = ["Alias", "Status", "Changes", "Last Tool Call", "Lock"];
+    let header_cells = [
+        "Alias",
+        "Status",
+        "Changes",
+        "Calls",
+        "Last Tool Call",
+        "Lock",
+    ];
     let header = Row::new(
         header_cells
             .iter()
@@ -300,7 +299,15 @@ fn render_table(
 
     let max_alias_w = repos
         .iter()
-        .map(|r| r.alias.len())
+        .map(|r| {
+            let extra = match r.csharp_index.as_str() {
+                "ready" => 4,    // " C#·"
+                "error" => 4,    // " C#!"
+                "indexing" => 4, // " C#…"
+                _ => 0,
+            };
+            r.alias.len() + extra
+        })
         .max()
         .unwrap_or(10)
         .max(10);
@@ -308,22 +315,59 @@ fn render_table(
     let rows: Vec<Row> = repos
         .iter()
         .map(|repo| {
-            let status_cell = status_cell(&repo.status);
-            let changes_cell = Cell::from(format!("{}", repo.changes))
-                .style(Style::default().fg(Color::White));
-            let tool_cell = Cell::from(
-                repo.last_tool_call
-                    .as_deref()
-                    .unwrap_or("—")
-                    .to_string(),
-            )
-            .style(Style::default().fg(Color::DarkGray));
+            let status_cell = status_cell(&repo.status, &repo.csharp_index);
+            // Keep left edge stable: fixed-width, right-aligned, capped at 5 chars.
+            let changes_str = if repo.changes > 99999 {
+                " 99k+".to_string()
+            } else {
+                format!("{:>5}", repo.changes)
+            };
+            let changes_cell = Cell::from(changes_str).style(Style::default().fg(Color::White));
+            let calls_cell = if repo.tool_call_count > 0 {
+                Cell::from(format!("{:>5}", repo.tool_call_count))
+                    .style(Style::default().fg(Color::Cyan))
+            } else {
+                Cell::from("    -".to_string()).style(Style::default().fg(Color::DarkGray))
+            };
+            let tool_cell = Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
+                .style(Style::default().fg(Color::DarkGray));
             let lock_cell = lock_cell(&repo.lock_mode);
 
+            // Alias cell with optional C# indicator
+            let alias_cell = match repo.csharp_index.as_str() {
+                "ready" => Cell::from(format!("{} C#·", repo.alias))
+                    .style(Style::default().fg(Color::White)),
+                "error" => {
+                    Cell::from(format!("{} C#!", repo.alias)).style(Style::default().fg(Color::Red))
+                }
+                "indexing" => {
+                    // Pulsing C# indicator during indexing (color only, fixed text width)
+                    if pulse_bright() {
+                        Cell::from(format!("{} C#…", repo.alias)).style(
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Cell::from(format!("{} C#…", repo.alias))
+                            .style(Style::default().fg(Color::DarkGray))
+                    }
+                }
+                _ => Cell::from(repo.alias.clone()).style(Style::default().fg(Color::White)),
+            };
+
+            // Red alias if the repo has errors
+            let alias_cell = if repo.status == "error" {
+                alias_cell.style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            } else {
+                alias_cell
+            };
+
             Row::new(vec![
-                Cell::from(repo.alias.clone()).style(Style::default().fg(Color::White)),
+                alias_cell,
                 status_cell,
                 changes_cell,
+                calls_cell,
                 tool_cell,
                 lock_cell,
             ])
@@ -333,9 +377,10 @@ fn render_table(
     let table = Table::new(
         rows,
         [
-            Constraint::Min(max_alias_w as u16 + 2),
+            Constraint::Length(max_alias_w as u16 + 2),
             Constraint::Length(12),
-            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Length(7),
             Constraint::Min(24),
             Constraint::Length(7),
         ],
@@ -356,12 +401,7 @@ fn render_table(
     f.render_stateful_widget(table, area, table_state);
 }
 
-fn render_detail(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    repos: &[RepoInfo],
-    table_state: &TableState,
-) {
+fn render_detail(f: &mut ratatui::Frame, area: Rect, repos: &[RepoInfo], table_state: &TableState) {
     if repos.is_empty() {
         return;
     }
@@ -388,7 +428,9 @@ fn render_detail(
         Span::styled(" ▶ ", Style::default().fg(Color::Yellow)),
         Span::styled(
             repo.alias.clone(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
         Span::styled(status_label, Style::default().fg(Color::Cyan)),
@@ -400,14 +442,38 @@ fn render_detail(
     ]);
 
     let tool_str = repo.last_tool_call.as_deref().unwrap_or("—");
+    let csharp_str = match repo.csharp_index.as_str() {
+        "ready" => "  C#·",
+        "error" => "  C#!",
+        "indexing" => "  C#…",
+        _ => "",
+    };
+    let csharp_color = match repo.csharp_index.as_str() {
+        "ready" => Color::Green,
+        "error" => Color::Red,
+        "indexing" => {
+            if pulse_bright() {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }
+        }
+        _ => Color::DarkGray,
+    };
     let info_line = Line::from(vec![
         Span::styled("   changes:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(" {}  ", repo.changes),
             Style::default().fg(Color::White),
         ),
+        Span::styled("calls:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {}  ", repo.tool_call_count),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("last:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!(" {}", tool_str), Style::default().fg(Color::White)),
+        Span::styled(csharp_str, Style::default().fg(csharp_color)),
     ]);
 
     let block = Block::default()
@@ -416,14 +482,17 @@ fn render_detail(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let detail_chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let detail_chunks =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
 
-    f.render_widget(ratatui::widgets::Paragraph::new(detail_line), detail_chunks[0]);
-    f.render_widget(ratatui::widgets::Paragraph::new(info_line), detail_chunks[1]);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(detail_line),
+        detail_chunks[0],
+    );
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(info_line),
+        detail_chunks[1],
+    );
 }
 
 fn render_footer(
@@ -433,6 +502,7 @@ fn render_footer(
     table_state: &TableState,
     active: u64,
     cpu: &str,
+    csharp_helper: bool,
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
@@ -444,17 +514,15 @@ fn render_footer(
     let sessions_str = format!("Sessions: {}", active);
     let cpu_str = format!("CPU: {}", cpu);
 
-    let right_len = cpu_str.len() + sessions_str.len() + 3;
+    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len();
 
     let footer_inner = area.inner(Margin {
         vertical: 0,
         horizontal: 1,
     });
-    let [left, right] = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(right_len as u16 + 2),
-    ])
-    .areas(footer_inner);
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(right_len as u16 + 2)])
+            .areas(footer_inner);
 
     let left_line = Line::from(vec![
         Span::styled("[q] quit  ", Style::default().fg(Color::DarkGray)),
@@ -462,7 +530,14 @@ fn render_footer(
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
     ]);
 
+    let csharp_indicator = if csharp_helper {
+        Span::styled("C# │ ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("C# │ ", Style::default().fg(Color::DarkGray))
+    };
+
     let right_line = Line::from(vec![
+        csharp_indicator,
         Span::styled(cpu_str, Style::default().fg(Color::Green)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(sessions_str, Style::default().fg(Color::Cyan)),
@@ -479,24 +554,33 @@ fn render_footer(
 // Cell styling helpers
 // ---------------------------------------------------------------------------
 
-fn status_cell(status: &str) -> Cell<'static> {
+fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
     match status {
-        "open" => Cell::from("✓ ready".to_string())
-            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        "warm" => Cell::from("◐ warm".to_string())
-            .style(Style::default().fg(Color::Yellow)),
-        "readonly" => Cell::from("◑ ro".to_string())
-            .style(Style::default().fg(Color::Cyan)),
-        "indexing" => Cell::from("⟳ idx…".to_string())
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        "closed" => Cell::from("○ closed".to_string())
-            .style(Style::default().fg(Color::Gray)),
-        "error" => Cell::from("✗ error".to_string())
+        "open" => Cell::from("✓ ready   ".to_string()).style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "warm" => match csharp {
+            "ready" => Cell::from("◐ warm+C# ".to_string())
+                .style(Style::default().fg(Color::Green)),
+            "indexing" => Cell::from("◐ warm C#…".to_string())
+                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            "error" => Cell::from("◐ warm C#!".to_string())
+                .style(Style::default().fg(Color::Red)),
+            _ => Cell::from("◐ warm    ".to_string()).style(Style::default().fg(Color::Yellow)),
+        },
+        "readonly" => Cell::from("◑ ro      ".to_string()).style(Style::default().fg(Color::Cyan)),
+        "indexing" => Cell::from("⟳ idx…    ".to_string()).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "closed" => Cell::from("○ closed  ".to_string()).style(Style::default().fg(Color::Gray)),
+        "error" => Cell::from("✗ error   ".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        "no_index" => Cell::from("— no idx".to_string())
-            .style(Style::default().fg(Color::Gray)),
-        _ => Cell::from(status.to_string())
-            .style(Style::default().fg(Color::White)),
+        "no_index" => Cell::from("— no idx  ".to_string()).style(Style::default().fg(Color::Gray)),
+        _ => Cell::from(format!("{:<10}", status)).style(Style::default().fg(Color::White)),
     }
 }
 

@@ -44,6 +44,7 @@ graph TB
     Router --> Find[find tool]
     Router --> Explore[explore tool]
     Router --> GetChunk[get_chunk tool]
+    Router --> FindImpact[find_impact tool]
     Router --> Status[status tool]
 
     Search -->|mode=semantic| Semantic[Vector ANN + BM25 + RRF Fusion]
@@ -61,6 +62,9 @@ graph TB
     Tantivy --> TantivyIdx[(Tantivy Index)]
 
     GetChunk --> LMDB
+
+    FindImpact -->|C# symbols| CSharpHelper[scip-csharp helper]
+    CSharpHelper -->|SCIP index| ScipLMDB[(LMDB scip_symbols)]
 
     subgraph "Serve Mode (multi-repo)"
         ServeRouter[HTTP Router] -->|project/group routing| Repo1[Repo A]
@@ -80,8 +84,11 @@ Download pre-built binaries from [Releases](https://github.com/flupkede/codesear
 | Platform | Download |
 |----------|----------|
 | Windows x86_64 | `codesearch-windows-x86_64.zip` |
+| Windows x86_64 + C# | `codesearch-windows-x86_64-with-csharp.zip` |
 | Linux x86_64 | `codesearch-linux-x86_64.tar.gz` |
+| Linux x86_64 + C# | `codesearch-linux-x86_64-with-csharp.tar.gz` |
 | macOS ARM64 | `codesearch-macos-arm64.tar.gz` |
+| macOS ARM64 + C# | `codesearch-macos-arm64-with-csharp.tar.gz` |
 
 Or build from source:
 
@@ -94,8 +101,11 @@ cargo build --release
 ### Index a repository
 
 ```bash
-# Register and index a repo (adds to ~/.codesearch/repos.json)
-codesearch index add /path/to/my-project --alias my-project
+# Register and index the current repo (adds to ~/.codesearch/repos.json)
+codesearch index add
+
+# Register and index a repo from outside the repo folder
+codesearch index add /path/to/my-project
 
 # Incremental update (only changed files)
 codesearch index /path/to/my-project
@@ -109,6 +119,9 @@ codesearch index rm /path/to/my-project
 # List registered repos
 codesearch index list
 ```
+
+`codesearch index add` is intended to be run from inside the repo you want to register.
+If you're launching it from somewhere else, pass the repo path explicitly.
 
 First-time indexing takes 2–5 minutes. Subsequent runs are incremental (10–30s). Branch switches trigger automatic re-indexing.
 
@@ -256,6 +269,22 @@ codesearch serve
 
 In multi-repo mode: auto-routes when chunk_id is unique; returns candidates list when ambiguous.
 
+### `find_impact` — Symbol Reference Impact
+
+Find all call-sites and references to a symbol with file/line precision, powered by per-language semantic analysis. Currently supports **C#** (via the bundled `scip-csharp` helper).
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `symbol_name` | string | Symbol name (e.g. `"FieldDefinition.Validate"`) |
+| `file` | string | File path for position-based lookup |
+| `line` | int | Line number for position-based lookup |
+| `language` | string | Language hint (auto-detected from file extension) |
+| `project` / `group` | string | Multi-repo routing |
+
+Returns a list of references with `file`, `start_line`, `end_line`, and `kind` (e.g. `"call"`, `"definition"`). Exposes `index_age_seconds` so agents can reason about staleness.
+
+> **Note:** Requires the `-with-csharp` release variant or a separately installed `scip-csharp` helper. See [C# Semantic Search](#c-semantic-search).
+
 ### `status` — Index Info
 
 | Parameter | Type | Description |
@@ -348,6 +377,7 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
+| `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
 
 ### `.codesearchignore`
@@ -366,6 +396,12 @@ node_modules/
 ### `repos.json`
 
 Located at `~/.codesearch/repos.json`. Managed by `codesearch index add/rm`. Contains repo aliases → paths and group definitions. See [Serve Mode](#serve-mode-multi-repo).
+
+## C# Semantic Search
+
+All C#-specific setup, operation, installation, and testing lives in [README_CSharp.md](README_CSharp.md).
+
+If you do not work with C# repos, you can skip it entirely.
 
 ## Supported Languages
 

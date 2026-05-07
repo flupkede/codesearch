@@ -11,6 +11,18 @@ pub struct ReposConfig {
     pub repos: HashMap<String, PathBuf>,
     #[serde(default)]
     pub groups: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub repos_meta: HashMap<String, RepoMeta>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoMeta {
+    /// Unix timestamp (seconds) of last observed repo change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_changed_unix: Option<i64>,
+    /// Unix timestamp (seconds) of last successful SCIP index rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scip_indexed_unix: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +62,7 @@ impl ReposConfig {
             return Ok(Self {
                 repos,
                 groups: HashMap::new(),
+                repos_meta: HashMap::new(),
             });
         }
 
@@ -129,6 +142,8 @@ impl ReposConfig {
             return false;
         }
 
+        self.repos_meta.remove(alias);
+
         for aliases in self.groups.values_mut() {
             aliases.retain(|a| a != alias);
         }
@@ -177,6 +192,35 @@ impl ReposConfig {
         self.repos.get(project).cloned()
     }
 
+    /// Metadata for an alias. Returns default metadata when absent.
+    pub fn meta(&self, alias: &str) -> RepoMeta {
+        self.repos_meta.get(alias).cloned().unwrap_or_default()
+    }
+
+    /// Mutable metadata entry for an alias, creating it if needed.
+    pub fn meta_mut(&mut self, alias: &str) -> &mut RepoMeta {
+        self.repos_meta.entry(alias.to_string()).or_default()
+    }
+
+    /// Update `last_changed_unix` only when `ts` is newer.
+    /// Returns true when metadata changed.
+    pub fn touch_last_changed(&mut self, alias: &str, ts: i64) -> bool {
+        let meta = self.meta_mut(alias);
+        match meta.last_changed_unix {
+            Some(existing) if ts <= existing => false,
+            _ => {
+                meta.last_changed_unix = Some(ts);
+                true
+            }
+        }
+    }
+
+    /// Mark last successful SCIP rebuild timestamp.
+    pub fn touch_last_scip(&mut self, alias: &str, ts: i64) {
+        let meta = self.meta_mut(alias);
+        meta.last_scip_indexed_unix = Some(ts);
+    }
+
     #[allow(dead_code)] // Used in tests only — dead in bin targets
     pub fn resolve_group(&self, group: &str) -> Vec<(String, PathBuf)> {
         let Some(aliases) = self.groups.get(group) else {
@@ -191,7 +235,10 @@ impl ReposConfig {
 
     pub fn add_group(&mut self, name: String, aliases: Vec<String>) -> Result<()> {
         if aliases.is_empty() {
-            return Err(anyhow::anyhow!("Group '{}' must contain at least one alias", name));
+            return Err(anyhow::anyhow!(
+                "Group '{}' must contain at least one alias",
+                name
+            ));
         }
 
         for alias in &aliases {
@@ -252,10 +299,7 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 fn unique_alias_for_path(existing: &HashMap<String, PathBuf>, path: &Path) -> String {
-    let base_raw = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("repo");
+    let base_raw = path.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
     let base = sanitize_alias(base_raw);
     let base = if base.is_empty() {
         "repo".to_string()
@@ -277,14 +321,21 @@ fn unique_alias_for_path(existing: &HashMap<String, PathBuf>, path: &Path) -> St
     }
 }
 
+/// Sanitize a raw alias string for use as a repo identifier.
+///
+/// Preserves the original casing and dots (e.g. "HUSQ.Aprimo" stays "HUSQ.Aprimo")
+/// to match the directory/repo name. Only removes characters that are problematic
+/// in identifiers: spaces become dashes, and characters outside `[a-zA-Z0-9._-]`
+/// are dropped. Collapses consecutive dashes and trims leading/trailing dashes.
 fn sanitize_alias(raw: &str) -> String {
     let mut out = String::new();
     for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            out.push(ch.to_ascii_lowercase());
-        } else if ch == ' ' || ch == '.' {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else if ch == ' ' {
             out.push('-');
         }
+        // All other characters (brackets, accents, etc.) are silently dropped
     }
 
     while out.contains("--") {
@@ -300,6 +351,7 @@ fn normalize_path_for_compare(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_unique_alias_generation() {
@@ -324,6 +376,78 @@ mod tests {
 
     #[test]
     fn test_sanitize_alias() {
-        assert_eq!(sanitize_alias("My Repo.Name"), "my-repo-name");
+        assert_eq!(sanitize_alias("My Repo.Name"), "My-Repo.Name");
+        // Preserves case and dots
+        assert_eq!(sanitize_alias("HUSQ.Aprimo"), "HUSQ.Aprimo");
+        assert_eq!(sanitize_alias("KRKA.Aprimo"), "KRKA.Aprimo");
+        // Spaces become dashes
+        assert_eq!(sanitize_alias("my repo"), "my-repo");
+        // Special characters dropped
+        assert_eq!(sanitize_alias("repo@v2!"), "repov2");
+        // Collapses double dashes
+        assert_eq!(sanitize_alias("a--b"), "a-b");
+    }
+
+    #[test]
+    fn test_load_legacy_config_without_repos_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("repos.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"repos":{{"my-repo":"/tmp/my-repo"}},"groups":{{"g":["my-repo"]}}}}"#
+        )
+        .unwrap();
+
+        let cfg = ReposConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.repos.len(), 1);
+        assert_eq!(cfg.groups.len(), 1);
+        assert!(cfg.repos_meta.is_empty());
+    }
+
+    #[test]
+    fn test_save_then_load_roundtrip_with_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("repos.json");
+
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        cfg.touch_last_changed("repo-a", 100);
+        cfg.touch_last_scip("repo-a", 120);
+        cfg.save_to(&path).unwrap();
+
+        let loaded = ReposConfig::load_from(&path).unwrap();
+        let meta = loaded.meta("repo-a");
+        assert_eq!(meta.last_changed_unix, Some(100));
+        assert_eq!(meta.last_scip_indexed_unix, Some(120));
+    }
+
+    #[test]
+    fn test_touch_last_changed_idempotent() {
+        let mut cfg = ReposConfig::default();
+        assert!(cfg.touch_last_changed("repo-a", 200));
+        assert!(!cfg.touch_last_changed("repo-a", 200));
+        assert!(!cfg.touch_last_changed("repo-a", 199));
+        assert!(cfg.touch_last_changed("repo-a", 201));
+    }
+
+    #[test]
+    fn test_meta_for_unknown_alias_returns_default() {
+        let cfg = ReposConfig::default();
+        let meta = cfg.meta("unknown");
+        assert_eq!(meta, RepoMeta::default());
+    }
+
+    #[test]
+    fn test_unregister_alias_removes_meta() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        cfg.touch_last_changed("repo-a", 100);
+        cfg.touch_last_scip("repo-a", 120);
+
+        assert!(cfg.unregister_alias("repo-a"));
+        assert!(!cfg.repos_meta.contains_key("repo-a"));
     }
 }
