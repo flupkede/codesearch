@@ -36,6 +36,16 @@ use tracing::{debug, error, info, warn};
 // Import Result from the parent module
 use super::Result;
 
+/// Callback invoked after each watcher-triggered C# symbol rebuild completes.
+///
+/// Arguments: `(success: bool, error_msg: Option<String>)`.
+/// - `(true, None)` on success.
+/// - `(false, Some(msg))` on failure.
+///
+/// The serve layer uses this to update `csharp_index_status` / `csharp_index_error`
+/// without coupling `IndexManager` to `ServeState`.
+pub type CSharpRebuildNotifier = Arc<dyn Fn(bool, Option<String>) + Send + Sync>;
+
 /// Batch flush timeout in milliseconds.
 /// Events are batched and flushed when:
 /// 1. No new events for this duration, OR
@@ -739,7 +749,11 @@ impl IndexManager {
     /// Spawns a background task that watches for file changes and refreshes the index.
     ///
     /// # Arguments
-    /// * `cancel_token` - Cancellation token for graceful shutdown
+    /// * `cancel_token` — Cancellation token for graceful shutdown.
+    /// * `csharp_notifier` — Optional callback invoked after each watcher-triggered C# symbol
+    ///   rebuild. Pass `Some(notifier)` from the serve layer to propagate rebuild outcomes to the
+    ///   TUI (`csharp_index_status` / `csharp_index_error`). `None` is valid for standalone /
+    ///   test use where no TUI status tracking is needed.
     ///
     /// # Returns
     /// * `Result<()>` - Success or error
@@ -752,7 +766,11 @@ impl IndexManager {
     /// - Logs all file system events and refresh operations
     /// - Continues running even if individual refresh operations fail
     /// - Stops gracefully when the cancellation token is cancelled
-    pub async fn start_file_watcher(&self, cancel_token: CancellationToken) -> Result<()> {
+    pub async fn start_file_watcher(
+        &self,
+        cancel_token: CancellationToken,
+        csharp_notifier: Option<CSharpRebuildNotifier>,
+    ) -> Result<()> {
         let path = self.codebase_path.clone();
         let db_path = self.db_path.clone();
         let watcher = self.watcher.clone();
@@ -787,7 +805,12 @@ impl IndexManager {
 
             // Symbol indexer debounce: .cs files are buffered separately and
             // flushed after SCIP_CSHARP_DEBOUNCE_MS of quiet time.
-            let mut cs_files_changed: HashSet<PathBuf> = HashSet::new();
+            // `cs_files_modified` — files that were added or changed (included in changed).
+            // `cs_files_deleted` — files that were deleted; must be passed explicitly to the
+            // incremental rebuild so their LMDB entries are purged even though they're absent
+            // from the new scip-csharp output.
+            let mut cs_files_modified: HashSet<PathBuf> = HashSet::new();
+            let mut cs_files_deleted: HashSet<PathBuf> = HashSet::new();
             let mut cs_last_event_time: Option<std::time::Instant> = None;
             let cs_debounce = std::time::Duration::from_millis(SCIP_CSHARP_DEBOUNCE_MS);
 
@@ -814,7 +837,8 @@ impl IndexManager {
                             // branch switch — the full refresh already handled everything
                             files_to_index.clear();
                             files_to_remove.clear();
-                            cs_files_changed.clear();
+                            cs_files_modified.clear();
+                            cs_files_deleted.clear();
                             cs_last_event_time = None;
                         }
                     }
@@ -849,9 +873,11 @@ impl IndexManager {
                                 // If file was marked for removal, cancel that
                                 files_to_remove.remove(&p);
                                 files_to_index.insert(p.clone());
-                                // Track .cs files for symbol rebuild debounce
+                                // Track .cs file modifications for symbol rebuild debounce
                                 if p.extension().and_then(|e| e.to_str()) == Some("cs") {
-                                    cs_files_changed.insert(p);
+                                    // If previously queued as deleted, promote to modified
+                                    cs_files_deleted.remove(&p);
+                                    cs_files_modified.insert(p);
                                     cs_last_event_time = Some(now);
                                 }
                             }
@@ -859,9 +885,12 @@ impl IndexManager {
                                 // If file was marked for indexing, cancel that
                                 files_to_index.remove(&p);
                                 files_to_remove.insert(p.clone());
-                                // Track .cs deletions too (symbol index needs rebuild)
+                                // Track .cs deletions separately — the symbol rebuilder
+                                // needs to explicitly purge LMDB entries for deleted files
+                                // since they won't appear in the new scip-csharp output.
                                 if p.extension().and_then(|e| e.to_str()) == Some("cs") {
-                                    cs_files_changed.insert(p);
+                                    cs_files_modified.remove(&p);
+                                    cs_files_deleted.insert(p);
                                     cs_last_event_time = Some(now);
                                 }
                             }
@@ -871,17 +900,19 @@ impl IndexManager {
                                 files_to_remove.insert(old_p.clone());
                                 files_to_remove.remove(&new_p);
                                 files_to_index.insert(new_p.clone());
-                                // Track .cs renames for symbol rebuild
+                                // Track .cs renames: old path is a deletion, new path is a modification
                                 let old_is_cs =
                                     old_p.extension().and_then(|e| e.to_str()) == Some("cs");
                                 let new_is_cs =
                                     new_p.extension().and_then(|e| e.to_str()) == Some("cs");
                                 if old_is_cs || new_is_cs {
                                     if old_is_cs {
-                                        cs_files_changed.insert(old_p);
+                                        cs_files_modified.remove(&old_p);
+                                        cs_files_deleted.insert(old_p);
                                     }
                                     if new_is_cs {
-                                        cs_files_changed.insert(new_p);
+                                        cs_files_deleted.remove(&new_p);
+                                        cs_files_modified.insert(new_p);
                                     }
                                     cs_last_event_time = Some(now);
                                 }
@@ -919,27 +950,35 @@ impl IndexManager {
                 }
 
                 // Check if we should flush the .cs symbol rebuild debounce
-                if !cs_files_changed.is_empty() {
+                let has_cs_changes = !cs_files_modified.is_empty() || !cs_files_deleted.is_empty();
+                if has_cs_changes {
                     if let Some(cs_last) = cs_last_event_time {
                         let elapsed = now.duration_since(cs_last);
                         if elapsed >= cs_debounce {
-                            let changed_count = cs_files_changed.len();
-                            let cs_changed: Vec<PathBuf> = cs_files_changed.drain().collect();
+                            let modified_count = cs_files_modified.len();
+                            let deleted_count = cs_files_deleted.len();
+                            let cs_modified: Vec<PathBuf> = cs_files_modified.drain().collect();
+                            let cs_deleted: Vec<PathBuf> = cs_files_deleted.drain().collect();
                             cs_last_event_time = None;
 
                             info!(
-                                "🔬 {} .cs file(s) changed, triggering incremental symbol rebuild (after {}s debounce)",
-                                changed_count,
+                                "🔬 {} modified + {} deleted .cs file(s), triggering incremental symbol rebuild (after {}s debounce)",
+                                modified_count, deleted_count,
                                 cs_debounce.as_secs()
                             );
 
-                            // Group changed files by .csproj so we can index per project.
+                            // Group changed (modified) files by .csproj so we can index per project.
                             // Each group triggers a separate incremental rebuild with
                             // --filter-project, which is much faster than rebuilding
                             // the entire solution.
+                            //
+                            // Deleted files are passed to every group as `deleted` so that their
+                            // stale LMDB entries are purged regardless of which project they
+                            // belonged to (we can't discover their csproj — they're gone).
                             let reg = symbol_registry.clone();
                             let rp = path.clone();
                             let dp = db_path.clone();
+                            let notifier = csharp_notifier.clone();
                             tokio::task::spawn_blocking(move || {
                                 if let Some(indexer) = reg.get("csharp") {
                                     if !indexer.applies_to(&rp) {
@@ -953,12 +992,12 @@ impl IndexManager {
                                         return;
                                     }
 
-                                    // Group files by their containing .csproj
+                                    // Group modified files by their containing .csproj
                                     let mut groups: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
                                         std::collections::HashMap::new();
                                     let mut ungrouped: Vec<PathBuf> = Vec::new();
 
-                                    for file in &cs_changed {
+                                    for file in &cs_modified {
                                         if let Some(csproj) =
                                             crate::symbols::csharp::CSharpSymbolIndexer::find_csproj_for_file(&rp, file)
                                         {
@@ -968,15 +1007,16 @@ impl IndexManager {
                                         }
                                     }
 
-                                    // If any files couldn't be mapped to a .csproj,
-                                    // fall back to a full solution rebuild
+                                    // If any modified files couldn't be mapped to a .csproj,
+                                    // fall back to a full solution rebuild (previously this
+                                    // incorrectly used RebuildScope::Files which only used
+                                    // files.first() and silently ignored the rest).
                                     if !ungrouped.is_empty() {
                                         info!(
-                                            "🔬 {} file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                            "🔬 {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
                                             ungrouped.len()
                                         );
-                                        let scope = RebuildScope::Files(cs_changed);
-                                        match indexer.rebuild(&rp, &dp, scope) {
+                                        match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
                                             Ok(summary) => {
                                                 info!(
                                                     "✅ Symbol rebuild complete: {} symbols, {} refs in {}ms",
@@ -984,29 +1024,42 @@ impl IndexManager {
                                                     summary.references_stored,
                                                     summary.duration_ms
                                                 );
+                                                if let Some(ref n) = notifier {
+                                                    n(true, None);
+                                                }
                                             }
                                             Err(e) => {
                                                 warn!("⚠️ Symbol rebuild failed: {}", e);
+                                                if let Some(ref n) = notifier {
+                                                    n(false, Some(e.to_string()));
+                                                }
                                             }
                                         }
                                         return;
                                     }
 
-                                    // Rebuild each project group separately
+                                    // Rebuild each project group separately.
+                                    // Deleted files are forwarded to every group so they're
+                                    // cleaned up from LMDB regardless of origin project.
                                     let total_groups = groups.len();
+                                    let mut last_error: Option<String> = None;
                                     for (i, (csproj, files)) in groups.into_iter().enumerate() {
                                         let csproj_name = csproj
                                             .file_name()
                                             .map(|n| n.to_string_lossy().into_owned())
                                             .unwrap_or_default();
                                         info!(
-                                            "🔬 incremental rebuild [{}/{}]: {} ({} file(s))",
+                                            "🔬 incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
                                             i + 1,
                                             total_groups,
                                             csproj_name,
-                                            files.len()
+                                            files.len(),
+                                            cs_deleted.len(),
                                         );
-                                        let scope = RebuildScope::Files(files);
+                                        let scope = RebuildScope::Files {
+                                            changed: files,
+                                            deleted: cs_deleted.clone(),
+                                        };
                                         match indexer.rebuild(&rp, &dp, scope) {
                                             Ok(summary) => {
                                                 info!(
@@ -1027,7 +1080,15 @@ impl IndexManager {
                                                     csproj_name,
                                                     e
                                                 );
+                                                last_error = Some(e.to_string());
                                             }
+                                        }
+                                    }
+                                    // Notify serve layer about overall outcome
+                                    if let Some(ref n) = notifier {
+                                        match last_error {
+                                            None => n(true, None),
+                                            Some(msg) => n(false, Some(msg)),
                                         }
                                     }
                                 }

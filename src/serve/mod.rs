@@ -39,7 +39,7 @@ use crate::constants::{
     REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::ReposConfig;
-use crate::index::{IndexManager, SharedStores};
+use crate::index::{CSharpRebuildNotifier, IndexManager, SharedStores};
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
 /// Lightweight repo status label derived from DashMap state only (no DB opens).
@@ -173,9 +173,12 @@ pub(crate) struct ServeState {
     /// Per-repo total tool call count.
     tool_call_counts: DashMap<String, AtomicU64>,
     /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
-    csharp_index_status: DashMap<String, CSharpIndexStatus>,
+    /// Wrapped in `Arc` so the watcher-loop notifier closure can capture a cheap clone
+    /// without requiring `Arc<ServeState>` in methods that only have `&self`.
+    csharp_index_status: Arc<DashMap<String, CSharpIndexStatus>>,
     /// Per-repo C# symbol index last error message (set when status is Error, cleared on success).
-    csharp_index_error: DashMap<String, String>,
+    /// Wrapped in `Arc` for the same reason as `csharp_index_status`.
+    csharp_index_error: Arc<DashMap<String, String>>,
     /// Debounced deadline for persisting repos config metadata (unix millis).
     persist_deadline_unix_ms: AtomicU64,
     /// Ensures only one debounce worker task runs.
@@ -213,8 +216,8 @@ impl ServeState {
             sysinfo_system: std::sync::Mutex::new(sys),
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
             tool_call_counts: DashMap::new(),
-            csharp_index_status: DashMap::new(),
-            csharp_index_error: DashMap::new(),
+            csharp_index_status: Arc::new(DashMap::new()),
+            csharp_index_error: Arc::new(DashMap::new()),
             persist_deadline_unix_ms: AtomicU64::new(0),
             persist_worker_started: AtomicBool::new(false),
             #[cfg(test)]
@@ -228,6 +231,30 @@ impl ServeState {
     /// helper-detection cache instead of creating fresh instances per request.
     pub(crate) fn symbol_registry(&self) -> Arc<SymbolIndexerRegistry> {
         Arc::clone(&self.symbol_registry)
+    }
+
+    /// Build a `CSharpRebuildNotifier` for the given repo `alias`.
+    ///
+    /// The notifier captures `Arc` clones of the two status maps so it can be sent
+    /// into the file-watcher background task without holding a reference to `&self`.
+    /// When the watcher-triggered rebuild completes it calls the closure, which updates
+    /// `csharp_index_status` and `csharp_index_error` — making the outcome visible in
+    /// the TUI and in `/status` without any extra polling.
+    fn make_csharp_notifier(&self, alias: &str) -> CSharpRebuildNotifier {
+        let status_map = Arc::clone(&self.csharp_index_status);
+        let error_map = Arc::clone(&self.csharp_index_error);
+        let alias_key = alias.to_string();
+        Arc::new(move |success: bool, error_msg: Option<String>| {
+            if success {
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Ready);
+                error_map.remove(&alias_key);
+            } else {
+                if let Some(msg) = error_msg {
+                    error_map.insert(alias_key.clone(), msg);
+                }
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Error);
+            }
+        })
     }
 
     fn now_unix_secs() -> i64 {
@@ -852,6 +879,7 @@ impl ServeState {
                 let stores_bg = stores.clone();
                 let im_for_task = im_arc.clone();
                 let token_for_task = token.clone();
+                let notifier = self.make_csharp_notifier(alias);
 
                 tokio::spawn(async move {
                     if let Err(e) = im_for_task.start_watching().await {
@@ -872,7 +900,7 @@ impl ServeState {
                         return;
                     }
 
-                    if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                    if let Err(e) = im_for_task.start_file_watcher(token_for_task, Some(notifier)).await {
                         tracing::error!("File watcher for '{}' stopped: {}", alias_bg, e);
                     }
                 });
@@ -1181,6 +1209,7 @@ impl ServeState {
                     let stores_for_task = stores_arc.clone();
                     let im_for_task = im_arc.clone();
                     let token_for_task = token.clone();
+                    let notifier = self.make_csharp_notifier(alias);
 
                     tokio::spawn(async move {
                         // Pre-start FSW so changes during initial refresh aren't lost
@@ -1204,7 +1233,7 @@ impl ServeState {
                         }
 
                         // Main file watcher loop — runs until cancel_token fires
-                        if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                        if let Err(e) = im_for_task.start_file_watcher(token_for_task, Some(notifier)).await {
                             tracing::error!("File watcher for '{}' stopped: {}", alias_clone, e);
                         }
                     });
@@ -1251,6 +1280,7 @@ impl ServeState {
         let alias_bg = alias.to_string();
         let path_bg = project_path.to_path_buf();
         let stores_bg = stores.clone();
+        let notifier = self.make_csharp_notifier(alias);
 
         let cancel_token = CancellationToken::new();
         let token_for_task = cancel_token.clone();
@@ -1283,7 +1313,7 @@ impl ServeState {
                         return;
                     }
 
-                    if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                    if let Err(e) = im_for_task.start_file_watcher(token_for_task, Some(notifier)).await {
                         tracing::error!("Lazy FSW for '{}' stopped: {}", alias_bg, e);
                     }
                 }

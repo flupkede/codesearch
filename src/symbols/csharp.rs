@@ -1054,25 +1054,32 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         // Determine solution/project from scope.
         // `is_incremental` true → RebuildScope::Files → merge, not replace.
-        let (solution, project, is_incremental) = match &scope {
+        // Also extract `deleted_for_cleanup`: paths absent from the new index that must
+        // still be purged from LMDB (files deleted on disk since last rebuild).
+        let (solution, project, is_incremental, deleted_for_cleanup) = match scope {
             RebuildScope::Full => {
                 let sln = Self::find_solution(repo_path).ok_or_else(|| {
                     anyhow::anyhow!("No .sln file found in {}", repo_path.display())
                 })?;
-                (sln, None, false)
+                (sln, None, false, vec![])
             }
             RebuildScope::Project(csproj) => {
                 let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
-                (sln, Some(csproj.clone()), false)
+                (sln, Some(csproj), false, vec![])
             }
-            RebuildScope::Files(files) => {
-                if let Some(first_file) = files.first() {
+            RebuildScope::Files { changed, deleted } => {
+                if let Some(first_file) = changed.first() {
                     let csproj = Self::find_csproj_for_file(repo_path, first_file)
                         .unwrap_or_else(|| first_file.clone());
                     let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
-                    (sln, Some(csproj), true) // ← incremental merge
+                    // Normalise deleted paths to forward-slash strings for LMDB key comparison.
+                    let deleted_norm: Vec<String> = deleted
+                        .iter()
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .collect();
+                    (sln, Some(csproj), true, deleted_norm) // ← incremental merge
                 } else {
-                    bail!("RebuildScope::Files is empty");
+                    bail!("RebuildScope::Files has no changed files");
                 }
             }
         };
@@ -1117,15 +1124,23 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         // Collect affected files (non-empty only for incremental/Files scope).
         // Declared outside the if/else so the write loop below can also reference it.
+        //
+        // For incremental rebuilds we also union in `deleted_for_cleanup`: files
+        // that were deleted since the last rebuild are not present in the new index
+        // output, so they would be silently skipped otherwise, leaving stale
+        // `scip_positions`/`scip_symbols` entries pointing at a non-existent file.
         let affected_files: HashSet<String> = if is_incremental {
-            index
+            let mut files: HashSet<String> = index
                 .values()
                 .flat_map(|refs| {
                     refs.iter()
                         .filter(|r| r.kind == "definition")
                         .map(|r| r.file.to_string_lossy().replace('\\', "/"))
                 })
-                .collect()
+                .collect();
+            // Explicitly include deleted paths so their LMDB entries are cleaned up.
+            files.extend(deleted_for_cleanup);
+            files
         } else {
             HashSet::new()
         };

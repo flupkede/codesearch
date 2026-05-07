@@ -19,7 +19,7 @@ use crate::vectordb::VectorStore;
 
 // Index manager module
 mod manager;
-pub use manager::{is_database_locked, IndexManager, SharedStores};
+pub use manager::{is_database_locked, CSharpRebuildNotifier, IndexManager, SharedStores};
 
 /// Get the database path and project path for a given directory
 /// Uses automatic database discovery to find indexes in parent/global directories

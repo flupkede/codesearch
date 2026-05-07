@@ -64,9 +64,17 @@ pub enum RebuildScope {
     Full,
     /// Reindex a single project (e.g. one `.csproj`).
     Project(PathBuf),
-    /// Future: per-file incremental (out of MVP scope).
-    #[allow(dead_code)]
-    Files(Vec<PathBuf>),
+    /// Incremental per-group rebuild for changed `.cs` files.
+    ///
+    /// `changed` — files that were modified/created; used to pick the `.csproj` to rebuild.
+    /// `deleted` — files that were deleted; absent from the new index so their LMDB entries
+    ///   must be explicitly included in `affected_files` for clean-up.
+    Files {
+        /// Modified or created `.cs` files.
+        changed: Vec<PathBuf>,
+        /// Deleted `.cs` files (not present in the new index output).
+        deleted: Vec<PathBuf>,
+    },
 }
 
 /// Summary returned after a rebuild completes.
