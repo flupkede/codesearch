@@ -422,10 +422,16 @@ fn render_detail(
             .csharp_error
             .as_deref()
             .unwrap_or("Unknown error");
-        // Truncate error message to fit the area
-        let max_err_len = (area.width as usize).saturating_sub(12);
-        let display_err = if err_msg.len() > max_err_len && max_err_len > 3 {
-            format!("{}...", &err_msg[..max_err_len - 3])
+        // Truncate error message to fit the area.
+        // Use char-boundary-safe truncation to avoid panics on multi-byte UTF-8
+        // (C# helper errors may contain '…', '—', non-ASCII project paths, etc.).
+        // The prefix "   ⚠ " occupies 6 visible columns; leave 1 col margin → subtract 7.
+        const ERR_PREFIX_COLS: usize = 7;
+        let max_err_chars = (area.width as usize).saturating_sub(ERR_PREFIX_COLS);
+        let err_chars: Vec<char> = err_msg.chars().collect();
+        let display_err = if err_chars.len() > max_err_chars && max_err_chars > 3 {
+            let truncated: String = err_chars[..max_err_chars - 3].iter().collect();
+            format!("{}...", truncated)
         } else {
             err_msg.to_string()
         };
