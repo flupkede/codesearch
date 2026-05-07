@@ -151,7 +151,10 @@ pub const SERVE_PORT_ENV: &str = "CODESEARCH_SERVE_PORT";
 
 /// Default base URL for connecting to a local `codesearch serve` instance.
 /// Used as the clap `--url` default and in `serve_base_url()`.
-/// Must stay in sync with `DEFAULT_SERVE_PORT`.
+///
+/// **Must stay in sync with `DEFAULT_SERVE_PORT`.**
+/// A `#[test]` in this module asserts `DEFAULT_SERVE_URL` contains the port string
+/// from `DEFAULT_SERVE_PORT`, so bumping one without the other will fail `cargo test`.
 pub const DEFAULT_SERVE_URL: &str = "http://127.0.0.1:39725";
 
 /// Path prefix for the per-repo reindex HTTP API route.
@@ -348,3 +351,20 @@ pub const ALWAYS_EXCLUDED: &[&str] = &[
     ".nyc_output",
     ".cache",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensure DEFAULT_SERVE_URL embeds the same port as DEFAULT_SERVE_PORT.
+    /// If you bump DEFAULT_SERVE_PORT, you must also update DEFAULT_SERVE_URL.
+    #[test]
+    fn default_serve_url_matches_default_serve_port() {
+        let port_str = DEFAULT_SERVE_PORT.to_string();
+        assert!(
+            DEFAULT_SERVE_URL.contains(&port_str),
+            "DEFAULT_SERVE_URL ({DEFAULT_SERVE_URL}) does not contain DEFAULT_SERVE_PORT ({DEFAULT_SERVE_PORT}). \
+             Update DEFAULT_SERVE_URL to match.",
+        );
+    }
+}
