@@ -546,6 +546,33 @@ async fn index_with_options(
     if is_incremental {
         let file_meta_store = file_meta_store.as_mut().unwrap();
 
+        // B1 safety guard: if FileMetaStore is empty but VectorStore has chunks,
+        // the metadata was lost/reset. Re-indexing without clearing would create
+        // duplicate chunks. Detect and clear before proceeding.
+        if file_meta_store.is_empty() {
+            let mut vs = VectorStore::new(&db_path, 384)?;
+            let existing_chunks = vs.stats().map(|s| s.total_chunks).unwrap_or(0);
+            if existing_chunks > 0 {
+                log_print!(
+                    "{}",
+                    format!(
+                        "⚠️  FileMetaStore is empty but VectorStore has {} chunks — \
+                         clearing to prevent duplicates (metadata was likely lost/reset)",
+                        existing_chunks
+                    )
+                    .yellow()
+                );
+                vs.clear()?;
+                drop(vs);
+                // Also clear FTS
+                let mut fts = FtsStore::new_with_writer(&db_path)?;
+                fts.clear()?;
+                drop(fts);
+            } else {
+                drop(vs);
+            }
+        }
+
         // Find changed and deleted files
         let mut changed_files = Vec::new();
         let mut unchanged_files = 0;

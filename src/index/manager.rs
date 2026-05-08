@@ -448,6 +448,31 @@ impl IndexManager {
         // Load FileMetaStore
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, &model_name, dimensions)?;
 
+        // B1 safety guard: if FileMetaStore is empty but VectorStore has chunks,
+        // the metadata was lost/reset (model change, corrupt file, etc.).
+        // Re-indexing without clearing would create duplicate chunks.
+        if file_meta_store.is_empty() {
+            let vs_chunks = {
+                let vs = stores.vector_store.read().await;
+                vs.stats().map(|s| s.total_chunks).unwrap_or(0)
+            };
+            if vs_chunks > 0 {
+                warn!(
+                    "⚠️  FileMetaStore is empty but VectorStore has {} chunks — \
+                     clearing stores to prevent duplicates (metadata was likely lost/reset)",
+                    vs_chunks
+                );
+                {
+                    let mut vstore = stores.vector_store.write().await;
+                    vstore.clear()?;
+                }
+                {
+                    let mut fts = stores.fts_store.write().await;
+                    fts.clear()?;
+                }
+            }
+        }
+
         // Walk files
         let walker = FileWalker::new(codebase_path.to_path_buf());
         let (files, _stats) = walker.walk()?;
