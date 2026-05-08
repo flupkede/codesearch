@@ -426,9 +426,9 @@ pub async fn index(
     model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    // When force=true, try to delegate to a running serve instance via HTTP.
+    // Always try to delegate to a running serve instance via HTTP.
     // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
-    if force && !dry_run {
+    if !dry_run {
         match try_delegate_reindex_to_serve(&path, force).await {
             Ok((alias, project_path)) => {
                 println!(
@@ -443,10 +443,31 @@ pub async fn index(
                 return Ok(());
             }
             Err(reason) => {
-                debug!(
-                    "Could not delegate reindex to serve (falling back to local): {}",
-                    reason
-                );
+                // Distinguish: serve not running (quiet fallback) vs. serve running
+                // but delegation failed (warn about potential conflict).
+                let reason_lower = reason.to_lowercase();
+                let serve_was_running = !reason_lower.contains("serve not reachable")
+                    && !reason_lower.contains("connection refused")
+                    && !reason_lower.contains("connect to server");
+                if serve_was_running {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "⚠️  codesearch serve is running but could not delegate: {}",
+                            reason
+                        )
+                        .yellow()
+                    );
+                    eprintln!(
+                        "{}",
+                        "   Running locally — LMDB file-lock conflicts are possible.".yellow()
+                    );
+                } else {
+                    debug!(
+                        "Could not delegate reindex to serve (falling back to local): {}",
+                        reason
+                    );
+                }
             }
         }
     }
