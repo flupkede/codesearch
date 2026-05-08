@@ -1,0 +1,2 @@
+# AGENTS.md is branch-specific - never merge from feature branches into develop
+AGENTS.md merge=ours

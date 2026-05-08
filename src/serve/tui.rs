@@ -20,6 +20,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use tokio_util::sync::CancellationToken;
 
 use super::ServeState;
+use crate::constants::LANG_CSHARP;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -94,7 +95,7 @@ async fn run_tui_loop(
             let chunks = Layout::vertical([
                 Constraint::Length(3), // header
                 Constraint::Min(4),    // body (table)
-                Constraint::Length(3), // detail panel (selected repo info)
+                Constraint::Length(4), // detail panel (selected repo info + optional error)
                 Constraint::Length(1), // footer
             ])
             .split(size);
@@ -102,7 +103,20 @@ async fn run_tui_loop(
             render_header(f, chunks[0], serve_url);
             render_table(f, chunks[1], &repos, &mut table_state);
             render_detail(f, chunks[2], &repos, &table_state, &state);
-            render_footer(f, chunks[3], &repos, &table_state, active, &cpu);
+            let csharp_helper = state
+                .symbol_registry
+                .get(LANG_CSHARP)
+                .map(|i| i.is_available())
+                .unwrap_or(false);
+            render_footer(
+                f,
+                chunks[3],
+                &repos,
+                &table_state,
+                active,
+                &cpu,
+                csharp_helper,
+            );
         })?;
 
         // Poll for key events
@@ -200,16 +214,12 @@ fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str) {
     let title_line = Line::from(vec![
         Span::styled(
             format!(" codesearch serve v{} · ", version),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            serve_url.to_string(),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(
-            format!("  {} ", now),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(serve_url.to_string(), Style::default().fg(Color::White)),
+        Span::styled(format!("  {} ", now), Style::default().fg(Color::DarkGray)),
     ]);
 
     let block = Block::default()
@@ -219,15 +229,19 @@ fn render_header(f: &mut ratatui::Frame, area: Rect, serve_url: &str) {
     f.render_widget(block, area);
 
     // Center the title line vertically (area is 3 rows, title is 1 row)
-    let centered = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(inner);
-    f.render_widget(
-        ratatui::widgets::Paragraph::new(title_line),
-        centered[0],
-    );
+    let centered = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    f.render_widget(ratatui::widgets::Paragraph::new(title_line), centered[0]);
+}
+
+/// Returns true during the "bright" phase of a ~1s pulse cycle (500ms bright, 500ms dim).
+/// Used to animate status indicators while indexing is in progress.
+fn pulse_bright() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        % 1000
+        < 500
 }
 
 fn render_table(
@@ -236,7 +250,14 @@ fn render_table(
     repos: &[(String, super::RepoStatusInfo)],
     table_state: &mut TableState,
 ) {
-    let header_cells = ["Alias", "Status", "Changes", "Last Tool Call", "Lock"];
+    let header_cells = [
+        "Alias",
+        "Status",
+        "Changes",
+        "Calls",
+        "Last Tool Call",
+        "Lock",
+    ];
     let header = Row::new(
         header_cells
             .iter()
@@ -255,23 +276,40 @@ fn render_table(
     let rows: Vec<Row> = repos
         .iter()
         .map(|(alias, info)| {
-            let status_cell = status_cell(info.status);
-            let changes_cell = Cell::from(format!("{}", info.changes))
-                .style(Style::default().fg(Color::White));
-            let tool_cell = Cell::from(
-                info.last_tool_call
-                    .as_deref()
-                    .unwrap_or("—")
-                    .to_string(),
-            )
-            .style(Style::default().fg(Color::DarkGray));
+            let status_cell = status_cell(info.status, info.csharp_index);
+            // Keep left edge stable: fixed-width, left-aligned value.
+            let changes_str = if info.changes > 99999 {
+                " 99k+".to_string()
+            } else {
+                format!("{:>5}", info.changes)
+            };
+            let changes_cell = Cell::from(changes_str).style(Style::default().fg(Color::White));
+            let calls_cell = if info.tool_call_count > 0 {
+                Cell::from(format!("{:>5}", info.tool_call_count))
+                    .style(Style::default().fg(Color::Cyan))
+            } else {
+                Cell::from("    -".to_string()).style(Style::default().fg(Color::DarkGray))
+            };
+            let tool_cell = Cell::from(info.last_tool_call.as_deref().unwrap_or("—").to_string())
+                .style(Style::default().fg(Color::DarkGray));
             // We don't have lock info in lightweight status, show status-derived value
             let lock_cell = lock_cell_from_status(info.status);
 
+            // Alias cell — plain name, no C# indicator
+            let alias_cell = Cell::from(alias.clone()).style(Style::default().fg(Color::White));
+
+            // Red alias if the repo has errors
+            let alias_cell = if matches!(info.status, super::RepoStateLabel::Error) {
+                alias_cell.style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            } else {
+                alias_cell
+            };
+
             Row::new(vec![
-                Cell::from(alias.clone()).style(Style::default().fg(Color::White)),
+                alias_cell,
                 status_cell,
                 changes_cell,
+                calls_cell,
                 tool_cell,
                 lock_cell,
             ])
@@ -281,9 +319,10 @@ fn render_table(
     let table = Table::new(
         rows,
         [
-            Constraint::Min(max_alias_w as u16 + 2),
-            Constraint::Length(12),
-            Constraint::Length(9),
+            Constraint::Length(max_alias_w as u16 + 2),
+            Constraint::Length(14),
+            Constraint::Length(7),
+            Constraint::Length(7),
             Constraint::Min(24),
             Constraint::Length(7),
         ],
@@ -322,7 +361,8 @@ fn render_detail(
 
     let (alias, info) = &repos[idx];
     let config = state.config_snapshot();
-    let path = config.resolve(alias)
+    let path = config
+        .resolve(alias)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "—".to_string());
 
@@ -334,33 +374,115 @@ fn render_detail(
         path
     };
 
-    let status_label = match info.status {
-        super::RepoStateLabel::Open => "Open",
-        super::RepoStateLabel::Warm => "Warm (no FSW)",
-        super::RepoStateLabel::Readonly => "Readonly",
-        super::RepoStateLabel::Closed => "Closed",
-        super::RepoStateLabel::Indexing => "Indexing…",
-        super::RepoStateLabel::Error => "Error",
-        super::RepoStateLabel::NoIndex => "No Index",
+    let (status_label, status_color) = match info.status {
+        super::RepoStateLabel::Open => match info.csharp_index {
+            super::CSharpIndexStatus::Ready => ("Open C#·".to_string(), Color::Green),
+            super::CSharpIndexStatus::Indexing => {
+                let c = if pulse_bright() {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                };
+                ("Index C#…".to_string(), c)
+            }
+            super::CSharpIndexStatus::Error => ("Open C#!".to_string(), Color::Red),
+            super::CSharpIndexStatus::None => ("Open".to_string(), Color::Green),
+        },
+        super::RepoStateLabel::Warm => match info.csharp_index {
+            super::CSharpIndexStatus::Ready => ("Warm C#·".to_string(), Color::Yellow),
+            super::CSharpIndexStatus::Indexing => {
+                let c = if pulse_bright() {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                };
+                ("Index C#…".to_string(), c)
+            }
+            super::CSharpIndexStatus::Error => ("Warm C#!".to_string(), Color::Red),
+            super::CSharpIndexStatus::None => ("Warm".to_string(), Color::Yellow),
+        },
+        super::RepoStateLabel::Readonly => ("Readonly".to_string(), Color::Cyan),
+        super::RepoStateLabel::Closed => ("Closed".to_string(), Color::Gray),
+        super::RepoStateLabel::Indexing => match info.csharp_index {
+            super::CSharpIndexStatus::Indexing => {
+                let c = if pulse_bright() {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                };
+                ("Index C#…".to_string(), c)
+            }
+            _ => {
+                let c = if pulse_bright() {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                };
+                ("Indexing…".to_string(), c)
+            }
+        },
+        super::RepoStateLabel::Error => ("Error".to_string(), Color::Red),
+        super::RepoStateLabel::NoIndex => ("No Index".to_string(), Color::Gray),
     };
 
     let detail_line = Line::from(vec![
         Span::styled(" ▶ ", Style::default().fg(Color::Yellow)),
-        Span::styled(alias.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            alias.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  ", Style::default()),
-        Span::styled(status_label, Style::default().fg(Color::Cyan)),
+        Span::styled(status_label, Style::default().fg(status_color)),
         Span::styled("  ", Style::default()),
         Span::styled(display_path, Style::default().fg(Color::DarkGray)),
     ]);
 
-    // Second line: changes + last tool call
+    // Second line: changes + tool calls + last tool call
     let tool_str = info.last_tool_call.as_deref().unwrap_or("—");
     let info_line = Line::from(vec![
         Span::styled("   changes:", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!(" {}  ", info.changes), Style::default().fg(Color::White)),
+        Span::styled(
+            format!(" {}  ", info.changes),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled("calls:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {}  ", info.tool_call_count),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("last:", Style::default().fg(Color::DarkGray)),
         Span::styled(format!(" {}", tool_str), Style::default().fg(Color::White)),
     ]);
+
+    // Error line: shown only when C# index has an error
+    let error_line = if matches!(info.csharp_index, super::CSharpIndexStatus::Error) {
+        let err_msg = info.csharp_error.as_deref().unwrap_or("Unknown error");
+        // Truncate error message to fit the area.
+        // Use char-boundary-safe truncation to avoid panics on multi-byte UTF-8
+        // (C# helper errors may contain '…', '—', non-ASCII project paths, etc.).
+        // The prefix "   ⚠ " occupies 6 visible columns; leave 1 col margin → subtract 7.
+        const ERR_PREFIX_COLS: usize = 7;
+        let max_err_chars = (area.width as usize).saturating_sub(ERR_PREFIX_COLS);
+        let err_chars: Vec<char> = err_msg.chars().collect();
+        let display_err = if err_chars.len() > max_err_chars && max_err_chars > 3 {
+            let truncated: String = err_chars[..max_err_chars - 3].iter().collect();
+            format!("{}...", truncated)
+        } else {
+            err_msg.to_string()
+        };
+        Some(Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled(
+                "⚠ ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(display_err, Style::default().fg(Color::Red)),
+        ]))
+    } else {
+        None
+    };
 
     let block = Block::default()
         .borders(Borders::TOP)
@@ -368,14 +490,28 @@ fn render_detail(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let detail_chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let constraints = if error_line.is_some() {
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![Constraint::Length(1), Constraint::Length(1)]
+    };
+    let detail_chunks = Layout::vertical(constraints).split(inner);
 
-    f.render_widget(ratatui::widgets::Paragraph::new(detail_line), detail_chunks[0]);
-    f.render_widget(ratatui::widgets::Paragraph::new(info_line), detail_chunks[1]);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(detail_line),
+        detail_chunks[0],
+    );
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(info_line),
+        detail_chunks[1],
+    );
+    if let Some(err_line) = error_line {
+        f.render_widget(ratatui::widgets::Paragraph::new(err_line), detail_chunks[2]);
+    }
 }
 
 fn render_footer(
@@ -385,6 +521,7 @@ fn render_footer(
     table_state: &TableState,
     active: u64,
     cpu: &str,
+    csharp_helper: bool,
 ) {
     let selected = table_state.selected().unwrap_or(0);
     let scroll_indicator = if repos.len() > 1 {
@@ -397,17 +534,15 @@ fn render_footer(
     let cpu_str = format!("CPU: {}", cpu);
 
     // Right side: CPU | Sessions
-    let right_len = cpu_str.len() + sessions_str.len() + 3; // 3 = " │ "
+    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len(); // C# label + " │ "
 
     let footer_inner = area.inner(Margin {
         vertical: 0,
         horizontal: 1,
     });
-    let [left, right] = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(right_len as u16 + 2),
-    ])
-    .areas(footer_inner);
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(right_len as u16 + 2)])
+            .areas(footer_inner);
 
     let left_line = Line::from(vec![
         Span::styled("[q] quit  ", Style::default().fg(Color::DarkGray)),
@@ -415,14 +550,24 @@ fn render_footer(
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
     ]);
 
+    let csharp_indicator = if csharp_helper {
+        Span::styled("C# │ ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("C# │ ", Style::default().fg(Color::DarkGray))
+    };
+
     let right_line = Line::from(vec![
+        csharp_indicator,
         Span::styled(cpu_str, Style::default().fg(Color::Green)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(sessions_str, Style::default().fg(Color::Cyan)),
     ]);
 
     f.render_widget(ratatui::widgets::Paragraph::new(left_line), left);
-    f.render_widget(ratatui::widgets::Paragraph::new(right_line).right_aligned(), right);
+    f.render_widget(
+        ratatui::widgets::Paragraph::new(right_line).right_aligned(),
+        right,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -467,23 +612,101 @@ fn cpu_usage_str(sys_system: &mut Option<sysinfo::System>) -> String {
     }
 }
 
-fn status_cell(status: super::RepoStateLabel) -> Cell<'static> {
+fn status_cell(status: super::RepoStateLabel, csharp: super::CSharpIndexStatus) -> Cell<'static> {
+    use super::CSharpIndexStatus as CS;
     use super::RepoStateLabel::*;
+    let bright = pulse_bright();
     match status {
-        Open => Cell::from("✓ ready".to_string())
-            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Warm => Cell::from("◐ warm".to_string())
-            .style(Style::default().fg(Color::Yellow)),
-        Readonly => Cell::from("◑ ro".to_string())
-            .style(Style::default().fg(Color::Cyan)),
-        Indexing => Cell::from("⟳ idx…".to_string())
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Closed => Cell::from("○ closed".to_string())
-            .style(Style::default().fg(Color::Gray)),
-        Error => Cell::from("✗ error".to_string())
+        Open => match csharp {
+            CS::Ready => Cell::from("✓ ready C#·  ".to_string()).style(
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            CS::Indexing => {
+                if bright {
+                    Cell::from("⟳ idx C#…    ".to_string()).style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Cell::from("⟳ idx C#…    ".to_string())
+                        .style(Style::default().fg(Color::DarkGray))
+                }
+            }
+            CS::Error => Cell::from("✓ ready C#!  ".to_string())
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            CS::None => Cell::from("✓ ready      ".to_string()).style(
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        },
+        Warm => {
+            match csharp {
+                CS::Ready => Cell::from("◐ warm C#·   ".to_string())
+                    .style(Style::default().fg(Color::Yellow)),
+                CS::Indexing => {
+                    if bright {
+                        Cell::from("⟳ idx C#…    ".to_string()).style(
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Cell::from("⟳ idx C#…    ".to_string())
+                            .style(Style::default().fg(Color::DarkGray))
+                    }
+                }
+                CS::Error => Cell::from("◐ warm C#!   ".to_string())
+                    .style(Style::default().fg(Color::Yellow)),
+                CS::None => Cell::from("◐ warm       ".to_string())
+                    .style(Style::default().fg(Color::Yellow)),
+            }
+        }
+        Readonly => Cell::from("◑ ro         ".to_string()).style(Style::default().fg(Color::Cyan)),
+        Indexing => {
+            if bright {
+                match csharp {
+                    CS::Ready => Cell::from("⟳ idx… C#·   ".to_string()).style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    CS::Indexing => Cell::from("⟳ idx C#…    ".to_string()).style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    CS::Error => Cell::from("⟳ idx… C#!   ".to_string()).style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    CS::None => Cell::from("⟳ indexing…  ".to_string()).style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                }
+            } else {
+                match csharp {
+                    CS::Ready => Cell::from("⟳ idx… C#·   ".to_string())
+                        .style(Style::default().fg(Color::DarkGray)),
+                    CS::Indexing => Cell::from("⟳ idx C#…    ".to_string())
+                        .style(Style::default().fg(Color::DarkGray)),
+                    CS::Error => Cell::from("⟳ idx… C#!   ".to_string())
+                        .style(Style::default().fg(Color::DarkGray)),
+                    CS::None => Cell::from("⟳ indexing…  ".to_string())
+                        .style(Style::default().fg(Color::DarkGray)),
+                }
+            }
+        }
+        Closed => Cell::from("○ closed     ".to_string()).style(Style::default().fg(Color::Gray)),
+        Error => Cell::from("✗ error      ".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        NoIndex => Cell::from("— no idx".to_string())
-            .style(Style::default().fg(Color::Gray)),
+        NoIndex => Cell::from("— no idx     ".to_string()).style(Style::default().fg(Color::Gray)),
     }
 }
 

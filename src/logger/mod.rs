@@ -307,8 +307,7 @@ pub fn init_serve_logger(log_level: LogLevel, _quiet: bool) -> Result<LoggerInit
     let config = LogRotationConfig::from_env();
 
     // Separate file name so serve logs don't mix with per-repo MCP client logs.
-    let file_appender =
-        RollingFileAppender::new(Rotation::DAILY, &log_dir, SERVE_LOG_FILE_NAME);
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, &log_dir, SERVE_LOG_FILE_NAME);
 
     let filter_str = format!(
         "{level},tantivy=warn,arroy=warn,ort=warn,h2=warn,hyper=warn,tower=warn",

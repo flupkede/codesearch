@@ -1,17 +1,38 @@
 # codesearch
 
-**Cross-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid search, symbol navigation, and multi-repository orchestration.**
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+[![MCP server](https://img.shields.io/badge/MCP-server-8a2be2.svg)](https://modelcontextprotocol.io/)
+[![GitHub release](https://img.shields.io/github/v/release/flupkede/codesearch?include_prereleases)](https://github.com/flupkede/codesearch/releases)
+[![GitHub stars](https://img.shields.io/github/stars/flupkede/codesearch?style=social)](https://github.com/flupkede/codesearch/stargazers)
 
-codesearch gives AI agents (OpenCode, Claude Code, Cursor, etc.) deep codebase understanding through 5 unified MCP tools. It runs entirely locally — no API calls, no cloud dependencies. Index once, search semantically across multiple repositories simultaneously.
+**Multi-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid retrieval, symbol navigation, and cross-repository orchestration. Fully local, fully offline, no GPU, no Docker.**
+
+codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) deep codebase understanding through 5 unified MCP tools. Index once, search semantically across multiple repositories simultaneously.
 
 ## Why codesearch?
 
-- **Multi-repo search**: Fan-out queries across repository groups
+- **Multi-repo serve mode**: Fan-out queries across repository groups with cross-repo RRF ranking
 - **Hybrid retrieval**: Vector embeddings + BM25 full-text search fused with Reciprocal Rank Fusion
-- **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents
+- **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents — in the same tool
 - **AST-aware chunking**: Tree-sitter parsing for 9 languages — chunks align to functions/classes, not arbitrary line ranges
 - **Token-efficient**: Returns metadata by default; agents fetch full code only when needed via `get_chunk`
+- **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only, no runtime model downloads (works behind enterprise proxies)
 - **Zero config for single repos**: `codesearch index && codesearch mcp` — done
+
+## How does this compare?
+
+The MCP code-search ecosystem grew rapidly in late 2025 / early 2026 and many projects share the same baseline stack (Rust + tree-sitter + BM25 + embeddings + MCP). codesearch's deliberate focus is:
+
+| Focus area | codesearch | Typical alternative |
+|---|---|---|
+| Repository scope | Multi-repo serve with cross-repo RRF | Usually single repo at a time |
+| Footprint | ~hundreds of MB, CPU-only, no Docker | GB-scale, GPU, Docker, or cloud |
+| Enterprise / offline | No runtime fetches; static binary | Often pulls models at first run |
+| Symbol navigation | `find` (def/usages/imports/dependents) co-located with semantic search | Often a separate code-graph tool |
+| Token cost per call | `compact=true` by default; chunks fetched on demand | Frequently dumps full snippets |
+
+Other projects in the same niche may go deeper on call-graph traversal, polished standalone CLIs, or memory/knowledge-graph features. codesearch is intentionally narrower — it picks "lightweight, multi-repo, MCP-native, fully offline" and stays on that lane.
 
 ## Architecture
 
@@ -23,6 +44,7 @@ graph TB
     Router --> Find[find tool]
     Router --> Explore[explore tool]
     Router --> GetChunk[get_chunk tool]
+    Router --> FindImpact[find_impact tool]
     Router --> Status[status tool]
 
     Search -->|mode=semantic| Semantic[Vector ANN + BM25 + RRF Fusion]
@@ -40,6 +62,9 @@ graph TB
     Tantivy --> TantivyIdx[(Tantivy Index)]
 
     GetChunk --> LMDB
+
+    FindImpact -->|C# symbols| CSharpHelper[scip-csharp helper]
+    CSharpHelper -->|SCIP index| ScipLMDB[(LMDB scip_symbols)]
 
     subgraph "Serve Mode (multi-repo)"
         ServeRouter[HTTP Router] -->|project/group routing| Repo1[Repo A]
@@ -59,8 +84,11 @@ Download pre-built binaries from [Releases](https://github.com/flupkede/codesear
 | Platform | Download |
 |----------|----------|
 | Windows x86_64 | `codesearch-windows-x86_64.zip` |
+| Windows x86_64 + C# | `codesearch-windows-x86_64-with-csharp.zip` |
 | Linux x86_64 | `codesearch-linux-x86_64.tar.gz` |
+| Linux x86_64 + C# | `codesearch-linux-x86_64-with-csharp.tar.gz` |
 | macOS ARM64 | `codesearch-macos-arm64.tar.gz` |
+| macOS ARM64 + C# | `codesearch-macos-arm64-with-csharp.tar.gz` |
 
 Or build from source:
 
@@ -73,7 +101,10 @@ cargo build --release
 ### Index a repository
 
 ```bash
-# Register and index a repo (adds to ~/.codesearch/repos.json)
+# Register and index the current repo (adds to ~/.codesearch/repos.json)
+codesearch index add
+
+# Register and index a repo from outside the repo folder
 codesearch index add /path/to/my-project
 
 # Incremental update (only changed files)
@@ -88,6 +119,9 @@ codesearch index rm /path/to/my-project
 # List registered repos
 codesearch index list
 ```
+
+`codesearch index add` is intended to be run from inside the repo you want to register.
+If you're launching it from somewhere else, pass the repo path explicitly.
 
 First-time indexing takes 2–5 minutes. Subsequent runs are incremental (10–30s). Branch switches trigger automatic re-indexing.
 
@@ -235,6 +269,22 @@ codesearch serve
 
 In multi-repo mode: auto-routes when chunk_id is unique; returns candidates list when ambiguous.
 
+### `find_impact` — Symbol Reference Impact
+
+Find all call-sites and references to a symbol with file/line precision, powered by per-language semantic analysis. Currently supports **C#** (via the bundled `scip-csharp` helper).
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `symbol_name` | string | Symbol name (e.g. `"FieldDefinition.Validate"`) |
+| `file` | string | File path for position-based lookup |
+| `line` | int | Line number for position-based lookup |
+| `language` | string | Language hint (auto-detected from file extension) |
+| `project` / `group` | string | Multi-repo routing |
+
+Returns a list of references with `file`, `start_line`, `end_line`, and `kind` (e.g. `"call"`, `"definition"`). Exposes `index_age_seconds` so agents can reason about staleness.
+
+> **Note:** Requires the `-with-csharp` release variant or a separately installed `scip-csharp` helper. See [C# Semantic Search](#c-semantic-search).
+
 ### `status` — Index Info
 
 | Parameter | Type | Description |
@@ -327,6 +377,7 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
+| `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
 
 ### `.codesearchignore`
@@ -345,6 +396,12 @@ node_modules/
 ### `repos.json`
 
 Located at `~/.codesearch/repos.json`. Managed by `codesearch index add/rm`. Contains repo aliases → paths and group definitions. See [Serve Mode](#serve-mode-multi-repo).
+
+## C# Semantic Search
+
+All C#-specific setup, operation, installation, and testing lives in [README_CSharp.md](README_CSharp.md).
+
+If you do not work with C# repos, you can skip it entirely.
 
 ## Supported Languages
 

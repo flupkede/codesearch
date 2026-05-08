@@ -27,9 +27,13 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: codesearch-windows-x86_64.zip
+            artifact_csharp: codesearch-windows-x86_64-with-csharp.zip
+            dotnet_rid: win-x64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: codesearch-linux-x86_64.tar.gz
+            artifact_csharp: codesearch-linux-x86_64-with-csharp.tar.gz
+            dotnet_rid: linux-x64
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -65,19 +69,49 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
 
-      - name: Package (Windows)
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish C# helper (self-contained single-file)
+        run: dotnet publish helpers/csharp -c Release -r ${{ matrix.dotnet_rid }} --self-contained -p:PublishSingleFile=true -o helpers-publish
+
+      - name: Package kale (Windows)
         if: runner.os == 'Windows'
         run: Compress-Archive -Path target\${{ matrix.target }}\release\codesearch.exe -DestinationPath ${{ matrix.artifact }}
 
-      - name: Package (Linux)
+      - name: Package kale (Linux)
         if: runner.os == 'Linux'
         run: tar czf ${{ matrix.artifact }} -C target/${{ matrix.target }}/release codesearch
 
-      - name: Upload artifact
+      - name: Package with-csharp (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir staging
+          Copy-Item target\${{ matrix.target }}\release\codesearch.exe staging\
+          Copy-Item -Recurse helpers-publish\* staging\helpers\csharp\
+          Compress-Archive -Path staging\* -DestinationPath ${{ matrix.artifact_csharp }}
+
+      - name: Package with-csharp (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p staging/helpers/csharp
+          cp target/${{ matrix.target }}/release/codesearch staging/
+          cp -r helpers-publish/* staging/helpers/csharp/
+          tar czf ${{ matrix.artifact_csharp }} -C staging .
+
+      - name: Upload kale artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+
+      - name: Upload with-csharp artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_csharp }}
+          path: ${{ matrix.artifact_csharp }}
 
   build-macos:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.include_macos)
@@ -111,14 +145,35 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
 
-      - name: Package
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish C# helper (self-contained single-file)
+        run: dotnet publish helpers/csharp -c Release -r osx-arm64 --self-contained -p:PublishSingleFile=true -o helpers-publish
+
+      - name: Package kale
         run: tar czf codesearch-macos-arm64.tar.gz -C target/aarch64-apple-darwin/release codesearch
 
-      - name: Upload artifact
+      - name: Package with-csharp
+        run: |
+          mkdir -p staging/helpers/csharp
+          cp target/aarch64-apple-darwin/release/codesearch staging/
+          cp -r helpers-publish/* staging/helpers/csharp/
+          tar czf codesearch-macos-arm64-with-csharp.tar.gz -C staging .
+
+      - name: Upload kale artifact
         uses: actions/upload-artifact@v4
         with:
           name: codesearch-macos-arm64.tar.gz
           path: codesearch-macos-arm64.tar.gz
+
+      - name: Upload with-csharp artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codesearch-macos-arm64-with-csharp.tar.gz
+          path: codesearch-macos-arm64-with-csharp.tar.gz
 
   release:
     needs: [build]

@@ -11,11 +11,13 @@
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
 mod tui;
+mod tui_remote;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::response::Json as AxumJson;
@@ -26,18 +28,21 @@ use rmcp::transport::{
     StreamableHttpService,
 };
 use serde_json::json;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::constants::{
-    DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, MCP_ENDPOINT_PATH, REAPER_INTERVAL_SECS,
-    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV,
+    CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT,
+    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, LANG_CSHARP,
+    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
+    REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::ReposConfig;
-use crate::index::{IndexManager, SharedStores};
+use crate::index::{CSharpRebuildNotifier, IndexManager, SharedStores};
 use crate::mcp::types::HealthResponse;
-
-/// Lightweight repo status derived from DashMap state only (no DB opens).
+use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
+/// Lightweight repo status label derived from DashMap state only (no DB opens).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepoStateLabel {
     Open,
@@ -47,6 +52,29 @@ pub(crate) enum RepoStateLabel {
     Indexing,
     Error,
     NoIndex,
+}
+
+/// Status of the C# symbol index for a repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CSharpIndexStatus {
+    /// No C# helper detected or no index built.
+    None,
+    /// Helper available and index built successfully.
+    Ready,
+    /// Index exists but had errors or is stale.
+    Error,
+    /// Symbol index is currently being built.
+    Indexing,
+}
+
+/// Lightweight repo status derived from DashMap state only (no DB opens).
+pub(crate) struct RepoStatusInfo {
+    pub(crate) status: RepoStateLabel,
+    pub(crate) changes: u64,
+    pub(crate) last_tool_call: Option<String>,
+    pub(crate) tool_call_count: u64,
+    pub(crate) csharp_index: CSharpIndexStatus,
+    pub(crate) csharp_error: Option<String>,
 }
 
 impl RepoStateLabel {
@@ -62,13 +90,6 @@ impl RepoStateLabel {
             Self::NoIndex => "No Index".dimmed(),
         }
     }
-}
-
-/// Lightweight status info for a single repo (no DB I/O).
-pub(crate) struct RepoStatusInfo {
-    pub(crate) status: RepoStateLabel,
-    pub(crate) changes: u64,
-    pub(crate) last_tool_call: Option<String>,
 }
 
 /// Format a tool call name and elapsed time into a human-readable string.
@@ -142,6 +163,26 @@ pub(crate) struct ServeState {
     active_sessions: AtomicU64,
     /// Total MCP sessions since serve started.
     total_sessions: AtomicU64,
+    /// Shared sysinfo instance for CPU measurement — must persist across calls
+    /// so cpu_usage() can compute a delta (first call always returns 0%).
+    sysinfo_system: std::sync::Mutex<sysinfo::System>,
+    /// Shared symbol indexer registry — used by HTTP reindex handler and MCP
+    /// `find_impact` to reuse helper-detection cache instead of creating fresh
+    /// instances per request.
+    symbol_registry: Arc<SymbolIndexerRegistry>,
+    /// Per-repo total tool call count.
+    tool_call_counts: DashMap<String, AtomicU64>,
+    /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
+    /// Wrapped in `Arc` so the watcher-loop notifier closure can capture a cheap clone
+    /// without requiring `Arc<ServeState>` in methods that only have `&self`.
+    csharp_index_status: Arc<DashMap<String, CSharpIndexStatus>>,
+    /// Per-repo C# symbol index last error message (set when status is Error, cleared on success).
+    /// Wrapped in `Arc` for the same reason as `csharp_index_status`.
+    csharp_index_error: Arc<DashMap<String, String>>,
+    /// Debounced deadline for persisting repos config metadata (unix millis).
+    persist_deadline_unix_ms: AtomicU64,
+    /// Ensures only one debounce worker task runs.
+    persist_worker_started: AtomicBool,
     /// Test-only counter for reload invocations that actually swapped config.
     #[cfg(test)]
     reload_count: std::sync::atomic::AtomicUsize,
@@ -159,6 +200,8 @@ impl std::fmt::Debug for ServeState {
 
 impl ServeState {
     fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
         Self {
             repos: DashMap::new(),
             last_access: DashMap::new(),
@@ -170,9 +213,513 @@ impl ServeState {
             last_tool_call: DashMap::new(),
             active_sessions: AtomicU64::new(0),
             total_sessions: AtomicU64::new(0),
+            sysinfo_system: std::sync::Mutex::new(sys),
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
+            tool_call_counts: DashMap::new(),
+            csharp_index_status: Arc::new(DashMap::new()),
+            csharp_index_error: Arc::new(DashMap::new()),
+            persist_deadline_unix_ms: AtomicU64::new(0),
+            persist_worker_started: AtomicBool::new(false),
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Return a clone of the shared symbol indexer registry Arc.
+    /// Used by MCP sessions (CodesearchService::new_for_serve) and
+    /// HTTP reindex handler (trigger_symbol_rebuild) to reuse
+    /// helper-detection cache instead of creating fresh instances per request.
+    pub(crate) fn symbol_registry(&self) -> Arc<SymbolIndexerRegistry> {
+        Arc::clone(&self.symbol_registry)
+    }
+
+    /// Build a `CSharpRebuildNotifier` for the given repo `alias`.
+    ///
+    /// The notifier captures `Arc` clones of the two status maps so it can be sent
+    /// into the file-watcher background task without holding a reference to `&self`.
+    /// When the watcher-triggered rebuild completes it calls the closure, which updates
+    /// `csharp_index_status` and `csharp_index_error` — making the outcome visible in
+    /// the TUI and in `/status` without any extra polling.
+    fn make_csharp_notifier(&self, alias: &str) -> CSharpRebuildNotifier {
+        let status_map = Arc::clone(&self.csharp_index_status);
+        let error_map = Arc::clone(&self.csharp_index_error);
+        let alias_key = alias.to_string();
+        Arc::new(move |success: bool, error_msg: Option<String>| {
+            if success {
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Ready);
+                error_map.remove(&alias_key);
+            } else {
+                if let Some(msg) = error_msg {
+                    error_map.insert(alias_key.clone(), msg);
+                }
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Error);
+            }
+        })
+    }
+
+    fn now_unix_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
+
+    fn now_unix_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// Read CSHARP_SCIP_CONCURRENCY from env, default
+    /// `CSHARP_SCIP_CONCURRENCY_DEFAULT` (currently 2), clamped to [1, 4].
+    fn csharp_scip_concurrency() -> usize {
+        let raw = std::env::var(CSHARP_SCIP_CONCURRENCY_ENV)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(CSHARP_SCIP_CONCURRENCY_DEFAULT);
+        raw.clamp(1, 4)
+    }
+
+    fn has_solution_file(repo_path: &Path) -> bool {
+        std::fs::read_dir(repo_path)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.flatten())
+            .any(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("sln"))
+    }
+
+    fn bootstrap_last_changed(repo_path: &Path) -> Option<i64> {
+        if repo_path.join(".git").exists() {
+            if let Ok(out) = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("log")
+                .arg("-1")
+                .arg("--format=%ct")
+                .arg("HEAD")
+                .output()
+            {
+                if out.status.success() {
+                    if let Ok(ts) = String::from_utf8_lossy(&out.stdout).trim().parse::<i64>() {
+                        return Some(ts);
+                    }
+                }
+            }
+        }
+
+        Self::bootstrap_last_changed_via_fs(repo_path)
+    }
+
+    fn bootstrap_last_changed_via_fs(repo_path: &Path) -> Option<i64> {
+        fn is_ignored_dir(name: &str) -> bool {
+            matches!(
+                name,
+                "bin" | "obj" | "node_modules" | ".git" | ".codesearch.db"
+            )
+        }
+        fn is_candidate(path: &Path) -> bool {
+            matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("sln" | "csproj" | "cs")
+            )
+        }
+
+        let mut stack = vec![repo_path.to_path_buf()];
+        let mut scanned = 0usize;
+        let mut best: Option<i64> = None;
+
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if scanned >= 10_000 {
+                    return best;
+                }
+                scanned += 1;
+
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        if is_ignored_dir(name) {
+                            continue;
+                        }
+                    }
+                    stack.push(path);
+                    continue;
+                }
+
+                if !is_candidate(&path) {
+                    continue;
+                }
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                let Ok(modified) = meta.modified() else {
+                    continue;
+                };
+                let secs = modified
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                best = Some(best.map_or(secs, |b| b.max(secs)));
+            }
+        }
+
+        best
+    }
+
+    /// Returns (needs_rebuild, reason) for C# SCIP phase-2 evaluation.
+    ///
+    /// Always bootstraps `last_changed_unix` when missing — even for repos
+    /// that have no index yet — so phase-2 can sort *all* candidates by
+    /// recency. Without this, every first-build candidate has
+    /// `last_changed_unix = 0`, making `candidates.sort_by(last_changed)`
+    /// effectively a no-op and the actual processing order dictated by
+    /// HashMap iteration of `config.repos`. That's why a stale repo could
+    /// land first instead of the most-recently-touched one.
+    fn evaluate_csharp_rebuild(
+        self: &Arc<Self>,
+        alias: &str,
+        repo_path: &Path,
+        db_path: &Path,
+    ) -> (bool, &'static str) {
+        if !Self::has_solution_file(repo_path) {
+            return (false, "no .sln");
+        }
+
+        let Some(indexer) = self.symbol_registry.get(LANG_CSHARP) else {
+            return (false, "helper not available");
+        };
+        if !indexer.is_available() {
+            return (false, "helper not available");
+        }
+
+        let status = self
+            .csharp_index_status
+            .get(alias)
+            .map(|e| *e.value())
+            .unwrap_or(CSharpIndexStatus::None);
+        if matches!(status, CSharpIndexStatus::Indexing) {
+            return (false, "indexing already in flight");
+        }
+
+        // Bootstrap last_changed_unix UP FRONT (before the has_index branch),
+        // so the sort key is meaningful for both first-builds and refreshes.
+        let (last_changed, last_scip, touched_bootstrap) = {
+            let mut cfg = match self.config.write() {
+                Ok(c) => c,
+                Err(_) => return (false, "config lock poisoned"),
+            };
+            let mut meta = cfg.meta(alias);
+            let mut touched = false;
+            if meta.last_changed_unix.is_none() {
+                meta.last_changed_unix =
+                    Self::bootstrap_last_changed(repo_path).or_else(|| Some(Self::now_unix_secs()));
+                if let Some(ts) = meta.last_changed_unix {
+                    touched = cfg.touch_last_changed(alias, ts);
+                }
+            }
+            (
+                meta.last_changed_unix.unwrap_or(0),
+                meta.last_scip_indexed_unix.unwrap_or(0),
+                touched,
+            )
+        };
+
+        if touched_bootstrap {
+            self.schedule_persist_repos_config();
+        }
+
+        if !indexer.has_index(db_path) {
+            return (true, "no index, first build");
+        }
+
+        if last_changed > last_scip {
+            (true, "changed since last build")
+        } else {
+            (false, "fresh, last_scip>=last_changed")
+        }
+    }
+
+    pub(crate) fn schedule_persist_repos_config(self: &Arc<Self>) {
+        let deadline = Self::now_unix_millis() + (PERSIST_DEBOUNCE_SECS * 1000);
+        self.persist_deadline_unix_ms
+            .store(deadline, Ordering::Relaxed);
+
+        if self
+            .persist_worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let deadline = state.persist_deadline_unix_ms.load(Ordering::Relaxed);
+                if deadline == 0 {
+                    continue;
+                }
+                let now = Self::now_unix_millis();
+                if now < deadline {
+                    continue;
+                }
+
+                let cfg = match state.config.read() {
+                    Ok(c) => c.clone(),
+                    Err(e) => {
+                        tracing::warn!("repos persist skipped: config lock poisoned: {}", e);
+                        state.persist_deadline_unix_ms.store(0, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let save_res = tokio::task::spawn_blocking(move || cfg.save()).await;
+                match save_res {
+                    Ok(Ok(())) => tracing::debug!("repos.json metadata persisted"),
+                    Ok(Err(e)) => tracing::warn!("repos persist failed: {}", e),
+                    Err(e) => tracing::warn!("repos persist task join failed: {}", e),
+                }
+
+                state.persist_deadline_unix_ms.store(0, Ordering::Relaxed);
+                state.persist_worker_started.store(false, Ordering::Release);
+
+                // Avoid race where a schedule landed between save() and worker stop.
+                let pending = state.persist_deadline_unix_ms.load(Ordering::Acquire);
+                if pending > Self::now_unix_millis()
+                    && state
+                        .persist_worker_started
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
+        });
+    }
+
+    /// Phase 1: warm all repos sequentially, awaiting incremental refresh per repo.
+    pub(crate) async fn run_phase_1_warmup_all(self: &Arc<Self>) {
+        let aliases = self.aliases();
+        if aliases.is_empty() {
+            return;
+        }
+        info!("🔥 Phase 1 warmup: {} repos (no FSW)", aliases.len());
+        for alias in &aliases {
+            match self.warmup_repo(alias).await {
+                Ok(()) => info!("phase-1: warmed '{}'", alias),
+                Err(e) => warn!("phase-1: warmup '{}' failed: {}", alias, e),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        info!("🔥 Phase 1 warmup complete");
+    }
+
+    /// Phase 2: semaphore-bounded concurrent C# SCIP rebuilds, sorted by recency.
+    pub(crate) async fn run_phase_2_csharp_scip(self: &Arc<Self>) {
+        let aliases = self.aliases();
+        let mut candidates: Vec<(String, i64)> = Vec::new();
+
+        for alias in &aliases {
+            let path = match self.config.read().ok().and_then(|c| c.resolve(alias)) {
+                Some(p) => p,
+                None => continue,
+            };
+            let db_path = path.join(DB_DIR_NAME);
+            let (needs, reason) = self.evaluate_csharp_rebuild(alias, &path, &db_path);
+            if !needs {
+                info!("phase-2: skip '{}' — {}", alias, reason);
+                continue;
+            }
+            let last_changed = self
+                .config
+                .read()
+                .ok()
+                .and_then(|c| c.meta(alias).last_changed_unix)
+                .unwrap_or(0);
+            info!(
+                "phase-2: queued '{}' — {} (last_changed={})",
+                alias, reason, last_changed
+            );
+            candidates.push((alias.clone(), last_changed));
+        }
+
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
+        if candidates.is_empty() {
+            info!("phase-2 complete: 0 candidates");
+            return;
+        }
+
+        let concurrency = Self::csharp_scip_concurrency();
+        info!(
+            "phase-2: {} candidates, concurrency={}",
+            candidates.len(),
+            concurrency
+        );
+        let sem = Arc::new(Semaphore::new(concurrency));
+        let mut handles = Vec::with_capacity(candidates.len());
+
+        for (alias, _) in candidates {
+            let sem = sem.clone();
+            let state = self.clone();
+            handles.push(tokio::spawn(async move {
+                let permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                info!("phase-2: starting '{}'", alias);
+                let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
+                    Some(p) => p,
+                    None => {
+                        drop(permit);
+                        return;
+                    }
+                };
+                let db_path = path.join(DB_DIR_NAME);
+                trigger_symbol_rebuild(&alias, &path, &db_path, &state).await;
+                drop(permit);
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+        info!("phase-2 complete");
+    }
+
+    /// Phase 3: background pre-warm of reference cache for C# repos.
+    ///
+    /// After Phase 2 finishes indexing definitions, Phase 3 runs
+    /// `scip-csharp batch-find-refs` for each repo to resolve references
+    /// for all uncached symbols in a single workspace session.
+    /// This amortizes the 30-60s workspace open cost across thousands of
+    /// symbols, making subsequent `find_impact` calls instant (LMDB cache hit).
+    ///
+    /// Controlled by `CSHARP_PREWARM_ENABLED` env (default: "true").
+    /// Set to "false" to skip Phase 3 entirely (useful on memory-constrained machines).
+    pub(crate) async fn run_phase_3_prewarm(self: &Arc<Self>) {
+        let enabled = std::env::var(CSHARP_PREWARM_ENABLED_ENV)
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
+        if !enabled {
+            info!(
+                "phase-3: pre-warm disabled by {}=false",
+                CSHARP_PREWARM_ENABLED_ENV
+            );
+            return;
+        }
+
+        let aliases = self.aliases();
+        let mut candidates: Vec<String> = Vec::new();
+
+        for alias in &aliases {
+            let path = match self.config.read().ok().and_then(|c| c.resolve(alias)) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Only pre-warm repos that have a ready C# index
+            let status = self
+                .csharp_index_status
+                .get(alias)
+                .map(|g| *g.value())
+                .unwrap_or(CSharpIndexStatus::None);
+
+            if !matches!(status, CSharpIndexStatus::Ready) {
+                info!("phase-3: skip '{}' — C# status is {:?}", alias, status);
+                continue;
+            }
+
+            // Check that the repo is applicable
+            let applies = self
+                .symbol_registry
+                .get(LANG_CSHARP)
+                .map(|i| i.applies_to(&path))
+                .unwrap_or(false);
+
+            if !applies {
+                continue;
+            }
+
+            candidates.push(alias.clone());
+        }
+
+        if candidates.is_empty() {
+            info!("phase-3: 0 candidates for pre-warm");
+            return;
+        }
+
+        info!("phase-3: pre-warming {} repo(s)", candidates.len());
+
+        let concurrency = Self::csharp_scip_concurrency();
+        let sem = Arc::new(Semaphore::new(concurrency));
+        let mut handles = Vec::with_capacity(candidates.len());
+
+        for alias in candidates {
+            let sem = sem.clone();
+            let state = self.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+
+                info!("phase-3: pre-warming '{}'", alias);
+
+                let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let db_path = path.join(DB_DIR_NAME);
+
+                let registry = state.symbol_registry.clone();
+                let alias_owned = alias.clone();
+
+                match tokio::task::spawn_blocking(move || {
+                    let Some(indexer) = registry.get(LANG_CSHARP) else {
+                        return Err(anyhow::anyhow!("No C# indexer"));
+                    };
+                    // Downcast to CSharpSymbolIndexer to access prewarm_ref_cache
+                    let csharp_indexer = indexer
+                        .as_any()
+                        .downcast_ref::<csharp::CSharpSymbolIndexer>()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Failed to downcast to CSharpSymbolIndexer")
+                        })?;
+                    csharp_indexer.prewarm_ref_cache(&path, &db_path, CSHARP_PREWARM_MAX_SYMBOLS)
+                })
+                .await
+                {
+                    Ok(Ok(summary)) => {
+                        info!(
+                            "phase-3: pre-warm complete for '{}': {} resolved, {} cached in {}ms",
+                            alias_owned, summary.resolved, summary.cached, summary.duration_ms
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("phase-3: pre-warm failed for '{}': {}", alias_owned, e);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "phase-3: pre-warm task panicked for '{}': {}",
+                            alias_owned,
+                            e
+                        );
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+        info!("phase-3 complete");
     }
 
     /// Build an actionable conflict error message.
@@ -341,6 +888,7 @@ impl ServeState {
                 let stores_bg = stores.clone();
                 let im_for_task = im_arc.clone();
                 let token_for_task = token.clone();
+                let notifier = self.make_csharp_notifier(alias);
 
                 tokio::spawn(async move {
                     if let Err(e) = im_for_task.start_watching().await {
@@ -361,7 +909,10 @@ impl ServeState {
                         return;
                     }
 
-                    if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                    if let Err(e) = im_for_task
+                        .start_file_watcher(token_for_task, Some(notifier))
+                        .await
+                    {
                         tracing::error!("File watcher for '{}' stopped: {}", alias_bg, e);
                     }
                 });
@@ -391,7 +942,10 @@ impl ServeState {
     /// immediately while repos become search-ready one-by-one. When a repo in `Warm`
     /// state is first queried, `get_or_open_stores()` will transition it to `Write`
     /// and start the FSW lazily.
-    pub(crate) async fn warmup_repo(&self, alias: &str) -> std::result::Result<(), String> {
+    pub(crate) async fn warmup_repo(
+        self: &Arc<Self>,
+        alias: &str,
+    ) -> std::result::Result<(), String> {
         let _ = self.reload_if_changed();
 
         // Fast path: already opened in any state
@@ -474,22 +1028,12 @@ impl ServeState {
 
         let stores_arc = Arc::new(stores);
 
-        // Perform incremental refresh in the background (don't block warmup of next repo)
-        let bg_alias = alias.to_string();
-        let bg_path = path.clone();
-        let bg_db_path = db_path.clone();
-        let bg_stores = stores_arc.clone();
-        tokio::spawn(async move {
-            if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
-                &bg_path,
-                &bg_db_path,
-                &bg_stores,
-            )
-            .await
-            {
-                tracing::warn!("Warmup '{}': incremental refresh failed: {}", bg_alias, e);
-            }
-        });
+        if let Err(e) =
+            IndexManager::perform_incremental_refresh_with_stores(&path, &db_path, &stores_arc)
+                .await
+        {
+            tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
+        }
 
         // Store as Warm — FSW will be started lazily on first query.
         self.repos
@@ -614,9 +1158,8 @@ impl ServeState {
                                 stores: stores_arc.clone(),
                             },
                         );
-                        if touch {
-                            self.touch_access(alias);
-                        }
+                        // Always update last_access so the reaper can evict.
+                        self.touch_access(alias);
                         return Ok(stores_arc);
                     }
                     Err(e) => {
@@ -651,7 +1194,21 @@ impl ServeState {
 
         let stores_arc = Arc::new(stores);
 
-        // Try to create IndexManager for live file watching.
+        // Fan-out / candidate-detection callers pass touch=false.
+        // Open as Warm only — no FSW, no IndexManager overhead.
+        // Always update last_access so the reaper can evict this repo after idle timeout.
+        if !touch {
+            self.repos.insert(
+                alias.to_string(),
+                RepoState::Warm {
+                    stores: stores_arc.clone(),
+                },
+            );
+            self.touch_access(alias);
+            return Ok(stores_arc);
+        }
+
+        // Explicit project query (touch=true) — start FSW, full Write mode.
         // On failure, still store as Write — searches keep working, live updates disabled.
         let (index_manager_opt, cancel_token) = {
             let alias_clone = alias.to_string();
@@ -664,6 +1221,7 @@ impl ServeState {
                     let stores_for_task = stores_arc.clone();
                     let im_for_task = im_arc.clone();
                     let token_for_task = token.clone();
+                    let notifier = self.make_csharp_notifier(alias);
 
                     tokio::spawn(async move {
                         // Pre-start FSW so changes during initial refresh aren't lost
@@ -687,7 +1245,10 @@ impl ServeState {
                         }
 
                         // Main file watcher loop — runs until cancel_token fires
-                        if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                        if let Err(e) = im_for_task
+                            .start_file_watcher(token_for_task, Some(notifier))
+                            .await
+                        {
                             tracing::error!("File watcher for '{}' stopped: {}", alias_clone, e);
                         }
                     });
@@ -715,9 +1276,8 @@ impl ServeState {
                 cancel_token,
             },
         );
-        if touch {
-            self.touch_access(alias);
-        }
+        // touch=true is guaranteed here (fan-out returns early above as Warm).
+        self.touch_access(alias);
         Ok(stores_arc)
     }
 
@@ -735,6 +1295,7 @@ impl ServeState {
         let alias_bg = alias.to_string();
         let path_bg = project_path.to_path_buf();
         let stores_bg = stores.clone();
+        let notifier = self.make_csharp_notifier(alias);
 
         let cancel_token = CancellationToken::new();
         let token_for_task = cancel_token.clone();
@@ -767,7 +1328,10 @@ impl ServeState {
                         return;
                     }
 
-                    if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                    if let Err(e) = im_for_task
+                        .start_file_watcher(token_for_task, Some(notifier))
+                        .await
+                    {
                         tracing::error!("Lazy FSW for '{}' stopped: {}", alias_bg, e);
                     }
                 }
@@ -884,6 +1448,13 @@ impl ServeState {
             alias.to_string(),
             (tool_name.to_string(), std::time::Instant::now()),
         );
+        // Increment total call count
+        self.tool_call_counts
+            .entry(alias.to_string())
+            .and_modify(|c| {
+                c.fetch_add(1, Ordering::Relaxed);
+            })
+            .or_insert_with(|| AtomicU64::new(1));
     }
 
     /// Record that changes were made to a repo (index/reindex).
@@ -909,7 +1480,6 @@ impl ServeState {
     }
 
     /// Get the current number of active sessions.
-    #[allow(dead_code)]
     pub(crate) fn active_session_count(&self) -> u64 {
         self.active_sessions.load(Ordering::Relaxed)
     }
@@ -969,15 +1539,53 @@ impl ServeState {
                 .map(|e| (e.value().0.clone(), e.value().1.elapsed()))
                 .map(|(name, ago)| format_tool_call_ago(&name, ago));
 
+            let tool_call_count = self
+                .tool_call_counts
+                .get(alias)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+
+            // C# index status: check cached value first, then probe
+            let csharp_index = self
+                .csharp_index_status
+                .get(alias)
+                .map(|e| *e.value())
+                .unwrap_or_else(|| {
+                    // Probe: helper available + index exists → Ready
+                    let registry = &self.symbol_registry;
+                    let has_helper = registry
+                        .get(LANG_CSHARP)
+                        .map(|i| i.is_available())
+                        .unwrap_or(false);
+                    if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
+                        CSharpIndexStatus::Ready
+                    } else {
+                        CSharpIndexStatus::None
+                    }
+                });
+
+            let csharp_error = if matches!(csharp_index, CSharpIndexStatus::Error) {
+                self.csharp_index_error
+                    .get(alias)
+                    .map(|e: dashmap::mapref::one::Ref<String, String>| e.value().clone())
+            } else {
+                None
+            };
+
             result.push((
                 alias.clone(),
                 RepoStatusInfo {
                     status: label,
                     changes,
                     last_tool_call: last_tool,
+                    tool_call_count,
+                    csharp_index,
+                    csharp_error,
                 },
             ));
         }
+        // Sort alphabetically by alias for consistent display in TUI
+        result.sort_by_key(|a| a.0.to_ascii_lowercase());
         result
     }
 
@@ -1209,12 +1817,199 @@ async fn health_handler() -> AxumJson<serde_json::Value> {
     }))
 }
 
+/// Status handler: GET /status
+///
+/// Returns a JSON snapshot of all repo states, active sessions, and CPU usage.
+/// Used by the standalone TUI (`codesearch serve tui`) to poll server state.
+async fn status_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> AxumJson<serde_json::Value> {
+    let repos = state.repo_statuses_lightweight();
+    let active_sessions = state.active_session_count();
+
+    let repo_json: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|(alias, info)| {
+            let status_str = match info.status {
+                RepoStateLabel::Open => "open",
+                RepoStateLabel::Warm => "warm",
+                RepoStateLabel::Readonly => "readonly",
+                RepoStateLabel::Closed => "closed",
+                RepoStateLabel::Indexing => "indexing",
+                RepoStateLabel::Error => "error",
+                RepoStateLabel::NoIndex => "no_index",
+            };
+            let lock_mode = match info.status {
+                RepoStateLabel::Open | RepoStateLabel::Indexing => "write",
+                RepoStateLabel::Warm | RepoStateLabel::Readonly => "read",
+                _ => "—",
+            };
+            let csharp_str = match info.csharp_index {
+                CSharpIndexStatus::None => "none",
+                CSharpIndexStatus::Ready => "ready",
+                CSharpIndexStatus::Error => "error",
+                CSharpIndexStatus::Indexing => "indexing",
+            };
+            json!({
+                "alias": alias,
+                "status": status_str,
+                "lock_mode": lock_mode,
+                "changes": info.changes,
+                "last_tool_call": info.last_tool_call,
+                "tool_call_count": info.tool_call_count,
+                "csharp_index": csharp_str,
+            })
+        })
+        .collect();
+
+    // CPU usage — reuse shared System instance so cpu_usage() can compute delta
+    let cpu = {
+        use sysinfo::ProcessesToUpdate;
+        let pid = match sysinfo::get_current_pid() {
+            Ok(p) => p,
+            Err(_) => {
+                return AxumJson(json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "repos": repo_json,
+                    "active_sessions": active_sessions,
+                    "cpu_percent": "—",
+                }));
+            }
+        };
+        let mut sys = match state.sysinfo_system.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                return AxumJson(json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "repos": repo_json,
+                    "active_sessions": active_sessions,
+                    "cpu_percent": "—",
+                }));
+            }
+        };
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        match sys.process(pid) {
+            Some(proc) => {
+                let num_cpus = sys.cpus().len().max(1) as f32;
+                let pct = proc.cpu_usage() / num_cpus;
+                format!("{:.0}%", pct)
+            }
+            None => "—".to_string(),
+        }
+    };
+
+    let csharp_helper = state
+        .symbol_registry
+        .get(LANG_CSHARP)
+        .map(|i| i.is_available())
+        .unwrap_or(false);
+
+    AxumJson(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "repos": repo_json,
+        "active_sessions": active_sessions,
+        "cpu_percent": cpu,
+        "csharp_helper": csharp_helper,
+    }))
+}
+
+/// Trigger a symbol index rebuild for a repo (C# etc.).
+///
+/// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the C# indexer,
+/// and runs `rebuild()` in a blocking task. Updates the C# index status on success/failure.
+async fn trigger_symbol_rebuild(
+    alias: &str,
+    project_path: &Path,
+    db_path: &Path,
+    state: &Arc<ServeState>,
+) {
+    // Skip non-applicable repos BEFORE touching status — otherwise the TUI
+    // would flip C#-indicator red on Rust/Python repos that simply have no
+    // .sln. The phase-2 gate (`evaluate_csharp_rebuild`) already filters
+    // these out, but other callers (POST /reindex?symbols=true,
+    // .cs watcher debounce, future paths) bypass that gate.
+    let applies = state
+        .symbol_registry
+        .get(LANG_CSHARP)
+        .map(|i| i.applies_to(project_path))
+        .unwrap_or(false);
+    if !applies {
+        tracing::info!(
+            "🔬 symbol reindex skipped for '{}': not applicable (no .sln)",
+            alias
+        );
+        return;
+    }
+
+    tracing::info!("🔬 symbol reindex triggered for '{}'", alias);
+    state
+        .csharp_index_status
+        .insert(alias.to_string(), CSharpIndexStatus::Indexing);
+    let rp = project_path.to_path_buf();
+    let dp = db_path.to_path_buf();
+    let alias_owned = alias.to_string();
+    let registry = state.symbol_registry.clone();
+    match tokio::task::spawn_blocking(move || {
+        let Some(indexer) = registry.get(LANG_CSHARP) else {
+            return Err(anyhow::anyhow!("No C# symbol indexer registered"));
+        };
+        if !indexer.is_available() {
+            return Err(anyhow::anyhow!("scip-csharp helper not available"));
+        }
+        indexer.rebuild(&rp, &dp, RebuildScope::Full)
+    })
+    .await
+    {
+        Ok(Ok(summary)) => {
+            tracing::info!(
+                "✅ Symbol rebuild complete for '{}': {} symbols, {} refs in {}ms",
+                alias_owned,
+                summary.symbols_indexed,
+                summary.references_stored,
+                summary.duration_ms
+            );
+            state
+                .csharp_index_status
+                .insert(alias_owned.clone(), CSharpIndexStatus::Ready);
+            state.csharp_index_error.remove(&alias_owned);
+
+            if let Ok(mut cfg) = state.config.write() {
+                cfg.touch_last_scip(&alias_owned, ServeState::now_unix_secs());
+            }
+            state.schedule_persist_repos_config();
+        }
+        Ok(Err(e)) => {
+            tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, e);
+            state
+                .csharp_index_error
+                .insert(alias_owned.clone(), e.to_string());
+            state
+                .csharp_index_status
+                .insert(alias_owned, CSharpIndexStatus::Error);
+        }
+        Err(e) => {
+            tracing::error!(
+                "❌ Symbol rebuild task panicked for '{}': {}",
+                alias_owned,
+                e
+            );
+            state
+                .csharp_index_error
+                .insert(alias_owned.clone(), format!("Task panicked: {}", e));
+            state
+                .csharp_index_status
+                .insert(alias_owned, CSharpIndexStatus::Error);
+        }
+    }
+}
+
 /// Reindex handler: POST /repos/{alias}/reindex
 ///
 /// Query params:
 /// - `force=true` — close the repo, delete the DB, full reindex, reopen.
 ///   Required when the caller wants a clean rebuild (e.g. `codesearch index -f`).
 ///   Without force, performs an incremental refresh only.
+/// - `symbols=true` — also rebuild the symbol index (C# SCIP) after text reindex.
 ///
 /// Returns 202 Accepted immediately; the reindex runs in the background.
 async fn reindex_handler(
@@ -1229,6 +2024,11 @@ async fn reindex_handler(
 
     let force = params
         .get("force")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let symbols = params
+        .get("symbols")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
@@ -1278,6 +2078,8 @@ async fn reindex_handler(
     let guard_alias = alias_bg.clone();
     let guard_state = state.clone();
 
+    let do_symbols = symbols;
+
     if force {
         // Force rebuild: stop FSW -> clear data in-place -> full reindex -> restart FSW.
         // The FSW must be stopped before clearing the FileMetaStore, otherwise it
@@ -1326,6 +2128,11 @@ async fn reindex_handler(
             // 3. Restart FSW with fresh IndexManager
             g_state.restart_fsw(&g_alias, stores).await;
 
+            // 4. Optional symbol index rebuild
+            if do_symbols {
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
+            }
+
             g_state.active_reindexes.remove(&g_alias);
         });
     } else {
@@ -1365,6 +2172,12 @@ async fn reindex_handler(
                     tracing::error!("❌ Reindex failed for '{}': {}", alias_bg, e);
                 }
             }
+
+            // Optional symbol index rebuild
+            if do_symbols {
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
+            }
+
             g_state.active_reindexes.remove(&g_alias);
         });
     }
@@ -1663,7 +2476,37 @@ async fn log_mcp_requests(
     response
 }
 
+/// Run the standalone TUI that connects to a running serve instance via HTTP.
+///
+/// This is the entry point for `codesearch serve tui`.
+pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
+    if !tui::is_tty() {
+        eprintln!("Error: No TTY detected. The standalone TUI requires an interactive terminal.");
+        std::process::exit(1);
+    }
 
+    // Check if serve is reachable
+    let health_url = format!("{}{}", serve_url, HEALTH_PATH);
+    match reqwest::get(&health_url).await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(_) => {
+            eprintln!(
+                "Error: Serve at {} returned an error. Is it running?",
+                serve_url
+            );
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!(
+                "Error: No serve running at {}. Start with: codesearch serve",
+                serve_url
+            );
+            std::process::exit(1);
+        }
+    }
+
+    tui_remote::run_remote_tui(serve_url).await
+}
 
 /// Run the MCP serve mode.
 ///
@@ -1671,6 +2514,7 @@ async fn log_mcp_requests(
 pub async fn run_serve(
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
+    no_tui: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let effective_port = port.unwrap_or_else(|| {
@@ -1755,6 +2599,7 @@ pub async fn run_serve(
     // before the request hits this middleware).
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
+        .route(STATUS_PATH, axum::routing::get(status_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
         .route(
@@ -1780,29 +2625,21 @@ pub async fn run_serve(
     let tui_state = serve_state.clone();
     let tui_url = serve_url.clone();
 
-    let tui_handle = tui::maybe_spawn_tui(tui_state, tui_cancel, tui_url);
+    let tui_handle = if !no_tui {
+        tui::maybe_spawn_tui(tui_state, tui_cancel, tui_url)
+    } else {
+        None
+    };
 
-    // ── Background pre-warming (NO FSW) ──
-    // Open all registered repos sequentially: opens DB, builds vector index,
-    // starts incremental refresh — but does NOT start file system watchers.
-    // FSW is started lazily on first query via get_or_open_stores().
-    // This saves memory and overhead for repos that are never queried.
+    // ── Startup phase orchestration ──
+    // Phase 1 warms all repos sequentially (text/vector ready).
+    // Phase 2 runs gated C# SCIP rebuilds ordered by last_changed.
     {
-        let warmup_state = serve_state.clone();
+        let phase_state = serve_state.clone();
         tokio::spawn(async move {
-            let aliases = warmup_state.aliases();
-            if !aliases.is_empty() {
-                info!("🔥 Background warming {} repos (no FSW)...", aliases.len());
-                for alias in &aliases {
-                    match warmup_state.warmup_repo(alias).await {
-                        Ok(()) => info!("  ✅ {} warmed (no FSW)", alias),
-                        Err(e) => warn!("  ⚠️  {} warmup failed: {}", alias, e),
-                    }
-                    // Small delay between repos to avoid I/O burst
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-                info!("🔥 Background warming complete");
-            }
+            phase_state.run_phase_1_warmup_all().await;
+            phase_state.run_phase_2_csharp_scip().await;
+            phase_state.run_phase_3_prewarm().await;
         });
     }
 

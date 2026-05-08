@@ -149,11 +149,30 @@ pub const DEFAULT_SERVE_PORT: u16 = 39725;
 /// Environment variable to override the serve port.
 pub const SERVE_PORT_ENV: &str = "CODESEARCH_SERVE_PORT";
 
+/// Default base URL for connecting to a local `codesearch serve` instance.
+/// Used as the clap `--url` default and in `serve_base_url()`.
+///
+/// **Must stay in sync with `DEFAULT_SERVE_PORT`.**
+/// A `#[test]` in this module asserts `DEFAULT_SERVE_URL` contains the port string
+/// from `DEFAULT_SERVE_PORT`, so bumping one without the other will fail `cargo test`.
+pub const DEFAULT_SERVE_URL: &str = "http://127.0.0.1:39725";
+
+/// Path prefix for the per-repo reindex HTTP API route.
+/// Full path: `{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}`.
+pub const REPO_REINDEX_PATH_PREFIX: &str = "/repos/";
+
+/// Path suffix for the per-repo reindex HTTP API route.
+pub const REPO_REINDEX_PATH_SUFFIX: &str = "/reindex";
+
 /// Health-check path served by `codesearch serve`.
 pub const HEALTH_PATH: &str = "/health";
 
 /// MCP endpoint path served by `codesearch serve` (streamable HTTP).
 pub const MCP_ENDPOINT_PATH: &str = "/mcp";
+
+/// Status endpoint path served by `codesearch serve`.
+/// Returns JSON snapshot of all repo states, sessions, and CPU usage.
+pub const STATUS_PATH: &str = "/status";
 
 /// How long an open repo may remain idle (no queries) before it is evicted.
 /// Eviction closes the DB handles, stops the FSW, and releases memory.
@@ -178,6 +197,65 @@ pub const MCP_MODE_ENV: &str = "CODESEARCH_MCP_MODE";
 
 /// Timeout for serve health probe in auto/client mode (milliseconds).
 pub const MCP_HEALTH_PROBE_TIMEOUT_MS: u64 = 500;
+
+/// Environment variable to override the scip-csharp helper path.
+pub const SCIP_CSHARP_HELPER_ENV: &str = "CODESEARCH_SCIP_CSHARP";
+
+/// Helper binary name for the C# symbol indexer (without extension).
+pub const SCIP_CSHARP_HELPER_NAME: &str = "scip-csharp";
+
+/// Subdirectory within the codesearch install dir where language helpers live.
+pub const HELPERS_SUBDIR: &str = "helpers";
+
+/// Debounce time in milliseconds for .cs file changes triggering a symbol rebuild.
+pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
+
+/// LMDB database name for the SCIP symbols table.
+pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
+
+/// LMDB metadata key for the last rebuild timestamp.
+pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
+
+/// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
+/// Used for O(1) position-based symbol lookup.
+pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
+
+/// LMDB table mapping simple names (last segment of SCIP symbol)
+/// to `[full_symbol_keys]`. Used for O(1) fuzzy symbol lookup.
+pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
+
+/// LMDB table caching on-demand reference results from `scip-csharp find-refs`.
+/// Key: full SCIP symbol key. Value: `[v1, bincode(Vec<StoredReference>)]` (same
+/// format as `scip_symbols`). Populated on first `find_impact` call for a symbol;
+/// cleared when the definition index is rebuilt. Gives O(1) lookup on 2nd+ calls.
+pub const SCIP_REF_CACHE_DB_NAME: &str = "scip_ref_cache";
+
+/// Language identifier for the C# symbol indexer.
+/// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
+pub const LANG_CSHARP: &str = "csharp";
+
+/// Environment variable controlling phase-2 C# SCIP rebuild concurrency.
+/// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].
+pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";
+
+/// Default value for `CSHARP_SCIP_CONCURRENCY` when the env var is unset
+/// or unparseable. Clamped to `[1, 4]` at the call site, so this default
+/// is also expected to live within that range.
+pub const CSHARP_SCIP_CONCURRENCY_DEFAULT: usize = 2;
+
+/// Environment variable controlling Phase 3 pre-warm of reference cache.
+/// When "true" (default), `run_phase_3_prewarm()` batch-resolves all uncached
+/// symbol references after Phase 2 completes. Set to "false" on memory-constrained
+/// machines to skip the workspace-open cost.
+pub const CSHARP_PREWARM_ENABLED_ENV: &str = "CSHARP_PREWARM_ENABLED";
+
+/// Maximum number of symbols to resolve per repo in Phase 3 pre-warm.
+/// Limits the batch size to avoid excessive memory usage on large solutions.
+pub const CSHARP_PREWARM_MAX_SYMBOLS: usize = 5000;
+
+/// Debounce window (seconds) for persisting repos.json metadata updates.
+/// Coalesces bursts of file changes into a single write.
+pub const PERSIST_DEBOUNCE_SECS: u64 = 10;
 
 /// File extensions that should never be indexed, regardless of content.
 /// These are generated/compiled/binary-adjacent files with no semantic code value.
@@ -273,3 +351,20 @@ pub const ALWAYS_EXCLUDED: &[&str] = &[
     ".nyc_output",
     ".cache",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensure DEFAULT_SERVE_URL embeds the same port as DEFAULT_SERVE_PORT.
+    /// If you bump DEFAULT_SERVE_PORT, you must also update DEFAULT_SERVE_URL.
+    #[test]
+    fn default_serve_url_matches_default_serve_port() {
+        let port_str = DEFAULT_SERVE_PORT.to_string();
+        assert!(
+            DEFAULT_SERVE_URL.contains(&port_str),
+            "DEFAULT_SERVE_URL ({DEFAULT_SERVE_URL}) does not contain DEFAULT_SERVE_PORT ({DEFAULT_SERVE_PORT}). \
+             Update DEFAULT_SERVE_URL to match.",
+        );
+    }
+}

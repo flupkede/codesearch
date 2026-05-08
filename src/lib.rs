@@ -14,6 +14,7 @@ pub mod output;
 pub mod rerank;
 pub mod search;
 pub mod serve;
+pub mod symbols;
 pub mod utils;
 pub mod vectordb;
 pub mod watch;

@@ -70,10 +70,7 @@ fn write_metadata_u32(db_path: &Path, key: &str, value: u32) -> Result<()> {
     };
 
     if let Some(obj) = json.as_object_mut() {
-        obj.insert(
-            key.to_string(),
-            serde_json::Value::Number(value.into()),
-        );
+        obj.insert(key.to_string(), serde_json::Value::Number(value.into()));
     }
 
     fs::write(&metadata_path, serde_json::to_string_pretty(&json)?)?;
@@ -934,10 +931,7 @@ impl VectorStore {
             }
         }
 
-        let mut out: Vec<ChunkMeta> = by_sig
-            .into_values()
-            .chain(by_range.into_values())
-            .collect();
+        let mut out: Vec<ChunkMeta> = by_sig.into_values().chain(by_range.into_values()).collect();
         out.sort_by_key(|c| c.start_line);
         Ok(out)
     }

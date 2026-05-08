@@ -1,0 +1,25 @@
+#!/bin/sh
+# pre-push hook — runs QC gate before allowing push
+# Install: cp scripts/pre-push .git/hooks/pre-push
+#
+# This mirrors .github/workflows/ci.yml checks locally so CI failures
+# are caught before they reach GitHub.
+
+echo ""
+echo "🔍 Running QC gate (mirrors CI)..."
+echo ""
+
+pwsh -NoProfile -File "$(git rev-parse --show-toplevel)/scripts/qc.ps1" -Fast
+
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "❌ QC gate FAILED. Push blocked."
+    echo "   Fix the errors above, or use 'git push --no-verify' to skip (not recommended)."
+    echo ""
+    exit 1
+fi
+
+echo ""
+echo "✅ QC gate passed. Pushing..."
+echo ""
+exit 0

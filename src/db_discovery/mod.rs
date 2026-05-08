@@ -119,7 +119,10 @@ fn find_best_database_no_global(target_dir: Option<&Path>) -> Result<Option<Data
     find_best_database_impl(target_dir, false)
 }
 
-fn find_best_database_impl(target_dir: Option<&Path>, include_global: bool) -> Result<Option<DatabaseInfo>> {
+fn find_best_database_impl(
+    target_dir: Option<&Path>,
+    include_global: bool,
+) -> Result<Option<DatabaseInfo>> {
     let target = target_dir.unwrap_or_else(|| Path::new("."));
 
     // Canonicalize the target path
@@ -308,7 +311,7 @@ pub fn load_repos_config() -> Result<ReposConfig> {
 #[allow(dead_code)] // Available for CLI and admin tooling
 pub fn save_repos_config(config: &ReposConfig) -> Result<()> {
     config.save()?;
-    
+
     Ok(())
 }
 

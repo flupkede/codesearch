@@ -3,6 +3,9 @@ use clap::{builder::BoolishValueParser, ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
+use crate::constants::{
+    DEFAULT_SERVE_URL, REPO_REINDEX_PATH_PREFIX, REPO_REINDEX_PATH_SUFFIX, SERVE_PORT_ENV,
+};
 use crate::embed::ModelType;
 use crate::search::SearchOptions;
 
@@ -36,6 +39,16 @@ pub enum IndexCommands {
 
     /// Show index status (local or global)
     List,
+
+    /// Rebuild symbol index (C# via scip-csharp) for a repository
+    Symbol {
+        /// Repository alias (required — use "index list" to see aliases)
+        alias: String,
+
+        /// Force full symbol rebuild (ignores cached state)
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
 }
 
 /// Cache subcommands
@@ -108,6 +121,16 @@ pub struct Cli {
     ///            jina-code, e5-multilingual, mxbai-large, modernbert-large
     #[arg(long, global = true)]
     pub model: Option<String>,
+}
+
+/// Action for the `serve` command.
+#[derive(clap::ValueEnum, Clone, Debug, Default)]
+pub enum ServeAction {
+    /// Start the serve process (default)
+    #[default]
+    Start,
+    /// Open a standalone TUI connected to a running serve instance
+    Tui,
 }
 
 #[derive(Subcommand, Debug)]
@@ -199,6 +222,10 @@ pub enum Commands {
         #[arg(short = 'f', long, alias = "full")]
         force: bool,
 
+        /// Also rebuild symbol index (C# via scip-csharp) after text reindex
+        #[arg(long)]
+        symbols: bool,
+
         // Backward-compat flags (predate subcommands)
         /// Add a repository to the index (creates local or global index)
         #[arg(long)]
@@ -227,6 +254,10 @@ pub enum Commands {
 
     /// Run a background MCP server with live file watching and multi-repo support
     Serve {
+        /// Action: `start` (default) or `tui`
+        #[arg(default_value = "start")]
+        action: ServeAction,
+
         /// Port to listen on (default: 39725, override with CODESEARCH_SERVE_PORT)
         #[arg(short, long)]
         port: Option<u16>,
@@ -255,6 +286,14 @@ pub enum Commands {
             default_missing_value = "true"
         )]
         create_index: bool,
+
+        /// Disable the embedded TUI even when a TTY is available
+        #[arg(long)]
+        no_tui: bool,
+
+        /// For `tui` action: serve URL to connect to
+        #[arg(long, default_value = DEFAULT_SERVE_URL)]
+        url: String,
     },
 
     /// Show statistics about the vector database
@@ -339,6 +378,78 @@ pub enum Commands {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Symbol reindex via HTTP API
+// ---------------------------------------------------------------------------
+
+/// Base URL for the codesearch serve instance.
+/// Override via `CODESEARCH_SERVE_PORT` env var (see `constants::SERVE_PORT_ENV`).
+fn serve_base_url() -> String {
+    use crate::constants::DEFAULT_SERVE_PORT;
+    let port = std::env::var(SERVE_PORT_ENV)
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_SERVE_PORT);
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Trigger a symbol reindex by calling the running serve instance's HTTP API.
+async fn trigger_symbol_reindex_via_api(alias: &str, force: bool) -> Result<()> {
+    use colored::Colorize;
+
+    let base = serve_base_url();
+    let url = if force {
+        format!("{base}{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}?force=true&symbols=true")
+    } else {
+        format!("{base}{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}?symbols=true")
+    };
+
+    println!(
+        "  {} symbol reindex for '{}' via {url}",
+        "⟳".yellow(),
+        alias.bright_green()
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+
+    let resp = client.post(&url).send().await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            if status.as_u16() == 202 {
+                println!(
+                    "  {} symbol reindex accepted — rebuilding in background",
+                    "✓".green()
+                );
+                Ok(())
+            } else if status.as_u16() == 404 {
+                anyhow::bail!(
+                    "Unknown alias '{}' — use `codesearch index list` to see registered repos",
+                    alias
+                );
+            } else if status.as_u16() == 409 {
+                anyhow::bail!("Reindex already in progress for '{}'", alias);
+            } else {
+                anyhow::bail!("Serve returned HTTP {}: {}", status.as_u16(), body.trim());
+            }
+        }
+        Err(e) => {
+            if e.is_connect() {
+                anyhow::bail!(
+                    "Cannot connect to codesearch serve at {}.\n  Is `codesearch serve` running?",
+                    base
+                );
+            } else {
+                anyhow::bail!("HTTP request failed: {}", e);
+            }
+        }
+    }
+}
+
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     let cli = Cli::parse();
 
@@ -347,7 +458,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     if cli.model.is_some() && model_type.is_none() {
         eprintln!(
             "Unknown model: '{}'. Available models:",
-            cli.model.as_ref().unwrap()
+            cli.model.as_deref().unwrap_or_default()
         );
         eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
         eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
@@ -418,6 +529,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             path,
             dry_run,
             force,
+            symbols,
             add,
             global,
             alias,
@@ -428,13 +540,22 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             // Subcommand path (preferred)
             if let Some(cmd) = command {
                 match cmd {
-                    IndexCommands::Add { path: add_path, global, alias } => {
-                        crate::index::add_to_index(add_path, global, alias, cancel_token.clone()).await
+                    IndexCommands::Add {
+                        path: add_path,
+                        global,
+                        alias,
+                    } => {
+                        crate::index::add_to_index(add_path, global, alias, cancel_token.clone())
+                            .await
                     }
-                    IndexCommands::Remove { path: rm_path, keep_config } => {
-                        crate::index::remove_from_index(rm_path, keep_config).await
-                    }
+                    IndexCommands::Remove {
+                        path: rm_path,
+                        keep_config,
+                    } => crate::index::remove_from_index(rm_path, keep_config).await,
                     IndexCommands::List => crate::index::list_index_status().await,
+                    IndexCommands::Symbol { alias, force } => {
+                        trigger_symbol_reindex_via_api(&alias, force).await
+                    }
                 }
             } else {
                 // Flag-based backward-compat path
@@ -448,12 +569,32 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
                 if add || is_add_cmd {
                     let effective_path = if is_add_cmd { None } else { path };
-                    crate::index::add_to_index(effective_path, global, alias, cancel_token.clone()).await
+                    crate::index::add_to_index(effective_path, global, alias, cancel_token.clone())
+                        .await
                 } else if remove || is_rm_cmd {
                     let effective_path = if is_rm_cmd { None } else { path };
                     crate::index::remove_from_index(effective_path, keep_config).await
                 } else if list || is_list_cmd {
                     crate::index::list_index_status().await
+                } else if symbols {
+                    // --symbols without subcommand: resolve path to alias, use HTTP API
+                    use crate::db_discovery::repos::ReposConfig;
+                    let config = ReposConfig::load().unwrap_or_default();
+                    let target_path = path.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+                    let resolved_alias = config.alias_for_path(target_path).or_else(|| {
+                        // Try the directory name as alias fallback
+                        target_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.to_string())
+                    });
+                    match resolved_alias {
+                        Some(a) => trigger_symbol_reindex_via_api(&a, force).await,
+                        None => anyhow::bail!(
+                            "Cannot resolve alias for path '{}'. Use `codesearch index symbol <alias>` instead.",
+                            target_path.display()
+                        ),
+                    }
                 } else {
                     crate::index::index(
                         path,
@@ -469,34 +610,50 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         }
         Commands::Stats { path } => crate::index::stats(path).await,
         Commands::Serve {
+            action,
             port,
             register,
             quiet,
             verbose,
             create_index: _,
+            no_tui,
+            url,
         } => {
-            // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
-            // regardless of whether a database exists in the current directory.
-            // This is a central log for the multi-repo serve process, separate from
-            // per-database logs written by the MCP client (codesearch.log.YYYY-MM-DD).
-            let effective_quiet = (cli.quiet || quiet) && !verbose;
-            if let Err(e) =
-                crate::logger::init_serve_logger(log_level, effective_quiet)
-            {
-                eprintln!("Warning: failed to initialize serve logger: {}", e);
+            match action {
+                crate::cli::ServeAction::Tui => crate::serve::run_tui_standalone(url).await,
+                crate::cli::ServeAction::Start => {
+                    // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
+                    // regardless of whether a database exists in the current directory.
+                    // This is a central log for the multi-repo serve process, separate from
+                    // per-database logs written by the MCP client (codesearch.log.YYYY-MM-DD).
+                    let effective_quiet = (cli.quiet || quiet) && !verbose;
+                    if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
+                        eprintln!("Warning: failed to initialize serve logger: {}", e);
+                    }
+                    crate::serve::run_serve(port, register, no_tui, cancel_token.clone()).await
+                }
             }
-            crate::serve::run_serve(port, register, cancel_token.clone()).await
         }
         Commands::Clear { path, yes } => crate::index::clear(path, yes).await,
-        Commands::Doctor { fix, json, all, repo } => crate::cli::doctor::run(fix, json, all, repo).await,
+        Commands::Doctor {
+            fix,
+            json,
+            all,
+            repo,
+        } => crate::cli::doctor::run(fix, json, all, repo).await,
         Commands::Setup { model } => crate::cli::setup::run(model).await,
-        Commands::Mcp { path, create_index, mode } => {
+        Commands::Mcp {
+            path,
+            create_index,
+            mode,
+        } => {
             // Logger is initialized inside run_mcp_server() once db_path is known.
             // This handles both the "DB already exists" and "auto-create DB" paths correctly.
             //
             // MCP stdio transport uses stdout for JSON-RPC — always force file-only
             // logging to keep the channel clean, regardless of the global --quiet flag.
-            crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token).await
+            crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token)
+                .await
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
@@ -680,14 +837,17 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
         }
         GroupsCommands::Add { name, aliases } => {
             if aliases.is_empty() {
-                return Err(anyhow::anyhow!("--aliases is required and must specify at least one alias."));
+                return Err(anyhow::anyhow!(
+                    "--aliases is required and must specify at least one alias."
+                ));
             }
             let mut config = crate::db_discovery::load_repos_config()?;
             // Validate that all aliases exist
             for alias in &aliases {
                 if !config.repos.contains_key(alias) {
                     return Err(anyhow::anyhow!(
-                        "alias '{}' is not registered. Use 'codesearch index add' first.", alias
+                        "alias '{}' is not registered. Use 'codesearch index add' first.",
+                        alias
                     ));
                 }
             }
@@ -752,8 +912,15 @@ mod tests {
 
     #[test]
     fn test_cli_index_add_accepts_alias_flag() {
-        let cli = Cli::try_parse_from(["codesearch", "index", "add", "/tmp/foo", "--alias", "myrepo"])
-            .expect("cli parse should succeed");
+        let cli = Cli::try_parse_from([
+            "codesearch",
+            "index",
+            "add",
+            "/tmp/foo",
+            "--alias",
+            "myrepo",
+        ])
+        .expect("cli parse should succeed");
         match cli.command {
             Commands::Index {
                 command: Some(IndexCommands::Add { alias: Some(a), .. }),
@@ -769,7 +936,10 @@ mod tests {
             .expect("cli parse should succeed");
         match cli.command {
             Commands::Index {
-                command: Some(IndexCommands::Remove { keep_config: true, .. }),
+                command:
+                    Some(IndexCommands::Remove {
+                        keep_config: true, ..
+                    }),
                 ..
             } => (),
             _ => panic!("expected Index::Remove subcommand with keep_config"),

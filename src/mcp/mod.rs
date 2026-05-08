@@ -2193,6 +2193,7 @@ use crate::fts::FtsStore;
 use crate::index::{IndexManager, SharedStores};
 use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_RRF_K};
 use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
+use crate::symbols::SymbolIndexerRegistry;
 use crate::vectordb::VectorStore;
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -2329,8 +2330,7 @@ impl ServerHandler for McpProxyService {
                     Ok(r) => return Ok(r),
                     Err(e) => {
                         let msg = e.to_string();
-                        if !is_transport_error_msg(&msg)
-                            || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
+                        if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
                         {
                             return Err(McpError::internal_error(msg, None));
                         }
@@ -2378,8 +2378,7 @@ impl ServerHandler for McpProxyService {
                     Ok(r) => return Ok(r),
                     Err(e) => {
                         let msg = e.to_string();
-                        if !is_transport_error_msg(&msg)
-                            || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
+                        if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
                         {
                             return Err(McpError::internal_error(msg, None));
                         }
@@ -2476,6 +2475,10 @@ pub struct CodesearchService {
     shared_stores: Option<Arc<SharedStores>>,
     // Serve-mode state (set when running inside `codesearch serve`)
     serve_state: Option<Arc<crate::serve::ServeState>>,
+    // Shared symbol indexer registry — reused across MCP sessions to preserve
+    // helper-detection cache. In serve mode, cloned from ServeState; in
+    // standalone mode, a locally owned Arc.
+    symbol_registry: Arc<SymbolIndexerRegistry>,
 }
 
 impl std::fmt::Debug for CodesearchService {
@@ -2986,11 +2989,7 @@ fn regex_has_disjunctive_or(pattern: &str) -> bool {
             ')' => {
                 depth_paren = depth_paren.saturating_sub(1);
             }
-            '|' => {
-                if depth_paren == 0 {
-                    return true;
-                }
-            }
+            '|' => return depth_paren == 0,
             _ => {}
         }
         i += 1;
@@ -3289,6 +3288,7 @@ impl CodesearchService {
             embedding_service: Mutex::new(None),
             shared_stores,
             serve_state: None,
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
 
@@ -3297,6 +3297,7 @@ impl CodesearchService {
     /// In serve mode, the service does not have a single local DB; instead
     /// it routes requests to the repo identified by `project`/`group`.
     pub(crate) fn new_for_serve(serve_state: Arc<crate::serve::ServeState>) -> Result<Self> {
+        let symbol_registry = serve_state.symbol_registry();
         Ok(Self {
             tool_router: Self::tool_router(),
             db_path: PathBuf::from("serve://multi-repo"),
@@ -3306,6 +3307,7 @@ impl CodesearchService {
             embedding_service: Mutex::new(None),
             shared_stores: None,
             serve_state: Some(serve_state),
+            symbol_registry,
         })
     }
 
@@ -5135,7 +5137,22 @@ impl CodesearchService {
             request.chunk_id,
             request.project,
         );
-        // Resolve project/group routing — allow unscoped for smart candidate detection
+
+        // In multi-repo serve mode, require explicit project or group scope.
+        // Unscoped get_chunk would fan-out over all repos, opening all DBs unnecessarily.
+        // Consistent with search/find/explore which also require scope.
+        if request.project.is_none() && request.group.is_none() {
+            if let Some(ref serve_state) = self.serve_state {
+                let config = serve_state.config_snapshot();
+                if config.repos.len() > 1 {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        self.format_scope_error(),
+                    )]));
+                }
+            }
+        }
+
+        // Resolve project/group routing — allow unscoped only for single-repo mode
         let ctx = match self
             .resolve_routing(&request.project, &request.group, true, "get_chunk")
             .await
@@ -5300,6 +5317,193 @@ impl CodesearchService {
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
+    ///
+    /// Uses language-specific semantic analysis (SCIP) to find all references to a symbol,
+    /// enabling agents to plan refactors with IDE-class accuracy instead of text-matching
+    /// grep heuristics. Currently supports C# only; architecture is language-agnostic.
+    #[tool(
+        description = "Symbol impact analysis — find all references to a symbol using language-specific semantic analysis (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors with IDE-class accuracy.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nCurrently supports C# only. Requires the `scip-csharp` helper to be installed (bundled in `-with-csharp` release variants).\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+    )]
+    async fn find_impact(
+        &self,
+        Parameters(request): Parameters<FindImpactRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            "📥 find_impact(symbol_name={:?}, file={:?}, line={:?}, language={:?}, project={:?})",
+            request.symbol_name,
+            request.file,
+            request.line,
+            request.language,
+            request.project,
+        );
+
+        // Validate input: must provide either symbol_name or file+line
+        let has_name = request
+            .symbol_name
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_position = request.file.is_some() && request.line.is_some();
+        if !has_name && !has_position {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Must provide either `symbol_name` or both `file` and `line` for position-based lookup.".to_string(),
+            )]));
+        }
+
+        // Resolve project/group routing
+        let ctx = match self
+            .resolve_routing(&request.project, &request.group, false, "find_impact")
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        // Determine project root and db_path for the symbol index
+        let (project_root, db_path) = if let Some(ref alias) = ctx.project_alias {
+            let root = ctx
+                .alias_roots
+                .get(alias)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.project_path.clone());
+            // The symbol index DB lives alongside the vector DB
+            let db = root.join(crate::constants::DB_DIR_NAME);
+            (root, db)
+        } else {
+            // Single-repo / stdio mode: use the service's own paths
+            (self.project_path.clone(), self.db_path.clone())
+        };
+
+        // Use the shared symbol indexer registry
+        let registry = &self.symbol_registry;
+
+        // Determine which language to use
+        let language = request.language.clone().or_else(|| {
+            // Auto-detect from file extension
+            request.file.as_ref().and_then(|f| {
+                let ext = Path::new(f).extension()?.to_str()?.to_lowercase();
+                match ext.as_str() {
+                    "cs" => Some(crate::constants::LANG_CSHARP.to_string()),
+                    _ => None,
+                }
+            })
+        });
+
+        let indexer: &dyn crate::symbols::SymbolIndexer = match language {
+            Some(ref lang) => match registry.get(lang) {
+                Some(i) => i,
+                None => {
+                    let available = registry.available_languages();
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "No symbol indexer for language '{}'. Available languages: {:?}",
+                        lang, available
+                    ))]));
+                }
+            },
+            None => {
+                // No language specified and couldn't auto-detect — try all installed
+                let installed = registry.installed_languages();
+                if installed.is_empty() {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        "No symbol indexers installed. Install the `scip-csharp` helper for C# support.".to_string(),
+                    )]));
+                }
+                // Use the first installed language (MVP: only C#)
+                match registry.get(&installed[0]) {
+                    Some(i) => i,
+                    None => {
+                        unreachable!("installed_languages() returned a language with no indexer")
+                    }
+                }
+            }
+        };
+
+        // Check if the helper is available
+        if !indexer.is_available() {
+            let error = crate::symbols::SymbolIndexError {
+                error: format!(
+                    "Symbol indexer for '{}' is not available. The helper binary is not installed.",
+                    indexer.language()
+                ),
+                available_languages: registry.available_languages(),
+                hint_for_agent: format!(
+                    "Install the `-with-csharp` release variant, or set {} to the helper path.",
+                    crate::constants::SCIP_CSHARP_HELPER_ENV
+                ),
+            };
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&error).unwrap_or_else(|_| error.error.clone()),
+            )]));
+        }
+
+        // Perform the lookup.
+        //
+        // `find_references` may invoke `scip-csharp find-refs` on a cache miss
+        // (lazy Opt-2 reference resolution). That subprocess can take several minutes
+        // on a large solution, so we use `block_in_place` to avoid blocking the async
+        // executor thread. `block_in_place` is safe here: we are inside a
+        // multi-threaded tokio runtime and do not hold any async locks.
+        let file_for_pos = if !has_name {
+            Some(self.normalize_symbol_query_path(
+                &project_root,
+                Path::new(request.file.as_ref().unwrap()),
+            ))
+        } else {
+            None
+        };
+        let symbol_name_for_lookup = request.symbol_name.clone();
+        let line_for_lookup = request.line;
+        let result = tokio::task::block_in_place(|| {
+            if has_name {
+                indexer.find_references(&db_path, symbol_name_for_lookup.as_ref().unwrap())
+            } else {
+                indexer.find_references_by_position(
+                    &db_path,
+                    &file_for_pos.unwrap(),
+                    line_for_lookup.unwrap(),
+                )
+            }
+        });
+
+        match result {
+            Ok(references) => {
+                let age = indexer.index_age(&db_path);
+                let impact = crate::symbols::FindImpactResult {
+                    symbol: request.symbol_name.clone().unwrap_or_else(|| {
+                        format!(
+                            "{}:{}",
+                            request.file.as_deref().unwrap_or("?"),
+                            request.line.unwrap_or(0)
+                        )
+                    }),
+                    references,
+                    index_age_seconds: age,
+                    language: indexer.language().to_string(),
+                    scope: ctx
+                        .project_alias
+                        .map(|a| format!("project:{}", a))
+                        .unwrap_or_else(|| "local".to_string()),
+                };
+                let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Symbol lookup failed: {}",
+                e
+            ))])),
+        }
+    }
+
+    fn normalize_symbol_query_path(&self, project_root: &Path, file: &Path) -> PathBuf {
+        if file.is_absolute() {
+            if let Ok(relative) = file.strip_prefix(project_root) {
+                return PathBuf::from(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+
+        PathBuf::from(file.to_string_lossy().replace('\\', "/"))
     }
 
     async fn find_imports(
@@ -6758,22 +6962,32 @@ impl ServerHandler for CodesearchService {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("codesearch", env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                r#"codesearch — semantic + lexical code search MCP server.
+                r#"codesearch — semantic code search + symbol impact analysis.
 
-TOOLS:
-| Tool          | Use for                                              |
-|---------------|------------------------------------------------------|
-| search        | Code search: `mode="semantic"` (default) or `mode="literal"` |
-| find          | Symbol navigation: `kind="definition"` (default), `"usages"`, `"imports"`, `"dependents"` |
-| explore       | File exploration: `kind="outline"` (default) or `"similar"` |
-| get_chunk     | Read full chunk content by chunk_id                  |
-| status        | Index/project info: `kind="index"` (default) or `"projects"` |
+PICK THE RIGHT TOOL FOR THE TASK:
+  "who calls X?" / "what breaks if I rename X?" / "find all refs"
+    → find_impact (file/line-precise, transitive callers, C# via SCIP)
+  "find code about X" / "how does X work" / "show me X"
+    → search(mode="semantic") — understands concepts + synonyms + identifiers
+  exact syntax like Vec<T> / foo = null / a::b
+    → search(mode="literal", regex=true) — ONLY for patterns semantic can't match
+  "where is X defined?" / "what does file X import?"
+    → find(kind="definition" | "imports")
+  "show all symbols in file X" / "code like chunk Y"
+    → explore(kind="outline" | "similar")
+  read chunk content → get_chunk(chunk_id)
+  index health / repo list → status
 
-Indexing is done via CLI: `codesearch index`. The MCP server cannot index.
+RULES:
+  - search(semantic) is the DEFAULT for code lookup. Don't skip it.
+  - find_impact BEFORE search when the task is about renaming/removing a specific symbol.
+  - find_impact > find(kind="usages") — it returns transitive callers, not just direct refs.
+  - NEVER use literal as first search unless you need exact syntax patterns.
+  - project or group is REQUIRED in multi-repo mode.
 
 Mode: {mode}
-Current project: {project}
-Current database: {db} ({exists})
+Project: {project}
+Database: {db} ({exists})
 Model: {model} ({dims}d)
 "#,
                 mode = mode,
@@ -7290,7 +7504,10 @@ pub async fn run_mcp_server(
 
                     // Step 2: AFTER refresh completes, start file watcher (also writes to stores)
                     tracing::info!("👀 Starting file watcher...");
-                    if let Err(e) = index_manager_arc.start_file_watcher(bg_cancel_token).await {
+                    if let Err(e) = index_manager_arc
+                        .start_file_watcher(bg_cancel_token, None)
+                        .await
+                    {
                         tracing::error!("❌ Failed to start file watcher: {}", e);
                     } else {
                         tracing::info!(
