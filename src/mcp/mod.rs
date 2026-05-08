@@ -1815,6 +1815,71 @@ mod tests {
         assert!(!super::looks_like_code_pattern(""));
     }
 
+    // ─── extract_bm25_query_from_regex tests ─────────────────────────
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_class_word_cache() {
+        // "class \w+Cache\b" → should extract "class Cache"
+        assert_eq!(
+            super::extract_bm25_query_from_regex("class \\w+Cache\\b"),
+            "class Cache"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_interface() {
+        // "interface I\w+" → should extract "interface"
+        assert_eq!(
+            super::extract_bm25_query_from_regex("interface I\\w+"),
+            "interface"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_class_word_store() {
+        // "class \w+Store\b" → should extract "class Store"
+        assert_eq!(
+            super::extract_bm25_query_from_regex("class \\w+Store\\b"),
+            "class Store"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_plain() {
+        // Plain identifier → unchanged
+        assert_eq!(
+            super::extract_bm25_query_from_regex("CleanupController"),
+            "CleanupController"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_all_escapes() {
+        // Pure escape classes → empty
+        assert_eq!(
+            super::extract_bm25_query_from_regex("\\w+"),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_method_call() {
+        // "\.MethodName\(" → "MethodName"
+        assert_eq!(
+            super::extract_bm25_query_from_regex("\\.MethodName\\("),
+            "MethodName"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_bracket_class() {
+        // "[a-z]+Cache" → "Cache" (bracket class stripped)
+        assert_eq!(
+            super::extract_bm25_query_from_regex("[a-z]+Cache"),
+            "Cache"
+        );
+    }
+
     // ─── compute_literal_low_confidence tests ─────────────────────────
 
     #[test]
@@ -2444,6 +2509,20 @@ fn read_model_metadata(db_path: &Path) -> (String, usize) {
     )
 }
 
+/// Read chunk/file counts from metadata.json (written after each indexing operation).
+/// Returns `(total_chunks, total_files)` defaulting to `(0, 0)`.
+fn read_metadata_stats(db_path: &Path) -> (usize, usize) {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            let total_chunks = json.get("total_chunks").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let total_files = json.get("total_files").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            return (total_chunks, total_files);
+        }
+    }
+    (0, 0)
+}
+
 /// RRF score threshold below which results are considered low-confidence.
 /// When the top result's RRF score falls below this, the response includes
 /// a `low_confidence` flag and a `suggested_tool` hint.
@@ -2948,6 +3027,83 @@ fn regex_has_anchorable_token(pattern: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Extracts a clean BM25 query string from a regex pattern.
+///
+/// When `regex=true` and the BM25 path is used, we can't pass the raw regex
+/// (e.g. `class \w+Cache\b`) to Tantivy — it tokenizes poorly on backslashes
+/// and metacharacters, producing useless candidates. Instead, this function
+/// extracts only the literal alphanumeric runs from the pattern and joins them
+/// with spaces, producing a clean BM25 query (e.g. `class Cache`).
+///
+/// The regex post-filter (`match_line_for_literal`) then correctly filters
+/// the BM25 candidates against the actual regex pattern.
+fn extract_bm25_query_from_regex(pattern: &str) -> String {
+    let mut tokens: Vec<&str> = Vec::new();
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    let mut run_start: Option<usize> = None;
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // Skip escaped characters (\w, \b, \d, etc.)
+        if c == '\\' && i + 1 < bytes.len() {
+            if run_start.is_some() {
+                let token = &pattern[run_start.unwrap()..i];
+                if token.len() >= 2 {
+                    tokens.push(token);
+                }
+                run_start = None;
+            }
+            i += 2;
+            continue;
+        }
+        // Skip character classes [abc]
+        if c == '[' {
+            if run_start.is_some() {
+                let token = &pattern[run_start.unwrap()..i];
+                if token.len() >= 2 {
+                    tokens.push(token);
+                }
+                run_start = None;
+            }
+            let mut j = i + 1;
+            while j < bytes.len() {
+                let cj = bytes[j] as char;
+                if cj == '\\' && j + 1 < bytes.len() {
+                    j += 2;
+                    continue;
+                }
+                if cj == ']' {
+                    break;
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else if run_start.is_some() {
+            let token = &pattern[run_start.unwrap()..i];
+            if token.len() >= 2 {
+                tokens.push(token);
+            }
+            run_start = None;
+        }
+        i += 1;
+    }
+    // Flush trailing run
+    if let Some(start) = run_start {
+        let token = &pattern[start..];
+        if token.len() >= 2 {
+            tokens.push(token);
+        }
+    }
+    tokens.join(" ")
 }
 
 /// Returns true when a regex pattern contains a top-level alternation (`|`)
@@ -6245,14 +6401,27 @@ impl CodesearchService {
             // Note: regex=true uses BM25 for candidates, then post-filters with the
             // actual regex on raw content (Tantivy's RegexQuery only works on individual
             // tokens, not raw text — underscores/punctuation cause empty results).
+            //
+            // When regex is enabled, strip metacharacters from the BM25 query so
+            // Tantivy gets clean tokens (e.g. "class Cache" instead of "class \w+Cache\b").
+            let bm25_query = if regex_enabled {
+                let cleaned = extract_bm25_query_from_regex(&effective_query);
+                if cleaned.is_empty() {
+                    effective_query.clone()
+                } else {
+                    cleaned
+                }
+            } else {
+                effective_query.clone()
+            };
             let fts_results = if let Some(ref sv) = ctx.stores_vec {
                 let sa = ctx.store_aliases.as_ref().unwrap();
                 self.with_fts_store_read_multi(
                     |fts_store| {
                         if request.phrase.unwrap_or(false) {
-                            fts_store.search_phrase(&effective_query, limit * 3)
+                            fts_store.search_phrase(&bm25_query, limit * 3)
                         } else {
-                            fts_store.search(&effective_query, limit * 3, None)
+                            fts_store.search(&bm25_query, limit * 3, None)
                         }
                     },
                     sv.clone(),
@@ -6265,9 +6434,9 @@ impl CodesearchService {
                     .with_fts_store_read_for(
                         |fts_store| {
                             if request.phrase.unwrap_or(false) {
-                                fts_store.search_phrase(&effective_query, limit * 3)
+                                fts_store.search_phrase(&bm25_query, limit * 3)
                             } else {
-                                fts_store.search(&effective_query, limit * 3, None)
+                                fts_store.search(&bm25_query, limit * 3, None)
                             }
                         },
                         ctx.stores.clone(),
@@ -6757,13 +6926,14 @@ impl CodesearchService {
                             ),
                         }
                     } else {
-                        // Repo NOT opened — use metadata only, no DB open
+                        // Repo NOT opened — read persisted stats from metadata.json
+                        let (md_chunks, md_files) = read_metadata_stats(&db_path);
                         let lock_status = if crate::index::is_database_locked(&db_path) {
                             "locked-externally".to_string()
                         } else {
                             "available".to_string()
                         };
-                        (0, 0, model_name, lock_status)
+                        (md_chunks, md_files, model_name, lock_status)
                     }
                 } else {
                     (0, 0, "not indexed".to_string(), "unknown".to_string())

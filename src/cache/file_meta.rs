@@ -283,6 +283,11 @@ impl FileMetaStore {
         self.files.keys()
     }
 
+    /// Returns true if no files are tracked (metadata was reset or never created).
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
     /// Find files that were deleted (exist in store but not on disk)
     pub fn find_deleted_files(&self) -> Vec<(String, Vec<u32>)> {
         self.files

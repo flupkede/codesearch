@@ -21,6 +21,23 @@ use crate::vectordb::VectorStore;
 mod manager;
 pub use manager::{is_database_locked, CSharpRebuildNotifier, IndexManager, SharedStores};
 
+/// Update metadata.json with current chunk/file counts so that `status(projects)`
+/// can report accurate numbers without opening LMDB.
+pub(crate) fn update_metadata_stats(db_path: &Path, total_chunks: usize, total_files: usize) {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&content) {
+            metadata["total_chunks"] = serde_json::Value::Number(total_chunks.into());
+            metadata["total_files"] = serde_json::Value::Number(total_files.into());
+            if let Ok(pretty) = serde_json::to_string_pretty(&metadata) {
+                if let Err(e) = fs::write(&metadata_path, pretty) {
+                    tracing::warn!("Failed to update metadata stats: {}", e);
+                }
+            }
+        }
+    }
+}
+
 /// Get the database path and project path for a given directory
 /// Uses automatic database discovery to find indexes in parent/global directories
 fn get_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
@@ -409,9 +426,9 @@ pub async fn index(
     model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    // When force=true, try to delegate to a running serve instance via HTTP.
+    // Always try to delegate to a running serve instance via HTTP.
     // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
-    if force && !dry_run {
+    if !dry_run {
         match try_delegate_reindex_to_serve(&path, force).await {
             Ok((alias, project_path)) => {
                 println!(
@@ -426,10 +443,31 @@ pub async fn index(
                 return Ok(());
             }
             Err(reason) => {
-                debug!(
-                    "Could not delegate reindex to serve (falling back to local): {}",
-                    reason
-                );
+                // Distinguish: serve not running (quiet fallback) vs. serve running
+                // but delegation failed (warn about potential conflict).
+                let reason_lower = reason.to_lowercase();
+                let serve_was_running = !reason_lower.contains("serve not reachable")
+                    && !reason_lower.contains("connection refused")
+                    && !reason_lower.contains("connect to server");
+                if serve_was_running {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "⚠️  codesearch serve is running but could not delegate: {}",
+                            reason
+                        )
+                        .yellow()
+                    );
+                    eprintln!(
+                        "{}",
+                        "   Running locally — LMDB file-lock conflicts are possible.".yellow()
+                    );
+                } else {
+                    debug!(
+                        "Could not delegate reindex to serve (falling back to local): {}",
+                        reason
+                    );
+                }
             }
         }
     }
@@ -528,6 +566,33 @@ async fn index_with_options(
 
     if is_incremental {
         let file_meta_store = file_meta_store.as_mut().unwrap();
+
+        // B1 safety guard: if FileMetaStore is empty but VectorStore has chunks,
+        // the metadata was lost/reset. Re-indexing without clearing would create
+        // duplicate chunks. Detect and clear before proceeding.
+        if file_meta_store.is_empty() {
+            let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
+            let existing_chunks = vs.stats().map(|s| s.total_chunks).unwrap_or(0);
+            if existing_chunks > 0 {
+                log_print!(
+                    "{}",
+                    format!(
+                        "⚠️  FileMetaStore is empty but VectorStore has {} chunks — \
+                         clearing to prevent duplicates (metadata was likely lost/reset)",
+                        existing_chunks
+                    )
+                    .yellow()
+                );
+                vs.clear()?;
+                drop(vs);
+                // Also clear FTS
+                let mut fts = FtsStore::new_with_writer(&db_path)?;
+                fts.clear()?;
+                drop(fts);
+            } else {
+                drop(vs);
+            }
+        }
 
         // Find changed and deleted files
         let mut changed_files = Vec::new();
@@ -1004,6 +1069,9 @@ async fn index_with_options(
             "❌ No"
         }
     );
+
+    // Persist chunk/file counts in metadata.json for status(projects)
+    update_metadata_stats(&db_path, db_stats.total_chunks, db_stats.total_files);
 
     // Calculate database size
     let mut total_size = 0u64;

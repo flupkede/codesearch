@@ -35,7 +35,12 @@ public sealed class SymbolIndexer
 
         // Collect all symbols across all projects
         var symbolMap = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
-        var projectRoot = FindCommonRoot(projects.Select(p => p.FilePath).Where(p => p != null).Cast<string>());
+        // Always compute root from ALL solution projects (not the filtered subset) so that
+        // relative paths are consistent between full and incremental rebuilds.
+        // Using only the filtered project would produce shorter paths (e.g. "Caches/ICache.cs")
+        // vs the full-rebuild paths ("src/Dlw.Aprimo.Dam/Caches/ICache.cs"),
+        // causing duplicate definitions in find_impact results.
+        var projectRoot = FindCommonRoot(solution.Projects.Select(p => p.FilePath).Where(p => p != null).Cast<string>());
 
         // Materialize project list once so we can log progress (i / total).
         var projectList = projects as IReadOnlyList<Project> ?? projects.ToList();
