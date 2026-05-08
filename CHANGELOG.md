@@ -5,15 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+
+## [1.0.93] - 2026-05-08
+
+### Changed
+
+- **Local QC gate** (`scripts/qc.ps1`) — mirrors CI checks locally
+  (`fmt → check → clippy → test --lib → test --test *`) and
+  includes pre-push hook (`scripts/pre-push`) that blocks pushes when QC fails.
+  Prevents recurring "local pass, CI fail" problems.
+- **CodeQL configuration** — added `.github/codeql/codeql-config.yml` to suppress
+  `rust/path-injection` false positives (codesearch is a local dev tool,
+  not a web-facing server). In-repo CodeQL workflow configured to use this config.
+
+### Fixed
+
+- **`test_gitignore_rules_respected`** — gitignore directory patterns like `obj/`,
+  `bin/`, `.claude/` now correctly match nested files. The `is_gitignored()`
+  method iterates over all path components with `is_dir=true` so that
+  directory-only patterns match files inside them.
+- **Clippy `unnecessary_sort_by`** — replaced `sort_by()` with `sort_by_key()`
+  in two locations in `src/serve/mod.rs` to avoid lint failure on CI.
+
 ## [Unreleased]
 
-### Added
-
-- **`find_impact` MCP tool** — returns transitive call-sites and references for
-  a symbol with file/line precision, enabling agents to plan refactors with
-  IDE-class accuracy instead of relying on text-matching grep heuristics.
-  Supports name-based lookup (`symbol_name`) and position-based lookup
-  (`file` + `line`). Currently supports **C#** via the `scip-csharp` helper.
 - **Dedicated C# README** — all C#-specific goal, operation, installation, and
   testing instructions now live in `README_CSharp.md`; the main README only
   links there so non-C# users can skip the extra detail.
@@ -193,7 +209,11 @@ repositories.
 - `codesearch serve` keeps one writer per database (LMDB invariant). Concurrent
   reindex from a second process is rejected.
 
+[1.0.93]: https://github.com/flupkede/codesearch/compare/v1.0.77...v1.0.93
 [1.0.77]: https://github.com/flupkede/codesearch/compare/v1.0.75...v1.0.77
+[1.0.93]: https://github.com/flupkede/codesearch/compare/v1.0.77...v1.0.93
 [1.0.75]: https://github.com/flupkede/codesearch/compare/v1.0.74...v1.0.75
+[1.0.93]: https://github.com/flupkede/codesearch/compare/v1.0.77...v1.0.93
 [1.0.74]: https://github.com/flupkede/codesearch/compare/v1.0.72...v1.0.74
+[1.0.93]: https://github.com/flupkede/codesearch/compare/v1.0.77...v1.0.93
 [1.0.72]: https://github.com/flupkede/codesearch/releases/tag/v1.0.72
