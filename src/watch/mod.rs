@@ -183,10 +183,21 @@ impl FileWatcher {
     }
 
     /// Check if a path is matched by .gitignore rules (relative to repo root).
+    /// Uses `is_dir=true` so directory patterns like `obj/` match files inside them.
     fn is_gitignored(&self, path: &Path) -> bool {
         if let Some(ref gi) = self.gitignore {
             let relative = path.strip_prefix(&self.root).unwrap_or(path);
-            gi.matched(relative, false).is_ignore()
+            // Check each ancestor component with is_dir=true so that
+            // directory-only patterns (e.g. `obj/`) correctly exclude
+            // files nested inside those directories.
+            let mut current = PathBuf::new();
+            for component in relative.components() {
+                current.push(component);
+                if gi.matched(&current, true).is_ignore() {
+                    return true;
+                }
+            }
+            false
         } else {
             false
         }
@@ -206,11 +217,8 @@ impl FileWatcher {
         }
 
         // Check .gitignore rules (relative to repo root)
-        if let Some(ref gi) = self.gitignore {
-            let relative = path.strip_prefix(&self.root).unwrap_or(path);
-            if gi.matched(relative, false).is_ignore() {
-                return false;
-            }
+        if self.is_gitignored(path) {
+            return false;
         }
 
         // Skip hardcoded extensions (e.g. .tmp, .map, .lock)
@@ -335,13 +343,13 @@ impl FileWatcher {
                         // Normalize path: strip UNC prefix, convert backslashes
                         let path = normalize_event_path(raw_path);
 
-                            // Skip ignored directories and duplicates
-                            if self.is_in_ignored_dir(&path)
-                                || self.is_gitignored(&path)
-                                || seen_paths.contains(&path)
-                            {
-                                continue;
-                            }
+                        // Skip ignored directories and duplicates
+                        if self.is_in_ignored_dir(&path)
+                            || self.is_gitignored(&path)
+                            || seen_paths.contains(&path)
+                        {
+                            continue;
+                        }
                         seen_paths.insert(path.clone());
 
                         use notify::EventKind;
@@ -606,10 +614,7 @@ mod tests {
         .unwrap();
 
         let watcher = FileWatcher::new(root.to_path_buf());
-        assert!(
-            watcher.gitignore.is_some(),
-            "Should have loaded .gitignore"
-        );
+        assert!(watcher.gitignore.is_some(), "Should have loaded .gitignore");
 
         // Should NOT watch (gitignored patterns)
         assert!(

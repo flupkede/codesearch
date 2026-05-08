@@ -562,12 +562,15 @@ fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         "warm" => match csharp {
-            "ready" => Cell::from("◐ warm+C# ".to_string())
-                .style(Style::default().fg(Color::Green)),
-            "indexing" => Cell::from("◐ warm C#…".to_string())
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            "error" => Cell::from("◐ warm C#!".to_string())
-                .style(Style::default().fg(Color::Red)),
+            "ready" => {
+                Cell::from("◐ warm+C# ".to_string()).style(Style::default().fg(Color::Green))
+            }
+            "indexing" => Cell::from("◐ warm C#…".to_string()).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            "error" => Cell::from("◐ warm C#!".to_string()).style(Style::default().fg(Color::Red)),
             _ => Cell::from("◐ warm    ".to_string()).style(Style::default().fg(Color::Yellow)),
         },
         "readonly" => Cell::from("◑ ro      ".to_string()).style(Style::default().fg(Color::Cyan)),
