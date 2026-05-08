@@ -548,7 +548,7 @@ impl ServeState {
             candidates.push((alias.clone(), last_changed));
         }
 
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
         if candidates.is_empty() {
             info!("phase-2 complete: 0 candidates");
             return;
@@ -1585,7 +1585,7 @@ impl ServeState {
             ));
         }
         // Sort alphabetically by alias for consistent display in TUI
-        result.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+        result.sort_by_key(|a| a.0.to_ascii_lowercase());
         result
     }
 
