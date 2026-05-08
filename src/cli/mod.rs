@@ -434,11 +434,7 @@ async fn trigger_symbol_reindex_via_api(alias: &str, force: bool) -> Result<()> 
             } else if status.as_u16() == 409 {
                 anyhow::bail!("Reindex already in progress for '{}'", alias);
             } else {
-                anyhow::bail!(
-                    "Serve returned HTTP {}: {}",
-                    status.as_u16(),
-                    body.trim()
-                );
+                anyhow::bail!("Serve returned HTTP {}: {}", status.as_u16(), body.trim());
             }
         }
         Err(e) => {
@@ -584,16 +580,14 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     // --symbols without subcommand: resolve path to alias, use HTTP API
                     use crate::db_discovery::repos::ReposConfig;
                     let config = ReposConfig::load().unwrap_or_default();
-                    let target_path = path.as_deref().unwrap_or_else(|| {
-                        std::path::Path::new(".")
+                    let target_path = path.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+                    let resolved_alias = config.alias_for_path(target_path).or_else(|| {
+                        // Try the directory name as alias fallback
+                        target_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.to_string())
                     });
-                    let resolved_alias = config.alias_for_path(target_path)
-                        .or_else(|| {
-                            // Try the directory name as alias fallback
-                            target_path.file_name()
-                                .and_then(|n| n.to_str())
-                                .map(|s| s.to_string())
-                        });
                     match resolved_alias {
                         Some(a) => trigger_symbol_reindex_via_api(&a, force).await,
                         None => anyhow::bail!(

@@ -548,7 +548,7 @@ impl ServeState {
             candidates.push((alias.clone(), last_changed));
         }
 
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
         if candidates.is_empty() {
             info!("phase-2 complete: 0 candidates");
             return;
@@ -608,7 +608,10 @@ impl ServeState {
             .unwrap_or(true);
 
         if !enabled {
-            info!("phase-3: pre-warm disabled by {}=false", CSHARP_PREWARM_ENABLED_ENV);
+            info!(
+                "phase-3: pre-warm disabled by {}=false",
+                CSHARP_PREWARM_ENABLED_ENV
+            );
             return;
         }
 
@@ -686,7 +689,9 @@ impl ServeState {
                     let csharp_indexer = indexer
                         .as_any()
                         .downcast_ref::<csharp::CSharpSymbolIndexer>()
-                        .ok_or_else(|| anyhow::anyhow!("Failed to downcast to CSharpSymbolIndexer"))?;
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Failed to downcast to CSharpSymbolIndexer")
+                        })?;
                     csharp_indexer.prewarm_ref_cache(&path, &db_path, CSHARP_PREWARM_MAX_SYMBOLS)
                 })
                 .await
@@ -701,7 +706,11 @@ impl ServeState {
                         tracing::warn!("phase-3: pre-warm failed for '{}': {}", alias_owned, e);
                     }
                     Err(e) => {
-                        tracing::warn!("phase-3: pre-warm task panicked for '{}': {}", alias_owned, e);
+                        tracing::warn!(
+                            "phase-3: pre-warm task panicked for '{}': {}",
+                            alias_owned,
+                            e
+                        );
                     }
                 }
             }));
@@ -900,7 +909,10 @@ impl ServeState {
                         return;
                     }
 
-                    if let Err(e) = im_for_task.start_file_watcher(token_for_task, Some(notifier)).await {
+                    if let Err(e) = im_for_task
+                        .start_file_watcher(token_for_task, Some(notifier))
+                        .await
+                    {
                         tracing::error!("File watcher for '{}' stopped: {}", alias_bg, e);
                     }
                 });
@@ -1233,7 +1245,10 @@ impl ServeState {
                         }
 
                         // Main file watcher loop — runs until cancel_token fires
-                        if let Err(e) = im_for_task.start_file_watcher(token_for_task, Some(notifier)).await {
+                        if let Err(e) = im_for_task
+                            .start_file_watcher(token_for_task, Some(notifier))
+                            .await
+                        {
                             tracing::error!("File watcher for '{}' stopped: {}", alias_clone, e);
                         }
                     });
@@ -1313,7 +1328,10 @@ impl ServeState {
                         return;
                     }
 
-                    if let Err(e) = im_for_task.start_file_watcher(token_for_task, Some(notifier)).await {
+                    if let Err(e) = im_for_task
+                        .start_file_watcher(token_for_task, Some(notifier))
+                        .await
+                    {
                         tracing::error!("Lazy FSW for '{}' stopped: {}", alias_bg, e);
                     }
                 }
@@ -1567,7 +1585,7 @@ impl ServeState {
             ));
         }
         // Sort alphabetically by alias for consistent display in TUI
-        result.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+        result.sort_by_key(|a| a.0.to_ascii_lowercase());
         result
     }
 

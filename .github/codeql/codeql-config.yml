@@ -1,0 +1,10 @@
+name: "Custom CodeQL Configuration"
+
+# codesearch is a local developer tool (CLI + daemon). All filesystem paths
+# originate from local config (repos.json), environment variables, or CLI
+# arguments — never from untrusted HTTP/user input. The rust/path-injection
+# rule produces false positives because it cannot distinguish local-tool
+# path construction from server-side path traversal.
+query-filters:
+  - exclude:
+      id: rust/path-injection

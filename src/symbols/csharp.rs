@@ -519,7 +519,9 @@ impl CSharpSymbolIndexer {
             })
         });
 
-        let status = child.wait().with_context(|| "Failed to wait for scip-csharp find-refs")?;
+        let status = child
+            .wait()
+            .with_context(|| "Failed to wait for scip-csharp find-refs")?;
 
         if let Some(h) = stderr_handle {
             let _ = h.join();
@@ -573,11 +575,10 @@ impl CSharpSymbolIndexer {
     fn resolve_canonical_key(&self, env: &Env, symbol: &str) -> Result<Option<String>> {
         let rtxn = env.read_txn()?;
 
-        let symbols_db: Database<Str, Bytes> =
-            match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
-                Some(db) => db,
-                None => return Ok(None),
-            };
+        let symbols_db: Database<Str, Bytes> = match env.open_database(&rtxn, Some(SCIP_DB_NAME))? {
+            Some(db) => db,
+            None => return Ok(None),
+        };
 
         // Exact match first
         if symbols_db.get(&rtxn, symbol)?.is_some() {
@@ -634,9 +635,7 @@ impl CSharpSymbolIndexer {
             let rtxn = env.read_txn()?;
 
             // 1. Load definitions from scip_symbols
-            if let Some(symbols_db) =
-                env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))?
-            {
+            if let Some(symbols_db) = env.open_database::<Str, Bytes>(&rtxn, Some(SCIP_DB_NAME))? {
                 if let Some(bytes) = symbols_db.get(&rtxn, canonical)? {
                     match deserialize_refs(bytes) {
                         Ok(defs) => all_stored.extend(defs),
@@ -692,11 +691,11 @@ impl CSharpSymbolIndexer {
         // fall back to db_path.parent() for backward compat with old indexes.
         let repo_path = {
             let rtxn = env.read_txn()?;
-            let meta_db: Database<Str, Str> =
-                env.open_database(&rtxn, Some(SCIP_META_DB_NAME))?
-                    .unwrap_or_else(|| {
-                        panic!("scip_meta DB should exist (created during open_scip_env)")
-                    });
+            let meta_db: Database<Str, Str> = env
+                .open_database(&rtxn, Some(SCIP_META_DB_NAME))?
+                .unwrap_or_else(|| {
+                    panic!("scip_meta DB should exist (created during open_scip_env)")
+                });
             match meta_db.get(&rtxn, META_REPO_PATH)? {
                 Some(path_str) => PathBuf::from(path_str),
                 None => {
@@ -873,12 +872,7 @@ impl CSharpSymbolIndexer {
         let _output_guard = TempFileGuard(output_path.clone());
 
         // Invoke batch-find-refs — symbols_file and output_path are cleaned up by guards
-        self.invoke_batch_find_refs_helper(
-            &helper,
-            &solution,
-            &symbols_file,
-            &output_path,
-        )?;
+        self.invoke_batch_find_refs_helper(&helper, &solution, &symbols_file, &output_path)?;
 
         // Parse and cache results
         let cached = self.parse_and_cache_batch_refs(db_path, &output_path)?;
@@ -1014,8 +1008,8 @@ impl CSharpSymbolIndexer {
             kind: String,
         }
 
-        let batch: BatchOutput =
-            serde_json::from_str(&content).with_context(|| "Failed to parse batch-find-refs output")?;
+        let batch: BatchOutput = serde_json::from_str(&content)
+            .with_context(|| "Failed to parse batch-find-refs output")?;
 
         // Reject outputs from unknown helper versions to avoid silently misinterpreting
         // a changed schema (same contract enforced on index and find-refs paths).
@@ -1050,9 +1044,8 @@ impl CSharpSymbolIndexer {
 
             // Cache even if empty — symbols with 0 references must be marked as
             // "resolved" so collect_uncached_symbol_keys() won't retry them forever.
-            let bytes = serialize_refs(&refs).with_context(|| {
-                format!("Failed to serialize batch refs for {}", result.symbol)
-            })?;
+            let bytes = serialize_refs(&refs)
+                .with_context(|| format!("Failed to serialize batch refs for {}", result.symbol))?;
             ref_cache_db.put(&mut wtxn, result.symbol.as_str(), &bytes)?;
             cached_count += 1;
         }
@@ -1292,8 +1285,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                     }
                     if let Ok(refs) = deserialize_refs(val) {
                         let has_stale_ref = refs.iter().any(|r| {
-                            affected_files
-                                .contains(&r.file.to_string_lossy().replace('\\', "/"))
+                            affected_files.contains(&r.file.to_string_lossy().replace('\\', "/"))
                         });
                         if has_stale_ref {
                             ref_site_stale_keys.push(key.to_string());
@@ -1346,9 +1338,8 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                             .into_iter()
                             .filter(|r| {
                                 r.kind == "definition"
-                                    && !affected_files.contains(
-                                        &r.file.to_string_lossy().replace('\\', "/"),
-                                    )
+                                    && !affected_files
+                                        .contains(&r.file.to_string_lossy().replace('\\', "/"))
                             })
                             .collect();
                         merged.extend(new_stored);
@@ -1397,7 +1388,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             positions_db.put(&mut wtxn, key.as_str(), &bytes)?;
         }
 
-        tracing::debug!("scip-csharp position index: {} new entries", positions.len());
+        tracing::debug!(
+            "scip-csharp position index: {} new entries",
+            positions.len()
+        );
 
         // ── Build simple-name index ────────────────────────────────
         // For incremental rebuilds: rebuild from ALL current scip_symbols entries
@@ -1661,10 +1655,7 @@ mod tests {
             "Add"
         );
         // Type-level key ends with '#' (no member suffix)
-        assert_eq!(
-            extract_simple_name("csharp App . MyService#"),
-            "MyService"
-        );
+        assert_eq!(extract_simple_name("csharp App . MyService#"), "MyService");
         // Namespace-qualified type (no '#' in SCIP key)
         assert_eq!(
             extract_simple_name("csharp . . Namespace.TopLevel#"),

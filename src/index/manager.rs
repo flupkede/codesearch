@@ -17,8 +17,8 @@
 
 use crate::cache::{normalize_path, normalize_path_str};
 use crate::constants::{
-    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP,
-    SCIP_CSHARP_DEBOUNCE_MS, WRITER_LOCK_FILE,
+    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, SCIP_CSHARP_DEBOUNCE_MS,
+    WRITER_LOCK_FILE,
 };
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
@@ -993,8 +993,10 @@ impl IndexManager {
                                     }
 
                                     // Group modified files by their containing .csproj
-                                    let mut groups: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
-                                        std::collections::HashMap::new();
+                                    let mut groups: std::collections::HashMap<
+                                        PathBuf,
+                                        Vec<PathBuf>,
+                                    > = std::collections::HashMap::new();
                                     let mut ungrouped: Vec<PathBuf> = Vec::new();
 
                                     for file in &cs_modified {

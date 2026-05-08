@@ -5457,8 +5457,7 @@ impl CodesearchService {
         let line_for_lookup = request.line;
         let result = tokio::task::block_in_place(|| {
             if has_name {
-                indexer
-                    .find_references(&db_path, symbol_name_for_lookup.as_ref().unwrap())
+                indexer.find_references(&db_path, symbol_name_for_lookup.as_ref().unwrap())
             } else {
                 indexer.find_references_by_position(
                     &db_path,
@@ -7505,7 +7504,10 @@ pub async fn run_mcp_server(
 
                     // Step 2: AFTER refresh completes, start file watcher (also writes to stores)
                     tracing::info!("👀 Starting file watcher...");
-                    if let Err(e) = index_manager_arc.start_file_watcher(bg_cancel_token, None).await {
+                    if let Err(e) = index_manager_arc
+                        .start_file_watcher(bg_cancel_token, None)
+                        .await
+                    {
                         tracing::error!("❌ Failed to start file watcher: {}", e);
                     } else {
                         tracing::info!(
