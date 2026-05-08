@@ -550,7 +550,7 @@ async fn index_with_options(
         // the metadata was lost/reset. Re-indexing without clearing would create
         // duplicate chunks. Detect and clear before proceeding.
         if file_meta_store.is_empty() {
-            let mut vs = VectorStore::new(&db_path, 384)?;
+            let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
             let existing_chunks = vs.stats().map(|s| s.total_chunks).unwrap_or(0);
             if existing_chunks > 0 {
                 log_print!(
