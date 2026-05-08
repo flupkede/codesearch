@@ -638,6 +638,14 @@ impl IndexManager {
             elapsed.as_secs_f64()
         );
 
+        // Persist chunk/file counts in metadata.json for status(projects)
+        {
+            let vs = stores.vector_store.read().await;
+            if let Ok(stats) = vs.stats() {
+                super::update_metadata_stats(db_path, stats.total_chunks, stats.total_files);
+            }
+        }
+
         Ok(())
     }
 
@@ -1255,6 +1263,14 @@ impl IndexManager {
             files_to_remove.len(),
             elapsed.as_secs_f64()
         );
+
+        // Persist chunk/file counts in metadata.json for status(projects)
+        {
+            let vs = stores.vector_store.read().await;
+            if let Ok(stats) = vs.stats() {
+                super::update_metadata_stats(db_path, stats.total_chunks, stats.total_files);
+            }
+        }
 
         Ok(())
     }

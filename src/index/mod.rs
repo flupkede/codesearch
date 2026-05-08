@@ -21,6 +21,21 @@ use crate::vectordb::VectorStore;
 mod manager;
 pub use manager::{is_database_locked, CSharpRebuildNotifier, IndexManager, SharedStores};
 
+/// Update metadata.json with current chunk/file counts so that `status(projects)`
+/// can report accurate numbers without opening LMDB.
+fn update_metadata_stats(db_path: &Path, total_chunks: usize, total_files: usize) {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&content) {
+            metadata["total_chunks"] = serde_json::Value::Number(total_chunks.into());
+            metadata["total_files"] = serde_json::Value::Number(total_files.into());
+            if let Ok(pretty) = serde_json::to_string_pretty(&metadata) {
+                let _ = fs::write(&metadata_path, pretty);
+            }
+        }
+    }
+}
+
 /// Get the database path and project path for a given directory
 /// Uses automatic database discovery to find indexes in parent/global directories
 fn get_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
@@ -1004,6 +1019,9 @@ async fn index_with_options(
             "❌ No"
         }
     );
+
+    // Persist chunk/file counts in metadata.json for status(projects)
+    update_metadata_stats(&db_path, db_stats.total_chunks, db_stats.total_files);
 
     // Calculate database size
     let mut total_size = 0u64;

@@ -2444,6 +2444,20 @@ fn read_model_metadata(db_path: &Path) -> (String, usize) {
     )
 }
 
+/// Read chunk/file counts from metadata.json (written after each indexing operation).
+/// Returns `(total_chunks, total_files)` defaulting to `(0, 0)`.
+fn read_metadata_stats(db_path: &Path) -> (usize, usize) {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            let total_chunks = json.get("total_chunks").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let total_files = json.get("total_files").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            return (total_chunks, total_files);
+        }
+    }
+    (0, 0)
+}
+
 /// RRF score threshold below which results are considered low-confidence.
 /// When the top result's RRF score falls below this, the response includes
 /// a `low_confidence` flag and a `suggested_tool` hint.
@@ -6757,13 +6771,14 @@ impl CodesearchService {
                             ),
                         }
                     } else {
-                        // Repo NOT opened — use metadata only, no DB open
+                        // Repo NOT opened — read persisted stats from metadata.json
+                        let (md_chunks, md_files) = read_metadata_stats(&db_path);
                         let lock_status = if crate::index::is_database_locked(&db_path) {
                             "locked-externally".to_string()
                         } else {
                             "available".to_string()
                         };
-                        (0, 0, model_name, lock_status)
+                        (md_chunks, md_files, model_name, lock_status)
                     }
                 } else {
                     (0, 0, "not indexed".to_string(), "unknown".to_string())
