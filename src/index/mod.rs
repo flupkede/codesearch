@@ -23,14 +23,16 @@ pub use manager::{is_database_locked, CSharpRebuildNotifier, IndexManager, Share
 
 /// Update metadata.json with current chunk/file counts so that `status(projects)`
 /// can report accurate numbers without opening LMDB.
-fn update_metadata_stats(db_path: &Path, total_chunks: usize, total_files: usize) {
+pub(crate) fn update_metadata_stats(db_path: &Path, total_chunks: usize, total_files: usize) {
     let metadata_path = db_path.join("metadata.json");
     if let Ok(content) = fs::read_to_string(&metadata_path) {
         if let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&content) {
             metadata["total_chunks"] = serde_json::Value::Number(total_chunks.into());
             metadata["total_files"] = serde_json::Value::Number(total_files.into());
             if let Ok(pretty) = serde_json::to_string_pretty(&metadata) {
-                let _ = fs::write(&metadata_path, pretty);
+                if let Err(e) = fs::write(&metadata_path, pretty) {
+                    tracing::warn!("Failed to update metadata stats: {}", e);
+                }
             }
         }
     }
