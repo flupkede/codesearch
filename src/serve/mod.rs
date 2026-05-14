@@ -2313,51 +2313,46 @@ async fn add_repo_handler(
         alias
     };
 
-    // Create the index using index_quiet
+    // Spawn index creation + warmup in the background to avoid blocking the
+    // HTTP handler.  Previously this ran inline, which caused a deadlock when
+    // the serve's own startup still held the LMDB lock (Phase 1).  Returning
+    // 202 Accepted immediately matches the pattern used by reindex_handler.
     let cancel_token = CancellationToken::new();
     let index_path = canonical_path.clone();
     let alias_bg = alias.clone();
     let state_bg = state.clone();
 
-    match crate::index::index_quiet(Some(index_path.clone()), false, body.global, cancel_token)
-        .await
-    {
-        Ok(()) => {
-            tracing::info!("Index created for '{}' ({})", alias, index_path.display());
-        }
-        Err(e) => {
-            // Index failed — remove the config entry we just added
-            tracing::error!("Index creation failed for '{}': {}", alias, e);
-            {
-                if let Ok(mut config) = state.config.write() {
-                    config.unregister_alias(&alias);
+    tokio::spawn(async move {
+        match crate::index::index_quiet(Some(index_path.clone()), false, body.global, cancel_token)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!("Index created for '{}' ({})", alias_bg, index_path.display());
+            }
+            Err(e) => {
+                // Index failed — remove the config entry we just added
+                tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
+                if let Ok(mut config) = state_bg.config.write() {
+                    config.unregister_alias(&alias_bg);
                     let _ = config.save();
                 }
+                return;
             }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::response::Json(json!({
-                    "error": format!("Index creation failed: {}", e),
-                    "status": "error"
-                })),
-            );
         }
-    }
 
-    // Warmup the repo (opens DB, builds vector index, stores as Warm)
-    tokio::spawn(async move {
+        // Warmup the repo (opens DB, builds vector index, stores as Warm)
         if let Err(e) = state_bg.warmup_repo(&alias_bg).await {
             tracing::warn!("Warmup failed for newly added repo '{}': {}", alias_bg, e);
         }
     });
 
     (
-        StatusCode::CREATED,
+        StatusCode::ACCEPTED,
         axum::response::Json(json!({
-            "status": "created",
+            "status": "accepted",
             "alias": alias,
             "path": canonical_path,
-            "message": "Repo registered, indexed, and warming up"
+            "message": "Repo registered, indexing in background"
         })),
     )
 }
