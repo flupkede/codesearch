@@ -2235,8 +2235,9 @@ struct AddRepoRequest {
 
 /// Add-repo handler: POST /repos
 ///
-/// Registers a new repo in repos.json, creates the index, and warms it up.
-/// Returns 201 on success.
+/// Registers a new repo in repos.json, spawns index creation + warmup in the
+/// background, and returns 202 Accepted immediately.  Indexing must not run
+/// inline because the serve's own startup may still hold the LMDB lock.
 async fn add_repo_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
     axum::extract::Json(body): axum::extract::Json<AddRepoRequest>,
