@@ -20,45 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
-## [1.0.94] - 2026-05-08
-
-### Fixed
-
-- **`status(projects)` now returns real chunk counts** for unopened repos by
-  persisting them in `metadata.json` after every indexing operation (B2).
-- **Double chunks on reindex** — guard clears both stores when `FileMetaStore`
-  is empty but `VectorStore` has data, preventing full duplication (B1).
-- **Regex `\w+`/`\b`/`\d` broken in literal mode** — extracts clean BM25 tokens
-  from regex patterns for candidate generation while preserving full regex for
-  post-filter (B3).
-- **Duplicate definitions in `find_impact`** — `FindCommonRoot` now uses all
-  solution projects instead of filtered subset for consistent relative paths (B4).
-- **`codesearch index` now always delegates to running serve** (not just `-f`),
-  preventing LMDB file-lock conflicts between CLI and serve.
-- **`release.ps1` path resolution** — fixed .NET `ReadAllText` resolving against
-  wrong CWD by using absolute paths derived from script location.
-
-## [1.0.93] - 2026-05-08
-
-### Changed
-
-- **Local QC gate** (`scripts/qc.ps1`) — mirrors CI checks locally
-  (`fmt → check → clippy → test --lib → test --test *`) and
-  includes pre-push hook (`scripts/pre-push`) that blocks pushes when QC fails.
-  Prevents recurring "local pass, CI fail" problems.
-- **CodeQL configuration** — added `.github/codeql/codeql-config.yml` to suppress
-  `rust/path-injection` false positives (codesearch is a local dev tool,
-  not a web-facing server). In-repo CodeQL workflow configured to use this config.
-
-### Fixed
-
-- **`test_gitignore_rules_respected`** — gitignore directory patterns like `obj/`,
-  `bin/`, `.claude/` now correctly match nested files. The `is_gitignored()`
-  method iterates over all path components with `is_dir=true` so that
-  directory-only patterns match files inside them.
-- **Clippy `unnecessary_sort_by`** — replaced `sort_by()` with `sort_by_key()`
-  in two locations in `src/serve/mod.rs` to avoid lint failure on CI.
-
 ## [1.0.96] - 2026-05-14
 
 ### Fixed
@@ -91,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Removed vendor name references** from docs and comments for a cleaner
   public repository.
+
+
 
 ## [1.0.94] - 2026-05-08
 
@@ -167,6 +130,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Removed `#[allow(dead_code)]`** on 5 SCIP constants in
   `constants.rs` that are now actively referenced from `csharp.rs`.
 
+
+
+## [1.0.93] - 2026-05-08
+
+### Changed
+
+- **Local QC gate** (`scripts/qc.ps1`) — mirrors CI checks locally
+  (`fmt → check → clippy → test --lib → test --test *`) and
+  includes pre-push hook (`scripts/pre-push`) that blocks pushes when QC fails.
+  Prevents recurring "local pass, CI fail" problems.
+- **CodeQL configuration** — added `.github/codeql/codeql-config.yml` to suppress
+  `rust/path-injection` false positives (codesearch is a local dev tool,
+  not a web-facing server). In-repo CodeQL workflow configured to use this config.
+
+### Fixed
+
+- **`test_gitignore_rules_respected`** — gitignore directory patterns like `obj/`,
+  `bin/`, `.claude/` now correctly match nested files. The `is_gitignored()`
+  method iterates over all path components with `is_dir=true` so that
+  directory-only patterns match files inside them.
+- **Clippy `unnecessary_sort_by`** — replaced `sort_by()` with `sort_by_key()`
+  in two locations in `src/serve/mod.rs` to avoid lint failure on CI.
+
+
+
 ## [1.0.81] - 2026-05-02
 
 ### Added
@@ -198,6 +186,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`unsafe` blocks documented**: SAFETY comments added to the three LMDB
   env-open `unsafe` blocks in `src/embed/cache.rs` and `src/vectordb/store.rs`.
 
+
+
 ## [1.0.77] - 2026-05-01
 
 ### Removed
@@ -206,6 +196,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed from the repository. These were internal working documents with no
   value for contributors.
 
+
+
 ## [1.0.74] - 2026-05-01
 
 ### Fixed
@@ -213,6 +205,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MCP session keep_alive timeout removed**: the previous 30-minute idle timeout
   was killing sessions mid-working-day. Sessions now live until TCP dies, which
   is the correct behaviour for a local single-user long-running serve process.
+
+
 
 ## [1.0.72] - 2026-05-01
 
@@ -292,8 +286,8 @@ repositories.
 [1.0.96]: https://github.com/flupkede/codesearch/compare/v1.0.95...v1.0.96
 [1.0.95]: https://github.com/flupkede/codesearch/compare/v1.0.94...v1.0.95
 [1.0.94]: https://github.com/flupkede/codesearch/compare/v1.0.93...v1.0.94
-[1.0.93]: https://github.com/flupkede/codesearch/compare/v1.0.77...v1.0.93
-[1.0.77]: https://github.com/flupkede/codesearch/compare/v1.0.75...v1.0.77
-[1.0.75]: https://github.com/flupkede/codesearch/compare/v1.0.74...v1.0.75
+[1.0.93]: https://github.com/flupkede/codesearch/compare/v1.0.81...v1.0.93
+[1.0.81]: https://github.com/flupkede/codesearch/compare/v1.0.77...v1.0.81
+[1.0.77]: https://github.com/flupkede/codesearch/compare/v1.0.74...v1.0.77
 [1.0.74]: https://github.com/flupkede/codesearch/compare/v1.0.72...v1.0.74
 [1.0.72]: https://github.com/flupkede/codesearch/releases/tag/v1.0.72
