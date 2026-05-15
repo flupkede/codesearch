@@ -502,22 +502,79 @@ impl ServeState {
         });
     }
 
-    /// Phase 1: warm all repos sequentially, awaiting incremental refresh per repo.
-    pub(crate) async fn run_phase_1_warmup_all(self: &Arc<Self>) {
-        let aliases = self.aliases();
-        if aliases.is_empty() {
-            return;
-        }
-        info!("🔥 Phase 1 warmup: {} repos (no FSW)", aliases.len());
-        for alias in &aliases {
-            match self.warmup_repo(alias).await {
-                Ok(()) => info!("phase-1: warmed '{}'", alias),
-                Err(e) => warn!("phase-1: warmup '{}' failed: {}", alias, e),
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        info!("🔥 Phase 1 warmup complete");
-    }
+     /// Phase 1: warm all repos sequentially, awaiting incremental refresh per repo.
+     /// Stale entries (database missing or repo path gone) are auto-pruned from repos.json.
+     pub(crate) async fn run_phase_1_warmup_all(self: &Arc<Self>) {
+         let aliases = self.aliases();
+         if aliases.is_empty() {
+             return;
+         }
+         info!("🔥 Phase 1 warmup: {} repos (no FSW)", aliases.len());
+
+         let mut pruned: Vec<String> = Vec::new();
+
+         for alias in &aliases {
+             match self.warmup_repo(alias).await {
+                 Ok(()) => info!("phase-1: warmed '{}'", alias),
+                 Err(e) => {
+                     // Auto-prune stale entries where the database or repo path no longer exists.
+                     let should_prune = {
+                         let config = self.config.read().ok();
+                         let path = config.as_ref().and_then(|c| c.resolve(alias));
+                         match path {
+                             Some(p) => {
+                                 let db_missing = !p.join(DB_DIR_NAME).exists();
+                                 let path_gone = !p.exists();
+                                 db_missing || path_gone
+                             }
+                             None => {
+                                 // Alias resolves to nothing — definitely stale
+                                 true
+                             }
+                         }
+                     };
+
+                     if should_prune {
+                         warn!(
+                             "phase-1: pruning stale alias '{}' — {}",
+                             alias, e
+                         );
+                         // Clean up any residual in-memory state
+                         let _ = self.stop_fsw(alias);
+                         self.repos.remove(alias);
+                         self.last_access.remove(alias);
+
+                         // Unregister from repos.json
+                         if let Ok(mut config) = self.config.write() {
+                             if config.unregister_alias(alias) {
+                                 if let Err(save_err) = config.save() {
+                                     warn!(
+                                         "phase-1: failed to save repos.json after pruning '{}': {}",
+                                         alias, save_err
+                                     );
+                                 } else {
+                                     pruned.push(alias.clone());
+                                 }
+                             }
+                         }
+                     } else {
+                         warn!("phase-1: warmup '{}' failed: {}", alias, e);
+                     }
+                 }
+             }
+             tokio::time::sleep(Duration::from_millis(200)).await;
+         }
+
+         if !pruned.is_empty() {
+             info!(
+                 "🔥 Phase 1 warmup complete (pruned {} stale: {})",
+                 pruned.len(),
+                 pruned.join(", ")
+             );
+         } else {
+             info!("🔥 Phase 1 warmup complete");
+         }
+     }
 
     /// Phase 2: semaphore-bounded concurrent C# SCIP rebuilds, sorted by recency.
     pub(crate) async fn run_phase_2_csharp_scip(self: &Arc<Self>) {
