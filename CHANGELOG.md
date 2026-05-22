@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.132] - 2026-05-22
+
+### Added
+
+- **Tree-sitter grammars for Bash, Ruby, PHP, YAML, JSON** — codesearch now
+  supports AST-aware chunking for 14 languages total (previously 9: Rust,
+  Python, JavaScript, TypeScript, C, C++, C#, Go, Java). Closes #55.
+- **Bash equivalents of QC and bump-version scripts** — `scripts/qc.sh` and
+  `scripts/bump-version.sh` for Linux/macOS environments, complementing the
+  existing PowerShell scripts.
+- **Platform-aware pre-push hook** — `.git/hooks/pre-push` auto-detects the
+  platform and calls the appropriate QC script before allowing a push.
+- **CodeQL configuration** — added `.github/codeql/codeql-config.yml` to
+  suppress `rust/path-injection` false positives (codesearch is a local dev
+  tool, not a web-facing server).
+
+### Changed
+
+- **SCIP LMDB map_size raised from 64 MB to 512 MB** — the SCIP symbol index
+  LMDB environment now defaults to 512 MB virtual address space, up from 64 MB.
+  This prevents `MDB_MAP_FULL` errors on large solutions. Override with
+  `CODESEARCH_SCIP_LMDB_MAP_MB` environment variable.
+- **Centralized DB open/create logic** — extracted `try_open_stores()` to
+  eliminate duplicate LMDB open paths across the codebase. All serve-context
+  LMDB access now goes through a single entry point.
+
+### Fixed
+
+- **LMDB double-open race in `add_repo_handler`** — a concurrent guard with
+  cancel token now prevents two simultaneous `add_repo` calls from opening the
+  same LMDB database, which caused panics and corrupted indexes.
+- **LMDB double-open in MCP fallback path** — blocked a code path where the
+  MCP handler could open a second LMDB environment on the same directory when
+  `SharedStores` initialization failed.
+- **`TrackedEnv` runtime guard** — a new runtime guard detects LMDB
+  double-open attempts at runtime, producing a clear error instead of a panic.
+- **Force-reindex on missing database** — `try_open_stores()` now creates the
+  database on the fly when it's missing, fixing the case where a previously
+  registered repo had no `.codesearch.db` directory yet.
+- **Explore two-pass fallback** — `explore outline` now falls back to a
+  second lookup strategy when the alias name matches a package subdirectory,
+  preventing empty results on certain project layouts.
+- **TUI C# indexing status** — Phase 2 SCIP rebuilds and Phase 3 pre-warm now
+  correctly signal the TUI `indexing_cb`, so the UI shows "C# Indexing"
+  during background symbol operations.
+- **FSW SCIP rebuild TUI signal** — file-watcher-triggered symbol rebuilds now
+  update `active_reindexes` so the TUI displays the correct indexing state.
+- **CI test resilience** — `test_indexer_returns_empty_when_db_missing` is now
+  resilient to LMDB lock contention on CI runners.
+- **Protect-master workflow** — GitHub Actions workflow that only allows PRs
+  from `develop` to `master`, preventing accidental direct pushes.
+- **`config.save()` failure warnings** — `add_repo_handler` now logs warnings
+  when `config.save()` fails instead of silently dropping the error.
+
+
+
 ## [1.0.97] - 2026-05-15
 
 ### Fixed
@@ -282,6 +338,7 @@ repositories.
 - `codesearch serve` keeps one writer per database (LMDB invariant). Concurrent
   reindex from a second process is rejected.
 
+[1.0.132]: https://github.com/flupkede/codesearch/compare/v1.0.97...v1.0.132
 [1.0.97]: https://github.com/flupkede/codesearch/compare/v1.0.96...v1.0.97
 [1.0.96]: https://github.com/flupkede/codesearch/compare/v1.0.95...v1.0.96
 [1.0.95]: https://github.com/flupkede/codesearch/compare/v1.0.94...v1.0.95
