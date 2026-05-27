@@ -3549,9 +3549,18 @@ impl CodesearchService {
         }
 
         // Must have serve_state to route
-        let serve_state = self.serve_state.as_ref().ok_or_else(|| {
-            "project/group routing requires `codesearch serve` to be running.".to_string()
-        })?;
+        let serve_state = match self.serve_state.as_ref() {
+            Some(ss) => ss,
+            None => {
+                // Local/stdio mode: only one DB available, project/group are meaningless.
+                // Fall through to local DB instead of erroring.
+                tracing::warn!(
+                    "MCP: project/group ignored in local mode (no serve running). \
+                     Using local database."
+                );
+                return Ok(None);
+            }
+        };
 
         // Validate params
         types::validate_project_group(project, group, true)?;
