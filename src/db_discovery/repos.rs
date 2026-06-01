@@ -354,21 +354,6 @@ fn normalize_path_for_compare(path: &Path) -> String {
     crate::cache::normalize_path(path)
 }
 
-/// Strip the Windows extended-length UNC prefix (`\\?\`) from a path so it is
-/// never persisted to repos.json in that form. `Path::canonicalize()` on Windows
-/// returns `\\?\C:\...`, which causes `Path::exists()` / `.join()` to behave
-/// inconsistently for sub-paths (e.g. `\\?\C:\foo\.codesearch.db` may not exist
-/// even when `C:\foo\.codesearch.db` does). Stripping the prefix before storage
-/// ensures all downstream path operations use the plain `C:\...` form.
-fn strip_unc(path: PathBuf) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        path
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
