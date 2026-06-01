@@ -426,7 +426,14 @@ pub async fn index(
     // Always try to delegate to a running serve instance via HTTP.
     // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
     if !dry_run {
-        match try_delegate_reindex_to_serve(&path, force).await {
+        // Try to delegate; if serve is unresponsive (warming up), wait and retry.
+        let delegate_result = serve_delegate_with_warmup_wait(|| {
+            let path = path.clone();
+            async move { try_delegate_reindex_to_serve(&path, force).await }
+        })
+        .await;
+
+        match delegate_result {
             Ok((alias, project_path)) => {
                 println!(
                     "{}",
@@ -445,19 +452,15 @@ pub async fn index(
                 debug!("serve not running; indexing locally");
             }
             Err(DelegateError::ServeUnresponsive) => {
-                // Serve IS running but did not answer /health in time (likely
-                // still warming up). Creating a local index now would produce a
-                // duplicate that conflicts with the serve-managed one, so abort
-                // loudly instead of silently duplicating.
+                // Serve was reachable but never became ready within the wait budget.
+                // Refusing to create a local duplicate — the user must decide.
                 return Err(anyhow::anyhow!(
-                    "codesearch serve is running but did not respond in time (it may still be \
-                     warming up). Refusing to create a local duplicate index.\n   \
-                     Try again in a moment, or stop serve first to index locally."
+                    "codesearch serve is running but did not become ready within the wait \
+                     budget (~2 min). Stop serve first to index locally, or wait for it \
+                     to finish warming up."
                 ));
             }
             Err(DelegateError::Failed(reason)) => {
-                // Serve responded but the delegation step failed. Warn about the
-                // potential file-lock conflict from running locally.
                 eprintln!(
                     "{}",
                     format!(
@@ -1262,7 +1265,14 @@ pub async fn add_to_index(
 
     // Try delegating to a running serve instance first.
     // Serve handles: register in repos.json + create index + warmup.
-    match try_delegate_add_to_serve(&path, &alias, global).await {
+    let add_delegate = serve_delegate_with_warmup_wait(|| {
+        let path = path.clone();
+        let alias = alias.clone();
+        async move { try_delegate_add_to_serve(&path, &alias, global).await }
+    })
+    .await;
+
+    match add_delegate {
         Ok((assigned_alias, _)) => {
             println!("\n{}", "✅ Delegated to running serve instance.".green());
             println!("   Registered as '{}'.", assigned_alias);
@@ -1274,16 +1284,13 @@ pub async fn add_to_index(
             tracing::debug!("add_to_index: serve not running, adding locally");
         }
         Err(DelegateError::ServeUnresponsive) => {
-            // Serve IS running but unresponsive (warming up). Don't create a local
-            // duplicate index — abort with guidance instead.
             return Err(anyhow::anyhow!(
-                "codesearch serve is running but did not respond in time (it may still be \
-                 warming up). Refusing to create a local duplicate index.\n   \
-                 Try again in a moment, or stop serve first to add locally."
+                "codesearch serve is running but did not become ready within the wait \
+                 budget (~2 min). Stop serve first to add locally, or wait for it to \
+                 finish warming up."
             ));
         }
         Err(DelegateError::Failed(reason)) => {
-            // Serve responded but delegation failed — warn and fall through to local.
             eprintln!(
                 "{}",
                 format!("⚠️  serve is running but could not delegate: {}", reason).yellow()
@@ -1618,6 +1625,56 @@ struct DbStats {
     bloat_ratio: Option<f64>,
 }
 
+/// Run a serve-delegation closure, waiting patiently if serve is reachable but
+/// still warming up (e.g. opening LMDB handles for 15+ repos at startup).
+///
+/// - `Ok(result)` immediately on success.
+/// - `Err(ServeDown)` immediately when nothing is listening (fast path preserved).
+/// - On `ServeUnresponsive`: print progress and retry up to [`SERVE_WARMUP_RETRIES`]
+///   times with [`SERVE_WARMUP_RETRY_SLEEP`] between attempts. Returns
+///   `Err(ServeUnresponsive)` only after exhausting the retry budget.
+/// - `Err(Failed(_))` propagated immediately.
+async fn serve_delegate_with_warmup_wait<F, Fut, T>(
+    mut f: F,
+) -> std::result::Result<T, DelegateError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, DelegateError>>,
+{
+    match f().await {
+        Ok(r) => return Ok(r),
+        Err(DelegateError::ServeDown) => return Err(DelegateError::ServeDown),
+        Err(DelegateError::Failed(e)) => return Err(DelegateError::Failed(e)),
+        Err(DelegateError::ServeUnresponsive) => {
+            // First encounter — print a friendly message and start waiting.
+            eprintln!(
+                "{}",
+                "⏳ serve is starting up, waiting for it to become ready...".yellow()
+            );
+        }
+    }
+
+    for attempt in 1..=SERVE_WARMUP_RETRIES {
+        tokio::time::sleep(SERVE_WARMUP_RETRY_SLEEP).await;
+        match f().await {
+            Ok(r) => {
+                eprintln!("{}", "✅ serve is ready, delegating...".green());
+                return Ok(r);
+            }
+            Err(DelegateError::ServeDown) => return Err(DelegateError::ServeDown),
+            Err(DelegateError::Failed(e)) => return Err(DelegateError::Failed(e)),
+            Err(DelegateError::ServeUnresponsive) => {
+                eprintln!(
+                    "{}",
+                    format!("⏳ still warming up ({attempt}/{SERVE_WARMUP_RETRIES})...").yellow()
+                );
+            }
+        }
+    }
+
+    Err(DelegateError::ServeUnresponsive)
+}
+
 /// Outcome of probing the serve `/health` endpoint.
 enum ServeProbe {
     /// Serve answered — safe to delegate.
@@ -1666,6 +1723,14 @@ impl std::fmt::Display for DelegateError {
 /// listening but busy, e.g. warming up repos at startup). Connection-refused is
 /// never retried, so the "no serve → index locally" path stays fast.
 const SERVE_HEALTH_RETRIES: u32 = 3;
+
+/// When serve is reachable but still warming up, how many times to retry the
+/// full delegation before giving up. Each iteration waits SERVE_WARMUP_RETRY_SLEEP
+/// then probes health + attempts delegation again.
+/// Budget: ~6 × (14s probe + 8s sleep) ≈ 2 min — covers a 15-repo warmup.
+const SERVE_WARMUP_RETRIES: u32 = 6;
+/// Sleep between warmup retries. Long enough for serve to finish warming one repo.
+const SERVE_WARMUP_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_secs(8);
 /// Sleep between serve `/health` timeout retries.
 const SERVE_HEALTH_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(600);
 
@@ -1864,6 +1929,38 @@ async fn try_delegate_reindex_to_serve(
         if !add_resp.status().is_success() {
             let add_status = add_resp.status();
             let add_text = add_resp.text().await.unwrap_or_default();
+
+            // 409 means serve already has this alias registered (the alias is in
+            // repos.json) but the DB directory is missing. POST /repos correctly
+            // rejects the duplicate registration. The right recovery is a force
+            // reindex, which uses allow_create=true and re-creates the DB.
+            if add_status == reqwest::StatusCode::CONFLICT {
+                tracing::info!(
+                    "alias '{}' already registered on serve (409), retrying as force reindex \
+                     to recreate missing database",
+                    alias
+                );
+                let force_url = format!("{}/repos/{}/reindex?force=true", base_url, alias);
+                let force_resp = client
+                    .post(&force_url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("force reindex POST failed: {}", e))?;
+                if force_resp.status().is_success() {
+                    tracing::info!(
+                        "force reindex accepted for '{}', DB will be recreated in background",
+                        alias
+                    );
+                    return Ok((alias, project_path));
+                }
+                let force_status = force_resp.status();
+                let force_text = force_resp.text().await.unwrap_or_default();
+                return Err(DelegateError::Failed(format!(
+                    "force reindex returned {} for alias '{}': {}",
+                    force_status, alias, force_text
+                )));
+            }
+
             return Err(DelegateError::Failed(format!(
                 "auto-register returned {} for alias '{}': {}",
                 add_status, alias, add_text

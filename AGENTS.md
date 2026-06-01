@@ -207,6 +207,13 @@ those tests will pass but a path-operation bug will manifest at runtime on Windo
 
 ## Remaining work
 
+- [ ] **Warmup blocks tokio runtime** — `perform_incremental_refresh_with_stores` in
+  `src/index/manager.rs` does synchronous file I/O (`FileWalker::walk`, `FileMetaStore::load_or_create`,
+  file hashing) and CPU-intensive embedding directly on the async executor without `spawn_blocking`.
+  During Phase 1 warmup of 15+ repos this starves the tokio threadpool, causing `/health` to time out.
+  Mitigation already in place: the CLI waits up to ~2 min for serve to become ready before refusing.
+  Real fix: wrap the sync-I/O-heavy sections inside `tokio::task::spawn_blocking` so the executor
+  stays responsive. This is a non-trivial refactor (the fn is async and takes `&SharedStores`).
 - [ ] Verify on live large repo: 1st `find_impact` call triggers lazy find-refs, 2nd+ call < 100ms (cache hit)
 - [ ] CI green on `csharp-integration-tests` job *(first run after push)*
 - [ ] Minor: warn if `--filter-project` passed to `find-refs` CLI (currently silently ignored)
