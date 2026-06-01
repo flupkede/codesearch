@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a 404, which recreates the database via serve without any local fallback.
 
 
+
 ## [1.0.137] - 2026-06-01
 
 ### Fixed
