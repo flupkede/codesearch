@@ -51,7 +51,8 @@ impl ReposConfig {
         let content = fs::read_to_string(path)?;
 
         // New format
-        if let Ok(config) = serde_json::from_str::<Self>(&content) {
+        if let Ok(mut config) = serde_json::from_str::<Self>(&content) {
+            config.reconcile();
             return Ok(config);
         }
 
@@ -64,11 +65,13 @@ impl ReposConfig {
                 repos.insert(alias, path);
             }
 
-            return Ok(Self {
+            let mut config = Self {
                 repos,
                 groups: HashMap::new(),
                 repos_meta: HashMap::new(),
-            });
+            };
+            config.reconcile();
+            return Ok(config);
         }
 
         // Both parses failed — file is corrupt
@@ -76,6 +79,65 @@ impl ReposConfig {
             "repos.json is corrupt or unrecognised at: {}",
             path.display()
         ))
+    }
+
+    /// Harden an in-memory config loaded from disk so a hand-edited
+    /// `repos.json` can never crash the app. This is best-effort cleanup,
+    /// performed in memory only (no disk write here):
+    ///
+    /// 1. Drop repo entries whose alias key is empty/blank.
+    /// 2. Drop `repos_meta` entries that reference an unknown alias.
+    /// 3. Prune group members that reference unknown aliases; drop now-empty
+    ///    groups.
+    ///
+    /// Existing (non-empty) alias keys are never renamed — that would break
+    /// group references — so a merely "non-standard" hand-edited alias is
+    /// tolerated as-is.
+    pub fn reconcile(&mut self) {
+        // 1. Drop empty/blank alias keys.
+        let empty_keys: Vec<String> = self
+            .repos
+            .keys()
+            .filter(|alias| alias.trim().is_empty())
+            .cloned()
+            .collect();
+        for alias in empty_keys {
+            tracing::warn!("repos.json: dropping entry with empty alias key");
+            self.repos.remove(&alias);
+        }
+
+        // 2. Drop meta entries pointing at unknown aliases.
+        let orphan_meta: Vec<String> = self
+            .repos_meta
+            .keys()
+            .filter(|alias| !self.repos.contains_key(*alias))
+            .cloned()
+            .collect();
+        for alias in orphan_meta {
+            tracing::warn!("repos.json: dropping orphan metadata for '{}'", alias);
+            self.repos_meta.remove(&alias);
+        }
+
+        // 3. Prune group members referencing unknown aliases; drop empty groups.
+        let mut empty_groups: Vec<String> = Vec::new();
+        for (group, members) in self.groups.iter_mut() {
+            let before = members.len();
+            members.retain(|alias| self.repos.contains_key(alias));
+            if members.len() != before {
+                tracing::warn!(
+                    "repos.json: pruned {} unknown alias(es) from group '{}'",
+                    before - members.len(),
+                    group
+                );
+            }
+            if members.is_empty() {
+                empty_groups.push(group.clone());
+            }
+        }
+        for group in empty_groups {
+            tracing::warn!("repos.json: dropping now-empty group '{}'", group);
+            self.groups.remove(&group);
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -565,6 +627,47 @@ mod tests {
 
         std::fs::rename(&plain, tmp.path().join("plain-moved")).unwrap();
         assert!(cfg.try_relocate(&alias).is_none());
+    }
+
+    #[test]
+    fn reconcile_drops_empty_alias_key() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos.insert(String::new(), PathBuf::from("/tmp/x"));
+        cfg.repos
+            .insert("good".to_string(), PathBuf::from("/tmp/good"));
+        cfg.reconcile();
+        assert!(!cfg.repos.contains_key(""));
+        assert!(cfg.repos.contains_key("good"));
+    }
+
+    #[test]
+    fn reconcile_prunes_unknown_group_members_and_empty_groups() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        cfg.groups.insert(
+            "mix".to_string(),
+            vec!["real".to_string(), "ghost".to_string()],
+        );
+        cfg.groups
+            .insert("dead".to_string(), vec!["ghost".to_string()]);
+        cfg.reconcile();
+        assert_eq!(cfg.groups.get("mix"), Some(&vec!["real".to_string()]));
+        assert!(
+            !cfg.groups.contains_key("dead"),
+            "group with only unknown members should be dropped"
+        );
+    }
+
+    #[test]
+    fn reconcile_drops_orphan_meta() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        cfg.repos_meta
+            .insert("ghost".to_string(), RepoMeta::default());
+        cfg.reconcile();
+        assert!(!cfg.repos_meta.contains_key("ghost"));
     }
 
     #[test]
