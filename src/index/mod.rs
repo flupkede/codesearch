@@ -61,13 +61,9 @@ fn get_db_path_smart(
     let target = path.as_deref();
     let project_path = path.as_deref().unwrap_or(Path::new("."));
 
-    // Try to canonicalize, but fall back to original path if it fails
-    // Then normalize: strip UNC prefix (\\?\) and use forward slashes for consistency
-    let canonical_path = PathBuf::from(normalize_path(
-        &project_path
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(project_path)),
-    ));
+    // Canonicalize and strip any Windows UNC prefix (\\?\) via the central helper.
+    let canonical_path =
+        safe_canonicalize(project_path).unwrap_or_else(|_| PathBuf::from(project_path));
 
     // Step 1: Handle --force flag — delete databases
     if force {
