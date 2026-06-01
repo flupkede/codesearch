@@ -590,10 +590,15 @@ impl ServeState {
             info!("reconcile: relocated '{}' → {}", alias, new_path.display());
         }
         for alias in &unresolved {
+            let missing = config
+                .repos
+                .get(alias)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
             warn!(
-                "reconcile: '{}' path missing; skipping — \
+                "reconcile: '{}' path missing ({}); skipping — \
                  run `codesearch index prune` to remove it",
-                alias
+                alias, missing
             );
         }
 
