@@ -267,6 +267,27 @@ LMDB **does not allow** two `EnvOpenOptions::open()` handles on the same directo
 
 ---
 
+## Release workflow — `/merge` and `/release`
+
+Two committed Claude Code slash commands codify the release process
+(`.claude/commands/merge.md`, `.claude/commands/release.md`; force-added past `.gitignore`).
+
+- **`/merge`** — land the current feature branch on `develop`: README/CHANGELOG freshness
+  checks → commit → `cargo fmt`/`check`/`clippy` → push → PR to `develop` → `gh pr merge --auto`
+  (lands after CI). Does **not** tag.
+- **`/release`** — `/merge`, then promote `develop` → `master` via a `Release vX.Y.Z` PR
+  (`protect-master.yml` allows PRs to `master` only from `develop` or `release/*`), then push
+  the `vX.Y.Z` tag that triggers `.github/workflows/release.yml` (6 archives, plain +
+  `-with-csharp`). Includes an optional post-release `master → develop` sync.
+
+**Version rule (encoded in the commands):** the `pre-commit` hook bumps the patch (+1) and
+rebuilds **only on `feature/*` | `features/*` | `fix/*` branches**; `develop`/`master`/`release`/
+`chore` get `cargo fmt` only. So the release version is fixed at the feature-branch commit and
+carries forward unchanged through develop, master, and the tag. `/merge` therefore aborts unless
+run from a feature/fix branch.
+
+---
+
 ## Live Test Report — 2026-05-08
 
 **Versie**: codesearch v1.0.93+416  
