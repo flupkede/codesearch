@@ -61,6 +61,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (caller refuses to create a local duplicate).
 
 
+## [1.0.135] - 2026-05-27
+
+### Fixed
+
+- **MCP local/stdio mode ignores `project`/`group` params** — when running
+  `codesearch mcp` without `codesearch serve` (Local mode), passing `project` or
+  `group` parameters caused a hard error: *"project/group routing requires
+  `codesearch serve` to be running."* The LLM (Claude Code) auto-fills these
+  params from the tool schema. Now they are silently ignored with a warning log,
+  and the local database is used. Closes #65.
+- **QC script `YELLOW` color variable undefined** — `scripts/qc.sh` referenced
+  `YELLOW` without defining it, causing `set -u` failures on Linux. Fixed by
+  adding the missing color constant.
+
+### Changed
+
+- **`protect-master.yml` allows `release/*` branches** — CI branch protection
+  workflow now accepts PRs from both `develop` and `release/*` branches into
+  `master`, enabling clean release branches when develop has diverged.
+
+
 ## [1.0.132] - 2026-05-22
 
 ### Added

@@ -8,11 +8,12 @@ jobs:
   check-source-branch:
     runs-on: ubuntu-latest
     steps:
-      - name: Ensure PR targets master only from develop
+      - name: Ensure PR targets master only from develop or release branches
         run: |
-          if [ "${{ github.head_ref }}" != "develop" ]; then
-            echo "::error::PRs to master must come from the develop branch. Got: ${{ github.head_ref }}"
+          SOURCE="${{ github.head_ref }}"
+          if [[ "$SOURCE" != "develop" && ! "$SOURCE" =~ ^release/ ]]; then
+            echo "::error::PRs to master must come from develop or release/* branches. Got: $SOURCE"
             echo "Please target your PR to develop instead."
             exit 1
           fi
-          echo "OK: PR source is develop"
+          echo "OK: PR source is '$SOURCE'"
