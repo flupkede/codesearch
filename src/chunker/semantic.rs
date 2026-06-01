@@ -111,7 +111,7 @@ impl SemanticChunker {
     /// captures the section's place in the document (e.g. `File: x.md > Title >
     /// Subsection`). Leading document content (YAML front-matter, prose before the
     /// first heading) becomes a single preamble chunk. Oversized sections are
-    /// char/line-bounded via `split_if_needed`, and a file with no parseable
+    /// char/line-bounded via `split_oversized`, and a file with no parseable
     /// structure falls back to the line-windowed chunker (also bounded).
     fn chunk_markdown(&mut self, path: &Path, content: &str) -> Result<Vec<Chunk>> {
         let bounded_fallback = |this: &Self| -> Vec<Chunk> {
