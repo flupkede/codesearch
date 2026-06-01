@@ -506,19 +506,14 @@ fn relocate_max_depth() -> usize {
 
 /// Directory names never worth descending into during a relocation scan.
 fn is_skippable_scan_dir(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some(
-            ".git"
-                | "node_modules"
-                | "target"
-                | "bin"
-                | "obj"
-                | "dist"
-                | "build"
-                | ".codesearch.db"
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name == crate::constants::DB_DIR_NAME
+        || matches!(
+            name,
+            ".git" | "node_modules" | "target" | "bin" | "obj" | "dist" | "build"
         )
-    )
 }
 
 /// Recursively collect git roots under `dir` (bounded by `depth`) whose
