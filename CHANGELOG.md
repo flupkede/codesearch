@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.149] - 2026-06-01
+
+### Added
+
+- **Best-effort relocation of moved/renamed repositories** — every repo's git
+  remote (`remote.origin.url`) is now captured at registration. When a
+  registered folder is renamed or moved, `codesearch serve` no longer crashes:
+  on startup it reconciles all paths, and for each missing path it scans nearby
+  folders (bounded depth, override with `CODESEARCH_RELOCATE_MAX_DEPTH`, default
+  `3`) for a git checkout with the same remote. A single unambiguous match is
+  rewritten into `repos.json`; ambiguous/absent matches are logged and skipped
+  (the dead path is never indexed). Phase-2 (C# SCIP) and Phase-3 (pre-warm)
+  also guard `path.exists()` so a stale path can never reach heavy code paths.
+- **`codesearch index prune`** — new command that relocates moved repos first,
+  then unregisters any remaining stale entries, printing a summary.
+
+### Changed
+
+- **The user-settable `--alias`/`-a` flag was removed from `index add`** — the
+  alias (the `repos.json` key, used by groups and the MCP `project` argument) is
+  now always derived from the repository directory name. In practice the alias
+  always had to equal the directory name, so a custom alias only caused
+  downstream mismatches. The `index symbol <alias>` positional (a lookup key) is
+  unchanged.
+
+### Fixed
+
+- **A hand-edited or corrupt-ish `repos.json` no longer crashes the app** — on
+  load the config is reconciled in memory: entries with empty/blank alias keys
+  are dropped, orphaned `repos_meta` is removed, and group members referencing
+  unknown aliases (and groups left empty) are pruned. Valid aliases are never
+  renamed (that would break group references).
+
+
 ## [1.0.142] - 2026-06-01
 
 ### Fixed
