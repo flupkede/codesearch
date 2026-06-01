@@ -444,32 +444,37 @@ pub async fn index(
                 );
                 return Ok(());
             }
-            Err(reason) => {
-                // Distinguish: serve not running (quiet fallback) vs. serve running
-                // but delegation failed (warn about potential conflict).
-                let reason_lower = reason.to_lowercase();
-                let serve_was_running = !reason_lower.contains("serve not reachable")
-                    && !reason_lower.contains("connection refused")
-                    && !reason_lower.contains("connect to server");
-                if serve_was_running {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "⚠️  codesearch serve is running but could not delegate: {}",
-                            reason
-                        )
-                        .yellow()
-                    );
-                    eprintln!(
-                        "{}",
-                        "   Running locally — LMDB file-lock conflicts are possible.".yellow()
-                    );
-                } else {
-                    debug!(
-                        "Could not delegate reindex to serve (falling back to local): {}",
+            Err(DelegateError::ServeDown) => {
+                // Serve is not running — index locally. Connection-refused is
+                // detected immediately, so this fast path is not slowed down.
+                debug!("serve not running; indexing locally");
+            }
+            Err(DelegateError::ServeUnresponsive) => {
+                // Serve IS running but did not answer /health in time (likely
+                // still warming up). Creating a local index now would produce a
+                // duplicate that conflicts with the serve-managed one, so abort
+                // loudly instead of silently duplicating.
+                return Err(anyhow::anyhow!(
+                    "codesearch serve is running but did not respond in time (it may still be \
+                     warming up). Refusing to create a local duplicate index.\n   \
+                     Try again in a moment, or stop serve first to index locally."
+                ));
+            }
+            Err(DelegateError::Failed(reason)) => {
+                // Serve responded but the delegation step failed. Warn about the
+                // potential file-lock conflict from running locally.
+                eprintln!(
+                    "{}",
+                    format!(
+                        "⚠️  codesearch serve is running but could not delegate: {}",
                         reason
-                    );
-                }
+                    )
+                    .yellow()
+                );
+                eprintln!(
+                    "{}",
+                    "   Running locally — LMDB file-lock conflicts are possible.".yellow()
+                );
             }
         }
     }
@@ -1269,9 +1274,26 @@ pub async fn add_to_index(
             println!("   Index creation running in background on the server.");
             return Ok(());
         }
-        Err(reason) => {
-            // Serve not running or delegation failed — fall through to local operation.
-            tracing::debug!("add_to_index: delegation skipped ({})", reason);
+        Err(DelegateError::ServeDown) => {
+            // Serve not running — fall through to local add (fast: refused is instant).
+            tracing::debug!("add_to_index: serve not running, adding locally");
+        }
+        Err(DelegateError::ServeUnresponsive) => {
+            // Serve IS running but unresponsive (warming up). Don't create a local
+            // duplicate index — abort with guidance instead.
+            return Err(anyhow::anyhow!(
+                "codesearch serve is running but did not respond in time (it may still be \
+                 warming up). Refusing to create a local duplicate index.\n   \
+                 Try again in a moment, or stop serve first to add locally."
+            ));
+        }
+        Err(DelegateError::Failed(reason)) => {
+            // Serve responded but delegation failed — warn and fall through to local.
+            eprintln!(
+                "{}",
+                format!("⚠️  serve is running but could not delegate: {}", reason).yellow()
+            );
+            eprintln!("   Adding locally instead.");
         }
     }
 
@@ -1601,6 +1623,90 @@ struct DbStats {
     bloat_ratio: Option<f64>,
 }
 
+/// Outcome of probing the serve `/health` endpoint.
+enum ServeProbe {
+    /// Serve answered — safe to delegate.
+    Up,
+    /// Nothing is listening (connection refused / cannot connect). Serve is not
+    /// running, so local indexing is appropriate. Detected immediately — the
+    /// HTTP timeout never elapses for a refused connection, so the common
+    /// "no serve → index locally" path stays fast.
+    Down,
+    /// A socket is listening but did not answer in time (serve is busy, e.g.
+    /// warming up many repos at startup). Callers MUST NOT create a local
+    /// duplicate index in this case — that is the bug this distinction prevents.
+    Unresponsive,
+}
+
+/// Why delegation to a running serve did not complete.
+pub(crate) enum DelegateError {
+    /// Serve is not running. Local indexing is the right fallback.
+    ServeDown,
+    /// Serve is running but did not respond to `/health` in time (busy/warming).
+    /// Callers must surface this loudly and must NOT create a local duplicate.
+    ServeUnresponsive,
+    /// Serve responded but a later delegation step failed.
+    Failed(String),
+}
+
+impl From<String> for DelegateError {
+    fn from(s: String) -> Self {
+        DelegateError::Failed(s)
+    }
+}
+
+impl std::fmt::Display for DelegateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DelegateError::ServeDown => write!(f, "serve is not running"),
+            DelegateError::ServeUnresponsive => {
+                write!(f, "serve is running but did not respond in time (busy)")
+            }
+            DelegateError::Failed(reason) => write!(f, "{}", reason),
+        }
+    }
+}
+
+/// How many times to retry the serve `/health` probe on *timeout* (serve is
+/// listening but busy, e.g. warming up repos at startup). Connection-refused is
+/// never retried, so the "no serve → index locally" path stays fast.
+const SERVE_HEALTH_RETRIES: u32 = 3;
+/// Sleep between serve `/health` timeout retries.
+const SERVE_HEALTH_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// Probe serve `/health`, distinguishing "not running" from "busy".
+///
+/// A *connection refused* (or any non-timeout connect error) returns
+/// [`ServeProbe::Down`] immediately, so the common "no serve → index locally"
+/// path is not slowed down. Only a *timeout* — a socket is listening but slow,
+/// which is what happens while serve warms up many repos — triggers a small,
+/// bounded set of retries before returning [`ServeProbe::Unresponsive`].
+async fn probe_serve_health(
+    client: &reqwest::Client,
+    base_url: &str,
+    max_timeout_retries: u32,
+    retry_sleep: std::time::Duration,
+) -> ServeProbe {
+    let url = format!("{}/health", base_url);
+    let mut attempt: u32 = 0;
+    loop {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => return ServeProbe::Up,
+            // A socket answered (even non-2xx) — serve is up and reachable.
+            Ok(_) => return ServeProbe::Up,
+            Err(e) if e.is_timeout() => {
+                if attempt >= max_timeout_retries {
+                    return ServeProbe::Unresponsive;
+                }
+                attempt += 1;
+                tokio::time::sleep(retry_sleep).await;
+            }
+            // Connection refused / cannot connect → nothing is listening.
+            Err(_) => return ServeProbe::Down,
+        }
+    }
+}
+
 /// Try to delegate a reindex to a running serve instance.
 ///
 /// Returns `Ok((alias, project_path))` if the serve accepted the reindex request.
@@ -1608,7 +1714,7 @@ struct DbStats {
 async fn try_delegate_reindex_to_serve(
     path: &Option<PathBuf>,
     force: bool,
-) -> std::result::Result<(String, PathBuf), String> {
+) -> std::result::Result<(String, PathBuf), DelegateError> {
     use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
@@ -1618,28 +1724,23 @@ async fn try_delegate_reindex_to_serve(
 
     let base_url = format!("http://127.0.0.1:{}", port);
 
-    // 1. Health check — is serve running?
+    // 1. Health check — is serve running (and responsive)?
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|e| format!("failed to build HTTP client: {}", e))?;
 
-    let health_resp = client
-        .get(format!("{}/health", base_url))
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "serve not reachable at {} ({}). Is 'codesearch serve' running?",
-                base_url, e
-            )
-        })?;
-
-    if !health_resp.status().is_success() {
-        return Err(format!(
-            "serve health check returned {}",
-            health_resp.status()
-        ));
+    match probe_serve_health(
+        &client,
+        &base_url,
+        SERVE_HEALTH_RETRIES,
+        SERVE_HEALTH_RETRY_SLEEP,
+    )
+    .await
+    {
+        ServeProbe::Up => {}
+        ServeProbe::Down => return Err(DelegateError::ServeDown),
+        ServeProbe::Unresponsive => return Err(DelegateError::ServeUnresponsive),
     }
 
     // 2. Resolve the project path to an alias by loading repos config
@@ -1727,10 +1828,10 @@ async fn try_delegate_reindex_to_serve(
         if !add_resp.status().is_success() {
             let add_status = add_resp.status();
             let add_text = add_resp.text().await.unwrap_or_default();
-            return Err(format!(
+            return Err(DelegateError::Failed(format!(
                 "auto-register returned {} for alias '{}': {}",
                 add_status, alias, add_text
-            ));
+            )));
         }
 
         // Auto-register returns 202 Accepted — indexing runs in background.
@@ -1742,10 +1843,10 @@ async fn try_delegate_reindex_to_serve(
         );
         Ok((alias, project_path))
     } else {
-        Err(format!(
+        Err(DelegateError::Failed(format!(
             "serve returned {} for alias '{}': {}",
             status, alias, body
-        ))
+        )))
     }
 }
 
@@ -1758,7 +1859,7 @@ pub(crate) async fn try_delegate_add_to_serve(
     path: &Option<PathBuf>,
     alias: &Option<String>,
     global: bool,
-) -> std::result::Result<(String, PathBuf), String> {
+) -> std::result::Result<(String, PathBuf), DelegateError> {
     use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
@@ -1768,28 +1869,23 @@ pub(crate) async fn try_delegate_add_to_serve(
 
     let base_url = format!("http://127.0.0.1:{}", port);
 
-    // 1. Health check
+    // 1. Health check — is serve running (and responsive)?
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|e| format!("failed to build HTTP client: {}", e))?;
 
-    let health_resp = client
-        .get(format!("{}/health", base_url))
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "serve not reachable at {} ({}). Is 'codesearch serve' running?",
-                base_url, e
-            )
-        })?;
-
-    if !health_resp.status().is_success() {
-        return Err(format!(
-            "serve health check returned {}",
-            health_resp.status()
-        ));
+    match probe_serve_health(
+        &client,
+        &base_url,
+        SERVE_HEALTH_RETRIES,
+        SERVE_HEALTH_RETRY_SLEEP,
+    )
+    .await
+    {
+        ServeProbe::Up => {}
+        ServeProbe::Down => return Err(DelegateError::ServeDown),
+        ServeProbe::Unresponsive => return Err(DelegateError::ServeUnresponsive),
     }
 
     // 2. Resolve path
@@ -1832,7 +1928,10 @@ pub(crate) async fn try_delegate_add_to_serve(
     } else {
         let status = add_resp.status();
         let text = add_resp.text().await.unwrap_or_default();
-        Err(format!("serve returned {}: {}", status, text))
+        Err(DelegateError::Failed(format!(
+            "serve returned {}: {}",
+            status, text
+        )))
     }
 }
 
@@ -1916,5 +2015,76 @@ pub(crate) async fn try_delegate_rm_to_serve(
             "serve returned {} for alias '{}': {}",
             status, alias, text
         ))
+    }
+}
+
+#[cfg(test)]
+mod serve_probe_tests {
+    use super::{probe_serve_health, ServeProbe};
+    use std::time::Duration;
+
+    /// Spawn a minimal HTTP server exposing `/health`. If `delay` is set, the
+    /// handler sleeps that long before answering (to simulate a busy serve).
+    async fn spawn_health_server(delay: Option<Duration>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || async move {
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                "ok"
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // Give the accept loop a moment to start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        format!("http://{}", addr)
+    }
+
+    fn client(timeout: Duration) -> reqwest::Client {
+        reqwest::Client::builder().timeout(timeout).build().unwrap()
+    }
+
+    /// A responsive `/health` → `Up` (delegation proceeds normally).
+    #[tokio::test]
+    async fn probe_reports_up_when_health_responds() {
+        let base = spawn_health_server(None).await;
+        let c = client(Duration::from_secs(2));
+        assert!(
+            matches!(
+                probe_serve_health(&c, &base, 3, Duration::from_millis(10)).await,
+                ServeProbe::Up
+            ),
+            "responsive /health must be Up"
+        );
+    }
+
+    /// A socket that listens but never answers in time must be `Unresponsive`,
+    /// NOT `Down` — this is the core of the fix: the caller treats `Unresponsive`
+    /// as "serve is up but busy" and refuses to create a local duplicate index,
+    /// instead of silently indexing locally. This is exactly the warmup scenario
+    /// that produced a duplicate index.
+    ///
+    /// (The `Down` branch — a *non-timeout* connect error such as connection
+    /// refused → `Down`, fast, no retries — is intentionally not unit-tested:
+    /// reliably producing a "refused" socket is OS-dependent. On this Windows
+    /// host a just-closed loopback port and the reserved port `:1` both *hang*
+    /// instead of refusing, which would make such a test flaky.)
+    #[tokio::test]
+    async fn probe_reports_unresponsive_when_listening_but_slow() {
+        let base = spawn_health_server(Some(Duration::from_secs(30))).await;
+        // Tiny per-request timeout so each attempt times out quickly.
+        let c = client(Duration::from_millis(150));
+        assert!(
+            matches!(
+                probe_serve_health(&c, &base, 2, Duration::from_millis(10)).await,
+                ServeProbe::Unresponsive
+            ),
+            "listening-but-slow serve must be Unresponsive, not Down"
+        );
     }
 }

@@ -7,10 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
-## [1.0.136] - 2026-06-01
+## [1.0.137] - 2026-06-01
 
 ### Fixed
 
+- **`codesearch index` silently created a local duplicate index when `serve`
+  was busy starting up** — the CLI probes `serve`'s `/health` before delegating.
+  Any failure (including a *timeout* while `serve` was warming up its repos) was
+  treated as "serve is not running", so the CLI silently fell back to creating a
+  **local index** — a duplicate that `serve` does not manage and that can cause
+  LMDB file-lock conflicts. The health probe now distinguishes three cases:
+  *responsive* (delegate), *connection refused / not running* (index locally —
+  detected immediately, so the local path is not slowed down), and *listening
+  but unresponsive* (serve is up but busy). In the last case the CLI now
+  **refuses to create a local duplicate** and asks you to retry shortly or stop
+  `serve` first, instead of silently duplicating. The fallback is never silent
+  anymore.
 - **`codesearch index` could not register a brand-new repo via a running
   `serve` instance** — when `serve` was running and you indexed a repo that
   was not yet known to it, the auto-register call (`POST /repos`) failed with
@@ -44,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`try_open_stores`, `SharedStores::new`, `acquire_writer_lock`, and an
   end-to-end `add_repo_handler` test asserting 202 + no `repos.json`
   rollback). These were verified to fail against the pre-fix code.
+- Added guards for the serve `/health` probe classification: a responsive
+  endpoint → delegate, and a listening-but-slow endpoint → "unresponsive"
+  (caller refuses to create a local duplicate).
 
 
 ## [1.0.132] - 2026-05-22
