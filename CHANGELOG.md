@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.142] - 2026-06-01
+
+### Fixed
+
+- **`codesearch serve` became unresponsive during startup warmup** — heavy
+  synchronous work (`FileWalker::walk`, `VectorStore::build_index` HNSW
+  construction, and fastembed/ONNX embedding which saturates all CPU cores)
+  ran directly on tokio worker threads while warming up repos at startup. This
+  starved the async runtime so `/health` timed out (>3s), causing
+  `codesearch index` to report "serve did not respond in time". That work is
+  now offloaded to `tokio::task::spawn_blocking`, keeping the async executor
+  responsive: serve answers `/health` and accepts `POST /repos[/:alias/reindex]`
+  immediately during warmup, returning 202 and running the index job in the
+  background (accept-and-defer) instead of making the client wait or fail.
+  Lock safety: every async `RwLock` guard is released before the blocking task
+  acquires `blocking_write()` on the same store, so there is no lock-over-await
+  deadlock.
+
+
 ## [1.0.138] - 2026-06-01
 
 ### Fixed

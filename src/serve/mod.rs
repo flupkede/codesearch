@@ -1084,21 +1084,44 @@ impl ServeState {
             OpenedStores::Write(s) => s,
         };
 
-        // Build vector index from existing data
-        {
-            let mut vstore = stores.vector_store.write().await;
+        // Build vector index from existing data.
+        //
+        // `build_index()` is a synchronous, CPU-heavy operation (HNSW graph
+        // construction). Running it directly on a tokio worker thread starves
+        // the async executor and makes `/health` time out during warmup, so it
+        // is offloaded to `spawn_blocking`. Stats are read first under a short
+        // `.read()` lock to decide whether a build is even needed.
+        let needs_build = {
+            let vstore = stores.vector_store.read().await;
             match vstore.stats() {
-                Ok(s) if s.total_chunks > 0 && !s.indexed => {
-                    info!(
-                        "Warmup '{}': building vector index ({} existing chunks)",
-                        alias, s.total_chunks
-                    );
-                    if let Err(e) = vstore.build_index() {
-                        warn!("Warmup '{}': failed to build vector index: {}", alias, e);
-                    }
+                Ok(s) if s.total_chunks > 0 && !s.indexed => Some(s.total_chunks),
+                Ok(_) => None,
+                Err(e) => {
+                    warn!("Warmup '{}': could not read stats: {}", alias, e);
+                    None
                 }
-                Ok(_) => {}
-                Err(e) => warn!("Warmup '{}': could not read stats: {}", alias, e),
+            }
+        };
+        if let Some(total_chunks) = needs_build {
+            info!(
+                "Warmup '{}': building vector index ({} existing chunks)",
+                alias, total_chunks
+            );
+            let vector_store = Arc::clone(&stores.vector_store);
+            match tokio::task::spawn_blocking(move || {
+                let mut vstore = vector_store.blocking_write();
+                vstore.build_index()
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("Warmup '{}': failed to build vector index: {}", alias, e)
+                }
+                Err(e) => warn!(
+                    "Warmup '{}': build vector index task panicked: {}",
+                    alias, e
+                ),
             }
         }
 

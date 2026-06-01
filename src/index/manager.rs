@@ -509,9 +509,15 @@ impl IndexManager {
             }
         }
 
-        // Walk files
-        let walker = FileWalker::new(codebase_path.to_path_buf());
-        let (files, _stats) = walker.walk()?;
+        // Walk files.
+        //
+        // `FileWalker::walk()` is synchronous and I/O-heavy (recursive directory
+        // traversal). Offload it to `spawn_blocking` so it does not block tokio
+        // worker threads during warmup.
+        let codebase = codebase_path.to_path_buf();
+        let (files, _stats) = tokio::task::spawn_blocking(move || FileWalker::new(codebase).walk())
+            .await
+            .map_err(|e| anyhow::anyhow!("file walk task panicked: {}", e))??;
 
         // Find changed and deleted files
         let mut changed_files = Vec::new();
@@ -601,35 +607,59 @@ impl IndexManager {
         if !changed_files.is_empty() {
             info!("🔄 Processing {} changed files...", changed_files.len());
 
-            let mut chunker = SemanticChunker::new(100, 2000, 10);
-            let mut all_chunks = Vec::new();
+            // Read + chunk + embed is synchronous, CPU/I/O-heavy work
+            // (file reads, tree-sitter parsing, fastembed/ONNX inference that
+            // saturates all cores). Offload the whole block to `spawn_blocking`
+            // so it never runs on a tokio worker thread. The `EmbeddingService`
+            // and `SemanticChunker` are built inside the closure because they
+            // are not needed on the async side and may not be `Send`.
+            let cache_dir = crate::constants::get_global_models_cache_dir()?;
+            let files_for_embed = changed_files.clone();
+            let embedded_chunks =
+                tokio::task::spawn_blocking(move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
+                    let mut chunker = SemanticChunker::new(100, 2000, 10);
+                    let mut all_chunks = Vec::new();
 
-            for file in &changed_files {
-                let content = match std::fs::read_to_string(&file.path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let chunks = chunker.chunk_semantic(file.language, &file.path, &content)?;
-                all_chunks.extend(chunks);
-            }
+                    for file in &files_for_embed {
+                        let content = match std::fs::read_to_string(&file.path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let chunks = chunker.chunk_semantic(file.language, &file.path, &content)?;
+                        all_chunks.extend(chunks);
+                    }
 
-            if !all_chunks.is_empty() {
-                // Embed chunks
-                info!("📦 Embedding {} chunks...", all_chunks.len());
-                let cache_dir = crate::constants::get_global_models_cache_dir()?;
-                let mut embedding_service = EmbeddingService::with_cache_dir(
-                    ModelType::default(),
-                    Some(cache_dir.as_path()),
-                )?;
-                let embedded_chunks = embedding_service.embed_chunks(all_chunks)?;
+                    if all_chunks.is_empty() {
+                        return Ok(Vec::new());
+                    }
 
-                // Insert into vector store
+                    info!("📦 Embedding {} chunks...", all_chunks.len());
+                    let mut embedding_service = EmbeddingService::with_cache_dir(
+                        ModelType::default(),
+                        Some(cache_dir.as_path()),
+                    )?;
+                    embedding_service.embed_chunks(all_chunks)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("chunk+embed task panicked: {}", e))??;
+
+            if !embedded_chunks.is_empty() {
+                // Insert into vector store. The HNSW `build_index()` is CPU-heavy,
+                // so it is offloaded to `spawn_blocking`; the insert itself needs
+                // the async RwLock and stays here.
                 let chunk_ids = {
                     let mut store = stores.vector_store.write().await;
-                    let ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
-                    store.build_index()?;
-                    ids
+                    store.insert_chunks_with_ids(embedded_chunks.clone())?
                 };
+                {
+                    let vector_store = Arc::clone(&stores.vector_store);
+                    tokio::task::spawn_blocking(move || {
+                        let mut store = vector_store.blocking_write();
+                        store.build_index()
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
+                }
 
                 // Insert into FTS
                 {
@@ -1395,9 +1425,13 @@ impl IndexManager {
         set_quiet(true);
 
         let result: Result<()> = async {
-            // Phase 1: Discover current files on disk
-            let walker = FileWalker::new(codebase_path.to_path_buf());
-            let (files, stats) = walker.walk()?;
+            // Phase 1: Discover current files on disk.
+            // `walk()` is synchronous + I/O-heavy — offload off the async executor.
+            let codebase = codebase_path.to_path_buf();
+            let (files, stats) =
+                tokio::task::spawn_blocking(move || FileWalker::new(codebase).walk())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("file walk task panicked: {}", e))??;
             info!(
                 "🔍 Branch refresh: discovered {} indexable files ({} skipped)",
                 files.len(),
@@ -1477,10 +1511,16 @@ impl IndexManager {
             // index_single_file loads its own fresh copy per file)
             file_meta_store.save(db_path)?;
 
-            // Rebuild vector index after FileMetaStore-based deletions
+            // Rebuild vector index after FileMetaStore-based deletions.
+            // `build_index()` is CPU-heavy — run it on `spawn_blocking`.
             {
-                let mut vstore = stores.vector_store.write().await;
-                vstore.build_index()?;
+                let vector_store = Arc::clone(&stores.vector_store);
+                tokio::task::spawn_blocking(move || {
+                    let mut vstore = vector_store.blocking_write();
+                    vstore.build_index()
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
             }
 
             // Phase 3.5: VectorStore-direct orphan cleanup
@@ -1508,11 +1548,20 @@ impl IndexManager {
                         orphan_file_count
                     );
 
-                    // Delete orphan chunks from VectorStore
+                    // Delete orphan chunks from VectorStore, then rebuild the
+                    // HNSW index off the async executor (CPU-heavy).
                     {
                         let mut vstore = stores.vector_store.write().await;
                         vstore.delete_chunks(&orphan_chunk_ids)?;
-                        vstore.build_index()?;
+                    }
+                    {
+                        let vector_store = Arc::clone(&stores.vector_store);
+                        tokio::task::spawn_blocking(move || {
+                            let mut vstore = vector_store.blocking_write();
+                            vstore.build_index()
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
                     }
 
                     // Delete orphan chunks from FtsStore
@@ -2174,5 +2223,54 @@ mod tests {
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
         let deleted = reloaded.find_deleted_files();
         assert!(deleted.is_empty(), "All stale entries should be removed");
+    }
+
+    #[tokio::test]
+    async fn test_incremental_refresh_up_to_date_is_noop() {
+        // End-to-end smoke test for perform_incremental_refresh_with_stores after
+        // the file walk was moved onto spawn_blocking. When every on-disk file is
+        // already tracked in FileMetaStore (no changes, no deletions), the refresh
+        // must walk the codebase off the async executor and return Ok early without
+        // touching the embedder.
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        create_metadata_json(&db_path, 4);
+
+        // Write a real source file and record its metadata so check_file reports
+        // "unchanged" — this drives the no-changes branch (no embedding required).
+        let file = codebase_path.join("lib.rs");
+        std::fs::write(&file, "pub fn lib_fn() {}").unwrap();
+
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        // update_file hashes current on-disk content, so a subsequent check_file
+        // on the unmodified file returns needs_reindex = false.
+        file_meta.update_file(&file, vec![1]).unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let result = IndexManager::perform_incremental_refresh_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Up-to-date incremental refresh should succeed: {:?}",
+            result
+        );
+
+        // The tracked file must still be tracked and not flagged as deleted.
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        assert!(
+            reloaded.find_deleted_files().is_empty(),
+            "No files should be flagged deleted on an up-to-date refresh"
+        );
     }
 }
