@@ -93,7 +93,7 @@ impl ReposConfig {
     /// Existing (non-empty) alias keys are never renamed — that would break
     /// group references — so a merely "non-standard" hand-edited alias is
     /// tolerated as-is.
-    pub fn reconcile(&mut self) {
+    pub(crate) fn reconcile(&mut self) {
         // 1. Drop empty/blank alias keys.
         let empty_keys: Vec<String> = self
             .repos

@@ -22,6 +22,7 @@ Add symbol-aware reference lookups to codesearch via `find_impact` MCP tool. Ret
 - **`-with-csharp` release variants** — 6 release archives (3 plain + 3 with helper)
 - **Gated integration test** — `csharp_helper_integration` cargo feature for full-pipeline testing
 - **CI** — separate `csharp-integration-tests` job in `.github/workflows/ci.yml`
+- **Stale-path resilience + derived alias** — moved/renamed indexed folders no longer crash serve: `git_remote` captured at registration, `reconcile_all_paths()` best-effort relocates by matching `remote.origin.url` (bounded depth, `CODESEARCH_RELOCATE_MAX_DEPTH`, default 3) else warn+skip; `codesearch index prune` for manual cleanup. The `--alias` flag was removed (alias always = directory name). `ReposConfig::reconcile()` hardens hand-edited `repos.json` on load. See AGENTS.md for details.
 
 ## Architecture
 
