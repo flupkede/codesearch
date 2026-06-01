@@ -105,6 +105,7 @@ impl Language {
                 | Self::Php
                 | Self::Yaml
                 | Self::Json
+                | Self::Markdown
         )
     }
 
@@ -176,7 +177,9 @@ mod tests {
         assert!(Language::Python.supports_tree_sitter());
         assert!(Language::TypeScript.supports_tree_sitter());
         assert!(Language::Json.supports_tree_sitter());
-        assert!(!Language::Markdown.supports_tree_sitter());
+        assert!(Language::Markdown.supports_tree_sitter());
+        // Toml has no tree-sitter grammar yet.
+        assert!(!Language::Toml.supports_tree_sitter());
     }
 
     #[test]

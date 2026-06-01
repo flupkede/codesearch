@@ -72,6 +72,11 @@ impl GrammarManager {
             Language::Php => Ok(tree_sitter_php::LANGUAGE_PHP.into()),
             Language::Yaml => Ok(tree_sitter_yaml::LANGUAGE.into()),
             Language::Json => Ok(tree_sitter_json::LANGUAGE.into()),
+            // Markdown uses the tree-sitter-md *block* grammar (sections, headings,
+            // code fences). The inline grammar is intentionally not used: chunk
+            // boundaries only need block structure, and the block grammar runs on a
+            // plain `Parser` like every other language here.
+            Language::Markdown => Ok(tree_sitter_md::LANGUAGE.into()),
             _ => Err(anyhow!(
                 "Language {} does not support tree-sitter",
                 language.name()
@@ -96,6 +101,7 @@ impl GrammarManager {
             Language::Php,
             Language::Yaml,
             Language::Json,
+            Language::Markdown,
         ]
     }
 
@@ -251,9 +257,18 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_language() {
+    fn test_load_markdown_grammar() {
         let manager = GrammarManager::new();
         let grammar = manager.get_grammar(Language::Markdown);
+
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_unsupported_language() {
+        let manager = GrammarManager::new();
+        // Toml has no compiled-in grammar.
+        let grammar = manager.get_grammar(Language::Toml);
 
         assert!(grammar.is_none());
     }
@@ -304,6 +319,7 @@ mod tests {
         assert!(manager.is_supported(Language::Php));
         assert!(manager.is_supported(Language::Yaml));
         assert!(manager.is_supported(Language::Json));
-        assert!(!manager.is_supported(Language::Markdown));
+        assert!(manager.is_supported(Language::Markdown));
+        assert!(!manager.is_supported(Language::Toml));
     }
 }
