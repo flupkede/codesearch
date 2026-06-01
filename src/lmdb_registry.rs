@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use crate::cache::safe_canonicalize;
+
 // ── Global registry ─────────────────────────────────────────────
 
 static LMDB_REGISTRY: OnceLock<DashMap<PathBuf, LmdbEntry>> = OnceLock::new();
@@ -28,8 +30,7 @@ struct LmdbEntry {
 
 fn register(path: &Path, description: &str) -> Result<PathBuf> {
     let registry = LMDB_REGISTRY.get_or_init(DashMap::new);
-    let canonical = path
-        .canonicalize()
+    let canonical = safe_canonicalize(path)
         .with_context(|| format!("Cannot canonicalize LMDB path: {}", path.display()))?;
 
     // Use DashMap's atomic entry API to prevent TOCTOU race between check+insert.

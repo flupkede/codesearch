@@ -32,6 +32,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::cache::safe_canonicalize;
 use crate::constants::{
     CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT,
     CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, LANG_CSHARP,
@@ -2406,7 +2407,7 @@ async fn add_repo_handler(
     use axum::http::StatusCode;
 
     // Canonicalize the path
-    let canonical_path = match body.path.canonicalize() {
+    let canonical_path = match safe_canonicalize(&body.path) {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -2805,7 +2806,7 @@ pub async fn run_serve(
     // Load repos config (register any --register paths first)
     let mut config = ReposConfig::load().unwrap_or_default();
     for path in &register_paths {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let canonical = safe_canonicalize(path).unwrap_or_else(|_| path.clone());
         let alias = config.register(canonical);
         eprintln!("Registered repo '{}' -> {}", alias, path.display());
         info!("Registered repo '{}' -> {}", alias, path.display());

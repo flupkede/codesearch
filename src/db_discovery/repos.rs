@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::cache::{safe_canonicalize, strip_unc_prefix};
 use crate::constants::{CONFIG_DIR_NAME, REPOS_CONFIG_FILE};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -93,7 +94,10 @@ impl ReposConfig {
     }
 
     pub fn register(&mut self, path: PathBuf) -> String {
-        let canonical = strip_unc(path.canonicalize().unwrap_or(path));
+        // safe_canonicalize strips \\?\ on success; strip_unc_prefix handles the
+        // fallback so UNC paths never enter the registry even if the path doesn't
+        // exist yet (e.g. a path that will be created during indexing).
+        let canonical = safe_canonicalize(&path).unwrap_or_else(|_| strip_unc_prefix(path));
 
         if let Some((alias, _)) = self
             .repos
@@ -109,7 +113,7 @@ impl ReposConfig {
     }
 
     pub fn register_with_alias(&mut self, path: PathBuf, alias: Option<String>) -> Result<String> {
-        let canonical = strip_unc(path.canonicalize().unwrap_or(path));
+        let canonical = safe_canonicalize(&path).unwrap_or_else(|_| strip_unc_prefix(path));
 
         if let Some((existing_alias, _)) = self
             .repos
@@ -174,7 +178,8 @@ impl ReposConfig {
     }
 
     pub fn unregister_path(&mut self, path: &Path) -> bool {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical =
+            safe_canonicalize(path).unwrap_or_else(|_| strip_unc_prefix(path.to_path_buf()));
         let to_remove = self
             .repos
             .iter()
@@ -267,7 +272,8 @@ impl ReposConfig {
     }
 
     pub fn alias_for_path(&self, path: &Path) -> Option<String> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical =
+            safe_canonicalize(path).unwrap_or_else(|_| strip_unc_prefix(path.to_path_buf()));
         self.repos
             .iter()
             .find(|(_, p)| normalize_path_for_compare(p) == normalize_path_for_compare(&canonical))
@@ -346,21 +352,6 @@ fn sanitize_alias(raw: &str) -> String {
 
 fn normalize_path_for_compare(path: &Path) -> String {
     crate::cache::normalize_path(path)
-}
-
-/// Strip the Windows extended-length UNC prefix (`\\?\`) from a path so it is
-/// never persisted to repos.json in that form. `Path::canonicalize()` on Windows
-/// returns `\\?\C:\...`, which causes `Path::exists()` / `.join()` to behave
-/// inconsistently for sub-paths (e.g. `\\?\C:\foo\.codesearch.db` may not exist
-/// even when `C:\foo\.codesearch.db` does). Stripping the prefix before storage
-/// ensures all downstream path operations use the plain `C:\...` form.
-fn strip_unc(path: PathBuf) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        path
-    }
 }
 
 #[cfg(test)]

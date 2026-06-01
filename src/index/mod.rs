@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::cache::{normalize_path, FileMetaStore};
+use crate::cache::{normalize_path, safe_canonicalize, FileMetaStore};
 use crate::chunker::SemanticChunker;
 use crate::db_discovery::{
     find_best_database, is_registered_repository, register_repository, unregister_repository,
@@ -254,8 +254,7 @@ fn get_db_path_smart(
 /// Searches upward (unlimited), then one level down if nothing found upward.
 /// Returns `Ok(None)` if not in a git repo. Returns `Err` if multiple child repos found.
 pub(crate) fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
-    let mut current = start_path
-        .canonicalize()
+    let mut current = safe_canonicalize(start_path)
         .map_err(|e| anyhow::anyhow!("Failed to canonicalize path: {}", e))?;
 
     // Search up the directory tree (unlimited levels)
@@ -381,7 +380,7 @@ fn get_global_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
     use dirs::home_dir;
 
     let project_path = path.unwrap_or_else(|| PathBuf::from("."));
-    let canonical_path = project_path.canonicalize()?;
+    let canonical_path = safe_canonicalize(&project_path)?;
 
     // Create a unique name for the project based on its path
     // Use the directory name as the project identifier
@@ -1259,7 +1258,7 @@ pub async fn add_to_index(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
-    let canonical_path = project_path.canonicalize()?;
+    let canonical_path = safe_canonicalize(project_path)?;
 
     println!("{}", "➕ Add to Index".bright_green().bold());
     println!("{}", "=".repeat(60));
@@ -1449,7 +1448,7 @@ pub async fn add_to_index(
 /// Remove the index (local or global, auto-detected)
 pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Result<()> {
     let project_path = path.clone().unwrap_or_else(|| PathBuf::from("."));
-    let canonical_path = project_path.canonicalize()?;
+    let canonical_path = safe_canonicalize(&project_path)?;
 
     println!("{}", "➖ Remove Index".bright_red().bold());
     println!("{}", "=".repeat(60));
@@ -1747,10 +1746,9 @@ async fn try_delegate_reindex_to_serve(
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    // Canonicalize to resolve symlinks and normalize separators (incl. UNC on Windows)
-    let project_path = raw_project_path
-        .canonicalize()
-        .unwrap_or_else(|_| raw_project_path.clone());
+    // Canonicalize and strip UNC prefix (\\?\) for reliable path operations.
+    let project_path =
+        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
 
     let config = crate::db_discovery::repos::ReposConfig::load()
         .map_err(|e| format!("cannot load repos.json: {}", e))?;
@@ -1759,7 +1757,7 @@ async fn try_delegate_reindex_to_serve(
     /// relative components), then normalize via `cache::normalize_path` (strips
     /// Windows UNC prefix, converts backslashes) and lowercases for case-insensitive match.
     fn normalize_for_cmp(p: &std::path::Path) -> String {
-        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let canonical = safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         crate::cache::normalize_path(&canonical).to_lowercase()
     }
 
@@ -1931,9 +1929,8 @@ pub(crate) async fn try_delegate_add_to_serve(
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let project_path = raw_project_path
-        .canonicalize()
-        .unwrap_or_else(|_| raw_project_path.clone());
+    let project_path =
+        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
 
     // 3. Build request body
     let mut body = serde_json::json!({
@@ -2018,12 +2015,11 @@ pub(crate) async fn try_delegate_rm_to_serve(
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let project_path = raw_project_path
-        .canonicalize()
-        .unwrap_or_else(|_| raw_project_path.clone());
+    let project_path =
+        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
 
     fn normalize_for_cmp(p: &std::path::Path) -> String {
-        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let canonical = safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         crate::cache::normalize_path(&canonical).to_lowercase()
     }
 

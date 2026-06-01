@@ -176,6 +176,35 @@ Debugging this required reading serve logs — no user-visible indication that D
 
 ---
 
+## ⚠️ Canonical Path Policy — MANDATORY
+
+**On Windows `Path::canonicalize()` returns `\\?\C:\...` (extended-length UNC prefix).
+Using this prefix in `.join()`, `Path::exists()`, or storing it in `repos.json` is
+unreliable and has caused multiple recurring bugs.**
+
+### Rule: NEVER call `.canonicalize()` directly. Always use `safe_canonicalize()`.
+
+```rust
+// ❌ FORBIDDEN everywhere in the codebase
+let p = path.canonicalize()?;
+
+// ✅ REQUIRED — central entry point, strips \\?\ prefix
+use crate::cache::safe_canonicalize;
+let p = safe_canonicalize(path)?;
+```
+
+`safe_canonicalize` is defined in `src/cache/file_meta.rs` and exported via `crate::cache`.
+It calls `canonicalize()` then `strip_unc_prefix()` and returns the same `io::Result` type.
+
+If you need to strip the prefix from an already-canonicalized `PathBuf`, use `strip_unc_prefix(path)`.
+
+The regression test class is `safe_canonicalize_on_existing_dir_returns_plain_path` in
+`src/cache/file_meta.rs` and `register_strips_unc_prefix_from_stored_path` in
+`src/db_discovery/repos.rs`. If you add a new `canonicalize()` call and bypass this rule,
+those tests will pass but a path-operation bug will manifest at runtime on Windows.
+
+---
+
 ## Remaining work
 
 - [ ] Verify on live large repo: 1st `find_impact` call triggers lazy find-refs, 2nd+ call < 100ms (cache hit)
