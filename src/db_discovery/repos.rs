@@ -24,6 +24,10 @@ pub struct RepoMeta {
     /// Unix timestamp (seconds) of last successful SCIP index rebuild.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scip_indexed_unix: Option<i64>,
+    /// Git remote URL (`remote.origin.url`) captured at registration time.
+    /// Used to re-locate a repo whose folder was renamed/moved (best-effort).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +112,9 @@ impl ReposConfig {
         }
 
         let alias = unique_alias_for_path(&self.repos, &canonical);
+        if let Some(remote) = git_remote_url(&canonical) {
+            self.repos_meta.entry(alias.clone()).or_default().git_remote = Some(remote);
+        }
         self.repos.insert(alias.clone(), canonical);
         alias
     }
@@ -137,6 +144,12 @@ impl ReposConfig {
             None => unique_alias_for_path(&self.repos, &canonical),
         };
 
+        if let Some(remote) = git_remote_url(&canonical) {
+            self.repos_meta
+                .entry(final_alias.clone())
+                .or_default()
+                .git_remote = Some(remote);
+        }
         self.repos.insert(final_alias.clone(), canonical);
         Ok(final_alias)
     }
@@ -352,6 +365,31 @@ fn sanitize_alias(raw: &str) -> String {
 
 fn normalize_path_for_compare(path: &Path) -> String {
     crate::cache::normalize_path(path)
+}
+
+/// Best-effort lookup of a directory's git remote URL (`remote.origin.url`).
+///
+/// Returns `None` when `git` is unavailable, the path is not a git repo, or the
+/// repo has no `origin` remote. Used both to capture a repo's identity at
+/// registration time and to match candidate directories during relocation.
+pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
 }
 
 #[cfg(test)]
