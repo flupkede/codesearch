@@ -532,7 +532,12 @@ impl ServeState {
                         continue;
                     }
                 };
-                let save_res = tokio::task::spawn_blocking(move || cfg.save()).await;
+                // Route through persist_config so the override path is honored
+                // (keeps the metadata-persist worker hermetic in tests; identical
+                // to cfg.save() in production where the override is None).
+                let state_persist = state.clone();
+                let save_res =
+                    tokio::task::spawn_blocking(move || state_persist.persist_config(&cfg)).await;
                 match save_res {
                     Ok(Ok(())) => tracing::debug!("repos.json metadata persisted"),
                     Ok(Err(e)) => tracing::warn!("repos persist failed: {}", e),
@@ -1515,6 +1520,21 @@ impl ServeState {
             .unwrap_or_default()
     }
 
+    /// Persist the repos config to disk, honoring `config_path_override`.
+    ///
+    /// Handlers MUST call this instead of `ReposConfig::save()` directly, so that
+    /// writes land in the same file `reload_if_changed` reads from. In production
+    /// `config_path_override` is `None`, making this identical to `config.save()`
+    /// (the real `~/.codesearch/repos.json`). In tests the override points at a
+    /// temp file, which keeps the register/remove paths hermetic and lets us
+    /// assert on persistence without touching the user's real config.
+    pub(crate) fn persist_config(&self, config: &ReposConfig) -> anyhow::Result<()> {
+        match self.config_path_override.as_ref() {
+            Some(path) => config.save_to(path),
+            None => config.save(),
+        }
+    }
+
     /// Resolve a group name to its constituent aliases.
     /// Returns an error if the group doesn't exist.
     pub(crate) fn resolve_group_aliases(
@@ -2439,7 +2459,7 @@ async fn add_repo_handler(
             }
         };
 
-        if let Err(e) = config.save() {
+        if let Err(e) = state.persist_config(&config) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::response::Json(json!({
@@ -2466,7 +2486,7 @@ async fn add_repo_handler(
             // Clean up the config entry we just added
             if let Ok(mut config) = state.config.write() {
                 config.unregister_alias(&alias);
-                if let Err(e) = config.save() {
+                if let Err(e) = state.persist_config(&config) {
                     tracing::warn!(
                         "Failed to persist config after add-repo DB open failure for '{}': {}",
                         alias,
@@ -2509,7 +2529,7 @@ async fn add_repo_handler(
         state.repos.remove(&alias);
         if let Ok(mut config) = state.config.write() {
             config.unregister_alias(&alias);
-            if let Err(e) = config.save() {
+            if let Err(e) = state.persist_config(&config) {
                 tracing::warn!(
                     "Failed to persist config after add-repo conflict for '{}': {}",
                     alias,
@@ -2553,7 +2573,7 @@ async fn add_repo_handler(
                 state_bg.active_reindexes.remove(&alias_bg);
                 if let Ok(mut config) = state_bg.config.write() {
                     config.unregister_alias(&alias_bg);
-                    if let Err(e) = config.save() {
+                    if let Err(e) = state_bg.persist_config(&config) {
                         tracing::warn!(
                             "Failed to persist config after add-repo index failure for '{}': {}",
                             alias_bg,
@@ -2659,7 +2679,7 @@ async fn remove_repo_handler(
             }
         };
         config.unregister_alias(&alias);
-        if let Err(e) = config.save() {
+        if let Err(e) = state.persist_config(&config) {
             tracing::warn!(
                 "Failed to save repos config after removing '{}': {}",
                 alias,
@@ -3078,6 +3098,140 @@ mod tests {
             err.contains("retry"),
             "error should mention 'retry': {}",
             err
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Central store-creation / register path — regression guards.
+    //
+    // This is the point that has silently broken multiple times: opening or
+    // creating a repo's database for a BRAND-NEW repo whose `.codesearch.db`
+    // directory does not exist yet. The failure mode was a misleading
+    // "Database is locked by another process" error -> HTTP 500 on POST /repos
+    // -> repos.json registration rolled back -> CLI fell back to a local
+    // duplicate index (control never handed to serve).
+    //
+    // RULE FOR THESE TESTS: never pre-create the `.codesearch.db` directory.
+    // Earlier tests masked this exact bug by creating it first. The create /
+    // register path must be exercised with the directory genuinely absent.
+    // ------------------------------------------------------------------
+
+    /// Core invariant: `try_open_stores(allow_create = true)` on a repo whose
+    /// database directory does not exist yet MUST create it and return a
+    /// writable handle — never a "locked"/open error. This is the single
+    /// assertion that directly catches the regression class.
+    #[tokio::test]
+    async fn try_open_stores_creates_db_for_brand_new_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("brandnew");
+        std::fs::create_dir(&repo_path).unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        assert!(
+            !db_path.exists(),
+            "test precondition violated: db dir must NOT be pre-created"
+        );
+
+        let state = state_with_config(ReposConfig::default());
+
+        match state.try_open_stores("brandnew", &db_path, true) {
+            Ok(OpenedStores::Write(_)) => {}
+            Ok(OpenedStores::Readonly(_)) => {
+                panic!("brand-new repo opened Readonly; expected Write")
+            }
+            Err(e) => panic!(
+                "opening stores for a brand-new repo (allow_create=true) must succeed, got: {e}"
+            ),
+        }
+
+        assert!(
+            db_path.exists(),
+            "the .codesearch.db directory should have been created"
+        );
+    }
+
+    /// End-to-end guard for the exact symptom pair: `POST /repos` for a repo
+    /// whose database does not exist yet must return 202 Accepted, persist the
+    /// alias to repos.json, and register the repo in WRITE mode — it must NOT
+    /// return 500 and roll back the registration.
+    ///
+    /// Determinism: `#[tokio::test]` uses a current-thread runtime, so the
+    /// background reindex task spawned by the handler cannot preempt this test
+    /// (no `.await` follows the handler call). All assertions observe the
+    /// handler's synchronous pre-spawn state — no embedding model required, no
+    /// race. `persist_config` honors the temp config override, so the real
+    /// `~/.codesearch/repos.json` is never touched.
+    #[tokio::test]
+    async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("brandnew");
+        std::fs::create_dir(&repo_path).unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        assert!(!db_path.exists(), "precondition: db dir must not exist yet");
+
+        let state = Arc::new(state_with_config(ReposConfig::default()));
+
+        let (status, body) = add_repo_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Json(AddRepoRequest {
+                path: repo_path.clone(),
+                alias: Some("brandnew".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::ACCEPTED,
+            "brand-new repo register must be accepted (not 500), got {}: {}",
+            status,
+            body.0
+        );
+
+        // Registration persisted, NOT rolled back.
+        assert!(
+            state.config_snapshot().repos.contains_key("brandnew"),
+            "alias must remain in repos.json after register (no rollback)"
+        );
+
+        // Registered in memory as Write so the fast-path avoids a second open.
+        assert_eq!(
+            state.repo_lock_status("brandnew"),
+            Some("write"),
+            "repo should be registered as Write immediately after add"
+        );
+
+        assert!(
+            db_path.exists(),
+            "the .codesearch.db directory should have been created"
+        );
+    }
+
+    /// `persist_config` must write to the override path (and therefore be
+    /// observable by `reload_if_changed`/`config_snapshot`) rather than the real
+    /// `~/.codesearch/repos.json`. Guards the wiring that makes the register
+    /// path hermetically testable.
+    #[test]
+    fn persist_config_honors_override_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("repos.json");
+        let repo_path = tmp.path().join("somerepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        ReposConfig::default().save_to(&config_file).unwrap();
+        let state = ServeState::new(ReposConfig::default(), Some(config_file.clone()));
+
+        {
+            let mut cfg = state.config.write().unwrap();
+            cfg.register_with_alias(repo_path.clone(), Some("somerepo".to_string()))
+                .unwrap();
+            state.persist_config(&cfg).unwrap();
+        }
+
+        // The override file on disk must contain the alias.
+        let on_disk = ReposConfig::load_from(&config_file).unwrap();
+        assert!(
+            on_disk.repos.contains_key("somerepo"),
+            "persist_config must write to the override path"
         );
     }
 

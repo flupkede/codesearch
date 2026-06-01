@@ -105,6 +105,23 @@ pub fn is_database_locked(db_path: &Path) -> bool {
 pub fn acquire_writer_lock(db_path: &Path) -> Option<File> {
     use fs2::FileExt;
 
+    // Ensure the database directory exists before placing the lock file inside it.
+    // For a brand-new repo (e.g. auto-register via POST /repos) the `.codesearch.db`
+    // directory does not exist yet. Without this, opening the lock file below fails
+    // with "path not found", which we'd misreport to the caller as
+    // "Database is locked by another process" — causing a spurious 500 on register.
+    // (SharedStores::new also creates this directory so it can surface genuine I/O
+    // errors distinctly; this call keeps acquire_writer_lock correct for any other
+    // caller. create_dir_all is idempotent, so the duplication is harmless.)
+    if let Err(e) = std::fs::create_dir_all(db_path) {
+        warn!(
+            "Failed to create database directory {}: {}",
+            db_path.display(),
+            e
+        );
+        return None;
+    }
+
     let lock_path = db_path.join(WRITER_LOCK_FILE);
 
     // Create or open the lock file
@@ -166,6 +183,17 @@ impl SharedStores {
     /// This acquires a writer lock. If another process already has the lock,
     /// this will fail with an error.
     pub fn new(db_path: &Path, dimensions: usize) -> Result<Self> {
+        use anyhow::Context;
+
+        // Ensure the database directory exists first, propagating any genuine I/O
+        // error (e.g. permission denied) as itself. `acquire_writer_lock` also
+        // creates the directory defensively, but doing it here lets us distinguish
+        // a real filesystem failure from a held lock: after this succeeds, a `None`
+        // from `acquire_writer_lock` unambiguously means "locked by another process".
+        std::fs::create_dir_all(db_path).with_context(|| {
+            format!("Failed to create database directory {}", db_path.display())
+        })?;
+
         // Try to acquire writer lock
         let lock = acquire_writer_lock(db_path);
         if lock.is_none() {
@@ -1850,6 +1878,44 @@ mod tests {
             readonly: false,
             changes_count: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn shared_stores_new_creates_missing_db_directory() {
+        // Regression: a brand-new repo's `.codesearch.db` directory does not exist
+        // yet when the serve auto-register path (POST /repos) opens the stores.
+        // SharedStores::new() must create it and acquire the writer lock, NOT fail
+        // with "Database is locked by another process".
+        let temp = tempdir().unwrap();
+        // Intentionally do NOT create this directory — it must not exist.
+        let db_path = temp.path().join("brand_new").join(DB_DIR_NAME);
+        assert!(!db_path.exists(), "precondition: db dir must not exist yet");
+
+        let stores = SharedStores::new(&db_path, 384)
+            .expect("SharedStores::new must succeed on a non-existent db_path");
+
+        assert!(db_path.exists(), "db directory should have been created");
+        assert!(!stores.readonly, "should be opened in read-write mode");
+        assert!(
+            db_path.join(WRITER_LOCK_FILE).exists(),
+            "writer lock file should have been created"
+        );
+    }
+
+    #[test]
+    fn acquire_writer_lock_succeeds_for_missing_directory() {
+        // acquire_writer_lock must create the db directory before placing the lock
+        // file, so a fresh repo path yields a real lock rather than None.
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("nested").join(DB_DIR_NAME);
+        assert!(!db_path.exists());
+
+        let lock = acquire_writer_lock(&db_path);
+        assert!(
+            lock.is_some(),
+            "acquire_writer_lock should create the dir and acquire the lock"
+        );
+        assert!(db_path.join(WRITER_LOCK_FILE).exists());
     }
 
     #[tokio::test]

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.136] - 2026-06-01
+
+### Fixed
+
+- **`codesearch index` could not register a brand-new repo via a running
+  `serve` instance** — when `serve` was running and you indexed a repo that
+  was not yet known to it, the auto-register call (`POST /repos`) failed with
+  a misleading *"Database is locked by another process"* error and HTTP 500.
+  Root cause: `SharedStores::new()` tried to acquire the writer lock
+  (`.writer.lock`) *before* the `.codesearch.db` directory existed, so opening
+  the lock file failed with "path not found" and was reported as a lock
+  conflict. Consequences: the `repos.json` registration was rolled back (the
+  alias was never persisted) and the CLI silently fell back to creating a
+  **local duplicate index** instead of handing control to `serve`. Existing
+  repos (whose database directory already existed) and local-only indexing
+  were unaffected. The database directory is now created before the writer
+  lock is acquired.
+- **Genuine filesystem errors during database creation were masked as lock
+  contention** — a real I/O failure (e.g. permission denied) while creating
+  the database directory now surfaces as itself instead of the misleading
+  "Database is locked by another process" message.
+
+### Changed
+
+- **Serve config writes now honor the configured config path** — all
+  `repos.json` writes from the register/remove/metadata-persist paths route
+  through `ServeState::persist_config()`, which respects the active config
+  path override. Production behavior is unchanged; this makes the
+  register/remove path hermetically testable.
+
+### Tests
+
+- Added regression guards that exercise the brand-new-repo store-creation and
+  register path with the `.codesearch.db` directory genuinely absent
+  (`try_open_stores`, `SharedStores::new`, `acquire_writer_lock`, and an
+  end-to-end `add_repo_handler` test asserting 202 + no `repos.json`
+  rollback). These were verified to fail against the pre-fix code.
+
+
 ## [1.0.132] - 2026-05-22
 
 ### Added
