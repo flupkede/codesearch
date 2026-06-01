@@ -192,6 +192,13 @@ pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
 /// Environment variable to override repos config file path.
 pub const REPOS_CONFIG_ENV: &str = "CODESEARCH_REPOS_CONFIG";
 
+/// Environment variable to override how deep relocation scans for a moved repo.
+pub const RELOCATE_MAX_DEPTH_ENV: &str = "CODESEARCH_RELOCATE_MAX_DEPTH";
+
+/// Default bounded depth for the relocation scan (directories below the nearest
+/// existing ancestor of a stale repo path).
+pub const DEFAULT_RELOCATE_MAX_DEPTH: usize = 3;
+
 /// Environment variable to set MCP mode: "auto", "client", or "local".
 pub const MCP_MODE_ENV: &str = "CODESEARCH_MCP_MODE";
 

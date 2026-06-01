@@ -1250,6 +1250,59 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
 }
 
 /// Add a repository to the index (creates local or global)
+/// Remove stale entries from `repos.json`.
+///
+/// For each registered repo whose path no longer exists on disk (e.g. its
+/// folder was renamed/moved), a best-effort git-identity relocation is tried
+/// first; only entries that cannot be relocated are unregistered. Prints a
+/// summary of what was relocated/removed.
+pub async fn prune_index() -> Result<()> {
+    use crate::db_discovery::repos::ReposConfig;
+
+    let mut config = ReposConfig::load()?;
+    let aliases: Vec<String> = config.repos.keys().cloned().collect();
+
+    let mut relocated: Vec<(String, PathBuf)> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+
+    for alias in &aliases {
+        let Some(path) = config.resolve(alias) else {
+            continue;
+        };
+        if path.exists() {
+            continue;
+        }
+
+        if let Some(new_path) = config.try_relocate(alias) {
+            config.repos.insert(alias.clone(), new_path.clone());
+            relocated.push((alias.clone(), new_path));
+        } else if config.unregister_alias(alias) {
+            removed.push(alias.clone());
+        }
+    }
+
+    if relocated.is_empty() && removed.is_empty() {
+        println!("✅ No stale repositories found — repos.json is clean.");
+        return Ok(());
+    }
+
+    config.save()?;
+
+    for (alias, path) in &relocated {
+        println!("📍 relocated '{}' → {}", alias, path.display());
+    }
+    for alias in &removed {
+        println!("🗑️  removed stale entry '{}'", alias);
+    }
+    println!(
+        "✅ Prune complete: {} relocated, {} removed.",
+        relocated.len(),
+        removed.len()
+    );
+
+    Ok(())
+}
+
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,

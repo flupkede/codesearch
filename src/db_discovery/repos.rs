@@ -292,6 +292,48 @@ impl ReposConfig {
             .find(|(_, p)| normalize_path_for_compare(p) == normalize_path_for_compare(&canonical))
             .map(|(alias, _)| alias.clone())
     }
+
+    /// Best-effort relocation of a registered repo whose stored path no longer
+    /// exists (e.g. its folder was renamed/moved). Starting from the nearest
+    /// still-existing ancestor of the stale path, scans (bounded depth) for a
+    /// git repository whose `remote.origin.url` matches the one captured at
+    /// registration time. Returns the new path only on a single unambiguous
+    /// match; `None` when the path still exists, no remote was recorded, or the
+    /// match is absent/ambiguous.
+    pub fn try_relocate(&self, alias: &str) -> Option<PathBuf> {
+        let stale = self.repos.get(alias)?;
+        if stale.exists() {
+            return None; // path is fine — nothing to relocate
+        }
+
+        let target_remote = self.repos_meta.get(alias)?.git_remote.clone()?;
+
+        // Walk up to the nearest ancestor that still exists on disk.
+        let mut anchor = stale.parent();
+        while let Some(dir) = anchor {
+            if dir.exists() {
+                break;
+            }
+            anchor = dir.parent();
+        }
+        let anchor = anchor?;
+
+        let mut matches = Vec::new();
+        scan_for_remote(anchor, &target_remote, relocate_max_depth(), &mut matches);
+
+        // Don't relocate onto a path already registered under another alias.
+        matches.retain(|p| {
+            !self.repos.iter().any(|(a, existing)| {
+                a != alias && normalize_path_for_compare(existing) == normalize_path_for_compare(p)
+            })
+        });
+
+        if matches.len() == 1 {
+            Some(strip_unc_prefix(matches.into_iter().next().unwrap()))
+        } else {
+            None
+        }
+    }
 }
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -392,10 +434,160 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     }
 }
 
+/// Configured relocation scan depth (`CODESEARCH_RELOCATE_MAX_DEPTH`, default 3).
+fn relocate_max_depth() -> usize {
+    std::env::var(crate::constants::RELOCATE_MAX_DEPTH_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(crate::constants::DEFAULT_RELOCATE_MAX_DEPTH)
+}
+
+/// Directory names never worth descending into during a relocation scan.
+fn is_skippable_scan_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some(
+            ".git"
+                | "node_modules"
+                | "target"
+                | "bin"
+                | "obj"
+                | "dist"
+                | "build"
+                | ".codesearch.db"
+        )
+    )
+}
+
+/// Recursively collect git roots under `dir` (bounded by `depth`) whose
+/// `remote.origin.url` matches `target_remote`. A matching git root is recorded
+/// and not descended into (nested repos below it are ignored).
+fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<PathBuf>) {
+    if dir.join(".git").exists() {
+        if git_remote_url(dir).as_deref() == Some(target_remote) {
+            out.push(dir.to_path_buf());
+        }
+        return;
+    }
+
+    if depth == 0 {
+        return;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() && !is_skippable_scan_dir(&child) {
+                scan_for_remote(&child, target_remote, depth - 1, out);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Initialise a git repo at `dir` with an `origin` remote pointing at `url`.
+    fn init_git_remote(dir: &Path, url: &str) {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git available in test env")
+        };
+        run(&["init"]);
+        run(&["remote", "add", "origin", url]);
+    }
+
+    #[test]
+    fn captures_git_remote_on_register() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_remote(&repo, "https://example.com/acme/repo.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(repo);
+        assert_eq!(
+            cfg.meta(&alias).git_remote.as_deref(),
+            Some("https://example.com/acme/repo.git")
+        );
+    }
+
+    #[test]
+    fn try_relocate_finds_renamed_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("myrepo");
+        std::fs::create_dir(&original).unwrap();
+        init_git_remote(&original, "https://example.com/acme/myrepo.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(original.clone());
+
+        // Rename the leaf folder; stored path is now stale.
+        let renamed = tmp.path().join("myrepo-renamed");
+        std::fs::rename(&original, &renamed).unwrap();
+
+        let found = cfg
+            .try_relocate(&alias)
+            .expect("should relocate renamed leaf");
+        assert_eq!(
+            normalize_path_for_compare(&found),
+            normalize_path_for_compare(&renamed)
+        );
+    }
+
+    #[test]
+    fn try_relocate_returns_none_when_path_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("live");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_remote(&repo, "https://example.com/acme/live.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(repo);
+        assert!(cfg.try_relocate(&alias).is_none());
+    }
+
+    #[test]
+    fn try_relocate_none_without_recorded_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(plain.clone());
+        assert!(cfg.meta(&alias).git_remote.is_none());
+
+        std::fs::rename(&plain, tmp.path().join("plain-moved")).unwrap();
+        assert!(cfg.try_relocate(&alias).is_none());
+    }
+
+    #[test]
+    fn try_relocate_none_when_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("orig");
+        std::fs::create_dir(&original).unwrap();
+        init_git_remote(&original, "https://example.com/acme/dup.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(original.clone());
+
+        // Two candidates with the same remote → ambiguous → no relocation.
+        let a = tmp.path().join("copy-a");
+        let b = tmp.path().join("copy-b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        init_git_remote(&a, "https://example.com/acme/dup.git");
+        init_git_remote(&b, "https://example.com/acme/dup.git");
+        std::fs::remove_dir_all(&original).unwrap();
+
+        assert!(cfg.try_relocate(&alias).is_none());
+    }
 
     #[test]
     fn test_unique_alias_generation() {

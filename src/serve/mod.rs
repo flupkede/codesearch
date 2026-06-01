@@ -563,6 +563,66 @@ impl ServeState {
         });
     }
 
+    /// Reconcile registered repo paths against the filesystem before warmup.
+    ///
+    /// For each alias whose stored path no longer exists (folder renamed/moved),
+    /// attempt a best-effort git-identity relocation and rewrite `repos.json`.
+    /// When relocation fails the entry is left in place and merely logged — it is
+    /// skipped safely at warmup and never crashes serve. Explicit cleanup of
+    /// unrecoverable entries is available via `codesearch index prune`.
+    pub(crate) fn reconcile_all_paths(self: &Arc<Self>) {
+        let aliases = self.aliases();
+        if aliases.is_empty() {
+            return;
+        }
+
+        let mut relocated = false;
+
+        let mut config = match self.config.write() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("reconcile: config lock poisoned: {}", e);
+                return;
+            }
+        };
+
+        for alias in &aliases {
+            let Some(path) = config.resolve(alias) else {
+                continue;
+            };
+            if path.exists() {
+                continue;
+            }
+
+            match config.try_relocate(alias) {
+                Some(new_path) => {
+                    info!(
+                        "reconcile: relocated '{}' → {} (was {})",
+                        alias,
+                        new_path.display(),
+                        path.display()
+                    );
+                    config.repos.insert(alias.clone(), new_path);
+                    relocated = true;
+                }
+                None => {
+                    warn!(
+                        "reconcile: '{}' path missing ({}); skipping — \
+                         run `codesearch index prune` to remove it",
+                        alias,
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        if relocated {
+            if let Err(e) = self.persist_config(&config) {
+                warn!("reconcile: failed to persist relocated paths: {}", e);
+            }
+        }
+    }
+
     /// Phase 1: warm all repos sequentially, awaiting incremental refresh per repo.
     pub(crate) async fn run_phase_1_warmup_all(self: &Arc<Self>) {
         let aliases = self.aliases();
@@ -662,6 +722,18 @@ impl ServeState {
                         return;
                     }
                 };
+                // Guard against stale entries whose folder was removed/renamed
+                // and could not be relocated: skip rather than run SCIP on a
+                // non-existent path.
+                if !path.exists() {
+                    warn!(
+                        "phase-2: skip '{}' — path missing ({})",
+                        alias,
+                        path.display()
+                    );
+                    drop(permit);
+                    return;
+                }
                 let db_path = path.join(DB_DIR_NAME);
                 trigger_symbol_rebuild(&alias, &path, &db_path, &state).await;
                 drop(permit);
@@ -706,6 +778,11 @@ impl ServeState {
                 Some(p) => p,
                 None => continue,
             };
+
+            // Skip stale entries whose folder no longer exists.
+            if !path.exists() {
+                continue;
+            }
 
             // Only pre-warm repos that have a ready C# index
             let status = self
@@ -2940,6 +3017,7 @@ pub async fn run_serve(
     {
         let phase_state = serve_state.clone();
         tokio::spawn(async move {
+            phase_state.reconcile_all_paths();
             phase_state.run_phase_1_warmup_all().await;
             phase_state.run_phase_2_csharp_scip().await;
             phase_state.run_phase_3_prewarm().await;

@@ -49,6 +49,9 @@ pub enum IndexCommands {
         #[arg(short = 'f', long)]
         force: bool,
     },
+
+    /// Remove stale entries from repos.json (relocates moved repos first)
+    Prune,
 }
 
 /// Cache subcommands
@@ -556,6 +559,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     IndexCommands::Symbol { alias, force } => {
                         trigger_symbol_reindex_via_api(&alias, force).await
                     }
+                    IndexCommands::Prune => crate::index::prune_index().await,
                 }
             } else {
                 // Flag-based backward-compat path
