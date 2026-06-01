@@ -93,7 +93,7 @@ impl ReposConfig {
     }
 
     pub fn register(&mut self, path: PathBuf) -> String {
-        let canonical = path.canonicalize().unwrap_or(path);
+        let canonical = strip_unc(path.canonicalize().unwrap_or(path));
 
         if let Some((alias, _)) = self
             .repos
@@ -109,7 +109,7 @@ impl ReposConfig {
     }
 
     pub fn register_with_alias(&mut self, path: PathBuf, alias: Option<String>) -> Result<String> {
-        let canonical = path.canonicalize().unwrap_or(path);
+        let canonical = strip_unc(path.canonicalize().unwrap_or(path));
 
         if let Some((existing_alias, _)) = self
             .repos
@@ -348,6 +348,21 @@ fn normalize_path_for_compare(path: &Path) -> String {
     crate::cache::normalize_path(path)
 }
 
+/// Strip the Windows extended-length UNC prefix (`\\?\`) from a path so it is
+/// never persisted to repos.json in that form. `Path::canonicalize()` on Windows
+/// returns `\\?\C:\...`, which causes `Path::exists()` / `.join()` to behave
+/// inconsistently for sub-paths (e.g. `\\?\C:\foo\.codesearch.db` may not exist
+/// even when `C:\foo\.codesearch.db` does). Stripping the prefix before storage
+/// ensures all downstream path operations use the plain `C:\...` form.
+fn strip_unc(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +464,38 @@ mod tests {
 
         assert!(cfg.unregister_alias("repo-a"));
         assert!(!cfg.repos_meta.contains_key("repo-a"));
+    }
+
+    /// Regression: `Path::canonicalize()` on Windows returns a `\\?\`-prefixed UNC
+    /// extended-length path. If stored verbatim in repos.json, downstream `.join()`
+    /// and `.exists()` calls fail (e.g. `\\?\C:\foo\.codesearch.db` may not exist
+    /// even when `C:\foo\.codesearch.db` does). `register` and `register_with_alias`
+    /// must strip the prefix before storage so repos.json always holds plain paths.
+    #[test]
+    fn register_strips_unc_prefix_from_stored_path() {
+        let mut cfg = ReposConfig::default();
+
+        // Simulate what canonicalize() returns on Windows: a \\?\ UNC path.
+        let unc_path = PathBuf::from(r"\\?\C:\WorkArea\AI\myrepo");
+        // register() calls canonicalize() internally, but also accepts any path.
+        // Test strip_unc directly (the private fn is in scope via pub(crate) isn't
+        // exposed, so we exercise it via register_with_alias on a pre-formed path
+        // by bypassing canonicalize with a path that starts with \\?\).
+        let alias = cfg
+            .register_with_alias(unc_path.clone(), Some("myrepo".to_string()))
+            .unwrap();
+
+        let stored = cfg.resolve(&alias).unwrap();
+        let stored_str = stored.to_string_lossy();
+        assert!(
+            !stored_str.starts_with(r"\\?\"),
+            "repos.json must not contain UNC prefix, got: {}",
+            stored_str
+        );
+        assert!(
+            stored_str.starts_with("C:\\") || stored_str.starts_with("C:/"),
+            "stored path should be a plain Windows path, got: {}",
+            stored_str
+        );
     }
 }

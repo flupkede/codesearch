@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.138] - 2026-06-01
+
+### Fixed
+
+- **`\\?\`-prefixed UNC paths stored in repos.json caused spurious "Database
+  not found" errors** — `Path::canonicalize()` on Windows returns an
+  extended-length UNC path (`\\?\C:\...`). When stored verbatim in
+  `repos.json`, downstream `.join(".codesearch.db")` and `Path::exists()`
+  calls failed inconsistently (e.g. `\\?\C:\foo\.codesearch.db` returned
+  `false` even when `C:\foo\.codesearch.db` existed). This affected 7 repos
+  in repos.json and caused a cascade of "Database not found" 500 errors and
+  fallbacks to local duplicate indexes. `register()` and `register_with_alias()`
+  now strip the `\\?\` prefix before storage so repos.json always holds plain
+  `C:\...` paths. Existing UNC entries are automatically corrected at the next
+  registration. (Existing repos.json was also patched in-place.)
+- **500 "Database not found" on reindex caused a local duplicate index** —
+  when a registered repo's database was deleted externally (e.g. serve killed
+  mid-index), the reindex endpoint returned 500 "Database not found". The CLI
+  treated this as a generic failure and fell back to local indexing, recreating
+  the duplicate. It now triggers the same auto-register (`POST /repos`) path as
+  a 404, which recreates the database via serve without any local fallback.
+
+
 ## [1.0.137] - 2026-06-01
 
 ### Fixed

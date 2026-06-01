@@ -1842,6 +1842,45 @@ async fn try_delegate_reindex_to_serve(
             alias
         );
         Ok((alias, project_path))
+    } else if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        && body.contains("Database not found")
+    {
+        // Serve knows the alias but its database was deleted externally (e.g. the
+        // previous serve run was killed mid-index and the DB never fully formed).
+        // Treat this the same as 404: auto-register so serve creates the DB fresh.
+        tracing::info!(
+            "alias '{}' has no database on serve (500 Database not found), \
+             auto-registering via POST /repos to recreate",
+            alias
+        );
+
+        let mut add_body = serde_json::json!({
+            "path": project_path,
+            "global": false,
+        });
+        add_body["alias"] = serde_json::Value::String(alias.clone());
+
+        let add_resp = client
+            .post(format!("{}/repos", base_url))
+            .json(&add_body)
+            .send()
+            .await
+            .map_err(|e| format!("auto-register POST /repos failed: {}", e))?;
+
+        if !add_resp.status().is_success() {
+            let add_status = add_resp.status();
+            let add_text = add_resp.text().await.unwrap_or_default();
+            return Err(DelegateError::Failed(format!(
+                "auto-register returned {} for alias '{}': {}",
+                add_status, alias, add_text
+            )));
+        }
+
+        tracing::info!(
+            "auto-register accepted for alias '{}' (DB recreate), indexing in background",
+            alias
+        );
+        Ok((alias, project_path))
     } else {
         Err(DelegateError::Failed(format!(
             "serve returned {} for alias '{}': {}",
