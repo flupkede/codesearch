@@ -20,7 +20,10 @@ release — tagging happens only in `/release`.
   version**; it carries forward unchanged through develop, master, and the tag.
 
 ## Guardrails
-- ABORT if the current branch is `develop` or `master`. This command runs from a feature branch.
+- ABORT unless the current branch matches `feature/*`, `features/*`, or `fix/*` — i.e. the
+  branches the pre-commit hook version-bumps. Never run from `develop`, `master`, `release/*`,
+  or `chore/*`: on those the hook does **not** bump, so the version/CHANGELOG premise below
+  would silently break.
 - NEVER push directly to `develop` or `master` — everything lands via a PR.
 - NEVER pass `--no-verify` / `--no-gpg-sign` — let the pre-commit hook run (it bumps + rebuilds).
 - Do NOT create or push a tag here. That is `/release`'s job.
@@ -29,7 +32,8 @@ release — tagging happens only in `/release`.
 ## Steps
 
 1. **Context**
-   - `git rev-parse --abbrev-ref HEAD` → current branch. If `develop`/`master`, STOP with an error.
+   - `git rev-parse --abbrev-ref HEAD` → current branch. If it is NOT `feature/*`, `features/*`,
+     or `fix/*`, STOP with an error (see Guardrails).
    - `git fetch origin`.
    - Compute the change set landing on develop: `git log origin/develop..HEAD --oneline`
      plus `git status --short` for uncommitted work. If there is nothing to land, report and STOP.
@@ -44,8 +48,12 @@ release — tagging happens only in `/release`.
 3. **CHANGELOG up to date?**
    - Ensure `CHANGELOG.md` has an entry for this change under a `## [X.Y.Z] - YYYY-MM-DD`
      heading with `Added` / `Changed` / `Fixed` subsections describing every user-facing change.
-   - **Version for the heading** = current `Cargo.toml` version **+ 1 patch** (the hook will bump
-     to that value on commit). Read it: `grep -m1 '^version' Cargo.toml`.
+   - **Version for the heading**: the hook bumps the patch by +1 on **every** feature-branch
+     commit where the working-tree version still equals HEAD's. The most reliable approach is to
+     land this branch in a **single commit** — then the heading version = current
+     `Cargo.toml` version + 1 (`grep -m1 '^version' Cargo.toml`). If you commit more than once,
+     the version advances once per commit; after the final commit, read the actual
+     `Cargo.toml` version and make sure the CHANGELOG heading matches it (fix it if not).
    - Use today's date. If an accurate entry already exists for the pending version, leave it.
 
 4. **Commit**
@@ -68,11 +76,13 @@ release — tagging happens only in `/release`.
    - Title: use `$ARGUMENTS` if provided; otherwise summarize the branch concisely.
    - Body: bullet summary of changes; end with:
      `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+   - Capture the PR number for the next step:
+     `PR=$(gh pr view --json number --jq .number)`.
 
 8. **Auto-merge after CI**
-   - `gh pr merge --auto --merge` so the PR lands automatically once required checks pass.
+   - `gh pr merge "$PR" --auto --merge` so the PR lands automatically once required checks pass.
    - If auto-merge is not enabled on the repo (command errors), fall back: poll
-     `gh pr checks <num> --watch`, then `gh pr merge --merge` once green.
+     `gh pr checks "$PR" --watch`, then `gh pr merge "$PR" --merge` once green.
 
 ## Report
 Branch, pending release version, doc updates made, PR URL, and merge status

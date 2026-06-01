@@ -27,8 +27,8 @@ triggers the build/publish pipeline.
 ## Part 1 — land on `develop` (the `/merge` workflow)
 Execute every step of **`/merge`** (README/CHANGELOG checks → commit → push → PR → auto-merge
 to `develop`). Then **wait for the develop PR to actually merge** (auto-merge waits on CI):
-- Get the PR number, then poll `gh pr view <num> --json state,mergedAt,mergeStateStatus`
-  until `state` is `MERGED`.
+- Capture the PR number (`PR=$(gh pr view --json number --jq .number)`), then poll
+  `gh pr view "$PR" --json state,mergedAt,mergeStateStatus` until `state` is `MERGED`.
 - If checks fail, STOP and report. Do not proceed to Part 2.
 
 ## Part 2 — promote `develop` → `master`
@@ -39,16 +39,20 @@ to `develop`). Then **wait for the develop PR to actually merge** (auto-merge wa
    - Title: prefix `Release $VERSION — ` then a short summary (or `$ARGUMENTS` if provided),
      matching history (e.g. `Release v1.0.142 — serve responsive during warmup`).
    - Body ends with: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
-4. `gh pr merge --auto --merge`. Wait until `state` is `MERGED` (poll as in Part 1).
-   If auto-merge is unavailable, `gh pr checks <num> --watch` then `gh pr merge --merge`.
-   If CI fails, STOP.
+   - Capture the PR number: `RELEASE_PR=$(gh pr view develop --json number --jq .number)`.
+4. `gh pr merge "$RELEASE_PR" --auto --merge`. Wait until `state` is
+   `MERGED` (poll as in Part 1). If auto-merge is unavailable, `gh pr checks "$RELEASE_PR" --watch`
+   then `gh pr merge "$RELEASE_PR" --merge`. If CI fails, STOP.
 
 ## Part 3 — tag the release
-1. `git fetch origin && git checkout master && git pull --ff-only origin master`.
+1. `git fetch origin --tags && git checkout master && git pull --ff-only origin master`.
 2. Confirm the version on master matches: `grep -m1 '^version' Cargo.toml` equals `$VERSION` (minus the `v`).
    If it does not match, STOP and report (do not guess a tag).
-3. `git tag "$VERSION" && git push origin "$VERSION"` → triggers `release.yml`.
-4. Report the pushed tag and remind the user to watch the Actions "Release" run for artifacts.
+3. Guard against a double release: if `$VERSION` already exists as a tag
+   (`git tag -l "$VERSION"` non-empty, or `git ls-remote --tags origin "$VERSION"` non-empty),
+   STOP — the release was already cut.
+4. `git tag "$VERSION" && git push origin "$VERSION"` → triggers `release.yml`.
+5. Report the pushed tag and remind the user to watch the Actions "Release" run for artifacts.
 
 ## Part 4 — keep `develop` in sync (only if needed)
 If `master` ended up ahead of `develop` (e.g. a CHANGELOG/version edit merged only on master),
