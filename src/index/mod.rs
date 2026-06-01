@@ -1260,26 +1260,7 @@ pub async fn prune_index() -> Result<()> {
     use crate::db_discovery::repos::ReposConfig;
 
     let mut config = ReposConfig::load()?;
-    let aliases: Vec<String> = config.repos.keys().cloned().collect();
-
-    let mut relocated: Vec<(String, PathBuf)> = Vec::new();
-    let mut removed: Vec<String> = Vec::new();
-
-    for alias in &aliases {
-        let Some(path) = config.resolve(alias) else {
-            continue;
-        };
-        if path.exists() {
-            continue;
-        }
-
-        if let Some(new_path) = config.try_relocate(alias) {
-            config.repos.insert(alias.clone(), new_path.clone());
-            relocated.push((alias.clone(), new_path));
-        } else if config.unregister_alias(alias) {
-            removed.push(alias.clone());
-        }
-    }
+    let (relocated, removed) = config.prune_stale();
 
     if relocated.is_empty() && removed.is_empty() {
         println!("✅ No stale repositories found — repos.json is clean.");

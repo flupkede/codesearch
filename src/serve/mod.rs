@@ -576,8 +576,6 @@ impl ServeState {
             return;
         }
 
-        let mut relocated = false;
-
         let mut config = match self.config.write() {
             Ok(c) => c,
             Err(e) => {
@@ -586,37 +584,20 @@ impl ServeState {
             }
         };
 
-        for alias in &aliases {
-            let Some(path) = config.resolve(alias) else {
-                continue;
-            };
-            if path.exists() {
-                continue;
-            }
+        let (relocated, unresolved) = config.relocate_missing();
 
-            match config.try_relocate(alias) {
-                Some(new_path) => {
-                    info!(
-                        "reconcile: relocated '{}' → {} (was {})",
-                        alias,
-                        new_path.display(),
-                        path.display()
-                    );
-                    config.repos.insert(alias.clone(), new_path);
-                    relocated = true;
-                }
-                None => {
-                    warn!(
-                        "reconcile: '{}' path missing ({}); skipping — \
-                         run `codesearch index prune` to remove it",
-                        alias,
-                        path.display()
-                    );
-                }
-            }
+        for (alias, new_path) in &relocated {
+            info!("reconcile: relocated '{}' → {}", alias, new_path.display());
+        }
+        for alias in &unresolved {
+            warn!(
+                "reconcile: '{}' path missing; skipping — \
+                 run `codesearch index prune` to remove it",
+                alias
+            );
         }
 
-        if relocated {
+        if !relocated.is_empty() {
             if let Err(e) = self.persist_config(&config) {
                 warn!("reconcile: failed to persist relocated paths: {}", e);
             }
