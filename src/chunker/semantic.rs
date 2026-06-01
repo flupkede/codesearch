@@ -859,7 +859,7 @@ class Calculator:
     fn test_chunk_markdown_sections() {
         let mut chunker = SemanticChunker::new(100, 2000, 10);
 
-        let md = "---\nsource: dam_help\ntitle: E-mail ordering\nurl: https://help.aprimo.com/x\npath: dam_help/Ordering/EmailOrd\n---\n\n# E-mail ordering\n\nIntro paragraph about ordering.\n\n## Configure SMTP\n\nSteps to configure the mail server.\n\n## Troubleshooting\n\nFinal section text about errors.\n";
+        let md = "---\nsource: dam_help\ntitle: E-mail ordering\nurl: https://help.example.com/x\npath: dam_help/Ordering/EmailOrd\n---\n\n# E-mail ordering\n\nIntro paragraph about ordering.\n\n## Configure SMTP\n\nSteps to configure the mail server.\n\n## Troubleshooting\n\nFinal section text about errors.\n";
 
         let path = Path::new("EmailOrd.md");
         let chunks = chunker
@@ -933,7 +933,7 @@ class Calculator:
 
     #[test]
     fn test_chunk_markdown_hard_splits_long_line() {
-        // Mirrors real scraped Aprimo docs: a section whose body is ONE huge line
+        // Mirrors real-world scraped docs: a section whose body is ONE huge line
         // (no internal newlines). Line-based splitting can't bound this; the
         // char-aware splitter must.
         let mut chunker = SemanticChunker::new(100, 500, 10);
