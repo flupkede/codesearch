@@ -15,7 +15,7 @@ codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) d
 - **Multi-repo serve mode**: Fan-out queries across repository groups with cross-repo RRF ranking
 - **Hybrid retrieval**: Vector embeddings + BM25 full-text search fused with Reciprocal Rank Fusion
 - **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents — in the same tool
-- **AST-aware chunking**: Tree-sitter parsing for 9 languages — chunks align to functions/classes, not arbitrary line ranges
+- **AST-aware chunking**: Tree-sitter parsing for 15 languages — chunks align to functions/classes (and Markdown sections), not arbitrary line ranges
 - **Token-efficient**: Returns metadata by default; agents fetch full code only when needed via `get_chunk`
 - **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only, no runtime model downloads (works behind enterprise proxies)
 - **Zero config for single repos**: `codesearch index && codesearch mcp` — done
@@ -410,16 +410,23 @@ Tree-sitter AST-aware chunking:
 | Language | Extensions |
 |----------|-----------|
 | Rust | `.rs` |
-| Python | `.py` |
-| JavaScript | `.js`, `.jsx` |
-| TypeScript | `.ts`, `.tsx` |
+| Python | `.py`, `.pyw`, `.pyi` |
+| JavaScript | `.js`, `.mjs`, `.cjs` |
+| TypeScript | `.ts`, `.tsx`, `.jsx`, `.mts`, `.cts` |
 | C | `.c`, `.h` |
-| C++ | `.cpp`, `.hpp` |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx` |
 | C# | `.cs` |
 | Go | `.go` |
 | Java | `.java` |
+| Shell | `.sh`, `.bash`, `.zsh` |
+| Ruby | `.rb`, `.rake` |
+| PHP | `.php` |
+| YAML | `.yaml`, `.yml` |
+| JSON | `.json` |
+| Markdown | `.md`, `.markdown`, `.txt` |
 
-All other text files use line-based chunking as fallback.
+Markdown uses the tree-sitter-md **block** grammar — chunks align to sections,
+headings, and code fences. All other text files use line-based chunking as fallback.
 
 ## Core Technology
 

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.145] - 2026-06-02
+
+### Added
+
+- **Semantic Markdown chunking** — Markdown files (`.md`, `.markdown`, `.txt`) are
+  now parsed with the **tree-sitter-md block grammar**, so chunks align to sections,
+  headings, and code fences instead of arbitrary line ranges. `Language::Markdown`
+  now reports `supports_tree_sitter() == true` and has a compiled-in grammar.
+
+### Changed
+
+- **Supported-languages documentation corrected** — the README language table now
+  lists all 15 tree-sitter languages actually supported (Rust, Python, JavaScript,
+  TypeScript, C, C++, C#, Go, Java, Shell, Ruby, PHP, YAML, JSON, Markdown);
+  it previously showed only 9, omitting Shell, Ruby, PHP, YAML, JSON, and Markdown.
+
 ## [1.0.142] - 2026-06-01
 
 ### Fixed
