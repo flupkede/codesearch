@@ -26,6 +26,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadlock.
 
 
+## [1.0.141] - 2026-06-01
+
+### Fixed
+
+- **`codesearch index` aborted instead of waiting when serve was warming up** —
+  on `ServeUnresponsive` the CLI returned an error. It now waits patiently
+  (`serve_delegate_with_warmup_wait`): prints progress and retries every 8s up
+  to ~2 min, delegating as soon as serve becomes ready, and only erroring if the
+  budget is exhausted. (Superseded for the responsiveness root cause by 1.0.142.)
+- **409 Conflict when recreating a missing database** — when a registered repo's
+  database was gone, the CLI's auto-register returned 409 ("already registered")
+  and fell back to a local duplicate. It now retries as
+  `POST /repos/{alias}/reindex?force=true`, which recreates the DB via serve.
+
+
+## [1.0.140] - 2026-06-01
+
+### Fixed
+
+- **Last raw `.canonicalize()` eliminated** — `get_db_path_smart` still used the
+  old `normalize_path(&p.canonicalize()...)` pattern. Routed through the central
+  `safe_canonicalize()` so no raw `.canonicalize()` remains outside its own
+  definition.
+
+
+## [1.0.139] - 2026-06-01
+
+### Changed
+
+- **Central path canonicalization** — introduced `safe_canonicalize()` and
+  `strip_unc_prefix()` in `crate::cache` as the single approved way to
+  canonicalize paths, and replaced all 16+ raw `.canonicalize()` call sites
+  across `repos.rs`, `db_discovery/mod.rs`, `index/mod.rs`, `lmdb_registry.rs`,
+  and `serve/mod.rs`. This structurally prevents the recurring Windows UNC-path
+  (`\\?\`) bug class. Policy documented in `AGENTS.md`; 6 regression tests added.
+
+
 ## [1.0.138] - 2026-06-01
 
 ### Fixed
