@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 /// format change). The open path checks this and reports mismatches so the
 /// caller can trigger a rebuild.
 const SCHEMA_VERSION: u32 = 1;
+use crate::lmdb_registry::TrackedEnv;
 use arroy::distances::Cosine;
 use arroy::{Database as ArroyDatabase, ItemId, Reader, Writer};
 use heed::byteorder::BigEndian;
@@ -236,7 +237,7 @@ impl ChunkMetadata {
 /// - ACID transactions
 /// - Memory-mapped for performance
 pub struct VectorStore {
-    env: heed::Env,
+    env: TrackedEnv,
     vectors: ArroyDatabase<Cosine>,
     chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
     next_id: u32,
@@ -286,11 +287,15 @@ impl VectorStore {
         // level (one `serve` process per machine, and the CLI rejects concurrent
         // reindex). The map_size is reconciled across opens via `resolve_map_size`
         // above, so we never reopen with a smaller map than was previously persisted.
+        // TrackedEnv additionally prevents double-open within the same process.
+        let mut opts = EnvOpenOptions::new();
+        opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
         let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(map_size_mb * 1024 * 1024)
-                .max_dbs(10)
-                .open(db_path)?
+            TrackedEnv::open(
+                &opts,
+                db_path,
+                &format!("VectorStore({})", db_path.display()),
+            )?
         };
 
         // Open or create databases
@@ -371,12 +376,17 @@ impl VectorStore {
         // which is acceptable because the writer's resize logic explicitly
         // rebuilds the env (see `resize_map` below) before any reader is invited
         // to reopen.
+        // TrackedEnv additionally prevents double-open within the same process.
+        let mut opts = EnvOpenOptions::new();
+        opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
+        // SAFETY: READ_ONLY flag is safe for concurrent read access.
+        unsafe { opts.flags(EnvFlags::READ_ONLY) };
         let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(map_size_mb * 1024 * 1024)
-                .max_dbs(10)
-                .flags(EnvFlags::READ_ONLY)
-                .open(db_path)?
+            TrackedEnv::open(
+                &opts,
+                db_path,
+                &format!("VectorStore(readonly, {})", db_path.display()),
+            )?
         };
 
         // Open databases (read-only, no create)

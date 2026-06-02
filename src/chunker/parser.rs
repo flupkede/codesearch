@@ -280,7 +280,8 @@ fn baz() {}
         let mut parser = CodeParser::new();
         let source = "some code";
 
-        let result = parser.parse(Language::Markdown, source);
+        // Toml has no compiled-in grammar, so parsing must fail.
+        let result = parser.parse(Language::Toml, source);
         assert!(result.is_err());
     }
 

@@ -8,6 +8,7 @@ mod embed;
 mod file;
 mod fts;
 mod index;
+mod lmdb_registry;
 mod logger;
 mod mcp;
 mod output;

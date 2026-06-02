@@ -26,12 +26,17 @@ Add symbol-aware reference lookups to codesearch via `find_impact` MCP tool. Ret
 - **Gated integration test** — `csharp_helper_integration` cargo feature for full-pipeline testing
 - **CI** — separate `csharp-integration-tests` job in `.github/workflows/ci.yml`
 - **Sequential phase-2 startup** — Phase 1 warms repos sequentially, Phase 2 runs gated C# SCIP rebuilds ordered by `last_changed_unix` under `Semaphore(concurrency)` via `CSHARP_SCIP_CONCURRENCY` env (default **2**, clamp [1,4])
-- **`repos_meta` tracking** — `RepoMeta` (last_changed_unix, last_scip_indexed_unix) persisted in `repos.json` with debounced save (10s window)
+- **`repos_meta` tracking** — `RepoMeta` (last_changed_unix, last_scip_indexed_unix, git_remote) persisted in `repos.json` with debounced save (10s window)
+- **Stale-path resilience** — a renamed/moved indexed folder no longer crashes serve. `git_remote` (`remote.origin.url`) is captured at registration; on startup `ServeState::reconcile_all_paths()` best-effort relocates a missing repo by scanning the nearest existing ancestor (bounded depth, env `CODESEARCH_RELOCATE_MAX_DEPTH`, default 3) for a git root with a matching remote — exactly one match rewrites `repos.json`, otherwise warn + skip. Phase-2/Phase-3 also guard `path.exists()`. Manual cleanup via **`codesearch index prune`** (relocate-first, else unregister stale aliases)
+- **Alias is always derived** — the user-settable `--alias`/`-a` flag was removed from `index add`; the alias always equals the (sanitized) directory name via `ReposConfig::register()`. The alias remains the internal identifier (repos.json key, groups, `project` arg); only user override is gone. The `index symbol <alias>` positional is a lookup key and is retained
+- **Hand-edited `repos.json` tolerated** — `ReposConfig::reconcile()` runs in-memory on every load: drops empty-alias entries, drops orphan `repos_meta`, prunes group members referencing unknown aliases and empty groups. Never renames valid aliases, never crashes
 - **TUI C# indicator** — in status column: green `C#·` ready, yellow `C#…` indexing, red `C#!` error; footer shows helper availability; Calls column with tool call count
+- **Phase 2 & 3 TUI feedback** — Phase 2 pre-marks all queued candidates as `C#…` immediately on discovery (before semaphore slot); Phase 3 pre-warm sets `csharp_index_status = Indexing` before `batch-find-refs` and restores `Ready` after — TUI shows `C#…` throughout without touching `active_reindexes` (avoids blocking HTTP /reindex)
 - **Selective ref cache invalidation** — incremental rebuilds only purge cached refs for affected symbols, not entire cache
 - **Phase 3 pre-warm** — after Phase 2 definitions, `scip-csharp batch-find-refs` resolves all uncached symbols in a single workspace session; controlled by `CSHARP_PREWARM_ENABLED` env (default: true)
 - **`index symbol` CLI** — `codesearch index symbol [-f] <alias>` for symbol-only rebuild; `--symbols` flag on `index -f` for combined text+symbol rebuild
 - **Watcher .csproj grouping** — changed .cs files grouped by .csproj, incremental rebuild per project instead of full solution
+- **SCIP LMDB map_size 512 MB** — increased from 64 MB (was causing `MDB_MAP_FULL` on enterprise repos when Phase-3 ref_cache exceeded 64 MB); override with `CODESEARCH_SCIP_LMDB_MAP_MB` env var; virtual address space only (no RAM cost on pages not written)
 
 ## Architecture
 
@@ -85,18 +90,19 @@ Missing helper disables `find_impact` for C# only — all other features keep wo
 
 The trait includes `as_any()` for downcasting to concrete types (needed for Phase 3 pre-warm which calls `CSharpSymbolIndexer::prewarm_ref_cache()`).
 
-## Current commit state (2026-05-06)
+## Current commit state (2026-05-20)
 
-Latest commits on `features/symbol-references`:
-- `35bbf36` fix: review remarks (double-Env, partial-class merge, META_SYMBOL_COUNT, temp collision)
-- `bb8c1c8` feat: Opt1+2+3 — filter external types, lazy refs, incremental merge
-- `6fc7861` feat: live progress streaming from scip-csharp (stage 6)
-- `88a8f01` fix: ordering + concurrency default=2 (stage 5)
-- `becc518` fix: IncludeAllContentForSelfExtract + MSBuild registration (stage 4)
-- `4ed0a3f` fix: applies_to + non-C# repos red TUI (stage 3)
+Branch: `fix/tui-indexing-status`
 
-**Status**: `cargo check` + `cargo clippy` clean, `dotnet build` clean.
-**Deployed**: Run `..\copy-to-common.ps1` to deploy to `~/.local/bin/`.
+Latest commits:
+- `6a0d637` tests: add unit tests for SCIP LMDB map_size constant and env-var override
+- `d2b4ce0` docs: update AGENTS.md — v1.0.120, Phase 2/3 TUI status feature documented
+- `ce6dad1` fix: Phase 2 queued candidates + Phase 3 pre-warm now signal TUI C# Indexing status
+- `e4fe2ab` chore: version bump to 1.0.119
+- `26b1833` fix: FSW SCIP rebuild signals indexing_cb so TUI shows Indexing during watcher-triggered symbol rebuild
+
+**Status**: `cargo check` + `cargo clippy` clean. All 6 unit tests in `symbols_csharp_test` pass. **Deployed as v1.0.124** (pre-commit hook auto-bumped).
+**To redeploy**: Run `..\copy-to-common.ps1`.
 
 ## Known Bugs (field-tested 2026-05-07 on ExampleRepo)
 
@@ -173,8 +179,44 @@ Debugging this required reading serve logs — no user-visible indication that D
 
 ---
 
+## ⚠️ Canonical Path Policy — MANDATORY
+
+**On Windows `Path::canonicalize()` returns `\\?\C:\...` (extended-length UNC prefix).
+Using this prefix in `.join()`, `Path::exists()`, or storing it in `repos.json` is
+unreliable and has caused multiple recurring bugs.**
+
+### Rule: NEVER call `.canonicalize()` directly. Always use `safe_canonicalize()`.
+
+```rust
+// ❌ FORBIDDEN everywhere in the codebase
+let p = path.canonicalize()?;
+
+// ✅ REQUIRED — central entry point, strips \\?\ prefix
+use crate::cache::safe_canonicalize;
+let p = safe_canonicalize(path)?;
+```
+
+`safe_canonicalize` is defined in `src/cache/file_meta.rs` and exported via `crate::cache`.
+It calls `canonicalize()` then `strip_unc_prefix()` and returns the same `io::Result` type.
+
+If you need to strip the prefix from an already-canonicalized `PathBuf`, use `strip_unc_prefix(path)`.
+
+The regression test class is `safe_canonicalize_on_existing_dir_returns_plain_path` in
+`src/cache/file_meta.rs` and `register_strips_unc_prefix_from_stored_path` in
+`src/db_discovery/repos.rs`. If you add a new `canonicalize()` call and bypass this rule,
+those tests will pass but a path-operation bug will manifest at runtime on Windows.
+
+---
+
 ## Remaining work
 
+- [ ] **Warmup blocks tokio runtime** — `perform_incremental_refresh_with_stores` in
+  `src/index/manager.rs` does synchronous file I/O (`FileWalker::walk`, `FileMetaStore::load_or_create`,
+  file hashing) and CPU-intensive embedding directly on the async executor without `spawn_blocking`.
+  During Phase 1 warmup of 15+ repos this starves the tokio threadpool, causing `/health` to time out.
+  Mitigation already in place: the CLI waits up to ~2 min for serve to become ready before refusing.
+  Real fix: wrap the sync-I/O-heavy sections inside `tokio::task::spawn_blocking` so the executor
+  stays responsive. This is a non-trivial refactor (the fn is async and takes `&SharedStores`).
 - [ ] Verify on live large repo: 1st `find_impact` call triggers lazy find-refs, 2nd+ call < 100ms (cache hit)
 - [ ] CI green on `csharp-integration-tests` job *(first run after push)*
 - [ ] Minor: warn if `--filter-project` passed to `find-refs` CLI (currently silently ignored)
@@ -191,6 +233,27 @@ Debugging this required reading serve logs — no user-visible indication that D
 - Symbol resolution: exact match first, then fuzzy via `scip_simple_names`
 - Position lookup matches `start_line` only (not `[start_line, end_line]` range)
 
+### ⚠️ LMDB Access Rule — CRITICAL
+
+LMDB **does not allow** two `EnvOpenOptions::open()` handles on the same directory in the same process. Violating this causes runtime panics and corrupted indexes.
+
+**In serve context (`codesearch serve`):** ALL LMDB access MUST go through `get_or_open_stores()` (serve/mod.rs) which returns `Arc<SharedStores>`. This is the single entry point that ensures one LMDB handle per `.codesearch.db`.
+
+**Forbidden in serve/MCP code:**
+- `VectorStore::new()` — opens its own LMDB environment
+- `VectorStore::open_readonly()` — same issue
+- Any direct `heed::EnvOpenOptions::open()` on a `.codesearch.db` path
+
+**Allowed in CLI/stdio context:** `VectorStore::new()` is fine when codesearch runs as a standalone CLI tool (own process, no conflicting handles).
+
+**The 4 LMDB environments in this codebase:**
+1. Vector DB — `.codesearch.db/` via `VectorStore` (serve: through `SharedStores` only)
+2. SCIP symbols — `.codesearch.db/scip/` via `open_scip_env()` (separate dir, separate handle, safe)
+3. Embed cache — `~/.codesearch/embed_cache/` via `EmbeddingCache` (global path, separate dir, safe)
+4. FTS — `.codesearch.db/fts/` — Tantivy, NOT LMDB (no constraint)
+
+**If you add a new feature that needs LMDB in serve context:** Use `get_or_open_stores()` to get the shared handle. Never open a second handle on the same path.
+
 ### Runtime vs build locations
 
 - **Runtime**: `C:\Users\develterf\.local\bin\` — contains `codesearch.exe` and `helpers/csharp/scip-csharp.exe`. This is where `codesearch serve` runs from.
@@ -204,6 +267,27 @@ Debugging this required reading serve logs — no user-visible indication that D
 - The helper is built via: `dotnet publish helpers/csharp/scip-csharp.csproj -r win-x64 --self-contained -c Release`
 - Helper output must be **single-file only**: `scip-csharp.exe` (+ optional `.pdb`). The `.csproj` has `PublishSingleFile=true` which bundles everything into one exe.
 - Do NOT copy framework DLLs, `BuildHost-*` dirs, or `.dll.config` files to the runtime location — only the single `.exe` is needed.
+
+---
+
+## Release workflow — `/merge` and `/release`
+
+Two committed Claude Code slash commands codify the release process
+(`.claude/commands/merge.md`, `.claude/commands/release.md`; force-added past `.gitignore`).
+
+- **`/merge`** — land the current feature branch on `develop`: README/CHANGELOG freshness
+  checks → commit → `cargo fmt`/`check`/`clippy` → push → PR to `develop` → `gh pr merge --auto`
+  (lands after CI). Does **not** tag.
+- **`/release`** — `/merge`, then promote `develop` → `master` via a `Release vX.Y.Z` PR
+  (`protect-master.yml` allows PRs to `master` only from `develop` or `release/*`), then push
+  the `vX.Y.Z` tag that triggers `.github/workflows/release.yml` (6 archives, plain +
+  `-with-csharp`). Includes an optional post-release `master → develop` sync.
+
+**Version rule (encoded in the commands):** the `pre-commit` hook bumps the patch (+1) and
+rebuilds **only on `feature/*` | `features/*` | `fix/*` branches**; `develop`/`master`/`release`/
+`chore` get `cargo fmt` only. So the release version is fixed at the feature-branch commit and
+carries forward unchanged through develop, master, and the tag. `/merge` therefore aborts unless
+run from a feature/fix branch.
 
 ---
 

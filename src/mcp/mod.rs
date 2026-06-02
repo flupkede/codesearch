@@ -3549,9 +3549,18 @@ impl CodesearchService {
         }
 
         // Must have serve_state to route
-        let serve_state = self.serve_state.as_ref().ok_or_else(|| {
-            "project/group routing requires `codesearch serve` to be running.".to_string()
-        })?;
+        let serve_state = match self.serve_state.as_ref() {
+            Some(ss) => ss,
+            None => {
+                // Local/stdio mode: only one DB available, project/group are meaningless.
+                // Fall through to local DB instead of erroring.
+                tracing::warn!(
+                    "MCP: project/group ignored in local mode (no serve running). \
+                     Using local database."
+                );
+                return Ok(None);
+            }
+        };
 
         // Validate params
         types::validate_project_group(project, group, true)?;
@@ -3711,14 +3720,22 @@ impl CodesearchService {
             match action(&store) {
                 Ok(result) => return Ok(result),
                 Err(shared_err) => {
-                    tracing::error!(
-                        "Shared vector store read failed, falling back to standalone open: {:?}",
-                        shared_err
-                    );
+                    tracing::error!("Shared vector store read failed: {:?}", shared_err);
+
+                    // In serve mode, do NOT fall back to a standalone VectorStore —
+                    // it would open a second LMDB handle on the same .codesearch.db,
+                    // which LMDB rejects ("environment already opened with different options").
+                    if self.serve_state.is_some() {
+                        return Err(shared_err.context(
+                            "Shared vector store read failed in serve mode; \
+                             standalone fallback disabled to prevent LMDB double-open",
+                        ));
+                    }
                 }
             }
 
-            // If MCP is in readonly mode, fallback must also use readonly open.
+            // Standalone readonly fallback (non-serve mode only).
+            // In serve mode the guard above already returned.
             if stores.readonly {
                 let ro_store = VectorStore::open_readonly(&self.db_path, self.dimensions)
                     .context("Error opening readonly database for read fallback")?;
@@ -3727,9 +3744,8 @@ impl CodesearchService {
             }
         }
 
-        // Fallback path:
-        // - when shared stores are not available, OR
-        // - when shared read fails (e.g., transient readonly/shared handle issues)
+        // Standalone fallback (non-serve mode only — CLI / stdio MCP).
+        // In serve mode, either Priority 1/2 succeeded or the guard above returned Err.
         let store = VectorStore::new(&self.db_path, self.dimensions)
             .context("Error opening database for read fallback")?;
         action(&store).context("Error reading from vector store")
@@ -5170,6 +5186,69 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
+    /// Fetch outline items for an already-normalised absolute path.
+    ///
+    /// Returns `Ok(vec![])` when no chunks match.
+    /// In multi-store mode, per-store I/O failures are logged and skipped (never `Err`).
+    /// In single-store mode, I/O failures are returned as `Err`.
+    async fn outline_items_for_normalized(
+        &self,
+        normalized: &str,
+        ctx: &MultiStoreContext,
+    ) -> anyhow::Result<Vec<FileOutlineItem>> {
+        if let Some(ref sv) = ctx.stores_vec {
+            let mut all_items: Vec<FileOutlineItem> = Vec::new();
+            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for store_arc in sv {
+                let store = store_arc.vector_store.read().await;
+                match store.chunks_for_file(normalized) {
+                    Ok(metas) => {
+                        for c in metas {
+                            if seen_ids.insert(c.id) {
+                                all_items.push(FileOutlineItem {
+                                    chunk_id: c.id,
+                                    kind: c.kind,
+                                    signature: c.signature,
+                                    start_line: c.start_line,
+                                    end_line: c.end_line,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Vector store read failed in outline_items_for_normalized fan-out: {:?}",
+                            e
+                        );
+                    }
+                }
+            }
+            all_items.sort_by_key(|i| i.start_line);
+            Ok(all_items)
+        } else {
+            let normalized_owned = normalized.to_string();
+            self.with_vector_store_read_for(
+                move |store| {
+                    let mut out: Vec<FileOutlineItem> = store
+                        .chunks_for_file(&normalized_owned)?
+                        .into_iter()
+                        .map(|c| FileOutlineItem {
+                            chunk_id: c.id,
+                            kind: c.kind,
+                            signature: c.signature,
+                            start_line: c.start_line,
+                            end_line: c.end_line,
+                        })
+                        .collect();
+                    out.sort_by_key(|i| i.start_line);
+                    Ok(out)
+                },
+                ctx.stores.clone(),
+            )
+            .await
+        }
+    }
+
     async fn file_outline(
         &self,
         Parameters(request): Parameters<FileOutlineRequest>,
@@ -5212,64 +5291,45 @@ impl CodesearchService {
         let stripped_path = strip_alias_prefix(&request.path, ctx.project_alias.as_ref());
         let normalized = normalize_tool_path(&stripped_path, &project_root);
 
-        let items = if let Some(ref sv) = ctx.stores_vec {
-            // Multi-store group fan-out: collect outline items from all stores
-            let mut all_items: Vec<FileOutlineItem> = Vec::new();
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for store_arc in sv {
-                let store = store_arc.vector_store.read().await;
-                match store.chunks_for_file(&normalized) {
-                    Ok(metas) => {
-                        for c in metas {
-                            if seen_ids.insert(c.id) {
-                                all_items.push(FileOutlineItem {
-                                    chunk_id: c.id,
-                                    kind: c.kind,
-                                    signature: c.signature,
-                                    start_line: c.start_line,
-                                    end_line: c.end_line,
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Vector store read failed in file_outline fan-out: {:?}", e);
-                    }
-                }
-            }
-            all_items.sort_by_key(|i| i.start_line);
-            all_items
-        } else {
-            match self
-                .with_vector_store_read_for(
-                    |store| {
-                        let mut out: Vec<FileOutlineItem> = store
-                            .chunks_for_file(&normalized)?
-                            .into_iter()
-                            .map(|c| FileOutlineItem {
-                                chunk_id: c.id,
-                                kind: c.kind,
-                                signature: c.signature,
-                                start_line: c.start_line,
-                                end_line: c.end_line,
-                            })
-                            .collect();
-                        out.sort_by_key(|i| i.start_line);
-                        Ok(out)
-                    },
-                    ctx.stores.clone(),
-                )
-                .await
-            {
-                Ok(items) => items,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error reading outline: {}",
-                        e
-                    ))]));
-                }
+        let mut items = match self.outline_items_for_normalized(&normalized, &ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error reading outline: {}",
+                    e
+                ))]));
             }
         };
+
+        // Two-pass fallback: if alias-stripping changed the path and yielded no results,
+        // try the original un-stripped path. Handles the case where the project alias
+        // matches a package subdirectory name (e.g. project "my_pkg" with target
+        // "my_pkg/config.py" → after strip becomes "config.py" which is wrong;
+        // the correct relative path is "my_pkg/config.py").
+        if items.is_empty() && stripped_path != request.path {
+            let normalized_orig = normalize_tool_path(&request.path, &project_root);
+            if normalized_orig != normalized {
+                tracing::debug!(
+                    "file_outline: primary '{}' empty, trying fallback '{}'",
+                    normalized,
+                    normalized_orig
+                );
+                items = match self
+                    .outline_items_for_normalized(&normalized_orig, &ctx)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            "file_outline: fallback '{}' also failed: {:?}",
+                            normalized_orig,
+                            e
+                        );
+                        Vec::new()
+                    }
+                };
+            }
+        }
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -7675,7 +7735,7 @@ pub async fn run_mcp_server(
                     // Step 2: AFTER refresh completes, start file watcher (also writes to stores)
                     tracing::info!("👀 Starting file watcher...");
                     if let Err(e) = index_manager_arc
-                        .start_file_watcher(bg_cancel_token, None)
+                        .start_file_watcher(bg_cancel_token, None, None)
                         .await
                     {
                         tracing::error!("❌ Failed to start file watcher: {}", e);

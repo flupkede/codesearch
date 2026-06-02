@@ -3,10 +3,54 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::constants::FILE_META_DB_NAME;
+
+// ─── CANONICAL PATH POLICY ────────────────────────────────────────────────────
+//
+// On Windows, `Path::canonicalize()` returns an extended-length UNC path of the
+// form `\\?\C:\...`. Passing this prefix to `.join()`, `.exists()`, or storing
+// it in repos.json causes inconsistent behaviour: `\\?\C:\foo\.codesearch.db`
+// may return `false` from `Path::exists()` even when `C:\foo\.codesearch.db`
+// exists, and HashMap keys built from UNC paths diverge from keys built from
+// plain paths on the same directory.
+//
+// RULE: **Never call `.canonicalize()` directly.** Always use `safe_canonicalize()`
+// instead. It is the single, central entry point that strips the prefix and
+// returns a plain, reliable path suitable for storage and all filesystem ops.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Strip the Windows extended-length UNC prefix (`\\?\`) from a canonicalized
+/// path, returning a plain `C:\...` path. Idempotent on all other inputs.
+///
+/// This is exposed publicly so callers that already have a `PathBuf` and want
+/// to strip the prefix without re-canonicalizing can do so.
+pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped.to_string())
+    } else {
+        path
+    }
+}
+
+/// Canonicalize a path and strip any Windows UNC `\\?\` prefix.
+///
+/// **This is the ONLY approved way to canonicalize paths in codesearch.**
+/// It returns the same error as `Path::canonicalize()` on failure (path does
+/// not exist, permission denied, etc.) and a clean `C:\...` path on success.
+///
+/// # Why not `.canonicalize()` directly?
+/// On Windows `canonicalize()` returns `\\?\C:\...`. That prefix causes
+/// `.join()` and `Path::exists()` to fail inconsistently on sub-paths, and
+/// produces diverging HashMap keys when the same directory is accessed with
+/// and without the prefix. `safe_canonicalize` eliminates this class of bug.
+pub fn safe_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize().map(strip_unc_prefix)
+}
 
 /// Normalize a file path for consistent HashMap lookups.
 ///
@@ -348,6 +392,64 @@ impl FileMetaStats {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // ── safe_canonicalize / strip_unc_prefix ────────────────────────────────
+
+    #[test]
+    fn strip_unc_prefix_removes_windows_unc() {
+        let unc = PathBuf::from(r"\\?\C:\WorkArea\AI\foo");
+        let stripped = strip_unc_prefix(unc);
+        assert_eq!(stripped, PathBuf::from(r"C:\WorkArea\AI\foo"));
+    }
+
+    #[test]
+    fn strip_unc_prefix_is_idempotent_on_plain_path() {
+        let plain = PathBuf::from(r"C:\WorkArea\AI\foo");
+        let result = strip_unc_prefix(plain.clone());
+        assert_eq!(result, plain);
+    }
+
+    #[test]
+    fn strip_unc_prefix_is_idempotent_on_unix_path() {
+        let unix = PathBuf::from("/home/user/project");
+        let result = strip_unc_prefix(unix.clone());
+        assert_eq!(result, unix);
+    }
+
+    /// `safe_canonicalize` on an existing directory must return a plain path
+    /// (no `\\?\` prefix) that `Path::exists()` confirms is reachable.
+    /// This is the core regression guard for the class of bugs where UNC paths
+    /// caused `.join(".codesearch.db").exists()` to return false.
+    #[test]
+    fn safe_canonicalize_on_existing_dir_returns_plain_path() {
+        let tmp = tempdir().unwrap();
+        let result = safe_canonicalize(tmp.path()).unwrap();
+        let s = result.to_string_lossy();
+        assert!(
+            !s.starts_with(r"\\?\"),
+            "safe_canonicalize must strip UNC prefix, got: {}",
+            s
+        );
+        // The returned path must still be a valid, accessible directory.
+        assert!(
+            result.exists(),
+            "safe_canonicalize result must exist: {}",
+            s
+        );
+        // A sub-path join must also be resolvable — this is what was broken.
+        let sub = result.join("dummy_check");
+        // exists() returns false (dir doesn't exist) but must NOT panic or error
+        let _ = sub.exists();
+    }
+
+    #[test]
+    fn safe_canonicalize_on_nonexistent_path_returns_error() {
+        let nonexistent = PathBuf::from(r"C:\this\path\does\not\exist\ever");
+        assert!(
+            safe_canonicalize(&nonexistent).is_err(),
+            "safe_canonicalize must propagate canonicalize() errors"
+        );
+    }
 
     #[test]
     fn test_normalize_path_strips_unc_prefix() {

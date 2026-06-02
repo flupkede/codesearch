@@ -7,6 +7,282 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.153] - 2026-06-02
+
+### Added
+
+- **Auto-prune stale repos during Phase 1 warmup** — when a repo fails warmup
+  because its path or database no longer exists, `codesearch serve` now
+  automatically removes it from `repos.json` and logs a warning, instead of
+  silently retrying on every restart. Works in concert with the relocation pass
+  (reconcile_all_paths): relocatable repos are rewritten first, truly missing
+  ones are pruned.
+
+### Fixed
+
+- **Missing `YELLOW` color variable in `scripts/qc.sh`** — the variable was
+  referenced but never declared, causing a visual glitch in QC output.
+
+## [1.0.152] - 2026-06-02
+
+### Added
+
+- **Best-effort relocation of moved/renamed repositories** — every repo's git
+  remote (`remote.origin.url`) is now captured at registration. When a
+  registered folder is renamed or moved, `codesearch serve` no longer crashes:
+  on startup it reconciles all paths, and for each missing path it scans nearby
+  folders (bounded depth, override with `CODESEARCH_RELOCATE_MAX_DEPTH`, default
+  `3`) for a git checkout with the same remote. A single unambiguous match is
+  rewritten into `repos.json`; ambiguous/absent matches are logged and skipped
+  (the dead path is never indexed). Phase-2 (C# SCIP) and Phase-3 (pre-warm)
+  also guard `path.exists()` so a stale path can never reach heavy code paths.
+- **`codesearch index prune`** — new command that relocates moved repos first,
+  then unregisters any remaining stale entries, printing a summary.
+
+### Changed
+
+- **The user-settable `--alias`/`-a` flag was removed from `index add`** — the
+  alias (the `repos.json` key, used by groups and the MCP `project` argument) is
+  now always derived from the repository directory name. In practice the alias
+  always had to equal the directory name, so a custom alias only caused
+  downstream mismatches. The `index symbol <alias>` positional (a lookup key) is
+  unchanged.
+
+### Fixed
+
+- **A hand-edited or corrupt-ish `repos.json` no longer crashes the app** — on
+  load the config is reconciled in memory: entries with empty/blank alias keys
+  are dropped, orphaned `repos_meta` is removed, and group members referencing
+  unknown aliases (and groups left empty) are pruned. Valid aliases are never
+  renamed (that would break group references).
+
+## [1.0.146] - 2026-06-02
+
+### Added
+
+- **Semantic Markdown chunking** — Markdown files (`.md`, `.markdown`, `.txt`) are
+  now parsed with the **tree-sitter-md block grammar**, so chunks align to sections,
+  headings, and code fences instead of arbitrary line ranges. `Language::Markdown`
+  now reports `supports_tree_sitter() == true` and has a compiled-in grammar.
+
+### Changed
+
+- **Supported-languages documentation corrected** — the README language table now
+  lists all 15 tree-sitter languages actually supported (Rust, Python, JavaScript,
+  TypeScript, C, C++, C#, Go, Java, Shell, Ruby, PHP, YAML, JSON, Markdown);
+  it previously showed only 9, omitting Shell, Ruby, PHP, YAML, JSON, and Markdown.
+
+## [1.0.142] - 2026-06-01
+
+### Fixed
+
+- **`codesearch serve` became unresponsive during startup warmup** — heavy
+  synchronous work (`FileWalker::walk`, `VectorStore::build_index` HNSW
+  construction, and fastembed/ONNX embedding which saturates all CPU cores)
+  ran directly on tokio worker threads while warming up repos at startup. This
+  starved the async runtime so `/health` timed out (>3s), causing
+  `codesearch index` to report "serve did not respond in time". That work is
+  now offloaded to `tokio::task::spawn_blocking`, keeping the async executor
+  responsive: serve answers `/health` and accepts `POST /repos[/:alias/reindex]`
+  immediately during warmup, returning 202 and running the index job in the
+  background (accept-and-defer) instead of making the client wait or fail.
+  Lock safety: every async `RwLock` guard is released before the blocking task
+  acquires `blocking_write()` on the same store, so there is no lock-over-await
+  deadlock.
+
+
+## [1.0.141] - 2026-06-01
+
+### Fixed
+
+- **`codesearch index` aborted instead of waiting when serve was warming up** —
+  on `ServeUnresponsive` the CLI returned an error. It now waits patiently
+  (`serve_delegate_with_warmup_wait`): prints progress and retries every 8s up
+  to ~2 min, delegating as soon as serve becomes ready, and only erroring if the
+  budget is exhausted. (Superseded for the responsiveness root cause by 1.0.142.)
+- **409 Conflict when recreating a missing database** — when a registered repo's
+  database was gone, the CLI's auto-register returned 409 ("already registered")
+  and fell back to a local duplicate. It now retries as
+  `POST /repos/{alias}/reindex?force=true`, which recreates the DB via serve.
+
+
+## [1.0.140] - 2026-06-01
+
+### Fixed
+
+- **Last raw `.canonicalize()` eliminated** — `get_db_path_smart` still used the
+  old `normalize_path(&p.canonicalize()...)` pattern. Routed through the central
+  `safe_canonicalize()` so no raw `.canonicalize()` remains outside its own
+  definition.
+
+
+## [1.0.139] - 2026-06-01
+
+### Changed
+
+- **Central path canonicalization** — introduced `safe_canonicalize()` and
+  `strip_unc_prefix()` in `crate::cache` as the single approved way to
+  canonicalize paths, and replaced all 16+ raw `.canonicalize()` call sites
+  across `repos.rs`, `db_discovery/mod.rs`, `index/mod.rs`, `lmdb_registry.rs`,
+  and `serve/mod.rs`. This structurally prevents the recurring Windows UNC-path
+  (`\\?\`) bug class. Policy documented in `AGENTS.md`; 6 regression tests added.
+
+
+## [1.0.138] - 2026-06-01
+
+### Fixed
+
+- **`\\?\`-prefixed UNC paths stored in repos.json caused spurious "Database
+  not found" errors** — `Path::canonicalize()` on Windows returns an
+  extended-length UNC path (`\\?\C:\...`). When stored verbatim in
+  `repos.json`, downstream `.join(".codesearch.db")` and `Path::exists()`
+  calls failed inconsistently (e.g. `\\?\C:\foo\.codesearch.db` returned
+  `false` even when `C:\foo\.codesearch.db` existed). This affected 7 repos
+  in repos.json and caused a cascade of "Database not found" 500 errors and
+  fallbacks to local duplicate indexes. `register()` and `register_with_alias()`
+  now strip the `\\?\` prefix before storage so repos.json always holds plain
+  `C:\...` paths. Existing UNC entries are automatically corrected at the next
+  registration. (Existing repos.json was also patched in-place.)
+- **500 "Database not found" on reindex caused a local duplicate index** —
+  when a registered repo's database was deleted externally (e.g. serve killed
+  mid-index), the reindex endpoint returned 500 "Database not found". The CLI
+  treated this as a generic failure and fell back to local indexing, recreating
+  the duplicate. It now triggers the same auto-register (`POST /repos`) path as
+  a 404, which recreates the database via serve without any local fallback.
+
+
+
+## [1.0.137] - 2026-06-01
+
+### Fixed
+
+- **`codesearch index` silently created a local duplicate index when `serve`
+  was busy starting up** — the CLI probes `serve`'s `/health` before delegating.
+  Any failure (including a *timeout* while `serve` was warming up its repos) was
+  treated as "serve is not running", so the CLI silently fell back to creating a
+  **local index** — a duplicate that `serve` does not manage and that can cause
+  LMDB file-lock conflicts. The health probe now distinguishes three cases:
+  *responsive* (delegate), *connection refused / not running* (index locally —
+  detected immediately, so the local path is not slowed down), and *listening
+  but unresponsive* (serve is up but busy). In the last case the CLI now
+  **refuses to create a local duplicate** and asks you to retry shortly or stop
+  `serve` first, instead of silently duplicating. The fallback is never silent
+  anymore.
+- **`codesearch index` could not register a brand-new repo via a running
+  `serve` instance** — when `serve` was running and you indexed a repo that
+  was not yet known to it, the auto-register call (`POST /repos`) failed with
+  a misleading *"Database is locked by another process"* error and HTTP 500.
+  Root cause: `SharedStores::new()` tried to acquire the writer lock
+  (`.writer.lock`) *before* the `.codesearch.db` directory existed, so opening
+  the lock file failed with "path not found" and was reported as a lock
+  conflict. Consequences: the `repos.json` registration was rolled back (the
+  alias was never persisted) and the CLI silently fell back to creating a
+  **local duplicate index** instead of handing control to `serve`. Existing
+  repos (whose database directory already existed) and local-only indexing
+  were unaffected. The database directory is now created before the writer
+  lock is acquired.
+- **Genuine filesystem errors during database creation were masked as lock
+  contention** — a real I/O failure (e.g. permission denied) while creating
+  the database directory now surfaces as itself instead of the misleading
+  "Database is locked by another process" message.
+
+### Changed
+
+- **Serve config writes now honor the configured config path** — all
+  `repos.json` writes from the register/remove/metadata-persist paths route
+  through `ServeState::persist_config()`, which respects the active config
+  path override. Production behavior is unchanged; this makes the
+  register/remove path hermetically testable.
+
+### Tests
+
+- Added regression guards that exercise the brand-new-repo store-creation and
+  register path with the `.codesearch.db` directory genuinely absent
+  (`try_open_stores`, `SharedStores::new`, `acquire_writer_lock`, and an
+  end-to-end `add_repo_handler` test asserting 202 + no `repos.json`
+  rollback). These were verified to fail against the pre-fix code.
+- Added guards for the serve `/health` probe classification: a responsive
+  endpoint → delegate, and a listening-but-slow endpoint → "unresponsive"
+  (caller refuses to create a local duplicate).
+
+
+## [1.0.135] - 2026-05-27
+
+### Fixed
+
+- **MCP local/stdio mode ignores `project`/`group` params** — when running
+  `codesearch mcp` without `codesearch serve` (Local mode), passing `project` or
+  `group` parameters caused a hard error: *"project/group routing requires
+  `codesearch serve` to be running."* The LLM (Claude Code) auto-fills these
+  params from the tool schema. Now they are silently ignored with a warning log,
+  and the local database is used. Closes #65.
+- **QC script `YELLOW` color variable undefined** — `scripts/qc.sh` referenced
+  `YELLOW` without defining it, causing `set -u` failures on Linux. Fixed by
+  adding the missing color constant.
+
+### Changed
+
+- **`protect-master.yml` allows `release/*` branches** — CI branch protection
+  workflow now accepts PRs from both `develop` and `release/*` branches into
+  `master`, enabling clean release branches when develop has diverged.
+
+
+## [1.0.132] - 2026-05-22
+
+### Added
+
+- **Tree-sitter grammars for Bash, Ruby, PHP, YAML, JSON** — codesearch now
+  supports AST-aware chunking for 14 languages total (previously 9: Rust,
+  Python, JavaScript, TypeScript, C, C++, C#, Go, Java). Closes #55.
+- **Bash equivalents of QC and bump-version scripts** — `scripts/qc.sh` and
+  `scripts/bump-version.sh` for Linux/macOS environments, complementing the
+  existing PowerShell scripts.
+- **Platform-aware pre-push hook** — `.git/hooks/pre-push` auto-detects the
+  platform and calls the appropriate QC script before allowing a push.
+- **CodeQL configuration** — added `.github/codeql/codeql-config.yml` to
+  suppress `rust/path-injection` false positives (codesearch is a local dev
+  tool, not a web-facing server).
+
+### Changed
+
+- **SCIP LMDB map_size raised from 64 MB to 512 MB** — the SCIP symbol index
+  LMDB environment now defaults to 512 MB virtual address space, up from 64 MB.
+  This prevents `MDB_MAP_FULL` errors on large solutions. Override with
+  `CODESEARCH_SCIP_LMDB_MAP_MB` environment variable.
+- **Centralized DB open/create logic** — extracted `try_open_stores()` to
+  eliminate duplicate LMDB open paths across the codebase. All serve-context
+  LMDB access now goes through a single entry point.
+
+### Fixed
+
+- **LMDB double-open race in `add_repo_handler`** — a concurrent guard with
+  cancel token now prevents two simultaneous `add_repo` calls from opening the
+  same LMDB database, which caused panics and corrupted indexes.
+- **LMDB double-open in MCP fallback path** — blocked a code path where the
+  MCP handler could open a second LMDB environment on the same directory when
+  `SharedStores` initialization failed.
+- **`TrackedEnv` runtime guard** — a new runtime guard detects LMDB
+  double-open attempts at runtime, producing a clear error instead of a panic.
+- **Force-reindex on missing database** — `try_open_stores()` now creates the
+  database on the fly when it's missing, fixing the case where a previously
+  registered repo had no `.codesearch.db` directory yet.
+- **Explore two-pass fallback** — `explore outline` now falls back to a
+  second lookup strategy when the alias name matches a package subdirectory,
+  preventing empty results on certain project layouts.
+- **TUI C# indexing status** — Phase 2 SCIP rebuilds and Phase 3 pre-warm now
+  correctly signal the TUI `indexing_cb`, so the UI shows "C# Indexing"
+  during background symbol operations.
+- **FSW SCIP rebuild TUI signal** — file-watcher-triggered symbol rebuilds now
+  update `active_reindexes` so the TUI displays the correct indexing state.
+- **CI test resilience** — `test_indexer_returns_empty_when_db_missing` is now
+  resilient to LMDB lock contention on CI runners.
+- **Protect-master workflow** — GitHub Actions workflow that only allows PRs
+  from `develop` to `master`, preventing accidental direct pushes.
+- **`config.save()` failure warnings** — `add_repo_handler` now logs warnings
+  when `config.save()` fails instead of silently dropping the error.
+
+
+
 ## [1.0.97] - 2026-05-15
 
 ### Fixed
@@ -282,6 +558,7 @@ repositories.
 - `codesearch serve` keeps one writer per database (LMDB invariant). Concurrent
   reindex from a second process is rejected.
 
+[1.0.132]: https://github.com/flupkede/codesearch/compare/v1.0.97...v1.0.132
 [1.0.97]: https://github.com/flupkede/codesearch/compare/v1.0.96...v1.0.97
 [1.0.96]: https://github.com/flupkede/codesearch/compare/v1.0.95...v1.0.96
 [1.0.95]: https://github.com/flupkede/codesearch/compare/v1.0.94...v1.0.95

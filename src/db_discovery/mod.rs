@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::cache::safe_canonicalize;
 use crate::constants::DB_DIR_NAME;
 
 /// Compare two paths by normalizing them (case-insensitive on Windows).
@@ -133,7 +134,7 @@ fn find_best_database_impl(
     };
 
     // Try to canonicalize, but handle errors gracefully
-    let canonical = match canonical.canonicalize() {
+    let canonical = match safe_canonicalize(&canonical) {
         Ok(path) => path,
         Err(_) => return Ok(None), // Path doesn't exist, return None
     };
@@ -366,7 +367,7 @@ pub fn resolve_database_with_message(
     };
 
     // Try to canonicalize, but fall back to original path if it fails
-    let canonical_path = project_path.canonicalize().unwrap_or(project_path.clone());
+    let canonical_path = safe_canonicalize(&project_path).unwrap_or(project_path.clone());
     let db_path = canonical_path.join(".codesearch.db");
     Ok((db_path, canonical_path))
 }
