@@ -463,6 +463,27 @@ impl ServeState {
 
         // Bootstrap last_changed_unix UP FRONT (before the has_index branch),
         // so the sort key is meaningful for both first-builds and refreshes.
+        //
+        // IMPORTANT: bootstrap_last_changed spawns a git subprocess and walks
+        // the filesystem (≤10,000 entries). Running that work while holding the
+        // config write-lock would block every concurrent config.read() call for
+        // the duration of the scan. Fix: check whether bootstrapping is needed
+        // under a *read* lock, perform the slow I/O outside any lock, then take
+        // the write lock only for the brief config update.
+        let needs_bootstrap = {
+            let cfg = match self.config.read() {
+                Ok(c) => c,
+                Err(_) => return RebuildDecision::ConfigPoisoned,
+            };
+            cfg.meta(alias).last_changed_unix.is_none()
+        };
+        // Slow git/fs work runs here — no lock held.
+        let bootstrapped_ts = if needs_bootstrap {
+            Self::bootstrap_last_changed(repo_path).or_else(|| Some(Self::now_unix_secs()))
+        } else {
+            None
+        };
+
         let (last_changed, last_scip, touched_bootstrap) = {
             let mut cfg = match self.config.write() {
                 Ok(c) => c,
@@ -471,8 +492,9 @@ impl ServeState {
             let mut meta = cfg.meta(alias);
             let mut touched = false;
             if meta.last_changed_unix.is_none() {
-                meta.last_changed_unix =
-                    Self::bootstrap_last_changed(repo_path).or_else(|| Some(Self::now_unix_secs()));
+                // Another task may have bootstrapped between our read and write;
+                // the double-check here is intentional (TOCTOU-safe via the write lock).
+                meta.last_changed_unix = bootstrapped_ts;
                 if let Some(ts) = meta.last_changed_unix {
                     touched = cfg.touch_last_changed(alias, ts);
                 }
@@ -693,7 +715,27 @@ impl ServeState {
                 None => continue,
             };
             let db_path = path.join(DB_DIR_NAME);
-            let decision = self.evaluate_csharp_rebuild(alias, &path, &db_path);
+            // evaluate_csharp_rebuild may spawn a git subprocess and walk the
+            // filesystem — offload to the blocking pool so the async runtime
+            // stays responsive while processing all candidates.
+            let state2 = self.clone();
+            let alias2 = alias.clone();
+            let path2 = path.clone();
+            let db_path2 = db_path.clone();
+            let decision = match tokio::task::spawn_blocking(move || {
+                state2.evaluate_csharp_rebuild(&alias2, &path2, &db_path2)
+            })
+            .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "phase-2: evaluate_csharp_rebuild panicked for '{}': {:?}",
+                        alias, e
+                    );
+                    continue;
+                }
+            };
             if !decision.needs_rebuild() {
                 // If the SCIP index exists and is fresh, mark C# status as Ready
                 // so the TUI shows the C# indicator (e.g. "C#·") instead of None.
@@ -1361,20 +1403,31 @@ impl ServeState {
         // When opening an existing DB, VectorStore starts with indexed=false.
         // Without this, search fails with "Index not built" until the background
         // refresh completes (which may take minutes for large repos).
+        // build_index() is CPU-heavy — offload to the blocking pool so the async
+        // runtime is not stalled while building the HNSW index for large repos.
         {
-            let mut vstore = stores.vector_store.write().await;
-            match vstore.stats() {
-                Ok(s) if s.total_chunks > 0 && !s.indexed => {
-                    info!(
-                        "Building vector index for '{}' ({} existing chunks)",
-                        alias, s.total_chunks
-                    );
-                    if let Err(e) = vstore.build_index() {
-                        warn!("Failed to build vector index for '{}': {}", alias, e);
+            let vector_store = Arc::clone(&stores.vector_store);
+            let alias_owned = alias.to_string();
+            match tokio::task::spawn_blocking(move || {
+                let mut vstore = vector_store.blocking_write();
+                match vstore.stats() {
+                    Ok(s) if s.total_chunks > 0 && !s.indexed => {
+                        info!(
+                            "Building vector index for '{}' ({} existing chunks)",
+                            alias_owned, s.total_chunks
+                        );
+                        if let Err(e) = vstore.build_index() {
+                            warn!("Failed to build vector index for '{}': {}", alias_owned, e);
+                        }
                     }
+                    Ok(_) => {} // already indexed or no chunks
+                    Err(e) => warn!("Could not read stats for '{}': {}", alias_owned, e),
                 }
-                Ok(_) => {} // already indexed or no chunks
-                Err(e) => warn!("Could not read stats for '{}': {}", alias, e),
+            })
+            .await
+            {
+                Ok(()) => {}
+                Err(e) => warn!("warmup: build_index task panicked for '{}': {:?}", alias, e),
             }
         }
 
@@ -2729,11 +2782,22 @@ async fn add_repo_handler(
             }
         }
 
-        // Build vector index from freshly indexed data
+        // Build vector index from freshly indexed data.
+        // build_index() is CPU-heavy — offload to the blocking pool.
         {
-            let mut vstore = stores.vector_store.write().await;
-            if let Err(e) = vstore.build_index() {
-                tracing::warn!("Failed to build vector index for '{}': {}", alias_bg, e);
+            let vector_store = Arc::clone(&stores.vector_store);
+            let alias_bi = alias_bg.clone();
+            match tokio::task::spawn_blocking(move || {
+                let mut vstore = vector_store.blocking_write();
+                vstore.build_index()
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to build vector index for '{}': {}", alias_bi, e)
+                }
+                Err(e) => tracing::warn!("build_index task panicked for '{}': {:?}", alias_bi, e),
             }
         }
 
