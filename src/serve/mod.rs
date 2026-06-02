@@ -648,10 +648,12 @@ impl ServeState {
                         self.repos.remove(alias);
                         self.last_access.remove(alias);
 
-                        // Unregister from repos.json
+                        // Unregister from repos.json — route through persist_config
+                        // so the config_path_override is honoured (same as all
+                        // other save sites in ServeState).
                         if let Ok(mut config) = self.config.write() {
                             if config.unregister_alias(alias) {
-                                if let Err(save_err) = config.save() {
+                                if let Err(save_err) = self.persist_config(&config) {
                                     warn!(
                                         "phase-1: failed to save repos.json after pruning '{}': {}",
                                         alias, save_err
@@ -3057,7 +3059,18 @@ pub async fn run_serve(
     {
         let phase_state = serve_state.clone();
         tokio::spawn(async move {
-            phase_state.reconcile_all_paths();
+            // reconcile_all_paths spawns git subprocesses and traverses the
+            // filesystem while holding the config RwLock write-guard.  Running
+            // it on a Tokio worker thread would starve the async runtime and
+            // block all concurrent config.read() calls for the entire duration.
+            // spawn_blocking offloads the synchronous work to the blocking
+            // thread pool, then we await the handle before proceeding to Phase 1.
+            let reconcile_state = phase_state.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || reconcile_state.reconcile_all_paths()).await
+            {
+                warn!("reconcile: spawn_blocking panicked: {:?}", e);
+            }
             phase_state.run_phase_1_warmup_all().await;
             phase_state.run_phase_2_csharp_scip().await;
             phase_state.run_phase_3_prewarm().await;

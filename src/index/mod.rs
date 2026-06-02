@@ -628,6 +628,34 @@ async fn index_with_options(
 
         // If no changes and no deleted files, we're done
         if changed_files.is_empty() && deleted_files.is_empty() {
+            // Safety net: if a previous run was cancelled/interrupted mid-way,
+            // the HNSW vector index may never have been built. Detect this and
+            // rebuild now so the database is usable without requiring --force.
+            {
+                let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
+                match vs.stats() {
+                    Ok(s) if s.total_chunks > 0 && !s.indexed => {
+                        log_print!(
+                            "\n{}",
+                            format!(
+                                "🔨 Vector index not built ({} chunks found from previous run). Rebuilding...",
+                                s.total_chunks
+                            )
+                            .yellow()
+                        );
+                        vs.build_index()?;
+                        log_print!("{}", "✅ Vector index rebuilt successfully!".green());
+                    }
+                    Ok(_) => {} // already indexed or no chunks — all good
+                    Err(e) => {
+                        log_print!(
+                            "{}",
+                            format!("⚠️  Could not check vector index status: {}", e).yellow()
+                        );
+                    }
+                }
+            }
+
             log_print!("\n{}", "✅ Database is up to date!".green());
             return Ok(());
         }
@@ -896,38 +924,85 @@ async fn index_with_options(
         // Memory is freed here - chunks/embeddings dropped before next file
     }
 
-    // Handle cancellation: exit quickly without blocking on build_index
+    // Handle cancellation: still finalize the index properly so the database
+    // remains usable. Skipping build_index() was the old behaviour — it left
+    // the database in a broken state that a subsequent incremental run could
+    // not recover from (no changed files → early return → index never built).
     if cancelled {
         pb.finish_with_message("Cancelled!");
-        log_print!("\n{}", "⚠️  Indexing cancelled by user".yellow());
+        log_print!(
+            "\n{}",
+            "⚠️  Indexing cancelled — finalising partial index...".yellow()
+        );
 
-        // Free ONNX model memory immediately
+        // Free ONNX model memory before build_index (releases hundreds of MB)
         drop(embedding_service);
         drop(chunker);
 
-        // Don't call build_index() — it blocks for 10-30 seconds on large datasets.
-        // The database is in a partially written state, user can re-run with --force.
-        // Commit FTS with retry to avoid index corruption on shutdown.
+        // Commit FTS
         if total_chunks > 0 {
             if let Err(e) = fts_store.commit() {
-                // Log the error - best-effort commit failed
-                log_print!(
-                    "{}   FTS commit warning: {} (index may need recovery)",
-                    "⚠️ ".yellow(),
-                    e
-                );
-                log_print!(
-                    "{}   Run {} to rebuild the index cleanly if needed",
-                    "💡 ".cyan(),
-                    "codesearch index -f".bright_cyan()
-                );
-            } else {
-                log_print!(
-                    "   Partial progress: {} chunks written (re-run with --force for clean index)",
-                    total_chunks
-                );
+                log_print!("{}   FTS commit warning: {}", "⚠️ ".yellow(), e);
             }
         }
+        drop(fts_store);
+
+        // Build vector index from the chunks that were successfully inserted
+        if total_chunks > 0 {
+            log_print!(
+                "   Building vector index for {} partial chunks...",
+                total_chunks
+            );
+            store.build_index()?;
+            log_print!("   ✅ Vector index built");
+        }
+
+        // Save metadata
+        std::fs::write(
+            db_path.join("metadata.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_short_name": model_type.short_name(),
+                "model_name": model_type.name(),
+                "dimensions": model_type.dimensions(),
+                "indexed_at": chrono::Utc::now().to_rfc3339(),
+                "partial": true,
+            }))?,
+        )?;
+
+        // Update FileMetaStore with the files that were actually processed
+        if !file_chunks.is_empty() {
+            if is_incremental {
+                let mut meta = file_meta_store.take().unwrap();
+                for (file_path, chunk_ids) in file_chunks {
+                    meta.update_file(Path::new(&file_path), chunk_ids)?;
+                }
+                meta.save(&db_path)?;
+            } else {
+                let mut meta = FileMetaStore::new(
+                    model_type.short_name().to_string(),
+                    model_type.dimensions(),
+                );
+                for (file_path, chunk_ids) in file_chunks {
+                    meta.update_file(Path::new(&file_path), chunk_ids)?;
+                }
+                meta.save(&db_path)?;
+            }
+        }
+
+        // Persist stats
+        let db_stats = store.stats()?;
+        update_metadata_stats(&db_path, db_stats.total_chunks, db_stats.total_files);
+
+        log_print!(
+            "   Partial index finalised: {} chunks, {} files",
+            db_stats.total_chunks,
+            db_stats.total_files
+        );
+        log_print!(
+            "{}   Run {} to index the remaining files",
+            "💡 ".cyan(),
+            "codesearch index".bright_cyan()
+        );
 
         return Ok(());
     }
