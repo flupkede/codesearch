@@ -17,9 +17,11 @@
 .DS_Store
 Thumbs.db
 
-# Ignore all hidden folders at any level
+# Ignore all hidden folders at any level (except .githooks)
 .*/ 
-**/.*/
+**/.*/ 
+!.githooks/
+!**/.githooks/
 
 # Project specific
 /data/

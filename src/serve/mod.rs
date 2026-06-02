@@ -11,11 +11,13 @@
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
 mod tui;
+mod tui_remote;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::response::Json as AxumJson;
@@ -26,18 +28,22 @@ use rmcp::transport::{
     StreamableHttpService,
 };
 use serde_json::json;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::cache::safe_canonicalize;
 use crate::constants::{
-    DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, MCP_ENDPOINT_PATH, REAPER_INTERVAL_SECS,
-    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV,
+    CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT,
+    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, HEALTH_PATH, LANG_CSHARP,
+    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
+    REPO_IDLE_TIMEOUT_SECS, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::ReposConfig;
-use crate::index::{IndexManager, SharedStores};
+use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
 use crate::mcp::types::HealthResponse;
-
-/// Lightweight repo status derived from DashMap state only (no DB opens).
+use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
+/// Lightweight repo status label derived from DashMap state only (no DB opens).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepoStateLabel {
     Open,
@@ -47,6 +53,29 @@ pub(crate) enum RepoStateLabel {
     Indexing,
     Error,
     NoIndex,
+}
+
+/// Status of the C# symbol index for a repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CSharpIndexStatus {
+    /// No C# helper detected or no index built.
+    None,
+    /// Helper available and index built successfully.
+    Ready,
+    /// Index exists but had errors or is stale.
+    Error,
+    /// Symbol index is currently being built.
+    Indexing,
+}
+
+/// Lightweight repo status derived from DashMap state only (no DB opens).
+pub(crate) struct RepoStatusInfo {
+    pub(crate) status: RepoStateLabel,
+    pub(crate) changes: u64,
+    pub(crate) last_tool_call: Option<String>,
+    pub(crate) tool_call_count: u64,
+    pub(crate) csharp_index: CSharpIndexStatus,
+    pub(crate) csharp_error: Option<String>,
 }
 
 impl RepoStateLabel {
@@ -62,13 +91,6 @@ impl RepoStateLabel {
             Self::NoIndex => "No Index".dimmed(),
         }
     }
-}
-
-/// Lightweight status info for a single repo (no DB I/O).
-pub(crate) struct RepoStatusInfo {
-    pub(crate) status: RepoStateLabel,
-    pub(crate) changes: u64,
-    pub(crate) last_tool_call: Option<String>,
 }
 
 /// Format a tool call name and elapsed time into a human-readable string.
@@ -119,6 +141,15 @@ impl std::fmt::Debug for RepoState {
     }
 }
 
+/// Result of [`ServeState::try_open_stores`].
+///
+/// - [`OpenedStores::Write`]: opened in write mode; NOT yet registered in `repos`. Caller decides state.
+/// - [`OpenedStores::Readonly`]: opened in readonly mode; ALREADY registered as [`RepoState::Readonly`].
+pub(crate) enum OpenedStores {
+    Write(Arc<SharedStores>),
+    Readonly(Arc<SharedStores>),
+}
+
 /// Shared state for the serve mode.
 pub(crate) struct ServeState {
     /// Repo alias → opened stores (or conflicted marker).
@@ -142,6 +173,26 @@ pub(crate) struct ServeState {
     active_sessions: AtomicU64,
     /// Total MCP sessions since serve started.
     total_sessions: AtomicU64,
+    /// Shared sysinfo instance for CPU measurement — must persist across calls
+    /// so cpu_usage() can compute a delta (first call always returns 0%).
+    sysinfo_system: std::sync::Mutex<sysinfo::System>,
+    /// Shared symbol indexer registry — used by HTTP reindex handler and MCP
+    /// `find_impact` to reuse helper-detection cache instead of creating fresh
+    /// instances per request.
+    symbol_registry: Arc<SymbolIndexerRegistry>,
+    /// Per-repo total tool call count.
+    tool_call_counts: DashMap<String, AtomicU64>,
+    /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
+    /// Wrapped in `Arc` so the watcher-loop notifier closure can capture a cheap clone
+    /// without requiring `Arc<ServeState>` in methods that only have `&self`.
+    csharp_index_status: Arc<DashMap<String, CSharpIndexStatus>>,
+    /// Per-repo C# symbol index last error message (set when status is Error, cleared on success).
+    /// Wrapped in `Arc` for the same reason as `csharp_index_status`.
+    csharp_index_error: Arc<DashMap<String, String>>,
+    /// Debounced deadline for persisting repos config metadata (unix millis).
+    persist_deadline_unix_ms: AtomicU64,
+    /// Ensures only one debounce worker task runs.
+    persist_worker_started: AtomicBool,
     /// Test-only counter for reload invocations that actually swapped config.
     #[cfg(test)]
     reload_count: std::sync::atomic::AtomicUsize,
@@ -157,8 +208,38 @@ impl std::fmt::Debug for ServeState {
     }
 }
 
+/// Decision returned by [`ServeState::evaluate_csharp_rebuild`].
+///
+/// Using an enum rather than `&'static str` prevents fragile string
+/// comparisons at call sites (previously `reason == "fresh, last_scip>=last_changed"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebuildDecision {
+    /// SCIP index exists and timestamps show no changes since last build.
+    Fresh,
+    /// No `.sln` file found; C# indexing is not applicable for this repo.
+    NoSolutionFile,
+    /// The scip-csharp helper binary is not available.
+    HelperUnavailable,
+    /// An indexing task for this alias is already running.
+    AlreadyInFlight,
+    /// The config lock was poisoned; retry later.
+    ConfigPoisoned,
+    /// No SCIP index exists yet; a first build is needed.
+    NoIndex,
+    /// The repo has changed since the last SCIP build.
+    ChangedSinceLastBuild,
+}
+
+impl RebuildDecision {
+    fn needs_rebuild(self) -> bool {
+        matches!(self, Self::NoIndex | Self::ChangedSinceLastBuild)
+    }
+}
+
 impl ServeState {
     fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
         Self {
             repos: DashMap::new(),
             last_access: DashMap::new(),
@@ -170,9 +251,690 @@ impl ServeState {
             last_tool_call: DashMap::new(),
             active_sessions: AtomicU64::new(0),
             total_sessions: AtomicU64::new(0),
+            sysinfo_system: std::sync::Mutex::new(sys),
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
+            tool_call_counts: DashMap::new(),
+            csharp_index_status: Arc::new(DashMap::new()),
+            csharp_index_error: Arc::new(DashMap::new()),
+            persist_deadline_unix_ms: AtomicU64::new(0),
+            persist_worker_started: AtomicBool::new(false),
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Return a clone of the shared symbol indexer registry Arc.
+    /// Used by MCP sessions (CodesearchService::new_for_serve) and
+    /// HTTP reindex handler (trigger_symbol_rebuild) to reuse
+    /// helper-detection cache instead of creating fresh instances per request.
+    pub(crate) fn symbol_registry(&self) -> Arc<SymbolIndexerRegistry> {
+        Arc::clone(&self.symbol_registry)
+    }
+
+    /// Build a `CSharpRebuildNotifier` for the given repo `alias`.
+    ///
+    /// The notifier captures `Arc` clones of the two status maps so it can be sent
+    /// into the file-watcher background task without holding a reference to `&self`.
+    /// When the watcher-triggered rebuild completes it calls the closure, which updates
+    /// `csharp_index_status` and `csharp_index_error` — making the outcome visible in
+    /// the TUI and in `/status` without any extra polling.
+    fn make_csharp_notifier(&self, alias: &str) -> CSharpRebuildNotifier {
+        let status_map = Arc::clone(&self.csharp_index_status);
+        let error_map = Arc::clone(&self.csharp_index_error);
+        let alias_key = alias.to_string();
+        Arc::new(move |success: bool, error_msg: Option<String>| {
+            if success {
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Ready);
+                error_map.remove(&alias_key);
+            } else {
+                if let Some(msg) = error_msg {
+                    error_map.insert(alias_key.clone(), msg);
+                }
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Error);
+            }
+        })
+    }
+
+    /// Build an `IndexingStatusCallback` for the given repo `alias`.
+    ///
+    /// The callback captures an `Arc` clone of `active_reindexes` so it can be sent
+    /// into the file-watcher background task. When the watcher triggers a refresh
+    /// (branch change, significant batch), it calls this closure to insert/remove
+    /// the alias — making "Indexing" visible in the TUI.
+    fn make_indexing_status_callback(&self, alias: &str) -> IndexingStatusCallback {
+        let reindexes = self.active_reindexes.clone();
+        let alias_key = alias.to_string();
+        Arc::new(move |active: bool| {
+            if active {
+                reindexes.insert(alias_key.clone());
+            } else {
+                reindexes.remove(&alias_key);
+            }
+        })
+    }
+
+    fn now_unix_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
+
+    fn now_unix_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// Read CSHARP_SCIP_CONCURRENCY from env, default
+    /// `CSHARP_SCIP_CONCURRENCY_DEFAULT` (currently 2), clamped to [1, 4].
+    fn csharp_scip_concurrency() -> usize {
+        let raw = std::env::var(CSHARP_SCIP_CONCURRENCY_ENV)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(CSHARP_SCIP_CONCURRENCY_DEFAULT);
+        raw.clamp(1, 4)
+    }
+
+    fn has_solution_file(repo_path: &Path) -> bool {
+        std::fs::read_dir(repo_path)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.flatten())
+            .any(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("sln"))
+    }
+
+    fn bootstrap_last_changed(repo_path: &Path) -> Option<i64> {
+        if repo_path.join(".git").exists() {
+            if let Ok(out) = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("log")
+                .arg("-1")
+                .arg("--format=%ct")
+                .arg("HEAD")
+                .output()
+            {
+                if out.status.success() {
+                    if let Ok(ts) = String::from_utf8_lossy(&out.stdout).trim().parse::<i64>() {
+                        return Some(ts);
+                    }
+                }
+            }
+        }
+
+        Self::bootstrap_last_changed_via_fs(repo_path)
+    }
+
+    fn bootstrap_last_changed_via_fs(repo_path: &Path) -> Option<i64> {
+        fn is_ignored_dir(name: &str) -> bool {
+            matches!(
+                name,
+                "bin" | "obj" | "node_modules" | ".git" | ".codesearch.db"
+            )
+        }
+        fn is_candidate(path: &Path) -> bool {
+            matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("sln" | "csproj" | "cs")
+            )
+        }
+
+        let mut stack = vec![repo_path.to_path_buf()];
+        let mut scanned = 0usize;
+        let mut best: Option<i64> = None;
+
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if scanned >= 10_000 {
+                    return best;
+                }
+                scanned += 1;
+
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        if is_ignored_dir(name) {
+                            continue;
+                        }
+                    }
+                    stack.push(path);
+                    continue;
+                }
+
+                if !is_candidate(&path) {
+                    continue;
+                }
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                let Ok(modified) = meta.modified() else {
+                    continue;
+                };
+                let secs = modified
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                best = Some(best.map_or(secs, |b| b.max(secs)));
+            }
+        }
+
+        best
+    }
+
+    /// Evaluates whether a C# SCIP rebuild is needed and why.
+    ///
+    /// Always bootstraps `last_changed_unix` when missing — even for repos
+    /// that have no index yet — so phase-2 can sort *all* candidates by
+    /// recency. Without this, every first-build candidate has
+    /// `last_changed_unix = 0`, making `candidates.sort_by(last_changed)`
+    /// effectively a no-op and the actual processing order dictated by
+    /// HashMap iteration of `config.repos`. That's why a stale repo could
+    /// land first instead of the most-recently-touched one.
+    fn evaluate_csharp_rebuild(
+        self: &Arc<Self>,
+        alias: &str,
+        repo_path: &Path,
+        db_path: &Path,
+    ) -> RebuildDecision {
+        if !Self::has_solution_file(repo_path) {
+            return RebuildDecision::NoSolutionFile;
+        }
+
+        let Some(indexer) = self.symbol_registry.get(LANG_CSHARP) else {
+            return RebuildDecision::HelperUnavailable;
+        };
+        if !indexer.is_available() {
+            return RebuildDecision::HelperUnavailable;
+        }
+
+        let status = self
+            .csharp_index_status
+            .get(alias)
+            .map(|e| *e.value())
+            .unwrap_or(CSharpIndexStatus::None);
+        if matches!(status, CSharpIndexStatus::Indexing) {
+            return RebuildDecision::AlreadyInFlight;
+        }
+
+        // Bootstrap last_changed_unix UP FRONT (before the has_index branch),
+        // so the sort key is meaningful for both first-builds and refreshes.
+        let (last_changed, last_scip, touched_bootstrap) = {
+            let mut cfg = match self.config.write() {
+                Ok(c) => c,
+                Err(_) => return RebuildDecision::ConfigPoisoned,
+            };
+            let mut meta = cfg.meta(alias);
+            let mut touched = false;
+            if meta.last_changed_unix.is_none() {
+                meta.last_changed_unix =
+                    Self::bootstrap_last_changed(repo_path).or_else(|| Some(Self::now_unix_secs()));
+                if let Some(ts) = meta.last_changed_unix {
+                    touched = cfg.touch_last_changed(alias, ts);
+                }
+            }
+            (
+                meta.last_changed_unix.unwrap_or(0),
+                meta.last_scip_indexed_unix.unwrap_or(0),
+                touched,
+            )
+        };
+
+        if touched_bootstrap {
+            self.schedule_persist_repos_config();
+        }
+
+        if !indexer.has_index(db_path) {
+            return RebuildDecision::NoIndex;
+        }
+
+        if last_changed > last_scip {
+            RebuildDecision::ChangedSinceLastBuild
+        } else {
+            RebuildDecision::Fresh
+        }
+    }
+
+    pub(crate) fn schedule_persist_repos_config(self: &Arc<Self>) {
+        let deadline = Self::now_unix_millis() + (PERSIST_DEBOUNCE_SECS * 1000);
+        self.persist_deadline_unix_ms
+            .store(deadline, Ordering::Relaxed);
+
+        if self
+            .persist_worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let deadline = state.persist_deadline_unix_ms.load(Ordering::Relaxed);
+                if deadline == 0 {
+                    continue;
+                }
+                let now = Self::now_unix_millis();
+                if now < deadline {
+                    continue;
+                }
+
+                let cfg = match state.config.read() {
+                    Ok(c) => c.clone(),
+                    Err(e) => {
+                        tracing::warn!("repos persist skipped: config lock poisoned: {}", e);
+                        state.persist_deadline_unix_ms.store(0, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                // Route through persist_config so the override path is honored
+                // (keeps the metadata-persist worker hermetic in tests; identical
+                // to cfg.save() in production where the override is None).
+                let state_persist = state.clone();
+                let save_res =
+                    tokio::task::spawn_blocking(move || state_persist.persist_config(&cfg)).await;
+                match save_res {
+                    Ok(Ok(())) => tracing::debug!("repos.json metadata persisted"),
+                    Ok(Err(e)) => tracing::warn!("repos persist failed: {}", e),
+                    Err(e) => tracing::warn!("repos persist task join failed: {}", e),
+                }
+
+                state.persist_deadline_unix_ms.store(0, Ordering::Relaxed);
+                state.persist_worker_started.store(false, Ordering::Release);
+
+                // Avoid race where a schedule landed between save() and worker stop.
+                let pending = state.persist_deadline_unix_ms.load(Ordering::Acquire);
+                if pending > Self::now_unix_millis()
+                    && state
+                        .persist_worker_started
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
+        });
+    }
+
+    /// Reconcile registered repo paths against the filesystem before warmup.
+    ///
+    /// For each alias whose stored path no longer exists (folder renamed/moved),
+    /// attempt a best-effort git-identity relocation and rewrite `repos.json`.
+    /// When relocation fails the entry is left in place and merely logged — it is
+    /// skipped safely at warmup and never crashes serve. Explicit cleanup of
+    /// unrecoverable entries is available via `codesearch index prune`.
+    pub(crate) fn reconcile_all_paths(self: &Arc<Self>) {
+        let aliases = self.aliases();
+        if aliases.is_empty() {
+            return;
+        }
+
+        let mut config = match self.config.write() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("reconcile: config lock poisoned: {}", e);
+                return;
+            }
+        };
+
+        let (relocated, unresolved) = config.relocate_missing();
+
+        for (alias, new_path) in &relocated {
+            info!("reconcile: relocated '{}' → {}", alias, new_path.display());
+        }
+        for alias in &unresolved {
+            let missing = config
+                .repos
+                .get(alias)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            warn!(
+                "reconcile: '{}' path missing ({}); skipping — \
+                 run `codesearch index prune` to remove it",
+                alias, missing
+            );
+        }
+
+        if !relocated.is_empty() {
+            if let Err(e) = self.persist_config(&config) {
+                warn!("reconcile: failed to persist relocated paths: {}", e);
+            }
+        }
+    }
+
+    /// Phase 1: warm all repos sequentially, awaiting incremental refresh per repo.
+    /// Stale entries (database missing or repo path gone) are auto-pruned from repos.json.
+    pub(crate) async fn run_phase_1_warmup_all(self: &Arc<Self>) {
+        let aliases = self.aliases();
+        if aliases.is_empty() {
+            return;
+        }
+        info!("🔥 Phase 1 warmup: {} repos (no FSW)", aliases.len());
+
+        let mut pruned: Vec<String> = Vec::new();
+
+        for alias in &aliases {
+            match self.warmup_repo(alias).await {
+                Ok(()) => info!("phase-1: warmed '{}'", alias),
+                Err(e) => {
+                    // Auto-prune stale entries where the database or repo path no longer exists.
+                    let should_prune = {
+                        let config = self.config.read().ok();
+                        let path = config.as_ref().and_then(|c| c.resolve(alias));
+                        match path {
+                            Some(p) => {
+                                let db_missing = !p.join(DB_DIR_NAME).exists();
+                                let path_gone = !p.exists();
+                                db_missing || path_gone
+                            }
+                            None => {
+                                // Alias resolves to nothing — definitely stale
+                                true
+                            }
+                        }
+                    };
+
+                    if should_prune {
+                        warn!("phase-1: pruning stale alias '{}' — {}", alias, e);
+                        // Clean up any residual in-memory state
+                        let _ = self.stop_fsw(alias);
+                        self.repos.remove(alias);
+                        self.last_access.remove(alias);
+
+                        // Unregister from repos.json
+                        if let Ok(mut config) = self.config.write() {
+                            if config.unregister_alias(alias) {
+                                if let Err(save_err) = config.save() {
+                                    warn!(
+                                        "phase-1: failed to save repos.json after pruning '{}': {}",
+                                        alias, save_err
+                                    );
+                                } else {
+                                    pruned.push(alias.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        warn!("phase-1: warmup '{}' failed: {}", alias, e);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        if !pruned.is_empty() {
+            info!(
+                "🔥 Phase 1 warmup complete (pruned {} stale: {})",
+                pruned.len(),
+                pruned.join(", ")
+            );
+        } else {
+            info!("🔥 Phase 1 warmup complete");
+        }
+    }
+
+    /// Phase 2: semaphore-bounded concurrent C# SCIP rebuilds, sorted by recency.
+    pub(crate) async fn run_phase_2_csharp_scip(self: &Arc<Self>) {
+        let aliases = self.aliases();
+        let mut candidates: Vec<(String, i64)> = Vec::new();
+
+        for alias in &aliases {
+            let path = match self.config.read().ok().and_then(|c| c.resolve(alias)) {
+                Some(p) => p,
+                None => continue,
+            };
+            let db_path = path.join(DB_DIR_NAME);
+            let decision = self.evaluate_csharp_rebuild(alias, &path, &db_path);
+            if !decision.needs_rebuild() {
+                // If the SCIP index exists and is fresh, mark C# status as Ready
+                // so the TUI shows the C# indicator (e.g. "C#·") instead of None.
+                if decision == RebuildDecision::Fresh {
+                    let mut status = self
+                        .csharp_index_status
+                        .get(alias)
+                        .map(|e| *e.value())
+                        .unwrap_or(CSharpIndexStatus::None);
+                    if matches!(status, CSharpIndexStatus::None) {
+                        status = CSharpIndexStatus::Ready;
+                    }
+                    self.csharp_index_status.insert(alias.to_string(), status);
+                }
+                info!("phase-2: skip '{}' — {:?}", alias, decision);
+                continue;
+            }
+            let last_changed = self
+                .config
+                .read()
+                .ok()
+                .and_then(|c| c.meta(alias).last_changed_unix)
+                .unwrap_or(0);
+            info!(
+                "phase-2: queued '{}' — {:?} (last_changed={})",
+                alias, decision, last_changed
+            );
+            candidates.push((alias.clone(), last_changed));
+        }
+
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
+        if candidates.is_empty() {
+            info!("phase-2 complete: 0 candidates");
+            return;
+        }
+
+        // Pre-mark all queued candidates as C# Indexing so the TUI C# indicator
+        // reflects pending rebuilds immediately, even before each repo acquires
+        // its semaphore slot. trigger_symbol_rebuild will overwrite this with the
+        // same value (no-op) and eventually with Ready or Error on completion.
+        for (alias, _) in &candidates {
+            self.csharp_index_status
+                .insert(alias.clone(), CSharpIndexStatus::Indexing);
+        }
+
+        let concurrency = Self::csharp_scip_concurrency();
+        info!(
+            "phase-2: {} candidates, concurrency={}",
+            candidates.len(),
+            concurrency
+        );
+        let sem = Arc::new(Semaphore::new(concurrency));
+        let mut handles = Vec::with_capacity(candidates.len());
+
+        for (alias, _) in candidates {
+            let sem = sem.clone();
+            let state = self.clone();
+            handles.push(tokio::spawn(async move {
+                let permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                info!("phase-2: starting '{}'", alias);
+                let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
+                    Some(p) => p,
+                    None => {
+                        drop(permit);
+                        return;
+                    }
+                };
+                // Guard against stale entries whose folder was removed/renamed
+                // and could not be relocated: skip rather than run SCIP on a
+                // non-existent path.
+                if !path.exists() {
+                    warn!(
+                        "phase-2: skip '{}' — path missing ({})",
+                        alias,
+                        path.display()
+                    );
+                    drop(permit);
+                    return;
+                }
+                let db_path = path.join(DB_DIR_NAME);
+                trigger_symbol_rebuild(&alias, &path, &db_path, &state).await;
+                drop(permit);
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+        info!("phase-2 complete");
+    }
+
+    /// Phase 3: background pre-warm of reference cache for C# repos.
+    ///
+    /// After Phase 2 finishes indexing definitions, Phase 3 runs
+    /// `scip-csharp batch-find-refs` for each repo to resolve references
+    /// for all uncached symbols in a single workspace session.
+    /// This amortizes the 30-60s workspace open cost across thousands of
+    /// symbols, making subsequent `find_impact` calls instant (LMDB cache hit).
+    ///
+    /// Controlled by `CSHARP_PREWARM_ENABLED` env (default: "true").
+    /// Set to "false" to skip Phase 3 entirely (useful on memory-constrained machines).
+    pub(crate) async fn run_phase_3_prewarm(self: &Arc<Self>) {
+        let enabled = std::env::var(CSHARP_PREWARM_ENABLED_ENV)
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
+        if !enabled {
+            info!(
+                "phase-3: pre-warm disabled by {}=false",
+                CSHARP_PREWARM_ENABLED_ENV
+            );
+            return;
+        }
+
+        let aliases = self.aliases();
+        let mut candidates: Vec<String> = Vec::new();
+
+        for alias in &aliases {
+            let path = match self.config.read().ok().and_then(|c| c.resolve(alias)) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Skip stale entries whose folder no longer exists.
+            if !path.exists() {
+                continue;
+            }
+
+            // Only pre-warm repos that have a ready C# index
+            let status = self
+                .csharp_index_status
+                .get(alias)
+                .map(|g| *g.value())
+                .unwrap_or(CSharpIndexStatus::None);
+
+            if !matches!(status, CSharpIndexStatus::Ready) {
+                info!("phase-3: skip '{}' — C# status is {:?}", alias, status);
+                continue;
+            }
+
+            // Check that the repo is applicable
+            let applies = self
+                .symbol_registry
+                .get(LANG_CSHARP)
+                .map(|i| i.applies_to(&path))
+                .unwrap_or(false);
+
+            if !applies {
+                continue;
+            }
+
+            candidates.push(alias.clone());
+        }
+
+        if candidates.is_empty() {
+            info!("phase-3: 0 candidates for pre-warm");
+            return;
+        }
+
+        info!("phase-3: pre-warming {} repo(s)", candidates.len());
+
+        let concurrency = Self::csharp_scip_concurrency();
+        let sem = Arc::new(Semaphore::new(concurrency));
+        let mut handles = Vec::with_capacity(candidates.len());
+
+        for alias in candidates {
+            let sem = sem.clone();
+            let state = self.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+
+                info!("phase-3: pre-warming '{}'", alias);
+
+                let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
+                    Some(p) => p,
+                    None => return,
+                };
+                let db_path = path.join(DB_DIR_NAME);
+
+                let registry = state.symbol_registry.clone();
+                let alias_owned = alias.clone();
+
+                // Signal TUI: C# ref-cache pre-warm is in progress.
+                // We set csharp_index_status → Indexing so the C# column shows "C#…"
+                // without touching active_reindexes — pre-warm does not block HTTP
+                // /reindex requests and should not override the repo label (Warm/Open).
+                state
+                    .csharp_index_status
+                    .insert(alias_owned.clone(), CSharpIndexStatus::Indexing);
+
+                match tokio::task::spawn_blocking(move || {
+                    let Some(indexer) = registry.get(LANG_CSHARP) else {
+                        return Err(anyhow::anyhow!("No C# indexer"));
+                    };
+                    // Downcast to CSharpSymbolIndexer to access prewarm_ref_cache
+                    let csharp_indexer = indexer
+                        .as_any()
+                        .downcast_ref::<csharp::CSharpSymbolIndexer>()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Failed to downcast to CSharpSymbolIndexer")
+                        })?;
+                    csharp_indexer.prewarm_ref_cache(&path, &db_path, CSHARP_PREWARM_MAX_SYMBOLS)
+                })
+                .await
+                {
+                    Ok(Ok(summary)) => {
+                        info!(
+                            "phase-3: pre-warm complete for '{}': {} resolved, {} cached in {}ms",
+                            alias_owned, summary.resolved, summary.cached, summary.duration_ms
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("phase-3: pre-warm failed for '{}': {}", alias_owned, e);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "phase-3: pre-warm task panicked for '{}': {}",
+                            alias_owned,
+                            e
+                        );
+                    }
+                }
+
+                // Restore Ready status regardless of pre-warm outcome: the SCIP
+                // definitions index (built in Phase 2) remains valid even if
+                // ref-cache pre-warm fails. TUI returns to "C#·" (ready).
+                state
+                    .csharp_index_status
+                    .insert(alias_owned, CSharpIndexStatus::Ready);
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+        info!("phase-3 complete");
     }
 
     /// Build an actionable conflict error message.
@@ -294,8 +1056,12 @@ impl ServeState {
                 RepoState::Warm { stores } => {
                     return Some(stores.clone());
                 }
-                RepoState::Readonly { stores } => {
-                    return Some(stores.clone());
+                RepoState::Readonly { .. } => {
+                    // Cannot force-reindex a readonly store; let the caller
+                    // fall through to try_open_stores(allow_create=true)
+                    // which will attempt a write-mode open (and fail with a
+                    // clear error if the write lock is still held).
+                    return None;
                 }
                 RepoState::Conflicted => return None,
             }
@@ -341,6 +1107,8 @@ impl ServeState {
                 let stores_bg = stores.clone();
                 let im_for_task = im_arc.clone();
                 let token_for_task = token.clone();
+                let notifier = self.make_csharp_notifier(alias);
+                let indexing_cb = self.make_indexing_status_callback(alias);
 
                 tokio::spawn(async move {
                     if let Err(e) = im_for_task.start_watching().await {
@@ -361,7 +1129,10 @@ impl ServeState {
                         return;
                     }
 
-                    if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                    if let Err(e) = im_for_task
+                        .start_file_watcher(token_for_task, Some(notifier), Some(indexing_cb))
+                        .await
+                    {
                         tracing::error!("File watcher for '{}' stopped: {}", alias_bg, e);
                     }
                 });
@@ -391,7 +1162,10 @@ impl ServeState {
     /// immediately while repos become search-ready one-by-one. When a repo in `Warm`
     /// state is first queried, `get_or_open_stores()` will transition it to `Write`
     /// and start the FSW lazily.
-    pub(crate) async fn warmup_repo(&self, alias: &str) -> std::result::Result<(), String> {
+    pub(crate) async fn warmup_repo(
+        self: &Arc<Self>,
+        alias: &str,
+    ) -> std::result::Result<(), String> {
         let _ = self.reload_if_changed();
 
         // Fast path: already opened in any state
@@ -416,80 +1190,66 @@ impl ServeState {
 
         let db_path = path.join(DB_DIR_NAME);
 
-        // Database existence precheck — don't cache missing DB as Conflicted
-        if !db_path.exists() {
-            return Err(format!(
-                "Database not found at {}. This usually means the repo was removed externally. \
-                 Run `codesearch index add {}` to recreate, or `codesearch index rm {}` to clean up the config entry.",
-                db_path.display(), path.display(), path.display()
-            ));
-        }
-
-        // Read dimensions from metadata
-        let dims = self.get_dimensions_for_path(&db_path);
-
-        // Try write-mode first, then readonly
-        let stores = match SharedStores::new(&db_path, dims) {
-            Ok(s) => {
-                info!("Warmup '{}': opened in write mode", alias);
-                s
+        // Open stores: existence check + write/readonly/conflicted logic.
+        let stores = match self.try_open_stores(alias, &db_path, false)? {
+            OpenedStores::Readonly(_) => {
+                // Already registered as Readonly by try_open_stores.
+                // Touch so the idle reaper can evict this handle.
+                self.touch_access(alias);
+                return Ok(());
             }
-            Err(_) => match SharedStores::new_readonly(&db_path, dims) {
-                Ok(s) => {
-                    info!("Warmup '{}': opened in readonly mode", alias);
-                    let stores_arc = Arc::new(s);
-                    self.repos.insert(
-                        alias.to_string(),
-                        RepoState::Readonly {
-                            stores: stores_arc.clone(),
-                        },
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!("Warmup '{}': failed to open: {}", alias, e);
-                    self.repos.insert(alias.to_string(), RepoState::Conflicted);
-                    return Err(Self::conflicted_msg(alias));
-                }
-            },
+            OpenedStores::Write(s) => s,
         };
 
-        // Build vector index from existing data
-        {
-            let mut vstore = stores.vector_store.write().await;
+        // Build vector index from existing data.
+        //
+        // `build_index()` is a synchronous, CPU-heavy operation (HNSW graph
+        // construction). Running it directly on a tokio worker thread starves
+        // the async executor and makes `/health` time out during warmup, so it
+        // is offloaded to `spawn_blocking`. Stats are read first under a short
+        // `.read()` lock to decide whether a build is even needed.
+        let needs_build = {
+            let vstore = stores.vector_store.read().await;
             match vstore.stats() {
-                Ok(s) if s.total_chunks > 0 && !s.indexed => {
-                    info!(
-                        "Warmup '{}': building vector index ({} existing chunks)",
-                        alias, s.total_chunks
-                    );
-                    if let Err(e) = vstore.build_index() {
-                        warn!("Warmup '{}': failed to build vector index: {}", alias, e);
-                    }
+                Ok(s) if s.total_chunks > 0 && !s.indexed => Some(s.total_chunks),
+                Ok(_) => None,
+                Err(e) => {
+                    warn!("Warmup '{}': could not read stats: {}", alias, e);
+                    None
                 }
-                Ok(_) => {}
-                Err(e) => warn!("Warmup '{}': could not read stats: {}", alias, e),
+            }
+        };
+        if let Some(total_chunks) = needs_build {
+            info!(
+                "Warmup '{}': building vector index ({} existing chunks)",
+                alias, total_chunks
+            );
+            let vector_store = Arc::clone(&stores.vector_store);
+            match tokio::task::spawn_blocking(move || {
+                let mut vstore = vector_store.blocking_write();
+                vstore.build_index()
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!("Warmup '{}': failed to build vector index: {}", alias, e)
+                }
+                Err(e) => warn!(
+                    "Warmup '{}': build vector index task panicked: {}",
+                    alias, e
+                ),
             }
         }
 
-        let stores_arc = Arc::new(stores);
+        let stores_arc = stores;
 
-        // Perform incremental refresh in the background (don't block warmup of next repo)
-        let bg_alias = alias.to_string();
-        let bg_path = path.clone();
-        let bg_db_path = db_path.clone();
-        let bg_stores = stores_arc.clone();
-        tokio::spawn(async move {
-            if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
-                &bg_path,
-                &bg_db_path,
-                &bg_stores,
-            )
-            .await
-            {
-                tracing::warn!("Warmup '{}': incremental refresh failed: {}", bg_alias, e);
-            }
-        });
+        if let Err(e) =
+            IndexManager::perform_incremental_refresh_with_stores(&path, &db_path, &stores_arc)
+                .await
+        {
+            tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
+        }
 
         // Store as Warm — FSW will be started lazily on first query.
         self.repos
@@ -584,48 +1344,14 @@ impl ServeState {
 
         let db_path = path.join(DB_DIR_NAME);
 
-        // Database existence precheck — don't cache missing DB as Conflicted
-        if !db_path.exists() {
-            return Err(format!(
-                "Database not found at {}. This usually means the repo was removed externally. \
-                 Run `codesearch index add {}` to recreate, or `codesearch index rm {}` to clean up the config entry.",
-                db_path.display(), path.display(), path.display()
-            ));
-        }
-
-        // Read dimensions from metadata
-        let dims = self.get_dimensions_for_path(&db_path);
-
-        // Try write-mode first, then readonly
-        let stores = match SharedStores::new(&db_path, dims) {
-            Ok(s) => {
-                info!("Opened repo '{}' in write mode", alias);
-                s
+        // Open stores: existence check + write/readonly/conflicted logic.
+        let stores = match self.try_open_stores(alias, &db_path, false)? {
+            OpenedStores::Readonly(s) => {
+                // Already registered as Readonly; touch and return.
+                self.touch_access(alias);
+                return Ok(s);
             }
-            Err(_) => {
-                // Try readonly
-                match SharedStores::new_readonly(&db_path, dims) {
-                    Ok(s) => {
-                        info!("Opened repo '{}' in readonly mode", alias);
-                        let stores_arc = Arc::new(s);
-                        self.repos.insert(
-                            alias.to_string(),
-                            RepoState::Readonly {
-                                stores: stores_arc.clone(),
-                            },
-                        );
-                        if touch {
-                            self.touch_access(alias);
-                        }
-                        return Ok(stores_arc);
-                    }
-                    Err(e) => {
-                        warn!("Failed to open repo '{}': {}", alias, e);
-                        self.repos.insert(alias.to_string(), RepoState::Conflicted);
-                        return Err(Self::conflicted_msg(alias));
-                    }
-                }
-            }
+            OpenedStores::Write(s) => s,
         };
 
         // Ensure the HNSW vector index is built from existing data.
@@ -649,9 +1375,23 @@ impl ServeState {
             }
         }
 
-        let stores_arc = Arc::new(stores);
+        let stores_arc = stores;
 
-        // Try to create IndexManager for live file watching.
+        // Fan-out / candidate-detection callers pass touch=false.
+        // Open as Warm only — no FSW, no IndexManager overhead.
+        // Always update last_access so the reaper can evict this repo after idle timeout.
+        if !touch {
+            self.repos.insert(
+                alias.to_string(),
+                RepoState::Warm {
+                    stores: stores_arc.clone(),
+                },
+            );
+            self.touch_access(alias);
+            return Ok(stores_arc);
+        }
+
+        // Explicit project query (touch=true) — start FSW, full Write mode.
         // On failure, still store as Write — searches keep working, live updates disabled.
         let (index_manager_opt, cancel_token) = {
             let alias_clone = alias.to_string();
@@ -664,6 +1404,8 @@ impl ServeState {
                     let stores_for_task = stores_arc.clone();
                     let im_for_task = im_arc.clone();
                     let token_for_task = token.clone();
+                    let notifier = self.make_csharp_notifier(alias);
+                    let indexing_cb = self.make_indexing_status_callback(alias);
 
                     tokio::spawn(async move {
                         // Pre-start FSW so changes during initial refresh aren't lost
@@ -687,7 +1429,10 @@ impl ServeState {
                         }
 
                         // Main file watcher loop — runs until cancel_token fires
-                        if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                        if let Err(e) = im_for_task
+                            .start_file_watcher(token_for_task, Some(notifier), Some(indexing_cb))
+                            .await
+                        {
                             tracing::error!("File watcher for '{}' stopped: {}", alias_clone, e);
                         }
                     });
@@ -715,9 +1460,8 @@ impl ServeState {
                 cancel_token,
             },
         );
-        if touch {
-            self.touch_access(alias);
-        }
+        // touch=true is guaranteed here (fan-out returns early above as Warm).
+        self.touch_access(alias);
         Ok(stores_arc)
     }
 
@@ -735,6 +1479,8 @@ impl ServeState {
         let alias_bg = alias.to_string();
         let path_bg = project_path.to_path_buf();
         let stores_bg = stores.clone();
+        let notifier = self.make_csharp_notifier(alias);
+        let indexing_cb = self.make_indexing_status_callback(alias);
 
         let cancel_token = CancellationToken::new();
         let token_for_task = cancel_token.clone();
@@ -767,7 +1513,10 @@ impl ServeState {
                         return;
                     }
 
-                    if let Err(e) = im_for_task.start_file_watcher(token_for_task).await {
+                    if let Err(e) = im_for_task
+                        .start_file_watcher(token_for_task, Some(notifier), Some(indexing_cb))
+                        .await
+                    {
                         tracing::error!("Lazy FSW for '{}' stopped: {}", alias_bg, e);
                     }
                 }
@@ -802,6 +1551,66 @@ impl ServeState {
             }
         }
         crate::constants::DEFAULT_EMBEDDING_DIMENSIONS // default
+    }
+
+    /// Opens (or creates) LMDB/Tantivy stores for the repo at db_path.
+    ///
+    /// `allow_create=false`: warmup / incremental reindex path — fails if DB is missing.
+    /// `allow_create=true`:  force-reindex / add-repo path — creates fresh DB if missing.
+    fn try_open_stores(
+        &self,
+        alias: &str,
+        db_path: &Path,
+        allow_create: bool,
+    ) -> std::result::Result<OpenedStores, String> {
+        if !db_path.exists() && !allow_create {
+            let parent = db_path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            return Err(format!(
+                "Database not found at {}. This usually means the repo was removed externally. \
+                 Run `codesearch index add {}` to recreate, or `codesearch index rm {}` to clean up the config entry.",
+                db_path.display(),
+                parent,
+                parent
+            ));
+        }
+
+        let dims = self.get_dimensions_for_path(db_path);
+
+        match SharedStores::new(db_path, dims) {
+            Ok(s) => {
+                info!("Opened repo in write mode: {}", alias);
+                Ok(OpenedStores::Write(Arc::new(s)))
+            }
+            Err(write_err) => {
+                if allow_create {
+                    return Err(format!(
+                        "Failed to open/create database for {}: {}",
+                        alias, write_err
+                    ));
+                }
+                match SharedStores::new_readonly(db_path, dims) {
+                    Ok(s) => {
+                        info!("Opened repo in readonly mode: {}", alias);
+                        let stores_arc = Arc::new(s);
+                        self.repos.insert(
+                            alias.to_string(),
+                            RepoState::Readonly {
+                                stores: stores_arc.clone(),
+                            },
+                        );
+                        Ok(OpenedStores::Readonly(stores_arc))
+                    }
+                    Err(e) => {
+                        warn!("Failed to open repo {}: {}", alias, e);
+                        self.repos.insert(alias.to_string(), RepoState::Conflicted);
+                        Err(Self::conflicted_msg(alias))
+                    }
+                }
+            }
+        }
     }
 
     /// Get all registered aliases.
@@ -852,6 +1661,21 @@ impl ServeState {
             .unwrap_or_default()
     }
 
+    /// Persist the repos config to disk, honoring `config_path_override`.
+    ///
+    /// Handlers MUST call this instead of `ReposConfig::save()` directly, so that
+    /// writes land in the same file `reload_if_changed` reads from. In production
+    /// `config_path_override` is `None`, making this identical to `config.save()`
+    /// (the real `~/.codesearch/repos.json`). In tests the override points at a
+    /// temp file, which keeps the register/remove paths hermetic and lets us
+    /// assert on persistence without touching the user's real config.
+    pub(crate) fn persist_config(&self, config: &ReposConfig) -> anyhow::Result<()> {
+        match self.config_path_override.as_ref() {
+            Some(path) => config.save_to(path),
+            None => config.save(),
+        }
+    }
+
     /// Resolve a group name to its constituent aliases.
     /// Returns an error if the group doesn't exist.
     pub(crate) fn resolve_group_aliases(
@@ -871,8 +1695,8 @@ impl ServeState {
     }
 
     /// Record that a repo was just accessed (query or reindex).
-    /// Called from `get_or_open_stores(touch=true)`, and `reindex_handler`.
-    /// NOT called from `warmup_repo` — background warmup is not a real query.
+    /// Called from `get_or_open_stores(touch=true)`, `reindex_handler`,
+    /// `add_repo_handler`, and `warmup_repo` (after successful warmup).
     pub(crate) fn touch_access(&self, alias: &str) {
         self.last_access
             .insert(alias.to_string(), std::time::Instant::now());
@@ -884,6 +1708,13 @@ impl ServeState {
             alias.to_string(),
             (tool_name.to_string(), std::time::Instant::now()),
         );
+        // Increment total call count
+        self.tool_call_counts
+            .entry(alias.to_string())
+            .and_modify(|c| {
+                c.fetch_add(1, Ordering::Relaxed);
+            })
+            .or_insert_with(|| AtomicU64::new(1));
     }
 
     /// Record that changes were made to a repo (index/reindex).
@@ -909,7 +1740,6 @@ impl ServeState {
     }
 
     /// Get the current number of active sessions.
-    #[allow(dead_code)]
     pub(crate) fn active_session_count(&self) -> u64 {
         self.active_sessions.load(Ordering::Relaxed)
     }
@@ -969,15 +1799,53 @@ impl ServeState {
                 .map(|e| (e.value().0.clone(), e.value().1.elapsed()))
                 .map(|(name, ago)| format_tool_call_ago(&name, ago));
 
+            let tool_call_count = self
+                .tool_call_counts
+                .get(alias)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+
+            // C# index status: check cached value first, then probe
+            let csharp_index = self
+                .csharp_index_status
+                .get(alias)
+                .map(|e| *e.value())
+                .unwrap_or_else(|| {
+                    // Probe: helper available + index exists → Ready
+                    let registry = &self.symbol_registry;
+                    let has_helper = registry
+                        .get(LANG_CSHARP)
+                        .map(|i| i.is_available())
+                        .unwrap_or(false);
+                    if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
+                        CSharpIndexStatus::Ready
+                    } else {
+                        CSharpIndexStatus::None
+                    }
+                });
+
+            let csharp_error = if matches!(csharp_index, CSharpIndexStatus::Error) {
+                self.csharp_index_error
+                    .get(alias)
+                    .map(|e: dashmap::mapref::one::Ref<String, String>| e.value().clone())
+            } else {
+                None
+            };
+
             result.push((
                 alias.clone(),
                 RepoStatusInfo {
                     status: label,
                     changes,
                     last_tool_call: last_tool,
+                    tool_call_count,
+                    csharp_index,
+                    csharp_error,
                 },
             ));
         }
+        // Sort alphabetically by alias for consistent display in TUI
+        result.sort_by_key(|a| a.0.to_ascii_lowercase());
         result
     }
 
@@ -1209,12 +2077,241 @@ async fn health_handler() -> AxumJson<serde_json::Value> {
     }))
 }
 
+/// Status handler: GET /status
+///
+/// Returns a JSON snapshot of all repo states, active sessions, and CPU usage.
+/// Used by the standalone TUI (`codesearch serve tui`) to poll server state.
+async fn status_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> AxumJson<serde_json::Value> {
+    let repos = state.repo_statuses_lightweight();
+    let active_sessions = state.active_session_count();
+
+    let repo_json: Vec<serde_json::Value> = repos
+        .iter()
+        .map(|(alias, info)| {
+            let status_str = match info.status {
+                RepoStateLabel::Open => "open",
+                RepoStateLabel::Warm => "warm",
+                RepoStateLabel::Readonly => "readonly",
+                RepoStateLabel::Closed => "closed",
+                RepoStateLabel::Indexing => "indexing",
+                RepoStateLabel::Error => "error",
+                RepoStateLabel::NoIndex => "no_index",
+            };
+            let lock_mode = match info.status {
+                RepoStateLabel::Open | RepoStateLabel::Indexing => "write",
+                RepoStateLabel::Warm | RepoStateLabel::Readonly => "read",
+                _ => "—",
+            };
+            let csharp_str = match info.csharp_index {
+                CSharpIndexStatus::None => "none",
+                CSharpIndexStatus::Ready => "ready",
+                CSharpIndexStatus::Error => "error",
+                CSharpIndexStatus::Indexing => "indexing",
+            };
+            json!({
+                "alias": alias,
+                "status": status_str,
+                "lock_mode": lock_mode,
+                "changes": info.changes,
+                "last_tool_call": info.last_tool_call,
+                "tool_call_count": info.tool_call_count,
+                "csharp_index": csharp_str,
+            })
+        })
+        .collect();
+
+    // CPU usage — reuse shared System instance so cpu_usage() can compute delta
+    let cpu = {
+        use sysinfo::ProcessesToUpdate;
+        let pid = match sysinfo::get_current_pid() {
+            Ok(p) => p,
+            Err(_) => {
+                return AxumJson(json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "repos": repo_json,
+                    "active_sessions": active_sessions,
+                    "cpu_percent": "—",
+                }));
+            }
+        };
+        let mut sys = match state.sysinfo_system.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                return AxumJson(json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "repos": repo_json,
+                    "active_sessions": active_sessions,
+                    "cpu_percent": "—",
+                }));
+            }
+        };
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        match sys.process(pid) {
+            Some(proc) => {
+                let num_cpus = sys.cpus().len().max(1) as f32;
+                let pct = proc.cpu_usage() / num_cpus;
+                format!("{:.0}%", pct)
+            }
+            None => "—".to_string(),
+        }
+    };
+
+    let csharp_helper = state
+        .symbol_registry
+        .get(LANG_CSHARP)
+        .map(|i| i.is_available())
+        .unwrap_or(false);
+
+    AxumJson(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "repos": repo_json,
+        "active_sessions": active_sessions,
+        "cpu_percent": cpu,
+        "csharp_helper": csharp_helper,
+    }))
+}
+
+/// Trigger a symbol index rebuild for a repo (C# etc.).
+///
+/// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the C# indexer,
+/// and runs `rebuild()` in a blocking task. Updates the C# index status on success/failure.
+async fn trigger_symbol_rebuild(
+    alias: &str,
+    project_path: &Path,
+    db_path: &Path,
+    state: &Arc<ServeState>,
+) {
+    // Skip non-applicable repos BEFORE touching status — otherwise the TUI
+    // would flip C#-indicator red on Rust/Python repos that simply have no
+    // .sln. The phase-2 gate (`evaluate_csharp_rebuild`) already filters
+    // these out, but other callers (POST /reindex?symbols=true,
+    // .cs watcher debounce, future paths) bypass that gate.
+    let applies = state
+        .symbol_registry
+        .get(LANG_CSHARP)
+        .map(|i| i.applies_to(project_path))
+        .unwrap_or(false);
+    if !applies {
+        tracing::info!(
+            "🔬 symbol reindex skipped for '{}': not applicable (no .sln)",
+            alias
+        );
+        return;
+    }
+
+    tracing::info!("🔬 symbol reindex triggered for '{}'", alias);
+    state
+        .csharp_index_status
+        .insert(alias.to_string(), CSharpIndexStatus::Indexing);
+    // Mark as actively indexing so the TUI status column shows "Indexing"
+    // (not just the C# indicator). This mirrors what reindex_handler does.
+    //
+    // Known benign race: if the FSW-SCIP rebuild path (indexing_cb) fires for
+    // the same alias simultaneously, both paths insert into active_reindexes.
+    // Because DashSet::insert is idempotent, there is no data corruption.
+    // However, whichever path finishes first will call remove(), which may
+    // briefly flip the TUI back to Warm/Open while the other path is still
+    // running. This is a cosmetic flash only — no state is corrupted.
+    state.active_reindexes.insert(alias.to_string());
+    let rp = project_path.to_path_buf();
+    let dp = db_path.to_path_buf();
+    let alias_owned = alias.to_string();
+    let registry = state.symbol_registry.clone();
+    match tokio::task::spawn_blocking(move || {
+        let Some(indexer) = registry.get(LANG_CSHARP) else {
+            return Err(anyhow::anyhow!("No C# symbol indexer registered"));
+        };
+        if !indexer.is_available() {
+            return Err(anyhow::anyhow!("scip-csharp helper not available"));
+        }
+        indexer.rebuild(&rp, &dp, RebuildScope::Full)
+    })
+    .await
+    {
+        Ok(Ok(summary)) => {
+            tracing::info!(
+                "✅ Symbol rebuild complete for '{}': {} symbols, {} refs in {}ms",
+                alias_owned,
+                summary.symbols_indexed,
+                summary.references_stored,
+                summary.duration_ms
+            );
+            state.active_reindexes.remove(&alias_owned);
+            state
+                .csharp_index_status
+                .insert(alias_owned.clone(), CSharpIndexStatus::Ready);
+            state.csharp_index_error.remove(&alias_owned);
+
+            if let Ok(mut cfg) = state.config.write() {
+                cfg.touch_last_scip(&alias_owned, ServeState::now_unix_secs());
+            }
+            state.schedule_persist_repos_config();
+        }
+        Ok(Err(e)) => {
+            tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, e);
+            state.active_reindexes.remove(&alias_owned);
+            state
+                .csharp_index_error
+                .insert(alias_owned.clone(), e.to_string());
+            state
+                .csharp_index_status
+                .insert(alias_owned, CSharpIndexStatus::Error);
+        }
+        Err(e) => {
+            tracing::error!(
+                "❌ Symbol rebuild task panicked for '{}': {}",
+                alias_owned,
+                e
+            );
+            state.active_reindexes.remove(&alias_owned);
+            state
+                .csharp_index_error
+                .insert(alias_owned.clone(), format!("Task panicked: {}", e));
+            state
+                .csharp_index_status
+                .insert(alias_owned, CSharpIndexStatus::Error);
+        }
+    }
+}
+
+/// Reload repos config handler: POST /reload
+///
+/// Forces a reload of repos.json from disk, even if the mtime hasn't changed.
+/// Used by the TUI [s] key to pick up external changes (e.g. `codesearch index add`).
+async fn reload_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> (
+    axum::http::StatusCode,
+    axum::response::Json<serde_json::Value>,
+) {
+    use axum::http::StatusCode;
+
+    // Clear the stored mtime so reload_if_changed will actually reload.
+    if let Ok(mut mtime_guard) = state.config_mtime.write() {
+        *mtime_guard = None;
+    }
+
+    match state.reload_if_changed() {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::response::Json(json!({"status": "reloaded"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::response::Json(json!({"error": format!("reload failed: {}", e)})),
+        ),
+    }
+}
+
 /// Reindex handler: POST /repos/{alias}/reindex
 ///
 /// Query params:
 /// - `force=true` — close the repo, delete the DB, full reindex, reopen.
 ///   Required when the caller wants a clean rebuild (e.g. `codesearch index -f`).
 ///   Without force, performs an incremental refresh only.
+/// - `symbols=true` — also rebuild the symbol index (C# SCIP) after text reindex.
 ///
 /// Returns 202 Accepted immediately; the reindex runs in the background.
 async fn reindex_handler(
@@ -1229,6 +2326,11 @@ async fn reindex_handler(
 
     let force = params
         .get("force")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let symbols = params
+        .get("symbols")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
@@ -1278,6 +2380,8 @@ async fn reindex_handler(
     let guard_alias = alias_bg.clone();
     let guard_state = state.clone();
 
+    let do_symbols = symbols;
+
     if force {
         // Force rebuild: stop FSW -> clear data in-place -> full reindex -> restart FSW.
         // The FSW must be stopped before clearing the FileMetaStore, otherwise it
@@ -1288,9 +2392,37 @@ async fn reindex_handler(
         let stores = match state.stop_fsw(&alias) {
             Some(s) => s,
             None => {
-                // FSW not running -- try opening normally
-                match state.get_or_open_stores(&alias, true).await {
-                    Ok(s) => s,
+                // FSW not running -- open existing or create fresh DB.
+                // allow_create=true so a force-reindex can recover a deleted DB.
+                let cancel = CancellationToken::new();
+                match state.try_open_stores(&alias, &db_path, true) {
+                    Ok(OpenedStores::Write(s)) => {
+                        // Register as Write to block double-open races while we reindex.
+                        state.repos.insert(
+                            alias.clone(),
+                            RepoState::Write {
+                                stores: s.clone(),
+                                index_manager: None,
+                                cancel_token: cancel,
+                            },
+                        );
+                        state.touch_access(&alias);
+                        s
+                    }
+                    Ok(OpenedStores::Readonly(_)) => {
+                        // Cannot force-reindex against a readonly store.
+                        state.active_reindexes.remove(&guard_alias);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::response::Json(json!({
+                                "error": format!(
+                                    "Repo {} could only be opened read-only; cannot force-reindex",
+                                    alias
+                                ),
+                                "status": "error"
+                            })),
+                        );
+                    }
                     Err(e) => {
                         state.active_reindexes.remove(&guard_alias);
                         return (
@@ -1325,6 +2457,11 @@ async fn reindex_handler(
 
             // 3. Restart FSW with fresh IndexManager
             g_state.restart_fsw(&g_alias, stores).await;
+
+            // 4. Optional symbol index rebuild
+            if do_symbols {
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
+            }
 
             g_state.active_reindexes.remove(&g_alias);
         });
@@ -1365,6 +2502,12 @@ async fn reindex_handler(
                     tracing::error!("❌ Reindex failed for '{}': {}", alias_bg, e);
                 }
             }
+
+            // Optional symbol index rebuild
+            if do_symbols {
+                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
+            }
+
             g_state.active_reindexes.remove(&g_alias);
         });
     }
@@ -1386,15 +2529,14 @@ struct AddRepoRequest {
     path: PathBuf,
     /// Optional alias to register under. If omitted, the directory name is used.
     alias: Option<String>,
-    /// Create a global index instead of local.
-    #[serde(default)]
-    global: bool,
 }
 
 /// Add-repo handler: POST /repos
 ///
-/// Registers a new repo in repos.json, creates the index, and warms it up.
-/// Returns 201 on success.
+/// Registers a new repo in repos.json, opens the LMDB/Tantivy stores inline
+/// (fast — prevents the double-open race from the old `index_quiet` path),
+/// then spawns a full reindex + vector index build + FSW start in the
+/// background. Returns 202 Accepted immediately.
 async fn add_repo_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
     axum::extract::Json(body): axum::extract::Json<AddRepoRequest>,
@@ -1405,7 +2547,7 @@ async fn add_repo_handler(
     use axum::http::StatusCode;
 
     // Canonicalize the path
-    let canonical_path = match body.path.canonicalize() {
+    let canonical_path = match safe_canonicalize(&body.path) {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -1458,7 +2600,7 @@ async fn add_repo_handler(
             }
         };
 
-        if let Err(e) = config.save() {
+        if let Err(e) = state.persist_config(&config) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::response::Json(json!({
@@ -1471,51 +2613,141 @@ async fn add_repo_handler(
         alias
     };
 
-    // Create the index using index_quiet
-    let cancel_token = CancellationToken::new();
-    let index_path = canonical_path.clone();
-    let alias_bg = alias.clone();
-    let state_bg = state.clone();
-
-    match crate::index::index_quiet(Some(index_path.clone()), false, body.global, cancel_token)
-        .await
-    {
-        Ok(()) => {
-            tracing::info!("Index created for '{}' ({})", alias, index_path.display());
+    // Open stores INLINE (fast -- just creates dirs + opens LMDB/Tantivy handles).
+    // This eliminates the LMDB double-open race that occurred when the old
+    //  path opened its own LMDB handle, conflicting with
+    //  calls from the serve's request handlers.
+    let db_path = canonical_path.join(DB_DIR_NAME);
+    let stores = match state.try_open_stores(&alias, &db_path, true) {
+        Ok(OpenedStores::Write(s)) => s,
+        Ok(OpenedStores::Readonly(_)) => {
+            unreachable!("try_open_stores(allow_create=true) never returns Readonly")
         }
         Err(e) => {
-            // Index failed — remove the config entry we just added
-            tracing::error!("Index creation failed for '{}': {}", alias, e);
-            {
-                if let Ok(mut config) = state.config.write() {
-                    config.unregister_alias(&alias);
-                    let _ = config.save();
+            // Clean up the config entry we just added
+            if let Ok(mut config) = state.config.write() {
+                config.unregister_alias(&alias);
+                if let Err(e) = state.persist_config(&config) {
+                    tracing::warn!(
+                        "Failed to persist config after add-repo DB open failure for '{}': {}",
+                        alias,
+                        e
+                    );
                 }
             }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::response::Json(json!({
-                    "error": format!("Index creation failed: {}", e),
+                    "error": format!("Failed to open database for {}: {}", alias, e),
                     "status": "error"
                 })),
             );
         }
+    };
+
+    // Store as Write immediately so get_or_open_stores() finds the repo in the
+    // fast-path and does NOT try to open a second LMDB handle on the same path.
+    let cancel_token = CancellationToken::new();
+    state.repos.insert(
+        alias.clone(),
+        RepoState::Write {
+            stores: stores.clone(),
+            index_manager: None,
+            cancel_token: cancel_token.clone(),
+        },
+    );
+    state.touch_access(&alias);
+
+    // Guard against concurrent reindex for the same alias.
+    if !state.active_reindexes.insert(alias.clone()) {
+        // Another reindex for this alias is already in progress.
+        // We must undo *all* side-effects created so far:
+        //   1. Cancel the token and remove from repos (releases the LMDB handle).
+        //   2. Unregister from config — the alias was persisted to repos.json a
+        //      few lines above. Without this cleanup the alias would remain in
+        //      repos.json with no open stores until the server is restarted.
+        cancel_token.cancel();
+        state.repos.remove(&alias);
+        if let Ok(mut config) = state.config.write() {
+            config.unregister_alias(&alias);
+            if let Err(e) = state.persist_config(&config) {
+                tracing::warn!(
+                    "Failed to persist config after add-repo conflict for '{}': {}",
+                    alias,
+                    e
+                );
+            }
+        }
+        return (
+            StatusCode::CONFLICT,
+            axum::response::Json(json!({
+                "error": format!("Reindex already in progress for '{}'", alias),
+                "status": "conflict"
+            })),
+        );
     }
 
-    // Warmup the repo (opens DB, builds vector index, stores as Warm)
+    // Spawn the heavy indexing work in the background.  Returns 202 immediately.
+    let alias_bg = alias.clone();
+    let state_bg = state.clone();
+    let project_path = canonical_path.clone();
+
     tokio::spawn(async move {
-        if let Err(e) = state_bg.warmup_repo(&alias_bg).await {
-            tracing::warn!("Warmup failed for newly added repo '{}': {}", alias_bg, e);
+        tracing::info!(
+            "Indexing newly added repo '{}' ({}) in background",
+            alias_bg,
+            project_path.display()
+        );
+
+        match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores).await {
+            Ok(()) => {
+                tracing::info!(
+                    "Index created for '{}' ({})",
+                    alias_bg,
+                    project_path.display()
+                );
+            }
+            Err(e) => {
+                tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
+                // Clean up: remove from repos and config
+                state_bg.repos.remove(&alias_bg);
+                state_bg.active_reindexes.remove(&alias_bg);
+                if let Ok(mut config) = state_bg.config.write() {
+                    config.unregister_alias(&alias_bg);
+                    if let Err(e) = state_bg.persist_config(&config) {
+                        tracing::warn!(
+                            "Failed to persist config after add-repo index failure for '{}': {}",
+                            alias_bg,
+                            e
+                        );
+                    }
+                }
+                return;
+            }
         }
+
+        // Build vector index from freshly indexed data
+        {
+            let mut vstore = stores.vector_store.write().await;
+            if let Err(e) = vstore.build_index() {
+                tracing::warn!("Failed to build vector index for '{}': {}", alias_bg, e);
+            }
+        }
+
+        // Start FSW and transition to proper Write state with IndexManager
+        state_bg.restart_fsw(&alias_bg, stores).await;
+
+        state_bg.active_reindexes.remove(&alias_bg);
+        tracing::info!("Repo '{}' fully indexed and ready", alias_bg);
     });
 
     (
-        StatusCode::CREATED,
+        StatusCode::ACCEPTED,
         axum::response::Json(json!({
-            "status": "created",
+            "status": "accepted",
             "alias": alias,
             "path": canonical_path,
-            "message": "Repo registered, indexed, and warming up"
+            "message": "Repo registered, indexing in background"
         })),
     )
 }
@@ -1588,7 +2820,7 @@ async fn remove_repo_handler(
             }
         };
         config.unregister_alias(&alias);
-        if let Err(e) = config.save() {
+        if let Err(e) = state.persist_config(&config) {
             tracing::warn!(
                 "Failed to save repos config after removing '{}': {}",
                 alias,
@@ -1663,7 +2895,37 @@ async fn log_mcp_requests(
     response
 }
 
+/// Run the standalone TUI that connects to a running serve instance via HTTP.
+///
+/// This is the entry point for `codesearch serve tui`.
+pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
+    if !tui::is_tty() {
+        eprintln!("Error: No TTY detected. The standalone TUI requires an interactive terminal.");
+        std::process::exit(1);
+    }
 
+    // Check if serve is reachable
+    let health_url = format!("{}{}", serve_url, HEALTH_PATH);
+    match reqwest::get(&health_url).await {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(_) => {
+            eprintln!(
+                "Error: Serve at {} returned an error. Is it running?",
+                serve_url
+            );
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!(
+                "Error: No serve running at {}. Start with: codesearch serve",
+                serve_url
+            );
+            std::process::exit(1);
+        }
+    }
+
+    tui_remote::run_remote_tui(serve_url).await
+}
 
 /// Run the MCP serve mode.
 ///
@@ -1671,6 +2933,7 @@ async fn log_mcp_requests(
 pub async fn run_serve(
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
+    no_tui: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let effective_port = port.unwrap_or_else(|| {
@@ -1683,7 +2946,7 @@ pub async fn run_serve(
     // Load repos config (register any --register paths first)
     let mut config = ReposConfig::load().unwrap_or_default();
     for path in &register_paths {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let canonical = safe_canonicalize(path).unwrap_or_else(|_| path.clone());
         let alias = config.register(canonical);
         eprintln!("Registered repo '{}' -> {}", alias, path.display());
         info!("Registered repo '{}' -> {}", alias, path.display());
@@ -1755,8 +3018,10 @@ pub async fn run_serve(
     // before the request hits this middleware).
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
+        .route(STATUS_PATH, axum::routing::get(status_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
+        .route("/reload", axum::routing::post(reload_handler))
         .route(
             "/repos/:alias/reindex",
             axum::routing::post(reindex_handler),
@@ -1780,29 +3045,22 @@ pub async fn run_serve(
     let tui_state = serve_state.clone();
     let tui_url = serve_url.clone();
 
-    let tui_handle = tui::maybe_spawn_tui(tui_state, tui_cancel, tui_url);
+    let tui_handle = if !no_tui {
+        tui::maybe_spawn_tui(tui_state, tui_cancel, tui_url)
+    } else {
+        None
+    };
 
-    // ── Background pre-warming (NO FSW) ──
-    // Open all registered repos sequentially: opens DB, builds vector index,
-    // starts incremental refresh — but does NOT start file system watchers.
-    // FSW is started lazily on first query via get_or_open_stores().
-    // This saves memory and overhead for repos that are never queried.
+    // ── Startup phase orchestration ──
+    // Phase 1 warms all repos sequentially (text/vector ready).
+    // Phase 2 runs gated C# SCIP rebuilds ordered by last_changed.
     {
-        let warmup_state = serve_state.clone();
+        let phase_state = serve_state.clone();
         tokio::spawn(async move {
-            let aliases = warmup_state.aliases();
-            if !aliases.is_empty() {
-                info!("🔥 Background warming {} repos (no FSW)...", aliases.len());
-                for alias in &aliases {
-                    match warmup_state.warmup_repo(alias).await {
-                        Ok(()) => info!("  ✅ {} warmed (no FSW)", alias),
-                        Err(e) => warn!("  ⚠️  {} warmup failed: {}", alias, e),
-                    }
-                    // Small delay between repos to avoid I/O burst
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-                info!("🔥 Background warming complete");
-            }
+            phase_state.reconcile_all_paths();
+            phase_state.run_phase_1_warmup_all().await;
+            phase_state.run_phase_2_csharp_scip().await;
+            phase_state.run_phase_3_prewarm().await;
         });
     }
 
@@ -1982,6 +3240,140 @@ mod tests {
             err.contains("retry"),
             "error should mention 'retry': {}",
             err
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Central store-creation / register path — regression guards.
+    //
+    // This is the point that has silently broken multiple times: opening or
+    // creating a repo's database for a BRAND-NEW repo whose `.codesearch.db`
+    // directory does not exist yet. The failure mode was a misleading
+    // "Database is locked by another process" error -> HTTP 500 on POST /repos
+    // -> repos.json registration rolled back -> CLI fell back to a local
+    // duplicate index (control never handed to serve).
+    //
+    // RULE FOR THESE TESTS: never pre-create the `.codesearch.db` directory.
+    // Earlier tests masked this exact bug by creating it first. The create /
+    // register path must be exercised with the directory genuinely absent.
+    // ------------------------------------------------------------------
+
+    /// Core invariant: `try_open_stores(allow_create = true)` on a repo whose
+    /// database directory does not exist yet MUST create it and return a
+    /// writable handle — never a "locked"/open error. This is the single
+    /// assertion that directly catches the regression class.
+    #[tokio::test]
+    async fn try_open_stores_creates_db_for_brand_new_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("brandnew");
+        std::fs::create_dir(&repo_path).unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        assert!(
+            !db_path.exists(),
+            "test precondition violated: db dir must NOT be pre-created"
+        );
+
+        let state = state_with_config(ReposConfig::default());
+
+        match state.try_open_stores("brandnew", &db_path, true) {
+            Ok(OpenedStores::Write(_)) => {}
+            Ok(OpenedStores::Readonly(_)) => {
+                panic!("brand-new repo opened Readonly; expected Write")
+            }
+            Err(e) => panic!(
+                "opening stores for a brand-new repo (allow_create=true) must succeed, got: {e}"
+            ),
+        }
+
+        assert!(
+            db_path.exists(),
+            "the .codesearch.db directory should have been created"
+        );
+    }
+
+    /// End-to-end guard for the exact symptom pair: `POST /repos` for a repo
+    /// whose database does not exist yet must return 202 Accepted, persist the
+    /// alias to repos.json, and register the repo in WRITE mode — it must NOT
+    /// return 500 and roll back the registration.
+    ///
+    /// Determinism: `#[tokio::test]` uses a current-thread runtime, so the
+    /// background reindex task spawned by the handler cannot preempt this test
+    /// (no `.await` follows the handler call). All assertions observe the
+    /// handler's synchronous pre-spawn state — no embedding model required, no
+    /// race. `persist_config` honors the temp config override, so the real
+    /// `~/.codesearch/repos.json` is never touched.
+    #[tokio::test]
+    async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("brandnew");
+        std::fs::create_dir(&repo_path).unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        assert!(!db_path.exists(), "precondition: db dir must not exist yet");
+
+        let state = Arc::new(state_with_config(ReposConfig::default()));
+
+        let (status, body) = add_repo_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Json(AddRepoRequest {
+                path: repo_path.clone(),
+                alias: Some("brandnew".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::ACCEPTED,
+            "brand-new repo register must be accepted (not 500), got {}: {}",
+            status,
+            body.0
+        );
+
+        // Registration persisted, NOT rolled back.
+        assert!(
+            state.config_snapshot().repos.contains_key("brandnew"),
+            "alias must remain in repos.json after register (no rollback)"
+        );
+
+        // Registered in memory as Write so the fast-path avoids a second open.
+        assert_eq!(
+            state.repo_lock_status("brandnew"),
+            Some("write"),
+            "repo should be registered as Write immediately after add"
+        );
+
+        assert!(
+            db_path.exists(),
+            "the .codesearch.db directory should have been created"
+        );
+    }
+
+    /// `persist_config` must write to the override path (and therefore be
+    /// observable by `reload_if_changed`/`config_snapshot`) rather than the real
+    /// `~/.codesearch/repos.json`. Guards the wiring that makes the register
+    /// path hermetically testable.
+    #[test]
+    fn persist_config_honors_override_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("repos.json");
+        let repo_path = tmp.path().join("somerepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        ReposConfig::default().save_to(&config_file).unwrap();
+        let state = ServeState::new(ReposConfig::default(), Some(config_file.clone()));
+
+        {
+            let mut cfg = state.config.write().unwrap();
+            cfg.register_with_alias(repo_path.clone(), Some("somerepo".to_string()))
+                .unwrap();
+            state.persist_config(&cfg).unwrap();
+        }
+
+        // The override file on disk must contain the alias.
+        let on_disk = ReposConfig::load_from(&config_file).unwrap();
+        assert!(
+            on_disk.repos.contains_key("somerepo"),
+            "persist_config must write to the override path"
         );
     }
 

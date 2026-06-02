@@ -67,6 +67,16 @@ impl GrammarManager {
             Language::CSharp => Ok(tree_sitter_c_sharp::LANGUAGE.into()),
             Language::Go => Ok(tree_sitter_go::LANGUAGE.into()),
             Language::Java => Ok(tree_sitter_java::LANGUAGE.into()),
+            Language::Shell => Ok(tree_sitter_bash::LANGUAGE.into()),
+            Language::Ruby => Ok(tree_sitter_ruby::LANGUAGE.into()),
+            Language::Php => Ok(tree_sitter_php::LANGUAGE_PHP.into()),
+            Language::Yaml => Ok(tree_sitter_yaml::LANGUAGE.into()),
+            Language::Json => Ok(tree_sitter_json::LANGUAGE.into()),
+            // Markdown uses the tree-sitter-md *block* grammar (sections, headings,
+            // code fences). The inline grammar is intentionally not used: chunk
+            // boundaries only need block structure, and the block grammar runs on a
+            // plain `Parser` like every other language here.
+            Language::Markdown => Ok(tree_sitter_md::LANGUAGE.into()),
             _ => Err(anyhow!(
                 "Language {} does not support tree-sitter",
                 language.name()
@@ -86,6 +96,12 @@ impl GrammarManager {
             Language::CSharp,
             Language::Go,
             Language::Java,
+            Language::Shell,
+            Language::Ruby,
+            Language::Php,
+            Language::Yaml,
+            Language::Json,
+            Language::Markdown,
         ]
     }
 
@@ -141,12 +157,51 @@ mod tests {
     }
 
     #[test]
-    fn test_load_rust_grammar() {
+    fn test_load_java_grammar() {
         let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Rust);
+        let grammar = manager.get_grammar(Language::Java);
 
         assert!(grammar.is_some());
-        assert_eq!(manager.stats().cached_grammars, 1);
+    }
+
+    #[test]
+    fn test_load_bash_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::Shell);
+
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_load_ruby_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::Ruby);
+
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_load_php_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::Php);
+
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_load_yaml_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::Yaml);
+
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_load_json_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::Json);
+
+        assert!(grammar.is_some());
     }
 
     #[test]
@@ -202,16 +257,18 @@ mod tests {
     }
 
     #[test]
-    fn test_load_java_grammar() {
+    fn test_load_markdown_grammar() {
         let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Java);
+        let grammar = manager.get_grammar(Language::Markdown);
+
         assert!(grammar.is_some());
     }
 
     #[test]
     fn test_unsupported_language() {
         let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Markdown);
+        // Toml has no compiled-in grammar.
+        let grammar = manager.get_grammar(Language::Toml);
 
         assert!(grammar.is_none());
     }
@@ -257,7 +314,12 @@ mod tests {
         assert!(manager.is_supported(Language::CSharp));
         assert!(manager.is_supported(Language::Go));
         assert!(manager.is_supported(Language::Java));
-        assert!(!manager.is_supported(Language::Markdown));
-        assert!(!manager.is_supported(Language::Json));
+        assert!(manager.is_supported(Language::Shell));
+        assert!(manager.is_supported(Language::Ruby));
+        assert!(manager.is_supported(Language::Php));
+        assert!(manager.is_supported(Language::Yaml));
+        assert!(manager.is_supported(Language::Json));
+        assert!(manager.is_supported(Language::Markdown));
+        assert!(!manager.is_supported(Language::Toml));
     }
 }

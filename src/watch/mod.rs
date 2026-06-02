@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,13 +23,24 @@ fn normalize_event_path(path: &Path) -> PathBuf {
 
 /// Change information from git HEAD file.
 ///
-/// Contains both the old and new HEAD content when a branch switch is detected.
+/// Contains both the old and new HEAD content and resolved commit hashes when
+/// a branch switch or branch tip move is detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadChange {
     /// Previous HEAD content (e.g., "ref: refs/heads/main\n")
     pub old_head: String,
     /// New HEAD content (e.g., "ref: refs/heads/feature\n")
     pub new_head: String,
+    /// Previous resolved commit hash, if it could be determined.
+    pub old_commit: Option<String>,
+    /// New resolved commit hash, if it could be determined.
+    pub new_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedHeadState {
+    head_content: String,
+    resolved_commit: Option<String>,
 }
 
 /// Types of file system events we care about
@@ -53,15 +66,62 @@ pub struct FileWatcher {
     root: PathBuf,
     debouncer: Option<Debouncer<RecommendedWatcher, FileIdMap>>,
     receiver: Option<Receiver<DebounceEventResult>>,
+    /// Compiled .gitignore matcher for the repo root (None if no .gitignore found).
+    gitignore: Option<Gitignore>,
 }
 
 impl FileWatcher {
     /// Create a new file watcher for the given root directory
     pub fn new(root: PathBuf) -> Self {
+        let gitignore = Self::build_gitignore(&root);
         Self {
             root,
             debouncer: None,
             receiver: None,
+            gitignore,
+        }
+    }
+
+    /// Build a `Gitignore` matcher from the repo root's `.gitignore` and
+    /// `.git/info/exclude`. Returns `None` if neither file exists.
+    fn build_gitignore(root: &Path) -> Option<Gitignore> {
+        let mut builder = GitignoreBuilder::new(root);
+
+        let mut added_any = false;
+
+        // Add .git/info/exclude if present
+        let exclude_path = root.join(".git").join("info").join("exclude");
+        if exclude_path.exists() {
+            if let Some(e) = builder.add(&exclude_path) {
+                tracing::debug!("Failed to add .git/info/exclude: {}", e);
+            } else {
+                added_any = true;
+            }
+        }
+
+        // Add .gitignore if present
+        let gitignore_path = root.join(".gitignore");
+        if gitignore_path.exists() {
+            if let Some(e) = builder.add(&gitignore_path) {
+                tracing::debug!("Failed to add .gitignore: {}", e);
+            } else {
+                added_any = true;
+            }
+        }
+
+        if !added_any {
+            return None;
+        }
+
+        match builder.build() {
+            Ok(gi) => {
+                tracing::debug!("Loaded .gitignore rules for {}", root.display());
+                Some(gi)
+            }
+            Err(e) => {
+                tracing::debug!("Failed to build gitignore matcher: {}", e);
+                None
+            }
         }
     }
 
@@ -122,15 +182,42 @@ impl FileWatcher {
         false
     }
 
+    /// Check if a path is matched by .gitignore rules (relative to repo root).
+    /// Uses `is_dir=true` so directory patterns like `obj/` match files inside them.
+    fn is_gitignored(&self, path: &Path) -> bool {
+        if let Some(ref gi) = self.gitignore {
+            let relative = path.strip_prefix(&self.root).unwrap_or(path);
+            // Check each ancestor component with is_dir=true so that
+            // directory-only patterns (e.g. `obj/`) correctly exclude
+            // files nested inside those directories.
+            let mut current = PathBuf::new();
+            for component in relative.components() {
+                current.push(component);
+                if gi.matched(&current, true).is_ignore() {
+                    return true;
+                }
+            }
+            false
+        } else {
+            false
+        }
+    }
+
     /// Check if a path should be watched.
     /// Uses the same logic as FileWalker so FSW and index agree on what is indexable:
     /// - Not in an ignored directory (ALWAYS_EXCLUDED)
+    /// - Not matched by .gitignore rules
     /// - Not a skip extension (ALWAYS_SKIP_EXTENSIONS)
     /// - Not a skip filename suffix (ALWAYS_SKIP_FILENAME_SUFFIXES)
     /// - Not 0 bytes
     /// - Language is indexable (Language::from_path)
     fn is_watchable(&self, path: &Path) -> bool {
         if self.is_in_ignored_dir(path) {
+            return false;
+        }
+
+        // Check .gitignore rules (relative to repo root)
+        if self.is_gitignored(path) {
             return false;
         }
 
@@ -190,11 +277,10 @@ impl FileWatcher {
                             // Convert to our event type
                             use notify::EventKind;
                             match event.kind {
-                                EventKind::Create(_) | EventKind::Modify(_) => {
-                                    // For creates/modifies, only process indexable files
-                                    if self.is_watchable(&path) && raw_path.exists() {
-                                        events.push(FileEvent::Modified(path));
-                                    }
+                                EventKind::Create(_) | EventKind::Modify(_)
+                                    if self.is_watchable(&path) && raw_path.exists() =>
+                                {
+                                    events.push(FileEvent::Modified(path));
                                 }
                                 EventKind::Remove(_) => {
                                     // For removals, don't filter by extension - directory
@@ -258,18 +344,20 @@ impl FileWatcher {
                         let path = normalize_event_path(raw_path);
 
                         // Skip ignored directories and duplicates
-                        if self.is_in_ignored_dir(&path) || seen_paths.contains(&path) {
+                        if self.is_in_ignored_dir(&path)
+                            || self.is_gitignored(&path)
+                            || seen_paths.contains(&path)
+                        {
                             continue;
                         }
                         seen_paths.insert(path.clone());
 
                         use notify::EventKind;
                         match event.kind {
-                            EventKind::Create(_) | EventKind::Modify(_) => {
-                                // For creates/modifies, only process indexable files
-                                if self.is_watchable(&path) && raw_path.exists() {
-                                    events.push(FileEvent::Modified(path));
-                                }
+                            EventKind::Create(_) | EventKind::Modify(_)
+                                if self.is_watchable(&path) && raw_path.exists() =>
+                            {
+                                events.push(FileEvent::Modified(path));
                             }
                             EventKind::Remove(_) => {
                                 // For removals, don't filter by extension - directory
@@ -303,10 +391,12 @@ impl Drop for FileWatcher {
 /// then polls cheaply by reading a single file and comparing content.
 #[derive(Clone)]
 pub struct GitHeadWatcher {
+    /// Git repository root used to resolve `git rev-parse HEAD`.
+    git_root: PathBuf,
     /// Resolved path to the HEAD file (e.g. /repo/.git/HEAD or worktree target)
     head_path: PathBuf,
-    /// Cached last HEAD content for change detection (thread-safe)
-    last_head_content: Arc<Mutex<Option<String>>>,
+    /// Cached last HEAD state for change detection (thread-safe)
+    last_head_state: Arc<Mutex<Option<CachedHeadState>>>,
 }
 
 impl GitHeadWatcher {
@@ -321,8 +411,9 @@ impl GitHeadWatcher {
         let head_path = Self::resolve_head_path(&git_root);
         tracing::debug!("👀 Git HEAD watcher: {}", head_path.display());
         Self {
+            git_root,
             head_path,
-            last_head_content: Arc::new(Mutex::new(None)),
+            last_head_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -373,27 +464,78 @@ impl GitHeadWatcher {
                 )
             })?;
 
-        let mut last = self.last_head_content.lock().await;
+        let current_commit = self.get_current_commit_hash();
+        let current_state = CachedHeadState {
+            head_content: current_content.clone(),
+            resolved_commit: current_commit.clone(),
+        };
+
+        let mut last = self.last_head_state.lock().await;
 
         let result = match &*last {
-            Some(prev) if prev != &current_content => Some(HeadChange {
-                old_head: prev.clone(),
-                new_head: current_content.clone(),
-            }),
+            Some(prev)
+                if prev.head_content != current_state.head_content
+                    || prev.resolved_commit != current_state.resolved_commit =>
+            {
+                Some(HeadChange {
+                    old_head: prev.head_content.clone(),
+                    new_head: current_state.head_content.clone(),
+                    old_commit: prev.resolved_commit.clone(),
+                    new_commit: current_state.resolved_commit.clone(),
+                })
+            }
             None => {
                 // First check — initialize, report no change
-                *last = Some(current_content);
+                *last = Some(current_state);
                 return Ok(None);
             }
             _ => None,
         };
 
         if result.is_some() {
-            tracing::info!("🔀 Git HEAD changed (branch switch or HEAD moved)");
-            *last = Some(current_content);
+            tracing::info!("🔀 Git HEAD changed (branch switch, HEAD moved, or commit advanced)");
+            *last = Some(current_state);
         }
 
         Ok(result)
+    }
+
+    /// Resolve the current commit hash for HEAD.
+    ///
+    /// Returns `None` when git is unavailable or the repo state cannot be
+    /// resolved. HEAD content changes are still detected independently.
+    fn get_current_commit_hash(&self) -> Option<String> {
+        let output = Command::new("git")
+            .current_dir(&self.git_root)
+            .args(["rev-parse", "HEAD"])
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if hash.is_empty() {
+                    None
+                } else {
+                    Some(hash)
+                }
+            }
+            Ok(output) => {
+                tracing::debug!(
+                    "Failed to resolve HEAD commit hash in {}: {}",
+                    self.git_root.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to execute git rev-parse in {}: {}",
+                    self.git_root.display(),
+                    e
+                );
+                None
+            }
+        }
     }
 
     /// Get the current HEAD reference (branch name or commit hash).
@@ -409,7 +551,22 @@ impl GitHeadWatcher {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<()> {
+        let output = Command::new("git").args(args).current_dir(cwd).output()?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn test_is_watchable() {
@@ -445,6 +602,50 @@ mod tests {
     }
 
     #[test]
+    fn test_gitignore_rules_respected() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Create .gitignore with obj/, bin/, .claude/ patterns
+        fs::write(
+            root.join(".gitignore"),
+            "obj/\nbin/\n.claude/\n*.deps.json\n",
+        )
+        .unwrap();
+
+        let watcher = FileWatcher::new(root.to_path_buf());
+        assert!(watcher.gitignore.is_some(), "Should have loaded .gitignore");
+
+        // Should NOT watch (gitignored patterns)
+        assert!(
+            !watcher.is_watchable(&root.join("obj/project.assets.json")),
+            "obj/ should be gitignored"
+        );
+        assert!(
+            !watcher.is_watchable(&root.join("bin/Debug/net8.0/app.deps.json")),
+            "bin/ should be gitignored"
+        );
+        assert!(
+            !watcher.is_watchable(&root.join(".claude/settings.local.json")),
+            ".claude/ should be gitignored"
+        );
+        assert!(
+            !watcher.is_watchable(&root.join("src/app.deps.json")),
+            "*.deps.json should be gitignored"
+        );
+
+        // SHOULD watch (non-ignored code files)
+        assert!(
+            watcher.is_watchable(&root.join("src/Program.cs")),
+            "src/Program.cs should be watchable"
+        );
+        assert!(
+            watcher.is_watchable(&root.join("README.md")),
+            "README.md should be watchable"
+        );
+    }
+
+    #[test]
     #[ignore] // Requires actual filesystem events
     fn test_file_watcher() {
         let dir = tempdir().unwrap();
@@ -461,5 +662,46 @@ mod tests {
         let events = watcher.poll_events();
 
         assert!(!events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_git_head_watcher_detects_commit_advance_without_head_change() {
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path();
+
+        run_git(repo_path, &["init"]).unwrap();
+        run_git(repo_path, &["config", "user.name", "Test User"]).unwrap();
+        run_git(repo_path, &["config", "user.email", "test@example.com"]).unwrap();
+
+        fs::create_dir_all(repo_path.join("src")).unwrap();
+        fs::write(
+            repo_path.join("src/main.rs"),
+            "fn main() { println!(\"hello\"); }\n",
+        )
+        .unwrap();
+        run_git(repo_path, &["add", "."]).unwrap();
+        run_git(repo_path, &["commit", "-m", "initial"]).unwrap();
+
+        let watcher = GitHeadWatcher::new(repo_path.to_path_buf());
+
+        assert!(watcher.check().await.unwrap().is_none());
+
+        fs::write(
+            repo_path.join("src/main.rs"),
+            "fn main() { println!(\"hello again\"); }\n",
+        )
+        .unwrap();
+        run_git(repo_path, &["add", "."]).unwrap();
+        run_git(repo_path, &["commit", "-m", "advance head"]).unwrap();
+
+        let change = watcher
+            .check()
+            .await
+            .unwrap()
+            .expect("expected head change");
+        assert_eq!(change.old_head, change.new_head);
+        assert_ne!(change.old_commit, change.new_commit);
+        assert!(change.old_commit.is_some());
+        assert!(change.new_commit.is_some());
     }
 }

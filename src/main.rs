@@ -8,12 +8,14 @@ mod embed;
 mod file;
 mod fts;
 mod index;
+mod lmdb_registry;
 mod logger;
 mod mcp;
 mod output;
 mod rerank;
 mod search;
 mod serve;
+mod symbols;
 mod vectordb;
 mod watch;
 

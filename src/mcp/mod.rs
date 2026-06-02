@@ -1815,6 +1815,65 @@ mod tests {
         assert!(!super::looks_like_code_pattern(""));
     }
 
+    // ─── extract_bm25_query_from_regex tests ─────────────────────────
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_class_word_cache() {
+        // "class \w+Cache\b" → should extract "class Cache"
+        assert_eq!(
+            super::extract_bm25_query_from_regex("class \\w+Cache\\b"),
+            "class Cache"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_interface() {
+        // "interface I\w+" → should extract "interface"
+        assert_eq!(
+            super::extract_bm25_query_from_regex("interface I\\w+"),
+            "interface"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_class_word_store() {
+        // "class \w+Store\b" → should extract "class Store"
+        assert_eq!(
+            super::extract_bm25_query_from_regex("class \\w+Store\\b"),
+            "class Store"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_plain() {
+        // Plain identifier → unchanged
+        assert_eq!(
+            super::extract_bm25_query_from_regex("CleanupController"),
+            "CleanupController"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_all_escapes() {
+        // Pure escape classes → empty
+        assert_eq!(super::extract_bm25_query_from_regex("\\w+"), "");
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_method_call() {
+        // "\.MethodName\(" → "MethodName"
+        assert_eq!(
+            super::extract_bm25_query_from_regex("\\.MethodName\\("),
+            "MethodName"
+        );
+    }
+
+    #[test]
+    fn test_extract_bm25_query_from_regex_bracket_class() {
+        // "[a-z]+Cache" → "Cache" (bracket class stripped)
+        assert_eq!(super::extract_bm25_query_from_regex("[a-z]+Cache"), "Cache");
+    }
+
     // ─── compute_literal_low_confidence tests ─────────────────────────
 
     #[test]
@@ -2193,6 +2252,7 @@ use crate::fts::FtsStore;
 use crate::index::{IndexManager, SharedStores};
 use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_RRF_K};
 use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
+use crate::symbols::SymbolIndexerRegistry;
 use crate::vectordb::VectorStore;
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -2329,8 +2389,7 @@ impl ServerHandler for McpProxyService {
                     Ok(r) => return Ok(r),
                     Err(e) => {
                         let msg = e.to_string();
-                        if !is_transport_error_msg(&msg)
-                            || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
+                        if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
                         {
                             return Err(McpError::internal_error(msg, None));
                         }
@@ -2378,8 +2437,7 @@ impl ServerHandler for McpProxyService {
                     Ok(r) => return Ok(r),
                     Err(e) => {
                         let msg = e.to_string();
-                        if !is_transport_error_msg(&msg)
-                            || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
+                        if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
                         {
                             return Err(McpError::internal_error(msg, None));
                         }
@@ -2445,6 +2503,26 @@ fn read_model_metadata(db_path: &Path) -> (String, usize) {
     )
 }
 
+/// Read chunk/file counts from metadata.json (written after each indexing operation).
+/// Returns `(total_chunks, total_files)` defaulting to `(0, 0)`.
+fn read_metadata_stats(db_path: &Path) -> (usize, usize) {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = std::fs::read_to_string(&metadata_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            let total_chunks = json
+                .get("total_chunks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let total_files = json
+                .get("total_files")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            return (total_chunks, total_files);
+        }
+    }
+    (0, 0)
+}
+
 /// RRF score threshold below which results are considered low-confidence.
 /// When the top result's RRF score falls below this, the response includes
 /// a `low_confidence` flag and a `suggested_tool` hint.
@@ -2476,6 +2554,10 @@ pub struct CodesearchService {
     shared_stores: Option<Arc<SharedStores>>,
     // Serve-mode state (set when running inside `codesearch serve`)
     serve_state: Option<Arc<crate::serve::ServeState>>,
+    // Shared symbol indexer registry — reused across MCP sessions to preserve
+    // helper-detection cache. In serve mode, cloned from ServeState; in
+    // standalone mode, a locally owned Arc.
+    symbol_registry: Arc<SymbolIndexerRegistry>,
 }
 
 impl std::fmt::Debug for CodesearchService {
@@ -2947,6 +3029,83 @@ fn regex_has_anchorable_token(pattern: &str) -> bool {
     false
 }
 
+/// Extracts a clean BM25 query string from a regex pattern.
+///
+/// When `regex=true` and the BM25 path is used, we can't pass the raw regex
+/// (e.g. `class \w+Cache\b`) to Tantivy — it tokenizes poorly on backslashes
+/// and metacharacters, producing useless candidates. Instead, this function
+/// extracts only the literal alphanumeric runs from the pattern and joins them
+/// with spaces, producing a clean BM25 query (e.g. `class Cache`).
+///
+/// The regex post-filter (`match_line_for_literal`) then correctly filters
+/// the BM25 candidates against the actual regex pattern.
+fn extract_bm25_query_from_regex(pattern: &str) -> String {
+    let mut tokens: Vec<&str> = Vec::new();
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    let mut run_start: Option<usize> = None;
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // Skip escaped characters (\w, \b, \d, etc.)
+        if c == '\\' && i + 1 < bytes.len() {
+            if run_start.is_some() {
+                let token = &pattern[run_start.unwrap()..i];
+                if token.len() >= 2 {
+                    tokens.push(token);
+                }
+                run_start = None;
+            }
+            i += 2;
+            continue;
+        }
+        // Skip character classes [abc]
+        if c == '[' {
+            if run_start.is_some() {
+                let token = &pattern[run_start.unwrap()..i];
+                if token.len() >= 2 {
+                    tokens.push(token);
+                }
+                run_start = None;
+            }
+            let mut j = i + 1;
+            while j < bytes.len() {
+                let cj = bytes[j] as char;
+                if cj == '\\' && j + 1 < bytes.len() {
+                    j += 2;
+                    continue;
+                }
+                if cj == ']' {
+                    break;
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+        } else if run_start.is_some() {
+            let token = &pattern[run_start.unwrap()..i];
+            if token.len() >= 2 {
+                tokens.push(token);
+            }
+            run_start = None;
+        }
+        i += 1;
+    }
+    // Flush trailing run
+    if let Some(start) = run_start {
+        let token = &pattern[start..];
+        if token.len() >= 2 {
+            tokens.push(token);
+        }
+    }
+    tokens.join(" ")
+}
+
 /// Returns true when a regex pattern contains a top-level alternation (`|`)
 /// that is NOT inside a group `(...)` or character class `[...]`.
 ///
@@ -2986,11 +3145,7 @@ fn regex_has_disjunctive_or(pattern: &str) -> bool {
             ')' => {
                 depth_paren = depth_paren.saturating_sub(1);
             }
-            '|' => {
-                if depth_paren == 0 {
-                    return true;
-                }
-            }
+            '|' => return depth_paren == 0,
             _ => {}
         }
         i += 1;
@@ -3289,6 +3444,7 @@ impl CodesearchService {
             embedding_service: Mutex::new(None),
             shared_stores,
             serve_state: None,
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
 
@@ -3297,6 +3453,7 @@ impl CodesearchService {
     /// In serve mode, the service does not have a single local DB; instead
     /// it routes requests to the repo identified by `project`/`group`.
     pub(crate) fn new_for_serve(serve_state: Arc<crate::serve::ServeState>) -> Result<Self> {
+        let symbol_registry = serve_state.symbol_registry();
         Ok(Self {
             tool_router: Self::tool_router(),
             db_path: PathBuf::from("serve://multi-repo"),
@@ -3306,6 +3463,7 @@ impl CodesearchService {
             embedding_service: Mutex::new(None),
             shared_stores: None,
             serve_state: Some(serve_state),
+            symbol_registry,
         })
     }
 
@@ -3391,9 +3549,18 @@ impl CodesearchService {
         }
 
         // Must have serve_state to route
-        let serve_state = self.serve_state.as_ref().ok_or_else(|| {
-            "project/group routing requires `codesearch serve` to be running.".to_string()
-        })?;
+        let serve_state = match self.serve_state.as_ref() {
+            Some(ss) => ss,
+            None => {
+                // Local/stdio mode: only one DB available, project/group are meaningless.
+                // Fall through to local DB instead of erroring.
+                tracing::warn!(
+                    "MCP: project/group ignored in local mode (no serve running). \
+                     Using local database."
+                );
+                return Ok(None);
+            }
+        };
 
         // Validate params
         types::validate_project_group(project, group, true)?;
@@ -3553,14 +3720,22 @@ impl CodesearchService {
             match action(&store) {
                 Ok(result) => return Ok(result),
                 Err(shared_err) => {
-                    tracing::error!(
-                        "Shared vector store read failed, falling back to standalone open: {:?}",
-                        shared_err
-                    );
+                    tracing::error!("Shared vector store read failed: {:?}", shared_err);
+
+                    // In serve mode, do NOT fall back to a standalone VectorStore —
+                    // it would open a second LMDB handle on the same .codesearch.db,
+                    // which LMDB rejects ("environment already opened with different options").
+                    if self.serve_state.is_some() {
+                        return Err(shared_err.context(
+                            "Shared vector store read failed in serve mode; \
+                             standalone fallback disabled to prevent LMDB double-open",
+                        ));
+                    }
                 }
             }
 
-            // If MCP is in readonly mode, fallback must also use readonly open.
+            // Standalone readonly fallback (non-serve mode only).
+            // In serve mode the guard above already returned.
             if stores.readonly {
                 let ro_store = VectorStore::open_readonly(&self.db_path, self.dimensions)
                     .context("Error opening readonly database for read fallback")?;
@@ -3569,9 +3744,8 @@ impl CodesearchService {
             }
         }
 
-        // Fallback path:
-        // - when shared stores are not available, OR
-        // - when shared read fails (e.g., transient readonly/shared handle issues)
+        // Standalone fallback (non-serve mode only — CLI / stdio MCP).
+        // In serve mode, either Priority 1/2 succeeded or the guard above returned Err.
         let store = VectorStore::new(&self.db_path, self.dimensions)
             .context("Error opening database for read fallback")?;
         action(&store).context("Error reading from vector store")
@@ -5012,6 +5186,69 @@ impl CodesearchService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
+    /// Fetch outline items for an already-normalised absolute path.
+    ///
+    /// Returns `Ok(vec![])` when no chunks match.
+    /// In multi-store mode, per-store I/O failures are logged and skipped (never `Err`).
+    /// In single-store mode, I/O failures are returned as `Err`.
+    async fn outline_items_for_normalized(
+        &self,
+        normalized: &str,
+        ctx: &MultiStoreContext,
+    ) -> anyhow::Result<Vec<FileOutlineItem>> {
+        if let Some(ref sv) = ctx.stores_vec {
+            let mut all_items: Vec<FileOutlineItem> = Vec::new();
+            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for store_arc in sv {
+                let store = store_arc.vector_store.read().await;
+                match store.chunks_for_file(normalized) {
+                    Ok(metas) => {
+                        for c in metas {
+                            if seen_ids.insert(c.id) {
+                                all_items.push(FileOutlineItem {
+                                    chunk_id: c.id,
+                                    kind: c.kind,
+                                    signature: c.signature,
+                                    start_line: c.start_line,
+                                    end_line: c.end_line,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Vector store read failed in outline_items_for_normalized fan-out: {:?}",
+                            e
+                        );
+                    }
+                }
+            }
+            all_items.sort_by_key(|i| i.start_line);
+            Ok(all_items)
+        } else {
+            let normalized_owned = normalized.to_string();
+            self.with_vector_store_read_for(
+                move |store| {
+                    let mut out: Vec<FileOutlineItem> = store
+                        .chunks_for_file(&normalized_owned)?
+                        .into_iter()
+                        .map(|c| FileOutlineItem {
+                            chunk_id: c.id,
+                            kind: c.kind,
+                            signature: c.signature,
+                            start_line: c.start_line,
+                            end_line: c.end_line,
+                        })
+                        .collect();
+                    out.sort_by_key(|i| i.start_line);
+                    Ok(out)
+                },
+                ctx.stores.clone(),
+            )
+            .await
+        }
+    }
+
     async fn file_outline(
         &self,
         Parameters(request): Parameters<FileOutlineRequest>,
@@ -5054,64 +5291,45 @@ impl CodesearchService {
         let stripped_path = strip_alias_prefix(&request.path, ctx.project_alias.as_ref());
         let normalized = normalize_tool_path(&stripped_path, &project_root);
 
-        let items = if let Some(ref sv) = ctx.stores_vec {
-            // Multi-store group fan-out: collect outline items from all stores
-            let mut all_items: Vec<FileOutlineItem> = Vec::new();
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for store_arc in sv {
-                let store = store_arc.vector_store.read().await;
-                match store.chunks_for_file(&normalized) {
-                    Ok(metas) => {
-                        for c in metas {
-                            if seen_ids.insert(c.id) {
-                                all_items.push(FileOutlineItem {
-                                    chunk_id: c.id,
-                                    kind: c.kind,
-                                    signature: c.signature,
-                                    start_line: c.start_line,
-                                    end_line: c.end_line,
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Vector store read failed in file_outline fan-out: {:?}", e);
-                    }
-                }
-            }
-            all_items.sort_by_key(|i| i.start_line);
-            all_items
-        } else {
-            match self
-                .with_vector_store_read_for(
-                    |store| {
-                        let mut out: Vec<FileOutlineItem> = store
-                            .chunks_for_file(&normalized)?
-                            .into_iter()
-                            .map(|c| FileOutlineItem {
-                                chunk_id: c.id,
-                                kind: c.kind,
-                                signature: c.signature,
-                                start_line: c.start_line,
-                                end_line: c.end_line,
-                            })
-                            .collect();
-                        out.sort_by_key(|i| i.start_line);
-                        Ok(out)
-                    },
-                    ctx.stores.clone(),
-                )
-                .await
-            {
-                Ok(items) => items,
-                Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error reading outline: {}",
-                        e
-                    ))]));
-                }
+        let mut items = match self.outline_items_for_normalized(&normalized, &ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error reading outline: {}",
+                    e
+                ))]));
             }
         };
+
+        // Two-pass fallback: if alias-stripping changed the path and yielded no results,
+        // try the original un-stripped path. Handles the case where the project alias
+        // matches a package subdirectory name (e.g. project "my_pkg" with target
+        // "my_pkg/config.py" → after strip becomes "config.py" which is wrong;
+        // the correct relative path is "my_pkg/config.py").
+        if items.is_empty() && stripped_path != request.path {
+            let normalized_orig = normalize_tool_path(&request.path, &project_root);
+            if normalized_orig != normalized {
+                tracing::debug!(
+                    "file_outline: primary '{}' empty, trying fallback '{}'",
+                    normalized,
+                    normalized_orig
+                );
+                items = match self
+                    .outline_items_for_normalized(&normalized_orig, &ctx)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            "file_outline: fallback '{}' also failed: {:?}",
+                            normalized_orig,
+                            e
+                        );
+                        Vec::new()
+                    }
+                };
+            }
+        }
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -5135,7 +5353,22 @@ impl CodesearchService {
             request.chunk_id,
             request.project,
         );
-        // Resolve project/group routing — allow unscoped for smart candidate detection
+
+        // In multi-repo serve mode, require explicit project or group scope.
+        // Unscoped get_chunk would fan-out over all repos, opening all DBs unnecessarily.
+        // Consistent with search/find/explore which also require scope.
+        if request.project.is_none() && request.group.is_none() {
+            if let Some(ref serve_state) = self.serve_state {
+                let config = serve_state.config_snapshot();
+                if config.repos.len() > 1 {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        self.format_scope_error(),
+                    )]));
+                }
+            }
+        }
+
+        // Resolve project/group routing — allow unscoped only for single-repo mode
         let ctx = match self
             .resolve_routing(&request.project, &request.group, true, "get_chunk")
             .await
@@ -5300,6 +5533,193 @@ impl CodesearchService {
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
+    ///
+    /// Uses language-specific semantic analysis (SCIP) to find all references to a symbol,
+    /// enabling agents to plan refactors with IDE-class accuracy instead of text-matching
+    /// grep heuristics. Currently supports C# only; architecture is language-agnostic.
+    #[tool(
+        description = "Symbol impact analysis — find all references to a symbol using language-specific semantic analysis (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors with IDE-class accuracy.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nCurrently supports C# only. Requires the `scip-csharp` helper to be installed (bundled in `-with-csharp` release variants).\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+    )]
+    async fn find_impact(
+        &self,
+        Parameters(request): Parameters<FindImpactRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            "📥 find_impact(symbol_name={:?}, file={:?}, line={:?}, language={:?}, project={:?})",
+            request.symbol_name,
+            request.file,
+            request.line,
+            request.language,
+            request.project,
+        );
+
+        // Validate input: must provide either symbol_name or file+line
+        let has_name = request
+            .symbol_name
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_position = request.file.is_some() && request.line.is_some();
+        if !has_name && !has_position {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Must provide either `symbol_name` or both `file` and `line` for position-based lookup.".to_string(),
+            )]));
+        }
+
+        // Resolve project/group routing
+        let ctx = match self
+            .resolve_routing(&request.project, &request.group, false, "find_impact")
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+        };
+
+        // Determine project root and db_path for the symbol index
+        let (project_root, db_path) = if let Some(ref alias) = ctx.project_alias {
+            let root = ctx
+                .alias_roots
+                .get(alias)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.project_path.clone());
+            // The symbol index DB lives alongside the vector DB
+            let db = root.join(crate::constants::DB_DIR_NAME);
+            (root, db)
+        } else {
+            // Single-repo / stdio mode: use the service's own paths
+            (self.project_path.clone(), self.db_path.clone())
+        };
+
+        // Use the shared symbol indexer registry
+        let registry = &self.symbol_registry;
+
+        // Determine which language to use
+        let language = request.language.clone().or_else(|| {
+            // Auto-detect from file extension
+            request.file.as_ref().and_then(|f| {
+                let ext = Path::new(f).extension()?.to_str()?.to_lowercase();
+                match ext.as_str() {
+                    "cs" => Some(crate::constants::LANG_CSHARP.to_string()),
+                    _ => None,
+                }
+            })
+        });
+
+        let indexer: &dyn crate::symbols::SymbolIndexer = match language {
+            Some(ref lang) => match registry.get(lang) {
+                Some(i) => i,
+                None => {
+                    let available = registry.available_languages();
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "No symbol indexer for language '{}'. Available languages: {:?}",
+                        lang, available
+                    ))]));
+                }
+            },
+            None => {
+                // No language specified and couldn't auto-detect — try all installed
+                let installed = registry.installed_languages();
+                if installed.is_empty() {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        "No symbol indexers installed. Install the `scip-csharp` helper for C# support.".to_string(),
+                    )]));
+                }
+                // Use the first installed language (MVP: only C#)
+                match registry.get(&installed[0]) {
+                    Some(i) => i,
+                    None => {
+                        unreachable!("installed_languages() returned a language with no indexer")
+                    }
+                }
+            }
+        };
+
+        // Check if the helper is available
+        if !indexer.is_available() {
+            let error = crate::symbols::SymbolIndexError {
+                error: format!(
+                    "Symbol indexer for '{}' is not available. The helper binary is not installed.",
+                    indexer.language()
+                ),
+                available_languages: registry.available_languages(),
+                hint_for_agent: format!(
+                    "Install the `-with-csharp` release variant, or set {} to the helper path.",
+                    crate::constants::SCIP_CSHARP_HELPER_ENV
+                ),
+            };
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string(&error).unwrap_or_else(|_| error.error.clone()),
+            )]));
+        }
+
+        // Perform the lookup.
+        //
+        // `find_references` may invoke `scip-csharp find-refs` on a cache miss
+        // (lazy Opt-2 reference resolution). That subprocess can take several minutes
+        // on a large solution, so we use `block_in_place` to avoid blocking the async
+        // executor thread. `block_in_place` is safe here: we are inside a
+        // multi-threaded tokio runtime and do not hold any async locks.
+        let file_for_pos = if !has_name {
+            Some(self.normalize_symbol_query_path(
+                &project_root,
+                Path::new(request.file.as_ref().unwrap()),
+            ))
+        } else {
+            None
+        };
+        let symbol_name_for_lookup = request.symbol_name.clone();
+        let line_for_lookup = request.line;
+        let result = tokio::task::block_in_place(|| {
+            if has_name {
+                indexer.find_references(&db_path, symbol_name_for_lookup.as_ref().unwrap())
+            } else {
+                indexer.find_references_by_position(
+                    &db_path,
+                    &file_for_pos.unwrap(),
+                    line_for_lookup.unwrap(),
+                )
+            }
+        });
+
+        match result {
+            Ok(references) => {
+                let age = indexer.index_age(&db_path);
+                let impact = crate::symbols::FindImpactResult {
+                    symbol: request.symbol_name.clone().unwrap_or_else(|| {
+                        format!(
+                            "{}:{}",
+                            request.file.as_deref().unwrap_or("?"),
+                            request.line.unwrap_or(0)
+                        )
+                    }),
+                    references,
+                    index_age_seconds: age,
+                    language: indexer.language().to_string(),
+                    scope: ctx
+                        .project_alias
+                        .map(|a| format!("project:{}", a))
+                        .unwrap_or_else(|| "local".to_string()),
+                };
+                let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Symbol lookup failed: {}",
+                e
+            ))])),
+        }
+    }
+
+    fn normalize_symbol_query_path(&self, project_root: &Path, file: &Path) -> PathBuf {
+        if file.is_absolute() {
+            if let Ok(relative) = file.strip_prefix(project_root) {
+                return PathBuf::from(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+
+        PathBuf::from(file.to_string_lossy().replace('\\', "/"))
     }
 
     async fn find_imports(
@@ -6041,14 +6461,27 @@ impl CodesearchService {
             // Note: regex=true uses BM25 for candidates, then post-filters with the
             // actual regex on raw content (Tantivy's RegexQuery only works on individual
             // tokens, not raw text — underscores/punctuation cause empty results).
+            //
+            // When regex is enabled, strip metacharacters from the BM25 query so
+            // Tantivy gets clean tokens (e.g. "class Cache" instead of "class \w+Cache\b").
+            let bm25_query = if regex_enabled {
+                let cleaned = extract_bm25_query_from_regex(&effective_query);
+                if cleaned.is_empty() {
+                    effective_query.clone()
+                } else {
+                    cleaned
+                }
+            } else {
+                effective_query.clone()
+            };
             let fts_results = if let Some(ref sv) = ctx.stores_vec {
                 let sa = ctx.store_aliases.as_ref().unwrap();
                 self.with_fts_store_read_multi(
                     |fts_store| {
                         if request.phrase.unwrap_or(false) {
-                            fts_store.search_phrase(&effective_query, limit * 3)
+                            fts_store.search_phrase(&bm25_query, limit * 3)
                         } else {
-                            fts_store.search(&effective_query, limit * 3, None)
+                            fts_store.search(&bm25_query, limit * 3, None)
                         }
                     },
                     sv.clone(),
@@ -6061,9 +6494,9 @@ impl CodesearchService {
                     .with_fts_store_read_for(
                         |fts_store| {
                             if request.phrase.unwrap_or(false) {
-                                fts_store.search_phrase(&effective_query, limit * 3)
+                                fts_store.search_phrase(&bm25_query, limit * 3)
                             } else {
-                                fts_store.search(&effective_query, limit * 3, None)
+                                fts_store.search(&bm25_query, limit * 3, None)
                             }
                         },
                         ctx.stores.clone(),
@@ -6553,13 +6986,14 @@ impl CodesearchService {
                             ),
                         }
                     } else {
-                        // Repo NOT opened — use metadata only, no DB open
+                        // Repo NOT opened — read persisted stats from metadata.json
+                        let (md_chunks, md_files) = read_metadata_stats(&db_path);
                         let lock_status = if crate::index::is_database_locked(&db_path) {
                             "locked-externally".to_string()
                         } else {
                             "available".to_string()
                         };
-                        (0, 0, model_name, lock_status)
+                        (md_chunks, md_files, model_name, lock_status)
                     }
                 } else {
                     (0, 0, "not indexed".to_string(), "unknown".to_string())
@@ -6758,22 +7192,32 @@ impl ServerHandler for CodesearchService {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("codesearch", env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                r#"codesearch — semantic + lexical code search MCP server.
+                r#"codesearch — semantic code search + symbol impact analysis.
 
-TOOLS:
-| Tool          | Use for                                              |
-|---------------|------------------------------------------------------|
-| search        | Code search: `mode="semantic"` (default) or `mode="literal"` |
-| find          | Symbol navigation: `kind="definition"` (default), `"usages"`, `"imports"`, `"dependents"` |
-| explore       | File exploration: `kind="outline"` (default) or `"similar"` |
-| get_chunk     | Read full chunk content by chunk_id                  |
-| status        | Index/project info: `kind="index"` (default) or `"projects"` |
+PICK THE RIGHT TOOL FOR THE TASK:
+  "who calls X?" / "what breaks if I rename X?" / "find all refs"
+    → find_impact (file/line-precise, transitive callers, C# via SCIP)
+  "find code about X" / "how does X work" / "show me X"
+    → search(mode="semantic") — understands concepts + synonyms + identifiers
+  exact syntax like Vec<T> / foo = null / a::b
+    → search(mode="literal", regex=true) — ONLY for patterns semantic can't match
+  "where is X defined?" / "what does file X import?"
+    → find(kind="definition" | "imports")
+  "show all symbols in file X" / "code like chunk Y"
+    → explore(kind="outline" | "similar")
+  read chunk content → get_chunk(chunk_id)
+  index health / repo list → status
 
-Indexing is done via CLI: `codesearch index`. The MCP server cannot index.
+RULES:
+  - search(semantic) is the DEFAULT for code lookup. Don't skip it.
+  - find_impact BEFORE search when the task is about renaming/removing a specific symbol.
+  - find_impact > find(kind="usages") — it returns transitive callers, not just direct refs.
+  - NEVER use literal as first search unless you need exact syntax patterns.
+  - project or group is REQUIRED in multi-repo mode.
 
 Mode: {mode}
-Current project: {project}
-Current database: {db} ({exists})
+Project: {project}
+Database: {db} ({exists})
 Model: {model} ({dims}d)
 "#,
                 mode = mode,
@@ -7290,7 +7734,10 @@ pub async fn run_mcp_server(
 
                     // Step 2: AFTER refresh completes, start file watcher (also writes to stores)
                     tracing::info!("👀 Starting file watcher...");
-                    if let Err(e) = index_manager_arc.start_file_watcher(bg_cancel_token).await {
+                    if let Err(e) = index_manager_arc
+                        .start_file_watcher(bg_cancel_token, None, None)
+                        .await
+                    {
                         tracing::error!("❌ Failed to start file watcher: {}", e);
                     } else {
                         tracing::info!(

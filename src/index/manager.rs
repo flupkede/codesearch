@@ -16,9 +16,13 @@
 #![allow(dead_code)]
 
 use crate::cache::{normalize_path, normalize_path_str};
-use crate::constants::{DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, WRITER_LOCK_FILE};
+use crate::constants::{
+    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, SCIP_CSHARP_DEBOUNCE_MS,
+    WRITER_LOCK_FILE,
+};
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
+use crate::symbols::{RebuildScope, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
 use crate::watch::{FileEvent, FileWatcher, GitHeadWatcher};
 use std::collections::HashSet;
@@ -31,6 +35,24 @@ use tracing::{debug, error, info, warn};
 
 // Import Result from the parent module
 use super::Result;
+
+/// Callback invoked after each watcher-triggered C# symbol rebuild completes.
+///
+/// Arguments: `(success: bool, error_msg: Option<String>)`.
+/// - `(true, None)` on success.
+/// - `(false, Some(msg))` on failure.
+///
+/// The serve layer uses this to update `csharp_index_status` / `csharp_index_error`
+/// without coupling `IndexManager` to `ServeState`.
+pub type CSharpRebuildNotifier = Arc<dyn Fn(bool, Option<String>) + Send + Sync>;
+
+/// Callback to notify the serve layer that text/vector indexing is active or idle.
+///
+/// Arguments: `(active: bool)` — `true` when indexing starts, `false` when it completes.
+///
+/// The serve layer uses this to update `active_reindexes` so the TUI shows "Indexing"
+/// during file-watcher-triggered refreshes (branch changes, batch flushes).
+pub type IndexingStatusCallback = Arc<dyn Fn(bool) + Send + Sync>;
 
 /// Batch flush timeout in milliseconds.
 /// Events are batched and flushed when:
@@ -82,6 +104,23 @@ pub fn is_database_locked(db_path: &Path) -> bool {
 /// Returns `None` if the lock is already held by another process.
 pub fn acquire_writer_lock(db_path: &Path) -> Option<File> {
     use fs2::FileExt;
+
+    // Ensure the database directory exists before placing the lock file inside it.
+    // For a brand-new repo (e.g. auto-register via POST /repos) the `.codesearch.db`
+    // directory does not exist yet. Without this, opening the lock file below fails
+    // with "path not found", which we'd misreport to the caller as
+    // "Database is locked by another process" — causing a spurious 500 on register.
+    // (SharedStores::new also creates this directory so it can surface genuine I/O
+    // errors distinctly; this call keeps acquire_writer_lock correct for any other
+    // caller. create_dir_all is idempotent, so the duplication is harmless.)
+    if let Err(e) = std::fs::create_dir_all(db_path) {
+        warn!(
+            "Failed to create database directory {}: {}",
+            db_path.display(),
+            e
+        );
+        return None;
+    }
 
     let lock_path = db_path.join(WRITER_LOCK_FILE);
 
@@ -144,6 +183,17 @@ impl SharedStores {
     /// This acquires a writer lock. If another process already has the lock,
     /// this will fail with an error.
     pub fn new(db_path: &Path, dimensions: usize) -> Result<Self> {
+        use anyhow::Context;
+
+        // Ensure the database directory exists first, propagating any genuine I/O
+        // error (e.g. permission denied) as itself. `acquire_writer_lock` also
+        // creates the directory defensively, but doing it here lets us distinguish
+        // a real filesystem failure from a held lock: after this succeeds, a `None`
+        // from `acquire_writer_lock` unambiguously means "locked by another process".
+        std::fs::create_dir_all(db_path).with_context(|| {
+            format!("Failed to create database directory {}", db_path.display())
+        })?;
+
         // Try to acquire writer lock
         let lock = acquire_writer_lock(db_path);
         if lock.is_none() {
@@ -229,6 +279,8 @@ pub struct IndexManager {
     git_head_watcher: Option<GitHeadWatcher>,
     /// Shared stores for concurrent access
     stores: Arc<SharedStores>,
+    /// Per-language symbol indexer registry (C# etc.)
+    symbol_registry: Arc<SymbolIndexerRegistry>,
 }
 
 impl IndexManager {
@@ -294,6 +346,7 @@ impl IndexManager {
             watcher,
             git_head_watcher: Some(git_head_watcher),
             stores,
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
 
@@ -389,6 +442,7 @@ impl IndexManager {
             watcher,
             git_head_watcher: Some(git_head_watcher),
             stores,
+            symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
 
@@ -430,9 +484,40 @@ impl IndexManager {
         // Load FileMetaStore
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, &model_name, dimensions)?;
 
-        // Walk files
-        let walker = FileWalker::new(codebase_path.to_path_buf());
-        let (files, _stats) = walker.walk()?;
+        // B1 safety guard: if FileMetaStore is empty but VectorStore has chunks,
+        // the metadata was lost/reset (model change, corrupt file, etc.).
+        // Re-indexing without clearing would create duplicate chunks.
+        if file_meta_store.is_empty() {
+            let vs_chunks = {
+                let vs = stores.vector_store.read().await;
+                vs.stats().map(|s| s.total_chunks).unwrap_or(0)
+            };
+            if vs_chunks > 0 {
+                warn!(
+                    "⚠️  FileMetaStore is empty but VectorStore has {} chunks — \
+                     clearing stores to prevent duplicates (metadata was likely lost/reset)",
+                    vs_chunks
+                );
+                {
+                    let mut vstore = stores.vector_store.write().await;
+                    vstore.clear()?;
+                }
+                {
+                    let mut fts = stores.fts_store.write().await;
+                    fts.clear()?;
+                }
+            }
+        }
+
+        // Walk files.
+        //
+        // `FileWalker::walk()` is synchronous and I/O-heavy (recursive directory
+        // traversal). Offload it to `spawn_blocking` so it does not block tokio
+        // worker threads during warmup.
+        let codebase = codebase_path.to_path_buf();
+        let (files, _stats) = tokio::task::spawn_blocking(move || FileWalker::new(codebase).walk())
+            .await
+            .map_err(|e| anyhow::anyhow!("file walk task panicked: {}", e))??;
 
         // Find changed and deleted files
         let mut changed_files = Vec::new();
@@ -522,35 +607,59 @@ impl IndexManager {
         if !changed_files.is_empty() {
             info!("🔄 Processing {} changed files...", changed_files.len());
 
-            let mut chunker = SemanticChunker::new(100, 2000, 10);
-            let mut all_chunks = Vec::new();
+            // Read + chunk + embed is synchronous, CPU/I/O-heavy work
+            // (file reads, tree-sitter parsing, fastembed/ONNX inference that
+            // saturates all cores). Offload the whole block to `spawn_blocking`
+            // so it never runs on a tokio worker thread. The `EmbeddingService`
+            // and `SemanticChunker` are built inside the closure because they
+            // are not needed on the async side and may not be `Send`.
+            let cache_dir = crate::constants::get_global_models_cache_dir()?;
+            let files_for_embed = changed_files.clone();
+            let embedded_chunks =
+                tokio::task::spawn_blocking(move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
+                    let mut chunker = SemanticChunker::new(100, 2000, 10);
+                    let mut all_chunks = Vec::new();
 
-            for file in &changed_files {
-                let content = match std::fs::read_to_string(&file.path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let chunks = chunker.chunk_semantic(file.language, &file.path, &content)?;
-                all_chunks.extend(chunks);
-            }
+                    for file in &files_for_embed {
+                        let content = match std::fs::read_to_string(&file.path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        let chunks = chunker.chunk_semantic(file.language, &file.path, &content)?;
+                        all_chunks.extend(chunks);
+                    }
 
-            if !all_chunks.is_empty() {
-                // Embed chunks
-                info!("📦 Embedding {} chunks...", all_chunks.len());
-                let cache_dir = crate::constants::get_global_models_cache_dir()?;
-                let mut embedding_service = EmbeddingService::with_cache_dir(
-                    ModelType::default(),
-                    Some(cache_dir.as_path()),
-                )?;
-                let embedded_chunks = embedding_service.embed_chunks(all_chunks)?;
+                    if all_chunks.is_empty() {
+                        return Ok(Vec::new());
+                    }
 
-                // Insert into vector store
+                    info!("📦 Embedding {} chunks...", all_chunks.len());
+                    let mut embedding_service = EmbeddingService::with_cache_dir(
+                        ModelType::default(),
+                        Some(cache_dir.as_path()),
+                    )?;
+                    embedding_service.embed_chunks(all_chunks)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("chunk+embed task panicked: {}", e))??;
+
+            if !embedded_chunks.is_empty() {
+                // Insert into vector store. The HNSW `build_index()` is CPU-heavy,
+                // so it is offloaded to `spawn_blocking`; the insert itself needs
+                // the async RwLock and stays here.
                 let chunk_ids = {
                     let mut store = stores.vector_store.write().await;
-                    let ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
-                    store.build_index()?;
-                    ids
+                    store.insert_chunks_with_ids(embedded_chunks.clone())?
                 };
+                {
+                    let vector_store = Arc::clone(&stores.vector_store);
+                    tokio::task::spawn_blocking(move || {
+                        let mut store = vector_store.blocking_write();
+                        store.build_index()
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
+                }
 
                 // Insert into FTS
                 {
@@ -609,7 +718,9 @@ impl IndexManager {
         // Track changes for dashboard/TUI
         let total_changes = (changed_files.len() + deleted_files.len()) as u64;
         if total_changes > 0 {
-            stores.changes_count.fetch_add(total_changes, std::sync::atomic::Ordering::Relaxed);
+            stores
+                .changes_count
+                .fetch_add(total_changes, std::sync::atomic::Ordering::Relaxed);
         }
 
         let elapsed = start.elapsed();
@@ -617,6 +728,14 @@ impl IndexManager {
             "✅ Incremental refresh completed in {:.2}s",
             elapsed.as_secs_f64()
         );
+
+        // Persist chunk/file counts in metadata.json for status(projects)
+        {
+            let vs = stores.vector_store.read().await;
+            if let Ok(stats) = vs.stats() {
+                super::update_metadata_stats(db_path, stats.total_chunks, stats.total_files);
+            }
+        }
 
         Ok(())
     }
@@ -694,9 +813,8 @@ impl IndexManager {
         // Write back the preserved metadata (with updated timestamp).
         {
             let mut metadata_to_write = preserved_metadata.clone();
-            metadata_to_write["indexed_at"] = serde_json::Value::String(
-                chrono::Utc::now().to_rfc3339(),
-            );
+            metadata_to_write["indexed_at"] =
+                serde_json::Value::String(chrono::Utc::now().to_rfc3339());
             std::fs::write(
                 &metadata_path,
                 serde_json::to_string_pretty(&metadata_to_write)?,
@@ -730,7 +848,15 @@ impl IndexManager {
     /// Spawns a background task that watches for file changes and refreshes the index.
     ///
     /// # Arguments
-    /// * `cancel_token` - Cancellation token for graceful shutdown
+    /// * `cancel_token` — Cancellation token for graceful shutdown.
+    /// * `csharp_notifier` — Optional callback invoked after each watcher-triggered C# symbol
+    ///   rebuild. Pass `Some(notifier)` from the serve layer to propagate rebuild outcomes to the
+    ///   TUI (`csharp_index_status` / `csharp_index_error`). `None` is valid for standalone /
+    ///   test use where no TUI status tracking is needed.
+    /// * `indexing_status_cb` — Optional callback invoked with `true` when text/vector indexing
+    ///   starts and `false` when it completes. The serve layer uses this to update
+    ///   `active_reindexes` so the TUI shows "Indexing" during watcher-triggered refreshes.
+    ///   `None` is valid for standalone/test use.
     ///
     /// # Returns
     /// * `Result<()>` - Success or error
@@ -743,12 +869,19 @@ impl IndexManager {
     /// - Logs all file system events and refresh operations
     /// - Continues running even if individual refresh operations fail
     /// - Stops gracefully when the cancellation token is cancelled
-    pub async fn start_file_watcher(&self, cancel_token: CancellationToken) -> Result<()> {
+    pub async fn start_file_watcher(
+        &self,
+        cancel_token: CancellationToken,
+        csharp_notifier: Option<CSharpRebuildNotifier>,
+        indexing_status_cb: Option<IndexingStatusCallback>,
+    ) -> Result<()> {
         let path = self.codebase_path.clone();
         let db_path = self.db_path.clone();
         let watcher = self.watcher.clone();
         let stores = self.stores.clone();
         let git_head_watcher = self.git_head_watcher.clone();
+        let symbol_registry = self.symbol_registry.clone();
+        let indexing_cb = indexing_status_cb.clone();
 
         info!("🚀 Starting background file watcher...");
 
@@ -775,6 +908,17 @@ impl IndexManager {
             let mut last_event_time = std::time::Instant::now();
             let flush_duration = std::time::Duration::from_millis(FSW_BATCH_FLUSH_MS);
 
+            // Symbol indexer debounce: .cs files are buffered separately and
+            // flushed after SCIP_CSHARP_DEBOUNCE_MS of quiet time.
+            // `cs_files_modified` — files that were added or changed (included in changed).
+            // `cs_files_deleted` — files that were deleted; must be passed explicitly to the
+            // incremental rebuild so their LMDB entries are purged even though they're absent
+            // from the new scip-csharp output.
+            let mut cs_files_modified: HashSet<PathBuf> = HashSet::new();
+            let mut cs_files_deleted: HashSet<PathBuf> = HashSet::new();
+            let mut cs_last_event_time: Option<std::time::Instant> = None;
+            let cs_debounce = std::time::Duration::from_millis(SCIP_CSHARP_DEBOUNCE_MS);
+
             loop {
                 // Check if shutdown was requested
                 if cancel_token.is_cancelled() {
@@ -787,6 +931,10 @@ impl IndexManager {
                     if let Ok(branch_changed) = watcher.check().await {
                         if branch_changed.is_some() {
                             info!("🔀 Git branch changed, triggering full incremental refresh...");
+                            // Notify serve layer: indexing active
+                            if let Some(ref cb) = indexing_cb {
+                                cb(true);
+                            }
                             // Perform a real incremental refresh: walk filesystem,
                             // detect changed/deleted files, clean stale chunks, re-index
                             if let Err(e) =
@@ -794,10 +942,17 @@ impl IndexManager {
                             {
                                 error!("❌ Branch change refresh failed: {}", e);
                             }
+                            // Notify serve layer: indexing idle
+                            if let Some(ref cb) = indexing_cb {
+                                cb(false);
+                            }
                             // Clear any buffered file events that arrived during the
                             // branch switch — the full refresh already handled everything
                             files_to_index.clear();
                             files_to_remove.clear();
+                            cs_files_modified.clear();
+                            cs_files_deleted.clear();
+                            cs_last_event_time = None;
                         }
                     }
                 }
@@ -830,19 +985,50 @@ impl IndexManager {
                             FileEvent::Modified(p) => {
                                 // If file was marked for removal, cancel that
                                 files_to_remove.remove(&p);
-                                files_to_index.insert(p);
+                                files_to_index.insert(p.clone());
+                                // Track .cs file modifications for symbol rebuild debounce
+                                if p.extension().and_then(|e| e.to_str()) == Some("cs") {
+                                    // If previously queued as deleted, promote to modified
+                                    cs_files_deleted.remove(&p);
+                                    cs_files_modified.insert(p);
+                                    cs_last_event_time = Some(now);
+                                }
                             }
                             FileEvent::Deleted(p) => {
                                 // If file was marked for indexing, cancel that
                                 files_to_index.remove(&p);
-                                files_to_remove.insert(p);
+                                files_to_remove.insert(p.clone());
+                                // Track .cs deletions separately — the symbol rebuilder
+                                // needs to explicitly purge LMDB entries for deleted files
+                                // since they won't appear in the new scip-csharp output.
+                                if p.extension().and_then(|e| e.to_str()) == Some("cs") {
+                                    cs_files_modified.remove(&p);
+                                    cs_files_deleted.insert(p);
+                                    cs_last_event_time = Some(now);
+                                }
                             }
                             FileEvent::Renamed(old_p, new_p) => {
                                 // Remove old path, index new path
                                 files_to_index.remove(&old_p);
-                                files_to_remove.insert(old_p);
+                                files_to_remove.insert(old_p.clone());
                                 files_to_remove.remove(&new_p);
-                                files_to_index.insert(new_p);
+                                files_to_index.insert(new_p.clone());
+                                // Track .cs renames: old path is a deletion, new path is a modification
+                                let old_is_cs =
+                                    old_p.extension().and_then(|e| e.to_str()) == Some("cs");
+                                let new_is_cs =
+                                    new_p.extension().and_then(|e| e.to_str()) == Some("cs");
+                                if old_is_cs || new_is_cs {
+                                    if old_is_cs {
+                                        cs_files_modified.remove(&old_p);
+                                        cs_files_deleted.insert(old_p);
+                                    }
+                                    if new_is_cs {
+                                        cs_files_deleted.remove(&new_p);
+                                        cs_files_modified.insert(new_p);
+                                    }
+                                    cs_last_event_time = Some(now);
+                                }
                             }
                         }
                     }
@@ -874,6 +1060,186 @@ impl IndexManager {
 
                     // Reset timer
                     last_event_time = now;
+                }
+
+                // Check if we should flush the .cs symbol rebuild debounce
+                let has_cs_changes = !cs_files_modified.is_empty() || !cs_files_deleted.is_empty();
+                if has_cs_changes {
+                    if let Some(cs_last) = cs_last_event_time {
+                        let elapsed = now.duration_since(cs_last);
+                        if elapsed >= cs_debounce {
+                            let modified_count = cs_files_modified.len();
+                            let deleted_count = cs_files_deleted.len();
+                            let cs_modified: Vec<PathBuf> = cs_files_modified.drain().collect();
+                            let cs_deleted: Vec<PathBuf> = cs_files_deleted.drain().collect();
+                            cs_last_event_time = None;
+
+                            info!(
+                                "🔬 {} modified + {} deleted .cs file(s), triggering incremental symbol rebuild (after {}s debounce)",
+                                modified_count, deleted_count,
+                                cs_debounce.as_secs()
+                            );
+
+                            // Group changed (modified) files by .csproj so we can index per project.
+                            // Each group triggers a separate incremental rebuild with
+                            // --filter-project, which is much faster than rebuilding
+                            // the entire solution.
+                            //
+                            // Deleted files are passed to every group as `deleted` so that their
+                            // stale LMDB entries are purged regardless of which project they
+                            // belonged to (we can't discover their csproj — they're gone).
+                            let reg = symbol_registry.clone();
+                            let rp = path.clone();
+                            let dp = db_path.clone();
+                            let notifier = csharp_notifier.clone();
+                            // Clone indexing_cb so the SCIP rebuild can signal
+                            // active_reindexes (and therefore show "Indexing" in
+                            // the TUI) for the duration of the symbol rebuild —
+                            // separate from the text-index callback used for
+                            // branch-change refreshes above.
+                            let indexing_cb_scip = indexing_cb.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(indexer) = reg.get(LANG_CSHARP) {
+                                    if !indexer.applies_to(&rp) {
+                                        info!(
+                                            "🔬 symbol rebuild skipped: not applicable (no .sln)"
+                                        );
+                                        return;
+                                    }
+                                    if !indexer.is_available() {
+                                        info!("🔬 symbol rebuild skipped: helper not available");
+                                        return;
+                                    }
+
+                                    // Signal "Indexing" to the TUI now that we know
+                                    // a real SCIP rebuild will actually run.
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(true);
+                                    }
+
+                                    // Group modified files by their containing .csproj
+                                    let mut groups: std::collections::HashMap<
+                                        PathBuf,
+                                        Vec<PathBuf>,
+                                    > = std::collections::HashMap::new();
+                                    let mut ungrouped: Vec<PathBuf> = Vec::new();
+
+                                    for file in &cs_modified {
+                                        if let Some(csproj) =
+                                            crate::symbols::csharp::CSharpSymbolIndexer::find_csproj_for_file(&rp, file)
+                                        {
+                                            groups.entry(csproj).or_default().push(file.clone());
+                                        } else {
+                                            ungrouped.push(file.clone());
+                                        }
+                                    }
+
+                                    // If any modified files couldn't be mapped to a .csproj,
+                                    // fall back to a full solution rebuild (previously this
+                                    // incorrectly used RebuildScope::Files which only used
+                                    // files.first() and silently ignored the rest).
+                                    if !ungrouped.is_empty() {
+                                        info!(
+                                            "🔬 {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                            ungrouped.len()
+                                        );
+                                        match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
+                                            Ok(summary) => {
+                                                info!(
+                                                    "✅ Symbol rebuild complete: {} symbols, {} refs in {}ms",
+                                                    summary.symbols_indexed,
+                                                    summary.references_stored,
+                                                    summary.duration_ms
+                                                );
+                                                if let Some(ref n) = notifier {
+                                                    n(true, None);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("⚠️ Symbol rebuild failed: {}", e);
+                                                if let Some(ref n) = notifier {
+                                                    n(false, Some(e.to_string()));
+                                                }
+                                            }
+                                        }
+                                        // Clear "Indexing" regardless of outcome
+                                        if let Some(ref cb) = indexing_cb_scip {
+                                            cb(false);
+                                        }
+                                        return;
+                                    }
+
+                                    // Rebuild each project group separately.
+                                    // Deleted files are forwarded to every group so they're
+                                    // cleaned up from LMDB regardless of origin project.
+                                    let total_groups = groups.len();
+                                    let mut last_error: Option<String> = None;
+                                    for (i, (csproj, files)) in groups.into_iter().enumerate() {
+                                        let csproj_name = csproj
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default();
+                                        info!(
+                                            "🔬 incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
+                                            i + 1,
+                                            total_groups,
+                                            csproj_name,
+                                            files.len(),
+                                            cs_deleted.len(),
+                                        );
+                                        let scope = RebuildScope::Files {
+                                            changed: files,
+                                            deleted: cs_deleted.clone(),
+                                        };
+                                        match indexer.rebuild(&rp, &dp, scope) {
+                                            Ok(summary) => {
+                                                if summary.symbols_indexed == 0 {
+                                                    warn!(
+                                                        "⚠️ [{}/{}] Symbol rebuild returned 0 symbols for '{}' — \
+                                                         project may have failed to load. Check scip-csharp logs above.",
+                                                        i + 1,
+                                                        total_groups,
+                                                        csproj_name
+                                                    );
+                                                } else {
+                                                    info!(
+                                                        "✅ [{}/{}] Symbol rebuild complete ({}): {} symbols, {} refs in {}ms",
+                                                        i + 1,
+                                                        total_groups,
+                                                        csproj_name,
+                                                        summary.symbols_indexed,
+                                                        summary.references_stored,
+                                                        summary.duration_ms
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "⚠️ [{}/{}] Symbol rebuild failed ({}): {}",
+                                                    i + 1,
+                                                    total_groups,
+                                                    csproj_name,
+                                                    e
+                                                );
+                                                last_error = Some(e.to_string());
+                                            }
+                                        }
+                                    }
+                                    // Notify serve layer about overall outcome
+                                    if let Some(ref n) = notifier {
+                                        match last_error {
+                                            None => n(true, None),
+                                            Some(msg) => n(false, Some(msg)),
+                                        }
+                                    }
+                                    // Clear "Indexing" now that all groups are done
+                                    if let Some(ref cb) = indexing_cb_scip {
+                                        cb(false);
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
 
                 // Sleep to avoid busy-waiting, but wake up immediately on shutdown
@@ -1010,7 +1376,9 @@ impl IndexManager {
         // Track changes for dashboard/TUI
         let batch_changes = (files_to_index.len() + files_to_remove.len()) as u64;
         if batch_changes > 0 {
-            stores.changes_count.fetch_add(batch_changes, std::sync::atomic::Ordering::Relaxed);
+            stores
+                .changes_count
+                .fetch_add(batch_changes, std::sync::atomic::Ordering::Relaxed);
         }
 
         let elapsed = start.elapsed();
@@ -1020,6 +1388,14 @@ impl IndexManager {
             files_to_remove.len(),
             elapsed.as_secs_f64()
         );
+
+        // Persist chunk/file counts in metadata.json for status(projects)
+        {
+            let vs = stores.vector_store.read().await;
+            if let Ok(stats) = vs.stats() {
+                super::update_metadata_stats(db_path, stats.total_chunks, stats.total_files);
+            }
+        }
 
         Ok(())
     }
@@ -1049,9 +1425,13 @@ impl IndexManager {
         set_quiet(true);
 
         let result: Result<()> = async {
-            // Phase 1: Discover current files on disk
-            let walker = FileWalker::new(codebase_path.to_path_buf());
-            let (files, stats) = walker.walk()?;
+            // Phase 1: Discover current files on disk.
+            // `walk()` is synchronous + I/O-heavy — offload off the async executor.
+            let codebase = codebase_path.to_path_buf();
+            let (files, stats) =
+                tokio::task::spawn_blocking(move || FileWalker::new(codebase).walk())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("file walk task panicked: {}", e))??;
             info!(
                 "🔍 Branch refresh: discovered {} indexable files ({} skipped)",
                 files.len(),
@@ -1131,10 +1511,16 @@ impl IndexManager {
             // index_single_file loads its own fresh copy per file)
             file_meta_store.save(db_path)?;
 
-            // Rebuild vector index after FileMetaStore-based deletions
+            // Rebuild vector index after FileMetaStore-based deletions.
+            // `build_index()` is CPU-heavy — run it on `spawn_blocking`.
             {
-                let mut vstore = stores.vector_store.write().await;
-                vstore.build_index()?;
+                let vector_store = Arc::clone(&stores.vector_store);
+                tokio::task::spawn_blocking(move || {
+                    let mut vstore = vector_store.blocking_write();
+                    vstore.build_index()
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
             }
 
             // Phase 3.5: VectorStore-direct orphan cleanup
@@ -1162,11 +1548,20 @@ impl IndexManager {
                         orphan_file_count
                     );
 
-                    // Delete orphan chunks from VectorStore
+                    // Delete orphan chunks from VectorStore, then rebuild the
+                    // HNSW index off the async executor (CPU-heavy).
                     {
                         let mut vstore = stores.vector_store.write().await;
                         vstore.delete_chunks(&orphan_chunk_ids)?;
-                        vstore.build_index()?;
+                    }
+                    {
+                        let vector_store = Arc::clone(&stores.vector_store);
+                        tokio::task::spawn_blocking(move || {
+                            let mut vstore = vector_store.blocking_write();
+                            vstore.build_index()
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
                     }
 
                     // Delete orphan chunks from FtsStore
@@ -1264,7 +1659,13 @@ impl IndexManager {
 
         // Call the quiet index function from the parent module (no CLI output)
         // For incremental refresh, we use force=false which enables incremental mode
-        super::index_quiet(Some(path.to_path_buf()), false, false, CancellationToken::new()).await?;
+        super::index_quiet(
+            Some(path.to_path_buf()),
+            false,
+            false,
+            CancellationToken::new(),
+        )
+        .await?;
 
         let elapsed = start.elapsed();
         info!(
@@ -1528,6 +1929,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shared_stores_new_creates_missing_db_directory() {
+        // Regression: a brand-new repo's `.codesearch.db` directory does not exist
+        // yet when the serve auto-register path (POST /repos) opens the stores.
+        // SharedStores::new() must create it and acquire the writer lock, NOT fail
+        // with "Database is locked by another process".
+        let temp = tempdir().unwrap();
+        // Intentionally do NOT create this directory — it must not exist.
+        let db_path = temp.path().join("brand_new").join(DB_DIR_NAME);
+        assert!(!db_path.exists(), "precondition: db dir must not exist yet");
+
+        let stores = SharedStores::new(&db_path, 384)
+            .expect("SharedStores::new must succeed on a non-existent db_path");
+
+        assert!(db_path.exists(), "db directory should have been created");
+        assert!(!stores.readonly, "should be opened in read-write mode");
+        assert!(
+            db_path.join(WRITER_LOCK_FILE).exists(),
+            "writer lock file should have been created"
+        );
+    }
+
+    #[test]
+    fn acquire_writer_lock_succeeds_for_missing_directory() {
+        // acquire_writer_lock must create the db directory before placing the lock
+        // file, so a fresh repo path yields a real lock rather than None.
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("nested").join(DB_DIR_NAME);
+        assert!(!db_path.exists());
+
+        let lock = acquire_writer_lock(&db_path);
+        assert!(
+            lock.is_some(),
+            "acquire_writer_lock should create the dir and acquire the lock"
+        );
+        assert!(db_path.join(WRITER_LOCK_FILE).exists());
+    }
+
     #[tokio::test]
     async fn test_refresh_no_metadata_early_return() {
         // When metadata.json doesn't exist, refresh should return Ok early
@@ -1784,5 +2223,54 @@ mod tests {
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
         let deleted = reloaded.find_deleted_files();
         assert!(deleted.is_empty(), "All stale entries should be removed");
+    }
+
+    #[tokio::test]
+    async fn test_incremental_refresh_up_to_date_is_noop() {
+        // End-to-end smoke test for perform_incremental_refresh_with_stores after
+        // the file walk was moved onto spawn_blocking. When every on-disk file is
+        // already tracked in FileMetaStore (no changes, no deletions), the refresh
+        // must walk the codebase off the async executor and return Ok early without
+        // touching the embedder.
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        create_metadata_json(&db_path, 4);
+
+        // Write a real source file and record its metadata so check_file reports
+        // "unchanged" — this drives the no-changes branch (no embedding required).
+        let file = codebase_path.join("lib.rs");
+        std::fs::write(&file, "pub fn lib_fn() {}").unwrap();
+
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        // update_file hashes current on-disk content, so a subsequent check_file
+        // on the unmodified file returns needs_reindex = false.
+        file_meta.update_file(&file, vec![1]).unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let result = IndexManager::perform_incremental_refresh_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Up-to-date incremental refresh should succeed: {:?}",
+            result
+        );
+
+        // The tracked file must still be tracked and not flagged as deleted.
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        assert!(
+            reloaded.find_deleted_files().is_empty(),
+            "No files should be flagged deleted on an up-to-date refresh"
+        );
     }
 }

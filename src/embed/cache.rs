@@ -1,9 +1,10 @@
 use super::batch::EmbeddedChunk;
 use crate::chunker::Chunk;
+use crate::lmdb_registry::TrackedEnv;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use heed::types::*;
-use heed::{Database, Env, EnvOpenOptions};
+use heed::{Database, EnvOpenOptions};
 use moka::sync::Cache;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -281,7 +282,7 @@ impl QueryCacheStats {
 /// This is separate from the in-memory EmbeddingCache which uses Moka for
 /// automatic memory management. The persistent cache provides long-term storage.
 pub struct PersistentEmbeddingCache {
-    env: Env,
+    env: TrackedEnv,
     db: Database<Str, SerdeBincode<Vec<f32>>>,
     cache_dir: PathBuf,
 }
@@ -313,11 +314,15 @@ impl PersistentEmbeddingCache {
         // (different map_size or flags) at the same time. The cache directory is
         // process-private under the user's codesearch state directory, and we open it
         // exactly once per process via this constructor.
+        // TrackedEnv additionally prevents double-open within the same process.
+        let mut opts = EnvOpenOptions::new();
+        opts.map_size(512 * 1024 * 1024).max_dbs(1); // 512MB — plenty for cache
         let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(512 * 1024 * 1024) // 512MB — plenty for cache
-                .max_dbs(1)
-                .open(&cache_dir)?
+            TrackedEnv::open(
+                &opts,
+                &cache_dir,
+                &format!("PersistentEmbeddingCache({})", model_name),
+            )?
         };
 
         let mut wtxn = env.write_txn()?;

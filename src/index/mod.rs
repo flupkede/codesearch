@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::cache::{normalize_path, FileMetaStore};
+use crate::cache::{normalize_path, safe_canonicalize, FileMetaStore};
 use crate::chunker::SemanticChunker;
 use crate::db_discovery::{
     find_best_database, is_registered_repository, register_repository, unregister_repository,
@@ -19,7 +19,26 @@ use crate::vectordb::VectorStore;
 
 // Index manager module
 mod manager;
-pub use manager::{IndexManager, SharedStores, is_database_locked};
+pub use manager::{
+    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores,
+};
+
+/// Update metadata.json with current chunk/file counts so that `status(projects)`
+/// can report accurate numbers without opening LMDB.
+pub(crate) fn update_metadata_stats(db_path: &Path, total_chunks: usize, total_files: usize) {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(mut metadata) = serde_json::from_str::<serde_json::Value>(&content) {
+            metadata["total_chunks"] = serde_json::Value::Number(total_chunks.into());
+            metadata["total_files"] = serde_json::Value::Number(total_files.into());
+            if let Ok(pretty) = serde_json::to_string_pretty(&metadata) {
+                if let Err(e) = fs::write(&metadata_path, pretty) {
+                    tracing::warn!("Failed to update metadata stats: {}", e);
+                }
+            }
+        }
+    }
+}
 
 /// Get the database path and project path for a given directory
 /// Uses automatic database discovery to find indexes in parent/global directories
@@ -42,13 +61,9 @@ fn get_db_path_smart(
     let target = path.as_deref();
     let project_path = path.as_deref().unwrap_or(Path::new("."));
 
-    // Try to canonicalize, but fall back to original path if it fails
-    // Then normalize: strip UNC prefix (\\?\) and use forward slashes for consistency
-    let canonical_path = PathBuf::from(normalize_path(
-        &project_path
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(project_path)),
-    ));
+    // Canonicalize and strip any Windows UNC prefix (\\?\) via the central helper.
+    let canonical_path =
+        safe_canonicalize(project_path).unwrap_or_else(|_| PathBuf::from(project_path));
 
     // Step 1: Handle --force flag — delete databases
     if force {
@@ -97,7 +112,9 @@ fn get_db_path_smart(
                 let db_project_normalized = normalize_path(&db_info.project_path);
                 let canonical_path_str = normalize_path(&canonical_path);
                 let db_is_for_this_project = db_project_normalized == canonical_path_str
-                    || canonical_path.as_path().starts_with(Path::new(&*db_project_normalized));
+                    || canonical_path
+                        .as_path()
+                        .starts_with(Path::new(&*db_project_normalized));
 
                 if !db_is_for_this_project {
                     anyhow::bail!(
@@ -233,8 +250,7 @@ fn get_db_path_smart(
 /// Searches upward (unlimited), then one level down if nothing found upward.
 /// Returns `Ok(None)` if not in a git repo. Returns `Err` if multiple child repos found.
 pub(crate) fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
-    let mut current = start_path
-        .canonicalize()
+    let mut current = safe_canonicalize(start_path)
         .map_err(|e| anyhow::anyhow!("Failed to canonicalize path: {}", e))?;
 
     // Search up the directory tree (unlimited levels)
@@ -360,7 +376,7 @@ fn get_global_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
     use dirs::home_dir;
 
     let project_path = path.unwrap_or_else(|| PathBuf::from("."));
-    let canonical_path = project_path.canonicalize()?;
+    let canonical_path = safe_canonicalize(&project_path)?;
 
     // Create a unique name for the project based on its path
     // Use the directory name as the project identifier
@@ -407,10 +423,17 @@ pub async fn index(
     model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    // When force=true, try to delegate to a running serve instance via HTTP.
+    // Always try to delegate to a running serve instance via HTTP.
     // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
-    if force && !dry_run {
-        match try_delegate_reindex_to_serve(&path, force).await {
+    if !dry_run {
+        // Try to delegate; if serve is unresponsive (warming up), wait and retry.
+        let delegate_result = serve_delegate_with_warmup_wait(|| {
+            let path = path.clone();
+            async move { try_delegate_reindex_to_serve(&path, force).await }
+        })
+        .await;
+
+        match delegate_result {
             Ok((alias, project_path)) => {
                 println!(
                     "{}",
@@ -423,10 +446,32 @@ pub async fn index(
                 );
                 return Ok(());
             }
-            Err(reason) => {
-                debug!(
-                    "Could not delegate reindex to serve (falling back to local): {}",
-                    reason
+            Err(DelegateError::ServeDown) => {
+                // Serve is not running — index locally. Connection-refused is
+                // detected immediately, so this fast path is not slowed down.
+                debug!("serve not running; indexing locally");
+            }
+            Err(DelegateError::ServeUnresponsive) => {
+                // Serve was reachable but never became ready within the wait budget.
+                // Refusing to create a local duplicate — the user must decide.
+                return Err(anyhow::anyhow!(
+                    "codesearch serve is running but did not become ready within the wait \
+                     budget (~2 min). Stop serve first to index locally, or wait for it \
+                     to finish warming up."
+                ));
+            }
+            Err(DelegateError::Failed(reason)) => {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "⚠️  codesearch serve is running but could not delegate: {}",
+                        reason
+                    )
+                    .yellow()
+                );
+                eprintln!(
+                    "{}",
+                    "   Running locally — LMDB file-lock conflicts are possible.".yellow()
                 );
             }
         }
@@ -526,6 +571,33 @@ async fn index_with_options(
 
     if is_incremental {
         let file_meta_store = file_meta_store.as_mut().unwrap();
+
+        // B1 safety guard: if FileMetaStore is empty but VectorStore has chunks,
+        // the metadata was lost/reset. Re-indexing without clearing would create
+        // duplicate chunks. Detect and clear before proceeding.
+        if file_meta_store.is_empty() {
+            let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
+            let existing_chunks = vs.stats().map(|s| s.total_chunks).unwrap_or(0);
+            if existing_chunks > 0 {
+                log_print!(
+                    "{}",
+                    format!(
+                        "⚠️  FileMetaStore is empty but VectorStore has {} chunks — \
+                         clearing to prevent duplicates (metadata was likely lost/reset)",
+                        existing_chunks
+                    )
+                    .yellow()
+                );
+                vs.clear()?;
+                drop(vs);
+                // Also clear FTS
+                let mut fts = FtsStore::new_with_writer(&db_path)?;
+                fts.clear()?;
+                drop(fts);
+            } else {
+                drop(vs);
+            }
+        }
 
         // Find changed and deleted files
         let mut changed_files = Vec::new();
@@ -1003,6 +1075,9 @@ async fn index_with_options(
         }
     );
 
+    // Persist chunk/file counts in metadata.json for status(projects)
+    update_metadata_stats(&db_path, db_stats.total_chunks, db_stats.total_files);
+
     // Calculate database size
     let mut total_size = 0u64;
     for entry in std::fs::read_dir(&db_path)? {
@@ -1175,14 +1250,47 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
 }
 
 /// Add a repository to the index (creates local or global)
+/// Remove stale entries from `repos.json`.
+///
+/// For each registered repo whose path no longer exists on disk (e.g. its
+/// folder was renamed/moved), a best-effort git-identity relocation is tried
+/// first; only entries that cannot be relocated are unregistered. Prints a
+/// summary of what was relocated/removed.
+pub async fn prune_index() -> Result<()> {
+    use crate::db_discovery::repos::ReposConfig;
+
+    let mut config = ReposConfig::load()?;
+    let (relocated, removed) = config.prune_stale();
+
+    if relocated.is_empty() && removed.is_empty() {
+        println!("✅ No stale repositories found — repos.json is clean.");
+        return Ok(());
+    }
+
+    config.save()?;
+
+    for (alias, path) in &relocated {
+        println!("📍 relocated '{}' → {}", alias, path.display());
+    }
+    for alias in &removed {
+        println!("🗑️  removed stale entry '{}'", alias);
+    }
+    println!(
+        "✅ Prune complete: {} relocated, {} removed.",
+        relocated.len(),
+        removed.len()
+    );
+
+    Ok(())
+}
+
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
-    alias: Option<String>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
-    let canonical_path = project_path.canonicalize()?;
+    let canonical_path = safe_canonicalize(project_path)?;
 
     println!("{}", "➕ Add to Index".bright_green().bold());
     println!("{}", "=".repeat(60));
@@ -1190,16 +1298,38 @@ pub async fn add_to_index(
 
     // Try delegating to a running serve instance first.
     // Serve handles: register in repos.json + create index + warmup.
-    match try_delegate_add_to_serve(&path, &alias, global).await {
+    let add_delegate = serve_delegate_with_warmup_wait(|| {
+        let path = path.clone();
+        // Alias is always derived from the directory name; the CLI no longer
+        // lets the user set it. Pass None so serve derives it consistently.
+        async move { try_delegate_add_to_serve(&path, &None, global).await }
+    })
+    .await;
+
+    match add_delegate {
         Ok((assigned_alias, _)) => {
             println!("\n{}", "✅ Delegated to running serve instance.".green());
             println!("   Registered as '{}'.", assigned_alias);
             println!("   Index creation running in background on the server.");
             return Ok(());
         }
-        Err(reason) => {
-            // Serve not running or delegation failed — fall through to local operation.
-            tracing::debug!("add_to_index: delegation skipped ({})", reason);
+        Err(DelegateError::ServeDown) => {
+            // Serve not running — fall through to local add (fast: refused is instant).
+            tracing::debug!("add_to_index: serve not running, adding locally");
+        }
+        Err(DelegateError::ServeUnresponsive) => {
+            return Err(anyhow::anyhow!(
+                "codesearch serve is running but did not become ready within the wait \
+                 budget (~2 min). Stop serve first to add locally, or wait for it to \
+                 finish warming up."
+            ));
+        }
+        Err(DelegateError::Failed(reason)) => {
+            eprintln!(
+                "{}",
+                format!("⚠️  serve is running but could not delegate: {}", reason).yellow()
+            );
+            eprintln!("   Adding locally instead.");
         }
     }
 
@@ -1219,25 +1349,19 @@ pub async fn add_to_index(
             println!("   Type: {}", "Local".bright_green());
         }
 
-        // If an alias is provided and this is a local DB in the current dir,
-        // register it in repos.json (for legacy DB's that predate auto-registration).
-        if alias.is_some() && db.is_current && !db.is_global {
-            let mut config = crate::db_discovery::repos::ReposConfig::load()
-                .unwrap_or_default();
+        // If this is a local DB in the current dir, ensure it is registered in
+        // repos.json (for legacy DBs that predate auto-registration). The alias
+        // is always derived from the directory name.
+        if db.is_current && !db.is_global {
+            let mut config = crate::db_discovery::repos::ReposConfig::load().unwrap_or_default();
             if let Some(existing) = config.alias_for_path(&canonical_path) {
                 println!("   Already registered as '{}'.", existing);
             } else {
-                match config.register_with_alias(canonical_path.clone(), alias.clone()) {
-                    Ok(assigned) => {
-                        if let Err(e) = config.save() {
-                            eprintln!("⚠️ Failed to save repos config: {}", e);
-                        } else {
-                            println!("   ✅ Registered as '{}'.", assigned);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️ Registration failed: {}", e);
-                    }
+                let assigned = config.register(canonical_path.clone());
+                if let Err(e) = config.save() {
+                    eprintln!("⚠️ Failed to save repos config: {}", e);
+                } else {
+                    println!("   ✅ Registered as '{}'.", assigned);
                 }
             }
             return Ok(());
@@ -1326,27 +1450,17 @@ pub async fn add_to_index(
             }
         };
 
-        let mut config = crate::db_discovery::repos::ReposConfig::load()
-            .unwrap_or_default();
+        let mut config = crate::db_discovery::repos::ReposConfig::load().unwrap_or_default();
 
         if let Some(existing) = config.alias_for_path(&canonical_path) {
             eprintln!("ℹ️ Already registered as '{}'.", existing);
         } else {
-            match config.register_with_alias(canonical_path.clone(), alias) {
-                Ok(assigned) => {
-                    if let Err(e) = config.save() {
-                        eprintln!("⚠️ Index created, but failed to save repos config: {}", e);
-                        eprintln!("   Config path: {}", config_path.display());
-                    } else {
-                        eprintln!("✅ Registered as '{}'.", assigned);
-                    }
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Index created, but registration failed: {}",
-                        e
-                    ));
-                }
+            let assigned = config.register(canonical_path.clone());
+            if let Err(e) = config.save() {
+                eprintln!("⚠️ Index created, but failed to save repos config: {}", e);
+                eprintln!("   Config path: {}", config_path.display());
+            } else {
+                eprintln!("✅ Registered as '{}'.", assigned);
             }
         }
     }
@@ -1355,12 +1469,9 @@ pub async fn add_to_index(
 }
 
 /// Remove the index (local or global, auto-detected)
-pub async fn remove_from_index(
-    path: Option<PathBuf>,
-    keep_config: bool,
-) -> Result<()> {
+pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Result<()> {
     let project_path = path.clone().unwrap_or_else(|| PathBuf::from("."));
-    let canonical_path = project_path.canonicalize()?;
+    let canonical_path = safe_canonicalize(&project_path)?;
 
     println!("{}", "➖ Remove Index".bright_red().bold());
     println!("{}", "=".repeat(60));
@@ -1396,8 +1507,7 @@ pub async fn remove_from_index(
 
     // Auto-unregister from repos.json unless --keep-config
     if !keep_config {
-        let mut config = crate::db_discovery::repos::ReposConfig::load()
-            .unwrap_or_default();
+        let mut config = crate::db_discovery::repos::ReposConfig::load().unwrap_or_default();
         if config.unregister_path(&canonical_path) {
             if let Err(e) = config.save() {
                 eprintln!("⚠️ Failed to update repos config: {}", e);
@@ -1417,7 +1527,9 @@ pub async fn remove_from_index(
         );
         println!("   Removing local index...");
         if let Err(e) = fs::remove_dir_all(&local_db) {
-            eprintln!("⚠️ Database files may be locked by a running codesearch serve. Stop it and retry.");
+            eprintln!(
+                "⚠️ Database files may be locked by a running codesearch serve. Stop it and retry."
+            );
             return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
         }
         println!("   {}", "✅ Local index removed".green());
@@ -1429,7 +1541,9 @@ pub async fn remove_from_index(
     if has_local {
         println!("\n{}", "Removing local index...".cyan());
         if let Err(e) = fs::remove_dir_all(&local_db) {
-            eprintln!("⚠️ Database files may be locked by a running codesearch serve. Stop it and retry.");
+            eprintln!(
+                "⚠️ Database files may be locked by a running codesearch serve. Stop it and retry."
+            );
             return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
         }
         println!("{}", "✅ Local index removed!".green());
@@ -1531,6 +1645,148 @@ struct DbStats {
     bloat_ratio: Option<f64>,
 }
 
+/// Run a serve-delegation closure, waiting patiently if serve is reachable but
+/// still warming up (e.g. opening LMDB handles for 15+ repos at startup).
+///
+/// - `Ok(result)` immediately on success.
+/// - `Err(ServeDown)` immediately when nothing is listening (fast path preserved).
+/// - On `ServeUnresponsive`: print progress and retry up to [`SERVE_WARMUP_RETRIES`]
+///   times with [`SERVE_WARMUP_RETRY_SLEEP`] between attempts. Returns
+///   `Err(ServeUnresponsive)` only after exhausting the retry budget.
+/// - `Err(Failed(_))` propagated immediately.
+async fn serve_delegate_with_warmup_wait<F, Fut, T>(
+    mut f: F,
+) -> std::result::Result<T, DelegateError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, DelegateError>>,
+{
+    match f().await {
+        Ok(r) => return Ok(r),
+        Err(DelegateError::ServeDown) => return Err(DelegateError::ServeDown),
+        Err(DelegateError::Failed(e)) => return Err(DelegateError::Failed(e)),
+        Err(DelegateError::ServeUnresponsive) => {
+            // First encounter — print a friendly message and start waiting.
+            eprintln!(
+                "{}",
+                "⏳ serve is starting up, waiting for it to become ready...".yellow()
+            );
+        }
+    }
+
+    for attempt in 1..=SERVE_WARMUP_RETRIES {
+        tokio::time::sleep(SERVE_WARMUP_RETRY_SLEEP).await;
+        match f().await {
+            Ok(r) => {
+                eprintln!("{}", "✅ serve is ready, delegating...".green());
+                return Ok(r);
+            }
+            Err(DelegateError::ServeDown) => return Err(DelegateError::ServeDown),
+            Err(DelegateError::Failed(e)) => return Err(DelegateError::Failed(e)),
+            Err(DelegateError::ServeUnresponsive) => {
+                eprintln!(
+                    "{}",
+                    format!("⏳ still warming up ({attempt}/{SERVE_WARMUP_RETRIES})...").yellow()
+                );
+            }
+        }
+    }
+
+    Err(DelegateError::ServeUnresponsive)
+}
+
+/// Outcome of probing the serve `/health` endpoint.
+enum ServeProbe {
+    /// Serve answered — safe to delegate.
+    Up,
+    /// Nothing is listening (connection refused / cannot connect). Serve is not
+    /// running, so local indexing is appropriate. Detected immediately — the
+    /// HTTP timeout never elapses for a refused connection, so the common
+    /// "no serve → index locally" path stays fast.
+    Down,
+    /// A socket is listening but did not answer in time (serve is busy, e.g.
+    /// warming up many repos at startup). Callers MUST NOT create a local
+    /// duplicate index in this case — that is the bug this distinction prevents.
+    Unresponsive,
+}
+
+/// Why delegation to a running serve did not complete.
+pub(crate) enum DelegateError {
+    /// Serve is not running. Local indexing is the right fallback.
+    ServeDown,
+    /// Serve is running but did not respond to `/health` in time (busy/warming).
+    /// Callers must surface this loudly and must NOT create a local duplicate.
+    ServeUnresponsive,
+    /// Serve responded but a later delegation step failed.
+    Failed(String),
+}
+
+impl From<String> for DelegateError {
+    fn from(s: String) -> Self {
+        DelegateError::Failed(s)
+    }
+}
+
+impl std::fmt::Display for DelegateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DelegateError::ServeDown => write!(f, "serve is not running"),
+            DelegateError::ServeUnresponsive => {
+                write!(f, "serve is running but did not respond in time (busy)")
+            }
+            DelegateError::Failed(reason) => write!(f, "{}", reason),
+        }
+    }
+}
+
+/// How many times to retry the serve `/health` probe on *timeout* (serve is
+/// listening but busy, e.g. warming up repos at startup). Connection-refused is
+/// never retried, so the "no serve → index locally" path stays fast.
+const SERVE_HEALTH_RETRIES: u32 = 3;
+
+/// When serve is reachable but still warming up, how many times to retry the
+/// full delegation before giving up. Each iteration waits SERVE_WARMUP_RETRY_SLEEP
+/// then probes health + attempts delegation again.
+/// Budget: ~6 × (14s probe + 8s sleep) ≈ 2 min — covers a 15-repo warmup.
+const SERVE_WARMUP_RETRIES: u32 = 6;
+/// Sleep between warmup retries. Long enough for serve to finish warming one repo.
+const SERVE_WARMUP_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_secs(8);
+/// Sleep between serve `/health` timeout retries.
+const SERVE_HEALTH_RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// Probe serve `/health`, distinguishing "not running" from "busy".
+///
+/// A *connection refused* (or any non-timeout connect error) returns
+/// [`ServeProbe::Down`] immediately, so the common "no serve → index locally"
+/// path is not slowed down. Only a *timeout* — a socket is listening but slow,
+/// which is what happens while serve warms up many repos — triggers a small,
+/// bounded set of retries before returning [`ServeProbe::Unresponsive`].
+async fn probe_serve_health(
+    client: &reqwest::Client,
+    base_url: &str,
+    max_timeout_retries: u32,
+    retry_sleep: std::time::Duration,
+) -> ServeProbe {
+    let url = format!("{}/health", base_url);
+    let mut attempt: u32 = 0;
+    loop {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => return ServeProbe::Up,
+            // A socket answered (even non-2xx) — serve is up and reachable.
+            Ok(_) => return ServeProbe::Up,
+            Err(e) if e.is_timeout() => {
+                if attempt >= max_timeout_retries {
+                    return ServeProbe::Unresponsive;
+                }
+                attempt += 1;
+                tokio::time::sleep(retry_sleep).await;
+            }
+            // Connection refused / cannot connect → nothing is listening.
+            Err(_) => return ServeProbe::Down,
+        }
+    }
+}
+
 /// Try to delegate a reindex to a running serve instance.
 ///
 /// Returns `Ok((alias, project_path))` if the serve accepted the reindex request.
@@ -1538,7 +1794,7 @@ struct DbStats {
 async fn try_delegate_reindex_to_serve(
     path: &Option<PathBuf>,
     force: bool,
-) -> std::result::Result<(String, PathBuf), String> {
+) -> std::result::Result<(String, PathBuf), DelegateError> {
     use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
@@ -1548,30 +1804,32 @@ async fn try_delegate_reindex_to_serve(
 
     let base_url = format!("http://127.0.0.1:{}", port);
 
-    // 1. Health check — is serve running?
+    // 1. Health check — is serve running (and responsive)?
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|e| format!("failed to build HTTP client: {}", e))?;
 
-    let health_resp = client
-        .get(format!("{}/health", base_url))
-        .send()
-        .await
-        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
-
-    if !health_resp.status().is_success() {
-        return Err(format!("serve health check returned {}", health_resp.status()));
+    match probe_serve_health(
+        &client,
+        &base_url,
+        SERVE_HEALTH_RETRIES,
+        SERVE_HEALTH_RETRY_SLEEP,
+    )
+    .await
+    {
+        ServeProbe::Up => {}
+        ServeProbe::Down => return Err(DelegateError::ServeDown),
+        ServeProbe::Unresponsive => return Err(DelegateError::ServeUnresponsive),
     }
 
     // 2. Resolve the project path to an alias by loading repos config
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    // Canonicalize to resolve symlinks and normalize separators (incl. UNC on Windows)
-    let project_path = raw_project_path
-        .canonicalize()
-        .unwrap_or_else(|_| raw_project_path.clone());
+    // Canonicalize and strip UNC prefix (\\?\) for reliable path operations.
+    let project_path =
+        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
 
     let config = crate::db_discovery::repos::ReposConfig::load()
         .map_err(|e| format!("cannot load repos.json: {}", e))?;
@@ -1580,7 +1838,7 @@ async fn try_delegate_reindex_to_serve(
     /// relative components), then normalize via `cache::normalize_path` (strips
     /// Windows UNC prefix, converts backslashes) and lowercases for case-insensitive match.
     fn normalize_for_cmp(p: &std::path::Path) -> String {
-        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let canonical = safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         crate::cache::normalize_path(&canonical).to_lowercase()
     }
 
@@ -1618,11 +1876,127 @@ async fn try_delegate_reindex_to_serve(
         .map_err(|e| format!("reindex POST failed: {}", e))?;
 
     if reindex_resp.status().is_success() {
+        return Ok((alias, project_path));
+    }
+
+    let status = reindex_resp.status();
+    let body = reindex_resp.text().await.unwrap_or_default();
+
+    // If 404, the alias is unknown to serve — auto-register via POST /repos, then retry reindex.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        tracing::info!(
+            "alias '{}' not known to serve (404), auto-registering via POST /repos",
+            alias
+        );
+
+        // Register the repo with serve
+        let mut add_body = serde_json::json!({
+            "path": project_path,
+            "global": false,
+        });
+        // Use the resolved alias so the reindex retry targets the same name
+        add_body["alias"] = serde_json::Value::String(alias.clone());
+
+        let add_resp = client
+            .post(format!("{}/repos", base_url))
+            .json(&add_body)
+            .send()
+            .await
+            .map_err(|e| format!("auto-register POST /repos failed: {}", e))?;
+
+        if !add_resp.status().is_success() {
+            let add_status = add_resp.status();
+            let add_text = add_resp.text().await.unwrap_or_default();
+            return Err(DelegateError::Failed(format!(
+                "auto-register returned {} for alias '{}': {}",
+                add_status, alias, add_text
+            )));
+        }
+
+        // Auto-register returns 202 Accepted — indexing runs in background.
+        // No need to retry the reindex; the database will be created by the
+        // spawned background task.
+        tracing::info!(
+            "auto-register accepted for alias '{}', indexing in background",
+            alias
+        );
+        Ok((alias, project_path))
+    } else if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        && body.contains("Database not found")
+    {
+        // Serve knows the alias but its database was deleted externally (e.g. the
+        // previous serve run was killed mid-index and the DB never fully formed).
+        // Treat this the same as 404: auto-register so serve creates the DB fresh.
+        tracing::info!(
+            "alias '{}' has no database on serve (500 Database not found), \
+             auto-registering via POST /repos to recreate",
+            alias
+        );
+
+        let mut add_body = serde_json::json!({
+            "path": project_path,
+            "global": false,
+        });
+        add_body["alias"] = serde_json::Value::String(alias.clone());
+
+        let add_resp = client
+            .post(format!("{}/repos", base_url))
+            .json(&add_body)
+            .send()
+            .await
+            .map_err(|e| format!("auto-register POST /repos failed: {}", e))?;
+
+        if !add_resp.status().is_success() {
+            let add_status = add_resp.status();
+            let add_text = add_resp.text().await.unwrap_or_default();
+
+            // 409 means serve already has this alias registered (the alias is in
+            // repos.json) but the DB directory is missing. POST /repos correctly
+            // rejects the duplicate registration. The right recovery is a force
+            // reindex, which uses allow_create=true and re-creates the DB.
+            if add_status == reqwest::StatusCode::CONFLICT {
+                tracing::info!(
+                    "alias '{}' already registered on serve (409), retrying as force reindex \
+                     to recreate missing database",
+                    alias
+                );
+                let force_url = format!("{}/repos/{}/reindex?force=true", base_url, alias);
+                let force_resp = client
+                    .post(&force_url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("force reindex POST failed: {}", e))?;
+                if force_resp.status().is_success() {
+                    tracing::info!(
+                        "force reindex accepted for '{}', DB will be recreated in background",
+                        alias
+                    );
+                    return Ok((alias, project_path));
+                }
+                let force_status = force_resp.status();
+                let force_text = force_resp.text().await.unwrap_or_default();
+                return Err(DelegateError::Failed(format!(
+                    "force reindex returned {} for alias '{}': {}",
+                    force_status, alias, force_text
+                )));
+            }
+
+            return Err(DelegateError::Failed(format!(
+                "auto-register returned {} for alias '{}': {}",
+                add_status, alias, add_text
+            )));
+        }
+
+        tracing::info!(
+            "auto-register accepted for alias '{}' (DB recreate), indexing in background",
+            alias
+        );
         Ok((alias, project_path))
     } else {
-        let status = reindex_resp.status();
-        let body = reindex_resp.text().await.unwrap_or_default();
-        Err(format!("serve returned {} for alias '{}': {}", status, alias, body))
+        Err(DelegateError::Failed(format!(
+            "serve returned {} for alias '{}': {}",
+            status, alias, body
+        )))
     }
 }
 
@@ -1635,7 +2009,7 @@ pub(crate) async fn try_delegate_add_to_serve(
     path: &Option<PathBuf>,
     alias: &Option<String>,
     global: bool,
-) -> std::result::Result<(String, PathBuf), String> {
+) -> std::result::Result<(String, PathBuf), DelegateError> {
     use crate::constants::{DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
@@ -1645,29 +2019,31 @@ pub(crate) async fn try_delegate_add_to_serve(
 
     let base_url = format!("http://127.0.0.1:{}", port);
 
-    // 1. Health check
+    // 1. Health check — is serve running (and responsive)?
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .map_err(|e| format!("failed to build HTTP client: {}", e))?;
 
-    let health_resp = client
-        .get(format!("{}/health", base_url))
-        .send()
-        .await
-        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
-
-    if !health_resp.status().is_success() {
-        return Err(format!("serve health check returned {}", health_resp.status()));
+    match probe_serve_health(
+        &client,
+        &base_url,
+        SERVE_HEALTH_RETRIES,
+        SERVE_HEALTH_RETRY_SLEEP,
+    )
+    .await
+    {
+        ServeProbe::Up => {}
+        ServeProbe::Down => return Err(DelegateError::ServeDown),
+        ServeProbe::Unresponsive => return Err(DelegateError::ServeUnresponsive),
     }
 
     // 2. Resolve path
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let project_path = raw_project_path
-        .canonicalize()
-        .unwrap_or_else(|_| raw_project_path.clone());
+    let project_path =
+        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
 
     // 3. Build request body
     let mut body = serde_json::json!({
@@ -1690,16 +2066,21 @@ pub(crate) async fn try_delegate_add_to_serve(
         let resp_body: serde_json::Value = add_resp.json().await.unwrap_or_default();
         let assigned_alias = resp_body["alias"]
             .as_str()
-            .unwrap_or_else(|| project_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown"))
+            .unwrap_or_else(|| {
+                project_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+            })
             .to_string();
         Ok((assigned_alias, project_path))
     } else {
         let status = add_resp.status();
         let text = add_resp.text().await.unwrap_or_default();
-        Err(format!("serve returned {}: {}", status, text))
+        Err(DelegateError::Failed(format!(
+            "serve returned {}: {}",
+            status, text
+        )))
     }
 }
 
@@ -1729,22 +2110,29 @@ pub(crate) async fn try_delegate_rm_to_serve(
         .get(format!("{}/health", base_url))
         .send()
         .await
-        .map_err(|e| format!("serve not reachable at {} ({}). Is 'codesearch serve' running?", base_url, e))?;
+        .map_err(|e| {
+            format!(
+                "serve not reachable at {} ({}). Is 'codesearch serve' running?",
+                base_url, e
+            )
+        })?;
 
     if !health_resp.status().is_success() {
-        return Err(format!("serve health check returned {}", health_resp.status()));
+        return Err(format!(
+            "serve health check returned {}",
+            health_resp.status()
+        ));
     }
 
     // 2. Resolve the project path to an alias
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let project_path = raw_project_path
-        .canonicalize()
-        .unwrap_or_else(|_| raw_project_path.clone());
+    let project_path =
+        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
 
     fn normalize_for_cmp(p: &std::path::Path) -> String {
-        let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let canonical = safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         crate::cache::normalize_path(&canonical).to_lowercase()
     }
 
@@ -1771,6 +2159,80 @@ pub(crate) async fn try_delegate_rm_to_serve(
     } else {
         let status = delete_resp.status();
         let text = delete_resp.text().await.unwrap_or_default();
-        Err(format!("serve returned {} for alias '{}': {}", status, alias, text))
+        Err(format!(
+            "serve returned {} for alias '{}': {}",
+            status, alias, text
+        ))
+    }
+}
+
+#[cfg(test)]
+mod serve_probe_tests {
+    use super::{probe_serve_health, ServeProbe};
+    use std::time::Duration;
+
+    /// Spawn a minimal HTTP server exposing `/health`. If `delay` is set, the
+    /// handler sleeps that long before answering (to simulate a busy serve).
+    async fn spawn_health_server(delay: Option<Duration>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || async move {
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                "ok"
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // Give the accept loop a moment to start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        format!("http://{}", addr)
+    }
+
+    fn client(timeout: Duration) -> reqwest::Client {
+        reqwest::Client::builder().timeout(timeout).build().unwrap()
+    }
+
+    /// A responsive `/health` → `Up` (delegation proceeds normally).
+    #[tokio::test]
+    async fn probe_reports_up_when_health_responds() {
+        let base = spawn_health_server(None).await;
+        let c = client(Duration::from_secs(2));
+        assert!(
+            matches!(
+                probe_serve_health(&c, &base, 3, Duration::from_millis(10)).await,
+                ServeProbe::Up
+            ),
+            "responsive /health must be Up"
+        );
+    }
+
+    /// A socket that listens but never answers in time must be `Unresponsive`,
+    /// NOT `Down` — this is the core of the fix: the caller treats `Unresponsive`
+    /// as "serve is up but busy" and refuses to create a local duplicate index,
+    /// instead of silently indexing locally. This is exactly the warmup scenario
+    /// that produced a duplicate index.
+    ///
+    /// (The `Down` branch — a *non-timeout* connect error such as connection
+    /// refused → `Down`, fast, no retries — is intentionally not unit-tested:
+    /// reliably producing a "refused" socket is OS-dependent. On this Windows
+    /// host a just-closed loopback port and the reserved port `:1` both *hang*
+    /// instead of refusing, which would make such a test flaky.)
+    #[tokio::test]
+    async fn probe_reports_unresponsive_when_listening_but_slow() {
+        let base = spawn_health_server(Some(Duration::from_secs(30))).await;
+        // Tiny per-request timeout so each attempt times out quickly.
+        let c = client(Duration::from_millis(150));
+        assert!(
+            matches!(
+                probe_serve_health(&c, &base, 2, Duration::from_millis(10)).await,
+                ServeProbe::Unresponsive
+            ),
+            "listening-but-slow serve must be Unresponsive, not Down"
+        );
     }
 }
