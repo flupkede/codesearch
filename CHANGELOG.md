@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.160] - 2026-06-02
+
+### Fixed
+
+- **`evaluate_csharp_rebuild` no longer holds `config.write()` during git/fs I/O** —
+  the bootstrap timestamp computation (git subprocess + ≤10 000-entry filesystem
+  walk) previously ran while holding the `config` write-lock, blocking every
+  concurrent `config.read()` caller for the full scan duration. The lock is now
+  acquired only for the brief config update; the slow work runs with no lock held.
+- **`evaluate_csharp_rebuild` offloaded to `spawn_blocking` in phase 2** — even
+  after the lock fix, the function ran synchronously on a Tokio worker thread.
+  Wrapped in `spawn_blocking` at the call site in `run_phase_2_csharp_scip` so
+  the async runtime stays responsive while processing all C# candidates.
+- **`build_index()` in warmup and add-repo background task now use `spawn_blocking`** —
+  two sites called the CPU-heavy HNSW `build_index()` directly on async threads.
+  Both now follow the established pattern (`spawn_blocking` + `blocking_write()`).
+- **`reload_if_changed` uses `safe_canonicalize`** — replaces the raw
+  `std::fs::canonicalize` that could leave Windows `\\?\` UNC prefixes on the
+  config path, causing path comparisons to silently fail.
+- **Accurate doc-comments on `relocate_missing` / `prune_stale`** — both
+  methods perform disk I/O (filesystem traversal, git subprocess) and should
+  be called via `spawn_blocking` in async contexts; the comments now say so.
+- **`ensure_hnsw_index_if_needed` extracted and tested** — the safety-net HNSW
+  rebuild logic (detects and repairs a DB with chunks but no index, e.g. after
+  cancellation) is now a named `pub(crate)` function with 3 unit tests
+  (unindexed-with-chunks rebuilds, already-indexed is idempotent, empty DB skips).
+- **`metadata.json` schema consistency** — the normal index path now writes
+  `"partial": false` so readers always find the field regardless of whether
+  indexing completed or was cancelled.
+- **Cancellation finalisation is best-effort** — metadata write, FileMetaStore
+  save, and stats read in the cancel path now log-and-continue on failure
+  instead of propagating `Err`, so the partial chunks remain searchable even
+  if any recovery step fails.
+
+## [1.0.156] - 2026-06-02
+
+### Fixed
+
+- **`reconcile_all_paths` no longer blocks the Tokio async runtime** — the
+  function spawns git subprocesses and holds the config `RwLock` write-guard
+  while scanning the filesystem. It is now offloaded via
+  `tokio::task::spawn_blocking` so Tokio worker threads stay responsive during
+  startup reconciliation.
+- **Phase 1 auto-prune now honours `config_path_override`** — the prune path
+  wrote `repos.json` via `config.save()`, bypassing `ServeState::persist_config`.
+  All save sites in `ServeState` must route through `persist_config` so the
+  override (used in integration tests) is respected. Fixed to use
+  `self.persist_config(&config)`.
+
+
+
 ## [1.0.154] - 2026-06-02
 
 ### Fixed

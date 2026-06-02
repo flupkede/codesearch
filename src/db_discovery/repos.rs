@@ -401,10 +401,16 @@ impl ReposConfig {
     ///
     /// For each missing path a best-effort git-identity relocation is attempted
     /// ([`Self::try_relocate`]); successful matches rewrite the in-memory
-    /// `repos` map. This is pure (no disk I/O, no logging) so callers can decide
-    /// how to report and persist. Returns `(relocated, unresolved)` where
-    /// `relocated` is the list of `(alias, new_path)` rewrites and `unresolved`
-    /// is the list of aliases whose path is still missing.
+    /// `repos` map.
+    ///
+    /// **Note:** this method performs disk I/O (filesystem traversal, git
+    /// subprocess) and should not be called while holding an async lock or from
+    /// an async task without `spawn_blocking`. No logging is emitted — callers
+    /// are responsible for reporting results.
+    ///
+    /// Returns `(relocated, unresolved)` where `relocated` is the list of
+    /// `(alias, new_path)` rewrites and `unresolved` is the list of aliases
+    /// whose path is still missing.
     #[must_use]
     pub fn relocate_missing(&mut self) -> (Vec<(String, PathBuf)>, Vec<String>) {
         let aliases: Vec<String> = self.repos.keys().cloned().collect();
@@ -431,7 +437,12 @@ impl ReposConfig {
     }
 
     /// Prune stale entries: relocate what can be relocated, then unregister the
-    /// rest. Pure (no disk I/O, no logging). Returns `(relocated, removed)`.
+    /// rest.
+    ///
+    /// **Note:** this method performs disk I/O (filesystem traversal, git
+    /// subprocess) via [`Self::relocate_missing`]. No logging is emitted.
+    ///
+    /// Returns `(relocated, removed)`.
     #[must_use]
     pub fn prune_stale(&mut self) -> (Vec<(String, PathBuf)>, Vec<String>) {
         let (relocated, unresolved) = self.relocate_missing();
