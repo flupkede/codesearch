@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.154] - 2026-06-02
+
+### Fixed
+
+- **Windows CI: path-comparison failures in relocation tests** — `scan_for_remote`
+  now canonicalizes discovered paths via `safe_canonicalize()` before recording
+  them, resolving 8.3 short names (e.g. `RUNNER~1`) to their long-name form
+  (`runneradmin`). Test assertions updated to use the same canonicalization so
+  `tempfile::tempdir()` short-name paths and `read_dir` long-name paths compare
+  equal on Windows.
+
 ## [1.0.153] - 2026-06-02
 
 ### Added

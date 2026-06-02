@@ -569,7 +569,9 @@ fn is_skippable_scan_dir(path: &Path) -> bool {
 fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<PathBuf>) {
     if dir.join(".git").exists() {
         if git_remote_url(dir).as_deref() == Some(target_remote) {
-            out.push(dir.to_path_buf());
+            // Canonicalize to resolve 8.3 short names on Windows (e.g. RUNNER~1 →
+            // runneradmin) so stored and found paths are always in the same form.
+            out.push(safe_canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
         }
         return;
     }
@@ -592,6 +594,17 @@ fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Canonicalize then normalize a path for use in test assertions.
+    ///
+    /// On Windows, `tempfile::tempdir()` may return an 8.3 short-name path
+    /// (e.g. `C:/Users/RUNNER~1/...`) while `std::fs::read_dir` can resolve the
+    /// same directory to its long-name form (`C:/Users/runneradmin/...`).
+    /// Applying `safe_canonicalize` before `normalize_path_for_compare` ensures
+    /// both sides of an assertion use the same form.
+    fn canon_norm(p: &Path) -> String {
+        normalize_path_for_compare(&safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+    }
 
     /// Initialise a git repo at `dir` with an `origin` remote pointing at `url`.
     fn init_git_remote(dir: &Path, url: &str) {
@@ -654,10 +667,7 @@ mod tests {
         let found = cfg
             .try_relocate(&alias)
             .expect("should relocate via renamed parent");
-        assert_eq!(
-            normalize_path_for_compare(&found),
-            normalize_path_for_compare(&expected)
-        );
+        assert_eq!(canon_norm(&found), canon_norm(&expected));
     }
 
     #[test]
@@ -704,13 +714,13 @@ mod tests {
         assert_eq!(relocated.len(), 1);
         assert_eq!(relocated[0].0, moved_alias);
         assert_eq!(
-            normalize_path_for_compare(cfg.repos.get(&moved_alias).unwrap()),
-            normalize_path_for_compare(&renamed)
+            canon_norm(cfg.repos.get(&moved_alias).unwrap()),
+            canon_norm(&renamed)
         );
         // The stable repo is untouched.
         assert_eq!(
-            normalize_path_for_compare(cfg.repos.get(&stable_alias).unwrap()),
-            normalize_path_for_compare(&stable)
+            canon_norm(cfg.repos.get(&stable_alias).unwrap()),
+            canon_norm(&stable)
         );
     }
 
@@ -792,10 +802,7 @@ mod tests {
         let found = cfg
             .try_relocate(&alias)
             .expect("should relocate renamed leaf");
-        assert_eq!(
-            normalize_path_for_compare(&found),
-            normalize_path_for_compare(&renamed)
-        );
+        assert_eq!(canon_norm(&found), canon_norm(&renamed));
     }
 
     #[test]
