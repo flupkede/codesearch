@@ -100,6 +100,12 @@ impl Language {
                 | Self::CSharp
                 | Self::Go
                 | Self::Java
+                | Self::Shell
+                | Self::Ruby
+                | Self::Php
+                | Self::Yaml
+                | Self::Json
+                | Self::Markdown
         )
     }
 
@@ -170,8 +176,10 @@ mod tests {
         assert!(Language::Rust.supports_tree_sitter());
         assert!(Language::Python.supports_tree_sitter());
         assert!(Language::TypeScript.supports_tree_sitter());
-        assert!(!Language::Markdown.supports_tree_sitter());
-        assert!(!Language::Json.supports_tree_sitter());
+        assert!(Language::Json.supports_tree_sitter());
+        assert!(Language::Markdown.supports_tree_sitter());
+        // Toml has no tree-sitter grammar yet.
+        assert!(!Language::Toml.supports_tree_sitter());
     }
 
     #[test]

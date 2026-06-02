@@ -868,7 +868,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // Deduplicate by (path, start_line, end_line) — eliminates historical
     // index snapshots that share the same location but have different chunk_ids.
     // Strategy: sort by chunk_id descending (newest first), retain first match.
-    results.sort_by(|a, b| b.id.cmp(&a.id));
+    results.sort_by_key(|b| std::cmp::Reverse(b.id));
     {
         let mut seen_locations: std::collections::HashSet<(String, usize, usize)> =
             std::collections::HashSet::new();
