@@ -26,7 +26,10 @@ Add symbol-aware reference lookups to codesearch via `find_impact` MCP tool. Ret
 - **Gated integration test** — `csharp_helper_integration` cargo feature for full-pipeline testing
 - **CI** — separate `csharp-integration-tests` job in `.github/workflows/ci.yml`
 - **Sequential phase-2 startup** — Phase 1 warms repos sequentially, Phase 2 runs gated C# SCIP rebuilds ordered by `last_changed_unix` under `Semaphore(concurrency)` via `CSHARP_SCIP_CONCURRENCY` env (default **2**, clamp [1,4])
-- **`repos_meta` tracking** — `RepoMeta` (last_changed_unix, last_scip_indexed_unix) persisted in `repos.json` with debounced save (10s window)
+- **`repos_meta` tracking** — `RepoMeta` (last_changed_unix, last_scip_indexed_unix, git_remote) persisted in `repos.json` with debounced save (10s window)
+- **Stale-path resilience** — a renamed/moved indexed folder no longer crashes serve. `git_remote` (`remote.origin.url`) is captured at registration; on startup `ServeState::reconcile_all_paths()` best-effort relocates a missing repo by scanning the nearest existing ancestor (bounded depth, env `CODESEARCH_RELOCATE_MAX_DEPTH`, default 3) for a git root with a matching remote — exactly one match rewrites `repos.json`, otherwise warn + skip. Phase-2/Phase-3 also guard `path.exists()`. Manual cleanup via **`codesearch index prune`** (relocate-first, else unregister stale aliases)
+- **Alias is always derived** — the user-settable `--alias`/`-a` flag was removed from `index add`; the alias always equals the (sanitized) directory name via `ReposConfig::register()`. The alias remains the internal identifier (repos.json key, groups, `project` arg); only user override is gone. The `index symbol <alias>` positional is a lookup key and is retained
+- **Hand-edited `repos.json` tolerated** — `ReposConfig::reconcile()` runs in-memory on every load: drops empty-alias entries, drops orphan `repos_meta`, prunes group members referencing unknown aliases and empty groups. Never renames valid aliases, never crashes
 - **TUI C# indicator** — in status column: green `C#·` ready, yellow `C#…` indexing, red `C#!` error; footer shows helper availability; Calls column with tool call count
 - **Phase 2 & 3 TUI feedback** — Phase 2 pre-marks all queued candidates as `C#…` immediately on discovery (before semaphore slot); Phase 3 pre-warm sets `csharp_index_status = Indexing` before `batch-find-refs` and restores `Ready` after — TUI shows `C#…` throughout without touching `active_reindexes` (avoids blocking HTTP /reindex)
 - **Selective ref cache invalidation** — incremental rebuilds only purge cached refs for affected symbols, not entire cache
@@ -264,6 +267,27 @@ LMDB **does not allow** two `EnvOpenOptions::open()` handles on the same directo
 - The helper is built via: `dotnet publish helpers/csharp/scip-csharp.csproj -r win-x64 --self-contained -c Release`
 - Helper output must be **single-file only**: `scip-csharp.exe` (+ optional `.pdb`). The `.csproj` has `PublishSingleFile=true` which bundles everything into one exe.
 - Do NOT copy framework DLLs, `BuildHost-*` dirs, or `.dll.config` files to the runtime location — only the single `.exe` is needed.
+
+---
+
+## Release workflow — `/merge` and `/release`
+
+Two committed Claude Code slash commands codify the release process
+(`.claude/commands/merge.md`, `.claude/commands/release.md`; force-added past `.gitignore`).
+
+- **`/merge`** — land the current feature branch on `develop`: README/CHANGELOG freshness
+  checks → commit → `cargo fmt`/`check`/`clippy` → push → PR to `develop` → `gh pr merge --auto`
+  (lands after CI). Does **not** tag.
+- **`/release`** — `/merge`, then promote `develop` → `master` via a `Release vX.Y.Z` PR
+  (`protect-master.yml` allows PRs to `master` only from `develop` or `release/*`), then push
+  the `vX.Y.Z` tag that triggers `.github/workflows/release.yml` (6 archives, plain +
+  `-with-csharp`). Includes an optional post-release `master → develop` sync.
+
+**Version rule (encoded in the commands):** the `pre-commit` hook bumps the patch (+1) and
+rebuilds **only on `feature/*` | `features/*` | `fix/*` branches**; `develop`/`master`/`release`/
+`chore` get `cargo fmt` only. So the release version is fixed at the feature-branch commit and
+carries forward unchanged through develop, master, and the tag. `/merge` therefore aborts unless
+run from a feature/fix branch.
 
 ---
 

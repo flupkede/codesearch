@@ -563,21 +563,121 @@ impl ServeState {
         });
     }
 
+    /// Reconcile registered repo paths against the filesystem before warmup.
+    ///
+    /// For each alias whose stored path no longer exists (folder renamed/moved),
+    /// attempt a best-effort git-identity relocation and rewrite `repos.json`.
+    /// When relocation fails the entry is left in place and merely logged — it is
+    /// skipped safely at warmup and never crashes serve. Explicit cleanup of
+    /// unrecoverable entries is available via `codesearch index prune`.
+    pub(crate) fn reconcile_all_paths(self: &Arc<Self>) {
+        let aliases = self.aliases();
+        if aliases.is_empty() {
+            return;
+        }
+
+        let mut config = match self.config.write() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("reconcile: config lock poisoned: {}", e);
+                return;
+            }
+        };
+
+        let (relocated, unresolved) = config.relocate_missing();
+
+        for (alias, new_path) in &relocated {
+            info!("reconcile: relocated '{}' → {}", alias, new_path.display());
+        }
+        for alias in &unresolved {
+            let missing = config
+                .repos
+                .get(alias)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            warn!(
+                "reconcile: '{}' path missing ({}); skipping — \
+                 run `codesearch index prune` to remove it",
+                alias, missing
+            );
+        }
+
+        if !relocated.is_empty() {
+            if let Err(e) = self.persist_config(&config) {
+                warn!("reconcile: failed to persist relocated paths: {}", e);
+            }
+        }
+    }
+
     /// Phase 1: warm all repos sequentially, awaiting incremental refresh per repo.
+    /// Stale entries (database missing or repo path gone) are auto-pruned from repos.json.
     pub(crate) async fn run_phase_1_warmup_all(self: &Arc<Self>) {
         let aliases = self.aliases();
         if aliases.is_empty() {
             return;
         }
         info!("🔥 Phase 1 warmup: {} repos (no FSW)", aliases.len());
+
+        let mut pruned: Vec<String> = Vec::new();
+
         for alias in &aliases {
             match self.warmup_repo(alias).await {
                 Ok(()) => info!("phase-1: warmed '{}'", alias),
-                Err(e) => warn!("phase-1: warmup '{}' failed: {}", alias, e),
+                Err(e) => {
+                    // Auto-prune stale entries where the database or repo path no longer exists.
+                    let should_prune = {
+                        let config = self.config.read().ok();
+                        let path = config.as_ref().and_then(|c| c.resolve(alias));
+                        match path {
+                            Some(p) => {
+                                let db_missing = !p.join(DB_DIR_NAME).exists();
+                                let path_gone = !p.exists();
+                                db_missing || path_gone
+                            }
+                            None => {
+                                // Alias resolves to nothing — definitely stale
+                                true
+                            }
+                        }
+                    };
+
+                    if should_prune {
+                        warn!("phase-1: pruning stale alias '{}' — {}", alias, e);
+                        // Clean up any residual in-memory state
+                        let _ = self.stop_fsw(alias);
+                        self.repos.remove(alias);
+                        self.last_access.remove(alias);
+
+                        // Unregister from repos.json
+                        if let Ok(mut config) = self.config.write() {
+                            if config.unregister_alias(alias) {
+                                if let Err(save_err) = config.save() {
+                                    warn!(
+                                        "phase-1: failed to save repos.json after pruning '{}': {}",
+                                        alias, save_err
+                                    );
+                                } else {
+                                    pruned.push(alias.clone());
+                                }
+                            }
+                        }
+                    } else {
+                        warn!("phase-1: warmup '{}' failed: {}", alias, e);
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        info!("🔥 Phase 1 warmup complete");
+
+        if !pruned.is_empty() {
+            info!(
+                "🔥 Phase 1 warmup complete (pruned {} stale: {})",
+                pruned.len(),
+                pruned.join(", ")
+            );
+        } else {
+            info!("🔥 Phase 1 warmup complete");
+        }
     }
 
     /// Phase 2: semaphore-bounded concurrent C# SCIP rebuilds, sorted by recency.
@@ -662,6 +762,18 @@ impl ServeState {
                         return;
                     }
                 };
+                // Guard against stale entries whose folder was removed/renamed
+                // and could not be relocated: skip rather than run SCIP on a
+                // non-existent path.
+                if !path.exists() {
+                    warn!(
+                        "phase-2: skip '{}' — path missing ({})",
+                        alias,
+                        path.display()
+                    );
+                    drop(permit);
+                    return;
+                }
                 let db_path = path.join(DB_DIR_NAME);
                 trigger_symbol_rebuild(&alias, &path, &db_path, &state).await;
                 drop(permit);
@@ -706,6 +818,11 @@ impl ServeState {
                 Some(p) => p,
                 None => continue,
             };
+
+            // Skip stale entries whose folder no longer exists.
+            if !path.exists() {
+                continue;
+            }
 
             // Only pre-warm repos that have a ready C# index
             let status = self
@@ -2940,6 +3057,7 @@ pub async fn run_serve(
     {
         let phase_state = serve_state.clone();
         tokio::spawn(async move {
+            phase_state.reconcile_all_paths();
             phase_state.run_phase_1_warmup_all().await;
             phase_state.run_phase_2_csharp_scip().await;
             phase_state.run_phase_3_prewarm().await;

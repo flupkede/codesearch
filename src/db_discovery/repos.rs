@@ -24,6 +24,10 @@ pub struct RepoMeta {
     /// Unix timestamp (seconds) of last successful SCIP index rebuild.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scip_indexed_unix: Option<i64>,
+    /// Git remote URL (`remote.origin.url`) captured at registration time.
+    /// Used to re-locate a repo whose folder was renamed/moved (best-effort).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,7 +51,8 @@ impl ReposConfig {
         let content = fs::read_to_string(path)?;
 
         // New format
-        if let Ok(config) = serde_json::from_str::<Self>(&content) {
+        if let Ok(mut config) = serde_json::from_str::<Self>(&content) {
+            config.reconcile();
             return Ok(config);
         }
 
@@ -60,11 +65,13 @@ impl ReposConfig {
                 repos.insert(alias, path);
             }
 
-            return Ok(Self {
+            let mut config = Self {
                 repos,
                 groups: HashMap::new(),
                 repos_meta: HashMap::new(),
-            });
+            };
+            config.reconcile();
+            return Ok(config);
         }
 
         // Both parses failed — file is corrupt
@@ -72,6 +79,65 @@ impl ReposConfig {
             "repos.json is corrupt or unrecognised at: {}",
             path.display()
         ))
+    }
+
+    /// Harden an in-memory config loaded from disk so a hand-edited
+    /// `repos.json` can never crash the app. This is best-effort cleanup,
+    /// performed in memory only (no disk write here):
+    ///
+    /// 1. Drop repo entries whose alias key is empty/blank.
+    /// 2. Drop `repos_meta` entries that reference an unknown alias.
+    /// 3. Prune group members that reference unknown aliases; drop now-empty
+    ///    groups.
+    ///
+    /// Existing (non-empty) alias keys are never renamed — that would break
+    /// group references — so a merely "non-standard" hand-edited alias is
+    /// tolerated as-is.
+    pub(crate) fn reconcile(&mut self) {
+        // 1. Drop empty/blank alias keys.
+        let empty_keys: Vec<String> = self
+            .repos
+            .keys()
+            .filter(|alias| alias.trim().is_empty())
+            .cloned()
+            .collect();
+        for alias in empty_keys {
+            tracing::warn!("repos.json: dropping entry with empty alias key");
+            self.repos.remove(&alias);
+        }
+
+        // 2. Drop meta entries pointing at unknown aliases.
+        let orphan_meta: Vec<String> = self
+            .repos_meta
+            .keys()
+            .filter(|alias| !self.repos.contains_key(*alias))
+            .cloned()
+            .collect();
+        for alias in orphan_meta {
+            tracing::warn!("repos.json: dropping orphan metadata for '{}'", alias);
+            self.repos_meta.remove(&alias);
+        }
+
+        // 3. Prune group members referencing unknown aliases; drop empty groups.
+        let mut empty_groups: Vec<String> = Vec::new();
+        for (group, members) in self.groups.iter_mut() {
+            let before = members.len();
+            members.retain(|alias| self.repos.contains_key(alias));
+            if members.len() != before {
+                tracing::warn!(
+                    "repos.json: pruned {} unknown alias(es) from group '{}'",
+                    before - members.len(),
+                    group
+                );
+            }
+            if members.is_empty() {
+                empty_groups.push(group.clone());
+            }
+        }
+        for group in empty_groups {
+            tracing::warn!("repos.json: dropping now-empty group '{}'", group);
+            self.groups.remove(&group);
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -108,6 +174,9 @@ impl ReposConfig {
         }
 
         let alias = unique_alias_for_path(&self.repos, &canonical);
+        if let Some(remote) = git_remote_url(&canonical) {
+            self.repos_meta.entry(alias.clone()).or_default().git_remote = Some(remote);
+        }
         self.repos.insert(alias.clone(), canonical);
         alias
     }
@@ -137,6 +206,12 @@ impl ReposConfig {
             None => unique_alias_for_path(&self.repos, &canonical),
         };
 
+        if let Some(remote) = git_remote_url(&canonical) {
+            self.repos_meta
+                .entry(final_alias.clone())
+                .or_default()
+                .git_remote = Some(remote);
+        }
         self.repos.insert(final_alias.clone(), canonical);
         Ok(final_alias)
     }
@@ -279,6 +354,95 @@ impl ReposConfig {
             .find(|(_, p)| normalize_path_for_compare(p) == normalize_path_for_compare(&canonical))
             .map(|(alias, _)| alias.clone())
     }
+
+    /// Best-effort relocation of a registered repo whose stored path no longer
+    /// exists (e.g. its folder was renamed/moved). Starting from the nearest
+    /// still-existing ancestor of the stale path, scans (bounded depth) for a
+    /// git repository whose `remote.origin.url` matches the one captured at
+    /// registration time. Returns the new path only on a single unambiguous
+    /// match; `None` when the path still exists, no remote was recorded, or the
+    /// match is absent/ambiguous.
+    pub fn try_relocate(&self, alias: &str) -> Option<PathBuf> {
+        let stale = self.repos.get(alias)?;
+        if stale.exists() {
+            return None; // path is fine — nothing to relocate
+        }
+
+        let target_remote = self.repos_meta.get(alias)?.git_remote.clone()?;
+
+        // Walk up to the nearest ancestor that still exists on disk.
+        let mut anchor = stale.parent();
+        while let Some(dir) = anchor {
+            if dir.exists() {
+                break;
+            }
+            anchor = dir.parent();
+        }
+        let anchor = anchor?;
+
+        let mut matches = Vec::new();
+        scan_for_remote(anchor, &target_remote, relocate_max_depth(), &mut matches);
+
+        // Don't relocate onto a path already registered under another alias.
+        matches.retain(|p| {
+            !self.repos.iter().any(|(a, existing)| {
+                a != alias && normalize_path_for_compare(existing) == normalize_path_for_compare(p)
+            })
+        });
+
+        if matches.len() == 1 {
+            Some(strip_unc_prefix(matches.into_iter().next().unwrap()))
+        } else {
+            None
+        }
+    }
+
+    /// Relocate every registered repo whose stored path no longer exists.
+    ///
+    /// For each missing path a best-effort git-identity relocation is attempted
+    /// ([`Self::try_relocate`]); successful matches rewrite the in-memory
+    /// `repos` map. This is pure (no disk I/O, no logging) so callers can decide
+    /// how to report and persist. Returns `(relocated, unresolved)` where
+    /// `relocated` is the list of `(alias, new_path)` rewrites and `unresolved`
+    /// is the list of aliases whose path is still missing.
+    #[must_use]
+    pub fn relocate_missing(&mut self) -> (Vec<(String, PathBuf)>, Vec<String>) {
+        let aliases: Vec<String> = self.repos.keys().cloned().collect();
+        let mut relocated = Vec::new();
+        let mut unresolved = Vec::new();
+
+        for alias in aliases {
+            let Some(path) = self.repos.get(&alias) else {
+                continue;
+            };
+            if path.exists() {
+                continue;
+            }
+            match self.try_relocate(&alias) {
+                Some(new_path) => {
+                    self.repos.insert(alias.clone(), new_path.clone());
+                    relocated.push((alias, new_path));
+                }
+                None => unresolved.push(alias),
+            }
+        }
+
+        (relocated, unresolved)
+    }
+
+    /// Prune stale entries: relocate what can be relocated, then unregister the
+    /// rest. Pure (no disk I/O, no logging). Returns `(relocated, removed)`.
+    #[must_use]
+    pub fn prune_stale(&mut self) -> (Vec<(String, PathBuf)>, Vec<String>) {
+        let (relocated, unresolved) = self.relocate_missing();
+        let mut removed = Vec::new();
+        for alias in unresolved {
+            if self.unregister_alias(&alias) {
+                removed.push(alias);
+            }
+        }
+        (relocated, removed)
+    }
 }
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -354,10 +518,381 @@ fn normalize_path_for_compare(path: &Path) -> String {
     crate::cache::normalize_path(path)
 }
 
+/// Best-effort lookup of a directory's git remote URL (`remote.origin.url`).
+///
+/// Returns `None` when `git` is unavailable, the path is not a git repo, or the
+/// repo has no `origin` remote. Used both to capture a repo's identity at
+/// registration time and to match candidate directories during relocation.
+pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+/// Configured relocation scan depth (`CODESEARCH_RELOCATE_MAX_DEPTH`, default 3).
+fn relocate_max_depth() -> usize {
+    std::env::var(crate::constants::RELOCATE_MAX_DEPTH_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(crate::constants::DEFAULT_RELOCATE_MAX_DEPTH)
+}
+
+/// Directory names never worth descending into during a relocation scan.
+fn is_skippable_scan_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name == crate::constants::DB_DIR_NAME
+        || matches!(
+            name,
+            ".git" | "node_modules" | "target" | "bin" | "obj" | "dist" | "build"
+        )
+}
+
+/// Recursively collect git roots under `dir` (bounded by `depth`) whose
+/// `remote.origin.url` matches `target_remote`. A matching git root is recorded
+/// and not descended into (nested repos below it are ignored).
+fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<PathBuf>) {
+    if dir.join(".git").exists() {
+        if git_remote_url(dir).as_deref() == Some(target_remote) {
+            // Canonicalize to resolve 8.3 short names on Windows (e.g. RUNNER~1 →
+            // runneradmin) so stored and found paths are always in the same form.
+            out.push(safe_canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        }
+        return;
+    }
+
+    if depth == 0 {
+        return;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() && !is_skippable_scan_dir(&child) {
+                scan_for_remote(&child, target_remote, depth - 1, out);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Canonicalize then normalize a path for use in test assertions.
+    ///
+    /// On Windows, `tempfile::tempdir()` may return an 8.3 short-name path
+    /// (e.g. `C:/Users/RUNNER~1/...`) while `std::fs::read_dir` can resolve the
+    /// same directory to its long-name form (`C:/Users/runneradmin/...`).
+    /// Applying `safe_canonicalize` before `normalize_path_for_compare` ensures
+    /// both sides of an assertion use the same form.
+    fn canon_norm(p: &Path) -> String {
+        normalize_path_for_compare(&safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+    }
+
+    /// Initialise a git repo at `dir` with an `origin` remote pointing at `url`.
+    fn init_git_remote(dir: &Path, url: &str) {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git available in test env")
+        };
+        run(&["init"]);
+        run(&["remote", "add", "origin", url]);
+    }
+
+    #[test]
+    fn captures_git_remote_on_register() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_remote(&repo, "https://example.com/acme/repo.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(repo);
+        assert_eq!(
+            cfg.meta(&alias).git_remote.as_deref(),
+            Some("https://example.com/acme/repo.git")
+        );
+    }
+
+    #[test]
+    fn register_derives_alias_from_directory_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("My.Cool-Repo");
+        std::fs::create_dir(&repo).unwrap();
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(repo.clone());
+        // Alias is derived from (and sanitized from) the directory name.
+        assert_eq!(alias, sanitize_alias("My.Cool-Repo"));
+        assert!(cfg.repos.contains_key(&alias));
+    }
+
+    #[test]
+    fn try_relocate_finds_renamed_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        let repo = parent.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_remote(&repo, "https://example.com/acme/parent-repo.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(repo.clone());
+
+        // Rename the PARENT folder; the stored repo path is now stale, but the
+        // repo itself sits one level below the nearest existing ancestor (tmp).
+        std::fs::rename(&parent, tmp.path().join("parent-renamed")).unwrap();
+
+        let expected = tmp.path().join("parent-renamed").join("repo");
+        let found = cfg
+            .try_relocate(&alias)
+            .expect("should relocate via renamed parent");
+        assert_eq!(canon_norm(&found), canon_norm(&expected));
+    }
+
+    #[test]
+    fn try_relocate_none_beyond_max_depth() {
+        // Default max depth is 3. Bury the repo deeper than that below the
+        // nearest existing ancestor so the scan cannot reach it.
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("oldbox").join("l1").join("l2").join("repo");
+        std::fs::create_dir_all(&deep).unwrap();
+        init_git_remote(&deep, "https://example.com/acme/deep.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(deep.clone());
+
+        // Rename the top box; nearest existing ancestor becomes tmp root, and
+        // the repo now sits 4 levels below it (box/l1/l2/repo) — out of reach.
+        std::fs::rename(tmp.path().join("oldbox"), tmp.path().join("box")).unwrap();
+
+        assert!(
+            cfg.try_relocate(&alias).is_none(),
+            "repo beyond CODESEARCH_RELOCATE_MAX_DEPTH must not be relocated"
+        );
+    }
+
+    #[test]
+    fn relocate_missing_rewrites_only_moved_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let moved = tmp.path().join("moved");
+        let stable = tmp.path().join("stable");
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::create_dir(&stable).unwrap();
+        init_git_remote(&moved, "https://example.com/acme/moved.git");
+        init_git_remote(&stable, "https://example.com/acme/stable.git");
+
+        let mut cfg = ReposConfig::default();
+        let moved_alias = cfg.register(moved.clone());
+        let stable_alias = cfg.register(stable.clone());
+
+        let renamed = tmp.path().join("moved-renamed");
+        std::fs::rename(&moved, &renamed).unwrap();
+
+        let (relocated, unresolved) = cfg.relocate_missing();
+        assert!(unresolved.is_empty());
+        assert_eq!(relocated.len(), 1);
+        assert_eq!(relocated[0].0, moved_alias);
+        assert_eq!(
+            canon_norm(cfg.repos.get(&moved_alias).unwrap()),
+            canon_norm(&renamed)
+        );
+        // The stable repo is untouched.
+        assert_eq!(
+            canon_norm(cfg.repos.get(&stable_alias).unwrap()),
+            canon_norm(&stable)
+        );
+    }
+
+    #[test]
+    fn prune_stale_removes_unrelocatable_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No git remote → cannot be relocated → must be pruned.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(plain.clone());
+        cfg.add_group("g".to_string(), vec![alias.clone()]).unwrap();
+
+        std::fs::rename(&plain, tmp.path().join("plain-moved")).unwrap();
+
+        let (relocated, removed) = cfg.prune_stale();
+        assert!(relocated.is_empty());
+        assert_eq!(removed, vec![alias.clone()]);
+        assert!(!cfg.repos.contains_key(&alias));
+        // unregister_alias also cleans group membership.
+        assert!(!cfg.groups.contains_key("g"));
+    }
+
+    #[test]
+    fn prune_stale_relocates_then_keeps_relocatable_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_remote(&repo, "https://example.com/acme/keep.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(repo.clone());
+
+        let renamed = tmp.path().join("repo-renamed");
+        std::fs::rename(&repo, &renamed).unwrap();
+
+        let (relocated, removed) = cfg.prune_stale();
+        assert!(removed.is_empty());
+        assert_eq!(relocated.len(), 1);
+        assert!(cfg.repos.contains_key(&alias), "relocated entry is kept");
+    }
+
+    #[test]
+    fn load_from_applies_reconcile_to_hand_edited_file() {
+        // A hand-edited repos.json with an empty-alias entry and a group that
+        // references an unknown alias must be reconciled (not crash) on load.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("repos.json");
+        let json = r#"{
+            "repos": { "": "/tmp/blank", "good": "/tmp/good" },
+            "groups": { "mix": ["good", "ghost"], "dead": ["ghost"] },
+            "repos_meta": { "ghost": {} }
+        }"#;
+        std::fs::write(&cfg_path, json).unwrap();
+
+        let cfg = ReposConfig::load_from(&cfg_path).expect("load should succeed");
+        assert!(!cfg.repos.contains_key(""), "empty alias dropped");
+        assert!(cfg.repos.contains_key("good"));
+        assert_eq!(cfg.groups.get("mix"), Some(&vec!["good".to_string()]));
+        assert!(!cfg.groups.contains_key("dead"), "empty group dropped");
+        assert!(!cfg.repos_meta.contains_key("ghost"), "orphan meta dropped");
+    }
+
+    #[test]
+    fn try_relocate_finds_renamed_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("myrepo");
+        std::fs::create_dir(&original).unwrap();
+        init_git_remote(&original, "https://example.com/acme/myrepo.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(original.clone());
+
+        // Rename the leaf folder; stored path is now stale.
+        let renamed = tmp.path().join("myrepo-renamed");
+        std::fs::rename(&original, &renamed).unwrap();
+
+        let found = cfg
+            .try_relocate(&alias)
+            .expect("should relocate renamed leaf");
+        assert_eq!(canon_norm(&found), canon_norm(&renamed));
+    }
+
+    #[test]
+    fn try_relocate_returns_none_when_path_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("live");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_remote(&repo, "https://example.com/acme/live.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(repo);
+        assert!(cfg.try_relocate(&alias).is_none());
+    }
+
+    #[test]
+    fn try_relocate_none_without_recorded_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(plain.clone());
+        assert!(cfg.meta(&alias).git_remote.is_none());
+
+        std::fs::rename(&plain, tmp.path().join("plain-moved")).unwrap();
+        assert!(cfg.try_relocate(&alias).is_none());
+    }
+
+    #[test]
+    fn reconcile_drops_empty_alias_key() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos.insert(String::new(), PathBuf::from("/tmp/x"));
+        cfg.repos
+            .insert("good".to_string(), PathBuf::from("/tmp/good"));
+        cfg.reconcile();
+        assert!(!cfg.repos.contains_key(""));
+        assert!(cfg.repos.contains_key("good"));
+    }
+
+    #[test]
+    fn reconcile_prunes_unknown_group_members_and_empty_groups() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        cfg.groups.insert(
+            "mix".to_string(),
+            vec!["real".to_string(), "ghost".to_string()],
+        );
+        cfg.groups
+            .insert("dead".to_string(), vec!["ghost".to_string()]);
+        cfg.reconcile();
+        assert_eq!(cfg.groups.get("mix"), Some(&vec!["real".to_string()]));
+        assert!(
+            !cfg.groups.contains_key("dead"),
+            "group with only unknown members should be dropped"
+        );
+    }
+
+    #[test]
+    fn reconcile_drops_orphan_meta() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        cfg.repos_meta
+            .insert("ghost".to_string(), RepoMeta::default());
+        cfg.reconcile();
+        assert!(!cfg.repos_meta.contains_key("ghost"));
+    }
+
+    #[test]
+    fn try_relocate_none_when_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("orig");
+        std::fs::create_dir(&original).unwrap();
+        init_git_remote(&original, "https://example.com/acme/dup.git");
+
+        let mut cfg = ReposConfig::default();
+        let alias = cfg.register(original.clone());
+
+        // Two candidates with the same remote → ambiguous → no relocation.
+        let a = tmp.path().join("copy-a");
+        let b = tmp.path().join("copy-b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        init_git_remote(&a, "https://example.com/acme/dup.git");
+        init_git_remote(&b, "https://example.com/acme/dup.git");
+        std::fs::remove_dir_all(&original).unwrap();
+
+        assert!(cfg.try_relocate(&alias).is_none());
+    }
 
     #[test]
     fn test_unique_alias_generation() {

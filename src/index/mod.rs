@@ -1250,10 +1250,43 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
 }
 
 /// Add a repository to the index (creates local or global)
+/// Remove stale entries from `repos.json`.
+///
+/// For each registered repo whose path no longer exists on disk (e.g. its
+/// folder was renamed/moved), a best-effort git-identity relocation is tried
+/// first; only entries that cannot be relocated are unregistered. Prints a
+/// summary of what was relocated/removed.
+pub async fn prune_index() -> Result<()> {
+    use crate::db_discovery::repos::ReposConfig;
+
+    let mut config = ReposConfig::load()?;
+    let (relocated, removed) = config.prune_stale();
+
+    if relocated.is_empty() && removed.is_empty() {
+        println!("✅ No stale repositories found — repos.json is clean.");
+        return Ok(());
+    }
+
+    config.save()?;
+
+    for (alias, path) in &relocated {
+        println!("📍 relocated '{}' → {}", alias, path.display());
+    }
+    for alias in &removed {
+        println!("🗑️  removed stale entry '{}'", alias);
+    }
+    println!(
+        "✅ Prune complete: {} relocated, {} removed.",
+        relocated.len(),
+        removed.len()
+    );
+
+    Ok(())
+}
+
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
-    alias: Option<String>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
@@ -1267,8 +1300,9 @@ pub async fn add_to_index(
     // Serve handles: register in repos.json + create index + warmup.
     let add_delegate = serve_delegate_with_warmup_wait(|| {
         let path = path.clone();
-        let alias = alias.clone();
-        async move { try_delegate_add_to_serve(&path, &alias, global).await }
+        // Alias is always derived from the directory name; the CLI no longer
+        // lets the user set it. Pass None so serve derives it consistently.
+        async move { try_delegate_add_to_serve(&path, &None, global).await }
     })
     .await;
 
@@ -1315,24 +1349,19 @@ pub async fn add_to_index(
             println!("   Type: {}", "Local".bright_green());
         }
 
-        // If an alias is provided and this is a local DB in the current dir,
-        // register it in repos.json (for legacy DB's that predate auto-registration).
-        if alias.is_some() && db.is_current && !db.is_global {
+        // If this is a local DB in the current dir, ensure it is registered in
+        // repos.json (for legacy DBs that predate auto-registration). The alias
+        // is always derived from the directory name.
+        if db.is_current && !db.is_global {
             let mut config = crate::db_discovery::repos::ReposConfig::load().unwrap_or_default();
             if let Some(existing) = config.alias_for_path(&canonical_path) {
                 println!("   Already registered as '{}'.", existing);
             } else {
-                match config.register_with_alias(canonical_path.clone(), alias.clone()) {
-                    Ok(assigned) => {
-                        if let Err(e) = config.save() {
-                            eprintln!("⚠️ Failed to save repos config: {}", e);
-                        } else {
-                            println!("   ✅ Registered as '{}'.", assigned);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️ Registration failed: {}", e);
-                    }
+                let assigned = config.register(canonical_path.clone());
+                if let Err(e) = config.save() {
+                    eprintln!("⚠️ Failed to save repos config: {}", e);
+                } else {
+                    println!("   ✅ Registered as '{}'.", assigned);
                 }
             }
             return Ok(());
@@ -1426,21 +1455,12 @@ pub async fn add_to_index(
         if let Some(existing) = config.alias_for_path(&canonical_path) {
             eprintln!("ℹ️ Already registered as '{}'.", existing);
         } else {
-            match config.register_with_alias(canonical_path.clone(), alias) {
-                Ok(assigned) => {
-                    if let Err(e) = config.save() {
-                        eprintln!("⚠️ Index created, but failed to save repos config: {}", e);
-                        eprintln!("   Config path: {}", config_path.display());
-                    } else {
-                        eprintln!("✅ Registered as '{}'.", assigned);
-                    }
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Index created, but registration failed: {}",
-                        e
-                    ));
-                }
+            let assigned = config.register(canonical_path.clone());
+            if let Err(e) = config.save() {
+                eprintln!("⚠️ Index created, but failed to save repos config: {}", e);
+                eprintln!("   Config path: {}", config_path.display());
+            } else {
+                eprintln!("✅ Registered as '{}'.", assigned);
             }
         }
     }

@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.154] - 2026-06-02
+
+### Fixed
+
+- **Windows CI: path-comparison failures in relocation tests** — `scan_for_remote`
+  now canonicalizes discovered paths via `safe_canonicalize()` before recording
+  them, resolving 8.3 short names (e.g. `RUNNER~1`) to their long-name form
+  (`runneradmin`). Test assertions updated to use the same canonicalization so
+  `tempfile::tempdir()` short-name paths and `read_dir` long-name paths compare
+  equal on Windows.
+
+## [1.0.153] - 2026-06-02
+
+### Added
+
+- **Auto-prune stale repos during Phase 1 warmup** — when a repo fails warmup
+  because its path or database no longer exists, `codesearch serve` now
+  automatically removes it from `repos.json` and logs a warning, instead of
+  silently retrying on every restart. Works in concert with the relocation pass
+  (reconcile_all_paths): relocatable repos are rewritten first, truly missing
+  ones are pruned.
+
+### Fixed
+
+- **Missing `YELLOW` color variable in `scripts/qc.sh`** — the variable was
+  referenced but never declared, causing a visual glitch in QC output.
+
+## [1.0.152] - 2026-06-02
+
+### Added
+
+- **Best-effort relocation of moved/renamed repositories** — every repo's git
+  remote (`remote.origin.url`) is now captured at registration. When a
+  registered folder is renamed or moved, `codesearch serve` no longer crashes:
+  on startup it reconciles all paths, and for each missing path it scans nearby
+  folders (bounded depth, override with `CODESEARCH_RELOCATE_MAX_DEPTH`, default
+  `3`) for a git checkout with the same remote. A single unambiguous match is
+  rewritten into `repos.json`; ambiguous/absent matches are logged and skipped
+  (the dead path is never indexed). Phase-2 (C# SCIP) and Phase-3 (pre-warm)
+  also guard `path.exists()` so a stale path can never reach heavy code paths.
+- **`codesearch index prune`** — new command that relocates moved repos first,
+  then unregisters any remaining stale entries, printing a summary.
+
+### Changed
+
+- **The user-settable `--alias`/`-a` flag was removed from `index add`** — the
+  alias (the `repos.json` key, used by groups and the MCP `project` argument) is
+  now always derived from the repository directory name. In practice the alias
+  always had to equal the directory name, so a custom alias only caused
+  downstream mismatches. The `index symbol <alias>` positional (a lookup key) is
+  unchanged.
+
+### Fixed
+
+- **A hand-edited or corrupt-ish `repos.json` no longer crashes the app** — on
+  load the config is reconciled in memory: entries with empty/blank alias keys
+  are dropped, orphaned `repos_meta` is removed, and group members referencing
+  unknown aliases (and groups left empty) are pruned. Valid aliases are never
+  renamed (that would break group references).
+
+## [1.0.146] - 2026-06-02
+
+### Added
+
+- **Semantic Markdown chunking** — Markdown files (`.md`, `.markdown`, `.txt`) are
+  now parsed with the **tree-sitter-md block grammar**, so chunks align to sections,
+  headings, and code fences instead of arbitrary line ranges. `Language::Markdown`
+  now reports `supports_tree_sitter() == true` and has a compiled-in grammar.
+
+### Changed
+
+- **Supported-languages documentation corrected** — the README language table now
+  lists all 15 tree-sitter languages actually supported (Rust, Python, JavaScript,
+  TypeScript, C, C++, C#, Go, Java, Shell, Ruby, PHP, YAML, JSON, Markdown);
+  it previously showed only 9, omitting Shell, Ruby, PHP, YAML, JSON, and Markdown.
+
 ## [1.0.142] - 2026-06-01
 
 ### Fixed

@@ -20,10 +20,6 @@ pub enum IndexCommands {
         /// Create global index instead of local
         #[arg(short = 'g', long)]
         global: bool,
-
-        /// Alias for this repository (auto-generated from directory name if omitted)
-        #[arg(short, long)]
-        alias: Option<String>,
     },
 
     /// Remove the index (local or global, auto-detected)
@@ -49,6 +45,9 @@ pub enum IndexCommands {
         #[arg(short = 'f', long)]
         force: bool,
     },
+
+    /// Remove stale entries from repos.json (relocates moved repos first)
+    Prune,
 }
 
 /// Cache subcommands
@@ -234,10 +233,6 @@ pub enum Commands {
         /// Create global index instead of local (only with --add)
         #[arg(short = 'g', long)]
         global: bool,
-
-        /// Alias for this repository (only with --add)
-        #[arg(short, long)]
-        alias: Option<String>,
 
         /// Remove the index (local or global, auto-detected)
         #[arg(long, visible_alias = "rm")]
@@ -532,7 +527,6 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             symbols,
             add,
             global,
-            alias,
             remove,
             keep_config,
             list,
@@ -543,11 +537,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     IndexCommands::Add {
                         path: add_path,
                         global,
-                        alias,
-                    } => {
-                        crate::index::add_to_index(add_path, global, alias, cancel_token.clone())
-                            .await
-                    }
+                    } => crate::index::add_to_index(add_path, global, cancel_token.clone()).await,
                     IndexCommands::Remove {
                         path: rm_path,
                         keep_config,
@@ -556,6 +546,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     IndexCommands::Symbol { alias, force } => {
                         trigger_symbol_reindex_via_api(&alias, force).await
                     }
+                    IndexCommands::Prune => crate::index::prune_index().await,
                 }
             } else {
                 // Flag-based backward-compat path
@@ -569,8 +560,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
                 if add || is_add_cmd {
                     let effective_path = if is_add_cmd { None } else { path };
-                    crate::index::add_to_index(effective_path, global, alias, cancel_token.clone())
-                        .await
+                    crate::index::add_to_index(effective_path, global, cancel_token.clone()).await
                 } else if remove || is_rm_cmd {
                     let effective_path = if is_rm_cmd { None } else { path };
                     crate::index::remove_from_index(effective_path, keep_config).await
@@ -911,22 +901,32 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_index_add_accepts_alias_flag() {
-        let cli = Cli::try_parse_from([
+    fn test_cli_index_add_rejects_alias_flag() {
+        // The user-settable alias was removed; the flag must no longer parse.
+        let result = Cli::try_parse_from([
             "codesearch",
             "index",
             "add",
             "/tmp/foo",
             "--alias",
             "myrepo",
-        ])
-        .expect("cli parse should succeed");
+        ]);
+        assert!(
+            result.is_err(),
+            "'--alias' flag should no longer be accepted on `index add`"
+        );
+    }
+
+    #[test]
+    fn test_cli_index_add_parses_without_alias() {
+        let cli = Cli::try_parse_from(["codesearch", "index", "add", "/tmp/foo"])
+            .expect("cli parse should succeed");
         match cli.command {
             Commands::Index {
-                command: Some(IndexCommands::Add { alias: Some(a), .. }),
+                command: Some(IndexCommands::Add { path: Some(p), .. }),
                 ..
-            } => assert_eq!(a, "myrepo"),
-            _ => panic!("expected Index::Add subcommand with alias"),
+            } => assert_eq!(p, std::path::PathBuf::from("/tmp/foo")),
+            _ => panic!("expected Index::Add subcommand"),
         }
     }
 
