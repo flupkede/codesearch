@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.156] - 2026-06-02
+
+### Fixed
+
+- **`reconcile_all_paths` no longer blocks the Tokio async runtime** — the
+  function spawns git subprocesses and holds the config `RwLock` write-guard
+  while scanning the filesystem. It is now offloaded via
+  `tokio::task::spawn_blocking` so Tokio worker threads stay responsive during
+  startup reconciliation.
+- **Phase 1 auto-prune now honours `config_path_override`** — the prune path
+  wrote `repos.json` via `config.save()`, bypassing `ServeState::persist_config`.
+  All save sites in `ServeState` must route through `persist_config` so the
+  override (used in integration tests) is respected. Fixed to use
+  `self.persist_config(&config)`.
+
+
+
 ## [1.0.154] - 2026-06-02
 
 ### Fixed
