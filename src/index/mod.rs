@@ -23,6 +23,31 @@ pub use manager::{
     is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores,
 };
 
+/// Ensure the HNSW vector index is built if it was never built in a previous
+/// (possibly cancelled) run.
+///
+/// Returns `true` if the index was rebuilt, `false` if nothing needed to be
+/// done (already indexed, or no chunks present). Returns an error only if the
+/// database cannot be opened or `build_index` fails; a failure reading stats is
+/// treated as a warning and returns `Ok(false)`.
+pub(crate) fn ensure_hnsw_index_if_needed(
+    db_path: &Path,
+    dimensions: usize,
+) -> anyhow::Result<bool> {
+    let mut vs = VectorStore::new(db_path, dimensions)?;
+    match vs.stats() {
+        Ok(s) if s.total_chunks > 0 && !s.indexed => {
+            vs.build_index()?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(e) => {
+            tracing::warn!("could not check vector index status: {}", e);
+            Ok(false)
+        }
+    }
+}
+
 /// Update metadata.json with current chunk/file counts so that `status(projects)`
 /// can report accurate numbers without opening LMDB.
 pub(crate) fn update_metadata_stats(db_path: &Path, total_chunks: usize, total_files: usize) {
@@ -631,28 +656,20 @@ async fn index_with_options(
             // Safety net: if a previous run was cancelled/interrupted mid-way,
             // the HNSW vector index may never have been built. Detect this and
             // rebuild now so the database is usable without requiring --force.
-            {
-                let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
-                match vs.stats() {
-                    Ok(s) if s.total_chunks > 0 && !s.indexed => {
-                        log_print!(
-                            "\n{}",
-                            format!(
-                                "🔨 Vector index not built ({} chunks found from previous run). Rebuilding...",
-                                s.total_chunks
-                            )
+            match ensure_hnsw_index_if_needed(&db_path, model_type.dimensions()) {
+                Ok(true) => {
+                    log_print!(
+                        "\n{}",
+                        "🔨 Vector index not built from previous run — rebuilt successfully."
                             .yellow()
-                        );
-                        vs.build_index()?;
-                        log_print!("{}", "✅ Vector index rebuilt successfully!".green());
-                    }
-                    Ok(_) => {} // already indexed or no chunks — all good
-                    Err(e) => {
-                        log_print!(
-                            "{}",
-                            format!("⚠️  Could not check vector index status: {}", e).yellow()
-                        );
-                    }
+                    );
+                }
+                Ok(false) => {} // already indexed or no chunks — all good
+                Err(e) => {
+                    log_print!(
+                        "{}",
+                        format!("⚠️  Could not rebuild vector index: {}", e).yellow()
+                    );
                 }
             }
 
@@ -957,47 +974,83 @@ async fn index_with_options(
             log_print!("   ✅ Vector index built");
         }
 
-        // Save metadata
-        std::fs::write(
-            db_path.join("metadata.json"),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "model_short_name": model_type.short_name(),
-                "model_name": model_type.name(),
-                "dimensions": model_type.dimensions(),
-                "indexed_at": chrono::Utc::now().to_rfc3339(),
-                "partial": true,
-            }))?,
-        )?;
+        // Save metadata — best-effort: log and continue on failure so the
+        // partial chunks we already built are still searchable.
+        let metadata_json = serde_json::to_string_pretty(&serde_json::json!({
+            "model_short_name": model_type.short_name(),
+            "model_name": model_type.name(),
+            "dimensions": model_type.dimensions(),
+            "indexed_at": chrono::Utc::now().to_rfc3339(),
+            "partial": true,
+        }));
+        match metadata_json {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(db_path.join("metadata.json"), json) {
+                    log_print!("{}   metadata.json write warning: {}", "⚠️ ".yellow(), e);
+                }
+            }
+            Err(e) => {
+                log_print!(
+                    "{}   metadata.json serialise warning: {}",
+                    "⚠️ ".yellow(),
+                    e
+                );
+            }
+        }
 
-        // Update FileMetaStore with the files that were actually processed
+        // Update FileMetaStore with the files that were actually processed.
+        // Also best-effort: a failed save means the next incremental run will
+        // re-process those files, which is acceptable for a cancelled index.
         if !file_chunks.is_empty() {
-            if is_incremental {
+            let save_result = if is_incremental {
                 let mut meta = file_meta_store.take().unwrap();
                 for (file_path, chunk_ids) in file_chunks {
-                    meta.update_file(Path::new(&file_path), chunk_ids)?;
+                    if let Err(e) = meta.update_file(Path::new(&file_path), chunk_ids) {
+                        log_print!(
+                            "{}   file-meta update warning for '{}': {}",
+                            "⚠️ ".yellow(),
+                            file_path,
+                            e
+                        );
+                    }
                 }
-                meta.save(&db_path)?;
+                meta.save(&db_path)
             } else {
                 let mut meta = FileMetaStore::new(
                     model_type.short_name().to_string(),
                     model_type.dimensions(),
                 );
                 for (file_path, chunk_ids) in file_chunks {
-                    meta.update_file(Path::new(&file_path), chunk_ids)?;
+                    if let Err(e) = meta.update_file(Path::new(&file_path), chunk_ids) {
+                        log_print!(
+                            "{}   file-meta update warning for '{}': {}",
+                            "⚠️ ".yellow(),
+                            file_path,
+                            e
+                        );
+                    }
                 }
-                meta.save(&db_path)?;
+                meta.save(&db_path)
+            };
+            if let Err(e) = save_result {
+                log_print!("{}   file-meta save warning: {}", "⚠️ ".yellow(), e);
             }
         }
 
-        // Persist stats
-        let db_stats = store.stats()?;
-        update_metadata_stats(&db_path, db_stats.total_chunks, db_stats.total_files);
-
-        log_print!(
-            "   Partial index finalised: {} chunks, {} files",
-            db_stats.total_chunks,
-            db_stats.total_files
-        );
+        // Persist stats — best-effort, only for display; failures are non-fatal.
+        match store.stats() {
+            Ok(db_stats) => {
+                update_metadata_stats(&db_path, db_stats.total_chunks, db_stats.total_files);
+                log_print!(
+                    "   Partial index finalised: {} chunks, {} files",
+                    db_stats.total_chunks,
+                    db_stats.total_files
+                );
+            }
+            Err(e) => {
+                log_print!("{}   Could not read final stats: {}", "⚠️ ".yellow(), e);
+            }
+        }
         log_print!(
             "{}   Run {} to index the remaining files",
             "💡 ".cyan(),
@@ -1088,12 +1141,15 @@ async fn index_with_options(
     store.build_index()?;
     let _storage_duration = storage_start.elapsed();
 
-    // Save model metadata
+    // Save model metadata.  `partial: false` is explicit so the schema matches
+    // the cancel path (which writes `partial: true`); readers can always check
+    // the field regardless of how indexing completed.
     let metadata = serde_json::json!({
         "model_short_name": model_short_name,
         "model_name": model_name,
         "dimensions": model_dimensions,
         "indexed_at": chrono::Utc::now().to_rfc3339(),
+        "partial": false,
     });
     std::fs::write(
         db_path.join("metadata.json"),
@@ -2309,5 +2365,105 @@ mod serve_probe_tests {
             ),
             "listening-but-slow serve must be Unresponsive, not Down"
         );
+    }
+}
+
+#[cfg(test)]
+mod index_quality_tests {
+    use super::ensure_hnsw_index_if_needed;
+    use crate::chunker::{Chunk, ChunkKind};
+    use crate::embed::EmbeddedChunk;
+    use crate::vectordb::VectorStore;
+    use tempfile::tempdir;
+
+    /// Helper: create a minimal EmbeddedChunk with `dims`-dimensional embedding.
+    fn fake_chunk(path: &str, dims: usize) -> EmbeddedChunk {
+        EmbeddedChunk::new(
+            Chunk::new(
+                "fn dummy() {}".to_string(),
+                0,
+                1,
+                ChunkKind::Function,
+                path.to_string(),
+            ),
+            vec![1.0_f32 / (dims as f32).sqrt(); dims],
+        )
+    }
+
+    /// `ensure_hnsw_index_if_needed` returns `true` and leaves the DB indexed
+    /// when there are chunks but the HNSW index was never built (simulates a
+    /// prior cancellation that finished inserting chunks but never called
+    /// `build_index`).
+    #[test]
+    fn rebuilds_unindexed_db_with_chunks() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        const DIMS: usize = 4;
+
+        // Insert a chunk without calling build_index — simulate cancelled run.
+        {
+            let mut vs = VectorStore::new(&db_path, DIMS).unwrap();
+            vs.insert_chunks(vec![fake_chunk("foo.rs", DIMS)]).unwrap();
+            // Deliberately do NOT call vs.build_index()
+            let s = vs.stats().unwrap();
+            assert!(s.total_chunks > 0, "precondition: DB has chunks");
+            assert!(!s.indexed, "precondition: index not yet built");
+        }
+
+        // Safety-net must detect and rebuild the index.
+        let rebuilt = ensure_hnsw_index_if_needed(&db_path, DIMS)
+            .expect("ensure_hnsw_index_if_needed should not error");
+        assert!(
+            rebuilt,
+            "expected the function to report it rebuilt the index"
+        );
+
+        // Verify: DB is now indexed.
+        let vs = VectorStore::new(&db_path, DIMS).unwrap();
+        assert!(
+            vs.is_indexed(),
+            "VectorStore must be indexed after ensure_hnsw_index_if_needed"
+        );
+    }
+
+    /// `ensure_hnsw_index_if_needed` returns `false` (no rebuild) when the DB
+    /// is already indexed — repeated calls must be idempotent.
+    #[test]
+    fn no_rebuild_when_already_indexed() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        const DIMS: usize = 4;
+
+        {
+            let mut vs = VectorStore::new(&db_path, DIMS).unwrap();
+            vs.insert_chunks(vec![fake_chunk("bar.rs", DIMS)]).unwrap();
+            vs.build_index().unwrap();
+            assert!(vs.is_indexed(), "precondition: already indexed");
+        }
+
+        let rebuilt = ensure_hnsw_index_if_needed(&db_path, DIMS)
+            .expect("should succeed on already-indexed DB");
+        assert!(
+            !rebuilt,
+            "should not report a rebuild on an already-indexed DB"
+        );
+    }
+
+    /// `ensure_hnsw_index_if_needed` returns `false` (no rebuild) for an empty
+    /// DB (no chunks, nothing to index).
+    #[test]
+    fn no_rebuild_for_empty_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        const DIMS: usize = 4;
+
+        // Empty DB — no chunks inserted.
+        {
+            let _vs = VectorStore::new(&db_path, DIMS).unwrap();
+        }
+
+        let rebuilt =
+            ensure_hnsw_index_if_needed(&db_path, DIMS).expect("should succeed on empty DB");
+        assert!(!rebuilt, "empty DB needs no rebuild");
     }
 }
