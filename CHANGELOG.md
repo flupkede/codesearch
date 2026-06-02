@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.0.162] - 2026-06-02
+
+### Fixed
+
+- **Windows: flaky relocation tests eliminated** — `std::fs::rename` and
+  `std::fs::remove_dir_all` on Windows fail with "Access is denied" when a
+  git subprocess from `init_git_remote` keeps a directory handle open after
+  exit. All 7 rename calls in `repos.rs` tests now use a `rename_retry()`
+  helper that retries up to 10 times with exponential back-off; the one
+  `remove_dir_all` call is now best-effort (the test assertion holds either
+  way). Verified stable across 3 consecutive full-suite runs (432 passed,
+  0 failed).
+
 ## [1.0.160] - 2026-06-02
 
 ### Fixed

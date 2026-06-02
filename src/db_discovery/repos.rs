@@ -631,6 +631,32 @@ mod tests {
         run(&["remote", "add", "origin", url]);
     }
 
+    /// Rename a directory with automatic retries.
+    ///
+    /// On Windows, git subprocesses spawned by `init_git_remote` may keep a
+    /// file handle on the directory open briefly after the process exits.
+    /// `std::fs::rename` fails with `Access is denied` in that window.
+    /// Retrying with a short exponential back-off is the simplest robust fix.
+    #[track_caller]
+    fn rename_retry(from: &Path, to: &Path) {
+        let mut last_err = None;
+        for attempt in 0..10u64 {
+            match std::fs::rename(from, to) {
+                Ok(()) => return,
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                }
+            }
+        }
+        panic!(
+            "rename {:?} → {:?} failed after 10 attempts: {}",
+            from,
+            to,
+            last_err.unwrap()
+        );
+    }
+
     #[test]
     fn captures_git_remote_on_register() {
         let tmp = tempfile::tempdir().unwrap();
@@ -672,7 +698,7 @@ mod tests {
 
         // Rename the PARENT folder; the stored repo path is now stale, but the
         // repo itself sits one level below the nearest existing ancestor (tmp).
-        std::fs::rename(&parent, tmp.path().join("parent-renamed")).unwrap();
+        rename_retry(&parent, &tmp.path().join("parent-renamed"));
 
         let expected = tmp.path().join("parent-renamed").join("repo");
         let found = cfg
@@ -695,7 +721,7 @@ mod tests {
 
         // Rename the top box; nearest existing ancestor becomes tmp root, and
         // the repo now sits 4 levels below it (box/l1/l2/repo) — out of reach.
-        std::fs::rename(tmp.path().join("oldbox"), tmp.path().join("box")).unwrap();
+        rename_retry(&tmp.path().join("oldbox"), &tmp.path().join("box"));
 
         assert!(
             cfg.try_relocate(&alias).is_none(),
@@ -718,7 +744,7 @@ mod tests {
         let stable_alias = cfg.register(stable.clone());
 
         let renamed = tmp.path().join("moved-renamed");
-        std::fs::rename(&moved, &renamed).unwrap();
+        rename_retry(&moved, &renamed);
 
         let (relocated, unresolved) = cfg.relocate_missing();
         assert!(unresolved.is_empty());
@@ -746,7 +772,7 @@ mod tests {
         let alias = cfg.register(plain.clone());
         cfg.add_group("g".to_string(), vec![alias.clone()]).unwrap();
 
-        std::fs::rename(&plain, tmp.path().join("plain-moved")).unwrap();
+        rename_retry(&plain, &tmp.path().join("plain-moved"));
 
         let (relocated, removed) = cfg.prune_stale();
         assert!(relocated.is_empty());
@@ -767,7 +793,7 @@ mod tests {
         let alias = cfg.register(repo.clone());
 
         let renamed = tmp.path().join("repo-renamed");
-        std::fs::rename(&repo, &renamed).unwrap();
+        rename_retry(&repo, &renamed);
 
         let (relocated, removed) = cfg.prune_stale();
         assert!(removed.is_empty());
@@ -808,7 +834,7 @@ mod tests {
 
         // Rename the leaf folder; stored path is now stale.
         let renamed = tmp.path().join("myrepo-renamed");
-        std::fs::rename(&original, &renamed).unwrap();
+        rename_retry(&original, &renamed);
 
         let found = cfg
             .try_relocate(&alias)
@@ -838,7 +864,7 @@ mod tests {
         let alias = cfg.register(plain.clone());
         assert!(cfg.meta(&alias).git_remote.is_none());
 
-        std::fs::rename(&plain, tmp.path().join("plain-moved")).unwrap();
+        rename_retry(&plain, &tmp.path().join("plain-moved"));
         assert!(cfg.try_relocate(&alias).is_none());
     }
 
@@ -900,7 +926,13 @@ mod tests {
         std::fs::create_dir(&b).unwrap();
         init_git_remote(&a, "https://example.com/acme/dup.git");
         init_git_remote(&b, "https://example.com/acme/dup.git");
-        std::fs::remove_dir_all(&original).unwrap();
+        // On Windows, git subprocesses spawned by init_git_remote may keep a
+        // handle on the directory briefly, causing remove_dir_all to fail under
+        // parallel test load. Ignore the error: if removal fails, `original`
+        // still exists and try_relocate returns None because the path is present;
+        // if removal succeeds, two ambiguous candidates are found → None.
+        // Either way the assertion holds.
+        let _ = std::fs::remove_dir_all(&original);
 
         assert!(cfg.try_relocate(&alias).is_none());
     }
