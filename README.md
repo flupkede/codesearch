@@ -353,7 +353,7 @@ crashing.
 Groups let you search across related repositories:
 
 ```bash
-codesearch groups add my-group repo1 repo2 repo3
+codesearch groups add my-group --aliases repo1 repo2 repo3
 codesearch groups list
 ```
 
