@@ -190,6 +190,7 @@ mod tests {
             results: vec![],
             low_confidence: Some(true),
             suggested_tool: Some("literal_search".to_string()),
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"low_confidence\":true"));
@@ -210,9 +211,12 @@ mod tests {
                 content: None,
                 context_prev: None,
                 context_next: None,
+                source: None,
+                chunk_ref: None,
             }],
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("low_confidence"));
@@ -954,9 +958,12 @@ mod tests {
                 content: None,
                 context_prev: None,
                 context_next: None,
+                source: None,
+                chunk_ref: None,
             }],
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"results\""));
@@ -970,6 +977,7 @@ mod tests {
             results: vec![],
             low_confidence: Some(true),
             suggested_tool: Some("find_definition".to_string()),
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"low_confidence\":true"));
@@ -3933,6 +3941,239 @@ impl CodesearchService {
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // Federation — cross-instance query merging (remote peers in a group).
+    // See docs/federation-feature.md.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Load the current repos config: from the live serve state when available,
+    /// else straight from disk (stdio mode). A missing disk file yields the
+    /// default (empty) config — federation simply has no peers to query.
+    fn federation_config(&self) -> crate::db_discovery::repos::ReposConfig {
+        if let Some(ref ss) = self.serve_state {
+            return ss.config_snapshot();
+        }
+        crate::db_discovery::repos::ReposConfig::load().unwrap_or_default()
+    }
+
+    /// True when the given group resolves to at least one remote peer.
+    fn group_has_remotes(cfg: &crate::db_discovery::repos::ReposConfig, group: &str) -> bool {
+        cfg.resolve_group_targets(group)
+            .iter()
+            .any(|t| matches!(t, crate::db_discovery::repos::Target::Remote { .. }))
+    }
+
+    /// Merge local + remote search results for a group that has `@<peer>`
+    /// members. Runs the local query (restricted to the group's local repos),
+    /// fans out to every remote peer in parallel, then RRF-interleaves the
+    /// disjoint ranked lists. One unreachable peer becomes a `warning`, never a
+    /// hard failure.
+    async fn federated_search(
+        &self,
+        request: &SearchRequest,
+        cfg: &crate::db_discovery::repos::ReposConfig,
+        remotes: Vec<(String, crate::db_discovery::repos::RemotePeer)>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::federation::{FederationClient, Outcome};
+        use crate::rerank::DEFAULT_RRF_K;
+
+        let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
+        let limit = request.limit.unwrap_or(10);
+        let group = request.group.clone().unwrap_or_default();
+
+        // 1) Local results — internal handlers ignore `@remote` group members
+        //    (they aren't local aliases), so they search only the group's local
+        //    repos. Skip entirely when the group has no local repos.
+        let (locals, _) = cfg.split_group_targets(&group);
+        let mut local_items: Vec<SearchResultItem> = Vec::new();
+        if !locals.is_empty() {
+            let local_result = match mode.as_str() {
+                "semantic" => {
+                    let req = SemanticSearchRequest {
+                        query: request.query.clone(),
+                        limit: request.limit,
+                        compact: request.compact,
+                        filter_path: request.filter_path.clone(),
+                        mode: request.semantic_mode.clone(),
+                        project: None,
+                        group: Some(group.clone()),
+                    };
+                    self.semantic_search(Parameters(req)).await?
+                }
+                "literal" => {
+                    let req = LiteralSearchRequest {
+                        query: request.query.clone(),
+                        regex: request.regex,
+                        phrase: request.phrase,
+                        limit: request.limit,
+                        file_glob: request.file_glob.clone(),
+                        language: request.language.clone(),
+                        format: request.format.clone(),
+                        project: None,
+                        group: Some(group.clone()),
+                    };
+                    self.literal_search(Parameters(req)).await?
+                }
+                _ => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Unknown search mode '{}'. Use `semantic` or `literal`.",
+                        mode
+                    ))]));
+                }
+            };
+            local_items = parse_search_items_from_call_result(&local_result, &mode);
+        }
+
+        // 2) Build the request body shipped to each remote (group forced to the
+        //    peer's own scope + project stripped by the federation client).
+        let body = serde_json::json!({
+            "query": request.query,
+            "mode": mode,
+            "compact": request.compact,
+            "semantic_mode": request.semantic_mode,
+            "filter_path": request.filter_path,
+            "regex": request.regex,
+            "phrase": request.phrase,
+            "file_glob": request.file_glob,
+            "language": request.language,
+            "format": request.format,
+            "limit": request.limit,
+        });
+
+        let client = match FederationClient::new() {
+            Ok(c) => c,
+            Err(e) => {
+                // Can't build the HTTP client at all — degrade to local-only.
+                return Ok(self.build_federated_response(
+                    local_items,
+                    limit,
+                    vec![format!("federation disabled (http client error): {e}")],
+                ));
+            }
+        };
+
+        // 3) Fan out to all remote peers concurrently.
+        let mut join = tokio::task::JoinSet::new();
+        for (peer_name, peer) in remotes.into_iter() {
+            let body = body.clone();
+            let client = client.clone();
+            join.spawn(async move {
+                let outcome = client.search(&peer, body).await;
+                (peer_name, outcome)
+            });
+        }
+
+        let mut warnings: Vec<String> = Vec::new();
+        let mut all_lists: Vec<Vec<SearchResultItem>> = vec![local_items];
+        while let Some(res) = join.join_next().await {
+            match res {
+                Ok((peer_name, Outcome::Ok(items))) => {
+                    all_lists.push(
+                        items
+                            .into_iter()
+                            .map(|it| convert_remote_item(&peer_name, it))
+                            .collect(),
+                    );
+                }
+                Ok((peer_name, Outcome::Unreachable(reason))) => {
+                    warnings.push(format!(
+                        "remote peer '{}' unreachable: {}",
+                        peer_name, reason
+                    ));
+                }
+                Err(joinerr) => {
+                    warnings.push(format!("federation task failed: {joinerr}"));
+                }
+            }
+        }
+
+        // 4) RRF-interleave the disjoint ranked lists and render.
+        let merged = merge_ranked_lists(all_lists, DEFAULT_RRF_K, limit);
+        Ok(self.build_federated_response(merged, limit, warnings))
+    }
+
+    /// Fetch a chunk from a remote peer by its namespaced `chunk_ref`.
+    async fn federated_get_chunk(
+        &self,
+        chunk_ref: &str,
+        context_lines: Option<usize>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::federation::{FederationClient, Outcome};
+
+        let (peer_name, id_str) = match chunk_ref.split_once(':') {
+            Some((p, i)) => (p, i),
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Invalid chunk_ref '{}': expected '<peer>:<chunk_id>'.",
+                    chunk_ref
+                ))]));
+            }
+        };
+        let chunk_id: u32 = match id_str.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Invalid chunk_ref '{}': chunk_id is not a number.",
+                    chunk_ref
+                ))]));
+            }
+        };
+        let cfg = self.federation_config();
+        let peer = match cfg.remotes.get(peer_name) {
+            Some(p) => p.clone(),
+            None => {
+                let known: Vec<String> = cfg.remotes.keys().cloned().collect();
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Unknown remote peer '{}' in chunk_ref '{}'. Known remotes: {}",
+                    peer_name,
+                    chunk_ref,
+                    known.join(", ")
+                ))]));
+            }
+        };
+        let client = match FederationClient::new() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "federation disabled (http client error): {e}"
+                ))]));
+            }
+        };
+        match client.get_chunk(&peer, chunk_id, context_lines).await {
+            Outcome::Ok(value) => Ok(CallToolResult::success(vec![Content::text(
+                value.to_string(),
+            )])),
+            Outcome::Unreachable(reason) => {
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Could not fetch chunk from remote peer '{}': {}",
+                    peer_name, reason
+                ))]))
+            }
+        }
+    }
+
+    /// Render the merged federated results as a `SemanticSearchResponse` JSON.
+    fn build_federated_response(
+        &self,
+        items: Vec<SearchResultItem>,
+        _limit: usize,
+        warnings: Vec<String>,
+    ) -> CallToolResult {
+        let low_confidence = items.first().map(|f| f.score < 0.15).unwrap_or(true);
+        let response = SemanticSearchResponse {
+            results: items,
+            low_confidence: if low_confidence { Some(true) } else { None },
+            suggested_tool: None,
+            warnings: if warnings.is_empty() {
+                None
+            } else {
+                Some(warnings)
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+        CallToolResult::success(vec![Content::text(json)])
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // Consolidated tools (the primary 5-tool surface)
     // ─────────────────────────────────────────────────────────────────
 
@@ -3951,6 +4192,20 @@ impl CodesearchService {
             request.project,
             request.group,
         );
+
+        // Federation: when the query targets a group that resolves to one or more
+        // remote peers, merge local + remote results (RRF-interleave) instead of
+        // searching local repos only. Only `group` federates; `project` stays
+        // local because project aliases are instance-local. See
+        // `docs/federation-feature.md`.
+        if let Some(group) = request.group.as_deref() {
+            let cfg = self.federation_config();
+            if Self::group_has_remotes(&cfg, group) {
+                let remotes = cfg.split_group_targets(group).1;
+                return self.federated_search(&request, &cfg, remotes).await;
+            }
+        }
+
         let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
         match mode.as_str() {
             "semantic" => {
@@ -4816,6 +5071,7 @@ impl CodesearchService {
                 results: vec![],
                 low_confidence: Some(true),
                 suggested_tool: Some("literal_search".to_string()),
+                warnings: None,
             };
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
             return Ok(CallToolResult::success(vec![Content::text(json)]));
@@ -4852,6 +5108,8 @@ impl CodesearchService {
                 content: if compact { None } else { Some(r.content) },
                 context_prev: if compact { None } else { r.context_prev },
                 context_next: if compact { None } else { r.context_next },
+                source: None,
+                chunk_ref: None,
             })
             .collect();
 
@@ -4876,6 +5134,7 @@ impl CodesearchService {
             results: items,
             low_confidence,
             suggested_tool,
+            warnings: None,
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -5403,6 +5662,15 @@ impl CodesearchService {
             request.chunk_id,
             request.project,
         );
+
+        // Federation: a `chunk_ref` of the form "<peer>:<chunk_id>" (returned by
+        // a federated search result) fetches the chunk from a remote peer rather
+        // than the local index.
+        if let Some(chunk_ref) = request.chunk_ref.as_deref() {
+            return self
+                .federated_get_chunk(chunk_ref, request.context_lines)
+                .await;
+        }
 
         // In multi-repo serve mode, require explicit project or group scope.
         // Unscoped get_chunk would fan-out over all repos, opening all DBs unnecessarily.
@@ -6245,6 +6513,8 @@ impl CodesearchService {
                                     content: None,
                                     context_prev: None,
                                     context_next: None,
+                                    source: None,
+                                    chunk_ref: None,
                                 });
                             }
                         }
@@ -6291,6 +6561,8 @@ impl CodesearchService {
                                 content: None,
                                 context_prev: None,
                                 context_next: None,
+                                source: None,
+                                chunk_ref: None,
                             })
                             .collect::<Vec<_>>();
                         Ok(items)
@@ -7280,6 +7552,144 @@ Model: {model} ({dims}d)
 "#;
 
 // ════════════════════════════════════════════════════════════════
+// Federation helpers (module-scope) — merge / parse / convert.
+// ════════════════════════════════════════════════════════════════
+
+/// RRF-interleave several disjoint ranked lists into one ranked list.
+///
+/// Each list is assumed already ranked best-first and disjoint from the others
+/// (local repos vs. distinct remote peers). An item's merged score is
+/// `1/(k + rank_in_own_list + 1)` (classic Reciprocal Rank Fusion with a `+1`
+/// so the top hit never exceeds `1/k`). The union is sorted by score desc with a
+/// stable source-order tiebreak, then truncated to `limit`.
+fn merge_ranked_lists(
+    lists: Vec<Vec<SearchResultItem>>,
+    k: f32,
+    limit: usize,
+) -> Vec<SearchResultItem> {
+    let mut merged: Vec<(f32, usize, SearchResultItem)> = Vec::new();
+    let mut order = 0usize;
+    for list in lists {
+        for (rank, item) in list.into_iter().enumerate() {
+            let score = 1.0 / (k + rank as f32 + 1.0);
+            merged.push((score, order, item));
+            order += 1;
+        }
+    }
+    // Sort by score desc; tiebreak on insertion order for stable, predictable
+    // output (local list first, then remotes in config order).
+    merged.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    merged
+        .into_iter()
+        .take(limit)
+        .map(|(score, _, mut it)| {
+            it.score = score;
+            it
+        })
+        .collect()
+}
+
+/// Extract the rendered tool payload from a `CallToolResult` and re-parse it as
+/// local `SearchResultItem`s. Works for both semantic and literal modes — the
+/// rendered JSON always has a top-level `results` array.
+fn parse_search_items_from_call_result(
+    result: &CallToolResult,
+    mode: &str,
+) -> Vec<SearchResultItem> {
+    let text = extract_call_tool_text(result);
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let results = match value.get("results").and_then(|r| r.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    match mode {
+        "semantic" => results
+            .iter()
+            .filter_map(|v| serde_json::from_value::<SearchResultItem>(v.clone()).ok())
+            .collect(),
+        // Literal items lack `chunk_id`; map their `snippet` into `content` so
+        // the merged list renders uniformly.
+        _ => results
+            .iter()
+            .map(|v| SearchResultItem {
+                chunk_id: v.get("chunk_id").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+                path: v
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                start_line: v.get("start_line").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+                end_line: v.get("end_line").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+                kind: v
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                score: v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0) as f32,
+                signature: v
+                    .get("signature")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string()),
+                content: v
+                    .get("snippet")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string()),
+                context_prev: None,
+                context_next: None,
+                source: None,
+                chunk_ref: None,
+            })
+            .collect(),
+    }
+}
+
+/// Convert a remote search hit into a local `SearchResultItem`, tagging it with
+/// its origin (`source`) and a namespaced `chunk_ref` for later retrieval.
+fn convert_remote_item(
+    peer_name: &str,
+    item: crate::federation::RemoteSearchItem,
+) -> SearchResultItem {
+    let chunk_ref = item.chunk_id.map(|id| format!("{peer_name}:{id}"));
+    SearchResultItem {
+        chunk_id: item.chunk_id.unwrap_or(0),
+        path: item.path,
+        start_line: item.start_line,
+        end_line: item.end_line,
+        kind: item.kind.unwrap_or_default(),
+        score: item.score,
+        signature: item.signature,
+        content: item.content.or(item.snippet),
+        context_prev: item.context_prev,
+        context_next: item.context_next,
+        source: Some(peer_name.to_string()),
+        chunk_ref,
+    }
+}
+
+/// Best-effort extraction of the concatenated text content of a
+/// `CallToolResult`. Resilient to rmcp's internal content enum shape.
+fn extract_call_tool_text(result: &CallToolResult) -> String {
+    serde_json::to_value(result)
+        .ok()
+        .and_then(|v| {
+            v.get("content").and_then(|c| c.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        })
+        .unwrap_or_default()
+}
+
+// ════════════════════════════════════════════════════════════════
 // REST API handlers (federation-friendly HTTP+JSON mirror of MCP tools).
 //
 // Expose the same logic over plain HTTP so a remote codesearch serve can be
@@ -7397,6 +7807,7 @@ pub(crate) async fn rest_get_chunk_handler(
 ) -> Result<RestResponse, RestError> {
     let req = GetChunkRequest {
         chunk_id,
+        chunk_ref: params.get("chunk_ref").cloned(),
         context_lines: params.get("context_lines").and_then(|s| s.parse().ok()),
         project: params.get("project").cloned(),
         group: params.get("group").cloned(),
@@ -8001,4 +8412,103 @@ pub async fn run_mcp_server(
 
     tracing::info!("✅ MCP server shut down cleanly");
     Ok(())
+}
+
+#[cfg(test)]
+mod federation_helpers_tests {
+    //! Unit tests for the federation merge/parse/convert helpers. The
+    //! FederationClient HTTP layer + resolve_group_targets are covered
+    //! separately (federation/mod.rs and db_discovery/repos.rs respectively).
+    use super::{convert_remote_item, merge_ranked_lists};
+    use crate::federation::RemoteSearchItem;
+    use crate::mcp::types::SearchResultItem;
+
+    fn local_item(chunk_id: u32, score: f32) -> SearchResultItem {
+        SearchResultItem {
+            chunk_id,
+            path: format!("local/{chunk_id}.rs"),
+            start_line: 1,
+            end_line: 2,
+            kind: "Function".to_string(),
+            score,
+            signature: None,
+            content: None,
+            context_prev: None,
+            context_next: None,
+            source: None,
+            chunk_ref: None,
+        }
+    }
+
+    #[test]
+    fn merge_interleaves_disjoint_lists_by_rank() {
+        // Two disjoint ranked lists. RRF must interleave by rank, not by raw
+        // score (scores aren't comparable across systems).
+        let local = vec![
+            local_item(1, 0.99),
+            local_item(2, 0.50),
+            local_item(3, 0.10),
+        ];
+        let remote = vec![local_item(10, 0.88), local_item(11, 0.60)];
+        let merged = merge_ranked_lists(vec![local, remote], 20.0, 10);
+
+        // Top of each list should rank highest; order alternates by rank.
+        assert_eq!(merged.len(), 5);
+        // Rank-0 of each list: score 1/(20+0+1) = 1/21 ≈ 0.0476 — both rank 0
+        // tiebreak on insertion order (local list first).
+        let top_ids: Vec<u32> = merged.iter().map(|i| i.chunk_id).collect();
+        assert_eq!(top_ids, vec![1, 10, 2, 11, 3]);
+        // Scores must be reassigned to the RRF value.
+        assert!((merged[0].score - 1.0 / 21.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn merge_respects_limit() {
+        let a = vec![local_item(1, 0.9), local_item(2, 0.8), local_item(3, 0.7)];
+        let merged = merge_ranked_lists(vec![a], 20.0, 2);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn convert_tags_source_and_namespaced_chunk_ref() {
+        let remote = RemoteSearchItem {
+            chunk_id: Some(42),
+            path: "cloud/kb.md".to_string(),
+            start_line: 5,
+            end_line: 9,
+            kind: Some("Section".to_string()),
+            score: 0.7,
+            signature: None,
+            content: Some("body".to_string()),
+            snippet: None,
+            context_prev: None,
+            context_next: None,
+        };
+        let item = convert_remote_item("cloud", remote);
+        assert_eq!(item.source.as_deref(), Some("cloud"));
+        assert_eq!(item.chunk_ref.as_deref(), Some("cloud:42"));
+        assert_eq!(item.chunk_id, 42); // local id preserved for rendering
+        assert_eq!(item.path, "cloud/kb.md");
+    }
+
+    #[test]
+    fn convert_falls_back_to_snippet_as_content() {
+        // Literal-mode remote hits have `snippet` but no `content`.
+        let remote = RemoteSearchItem {
+            chunk_id: None,
+            path: "x".to_string(),
+            start_line: 0,
+            end_line: 0,
+            kind: None,
+            score: 0.1,
+            signature: None,
+            content: None,
+            snippet: Some("matched line".to_string()),
+            context_prev: None,
+            context_next: None,
+        };
+        let item = convert_remote_item("peer", remote);
+        assert_eq!(item.content.as_deref(), Some("matched line"));
+        assert!(item.chunk_ref.is_none(), "no chunk_ref without chunk_id");
+    }
 }

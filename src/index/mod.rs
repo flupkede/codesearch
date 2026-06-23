@@ -1924,7 +1924,7 @@ fn build_serve_client(
 /// Inner, testable form of [`build_serve_client`]: build a client that attaches
 /// `Authorization: Bearer <key>` (when `key` is `Some`) as a default header, so
 /// every request — health probe, POST, DELETE — carries it automatically.
-fn build_serve_client_with_key(
+pub(crate) fn build_serve_client_with_key(
     timeout: std::time::Duration,
     key: Option<&str>,
 ) -> std::result::Result<reqwest::Client, String> {

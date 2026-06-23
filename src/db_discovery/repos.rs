@@ -7,6 +7,49 @@ use std::path::{Path, PathBuf};
 use crate::cache::{safe_canonicalize, strip_unc_prefix};
 use crate::constants::{CONFIG_DIR_NAME, REPOS_CONFIG_FILE};
 
+/// A remote `codesearch serve` peer that can be queried for federation.
+///
+/// A group references a remote by listing `"@<peer_name>"` among its members
+/// (the leading `@` marks it as a remote reference rather than a local alias).
+/// Queries against such a group fan out to each remote peer over HTTP(S) and
+/// the results are merged with the local results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemotePeer {
+    /// Base URL of the remote serve instance, e.g. `https://codesearch.example.com`.
+    #[serde(alias = "base_url")]
+    pub url: String,
+    /// Bearer / `X-API-Key` shared secret accepted by the remote (required when
+    /// the remote is bound to a non-localhost address).
+    #[serde(default)]
+    pub api_key: String,
+    /// Group to query on the remote (in the remote's own `repos.json`).
+    /// When `None`, the remote's virtual `"all"` group is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Per-peer request timeout in seconds (default 15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// A resolved federation target — either a local repo or a remote peer.
+///
+/// Produced by [`ReposConfig::resolve_group_targets`]. Read-only tool handlers
+/// split their resolved targets into local and remote sets: local targets are
+/// served from the local LMDB stores as today; remote targets are queried over
+/// HTTP and their results merged in.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// A local repo, identified by alias and on-disk path.
+    Local { alias: String, path: PathBuf },
+    /// A remote peer, identified by the peer name under which it was declared
+    /// in `remotes`, together with its full connection config.
+    Remote { peer_name: String, peer: RemotePeer },
+}
+
+/// Prefix that marks a group member as a reference to a remote peer rather than
+/// a local alias (e.g. `"@cloud"` → remote peer named `cloud`).
+pub const REMOTE_REF_PREFIX: &str = "@";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReposConfig {
     pub repos: HashMap<String, PathBuf>,
@@ -14,6 +57,10 @@ pub struct ReposConfig {
     pub groups: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub repos_meta: HashMap<String, RepoMeta>,
+    /// Remote `codesearch serve` peers reachable for federation. Group members
+    /// reference these via the `"@<peer_name>"` convention.
+    #[serde(default)]
+    pub remotes: HashMap<String, RemotePeer>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +116,7 @@ impl ReposConfig {
                 repos,
                 groups: HashMap::new(),
                 repos_meta: HashMap::new(),
+                remotes: HashMap::new(),
             };
             config.reconcile();
             return Ok(config);
@@ -118,14 +166,40 @@ impl ReposConfig {
             self.repos_meta.remove(&alias);
         }
 
-        // 3. Prune group members referencing unknown aliases; drop empty groups.
+        // 3. Prune group members referencing unknown aliases OR unknown remote
+        //    peers; drop now-empty groups. A member starting with `@` is a
+        //    federation reference to a remote peer (`@cloud`), all others are
+        //    local aliases. Unknown references on both sides are dropped so a
+        //    hand-edited repos.json can never crash a later query.
         let mut empty_groups: Vec<String> = Vec::new();
         for (group, members) in self.groups.iter_mut() {
             let before = members.len();
-            members.retain(|alias| self.repos.contains_key(alias));
+            members.retain(|member| {
+                if let Some(peer_name) = member.strip_prefix(REMOTE_REF_PREFIX) {
+                    let known = self.remotes.contains_key(peer_name);
+                    if !known {
+                        tracing::warn!(
+                            "repos.json: pruned unknown remote reference '{}' from group '{}'",
+                            member,
+                            group
+                        );
+                    }
+                    known
+                } else {
+                    let known = self.repos.contains_key(member);
+                    if !known {
+                        tracing::warn!(
+                            "repos.json: pruned unknown alias '{}' from group '{}'",
+                            member,
+                            group
+                        );
+                    }
+                    known
+                }
+            });
             if members.len() != before {
                 tracing::warn!(
-                    "repos.json: pruned {} unknown alias(es) from group '{}'",
+                    "repos.json: pruned {} unknown member(s) from group '{}'",
                     before - members.len(),
                     group
                 );
@@ -319,6 +393,78 @@ impl ReposConfig {
             .iter()
             .filter_map(|alias| self.repos.get(alias).map(|p| (alias.clone(), p.clone())))
             .collect()
+    }
+
+    /// Federation-aware group resolution.
+    ///
+    /// Like [`resolve_group`](Self::resolve_group) but also expands `"@<peer>"`
+    /// members into [`Target::Remote`] entries. The virtual `"all"` group is
+    /// **always local-only** — it never federates (it expands to every local
+    /// repo, exactly as `resolve_group` does), so an `"all"` query can never
+    /// accidentally leak to a remote peer.
+    ///
+    /// Unknown remote references (`@ghost` with no matching `remotes` entry)
+    /// are skipped with a warning rather than failing — `reconcile` already
+    /// prunes them at load time, this is a defensive double-check for configs
+    /// built in-memory.
+    pub fn resolve_group_targets(&self, group: &str) -> Vec<Target> {
+        // Virtual "all" group: resolves to every registered LOCAL repo, never
+        // stored and never federated.
+        if group == crate::constants::ALL_GROUP_NAME {
+            return self
+                .repos
+                .iter()
+                .map(|(a, p)| Target::Local {
+                    alias: a.clone(),
+                    path: p.clone(),
+                })
+                .collect();
+        }
+        let Some(members) = self.groups.get(group) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for member in members {
+            if let Some(peer_name) = member.strip_prefix(REMOTE_REF_PREFIX) {
+                match self.remotes.get(peer_name) {
+                    Some(peer) => out.push(Target::Remote {
+                        peer_name: peer_name.to_string(),
+                        peer: peer.clone(),
+                    }),
+                    None => tracing::warn!(
+                        "group '{}' references unknown remote peer '{}'; skipped",
+                        group,
+                        peer_name
+                    ),
+                }
+            } else if let Some(path) = self.repos.get(member) {
+                out.push(Target::Local {
+                    alias: member.clone(),
+                    path: path.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Convenience: split a group's targets into local aliases (with paths) and
+    /// remote peers. Useful for handlers that fan out local stores and remote
+    /// peers separately.
+    #[allow(clippy::type_complexity)]
+    pub fn split_group_targets(
+        &self,
+        group: &str,
+    ) -> (Vec<(String, PathBuf)>, Vec<(String, RemotePeer)>) {
+        let mut locals = Vec::new();
+        let mut remotes = Vec::new();
+        for t in self.resolve_group_targets(group) {
+            match t {
+                Target::Local { alias, path } => locals.push((alias, path)),
+                Target::Remote { peer_name, peer } => remotes.push((peer_name, peer)),
+            }
+        }
+        (locals, remotes)
     }
 
     pub fn add_group(&mut self, name: String, aliases: Vec<String>) -> Result<()> {
@@ -1219,5 +1365,174 @@ mod tests {
             !cfg.groups.contains_key(crate::constants::ALL_GROUP_NAME),
             "\"all\" must not leak into the stored groups map"
         );
+    }
+
+    // ── Federation: remotes + resolve_group_targets ───────────────────
+
+    fn make_peer(url: &str) -> RemotePeer {
+        RemotePeer {
+            url: url.to_string(),
+            api_key: "secret".to_string(),
+            group: Some("docs".to_string()),
+            timeout_secs: Some(15),
+        }
+    }
+
+    #[test]
+    fn resolve_group_targets_expands_local_and_remote_members() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        cfg.remotes
+            .insert("cloud".to_string(), make_peer("https://cloud"));
+        cfg.groups.insert(
+            "docs".to_string(),
+            vec!["local-a".to_string(), "@cloud".to_string()],
+        );
+
+        let targets = cfg.resolve_group_targets("docs");
+        assert_eq!(targets.len(), 2);
+        // Local member expands to a Local target.
+        assert!(matches!(
+            &targets[0],
+            Target::Local { alias, .. } if alias == "local-a"
+        ));
+        // Remote member expands to a Remote target carrying the peer config.
+        match &targets[1] {
+            Target::Remote { peer_name, peer } => {
+                assert_eq!(peer_name, "cloud");
+                assert_eq!(peer.url, "https://cloud");
+            }
+            other => panic!("expected Remote, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn split_group_targets_partitions_locals_and_remotes() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        cfg.repos
+            .insert("local-b".to_string(), PathBuf::from("/tmp/b"));
+        cfg.remotes
+            .insert("cloud".to_string(), make_peer("https://cloud"));
+        cfg.groups.insert(
+            "docs".to_string(),
+            vec![
+                "@cloud".to_string(),
+                "local-a".to_string(),
+                "local-b".to_string(),
+            ],
+        );
+
+        let (locals, remotes) = cfg.split_group_targets("docs");
+        assert_eq!(locals.len(), 2);
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].0, "cloud");
+    }
+
+    #[test]
+    fn resolve_group_targets_all_never_federates() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        cfg.remotes
+            .insert("cloud".to_string(), make_peer("https://cloud"));
+        // Even if a group "docs" federates, querying "all" must stay local.
+        cfg.groups
+            .insert("docs".to_string(), vec!["@cloud".to_string()]);
+
+        let targets = cfg.resolve_group_targets(crate::constants::ALL_GROUP_NAME);
+        assert!(targets.iter().all(|t| matches!(t, Target::Local { .. })));
+        assert_eq!(targets.len(), 1); // local-a only
+    }
+
+    #[test]
+    fn resolve_group_targets_skips_unknown_remote_ref() {
+        let mut cfg = ReposConfig::default();
+        cfg.groups.insert(
+            "docs".to_string(),
+            vec!["@ghost".to_string()], // no `remotes` entry for "ghost"
+        );
+
+        let targets = cfg.resolve_group_targets("docs");
+        assert!(targets.is_empty(), "unknown remote ref must be skipped");
+    }
+
+    #[test]
+    fn reconcile_prunes_unknown_remote_ref_and_drops_now_empty_group() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        cfg.groups
+            .insert("docs".to_string(), vec!["@ghost".to_string()]);
+        // Only "ghost" is referenced but "cloud" exists → "ghost" pruned, group
+        // becomes empty and is dropped.
+        cfg.remotes
+            .insert("cloud".to_string(), make_peer("https://cloud"));
+
+        cfg.reconcile();
+        assert!(
+            !cfg.groups.contains_key("docs"),
+            "empty group must be dropped"
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_valid_remote_ref() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        cfg.remotes
+            .insert("cloud".to_string(), make_peer("https://cloud"));
+        cfg.groups.insert(
+            "docs".to_string(),
+            vec!["real".to_string(), "@cloud".to_string()],
+        );
+
+        cfg.reconcile();
+        assert_eq!(
+            cfg.groups.get("docs"),
+            Some(&vec!["real".to_string(), "@cloud".to_string()]),
+            "valid local alias AND valid remote ref must both survive reconcile"
+        );
+    }
+
+    #[test]
+    fn remotes_roundtrip_through_json() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        cfg.remotes
+            .insert("cloud".to_string(), make_peer("https://cloud"));
+        cfg.groups
+            .insert("docs".to_string(), vec!["@cloud".to_string()]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("repos.json");
+        cfg.save_to(&path).unwrap();
+
+        let loaded = ReposConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.remotes.len(), 1);
+        let peer = loaded.remotes.get("cloud").unwrap();
+        assert_eq!(peer.url, "https://cloud");
+        assert_eq!(peer.api_key, "secret");
+        assert_eq!(peer.group.as_deref(), Some("docs"));
+        // Group with remote ref survives the load+reconcile roundtrip.
+        assert_eq!(loaded.groups.get("docs"), Some(&vec!["@cloud".to_string()]));
+    }
+
+    #[test]
+    fn remotes_alias_base_url_field() {
+        // The `url` field accepts the friendlier `base_url` alias for ergonomics.
+        let json = r#"{
+            "repos": {"a": "/tmp/a"},
+            "remotes": {"cloud": {"base_url": "https://cloud", "api_key": "k"}}
+        }"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("repos.json");
+        std::fs::write(&path, json).unwrap();
+        let cfg = ReposConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.remotes.get("cloud").unwrap().url, "https://cloud");
     }
 }

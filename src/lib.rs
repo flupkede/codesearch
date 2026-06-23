@@ -6,6 +6,7 @@ pub mod constants;
 pub mod db_discovery;
 pub mod embed;
 pub mod error;
+pub mod federation;
 pub mod file;
 pub mod fts;
 pub mod index;
