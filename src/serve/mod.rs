@@ -214,6 +214,12 @@ pub(crate) struct ServeState {
     /// `find_impact` to reuse helper-detection cache instead of creating fresh
     /// instances per request.
     symbol_registry: Arc<SymbolIndexerRegistry>,
+    /// Shared embedding service — used by MCP sessions AND the REST handlers so
+    /// the ONNX embedding model is loaded ONCE per serve instance (lazily, on
+    /// the first semantic query) and reused across all requests. Without this,
+    /// per-request `CodesearchService` construction (REST handlers) would reload
+    /// the model on every call (~100ms–2s). Mirrors the `symbol_registry` pattern.
+    embedding_service: Arc<std::sync::Mutex<Option<crate::embed::EmbeddingService>>>,
     /// Per-repo total tool call count.
     tool_call_counts: DashMap<String, AtomicU64>,
     /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
@@ -289,6 +295,7 @@ impl ServeState {
             total_sessions: AtomicU64::new(0),
             sysinfo_system: std::sync::Mutex::new(sys),
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
+            embedding_service: Arc::new(std::sync::Mutex::new(None)),
             tool_call_counts: DashMap::new(),
             csharp_index_status: Arc::new(DashMap::new()),
             csharp_index_error: Arc::new(DashMap::new()),
@@ -306,6 +313,16 @@ impl ServeState {
     /// helper-detection cache instead of creating fresh instances per request.
     pub(crate) fn symbol_registry(&self) -> Arc<SymbolIndexerRegistry> {
         Arc::clone(&self.symbol_registry)
+    }
+
+    /// Return a clone of the shared embedding-service Arc.
+    /// Shared across MCP sessions AND REST handlers so the ONNX model is loaded
+    /// once per serve instance (lazily on first semantic query) instead of being
+    /// reloaded per request/session.
+    pub(crate) fn embedding_service(
+        &self,
+    ) -> Arc<std::sync::Mutex<Option<crate::embed::EmbeddingService>>> {
+        Arc::clone(&self.embedding_service)
     }
 
     /// Return the instant when serve started, used to compute uptime.

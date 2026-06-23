@@ -2591,7 +2591,7 @@ pub struct CodesearchService {
     model_type: ModelType,
     dimensions: usize,
     // Lazily initialized on first search
-    embedding_service: Mutex<Option<EmbeddingService>>,
+    embedding_service: Arc<Mutex<Option<EmbeddingService>>>,
     // Shared stores for concurrent access (optional - only set when running with IndexManager)
     shared_stores: Option<Arc<SharedStores>>,
     // Serve-mode state (set when running inside `codesearch serve`)
@@ -3483,7 +3483,7 @@ impl CodesearchService {
             project_path,
             model_type,
             dimensions,
-            embedding_service: Mutex::new(None),
+            embedding_service: Arc::new(Mutex::new(None)),
             shared_stores,
             serve_state: None,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
@@ -3502,7 +3502,7 @@ impl CodesearchService {
             project_path: PathBuf::from("serve://multi-repo"),
             model_type: ModelType::default(),
             dimensions: crate::constants::DEFAULT_EMBEDDING_DIMENSIONS,
-            embedding_service: Mutex::new(None),
+            embedding_service: serve_state.embedding_service(),
             shared_stores: None,
             serve_state: Some(serve_state),
             symbol_registry,
