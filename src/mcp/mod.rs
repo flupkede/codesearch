@@ -4045,7 +4045,6 @@ impl CodesearchService {
                 // Can't build the HTTP client at all — degrade to local-only.
                 return Ok(self.build_federated_response(
                     local_items,
-                    limit,
                     vec![format!("federation disabled (http client error): {e}")],
                 ));
             }
@@ -4088,7 +4087,7 @@ impl CodesearchService {
 
         // 4) RRF-interleave the disjoint ranked lists and render.
         let merged = merge_ranked_lists(all_lists, DEFAULT_RRF_K, limit);
-        Ok(self.build_federated_response(merged, limit, warnings))
+        Ok(self.build_federated_response(merged, warnings))
     }
 
     /// Fetch a chunk from a remote peer by its namespaced `chunk_ref`.
@@ -4152,16 +4151,21 @@ impl CodesearchService {
     }
 
     /// Render the merged federated results as a `SemanticSearchResponse` JSON.
+    ///
+    /// `low_confidence` is only flagged when the merged set is empty: RRF-fused
+    /// scores (`1/(k+rank+1)`, max ≈ 0.048 for k=20) are NOT comparable to the
+    /// single-source embedding/BM25 thresholds, so applying any score cutoff
+    /// here would be meaningless. An empty result, however, is a genuine signal
+    /// to the agent that federation yielded nothing and it should try a broader
+    /// query or a different scope.
     fn build_federated_response(
         &self,
         items: Vec<SearchResultItem>,
-        _limit: usize,
         warnings: Vec<String>,
     ) -> CallToolResult {
-        let low_confidence = items.first().map(|f| f.score < 0.15).unwrap_or(true);
         let response = SemanticSearchResponse {
+            low_confidence: if items.is_empty() { Some(true) } else { None },
             results: items,
-            low_confidence: if low_confidence { Some(true) } else { None },
             suggested_tool: None,
             warnings: if warnings.is_empty() {
                 None
