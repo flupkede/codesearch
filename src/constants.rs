@@ -231,6 +231,22 @@ pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 /// Returns JSON snapshot of all repo states, sessions, and CPU usage.
 pub const STATUS_PATH: &str = "/status";
 
+/// REST search endpoint (federation-friendly HTTP mirror of the `search` MCP
+/// tool). POST a `SearchRequest` body; returns the tool's JSON payload.
+pub const SEARCH_PATH: &str = "/search";
+
+/// REST find endpoint (HTTP mirror of the `find` MCP tool).
+/// POST a `FindRequest` body.
+pub const FIND_PATH: &str = "/find";
+
+/// REST explore endpoint (HTTP mirror of the `explore` MCP tool).
+/// POST an `ExploreRequest` body.
+pub const EXPLORE_PATH: &str = "/explore";
+
+/// REST get-chunk endpoint (HTTP mirror of the `get_chunk` MCP tool).
+/// GET `/chunk/:id?context_lines=&project=&group=`.
+pub const CHUNK_PATH: &str = "/chunk/:id";
+
 /// How long an open repo may remain idle (no queries) before it is evicted.
 /// Eviction closes the DB handles, stops the FSW, and releases memory.
 /// The repo is automatically re-opened on the next query.

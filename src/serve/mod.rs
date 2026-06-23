@@ -35,11 +35,11 @@ use tracing::{info, warn};
 
 use crate::cache::safe_canonicalize;
 use crate::constants::{
-    ALLOWED_ROOTS_ENV, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
+    ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
     CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
-    HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH,
-    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS,
-    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    EXPLORE_PATH, FIND_PATH, HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV,
+    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
+    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -3710,6 +3710,27 @@ pub async fn run_serve(
         // protected by require_auth_for_network on network binds. If doctor ever
         // gains a mutating mode, add it to `is_management` in require_admin_auth.
         .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
+        // REST endpoints — federation-friendly HTTP+JSON mirror of the read-only
+        // MCP tools (search/find/explore/get_chunk). Lets a remote codesearch
+        // serve be queried WITHOUT an MCP session. Same auth layers as /mcp &
+        // /status (require_auth_for_network on network binds). Read-only by
+        // construction (the underlying tools never mutate the index).
+        .route(
+            SEARCH_PATH,
+            axum::routing::post(crate::mcp::rest_search_handler),
+        )
+        .route(
+            FIND_PATH,
+            axum::routing::post(crate::mcp::rest_find_handler),
+        )
+        .route(
+            EXPLORE_PATH,
+            axum::routing::post(crate::mcp::rest_explore_handler),
+        )
+        .route(
+            CHUNK_PATH,
+            axum::routing::get(crate::mcp::rest_get_chunk_handler),
+        )
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))
@@ -4378,6 +4399,146 @@ mod tests {
             "expected JSON error body from doctor handler, got: {}",
             body
         );
+    }
+
+    /// Verify that the federation REST endpoints (/search, /find, /explore,
+    /// /chunk/:id) are registered and reachable. Each must dispatch to OUR
+    /// handler (returning a JSON body) rather than axum's built-in empty 404.
+    /// Starts a real axum server on a random port.
+    #[tokio::test]
+    async fn rest_routes_are_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("myrepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+
+        let state = Arc::new(ServeState::new(config, Some(config_file)));
+
+        let app = axum::Router::new()
+            .route(
+                crate::constants::HEALTH_PATH,
+                axum::routing::get(health_handler),
+            )
+            .route(
+                crate::constants::SEARCH_PATH,
+                axum::routing::post(crate::mcp::rest_search_handler),
+            )
+            .route(
+                crate::constants::FIND_PATH,
+                axum::routing::post(crate::mcp::rest_find_handler),
+            )
+            .route(
+                crate::constants::EXPLORE_PATH,
+                axum::routing::post(crate::mcp::rest_explore_handler),
+            )
+            .route(
+                crate::constants::CHUNK_PATH,
+                axum::routing::get(crate::mcp::rest_get_chunk_handler),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // Helper: a response from OUR handler is either 200 (success) or 500
+        // (McpError mapped), but ALWAYS a parseable JSON body — never axum's
+        // built-in empty 404. The repo has no index, so the tools return
+        // error/scope JSON; we only assert the route + handler are wired.
+        async fn assert_our_handler(client: &reqwest::Client, url: String) -> serde_json::Value {
+            let resp = client.get(&url).send().await.unwrap();
+            // GET endpoints: must reach our handler (JSON body), status 200/500.
+            assert!(
+                resp.status() == reqwest::StatusCode::OK
+                    || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "GET {} -> unexpected status {} (route not registered?)",
+                url,
+                resp.status()
+            );
+            resp.json().await.unwrap_or_else(|e| {
+                panic!(
+                    "GET {} did not return a JSON body from our handler: {}",
+                    url, e
+                )
+            })
+        }
+
+        // POST /search — dispatches to rest_search_handler.
+        let resp = client
+            .post(format!("http://{}/search", addr))
+            .json(&serde_json::json!({"query": "foo", "project": "testalias"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == reqwest::StatusCode::OK
+                || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "POST /search -> unexpected status {} (route not registered?)",
+            resp.status()
+        );
+        let _body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("POST /search should return JSON from our handler, not axum's 404");
+
+        // POST /find — dispatches to rest_find_handler.
+        let resp = client
+            .post(format!("http://{}/find", addr))
+            .json(
+                &serde_json::json!({"kind": "definition", "symbol": "foo", "project": "testalias"}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == reqwest::StatusCode::OK
+                || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "POST /find -> unexpected status {} (route not registered?)",
+            resp.status()
+        );
+        let _: serde_json::Value = resp
+            .json()
+            .await
+            .expect("POST /find should return JSON from our handler");
+
+        // POST /explore — dispatches to rest_explore_handler.
+        let resp = client
+            .post(format!("http://{}/explore", addr))
+            .json(&serde_json::json!({"kind": "outline", "target": "somefile", "project": "testalias"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == reqwest::StatusCode::OK
+                || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "POST /explore -> unexpected status {} (route not registered?)",
+            resp.status()
+        );
+        let _: serde_json::Value = resp
+            .json()
+            .await
+            .expect("POST /explore should return JSON from our handler");
+
+        // GET /chunk/1 — dispatches to rest_get_chunk_handler.
+        let _ = assert_our_handler(
+            &client,
+            format!("http://{}/chunk/1?project=testalias", addr),
+        )
+        .await;
     }
 
     #[test]
