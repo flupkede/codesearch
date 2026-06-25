@@ -224,6 +224,16 @@ pub const REPO_REINDEX_PATH_SUFFIX: &str = "/reindex";
 /// Health-check path served by `codesearch serve`.
 pub const HEALTH_PATH: &str = "/health";
 
+/// Unauthenticated liveness-probe path served by `codesearch serve`.
+///
+/// Unlike `HEALTH_PATH` (which reports the version and sits behind the
+/// network-auth layer), this endpoint is ALWAYS reachable without an API key —
+/// even on a non-localhost bind — and returns a fixed `{"status":"ok"}` body
+/// with no version or repo information. Intended for container-orchestrator
+/// liveness/readiness probes (e.g. Azure Container Apps) that cannot present
+/// the Bearer key.
+pub const HEALTHZ_PATH: &str = "/healthz";
+
 /// MCP endpoint path served by `codesearch serve` (streamable HTTP).
 pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 

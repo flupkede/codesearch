@@ -37,9 +37,10 @@ use crate::cache::safe_canonicalize;
 use crate::constants::{
     ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
     CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
-    EXPLORE_PATH, FIND_PATH, HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV,
-    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV,
-    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    EXPLORE_PATH, FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS,
+    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
+    STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -2371,6 +2372,16 @@ async fn health_handler() -> AxumJson<serde_json::Value> {
     }))
 }
 
+/// Unauthenticated liveness-probe handler: GET /healthz
+///
+/// Always returns `200 {"status":"ok"}` with no version or repo information.
+/// Exempted from `require_auth_for_network`, so container-orchestrator probes
+/// (e.g. Azure Container Apps) can reach it on a network bind without the
+/// Bearer key. Keep this body free of any sensitive/identifying data.
+async fn healthz_handler() -> AxumJson<serde_json::Value> {
+    AxumJson(json!({ "status": "ok" }))
+}
+
 /// Status handler: GET /status
 ///
 /// Returns a JSON snapshot of all repo states, active sessions, and CPU usage.
@@ -3467,6 +3478,13 @@ async fn require_auth_for_network(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // Public liveness probe: always unauthenticated, even on a network bind.
+    // Container orchestrators (e.g. Azure Container Apps) hit this without the
+    // Bearer key. The handler returns no sensitive info.
+    if req.uri().path() == HEALTHZ_PATH {
+        return next.run(req).await;
+    }
+
     // Localhost binding: no auth required.
     if !auth_config.is_network_bind {
         return next.run(req).await;
@@ -3520,7 +3538,7 @@ async fn log_mcp_requests(
 
     let response = next.run(req).await;
 
-    if path != crate::constants::HEALTH_PATH {
+    if path != crate::constants::HEALTH_PATH && path != crate::constants::HEALTHZ_PATH {
         let status = response.status().as_u16();
         tracing::info!("{} {} → {}", method, path, status);
     }
@@ -3712,6 +3730,7 @@ pub async fn run_serve(
     // Auth failures are logged because log_mcp_requests wraps the admin-auth layer.
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
+        .route(HEALTHZ_PATH, axum::routing::get(healthz_handler))
         .route(STATUS_PATH, axum::routing::get(status_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
@@ -4332,6 +4351,61 @@ mod tests {
             body.get("status").is_some(),
             "expected JSON with 'status' field, got: {}",
             body
+        );
+    }
+
+    /// `/healthz` is exempt from `require_auth_for_network`: reachable without a
+    /// key even on a (simulated) network bind, while `/health` stays protected.
+    #[tokio::test]
+    async fn healthz_is_unauthenticated_on_network_bind() {
+        let network_auth = NetworkAuthConfig {
+            is_network_bind: true,
+            api_key: Some("secret-key".to_string()),
+        };
+
+        let app = axum::Router::new()
+            .route(HEALTH_PATH, axum::routing::get(health_handler))
+            .route(HEALTHZ_PATH, axum::routing::get(healthz_handler))
+            .layer(axum::middleware::from_fn(require_auth_for_network))
+            .layer(axum::Extension(network_auth));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // /healthz reachable WITHOUT a key on a network bind.
+        let resp = client
+            .get(format!("http://{}/healthz", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "/healthz must be public on a network bind"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("status").and_then(|v| v.as_str()),
+            Some("ok"),
+            "/healthz body must be {{\"status\":\"ok\"}}"
+        );
+
+        // /health stays protected on a network bind (401 without a key).
+        let resp = client
+            .get(format!("http://{}/health", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "/health must still require auth on a network bind"
         );
     }
 
