@@ -305,6 +305,18 @@ pub enum Commands {
         #[arg(long)]
         no_tui: bool,
 
+        /// Cloud keep-warm: self-ping this ingress URL (e.g. the app's public
+        /// FQDN) to stay warm on a scale-to-zero host while recently active.
+        /// Overrides CODESEARCH_KEEP_WARM_URL.
+        #[arg(long)]
+        keep_warm_url: Option<String>,
+
+        /// Idle window (seconds) before keep-warm stops and the host may
+        /// suspend the replica (default 7200 = 2h). Overrides
+        /// CODESEARCH_IDLE_SUSPEND_SECS.
+        #[arg(long)]
+        idle_suspend_secs: Option<u64>,
+
         /// For `tui` action: serve URL to connect to
         #[arg(long, default_value = DEFAULT_SERVE_URL)]
         url: String,
@@ -655,6 +667,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             verbose,
             create_index: _,
             no_tui,
+            keep_warm_url,
+            idle_suspend_secs,
             url,
         } => {
             match action {
@@ -668,8 +682,16 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     if let Err(e) = crate::logger::init_serve_logger(log_level, effective_quiet) {
                         eprintln!("Warning: failed to initialize serve logger: {}", e);
                     }
-                    crate::serve::run_serve(host, port, register, no_tui, cancel_token.clone())
-                        .await
+                    crate::serve::run_serve(
+                        host,
+                        port,
+                        register,
+                        no_tui,
+                        keep_warm_url,
+                        idle_suspend_secs,
+                        cancel_token.clone(),
+                    )
+                    .await
                 }
             }
         }

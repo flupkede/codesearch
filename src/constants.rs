@@ -269,6 +269,30 @@ pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 /// Environment variable to override the repo idle timeout.
 pub const REPO_IDLE_TIMEOUT_ENV: &str = "CODESEARCH_REPO_IDLE_TIMEOUT_SECS";
 
+// --- Cloud keep-warm (scale-to-zero suspend after idle) ----------------------
+
+/// URL serve self-pings (its own ingress FQDN) to stay warm while active.
+///
+/// In a scale-to-zero host (e.g. Azure Container Apps), no ingress traffic →
+/// the platform suspends the replica after its cooldown. While the most recent
+/// real tool call is younger than `IDLE_SUSPEND_SECS_ENV`, serve periodically
+/// GETs `<url>/healthz` to generate ingress traffic and stay warm. Once idle
+/// exceeds that window it stops, letting the host suspend; the next real
+/// request wakes it automatically. Empty/unset disables keep-warm.
+///
+/// Set via `--keep-warm-url` or this env var (flag takes precedence).
+pub const KEEP_WARM_URL_ENV: &str = "CODESEARCH_KEEP_WARM_URL";
+
+/// Environment variable to override the idle-before-suspend window.
+pub const IDLE_SUSPEND_SECS_ENV: &str = "CODESEARCH_IDLE_SUSPEND_SECS";
+
+/// Default idle window before serve stops self-pinging and lets the host
+/// suspend the replica (2 hours).
+pub const DEFAULT_IDLE_SUSPEND_SECS: u64 = 2 * 60 * 60;
+
+/// How often the keep-warm task pings its own ingress while active.
+pub const KEEP_WARM_INTERVAL_SECS: u64 = 2 * 60; // 2 minutes
+
 /// Maximum wall-clock duration a single reindex may take before its
 /// `active_reindexes` entry is considered **stale** (leaked).
 ///

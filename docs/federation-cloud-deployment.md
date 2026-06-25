@@ -33,13 +33,23 @@ Producers run on the operator's laptop for now (auth via `az login`), writing `.
 Work items:
 1. **Shared `BlobStorageProvider`** (Python) added to `aprimo_mcp` and `ia-anthropic-readonly` — uploads normalized `.md` to a blob container (e.g. `kb`, prefixes `docs/` and `aprimo/`). Auth via `DefaultAzureCredential` locally.
 2. **codesearch container** — new `Dockerfile` + `docker/entrypoint.sh`:
-   - multi-stage: `cargo build --release` → runtime image with `azcopy` + `git` + the binary
-   - entrypoint: `azcopy sync <blob-sas-url> /data/docs` (+ optional `git pull` of curated KB into `/data/aprimo`) → `codesearch index /data` → start `codesearch serve` on `0.0.0.0:39725`
-   - background loop: every `REINDEX_INTERVAL_SECS` → `azcopy sync` + codesearch incremental `refresh`
-   - **no Caddy** (ACA does TLS)
-3. **codesearch code change (minimal):** add an unauthenticated `/healthz` endpoint for the ACA liveness/readiness probe (`/status` sits behind auth on network bind). Index behavior (full/incremental) needs **no change** — already implemented.
-4. **ACA app** — single replica, external HTTPS ingress, inline secrets.
-5. **Dev wiring** — `remotes` entry in `repos.json` → `@cloud` group.
+   - multi-stage build: `cargo build --release` → **model pre-warm** (bake the fastembed model into the image; loaded by ONNX from a local path, never from blob) → slim runtime with `azcopy` + `git` + the binary
+   - entrypoint (`docker/entrypoint.sh`): **restore snapshot** (if any) → `azcopy sync <BLOB_SAS_URL> /data/docs` (+ optional `git pull` of curated KB into `/data/aprimo`) → `codesearch serve` on `0.0.0.0:39725` (registered repos auto-index on start; incremental when a snapshot was restored)
+   - background loop: every `REINDEX_INTERVAL_SECS` → `azcopy sync` + POST `/repos/<alias>/reindex` (incremental); every `SNAPSHOT_INTERVAL_SECS` → upload an index snapshot to blob
+   - **no Caddy** (ACA does TLS), **no FSW** (full-on-start + incremental-on-timer only)
+3. **codesearch code changes (small, shipped):**
+   - unauthenticated `/healthz` probe (`/status` sits behind auth on network bind) — stage 1.
+   - **cloud keep-warm in serve** — `--keep-warm-url` / `CODESEARCH_KEEP_WARM_URL` + `--idle-suspend-secs` / `CODESEARCH_IDLE_SUSPEND_SECS` (default 7200). Serve self-pings its own ingress `/healthz` while the most-recent real tool call is younger than the idle window, then stops so ACA suspends; the next real query wakes it. This is the **2h-idle-then-suspend** mechanism — self-contained, no Logic App, no managed identity / role assignment.
+   - index full/incremental behavior unchanged (already implemented).
+4. **ACA app** — **scale-to-zero (min-replicas 0)**, external HTTPS ingress, inline secrets (API key, blob SAS, snapshot SAS). Warm wake via snapshot restore; 2h warm window via serve keep-warm.
+5. **Dev wiring** — `remotes` entry in `repos.json` → `@cloud` group, with `timeout_secs: 90` so the client waits through a cold-start wake (~20-45s) instead of falling back to local-only.
+
+### Suspend / wake model (option D)
+
+- **Suspend:** serve keep-warm pings its FQDN while idle < 2h. After 2h with no real query it stops → ACA scales the replica to zero (~5 min cooldown). Idle cost ≈ €0.
+- **Wake:** a real federated query hits the ingress → ACA cold-starts a replica → entrypoint restores the blob snapshot (index + embedding cache, *not* the baked model) → serve answers. No mass re-embedding.
+- **Cold-start latency:** ~20-45s typical (image pull amortized by node cache; snapshot restore + model load dominate). The dev client's `timeout_secs: 90` absorbs it. First-ever start (no snapshot) = full index.
+- **Snapshot safety:** LMDB never runs on network storage; it only travels as an inert tarball in a *separate* `snapshots` blob container, so there is no memory-mapped-FS corruption risk.
 
 ### Phase 2 — cloudify scraping
 
@@ -70,41 +80,49 @@ Example sources config (Phase 2):
 
 **Secrets are all inline ACA secrets** (paste-in at `az containerapp create/update`), sourced/rotated from your Key Vault. No MI → KV link (that would need a role assignment).
 
-## az commands (Phase 1 skeleton)
+## az commands (Phase 1 — actual SSOT/Aprimo deployment)
+
+Resources live in **subscription `Delaware.SSOT`, RG `Aprimo`, region `westeurope`**, created under a **PIM-activated Contributor** role (self-activated, 8h, no colleague). Already provisioned: storage `staprmocsfed001`, blob container `docs`, ACA env `cae-aprimo-shared`.
 
 ```bash
-RG=rg-codesearch; LOC=westeurope; ST=stcodesearchkb; ENV=cae-shared
-az group create -n $RG -l $LOC
-az storage account create -n $ST -g $RG -l $LOC --sku Standard_LRS
-az storage container create --account-name $ST -n kb \
-  --auth-mode key --account-key "$(az storage account keys list -n $ST -g $RG --query [0].value -o tsv)"
-az containerapp env create -n $ENV -g $RG -l $LOC
+RG=Aprimo; LOC=westeurope; ST=staprmocsfed001; ENV=cae-aprimo-shared
+KEY=$(az storage account keys list -n $ST -g $RG --query "[0].value" -o tsv)
 
-# Build/push image — GHCR route (no ACR rights needed):
-#   docker build -t ghcr.io/<org>/codesearch-serve:latest . && docker push ...
-# OR ACR-admin route:
-#   az acr create -n <acr> -g $RG --sku Basic --admin-enabled true
-#   az acr build -r <acr> -t codesearch-serve:latest .
+# Snapshot container (separate from the docs source so it is never indexed):
+az storage container create --account-name $ST -n snapshots --auth-mode key --account-key "$KEY"
 
-# Generate a read SAS for azcopy (account-key SAS — Contributor can list keys):
-SAS=$(az storage container generate-sas --account-name $ST -n kb \
-  --permissions rl --expiry 2026-12-31T00:00:00Z \
-  --account-key "$(az storage account keys list -n $ST -g $RG --query [0].value -o tsv)" -o tsv)
+# Read SAS for the docs source; read+write+list SAS for snapshots:
+DOCS_SAS=$(az storage container generate-sas --account-name $ST -n docs \
+  --permissions rl --expiry 2026-12-31T00:00:00Z --account-key "$KEY" -o tsv)
+SNAP_SAS=$(az storage container generate-sas --account-name $ST -n snapshots \
+  --permissions rwl --expiry 2026-12-31T00:00:00Z --account-key "$KEY" -o tsv)
 API_KEY=$(openssl rand -hex 32)
 
+# Image — GHCR (no ACR rights needed) OR ACR (Contributor on the RG can create it):
+#   az acr create -n acraprimocsfed -g $RG --sku Basic --admin-enabled true
+#   az acr build -r acraprimocsfed -t codesearch-serve:latest .
+
+FQDN="https://codesearch-serve.<env-hash>.westeurope.azurecontainerapps.io"  # known after first create
 az containerapp create -n codesearch-serve -g $RG --environment $ENV \
-  --image ghcr.io/<org>/codesearch-serve:latest \
+  --image <registry>/codesearch-serve:latest \
   --ingress external --target-port 39725 --transport http \
-  --min-replicas 1 --max-replicas 1 \
-  --registry-server ghcr.io --registry-username <gh-user> --registry-password <gh-pat> \
-  --secrets api-key=$API_KEY blob-sas="$SAS" \
+  --min-replicas 0 --max-replicas 1 \
+  --secrets api-key=$API_KEY docs-sas="$DOCS_SAS" snap-sas="$SNAP_SAS" \
   --env-vars \
      CODESEARCH_SERVE_HOST=0.0.0.0 \
      CODESEARCH_SERVE_PORT=39725 \
      CODESEARCH_SERVE_API_KEY=secretref:api-key \
-     BLOB_SAS_URL="https://$ST.blob.core.windows.net/kb?secretref:blob-sas" \
-     REINDEX_INTERVAL_SECS=900
+     BLOB_SAS_URL="https://$ST.blob.core.windows.net/docs?secretref:docs-sas" \
+     SNAPSHOT_SAS_URL="https://$ST.blob.core.windows.net/snapshots?secretref:snap-sas" \
+     REINDEX_INTERVAL_SECS=900 \
+     SNAPSHOT_INTERVAL_SECS=1800 \
+     CODESEARCH_KEEP_WARM_URL="$FQDN" \
+     CODESEARCH_IDLE_SUSPEND_SECS=7200
+# After create, read the real FQDN and `az containerapp update` CODESEARCH_KEEP_WARM_URL to it.
 ```
+
+> `--min-replicas 0` = scale-to-zero. The keep-warm task holds the replica up for 2h after
+> the last real query (`CODESEARCH_IDLE_SUSPEND_SECS=7200`), then lets ACA suspend it.
 
 ## Dev wiring (`repos.json`)
 
@@ -114,16 +132,23 @@ az containerapp create -n codesearch-serve -g $RG --environment $ENV \
     "cloud": {
       "url": "https://codesearch-serve.<env-hash>.<region>.azurecontainerapps.io",
       "api_key": "<API_KEY>",
-      "group": "docs"
+      "group": "docs",
+      "timeout_secs": 90
     }
   },
   "groups": { "docs": ["@cloud"] }
 }
 ```
 
-## Open / to-verify
+`timeout_secs: 90` lets the federated query wait through a scale-to-zero cold-start wake (~20-45s) instead of timing out at the 15s default and returning local-only + a warning.
 
-- **`/healthz`** endpoint must be added to the serve router (unauthenticated) before the ACA probe works.
+## Status / to-verify
+
+- [x] `/healthz` unauthenticated probe — shipped (stage 1).
+- [x] Cloud keep-warm in serve (2h-idle-then-suspend) — shipped (stage 2).
+- [x] Storage `staprmocsfed001` + `docs` container + ACA env `cae-aprimo-shared` — created.
+- [ ] `snapshots` container, SAS tokens, image push, ACA app create — stage 3.
 - **SAS expiry rotation** — account-key SAS expires; schedule a rotation reminder (or regenerate via pipeline).
-- **Cold-start time** — first request after scale-to-zero = full index. `min-replicas 1` keeps it warm; weigh cost vs latency.
+- **Snapshot consistency** — the index tarball is taken on a loop tick before reindex (quiescent window); acceptable for Phase 1. A future `codesearch snapshot` using `mdb_env_copy` would make it transactionally clean.
+- **Keep-warm self-ping reachability** — confirm the container can reach its own public FQDN through ACA ingress (egress allowed by default).
 - **federation coverage** — only `search` + `get_chunk` federate today (`find`/`explore`/`find_impact` deferred, per `federation-feature.md`). Fine for docs/KB.

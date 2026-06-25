@@ -2012,6 +2012,19 @@ impl ServeState {
             .or_insert_with(|| AtomicU64::new(1));
     }
 
+    /// Most recent real tool-call time across all repos, if any.
+    ///
+    /// Used by the cloud keep-warm task to decide whether the server is still
+    /// "active". Only genuine tool calls update `last_tool_call`; health/status
+    /// probes and the keep-warm self-ping do not, so this reflects real query
+    /// activity — not the keep-warm traffic that keeps the replica alive.
+    pub(crate) fn most_recent_tool_call(&self) -> Option<Instant> {
+        self.last_tool_call
+            .iter()
+            .map(|entry| entry.value().1)
+            .max()
+    }
+
     /// Record that changes were made to a repo (index/reindex).
     #[allow(dead_code)]
     pub(crate) fn record_changes(&self, alias: &str, count: u64) {
@@ -3586,6 +3599,8 @@ pub async fn run_serve(
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
     no_tui: bool,
+    keep_warm_url: Option<String>,
+    idle_suspend_secs: Option<u64>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     use crate::constants::{resolve_serve_host, SERVE_HOST_ENV};
@@ -3845,6 +3860,59 @@ pub async fn run_serve(
                     _ = reaper_cancel.cancelled() => {
                         break;
                     }
+                }
+            }
+        });
+    }
+
+    // ── Cloud keep-warm (scale-to-zero suspend after idle) ──
+    // On a scale-to-zero host (e.g. Azure Container Apps) no ingress traffic
+    // means the platform suspends the replica. While the most recent real tool
+    // call is younger than the idle window, self-ping our own ingress FQDN to
+    // generate traffic and stay warm; once idle exceeds the window, stop and let
+    // the host suspend. The next real request wakes us automatically.
+    let keep_warm_url = keep_warm_url
+        .filter(|u| !u.is_empty())
+        .or_else(|| std::env::var(crate::constants::KEEP_WARM_URL_ENV).ok())
+        .filter(|u| !u.is_empty());
+    if let Some(base_url) = keep_warm_url {
+        let idle_suspend = idle_suspend_secs
+            .or_else(|| {
+                std::env::var(crate::constants::IDLE_SUSPEND_SECS_ENV)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(crate::constants::DEFAULT_IDLE_SUSPEND_SECS);
+        let ping_url = format!("{}{}", base_url.trim_end_matches('/'), HEALTHZ_PATH);
+        let kw_state = serve_state.clone();
+        let kw_cancel = cancel_token.clone();
+        let start = Instant::now();
+        info!(
+            "🔥 keep-warm enabled: pinging {} every {}s while idle < {}s",
+            ping_url,
+            crate::constants::KEEP_WARM_INTERVAL_SECS,
+            idle_suspend
+        );
+        tokio::spawn(async move {
+            let interval =
+                std::time::Duration::from_secs(crate::constants::KEEP_WARM_INTERVAL_SECS);
+            let client = reqwest::Client::new();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        // Fall back to the server start time when no query has
+                        // happened yet, so a freshly deployed replica stays warm
+                        // for the full idle window before first use.
+                        let last = kw_state.most_recent_tool_call().unwrap_or(start);
+                        if last.elapsed().as_secs() < idle_suspend {
+                            let _ = client
+                                .get(&ping_url)
+                                .timeout(std::time::Duration::from_secs(10))
+                                .send()
+                                .await;
+                        }
+                    }
+                    _ = kw_cancel.cancelled() => break,
                 }
             }
         });
