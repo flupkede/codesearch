@@ -14,7 +14,10 @@
 # ---------------------------------------------------------------------------
 # 1. Builder
 # ---------------------------------------------------------------------------
-FROM rust:1-bookworm AS builder
+# trixie (glibc 2.41), NOT bookworm (2.36): the prebuilt onnxruntime pulled by
+# `ort` references glibc-2.38+ C23 symbols (__isoc23_strtoll), so linking on
+# bookworm fails. Runtime stage matches (trixie) so the binary loads at runtime.
+FROM rust:1-trixie AS builder
 WORKDIR /src
 
 # System deps for the build: onnxruntime (ort/fastembed) + TLS for reqwest.
@@ -23,12 +26,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Cache dependencies separately from source for faster rebuilds.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+# build.rs sets CARGO_PKG_VERSION_FULL (consumed by env!() in main.rs/cli). It
+# shells out to git for the commit count/hash but falls back to "0"/"unknown"
+# when .git is absent (it is — excluded by .dockerignore), so the build is
+# reproducible without the repo history.
 # Build only the main binary (the C# helper is not needed for docs federation).
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --bin codesearch \
+# NOTE: no BuildKit `--mount=type=cache` here — ACR Tasks uses the classic
+# builder, which rejects `--mount`. ACR builds fresh each run anyway.
+RUN cargo build --release --bin codesearch \
     && cp /src/target/release/codesearch /usr/local/bin/codesearch \
     # Stage any onnxruntime shared lib emitted next to the binary so the
     # runtime image can load it (ort dynamic-link layout).
@@ -52,15 +59,16 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 # 3. Runtime
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 ENV HOME=/home/app \
     LD_LIBRARY_PATH=/usr/local/lib \
     CODESEARCH_SERVE_PORT=39725 \
     DATA_DIR=/data
 
 # Runtime deps: TLS roots, git (KB pull), libgomp (onnxruntime), curl (probe loop).
+# No libssl: reqwest uses rustls (Cargo.toml), so no OpenSSL at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates git libgomp1 libssl3 curl \
+        ca-certificates git libgomp1 curl \
     && rm -rf /var/lib/apt/lists/*
 
 # azcopy (single static binary from Microsoft).
