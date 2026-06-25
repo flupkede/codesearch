@@ -524,7 +524,12 @@ impl ReposConfig {
     ///
     /// Deliberate exclusions:
     /// - The virtual `"all"` group is never included — every repo belongs to it,
-    ///   so it would be pure noise and drown the high-signal membership.
+    ///   so it would be pure noise and drown the high-signal membership. (This
+    ///   exclusion is *implicit*: `"all"` is never persisted in `self.groups`
+    ///   — it is synthesized on demand by `groups_with_virtual_all` /
+    ///   `resolve_group` — so iterating `self.groups` simply never sees it. A
+    ///   future change that starts persisting `"all"` would need to filter it
+    ///   here explicitly.)
     /// - `"@remote"` group members are skipped — they are federation peers, not
     ///   local project aliases.
     /// - Aliases that belong to no named group are omitted entirely (no empty
