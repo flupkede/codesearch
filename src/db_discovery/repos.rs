@@ -516,6 +516,41 @@ impl ReposConfig {
         out
     }
 
+    /// Inverse index: map each registered repo alias to the **named** group(s)
+    /// it belongs to (sorted, de-duplicated). Used by discoverability surfaces
+    /// (`status`, the `scope_required` error) so an agent can tell that, e.g.,
+    /// `"BAYR.Aprimo"` is a member of group `"BAYER"` and prefer a cross-repo
+    /// `group=` query over a single-repo `project=` query.
+    ///
+    /// Deliberate exclusions:
+    /// - The virtual `"all"` group is never included — every repo belongs to it,
+    ///   so it would be pure noise and drown the high-signal membership.
+    /// - `"@remote"` group members are skipped — they are federation peers, not
+    ///   local project aliases.
+    /// - Aliases that belong to no named group are omitted entirely (no empty
+    ///   entries).
+    pub fn project_groups(&self) -> std::collections::HashMap<String, Vec<String>> {
+        let mut out: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (group, members) in &self.groups {
+            for member in members {
+                // Skip federation references ("@peer") — not local projects.
+                if member.starts_with(REMOTE_REF_PREFIX) {
+                    continue;
+                }
+                // Only map known local aliases.
+                if self.repos.contains_key(member) {
+                    out.entry(member.clone()).or_default().push(group.clone());
+                }
+            }
+        }
+        for groups in out.values_mut() {
+            groups.sort();
+            groups.dedup();
+        }
+        out
+    }
+
     pub fn remove_group(&mut self, name: &str) -> bool {
         self.groups.remove(name).is_some()
     }
@@ -1365,6 +1400,63 @@ mod tests {
             !cfg.groups.contains_key(crate::constants::ALL_GROUP_NAME),
             "\"all\" must not leak into the stored groups map"
         );
+    }
+
+    #[test]
+    fn project_groups_maps_aliases_to_named_groups() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("BAYR.Aprimo".to_string(), PathBuf::from("/tmp/bayr"));
+        cfg.repos
+            .insert("BAYR.CONFIG.APRIMO".to_string(), PathBuf::from("/tmp/cfg"));
+        cfg.repos
+            .insert("lonely".to_string(), PathBuf::from("/tmp/lonely"));
+        // BAYR.Aprimo is a member of two named groups.
+        cfg.add_group(
+            "BAYER".to_string(),
+            vec!["BAYR.Aprimo".to_string(), "BAYR.CONFIG.APRIMO".to_string()],
+        )
+        .unwrap();
+        cfg.add_group("aprimo".to_string(), vec!["BAYR.Aprimo".to_string()])
+            .unwrap();
+
+        let pg = cfg.project_groups();
+
+        // Multi-group membership is sorted + de-duplicated.
+        assert_eq!(
+            pg.get("BAYR.Aprimo"),
+            Some(&vec!["BAYER".to_string(), "aprimo".to_string()])
+        );
+        assert_eq!(
+            pg.get("BAYR.CONFIG.APRIMO"),
+            Some(&vec!["BAYER".to_string()])
+        );
+        // A repo in no named group is omitted entirely (no empty entry).
+        assert!(!pg.contains_key("lonely"));
+    }
+
+    #[test]
+    fn project_groups_excludes_virtual_all_and_remote_refs() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        cfg.remotes
+            .insert("cloud".to_string(), make_peer("https://cloud"));
+        cfg.groups.insert(
+            "docs".to_string(),
+            vec!["local-a".to_string(), "@cloud".to_string()],
+        );
+
+        let pg = cfg.project_groups();
+
+        // Only the local alias is mapped; "@cloud" never appears as a key.
+        assert_eq!(pg.get("local-a"), Some(&vec!["docs".to_string()]));
+        assert!(!pg.contains_key("@cloud"));
+        assert!(!pg.contains_key("cloud"));
+        // The virtual "all" group is never a member entry.
+        for groups in pg.values() {
+            assert!(!groups.contains(&crate::constants::ALL_GROUP_NAME.to_string()));
+        }
     }
 
     // ── Federation: remotes + resolve_group_targets ───────────────────

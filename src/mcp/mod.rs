@@ -3723,18 +3723,22 @@ impl CodesearchService {
     /// Build a structured `scope_required` error JSON for multi-repo mode.
     ///
     /// Returns a JSON string containing `error_code`, `message`, `available_projects`,
-    /// `available_groups`, and `hint_for_agent` so that LLM agents can programmatically
-    /// react to the scope requirement.
+    /// `available_groups`, `project_groups`, and `hint_for_agent` so that LLM
+    /// agents can programmatically react to the scope requirement. `project_groups`
+    /// maps each project to the named group(s) it belongs to, so an agent can tell
+    /// that picking a single project would miss sibling repos in the same group
+    /// (e.g. a separate config / import-data repo).
     fn format_scope_error(&self) -> String {
-        let (projects, mut groups) = if let Some(ref serve_state) = self.serve_state {
+        let (projects, mut groups, project_groups) = if let Some(ref serve_state) = self.serve_state
+        {
             let cfg = serve_state.config_snapshot();
             let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
             projects.sort();
             let mut groups: Vec<String> = cfg.groups.keys().cloned().collect();
             groups.sort();
-            (projects, groups)
+            (projects, groups, cfg.project_groups())
         } else {
-            (vec![], vec![])
+            (vec![], vec![], std::collections::HashMap::new())
         };
         // The "all" virtual group is always available when there are projects to
         // search — advertise it so agents discover the cross-repo shortcut.
@@ -3750,7 +3754,8 @@ impl CodesearchService {
             "message": "Specify project= for a single repository or group= for cross-repo search.",
             "available_projects": projects,
             "available_groups": groups,
-            "hint_for_agent": "If the user has not indicated which repository to search, ask them to choose. Show available_projects and available_groups as options."
+            "project_groups": project_groups,
+            "hint_for_agent": "If the user has not indicated which repository to search, ask them to choose. Show available_projects and available_groups as options. IMPORTANT: project_groups maps each project to the group(s) it belongs to — if the project you would pick is listed there, prefer group= over project= so related repos (e.g. a separate config or import-data repo) are searched too."
         });
         payload.to_string()
     }
