@@ -480,6 +480,12 @@ pub struct RepoInfo {
     pub total_files: usize,
     pub model: String,
     pub lock_status: String,
+    /// Named group(s) this repo belongs to (sorted; excludes the virtual "all"
+    /// group). Lets an agent see that a single repo is part of a larger group
+    /// and prefer a cross-repo `group=` query — e.g. a separate config /
+    /// import-data repo that shares a group with the main project. Empty when
+    /// the repo is in no named group.
+    pub groups: Vec<String>,
 }
 
 /// Health response served by `codesearch serve` at GET /health.

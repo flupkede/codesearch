@@ -7287,6 +7287,7 @@ impl CodesearchService {
         // When serve is active, use ServeState as source of truth for lock status
         if let Some(ref serve_state) = self.serve_state {
             let config = serve_state.config_snapshot();
+            let project_groups = config.project_groups();
             let mut repos_info = Vec::new();
 
             for (alias, path) in &config.repos {
@@ -7342,6 +7343,7 @@ impl CodesearchService {
                     total_files,
                     model,
                     lock_status,
+                    groups: project_groups.get(alias).cloned().unwrap_or_default(),
                 });
             }
 
@@ -7359,6 +7361,7 @@ impl CodesearchService {
 
         // Stdio mode: fall back to disk-based lock detection
         let config = load_repos_config().unwrap_or_default();
+        let project_groups = config.project_groups();
         let mut repos_info = Vec::new();
         for (alias, path) in &config.repos {
             let db_path = path.join(crate::constants::DB_DIR_NAME);
@@ -7399,6 +7402,7 @@ impl CodesearchService {
                 total_files,
                 model,
                 lock_status,
+                groups: project_groups.get(alias).cloned().unwrap_or_default(),
             });
         }
 
