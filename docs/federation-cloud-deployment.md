@@ -174,18 +174,30 @@ MB). Sizing one app for the build would waste RAM on every active serving window
   (`az containerapp job start -n codesearch-indexer -g Aprimo`) and, later, on the harvester's
   weekly/monthly cadence.
 
-**Refresh path (steady state):** when a snapshot already exists, the job issues
-`POST /repos/<alias>/reindex` (incremental, no `force`). That opens the existing index in
-place and re-embeds **only** added/changed/removed docs — fast, and it never deletes the
-index. The first-ever **cold build** (no snapshot yet) instead does `POST /repos {path}` for a
-full corpus embed.
+**Refresh path (steady state):** when a snapshot already exists, the index is refreshed by
+serve's own **Phase-1 startup warmup** — on start, serve opens every registered repo in write
+mode and runs an incremental refresh, re-embedding **only** added/changed/removed docs (fast;
+never deletes the index). The job therefore does **not** issue its own reindex for a registered
+repo — it simply waits for the repo to reach a ready (`warm`) state, then verifies and snapshots.
+The first-ever **cold build** (no snapshot yet, repo unregistered) instead does `POST /repos
+{path}` for a full corpus embed.
 
-Two paths are deliberately **avoided**: `/reindex?force=true` returns 500 in this deployment,
-and `DELETE + POST /repos` (the earlier approach) deletes the ~60 MB index dir then immediately
-reopens it — racy on the container overlayfs, which surfaced as `register failed` and a stalled
-build. The incremental `/reindex` sidesteps both. A hard failure to kick off the rebuild, or an
-empty index at verify time, **aborts the job without uploading**, so a broken build can never
-clobber a known-good snapshot.
+Two things are critical to this working:
+
+1. **The corpus sync must never touch the index.** The index lives *inside* the synced dir at
+   `${DOCS_DIR}/.codesearch.db`, but the blob holds only `.md` source — so the sync uses
+   `azcopy ... --exclude-path=".codesearch.db"`. Without it, `--delete-destination` deletes the
+   whole restored index as "extra" (this masked itself under the old full-rebuild path, which
+   simply rebuilt from scratch).
+2. **No competing reindex.** Issuing `POST /repos/<alias>/reindex` while the warmup holds the
+   repo's LMDB write lock opens a second write handle and fails with HTTP 500 "locked by another
+   codesearch process". So the job lets the warmup own the refresh. Stale lock files baked into
+   an older snapshot are deleted on restore (a fresh container has no other process).
+
+`/reindex?force=true` (returns 500 here) and the earlier `DELETE + POST /repos` (deletes the
+~60 MB index then reopens it — racy on overlayfs) are both avoided. A hard failure to kick off a
+cold build, or an empty index (`chunks < 1`) at verify time, **aborts the job without
+uploading**, so a broken build can never clobber a known-good snapshot.
 
 **End-to-end verified:** `/healthz` 200 (unauth) · `/status` 401 without key / 200 with key ·
 the `index-job` builds the full 2737-doc corpus and uploads the snapshot · the 2 GiB

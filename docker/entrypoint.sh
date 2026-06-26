@@ -161,37 +161,41 @@ wait_healthz() {
   done
 }
 
-# Refresh a repo's index using the SAFE, LIGHT path:
-#   - already registered (restored from a prior snapshot)
-#         -> POST /repos/<alias>/reindex  (incremental, 202 Accepted)
-#       Opens the EXISTING index in place and re-embeds only added/changed/removed
-#       docs. No DB delete, no reopen — so it avoids both the ~60 MB delete-then-
-#       reopen race on the container overlayfs (the likely cause of the old
-#       "register failed" 500) AND the full ~20-25 min re-embed. /reindex?force=true
-#       is deliberately NOT used — it returns 500 in this deployment.
-#   - not yet registered (first-ever cold build, no snapshot existed)
-#         -> POST /repos {path}  (full index build, 202 Accepted)
+# Make sure a repo's index is built/refreshed; wait_until_indexed() then blocks for
+# completion. Two cases:
 #
-# Both kick the work off in the BACKGROUND; wait_until_indexed() blocks for it to
-# finish. A hard failure here ABORTS the job (die) so we never carry on to upload a
-# broken/empty snapshot over a good one.
+#   - ALREADY REGISTERED (index restored from a prior snapshot): do NOT issue any
+#     reindex here. serve's Phase-1 STARTUP WARMUP already opens the repo in write
+#     mode and runs an incremental refresh (re-embedding only added/changed/removed
+#     docs) the moment serve starts — and it holds the LMDB write lock for the whole
+#     refresh. A competing POST /repos/<alias>/reindex opens a SECOND write handle on
+#     the same LMDB env and fails with HTTP 500 "locked by another codesearch
+#     process" (observed). So we let the warmup own the refresh and simply wait for
+#     the repo to reach a ready ("warm") state. During warmup /status reports the
+#     repo as "closed"; it flips to "warm" only after the refresh completes, which is
+#     exactly the signal wait_until_indexed() blocks on. /reindex?force=true is also
+#     unused (returns 500 in this deployment).
+#
+#   - NOT YET REGISTERED (first-ever cold build, no snapshot existed): POST /repos
+#     {path} to build the index from scratch (202; background; shows "indexing").
+#     A hard failure to kick this off ABORTS the job (die) so we never go on to
+#     upload a broken/empty snapshot over a good one.
 rebuild_repo() {
   local path="$1" name base="http://127.0.0.1:${PORT}" resp code
   name="$(basename "$path")"
   if api "${base}/status" 2>/dev/null | grep -q "\"alias\":\"${name}\""; then
-    log "repo '${name}' already registered — incremental reindex (delta re-embed only)"
-    resp="$(api_code -X POST "${base}/repos/${name}/reindex" || true)"
-  else
-    log "repo '${name}' not registered — full index build of ${path}"
-    resp="$(api_code -X POST "${base}/repos" -H "Content-Type: application/json" \
-      -d "{\"path\":\"${path}\"}" || true)"
+    log "repo '${name}' already registered — serve startup warmup is incrementally \
+refreshing it; waiting for warmup to finish (no competing reindex)"
+    return 0
   fi
+  log "repo '${name}' not registered — full index build of ${path}"
+  resp="$(api_code -X POST "${base}/repos" -H "Content-Type: application/json" \
+    -d "{\"path\":\"${path}\"}" || true)"
   code="${resp##*$'\n'}"          # last line = HTTP status
   case "${code}" in
-    200|201|202) log "rebuild accepted for '${name}' (HTTP ${code})" ;;
-    409) log "rebuild already in progress for '${name}' (HTTP 409) — serve is already \
-reindexing it (likely startup warmup); will wait for that build to finish" ;;
-    *) die "rebuild request for '${name}' failed — HTTP ${code:-<none>}: ${resp%$'\n'*}" ;;
+    200|201|202) log "build accepted for '${name}' (HTTP ${code})" ;;
+    409) log "build already in progress for '${name}' (HTTP 409) — will wait for it" ;;
+    *) die "build request for '${name}' failed — HTTP ${code:-<none>}: ${resp%$'\n'*}" ;;
   esac
 }
 
