@@ -153,7 +153,7 @@ Subscription `Delaware.SSOT`, RG `Aprimo`, region `westeurope`:
 | Container Apps env | `cae-aprimo-shared` |
 | Container Registry | `acraprimocsfed` (Basic, admin-enabled) |
 | ACA app | `codesearch-serve` (**1 vCPU / 2 GiB**, min 0 / max 1, HTTPS ingress) |
-| ACA job | `codesearch-indexer` (**2 vCPU / 4 GiB**, Manual trigger) |
+| ACA job | `codesearch-indexer` (**4 vCPU / 8 GiB**, 5400s timeout, Manual trigger) |
 | FQDN | `https://codesearch-serve.happywave-063747be.westeurope.azurecontainerapps.io` |
 | Image | `acraprimocsfed.azurecr.io/codesearch-serve:v2.1` (dual-mode entrypoint) |
 
@@ -168,15 +168,24 @@ MB). Sizing one app for the build would waste RAM on every active serving window
   **read-only** — never registers, reindexes, or snapshots, so it never does heavy work and
   never OOMs. Fresh content is picked up on the next cold start (scale-to-zero makes those
   frequent).
-- **`index-job`** (the Job, 2 vCPU / 4 GiB): restore → sync blob → drive a local serve to
-  **rebuild** the index (DELETE + POST /repos) → wait until `/status` clears `"indexing"` →
-  upload snapshot → exit. This is a FULL re-embed (~20-25 min for the 2737-doc corpus on the
-  job replica) — heavy by design, which is why it lives in the Job and never in serve. Run on
-  demand (`az containerapp job start -n codesearch-indexer -g Aprimo`) and, later, on the
-  harvester's weekly/monthly cadence.
+- **`index-job`** (the Job, 4 vCPU / 8 GiB): restore → sync blob → drive a local serve to
+  **refresh** the index → wait until `/status` clears `"indexing"` → verify the index is
+  populated (`GET /repos/docs/info` → `chunks > 0`) → upload snapshot → exit. Run on demand
+  (`az containerapp job start -n codesearch-indexer -g Aprimo`) and, later, on the harvester's
+  weekly/monthly cadence.
 
-`/reindex?force=true` is deliberately NOT used by the job — it returns 500 in this
-deployment; DELETE + POST /repos is the reliable rebuild path.
+**Refresh path (steady state):** when a snapshot already exists, the job issues
+`POST /repos/<alias>/reindex` (incremental, no `force`). That opens the existing index in
+place and re-embeds **only** added/changed/removed docs — fast, and it never deletes the
+index. The first-ever **cold build** (no snapshot yet) instead does `POST /repos {path}` for a
+full corpus embed.
+
+Two paths are deliberately **avoided**: `/reindex?force=true` returns 500 in this deployment,
+and `DELETE + POST /repos` (the earlier approach) deletes the ~60 MB index dir then immediately
+reopens it — racy on the container overlayfs, which surfaced as `register failed` and a stalled
+build. The incremental `/reindex` sidesteps both. A hard failure to kick off the rebuild, or an
+empty index at verify time, **aborts the job without uploading**, so a broken build can never
+clobber a known-good snapshot.
 
 **End-to-end verified:** `/healthz` 200 (unauth) · `/status` 401 without key / 200 with key ·
 the `index-job` builds the full 2737-doc corpus and uploads the snapshot · the 2 GiB

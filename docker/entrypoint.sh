@@ -124,6 +124,14 @@ upload_snapshot() {
 # --- Local serve control (used by index-job) ---------------------------------
 api() { curl -fsS -H "Authorization: Bearer ${CODESEARCH_SERVE_API_KEY}" "$@"; }
 
+# Like api() but never aborts the script on HTTP >= 400: emits the response body
+# followed by a final line containing the HTTP status code. Callers split off the
+# trailing line to branch on the code (and surface the body on failure) instead of
+# silently swallowing errors with `>/dev/null 2>&1` (which hid the old 500s).
+api_code() {
+  curl -sS -H "Authorization: Bearer ${CODESEARCH_SERVE_API_KEY}" -w $'\n%{http_code}' "$@"
+}
+
 wait_healthz() {
   local base="http://127.0.0.1:${PORT}"
   local tries="${1:-60}"
@@ -134,38 +142,60 @@ wait_healthz() {
   done
 }
 
-# (Re)build a repo's index via the PROVEN POST /repos path. If the repo is
-# already registered (restored from a prior snapshot), DELETE it first so the
-# subsequent POST does a clean full rebuild that reliably picks up added/removed
-# docs. We deliberately do NOT use /reindex?force=true here: that endpoint is
-# flaky in this deployment (returns 500), whereas DELETE + POST is reliable.
-# This is a FULL rebuild — it re-embeds the corpus (~20-25 min for ~2700 docs on
-# the job replica). That heavy cost is exactly why it lives in the Job (big
-# replica) and never in serve. Indexing runs in the background; poll /status to
-# know when it finishes.
+# Refresh a repo's index using the SAFE, LIGHT path:
+#   - already registered (restored from a prior snapshot)
+#         -> POST /repos/<alias>/reindex  (incremental, 202 Accepted)
+#       Opens the EXISTING index in place and re-embeds only added/changed/removed
+#       docs. No DB delete, no reopen — so it avoids both the ~60 MB delete-then-
+#       reopen race on the container overlayfs (the likely cause of the old
+#       "register failed" 500) AND the full ~20-25 min re-embed. /reindex?force=true
+#       is deliberately NOT used — it returns 500 in this deployment.
+#   - not yet registered (first-ever cold build, no snapshot existed)
+#         -> POST /repos {path}  (full index build, 202 Accepted)
+#
+# Both kick the work off in the BACKGROUND; wait_until_indexed() blocks for it to
+# finish. A hard failure here ABORTS the job (die) so we never carry on to upload a
+# broken/empty snapshot over a good one.
 rebuild_repo() {
-  local path="$1" name base="http://127.0.0.1:${PORT}"
+  local path="$1" name base="http://127.0.0.1:${PORT}" resp code
   name="$(basename "$path")"
   if api "${base}/status" 2>/dev/null | grep -q "\"alias\":\"${name}\""; then
-    log "repo '${name}' already registered — DELETE then rebuild (picks up changes)"
-    api -X DELETE "${base}/repos/${name}" >/dev/null 2>&1 \
-      || log "WARN: delete ${name} failed (continuing)"
-    sleep 2   # let the eviction settle before re-registering
+    log "repo '${name}' already registered — incremental reindex (delta re-embed only)"
+    resp="$(api_code -X POST "${base}/repos/${name}/reindex" || true)"
+  else
+    log "repo '${name}' not registered — full index build of ${path}"
+    resp="$(api_code -X POST "${base}/repos" -H "Content-Type: application/json" \
+      -d "{\"path\":\"${path}\"}" || true)"
   fi
-  log "registering repo '${name}' (${path}) — full index"
-  api -X POST "${base}/repos" -H "Content-Type: application/json" \
-    -d "{\"path\":\"${path}\"}" >/dev/null 2>&1 \
-    && log "registered repo '${name}'" \
-    || log "WARN: register ${path} failed"
+  code="${resp##*$'\n'}"          # last line = HTTP status
+  case "${code}" in
+    200|201|202) log "rebuild accepted for '${name}' (HTTP ${code})" ;;
+    *) die "rebuild request for '${name}' failed — HTTP ${code:-<none>}: ${resp%$'\n'*}" ;;
+  esac
+}
+
+# Hard pre-upload guard: confirm the repo actually has a populated index before we
+# snapshot it. GET /repos/<alias>/info reports {"chunks":N,...}. chunks < 1 means the
+# index is empty/broken — refuse to upload so we never clobber a known-good snapshot.
+verify_index_ready() {
+  local name="$1" base="http://127.0.0.1:${PORT}" info chunks
+  info="$(api "${base}/repos/${name}/info" 2>/dev/null || true)"
+  chunks="$(printf '%s' "${info}" | sed -n 's/.*"chunks":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+  if [ -z "${chunks}" ] || [ "${chunks}" -lt 1 ] 2>/dev/null; then
+    log "verify: repo '${name}' reports chunks=${chunks:-<none>} — index looks EMPTY"
+    return 1
+  fi
+  log "verify: repo '${name}' OK — ${chunks} chunks indexed"
 }
 
 # Block until the requested rebuild has STARTED and then FINISHED (or timeout).
-# Two phases avoid two races introduced by the DELETE+POST rebuild:
-#   1. After DELETE the repo briefly disappears from /status, and after POST
-#      there's a short window before indexing flips the status to "indexing".
-#      Phase 1 waits for a real build to be observable (status "indexing", or an
-#      already-ready "open"/"warm" for a cache-instant rebuild) so we never
-#      mistake the gap for "done".
+# /reindex (and /repos) return 202 immediately and run in the background, so two
+# phases close the start-up race:
+#   1. After the 202 there's a short window before the background task flips the
+#      repo to "indexing". Phase 1 waits for a real build to be observable (status
+#      "indexing", or an already-ready "open"/"warm" when an incremental reindex
+#      finds no deltas and completes instantly) so we never mistake the gap for
+#      "done".
 #   2. Phase 2 then waits for "indexing" to clear.
 # The /status repo objects carry a "status" field per alias.
 wait_until_indexed() {
@@ -221,6 +251,11 @@ run_index_job() {
   [ -d "${KB_DIR}/.git" ] && rebuild_repo "${KB_DIR}"
   wait_until_indexed
 
+  # Never overwrite a good snapshot with a broken one: confirm the docs index is
+  # populated before uploading. (Incremental reindex never empties the index, so
+  # this should always pass — it's a backstop against a regressed build.)
+  verify_index_ready "$(basename "${DOCS_DIR}")" \
+    || die "index verification failed (empty/broken) — refusing to upload over the good snapshot"
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"
 
   log "index-job done — shutting down local serve"
