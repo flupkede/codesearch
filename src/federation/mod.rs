@@ -19,7 +19,8 @@ use serde::Deserialize;
 use crate::db_discovery::repos::RemotePeer;
 use crate::index::build_serve_client_with_key;
 
-/// Per-peer request timeout when none is configured (`timeout_secs = None`).
+// Per-peer request timeout when none is configured (`timeout_secs = None`).
+// Shared with the `remote` CLI command via constants (single source of truth).
 use crate::constants::DEFAULT_REMOTE_TIMEOUT_SECS as DEFAULT_TIMEOUT_SECS;
 
 /// A single hit returned by a remote `/search` endpoint.

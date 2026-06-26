@@ -1068,8 +1068,9 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
             }
         }
         RemoteCommands::Remove { name } => {
+            let name = name.trim();
             let mut config = crate::db_discovery::load_repos_config()?;
-            if config.remove_remote(&name) {
+            if config.remove_remote(name) {
                 config.save()?;
                 println!("Remote peer '{}' removed.", name);
             } else {
