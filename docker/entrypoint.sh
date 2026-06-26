@@ -134,37 +134,63 @@ wait_healthz() {
   done
 }
 
-# Register (build) a repo, or force-reindex it if it already exists (restored
-# from a prior snapshot). POST /repos builds the initial index; /reindex?force
-# refreshes an existing one. Returns once the request is accepted (indexing then
-# runs in the background — poll /status to know when it finishes).
-register_or_reindex() {
+# (Re)build a repo's index via the PROVEN POST /repos path. If the repo is
+# already registered (restored from a prior snapshot), DELETE it first so the
+# subsequent POST does a clean full rebuild that picks up added/removed docs.
+# We deliberately do NOT use /reindex?force=true here: that endpoint is flaky in
+# this deployment (returns 500), whereas DELETE + POST is reliable. The rebuild
+# re-embeds, but the restored embedding cache turns unchanged docs into cache
+# hits, so only genuinely new/changed docs cost real work — exactly what the Job
+# (running on a big replica) is for. Indexing then runs in the background; poll
+# /status to know when it finishes.
+rebuild_repo() {
   local path="$1" name base="http://127.0.0.1:${PORT}"
   name="$(basename "$path")"
   if api "${base}/status" 2>/dev/null | grep -q "\"alias\":\"${name}\""; then
-    log "repo '${name}' already registered — forcing reindex"
-    api -X POST "${base}/repos/${name}/reindex?force=true" >/dev/null 2>&1 \
-      && log "force reindex requested for '${name}'" \
-      || log "WARN: reindex ${name} failed"
-  else
-    log "registering repo '${name}' (${path}) — full index"
-    api -X POST "${base}/repos" -H "Content-Type: application/json" \
-      -d "{\"path\":\"${path}\"}" >/dev/null 2>&1 \
-      && log "registered repo '${name}'" \
-      || log "WARN: register ${path} failed"
+    log "repo '${name}' already registered — DELETE then rebuild (picks up changes)"
+    api -X DELETE "${base}/repos/${name}" >/dev/null 2>&1 \
+      || log "WARN: delete ${name} failed (continuing)"
+    sleep 2   # let the eviction settle before re-registering
   fi
+  log "registering repo '${name}' (${path}) — full index"
+  api -X POST "${base}/repos" -H "Content-Type: application/json" \
+    -d "{\"path\":\"${path}\"}" >/dev/null 2>&1 \
+    && log "registered repo '${name}'" \
+    || log "WARN: register ${path} failed"
 }
 
-# Block until no repo reports status "indexing" (or timeout). The /status repo
-# objects carry a "status" field; "indexing" means a build/reindex is in flight.
+# Block until the requested rebuild has STARTED and then FINISHED (or timeout).
+# Two phases avoid two races introduced by the DELETE+POST rebuild:
+#   1. After DELETE the repo briefly disappears from /status, and after POST
+#      there's a short window before indexing flips the status to "indexing".
+#      Phase 1 waits for a real build to be observable (status "indexing", or an
+#      already-ready "open"/"warm" for a cache-instant rebuild) so we never
+#      mistake the gap for "done".
+#   2. Phase 2 then waits for "indexing" to clear.
+# The /status repo objects carry a "status" field per alias.
 wait_until_indexed() {
-  local base="http://127.0.0.1:${PORT}" waited=0 step=10
-  # Give the just-requested indexing a moment to flip the status to "indexing".
-  sleep 5
-  while [ "${waited}" -lt "${INDEX_JOB_MAX_WAIT_SECS}" ]; do
-    local body
+  local base="http://127.0.0.1:${PORT}" waited=0 step=10 body started=0
+  # Phase 1: confirm a build is observable (bounded — a huge corpus enters
+  # "indexing" within seconds; a fully cache-hit rebuild may go straight to ready).
+  local start_wait=0
+  while [ "${start_wait}" -lt 120 ]; do
     body="$(api "${base}/status" 2>/dev/null || true)"
-    if [ -n "${body}" ] && ! printf '%s' "${body}" | grep -q '"status":"indexing"'; then
+    if printf '%s' "${body}" | grep -q '"status":"indexing"'; then
+      started=1; break
+    fi
+    if printf '%s' "${body}" | grep -qE '"status":"(open|warm|readonly)"'; then
+      log "repo already ready (cache-instant rebuild) after ~${start_wait}s"; return 0
+    fi
+    sleep 3; start_wait=$((start_wait + 3))
+  done
+  [ "${started}" -eq 1 ] && log "build started; waiting for completion" \
+    || log "WARN: no 'indexing' observed within ${start_wait}s — proceeding cautiously"
+  # Phase 2: wait for indexing to clear, requiring the repo to be present + ready.
+  while [ "${waited}" -lt "${INDEX_JOB_MAX_WAIT_SECS}" ]; do
+    body="$(api "${base}/status" 2>/dev/null || true)"
+    if [ -n "${body}" ] \
+        && ! printf '%s' "${body}" | grep -q '"status":"indexing"' \
+        && printf '%s' "${body}" | grep -qE '"status":"(open|warm|readonly)"'; then
       log "indexing complete after ~${waited}s"
       return 0
     fi
@@ -191,8 +217,8 @@ run_index_job() {
   trap 'kill "${serve_pid}" 2>/dev/null || true' EXIT
 
   wait_healthz 90 || { log "serve never came up"; exit 1; }
-  register_or_reindex "${DOCS_DIR}"
-  [ -d "${KB_DIR}/.git" ] && register_or_reindex "${KB_DIR}"
+  rebuild_repo "${DOCS_DIR}"
+  [ -d "${KB_DIR}/.git" ] && rebuild_repo "${KB_DIR}"
   wait_until_indexed
 
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"

@@ -152,12 +152,36 @@ Subscription `Delaware.SSOT`, RG `Aprimo`, region `westeurope`:
 | Blob containers | `docs` (source), `snapshots` (index snapshots) |
 | Container Apps env | `cae-aprimo-shared` |
 | Container Registry | `acraprimocsfed` (Basic, admin-enabled) |
-| ACA app | `codesearch-serve` (min 0 / max 1, HTTPS ingress) |
+| ACA app | `codesearch-serve` (**1 vCPU / 2 GiB**, min 0 / max 1, HTTPS ingress) |
+| ACA job | `codesearch-indexer` (**2 vCPU / 4 GiB**, Manual trigger) |
 | FQDN | `https://codesearch-serve.happywave-063747be.westeurope.azurecontainerapps.io` |
+| Image | `acraprimocsfed.azurecr.io/codesearch-serve:v2.1` (dual-mode entrypoint) |
+
+### Build/serve split (two entrypoint modes)
+
+A full index build is memory-heavy (embedding thousands of docs at once → ~4 GiB peak;
+a 2 GiB replica OOM-kills with exit 137), but serving/warm-restore is light (~hundreds of
+MB). Sizing one app for the build would waste RAM on every active serving window. So
+`docker/entrypoint.sh` branches on `CODESEARCH_RUN_MODE`:
+
+- **`serve`** (the App, 1 vCPU / 2 GiB): restore the prebuilt snapshot from blob and serve
+  **read-only** — never registers, reindexes, or snapshots, so it never does heavy work and
+  never OOMs. Fresh content is picked up on the next cold start (scale-to-zero makes those
+  frequent).
+- **`index-job`** (the Job, 2 vCPU / 4 GiB): restore → sync blob → drive a local serve to
+  **rebuild** the index (DELETE + POST /repos; the restored embedding cache makes unchanged
+  docs cache-hits, so only new/changed docs cost real work) → wait until `/status` clears
+  `"indexing"` → upload snapshot → exit. Run on demand (`az containerapp job start -n
+  codesearch-indexer -g Aprimo`) and, later, on the harvester's weekly/monthly cadence.
+
+`/reindex?force=true` is deliberately NOT used by the job — it returns 500 in this
+deployment; DELETE + POST /repos is the reliable rebuild path.
 
 **End-to-end verified:** `/healthz` 200 (unauth) · `/status` 401 without key / 200 with key ·
-cold-start → entrypoint auto-registers `docs` via POST /repos → indexes → `/search` returns
-the doc within ~5s. Scale-to-zero active; keep-warm env wired (2h idle window).
+the `index-job` builds the full 2737-doc corpus and uploads the snapshot · the 2 GiB
+restore-only serve cold-starts, restores the snapshot, and `/search` returns mo_help/rest_api
+results immediately with **restart count 0** (no OOM). Scale-to-zero active; keep-warm env
+wired (2h idle window).
 
 Build note: the image was built locally with `docker build` and pushed to ACR (`docker push`),
 NOT `az acr build` — the warmup prints a ➕ emoji that crashes the Windows `az` CLI log streamer
@@ -171,6 +195,6 @@ NOT `az acr build` — the warmup prints a ➕ emoji that crashes the Windows `a
 - [x] Storage + `docs`/`snapshots` containers + ACA env + ACR + ACA app — created & verified.
 - [x] Image built, pushed, ACA app live and serving federated search.
 - **SAS expiry rotation** — account-key SAS expires; schedule a rotation reminder (or regenerate via pipeline).
-- **Snapshot consistency** — the index tarball is taken on a loop tick before reindex (quiescent window); acceptable for Phase 1. A future `codesearch snapshot` using `mdb_env_copy` would make it transactionally clean.
+- **Snapshot consistency** — the `index-job` now waits for `/status` to clear `"indexing"` before tarring, so the snapshot is taken on a quiescent index (no longer a blind loop-tick). A future `codesearch snapshot` using `mdb_env_copy` would make it transactionally clean.
 - **Keep-warm self-ping reachability** — confirm the container can reach its own public FQDN through ACA ingress (egress allowed by default).
 - **federation coverage** — only `search` + `get_chunk` federate today (`find`/`explore`/`find_impact` deferred, per `federation-feature.md`). Fine for docs/KB.
