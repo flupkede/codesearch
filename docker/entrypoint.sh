@@ -67,8 +67,16 @@ sync_blob() {
   # --delete-destination keeps the local mirror in lock-step with the blob so
   # deletions propagate. No --compare-hash=MD5 — that needs a user_xattr the
   # container overlayfs lacks (transfer fails); size+mtime compare needs none.
+  #
+  # CRITICAL: --exclude-path=".codesearch.db" — the search index lives INSIDE the
+  # synced directory (${DOCS_DIR}/.codesearch.db) but the blob holds only source
+  # (.md) files, so without this exclusion --delete-destination would treat the
+  # whole restored index as "extra" and DELETE it. The index must be owned by the
+  # snapshot/indexer, never clobbered by the corpus sync (this also protects the
+  # serve app's restored index on cold start).
   azcopy sync "${BLOB_SAS_URL}" "${DOCS_DIR}" \
-    --delete-destination=true 2>&1 | sed 's/^/[azcopy] /' || \
+    --delete-destination=true \
+    --exclude-path=".codesearch.db" 2>&1 | sed 's/^/[azcopy] /' || \
     log "WARN: azcopy sync failed (continuing with existing local copy)"
 }
 
@@ -100,6 +108,14 @@ restore_snapshot() {
     if [ -f "${SNAPSHOT_LOCAL}" ]; then
       tar xzf "${SNAPSHOT_LOCAL}" -C / 2>&1 | sed 's/^/[snapshot] /' || log "WARN: snapshot extract failed"
       rm -f "${SNAPSHOT_LOCAL}"
+      # Drop stale lock files a prior snapshot may have captured (the original
+      # serve/indexer was killed while holding write locks, so .writer.lock /
+      # lock.mdb / tantivy locks can be baked in). A fresh container has no other
+      # process, so any lock here is stale; leaving them makes serve report the
+      # repo "locked by another codesearch process". LMDB recreates lock.mdb on
+      # open; the app-level *.lock files are pure stale-guards.
+      find "${DATA_DIR}" \( -name '.writer.lock' -o -name '.tantivy-writer.lock' \
+        -o -name '.tantivy-meta.lock' -o -name 'lock.mdb' \) -delete 2>/dev/null || true
       SNAPSHOT_RESTORED=1
       log "snapshot restored"
       return 0
@@ -111,8 +127,11 @@ restore_snapshot() {
 upload_snapshot() {
   [ -n "${SNAPSHOT_SAS_URL:-}" ] || { log "no SNAPSHOT_SAS_URL — skipping upload"; return 0; }
   log "creating index snapshot (excluding model weights)"
+  # Exclude model weights (baked into the image) and lock files (never valid to
+  # carry across containers — see restore_snapshot for why).
   tar czf "${SNAPSHOT_LOCAL}" -C / \
     --exclude='*.onnx' --exclude='*.onnx_data' \
+    --exclude='*.lock' --exclude='lock.mdb' \
     "${DATA_DIR#/}" "${CONFIG_DIR#/}" 2>/dev/null || { log "WARN: snapshot tar failed"; return 1; }
   azcopy copy "${SNAPSHOT_LOCAL}" "$(snapshot_blob_url)" --overwrite=true 2>&1 | sed 's/^/[azcopy] /' || {
     log "WARN: snapshot upload failed"; rm -f "${SNAPSHOT_LOCAL}"; return 1;
@@ -170,6 +189,8 @@ rebuild_repo() {
   code="${resp##*$'\n'}"          # last line = HTTP status
   case "${code}" in
     200|201|202) log "rebuild accepted for '${name}' (HTTP ${code})" ;;
+    409) log "rebuild already in progress for '${name}' (HTTP 409) — serve is already \
+reindexing it (likely startup warmup); will wait for that build to finish" ;;
     *) die "rebuild request for '${name}' failed — HTTP ${code:-<none>}: ${resp%$'\n'*}" ;;
   esac
 }
