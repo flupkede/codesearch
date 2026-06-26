@@ -142,12 +142,34 @@ az containerapp create -n codesearch-serve -g $RG --environment $ENV \
 
 `timeout_secs: 90` lets the federated query wait through a scale-to-zero cold-start wake (~20-45s) instead of timing out at the 15s default and returning local-only + a warning.
 
+## Deployed (verified live, 2026-06-26)
+
+Subscription `Delaware.SSOT`, RG `Aprimo`, region `westeurope`:
+
+| Resource | Name |
+|---|---|
+| Storage account | `staprmocsfed001` |
+| Blob containers | `docs` (source), `snapshots` (index snapshots) |
+| Container Apps env | `cae-aprimo-shared` |
+| Container Registry | `acraprimocsfed` (Basic, admin-enabled) |
+| ACA app | `codesearch-serve` (min 0 / max 1, HTTPS ingress) |
+| FQDN | `https://codesearch-serve.happywave-063747be.westeurope.azurecontainerapps.io` |
+
+**End-to-end verified:** `/healthz` 200 (unauth) · `/status` 401 without key / 200 with key ·
+cold-start → entrypoint auto-registers `docs` via POST /repos → indexes → `/search` returns
+the doc within ~5s. Scale-to-zero active; keep-warm env wired (2h idle window).
+
+Build note: the image was built locally with `docker build` and pushed to ACR (`docker push`),
+NOT `az acr build` — the warmup prints a ➕ emoji that crashes the Windows `az` CLI log streamer
+(cp1252). The ACR-side build itself also works; only the local log stream crashes.
+
 ## Status / to-verify
 
 - [x] `/healthz` unauthenticated probe — shipped (stage 1).
-- [x] Cloud keep-warm in serve (2h-idle-then-suspend) — shipped (stage 2).
-- [x] Storage `staprmocsfed001` + `docs` container + ACA env `cae-aprimo-shared` — created.
-- [ ] `snapshots` container, SAS tokens, image push, ACA app create — stage 3.
+- [x] Cloud keep-warm in serve (2h-idle-then-suspend) — shipped (stage 2); 2h suspend not yet
+      observed in wall-clock (logic reviewed + wired).
+- [x] Storage + `docs`/`snapshots` containers + ACA env + ACR + ACA app — created & verified.
+- [x] Image built, pushed, ACA app live and serving federated search.
 - **SAS expiry rotation** — account-key SAS expires; schedule a rotation reminder (or regenerate via pipeline).
 - **Snapshot consistency** — the index tarball is taken on a loop tick before reindex (quiescent window); acceptable for Phase 1. A future `codesearch snapshot` using `mdb_env_copy` would make it transactionally clean.
 - **Keep-warm self-ping reachability** — confirm the container can reach its own public FQDN through ACA ingress (egress allowed by default).
