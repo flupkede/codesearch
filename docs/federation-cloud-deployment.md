@@ -169,10 +169,11 @@ MB). Sizing one app for the build would waste RAM on every active serving window
   never OOMs. Fresh content is picked up on the next cold start (scale-to-zero makes those
   frequent).
 - **`index-job`** (the Job, 2 vCPU / 4 GiB): restore → sync blob → drive a local serve to
-  **rebuild** the index (DELETE + POST /repos; the restored embedding cache makes unchanged
-  docs cache-hits, so only new/changed docs cost real work) → wait until `/status` clears
-  `"indexing"` → upload snapshot → exit. Run on demand (`az containerapp job start -n
-  codesearch-indexer -g Aprimo`) and, later, on the harvester's weekly/monthly cadence.
+  **rebuild** the index (DELETE + POST /repos) → wait until `/status` clears `"indexing"` →
+  upload snapshot → exit. This is a FULL re-embed (~20-25 min for the 2737-doc corpus on the
+  job replica) — heavy by design, which is why it lives in the Job and never in serve. Run on
+  demand (`az containerapp job start -n codesearch-indexer -g Aprimo`) and, later, on the
+  harvester's weekly/monthly cadence.
 
 `/reindex?force=true` is deliberately NOT used by the job — it returns 500 in this
 deployment; DELETE + POST /repos is the reliable rebuild path.

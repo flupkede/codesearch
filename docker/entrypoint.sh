@@ -136,13 +136,13 @@ wait_healthz() {
 
 # (Re)build a repo's index via the PROVEN POST /repos path. If the repo is
 # already registered (restored from a prior snapshot), DELETE it first so the
-# subsequent POST does a clean full rebuild that picks up added/removed docs.
-# We deliberately do NOT use /reindex?force=true here: that endpoint is flaky in
-# this deployment (returns 500), whereas DELETE + POST is reliable. The rebuild
-# re-embeds, but the restored embedding cache turns unchanged docs into cache
-# hits, so only genuinely new/changed docs cost real work — exactly what the Job
-# (running on a big replica) is for. Indexing then runs in the background; poll
-# /status to know when it finishes.
+# subsequent POST does a clean full rebuild that reliably picks up added/removed
+# docs. We deliberately do NOT use /reindex?force=true here: that endpoint is
+# flaky in this deployment (returns 500), whereas DELETE + POST is reliable.
+# This is a FULL rebuild — it re-embeds the corpus (~20-25 min for ~2700 docs on
+# the job replica). That heavy cost is exactly why it lives in the Job (big
+# replica) and never in serve. Indexing runs in the background; poll /status to
+# know when it finishes.
 rebuild_repo() {
   local path="$1" name base="http://127.0.0.1:${PORT}"
   name="$(basename "$path")"
