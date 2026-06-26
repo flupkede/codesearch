@@ -98,6 +98,49 @@ pub enum GroupsCommands {
     },
 }
 
+/// Remote federation-peer subcommands
+#[derive(Subcommand, Debug)]
+pub enum RemoteCommands {
+    /// List configured remote peers
+    List,
+
+    /// Add (or overwrite) a remote `codesearch serve` peer for federation
+    Add {
+        /// Peer name (referenced from groups as "@<name>")
+        name: String,
+
+        /// Base URL of the remote serve instance (e.g. https://codesearch.example.com)
+        #[arg(long, visible_alias = "base-url")]
+        url: String,
+
+        /// Bearer / X-API-Key secret accepted by the remote (required when the
+        /// remote binds a non-localhost address)
+        #[arg(long)]
+        api_key: Option<String>,
+
+        /// Group to query on the remote (in the remote's own repos.json);
+        /// defaults to the remote's virtual "all" group when omitted
+        #[arg(long)]
+        group: Option<String>,
+
+        /// Per-peer request timeout in seconds (default 15)
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+
+        /// Also add "@<name>" to this LOCAL group (created if needed) so the
+        /// peer is actually queryable via that group
+        #[arg(long)]
+        into_group: Option<String>,
+    },
+
+    /// Remove a remote peer (and prune "@<name>" from any groups)
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// Peer name
+        name: String,
+    },
+}
+
 /// Hook subcommands
 #[derive(Subcommand, Debug)]
 pub enum HookCommands {
@@ -395,6 +438,12 @@ pub enum Commands {
     Groups {
         #[command(subcommand)]
         command: GroupsCommands,
+    },
+
+    /// Manage remote federation peers (other `codesearch serve` instances)
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommands,
     },
 
     /// Manage persistent embedding cache
@@ -721,6 +770,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             CacheCommands::Clear { model, yes } => run_cache_clear(model, yes).await,
         },
         Commands::Groups { command } => run_groups_command(command).await,
+        Commands::Remote { command } => run_remote_command(command).await,
         Commands::Hook { command } => match command {
             HookCommands::Install { path } => run_hook_install(path).await,
         },
@@ -945,6 +995,85 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
                 println!("Group '{}' removed.", name);
             } else {
                 eprintln!("Group '{}' not found.", name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle remote federation-peer subcommands
+async fn run_remote_command(command: RemoteCommands) -> Result<()> {
+    use crate::constants::DEFAULT_REMOTE_TIMEOUT_SECS;
+    use crate::db_discovery::repos::RemotePeer;
+
+    match command {
+        RemoteCommands::List => {
+            let config = crate::db_discovery::load_repos_config()?;
+            if config.remotes.is_empty() {
+                println!("No remote peers configured.");
+                return Ok(());
+            }
+            println!("Remote peers:");
+            let mut names: Vec<&String> = config.remotes.keys().collect();
+            names.sort();
+            for name in names {
+                let peer = &config.remotes[name];
+                let group = peer.group.as_deref().unwrap_or("(remote's \"all\")");
+                let timeout = peer.timeout_secs.unwrap_or(DEFAULT_REMOTE_TIMEOUT_SECS);
+                let auth = if peer.api_key.is_empty() {
+                    "no api-key"
+                } else {
+                    "api-key set"
+                };
+                let refs = config.groups_referencing_remote(name);
+                let wired = if refs.is_empty() {
+                    "not in any group — add with --into-group or `codesearch groups`".to_string()
+                } else {
+                    format!("groups: {}", refs.join(", "))
+                };
+                println!(
+                    "  @{name}: {url} [remote-group={group}, timeout={timeout}s, {auth}]\n      {wired}",
+                    url = peer.url
+                );
+            }
+        }
+        RemoteCommands::Add {
+            name,
+            url,
+            api_key,
+            group,
+            timeout_secs,
+            into_group,
+        } => {
+            let mut config = crate::db_discovery::load_repos_config()?;
+            let peer = RemotePeer {
+                url,
+                api_key: api_key.unwrap_or_default(),
+                group,
+                timeout_secs,
+            };
+            config.add_remote(name.clone(), peer)?;
+            if let Some(g) = &into_group {
+                config.add_remote_to_group(g.clone(), name.trim())?;
+            }
+            config.save()?;
+            println!("Remote peer '{}' added/updated.", name.trim());
+            if let Some(g) = into_group {
+                println!("  wired into group '{}' as \"@{}\".", g, name.trim());
+            } else {
+                println!(
+                    "  note: add it to a group to query it, e.g. `codesearch remote add {} --url ... --into-group docs`",
+                    name.trim()
+                );
+            }
+        }
+        RemoteCommands::Remove { name } => {
+            let mut config = crate::db_discovery::load_repos_config()?;
+            if config.remove_remote(&name) {
+                config.save()?;
+                println!("Remote peer '{}' removed.", name);
+            } else {
+                eprintln!("Remote peer '{}' not found.", name);
             }
         }
     }

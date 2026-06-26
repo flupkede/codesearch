@@ -293,6 +293,11 @@ pub const DEFAULT_IDLE_SUSPEND_SECS: u64 = 2 * 60 * 60;
 /// How often the keep-warm task pings its own ingress while active.
 pub const KEEP_WARM_INTERVAL_SECS: u64 = 2 * 60; // 2 minutes
 
+/// Default per-peer federation request timeout (seconds) when a remote peer
+/// does not specify its own `timeout_secs`. Shared by the federation client
+/// and the `remote` CLI command so both report/apply the same default.
+pub const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 15;
+
 /// Maximum wall-clock duration a single reindex may take before its
 /// `active_reindexes` entry is considered **stale** (leaked).
 ///

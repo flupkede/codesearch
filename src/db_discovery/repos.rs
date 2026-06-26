@@ -560,6 +560,92 @@ impl ReposConfig {
         self.groups.remove(name).is_some()
     }
 
+    /// Register (or overwrite) a remote federation peer under `name`.
+    ///
+    /// The peer becomes referenceable from a group as `"@<name>"`. Adding a
+    /// remote does NOT, by itself, make it queryable — the `"@<name>"` reference
+    /// must also be added to a group (see [`add_remote_to_group`]).
+    ///
+    /// Validates that the name is non-empty and does not itself carry the
+    /// `@` reference prefix (which is added automatically in group members),
+    /// and that the peer URL is non-empty.
+    pub fn add_remote(&mut self, name: String, peer: RemotePeer) -> Result<()> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow::anyhow!("Remote peer name must not be empty"));
+        }
+        if trimmed.starts_with(REMOTE_REF_PREFIX) {
+            return Err(anyhow::anyhow!(
+                "Remote peer name must not start with '{}' — that prefix is only used inside group references (e.g. group member \"@{}\")",
+                REMOTE_REF_PREFIX,
+                trimmed.trim_start_matches(REMOTE_REF_PREFIX)
+            ));
+        }
+        if peer.url.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Remote peer '{}' must have a non-empty url",
+                trimmed
+            ));
+        }
+        self.remotes.insert(trimmed.to_string(), peer);
+        Ok(())
+    }
+
+    /// Remove a remote peer and prune every `"@<name>"` reference to it from all
+    /// groups; groups left empty by the prune are dropped. Returns `false` when
+    /// no peer of that name was registered.
+    pub fn remove_remote(&mut self, name: &str) -> bool {
+        if self.remotes.remove(name).is_none() {
+            return false;
+        }
+        let reference = format!("{REMOTE_REF_PREFIX}{name}");
+        for members in self.groups.values_mut() {
+            members.retain(|m| m != &reference);
+        }
+        self.groups.retain(|_, members| !members.is_empty());
+        true
+    }
+
+    /// Add a `"@<remote_name>"` reference to `group`, creating the group if it
+    /// does not exist. Idempotent — a reference already present is not
+    /// duplicated. The reserved virtual `"all"` group never federates and
+    /// cannot be targeted. Errors when the remote peer is unknown.
+    pub fn add_remote_to_group(&mut self, group: String, remote_name: &str) -> Result<()> {
+        if group == crate::constants::ALL_GROUP_NAME {
+            return Err(anyhow::anyhow!(
+                "Group name '{}' is reserved — it always resolves to all registered repos and never federates.",
+                group
+            ));
+        }
+        if !self.remotes.contains_key(remote_name) {
+            return Err(anyhow::anyhow!(
+                "Unknown remote peer '{}' — add it first with `codesearch remote add`.",
+                remote_name
+            ));
+        }
+        let reference = format!("{REMOTE_REF_PREFIX}{remote_name}");
+        let members = self.groups.entry(group).or_default();
+        if !members.contains(&reference) {
+            members.push(reference);
+        }
+        Ok(())
+    }
+
+    /// Named groups that reference the given remote peer as `"@<name>"`
+    /// (sorted). Used by the `remote list` surface to show where a peer is wired
+    /// in. The virtual `"all"` group never federates, so it is never included.
+    pub fn groups_referencing_remote(&self, remote_name: &str) -> Vec<String> {
+        let reference = format!("{REMOTE_REF_PREFIX}{remote_name}");
+        let mut out: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|(_, members)| members.contains(&reference))
+            .map(|(name, _)| name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
     pub fn alias_for_path(&self, path: &Path) -> Option<String> {
         let canonical =
             safe_canonicalize(path).unwrap_or_else(|_| strip_unc_prefix(path.to_path_buf()));
@@ -1617,6 +1703,112 @@ mod tests {
         assert_eq!(peer.group.as_deref(), Some("docs"));
         // Group with remote ref survives the load+reconcile roundtrip.
         assert_eq!(loaded.groups.get("docs"), Some(&vec!["@cloud".to_string()]));
+    }
+
+    #[test]
+    fn add_remote_inserts_and_overwrites() {
+        let mut cfg = ReposConfig::default();
+        cfg.add_remote("cloud".to_string(), make_peer("https://cloud"))
+            .unwrap();
+        assert_eq!(cfg.remotes.get("cloud").unwrap().url, "https://cloud");
+        // Overwrite with a new URL.
+        cfg.add_remote("cloud".to_string(), make_peer("https://cloud2"))
+            .unwrap();
+        assert_eq!(cfg.remotes.len(), 1);
+        assert_eq!(cfg.remotes.get("cloud").unwrap().url, "https://cloud2");
+    }
+
+    #[test]
+    fn add_remote_rejects_empty_name_prefixed_name_and_empty_url() {
+        let mut cfg = ReposConfig::default();
+        assert!(cfg
+            .add_remote("  ".to_string(), make_peer("https://cloud"))
+            .is_err());
+        assert!(cfg
+            .add_remote("@cloud".to_string(), make_peer("https://cloud"))
+            .is_err());
+        let mut blank = make_peer("https://cloud");
+        blank.url = "  ".to_string();
+        assert!(cfg.add_remote("cloud".to_string(), blank).is_err());
+        assert!(cfg.remotes.is_empty());
+    }
+
+    #[test]
+    fn add_remote_trims_name() {
+        let mut cfg = ReposConfig::default();
+        cfg.add_remote("  cloud  ".to_string(), make_peer("https://cloud"))
+            .unwrap();
+        assert!(cfg.remotes.contains_key("cloud"));
+    }
+
+    #[test]
+    fn add_remote_to_group_creates_and_is_idempotent() {
+        let mut cfg = ReposConfig::default();
+        cfg.add_remote("cloud".to_string(), make_peer("https://cloud"))
+            .unwrap();
+        cfg.add_remote_to_group("docs".to_string(), "cloud")
+            .unwrap();
+        cfg.add_remote_to_group("docs".to_string(), "cloud")
+            .unwrap(); // idempotent
+        assert_eq!(cfg.groups.get("docs"), Some(&vec!["@cloud".to_string()]));
+    }
+
+    #[test]
+    fn add_remote_to_group_rejects_reserved_all_and_unknown_remote() {
+        let mut cfg = ReposConfig::default();
+        cfg.add_remote("cloud".to_string(), make_peer("https://cloud"))
+            .unwrap();
+        assert!(cfg
+            .add_remote_to_group(crate::constants::ALL_GROUP_NAME.to_string(), "cloud")
+            .is_err());
+        assert!(cfg
+            .add_remote_to_group("docs".to_string(), "ghost")
+            .is_err());
+    }
+
+    #[test]
+    fn remove_remote_prunes_group_references_and_empties() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        cfg.add_remote("cloud".to_string(), make_peer("https://cloud"))
+            .unwrap();
+        cfg.groups.insert(
+            "docs".to_string(),
+            vec!["local-a".to_string(), "@cloud".to_string()],
+        );
+        cfg.groups
+            .insert("cloud-only".to_string(), vec!["@cloud".to_string()]);
+
+        assert!(cfg.remove_remote("cloud"));
+        assert!(!cfg.remotes.contains_key("cloud"));
+        // The mixed group keeps its local member but drops the remote ref.
+        assert_eq!(cfg.groups.get("docs"), Some(&vec!["local-a".to_string()]));
+        // The group that only referenced the remote is dropped entirely.
+        assert!(!cfg.groups.contains_key("cloud-only"));
+    }
+
+    #[test]
+    fn remove_remote_returns_false_for_unknown() {
+        let mut cfg = ReposConfig::default();
+        assert!(!cfg.remove_remote("ghost"));
+    }
+
+    #[test]
+    fn groups_referencing_remote_lists_sorted_groups() {
+        let mut cfg = ReposConfig::default();
+        cfg.add_remote("cloud".to_string(), make_peer("https://cloud"))
+            .unwrap();
+        cfg.groups
+            .insert("zeta".to_string(), vec!["@cloud".to_string()]);
+        cfg.groups
+            .insert("alpha".to_string(), vec!["@cloud".to_string()]);
+        cfg.groups
+            .insert("other".to_string(), vec!["@somewhere".to_string()]);
+        assert_eq!(
+            cfg.groups_referencing_remote("cloud"),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
     }
 
     #[test]
