@@ -91,7 +91,10 @@ RUN useradd --create-home --home-dir /home/app --shell /usr/sbin/nologin app
 # Binary + onnxruntime lib + pre-warmed model cache + entrypoint.
 COPY --from=builder /usr/local/bin/codesearch /usr/local/bin/codesearch
 COPY --from=builder /out/lib/ /usr/local/lib/
-COPY --from=warmer  /home/app/.codesearch /home/app/.codesearch
+# Copy ONLY the models cache (model weights + embedding cache), NOT the whole
+# ~/.codesearch — the warmup also writes a repos.json registering "/tmp/warm",
+# which would otherwise bake a stale "warm" repo into the runtime image.
+COPY --from=warmer  /home/app/.codesearch/models /home/app/.codesearch/models
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh \
     && mkdir -p /data \

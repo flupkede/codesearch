@@ -60,8 +60,11 @@ sync_blob() {
   log "azcopy sync blob -> ${DOCS_DIR}"
   # --delete-destination keeps the local mirror in lock-step with the blob so
   # deletions propagate and codesearch's incremental pass can drop them.
+  # NB: no --compare-hash=MD5 — that stores the hash in a user_xattr, which the
+  # container overlayfs does not support (transfer fails). Default sync compares
+  # last-modified-time + size, which needs no xattr.
   azcopy sync "${BLOB_SAS_URL}" "${DOCS_DIR}" \
-    --delete-destination=true --compare-hash=MD5 2>&1 | sed 's/^/[azcopy] /' || \
+    --delete-destination=true 2>&1 | sed 's/^/[azcopy] /' || \
     log "WARN: azcopy sync failed (continuing with existing local copy)"
 }
 
@@ -117,10 +120,28 @@ upload_snapshot() {
 # interval. Alias == the registered directory's name (codesearch convention),
 # so /data/docs -> "docs". A snapshot is taken on tick boundaries that cross the
 # snapshot interval, BEFORE the reindex writes, when the DB is most quiescent.
+# Register (create DB + index + warm) a repo via the REST API. We do NOT use
+# `serve --register`: it adds the alias to config but does NOT build the initial
+# index, and an unindexed repo is auto-pruned at warmup. POST /repos creates the
+# DB, indexes, and warms — so the repo survives and is searchable.
+register_repo() {
+  local path="$1" name
+  name="$(basename "$path")"
+  curl -fsS -X POST "http://127.0.0.1:${PORT}/repos" \
+    -H "Authorization: Bearer ${CODESEARCH_SERVE_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "{\"path\":\"${path}\"}" >/dev/null 2>&1 \
+    && log "registered repo '${name}' (${path})" \
+    || log "WARN: register ${path} failed"
+}
+
 background_loop() {
   local base="http://127.0.0.1:${PORT}"
   until curl -fsS "${base}/healthz" >/dev/null 2>&1; do sleep 2; done
-  log "serve is live; reindex every ${REINDEX_INTERVAL_SECS}s, snapshot every ${SNAPSHOT_INTERVAL_SECS}s"
+  log "serve is live; registering repos"
+  register_repo "${DOCS_DIR}"
+  [ -d "${KB_DIR}/.git" ] && register_repo "${KB_DIR}"
+  log "reindex every ${REINDEX_INTERVAL_SECS}s, snapshot every ${SNAPSHOT_INTERVAL_SECS}s"
   local since_snapshot=0
   while true; do
     sleep "${REINDEX_INTERVAL_SECS}"
@@ -145,20 +166,16 @@ restore_snapshot
 sync_blob
 sync_kb
 
-REGISTER_ARGS=(--register "${DOCS_DIR}")
-if [ -d "${KB_DIR}/.git" ]; then
-  REGISTER_ARGS+=(--register "${KB_DIR}")
-fi
-
+# background_loop registers the repos via POST /repos once serve is live, then
+# runs the incremental-reindex + snapshot loop.
 background_loop &
 
 log "starting codesearch serve on 0.0.0.0:${PORT}"
-# create_index defaults true -> registered repos are indexed on startup. With a
-# restored snapshot this is an INCREMENTAL pass (DB already present); without
-# one it is a full build. Bind 0.0.0.0; CODESEARCH_SERVE_API_KEY enforces auth.
+# Repos are registered via the API (see register_repo), NOT --register, because
+# --register does not build the initial index. Bind 0.0.0.0; the API key
+# enforces auth on this network bind.
 exec codesearch serve \
   --host 0.0.0.0 \
   --port "${PORT}" \
-  "${REGISTER_ARGS[@]}" \
   --no-tui \
   --quiet=false
