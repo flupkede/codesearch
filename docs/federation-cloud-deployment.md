@@ -142,6 +142,55 @@ az containerapp create -n codesearch-serve -g $RG --environment $ENV \
 
 `timeout_secs: 90` lets the federated query wait through a scale-to-zero cold-start wake (~20-45s) instead of timing out at the 15s default and returning local-only + a warning.
 
+## Managing the peer's indexes from your laptop (`index … --remote`)
+
+You no longer need to `az containerapp exec` into the cloud peer to add, remove,
+reindex, or list its repos. The local `codesearch index` verbs take a `--remote <peer>`
+flag that resolves against the `remotes` map in `repos.json` and drives the peer's
+management API (`GET /status`, `POST /repos`, `DELETE /repos/:alias`,
+`POST /repos/:alias/reindex`) over TLS with the peer's stored `api_key`. The peer must
+already be configured via `codesearch remote add`.
+
+```bash
+# what's currently indexed on the cloud peer?
+codesearch index list --remote cloud
+
+# register a path on the peer (path is on the PEER's filesystem, e.g. /data/docs/...)
+codesearch index add /data/docs/aprimo-docs --remote cloud
+
+# remove one repo by alias
+codesearch index rm inriver --remote cloud
+
+# kick off a background reindex on the peer (incremental by default; --force = full)
+codesearch index reindex aprimo-docs --remote cloud --force
+```
+
+`index list` and `index reindex` accept `--json` for script/agent use (**requires `--remote`**).
+
+> ⚠️ The `index-job` (`indexer-job` entrypoint mode) already owns the build path —
+> restore → sync blob → warmup refresh → snapshot. Do **not** issue
+> `index reindex <alias> --remote` against a repo whose warmup is still running: it
+> opens a second LMDB write handle and the peer returns HTTP 500
+> ("locked by another codesearch process"). Run `index list --remote` first and confirm
+> the target repo's `status` is `warm`/`open` (not `indexing`).
+
+### Per-vendor sub-path registration
+
+The cloud peer currently serves one mixed index (alias `docs`, with
+`rest_api/ dam_help/ mo_help/ inriver/ akeneo/ …` underneath). To mirror the clean
+local per-vendor layout (`aprimo-docs`, `inriver-docs`, `akeneo-docs`, …), register
+each vendor's synced sub-folder as its own repo on the peer:
+
+```bash
+for v in aprimo-docs inriver-docs akeneo-docs; do
+  codesearch index add "/data/docs/$v" --remote cloud
+done
+codesearch index list --remote cloud   # one alias per vendor
+```
+
+Each alias then becomes individually addressable via MCP `project="<alias>"` and
+individually reindexable / removable from the laptop.
+
 ## Deployed (verified live, 2026-06-26)
 
 Subscription `Delaware.SSOT`, RG `Aprimo`, region `westeurope`:

@@ -445,6 +445,55 @@ codesearch mcp --mode client  # force serve connection
 
 The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 
+### Federation (remote peers)
+
+codesearch can fan-out read queries (`search`, `get_chunk`) to **remote peers** — other `codesearch serve` instances (e.g. a cloud-hosted docs/KB peer) — and merge results with local indexes via RRF. This lets a team share one knowledge base while each dev keeps code search local.
+
+**Manage peer entries** (pure local config — does not call the remote):
+
+```bash
+codesearch remote add cloud \
+  --url https://codesearch-serve.<env>.<region>.azurecontainerapps.io \
+  --api-key $API_KEY --timeout-secs 90
+codesearch remote list          # show configured peers
+codesearch remote rm cloud      # remove a peer entry
+```
+
+A group then references a peer via `@`-prefix (`"groups": { "docs": ["@cloud"] }`), and `group="docs"` fans the query out over TLS. Remote misses never hard-fail — they degrade to local-only results with a `warnings` field.
+
+**Manage indexes ON a peer** — the same `index` verbs, scoped with `--remote <peer>`:
+
+```bash
+# list the repos living on the cloud peer
+codesearch index list --remote cloud
+
+# register a path on the peer's filesystem (NOT your local FS)
+codesearch index add /data/docs/aprimo --remote cloud
+
+# remove a repo by its alias on the peer (NOT a local path)
+codesearch index rm inriver --remote cloud
+
+# trigger a background reindex of one repo on the peer
+codesearch index reindex inriver --remote cloud          # incremental
+codesearch index reindex inriver --remote cloud --force  # force full
+```
+
+- `--remote` resolves `<peer>` against the peers you configured with `codesearch remote add`. An unknown peer produces a clear error listing the known ones.
+- With `--remote`, `add` takes a **path on the peer's filesystem** and `rm`/`reindex` take a **remote alias** (never your local path).
+- Without `--remote`, every `index` command behaves exactly as today (local).
+- `index list` and `index reindex` accept `--json` for agent-friendly output (**requires `--remote`**).
+
+**Per-vendor layout on a peer.** Instead of registering one mixed corpus, register each vendor's sub-folder as its own repo so the cloud layout mirrors your local one:
+
+```bash
+for v in aprimo-docs inriver-docs akeneo-docs; do
+  codesearch index add "/data/docs/$v" --remote cloud
+done
+codesearch index list --remote cloud   # one alias per vendor
+```
+
+See `docs/federation-feature.md` (Rust feature: REST endpoints, RRF merge, config) and `docs/federation-cloud-deployment.md` (Azure deployment + the `--remote` management recipe).
+
 ## CLI Reference
 
 | Command | Description |
