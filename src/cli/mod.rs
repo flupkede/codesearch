@@ -49,6 +49,7 @@ pub enum IndexCommands {
     },
 
     /// Show index status (local, global, or on a remote peer)
+    #[command(visible_alias = "ls")]
     List {
         /// List indexes on a remote peer.
         #[arg(long)]
@@ -115,6 +116,7 @@ pub enum CacheCommands {
 #[derive(Subcommand, Debug)]
 pub enum GroupsCommands {
     /// List all groups
+    #[command(visible_alias = "ls")]
     List,
 
     /// Create or update a group
@@ -139,6 +141,7 @@ pub enum GroupsCommands {
 #[derive(Subcommand, Debug)]
 pub enum RemoteCommands {
     /// List configured remote peers
+    #[command(visible_alias = "ls")]
     List,
 
     /// Add (or overwrite) a remote `codesearch serve` peer for federation
