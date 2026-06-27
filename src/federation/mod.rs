@@ -14,6 +14,7 @@
 //! into `warnings` on the response so one bad peer can never fail an otherwise
 //! healthy query.
 
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::db_discovery::repos::RemotePeer;
@@ -73,6 +74,108 @@ pub enum Outcome<T> {
     Ok(T),
     /// The peer was unreachable or errored — degrade gracefully.
     Unreachable(String),
+}
+
+/// The outcome of a *management* call (`index … --remote <peer>`):
+/// [`list_repos`](FederationClient::list_repos),
+/// [`add_repo`](FederationClient::add_repo),
+/// [`remove_repo`](FederationClient::remove_repo),
+/// [`reindex`](FederationClient::reindex).
+///
+/// Richer than the query-path [`Outcome`] because management commands are
+/// interactive (a human invoked them directly) and must distinguish "peer
+/// unreachable" from "peer rejected the request" so the CLI can print a precise
+/// message and set the right exit code. A `409 conflict` is not a transport
+/// failure — the peer answered; it just said no.
+#[derive(Debug)]
+pub enum ManagementOutcome<T> {
+    /// The peer answered with a 2xx status.
+    Ok(T),
+    /// The peer answered with a non-2xx status (conflict, not found, warmup
+    /// lock, …). Carries the HTTP status code and the peer's `error`/`message`
+    /// text so the CLI can surface exactly what the peer reported.
+    HttpError {
+        /// HTTP status code returned by the peer (e.g. 404, 409, 500).
+        status: u16,
+        /// Human-readable reason extracted from the peer's JSON `error`/`message`
+        /// field, or the raw body when it wasn't JSON.
+        reason: String,
+    },
+    /// The peer did not answer at all (connection refused, timeout, DNS failure,
+    /// non-UTF8 / non-JSON body on a success path).
+    Unreachable(String),
+}
+
+/// `GET /status` payload as served by `codesearch serve`. Only the fields the
+/// management commands care about are typed; every field is optional/defaulted
+/// so an older or newer remote that adds/omits fields still parses.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteStatus {
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub repos: Vec<RemoteRepoStatus>,
+    #[serde(default)]
+    pub uptime_secs: Option<u64>,
+    #[serde(default)]
+    pub active_sessions: Option<u64>,
+}
+
+/// A single repo entry inside a [`RemoteStatus`] payload.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteRepoStatus {
+    #[serde(default)]
+    pub alias: String,
+    /// Repo lifecycle state reported by the server
+    /// (`open`/`warm`/`readonly`/`closed`/`indexing`/`error`/`no_index`).
+    #[serde(default)]
+    pub status: String,
+    /// `write`/`read`/`-`.
+    #[serde(default)]
+    pub lock_mode: String,
+    #[serde(default)]
+    pub changes: u64,
+    #[serde(default)]
+    pub last_tool_call: Option<String>,
+    #[serde(default)]
+    pub tool_call_count: Option<u64>,
+}
+
+/// `POST /repos` success payload (HTTP 202).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteRepoAdded {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub alias: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `DELETE /repos/:alias` success payload (HTTP 200).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteRepoRemoved {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub alias: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `POST /repos/:alias/reindex` success payload (HTTP 202).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RemoteReindexResult {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub alias: String,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// HTTP client for talking to remote `codesearch serve` peers.
@@ -213,6 +316,141 @@ impl FederationClient {
             }
             Err(e) => Outcome::Unreachable(format!("remote /chunk unreachable: {e}")),
         }
+    }
+
+    /// Shared request/response handling for the management endpoints
+    /// (`/status`, `/repos`, `/repos/:alias`, `/repos/:alias/reindex`).
+    ///
+    /// Distinguishes three failure modes (see [`ManagementOutcome`]):
+    /// transport failure → `Unreachable`; non-2xx → `HttpError` with the peer's
+    /// own `error`/`message` text; success → deserialised into `T`. Reading the
+    /// body as text first lets us surface the raw payload on a parse error
+    /// instead of a generic "non-JSON" message.
+    async fn send_management<T: DeserializeOwned>(
+        &self,
+        peer: &RemotePeer,
+        method: reqwest::Method,
+        suffix: &str,
+        body: Option<&serde_json::Value>,
+        query: Option<&str>,
+    ) -> ManagementOutcome<T> {
+        let mut url = Self::peer_url(peer, suffix);
+        if let Some(q) = query {
+            url.push('?');
+            url.push_str(q);
+        }
+        let mut req = self
+            .client
+            .request(method, &url)
+            .timeout(Self::peer_timeout(peer));
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let req = attach_bearer(req, &peer.api_key);
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => return ManagementOutcome::Unreachable(format!("{url} unreachable: {e}")),
+        };
+        let status = resp.status();
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                return ManagementOutcome::Unreachable(format!(
+                    "{url} returned an unreadable body (http={status}): {e}"
+                ))
+            }
+        };
+        if status.is_success() {
+            match serde_json::from_str::<T>(&text) {
+                Ok(v) => ManagementOutcome::Ok(v),
+                Err(e) => ManagementOutcome::Unreachable(format!(
+                    "{url} returned a body that did not parse (http={status}): {e}"
+                )),
+            }
+        } else {
+            // Surface the peer's own error/message field when present; fall back
+            // to the raw body so 4xx/5xx diagnostics are never lost.
+            let reason = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .map(|v| short_reason(&v))
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| {
+                    if text.trim().is_empty() {
+                        "<no detail>".to_string()
+                    } else {
+                        text.trim().to_string()
+                    }
+                });
+            ManagementOutcome::HttpError {
+                status: status.as_u16(),
+                reason,
+            }
+        }
+    }
+
+    /// `GET /status` — list every repo known to the peer plus its runtime state.
+    pub async fn list_repos(&self, peer: &RemotePeer) -> ManagementOutcome<RemoteStatus> {
+        self.send_management(
+            peer,
+            reqwest::Method::GET,
+            crate::constants::STATUS_PATH,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// `POST /repos { path }` — register a repo on the peer. `path` is a path
+    /// on the **peer's** filesystem; the flag does not stat anything locally.
+    /// Returns 202 on accept, 409 if already registered.
+    pub async fn add_repo(
+        &self,
+        peer: &RemotePeer,
+        path: &str,
+    ) -> ManagementOutcome<RemoteRepoAdded> {
+        let body = serde_json::json!({ "path": path });
+        self.send_management(
+            peer,
+            reqwest::Method::POST,
+            crate::constants::REPOS_PATH,
+            Some(&body),
+            None,
+        )
+        .await
+    }
+
+    /// `DELETE /repos/:alias` — unregister a repo on the peer and delete its DB.
+    /// `alias` is the peer's repo alias (NOT a local path).
+    pub async fn remove_repo(
+        &self,
+        peer: &RemotePeer,
+        alias: &str,
+    ) -> ManagementOutcome<RemoteRepoRemoved> {
+        // Build the per-repo path from the neutral REPOS_PATH collection route
+        // (not REPO_REINDEX_PATH_PREFIX, whose name implies reindex-only use).
+        let suffix = format!("{}/{}", crate::constants::REPOS_PATH, urlencoding(alias));
+        self.send_management(peer, reqwest::Method::DELETE, &suffix, None, None)
+            .await
+    }
+
+    /// `POST /repos/:alias/reindex[?force=true]` — trigger a background
+    /// incremental (or forced full) reindex of a repo on the peer.
+    pub async fn reindex(
+        &self,
+        peer: &RemotePeer,
+        alias: &str,
+        force: bool,
+    ) -> ManagementOutcome<RemoteReindexResult> {
+        let suffix = format!(
+            "{}/{}{}",
+            crate::constants::REPOS_PATH,
+            urlencoding(alias),
+            crate::constants::REPO_REINDEX_PATH_SUFFIX,
+        );
+        let query = if force { Some("force=true") } else { None };
+        self.send_management(peer, reqwest::Method::POST, &suffix, None, query)
+            .await
     }
 }
 
@@ -369,6 +607,297 @@ mod tests {
                 );
             }
             other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    // --- management methods (list/add/remove/reindex) ---
+
+    #[tokio::test]
+    async fn list_repos_returns_status_from_a_live_peer() {
+        let app = axum::Router::new().route(
+            crate::constants::STATUS_PATH,
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "version": "1.0.0",
+                    "repos": [
+                        {"alias": "docs", "status": "open", "lock_mode": "read", "changes": 3},
+                        {"alias": "inriver", "status": "warm", "lock_mode": "-", "changes": 0}
+                    ],
+                    "active_sessions": 1,
+                    "uptime_secs": 600
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client.list_repos(&peer(format!("http://{addr}"))).await;
+        match outcome {
+            ManagementOutcome::Ok(status) => {
+                assert_eq!(status.version.as_deref(), Some("1.0.0"));
+                assert_eq!(status.repos.len(), 2);
+                assert_eq!(status.repos[0].alias, "docs");
+                assert_eq!(status.repos[0].status, "open");
+                assert_eq!(status.repos[0].changes, 3);
+                assert_eq!(status.repos[1].alias, "inriver");
+                assert_eq!(status.repos[1].lock_mode, "-");
+                assert_eq!(status.active_sessions, Some(1));
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_repo_forwards_path_and_parses_accepted() {
+        // Echo the received `path` back so we verify it was forwarded.
+        let app = axum::Router::new().route(
+            crate::constants::REPOS_PATH,
+            axum::routing::post(
+                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let path = body
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    axum::Json(serde_json::json!({
+                        "status": "accepted",
+                        "alias": "docs",
+                        "path": path,
+                        "message": "Reindex started in background"
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .add_repo(&peer(format!("http://{addr}")), "/app/docs")
+            .await;
+        match outcome {
+            ManagementOutcome::Ok(added) => {
+                assert_eq!(added.status, "accepted");
+                assert_eq!(added.alias, "docs");
+                assert_eq!(added.path, "/app/docs");
+                assert_eq!(
+                    added.message.as_deref(),
+                    Some("Reindex started in background")
+                );
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_repo_targets_alias_in_url() {
+        // Echo the captured alias back to prove it landed in the DELETE path.
+        let app = axum::Router::new().route(
+            "/repos/:alias",
+            axum::routing::delete(
+                |axum::extract::Path(alias): axum::extract::Path<String>| async move {
+                    axum::Json(serde_json::json!({
+                        "status": "removed",
+                        "alias": alias,
+                        "message": "unregistered"
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .remove_repo(&peer(format!("http://{addr}")), "inriver")
+            .await;
+        match outcome {
+            ManagementOutcome::Ok(removed) => {
+                assert_eq!(removed.status, "removed");
+                assert_eq!(removed.alias, "inriver");
+                assert_eq!(removed.message.as_deref(), Some("unregistered"));
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_posts_to_alias_reindex_path() {
+        // Capture the alias from the path to prove the reindex URL was built.
+        let app = axum::Router::new().route(
+            "/repos/:alias/reindex",
+            axum::routing::post(
+                |axum::extract::Path(alias): axum::extract::Path<String>| async move {
+                    axum::Json(serde_json::json!({
+                        "status": "accepted",
+                        "alias": alias,
+                        "message": "Reindex started in background"
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .reindex(&peer(format!("http://{addr}")), "inriver", false)
+            .await;
+        match outcome {
+            ManagementOutcome::Ok(res) => {
+                assert_eq!(res.status, "accepted");
+                assert_eq!(res.alias, "inriver");
+                assert_eq!(
+                    res.message.as_deref(),
+                    Some("Reindex started in background")
+                );
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_with_force_appends_force_query() {
+        // Capture the query string to prove ?force=true was forwarded.
+        let app = axum::Router::new().route(
+            "/repos/:alias/reindex",
+            axum::routing::post(
+                |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    let force = params.get("force").map(String::as_str).unwrap_or("");
+                    axum::Json(serde_json::json!({
+                        "status": "accepted",
+                        "alias": "inriver",
+                        "message": format!("force={force}")
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = FederationClient::new().unwrap();
+        // force=true must arrive at the peer.
+        let outcome = client
+            .reindex(&peer(format!("http://{addr}")), "inriver", true)
+            .await;
+        match outcome {
+            ManagementOutcome::Ok(res) => {
+                assert_eq!(res.message.as_deref(), Some("force=true"));
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_repo_urlencodes_alias_in_path() {
+        // An alias with a space must be percent-encoded on the wire and decoded
+        // back by axum — proves the encoding round-trips through the HTTP layer.
+        let app = axum::Router::new().route(
+            "/repos/:alias",
+            axum::routing::delete(
+                |axum::extract::Path(alias): axum::extract::Path<String>| async move {
+                    axum::Json(serde_json::json!({
+                        "status": "removed",
+                        "alias": alias,
+                        "message": "unregistered"
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .remove_repo(&peer(format!("http://{addr}")), "my repo")
+            .await;
+        match outcome {
+            ManagementOutcome::Ok(removed) => {
+                // axum decodes %20 → space, so the echoed alias must match input.
+                assert_eq!(removed.alias, "my repo");
+                assert_eq!(removed.status, "removed");
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn management_http_error_surfaces_peer_reason() {
+        // Peer rejects with 409 conflict — must become HttpError, not Unreachable.
+        let app = axum::Router::new().route(
+            crate::constants::REPOS_PATH,
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    axum::Json(serde_json::json!({
+                        "error": "already registered",
+                        "status": "conflict",
+                        "alias": "docs"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .add_repo(&peer(format!("http://{addr}")), "/app/docs")
+            .await;
+        match outcome {
+            ManagementOutcome::HttpError { status, reason } => {
+                assert_eq!(status, 409);
+                assert_eq!(reason, "already registered");
+            }
+            other => panic!("expected HttpError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn management_unreachable_when_peer_is_down() {
+        // Bind then drop so the address refuses connections.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .remove_repo(&peer(format!("http://{addr}")), "inriver")
+            .await;
+        match outcome {
+            ManagementOutcome::Unreachable(_) => {}
+            other => panic!("expected Unreachable, got {:?}", other),
         }
     }
 }

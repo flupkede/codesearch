@@ -214,8 +214,15 @@ pub const ALLOWED_ROOTS_ENV: &str = "CODESEARCH_ALLOWED_ROOTS";
 /// from `DEFAULT_SERVE_PORT`, so bumping one without the other will fail `cargo test`.
 pub const DEFAULT_SERVE_URL: &str = "http://127.0.0.1:39725";
 
+/// Management collection route served by `codesearch serve`:
+/// `POST /repos { path, alias?, model? }` registers + indexes a new repo.
+///
+/// Per-repo routes are derived from this: `DELETE {REPOS_PATH}/:alias`,
+/// `POST {REPOS_PATH}/:alias/reindex`, `GET {REPOS_PATH}/:alias/info`.
+pub const REPOS_PATH: &str = "/repos";
+
 /// Path prefix for the per-repo reindex HTTP API route.
-/// Full path: `{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}`.
+/// Full path: `{REPOS_PATH}/{alias}{REPO_REINDEX_PATH_SUFFIX}`.
 pub const REPO_REINDEX_PATH_PREFIX: &str = "/repos/";
 
 /// Path suffix for the per-repo reindex HTTP API route.
