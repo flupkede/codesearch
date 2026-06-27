@@ -15,7 +15,7 @@
 //! healthy query.
 
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db_discovery::repos::RemotePeer;
 use crate::index::build_serve_client_with_key;
@@ -29,7 +29,7 @@ use crate::constants::DEFAULT_REMOTE_TIMEOUT_SECS as DEFAULT_TIMEOUT_SECS;
 /// Fields mirror the local search-item shapes (semantic *and* literal) but are
 /// all optional / defaulted so a slightly older remote that omits a field is
 /// tolerated rather than rejecting the whole payload.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteSearchItem {
     /// Remote chunk id (semantic results only; `None` for literal hits).
     #[serde(default)]
@@ -109,7 +109,7 @@ pub enum ManagementOutcome<T> {
 /// `GET /status` payload as served by `codesearch serve`. Only the fields the
 /// management commands care about are typed; every field is optional/defaulted
 /// so an older or newer remote that adds/omits fields still parses.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteStatus {
     #[serde(default)]
     pub version: Option<String>,
@@ -122,7 +122,7 @@ pub struct RemoteStatus {
 }
 
 /// A single repo entry inside a [`RemoteStatus`] payload.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteRepoStatus {
     #[serde(default)]
     pub alias: String,
@@ -142,7 +142,7 @@ pub struct RemoteRepoStatus {
 }
 
 /// `POST /repos` success payload (HTTP 202).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteRepoAdded {
     #[serde(default)]
     pub status: String,
@@ -155,7 +155,7 @@ pub struct RemoteRepoAdded {
 }
 
 /// `DELETE /repos/:alias` success payload (HTTP 200).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteRepoRemoved {
     #[serde(default)]
     pub status: String,
@@ -168,7 +168,7 @@ pub struct RemoteRepoRemoved {
 }
 
 /// `POST /repos/:alias/reindex` success payload (HTTP 202).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteReindexResult {
     #[serde(default)]
     pub status: String,
