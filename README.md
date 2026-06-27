@@ -468,7 +468,7 @@ A group then references a peer via `@`-prefix (`"groups": { "docs": ["@cloud"] }
 codesearch index list --remote cloud
 
 # register a path on the peer's filesystem (NOT your local FS)
-codesearch index add /data/docs/aprimo --remote cloud
+codesearch index add /data/docs/aprimo-docs --remote cloud
 
 # remove a repo by its alias on the peer (NOT a local path)
 codesearch index rm inriver --remote cloud
@@ -482,6 +482,7 @@ codesearch index reindex inriver --remote cloud --force  # force full
 - With `--remote`, `add` takes a **path on the peer's filesystem** and `rm`/`reindex` take a **remote alias** (never your local path).
 - Without `--remote`, every `index` command behaves exactly as today (local).
 - `index list` and `index reindex` accept `--json` for agent-friendly output (**requires `--remote`**).
+- The write verbs (`add`, `reindex`, `--force`) require the peer to hold the repo **read-write**. A read-only / restore-only peer (e.g. a snapshot-restore cloud serve) rejects them — `add`/`--force` return HTTP 4xx/5xx with the peer's error message. Use them against a writable peer; `list` is always safe.
 
 **Per-vendor layout on a peer.** Instead of registering one mixed corpus, register each vendor's sub-folder as its own repo so the cloud layout mirrors your local one:
 

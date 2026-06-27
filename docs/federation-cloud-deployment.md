@@ -144,52 +144,61 @@ az containerapp create -n codesearch-serve -g $RG --environment $ENV \
 
 ## Managing the peer's indexes from your laptop (`index … --remote`)
 
-You no longer need to `az containerapp exec` into the cloud peer to add, remove,
-reindex, or list its repos. The local `codesearch index` verbs take a `--remote <peer>`
-flag that resolves against the `remotes` map in `repos.json` and drives the peer's
-management API (`GET /status`, `POST /repos`, `DELETE /repos/:alias`,
-`POST /repos/:alias/reindex`) over TLS with the peer's stored `api_key`. The peer must
-already be configured via `codesearch remote add`.
+The local `codesearch index` verbs take a `--remote <peer>` flag that resolves against
+the `remotes` map in `repos.json` and drives the peer's management API (`GET /status`,
+`POST /repos`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex`) over TLS with the
+peer's stored `api_key`. The peer must already be configured via `codesearch remote add`.
 
 ```bash
-# what's currently indexed on the cloud peer?
+# what's currently indexed on the cloud peer? (read-only — always safe here)
 codesearch index list --remote cloud
-
-# register a path on the peer (path is on the PEER's filesystem, e.g. /data/docs/...)
-codesearch index add /data/docs/aprimo-docs --remote cloud
-
-# remove one repo by alias
-codesearch index rm inriver --remote cloud
-
-# kick off a background reindex on the peer (incremental by default; --force = full)
-codesearch index reindex aprimo-docs --remote cloud --force
 ```
 
 `index list` and `index reindex` accept `--json` for script/agent use (**requires `--remote`**).
 
-> ⚠️ The `index-job` (`indexer-job` entrypoint mode) already owns the build path —
-> restore → sync blob → warmup refresh → snapshot. Do **not** issue
-> `index reindex <alias> --remote` against a repo whose warmup is still running: it
-> opens a second LMDB write handle and the peer returns HTTP 500
-> ("locked by another codesearch process"). Run `index list --remote` first and confirm
-> the target repo's `status` is `warm`/`open` (not `indexing`).
+> ⚠️ **Read-only cloud peer.** This deployment's serve app is restore-only (see the
+> *Build/serve split* section below): it restores the prebuilt
+> snapshot and serves **read-only** — it never registers or reindexes. So:
+> - `index list --remote cloud` is the practical verb for this peer — inspect its repos
+>   from the laptop, no `az containerapp exec` needed.
+> - `index add` / `reindex` / `--force` target a **writable** peer. Against this
+>   restore-only peer they fail: a full `add` embed OOMs the 2 GiB replica, and the serve
+>   app opens repos read-only so `POST /repos/:alias/reindex?force=true` returns HTTP 500
+>   (*"could only be opened read-only; cannot force-reindex"*). This is the "force
+>   currently 500 on cloud" caveat from the build/serve split, now surfaced cleanly to the
+>   CLI instead of buried in a log.
+> - New/refreshed content flows in via the **indexer-job** (blob sync → warmup refresh →
+>   snapshot), not via live `--remote` writes.
+> - `index rm --remote cloud` unregisters on the peer but is **not durable** — the next
+>   cold start re-registers from the restored snapshot.
+
+To use the write verbs (`add` / `reindex` / `--force`), point `--remote` at a
+**writable** serve peer — e.g. a dev/staging peer, or a peer spun up for a build (one
+whose entrypoint registers/reindexes, i.e. not running in restore-only `serve` mode).
 
 ### Per-vendor sub-path registration
 
 The cloud peer currently serves one mixed index (alias `docs`, with
 `rest_api/ dam_help/ mo_help/ inriver/ akeneo/ …` underneath). To mirror the clean
 local per-vendor layout (`aprimo-docs`, `inriver-docs`, `akeneo-docs`, …), register
-each vendor's synced sub-folder as its own repo on the peer:
+each vendor's synced sub-folder as its own repo. **On a writable peer** you can drive
+this from the laptop:
 
 ```bash
 for v in aprimo-docs inriver-docs akeneo-docs; do
-  codesearch index add "/data/docs/$v" --remote cloud
+  codesearch index add "/data/docs/$v" --remote <writable-peer>
 done
-codesearch index list --remote cloud   # one alias per vendor
+codesearch index list --remote <writable-peer>   # one alias per vendor
 ```
 
-Each alias then becomes individually addressable via MCP `project="<alias>"` and
-individually reindexable / removable from the laptop.
+For the **read-only cloud peer**, the per-vendor split is instead done at **indexer-job
+build time**: the job's `POST /repos {path}` calls (run on the 4 vCPU / 8 GiB build
+container, not the 2 GiB serve replica) register the sub-paths before the snapshot is
+taken, so the aliases are baked into the snapshot the serve app restores. The `--remote`
+verbs then let you *list* those per-vendor aliases from the laptop.
+
+Each alias becomes individually addressable via MCP `project="<alias>"`, and on a
+writable peer individually reindexable / removable from the laptop.
 
 ## Deployed (verified live, 2026-06-26)
 
