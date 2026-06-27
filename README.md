@@ -482,9 +482,9 @@ codesearch index reindex inriver --remote cloud --force  # force full
 - With `--remote`, `add` takes a **path on the peer's filesystem** and `rm`/`reindex` take a **remote alias** (never your local path).
 - Without `--remote`, every `index` command behaves exactly as today (local).
 - `index list` and `index reindex` accept `--json` for agent-friendly output (**requires `--remote`**).
-- The write verbs (`add`, `reindex`, `--force`) require the peer to hold the repo **read-write**. A read-only / restore-only peer (e.g. a snapshot-restore cloud serve) rejects them — `add`/`--force` return HTTP 4xx/5xx with the peer's error message. Use them against a writable peer; `list` is always safe.
+- The write verbs (`add`, `reindex`, `--force`) require the peer to hold the repo **read-write**. A read-only / restore-only peer (e.g. a snapshot-restore cloud serve) rejects them — `--force` returns a clean HTTP 500 with a message, and `add` (a full embed) may OOM or time out a small replica. Use them against a writable peer; `list` is always safe.
 
-**Per-vendor layout on a peer.** Instead of registering one mixed corpus, register each vendor's sub-folder as its own repo so the cloud layout mirrors your local one:
+**Per-vendor layout on a peer.** Instead of registering one mixed corpus, register each vendor's sub-folder as its own repo so the peer's layout mirrors your local one. (Requires a **writable** peer — see the note above; a read-only restore-only peer rejects `add`.)
 
 ```bash
 for v in aprimo-docs inriver-docs akeneo-docs; do
