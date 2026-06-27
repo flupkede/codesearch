@@ -54,7 +54,7 @@ pub enum IndexCommands {
         #[arg(long)]
         remote: Option<String>,
 
-        /// Output JSON (agent-friendly).
+        /// Output JSON (requires --remote; agent-friendly).
         #[arg(long)]
         json: bool,
     },
@@ -82,7 +82,7 @@ pub enum IndexCommands {
         #[arg(long)]
         remote: Option<String>,
 
-        /// Output JSON (agent-friendly).
+        /// Output JSON (requires --remote; agent-friendly).
         #[arg(long)]
         json: bool,
     },
@@ -957,6 +957,10 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     IndexCommands::List { remote, json } => {
                         if let Some(peer_name) = &remote {
                             run_remote_list(peer_name, json).await
+                        } else if json {
+                            anyhow::bail!(
+                                "--json is only supported with --remote (local list is always a table)"
+                            )
                         } else {
                             crate::index::list_index_status().await
                         }
@@ -972,6 +976,10 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     } => {
                         if let Some(peer_name) = &remote {
                             run_remote_reindex(peer_name, &alias, force, json).await
+                        } else if json {
+                            anyhow::bail!(
+                                "--json is only supported with --remote (local reindex prints a status line)"
+                            )
                         } else {
                             trigger_reindex_via_api(&alias, force).await
                         }
