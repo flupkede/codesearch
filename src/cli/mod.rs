@@ -650,7 +650,11 @@ fn resolve_remote_peer(name: &str) -> Result<crate::db_discovery::repos::RemoteP
                 } else {
                     format!(
                         " Configured remotes: {}.",
-                        known.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        known
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )
                 }
             )
@@ -694,10 +698,7 @@ async fn run_remote_list(peer_name: &str, json: bool) -> Result<()> {
     } else {
         // Aligned table: alias | status | lock | changes | last_tool_call
         for repo in &status.repos {
-            let last = repo
-                .last_tool_call
-                .as_deref()
-                .unwrap_or("—");
+            let last = repo.last_tool_call.as_deref().unwrap_or("—");
             println!(
                 "  {:<18} {:<10} {:<6} {:>6} changes   last: {}",
                 repo.alias, repo.status, repo.lock_mode, repo.changes, last
@@ -779,8 +780,7 @@ async fn run_remote_remove(peer_name: &str, alias: Option<PathBuf>) -> Result<()
 
     let peer = resolve_remote_peer(peer_name)?;
     let client = crate::federation::FederationClient::new().map_err(anyhow::Error::msg)?;
-    let removed =
-        unwrap_management(peer_name, client.remove_repo(&peer, alias_str).await)?;
+    let removed = unwrap_management(peer_name, client.remove_repo(&peer, alias_str).await)?;
 
     println!(
         "{} Removed '{}' from peer '{}'",
@@ -795,18 +795,12 @@ async fn run_remote_remove(peer_name: &str, alias: Option<PathBuf>) -> Result<()
 }
 
 /// `codesearch index reindex <alias> --remote <peer>` — trigger reindex on a peer.
-async fn run_remote_reindex(
-    peer_name: &str,
-    alias: &str,
-    force: bool,
-    json: bool,
-) -> Result<()> {
+async fn run_remote_reindex(peer_name: &str, alias: &str, force: bool, json: bool) -> Result<()> {
     use colored::Colorize;
 
     let peer = resolve_remote_peer(peer_name)?;
     let client = crate::federation::FederationClient::new().map_err(anyhow::Error::msg)?;
-    let result =
-        unwrap_management(peer_name, client.reindex(&peer, alias, force).await)?;
+    let result = unwrap_management(peer_name, client.reindex(&peer, alias, force).await)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -937,13 +931,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                                     parsed
                                 })
                                 .or(model_type);
-                            crate::index::add_to_index(
-                                add_path,
-                                global,
-                                mt,
-                                cancel_token.clone(),
-                            )
-                            .await
+                            crate::index::add_to_index(add_path, global, mt, cancel_token.clone())
+                                .await
                         }
                     }
                     IndexCommands::Remove {
@@ -1610,9 +1599,15 @@ mod tests {
 
     #[test]
     fn test_cli_index_add_with_remote() {
-        let cli =
-            Cli::try_parse_from(["codesearch", "index", "add", "/app/docs", "--remote", "aprimo"])
-                .expect("cli parse should succeed");
+        let cli = Cli::try_parse_from([
+            "codesearch",
+            "index",
+            "add",
+            "/app/docs",
+            "--remote",
+            "aprimo",
+        ])
+        .expect("cli parse should succeed");
         match cli.command {
             Commands::Index {
                 command:
@@ -1639,8 +1634,7 @@ mod tests {
             Commands::Index {
                 command:
                     Some(IndexCommands::Remove {
-                        remote: Some(peer),
-                        ..
+                        remote: Some(peer), ..
                     }),
                 ..
             } => assert_eq!(peer, "aprimo"),
@@ -1650,9 +1644,15 @@ mod tests {
 
     #[test]
     fn test_cli_index_list_with_remote() {
-        let cli =
-            Cli::try_parse_from(["codesearch", "index", "list", "--remote", "aprimo", "--json"])
-                .expect("cli parse should succeed");
+        let cli = Cli::try_parse_from([
+            "codesearch",
+            "index",
+            "list",
+            "--remote",
+            "aprimo",
+            "--json",
+        ])
+        .expect("cli parse should succeed");
         match cli.command {
             Commands::Index {
                 command:

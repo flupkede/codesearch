@@ -1624,12 +1624,7 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
                     Some(resolved) => {
                         println!(
                             "{}",
-                            format!(
-                                "🏷️  Resolved alias '{}' → {}",
-                                raw,
-                                resolved.display()
-                            )
-                            .cyan()
+                            format!("🏷️  Resolved alias '{}' → {}", raw, resolved.display()).cyan()
                         );
                         Some(resolved)
                     }
@@ -1641,9 +1636,7 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
         None => path.clone(),
     };
 
-    let project_path = effective_path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("."));
+    let project_path = effective_path.clone().unwrap_or_else(|| PathBuf::from("."));
     let canonical_path = safe_canonicalize(&project_path)?;
 
     println!("{}", "➖ Remove Index".bright_red().bold());

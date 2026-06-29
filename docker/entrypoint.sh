@@ -28,6 +28,8 @@
 # Optional env:
 #   CODESEARCH_RUN_MODE       "serve" (default) | "index-job".
 #   KB_GIT_URL / GIT_PAT      Curated KB git repo (cloned to /data/aprimo).
+#   KB_PULL_INTERVAL_SECS     serve mode: git-pull the KB this often so the periodic
+#                             incremental reindex picks up new entries (default 900).
 #   DATA_DIR                  Working root (default /data).
 #   CODESEARCH_SERVE_PORT     Serve port (default 39725).
 #   INDEX_JOB_MAX_WAIT_SECS   Max seconds the job waits for indexing to finish
@@ -304,6 +306,16 @@ run_serve() {
   if [ "${SNAPSHOT_RESTORED}" -ne 1 ]; then
     log "WARN: no index snapshot was restored — serving will be EMPTY."
     log "      Run the 'index-job' Container Apps Job first to seed the snapshot."
+  fi
+
+  # Background: keep the custom-KB git clone fresh so serve's periodic
+  # incremental reindex (REINDEX_INTERVAL_SECS) picks up newly-pushed entries
+  # WITHOUT a restart. Cheap — the KB repo is small (only the custom/ corpus).
+  # Only runs when KB_GIT_URL is set; the heavy DOCS corpus stays job-only.
+  if [ -n "${KB_GIT_URL:-}" ]; then
+    KB_PULL_INTERVAL_SECS="${KB_PULL_INTERVAL_SECS:-900}"
+    ( while sleep "${KB_PULL_INTERVAL_SECS}"; do sync_kb; done ) &
+    log "KB auto-pull loop started (git pull every ${KB_PULL_INTERVAL_SECS}s -> /data/aprimo)"
   fi
 
   log "starting codesearch serve on 0.0.0.0:${PORT}"
