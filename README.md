@@ -204,7 +204,23 @@ If your agent skips codesearch and falls back to grep/glob too often, paste this
 
 OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies across all projects). Claude Code reads a project-level `AGENTS.md`, so add it per-project (or symlink a shared one).
 
-**Claude Code specifically** tends to ignore this advice more than other clients — its MCP tool schemas are deferred (an extra `ToolSearch` call is needed before codesearch tools are even callable), while Grep/Glob are always fully loaded and zero-friction, and spawned subagents don't inherit `AGENTS.md` or the MCP `initialize` instructions at all. If you want this enforced rather than advisory, see [`integrations/claude-code/`](integrations/claude-code/) for a pair of hooks that block/redirect Grep toward codesearch and inject codesearch guidance into every subagent — `pwsh -File integrations/claude-code/install.ps1` (or `install.sh` on macOS/Linux) wires it up in one step.
+**Claude Code specifically** tends to ignore this advice more than other clients — its MCP tool schemas are deferred (an extra `ToolSearch` call is needed before codesearch tools are even callable), while Grep/Glob are always fully loaded and zero-friction, and spawned subagents don't inherit `AGENTS.md` or the MCP `initialize` instructions at all.
+
+To make the preference **structural** instead of advisory, this repo ships two Claude Code hooks in [`integrations/claude-code/`](integrations/claude-code/):
+
+- **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks the first grep against an in-repo path when codesearch looks available (a local `.codesearch.db` at the git root, or a `CODESEARCH_SERVER` env var for remote-serve setups), with a message telling the model how to load and call codesearch instead. A retry of the same query within 5 minutes is let through unblocked — the legitimate "codesearch found nothing, falling back" path. Greps outside the current repo are never blocked, and the hook fails open (never traps the model).
+- **`subagent-preamble`** — a `PreToolUse` hook on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all.
+
+Install (idempotent — user scope applies to every project; project scope is this repo only):
+
+```bash
+pwsh -File integrations/claude-code/install.ps1                 # Windows — user scope (~/.claude)
+pwsh -File integrations/claude-code/install.ps1 -Scope project  # Windows — project scope (./.claude)
+bash integrations/claude-code/install.sh                        # macOS/Linux — user scope
+bash integrations/claude-code/install.sh --project              # macOS/Linux — project scope
+```
+
+Note: the guard detects "codesearch is available **for this repo**" via a local `.codesearch.db` or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory). For a remote-serve setup with no local index, set `CODESEARCH_SERVER` to opt back into enforcement.
 
 ## MCP Tools Reference
 
@@ -451,8 +467,6 @@ for v in aprimo-docs inriver-docs akeneo-docs; do
 done
 codesearch index list --remote cloud   # one alias per vendor
 ```
-
-See `docs/federation-feature.md` (Rust feature: REST endpoints, RRF merge, config) and `docs/federation-cloud-deployment.md` (Azure deployment + the `--remote` management recipe).
 
 ## CLI Reference
 

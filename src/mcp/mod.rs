@@ -3972,7 +3972,6 @@ impl CodesearchService {
 
     // ─────────────────────────────────────────────────────────────────
     // Federation — cross-instance query merging (remote peers in a group).
-    // See docs/federation-feature.md.
     // ─────────────────────────────────────────────────────────────────
 
     /// Load the current repos config: from the live serve state when available,
@@ -4230,8 +4229,7 @@ impl CodesearchService {
         // Federation: when the query targets a group that resolves to one or more
         // remote peers, merge local + remote results (RRF-interleave) instead of
         // searching local repos only. Only `group` federates; `project` stays
-        // local because project aliases are instance-local. See
-        // `docs/federation-feature.md`.
+        // local because project aliases are instance-local.
         if let Some(group) = request.group.as_deref() {
             let cfg = self.federation_config();
             if Self::group_has_remotes(&cfg, group) {

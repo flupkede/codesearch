@@ -1,5 +1,5 @@
 //! Federation client — query remote `codesearch serve` peers over HTTP(S) for
-//! cross-instance result merging (see `docs/federation-feature.md`).
+//! cross-instance result merging.
 //!
 //! A group in `repos.json` may list `"@<peer>"` members that reference entries
 //! in the `remotes` map. The MCP read-only tools resolve such a group into local
