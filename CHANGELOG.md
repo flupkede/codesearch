@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`index rm <arg>`** now resolves the argument as a **registered alias first**, falling back to path interpretation only when it isn't one (previously a bare alias failed with an OS path error).
 - Added an `ls` visible alias to the `index`/`groups`/`remote` `list` subcommands.
 
+### Changed
+
+- Pre-GA changelog history (`[1.0.72]`–`[1.0.208]`) condensed to one-line summaries to mark the GA cutover; no entry was dropped and the key facts survive in the summaries. Full detail for the latest pre-GA release (`[1.0.209]`) is preserved verbatim below.
 
 ## [1.0.209] - 2026-06-17
 
@@ -120,7 +123,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed the 30-minute MCP session keep_alive timeout; sessions now live until TCP dies (correct for a local single-user long-running serve).
 
 ## [1.0.72] - 2026-05-01
-- First stable release: multi-repo `serve` (HTTP/SSE, per-project/group routing, RRF cross-repo search), stdio MCP proxy with client-side auto-reconnect, tree-sitter chunking (9 langs), persistent SHA-256 embedding cache, repository groups, re-tuned RRF, and LMDB resize crash fix (#30, `MDB_MAP_FULL`).
+- Initial multi-repo release: multi-repo `serve` (HTTP/SSE, per-project/group routing, RRF cross-repo search), stdio MCP proxy with client-side auto-reconnect, tree-sitter chunking (9 langs), persistent SHA-256 embedding cache, repository groups, re-tuned RRF, and LMDB resize crash fix (#30, `MDB_MAP_FULL`).
 
 [1.0.171]: https://github.com/flupkede/codesearch/compare/v1.0.162...v1.0.171
 [1.0.162]: https://github.com/flupkede/codesearch/compare/v1.0.160...v1.0.162
