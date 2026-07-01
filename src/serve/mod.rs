@@ -4206,6 +4206,55 @@ mod tests {
         assert!(state.fsw_tasks.is_empty());
     }
 
+    /// Regression guard: `GET /remotes` must NEVER expose a peer's `api_key`.
+    ///
+    /// `RemotePeerInfo` is a dedicated projection struct with no `api_key`
+    /// field — serde cannot serialize a field that doesn't exist, so the
+    /// shared secret cannot leak even by accident. This test locks that
+    /// defense-in-depth: if a future change adds an `api_key` field to
+    /// `RemotePeerInfo` (or otherwise lets the key into the response shape),
+    /// this assertion fails.
+    #[test]
+    fn remote_peer_info_never_serializes_api_key() {
+        use crate::db_discovery::repos::RemotePeer;
+
+        // Build a peer carrying a real-looking secret, exactly as it lives in
+        // repos.json, then project it the same way `remotes_handler` does.
+        let peer = RemotePeer {
+            url: "https://codesearch-serve.example.internal".to_string(),
+            api_key: "supersecret-LEAK-MARKER-do-not-serialize".to_string(),
+            group: Some("all".to_string()),
+            timeout_secs: Some(90),
+        };
+        let info = RemotePeerInfo {
+            alias: "cloud".to_string(),
+            url: peer.url.clone(),
+            group: peer.group.clone(),
+            timeout_secs: peer.timeout_secs,
+        };
+
+        let json = serde_json::to_string(&info).expect("RemotePeerInfo must serialize");
+
+        // The four whitelisted fields are present:
+        assert!(json.contains("cloud"), "alias missing: {json}");
+        assert!(
+            json.contains("codesearch-serve.example.internal"),
+            "url missing: {json}"
+        );
+        assert!(json.contains("all"), "group missing: {json}");
+        assert!(json.contains("90"), "timeout_secs missing: {json}");
+
+        // The secret is NOT present — neither the field name nor the value:
+        assert!(
+            !json.contains("api_key"),
+            "api_key FIELD leaked into /remotes response shape: {json}"
+        );
+        assert!(
+            !json.contains("supersecret-LEAK-MARKER"),
+            "api_key VALUE leaked into /remotes response: {json}"
+        );
+    }
+
     fn state_with_config(config: ReposConfig) -> ServeState {
         // Use a temp file override so reload_if_changed doesn't see the real repos.json
         let tmp = tempfile::tempdir().unwrap();
