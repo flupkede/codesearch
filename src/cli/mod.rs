@@ -1605,7 +1605,7 @@ mod tests {
             "add",
             "/app/docs",
             "--remote",
-            "aprimo",
+            "peer-a",
         ])
         .expect("cli parse should succeed");
         match cli.command {
@@ -1619,7 +1619,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(path.as_deref(), Some(std::path::Path::new("/app/docs")));
-                assert_eq!(peer, "aprimo");
+                assert_eq!(peer, "peer-a");
             }
             _ => panic!("expected Index::Add with --remote"),
         }
@@ -1628,7 +1628,7 @@ mod tests {
     #[test]
     fn test_cli_index_rm_with_remote() {
         let cli =
-            Cli::try_parse_from(["codesearch", "index", "rm", "inriver", "--remote", "aprimo"])
+            Cli::try_parse_from(["codesearch", "index", "rm", "inriver", "--remote", "peer-a"])
                 .expect("cli parse should succeed");
         match cli.command {
             Commands::Index {
@@ -1637,7 +1637,7 @@ mod tests {
                         remote: Some(peer), ..
                     }),
                 ..
-            } => assert_eq!(peer, "aprimo"),
+            } => assert_eq!(peer, "peer-a"),
             _ => panic!("expected Index::Remove with --remote"),
         }
     }
@@ -1649,7 +1649,7 @@ mod tests {
             "index",
             "list",
             "--remote",
-            "aprimo",
+            "peer-a",
             "--json",
         ])
         .expect("cli parse should succeed");
@@ -1661,7 +1661,7 @@ mod tests {
                         json: true,
                     }),
                 ..
-            } => assert_eq!(peer, "aprimo"),
+            } => assert_eq!(peer, "peer-a"),
             _ => panic!("expected Index::List with --remote and --json"),
         }
     }
@@ -1694,7 +1694,7 @@ mod tests {
             "inriver",
             "--force",
             "--remote",
-            "aprimo",
+            "peer-a",
         ])
         .expect("cli parse should succeed");
         match cli.command {
@@ -1709,7 +1709,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(alias, "inriver");
-                assert_eq!(peer, "aprimo");
+                assert_eq!(peer, "peer-a");
             }
             _ => panic!("expected Index::Reindex with --remote and --force"),
         }

@@ -1,11 +1,60 @@
-# AGENTS.md — codesearch (feature/global-codesearchignore)
+# AGENTS.md — codesearch (features/codesearch-federation)
 
 ## Current state
 
-- **Branch:** `feature/global-codesearchignore` (based on `develop` at 7b8cd71)
-- **Version:** v1.0.192
+- **Branch:** `features/codesearch-federation`
+- **Version:** v1.0.235
 - **Status:** `cargo check` + `cargo clippy` clean
-- **Validation:** `cargo check` for iteration, `cargo clippy` for lint. No `--release` builds.
+- **Validation:** `cargo check` for iteration, `cargo clippy` for lint. No `--release` builds during the fix loop; build only at the very end.
+
+## Implemented on this branch
+
+- **Federation peers** — `codesearch remote add/rm/list` (local `repos.json` peer config: `alias → url, api_key, group, into_group`) + `@peer` group references; `FederationClient` search/get_chunk fan-out with RRF. See `docs/federation-feature.md`.
+- **Cloud indexer-job split** — heavy 4 vCPU/8 GiB build job uploads a snapshot; light 1 vCPU/2 GiB serve restores it read-only; snapshot refresh/verify loop. Cloud peer live + validated. See `docs/federation-cloud-deployment.md`.
+- **Remote index management (`--remote`)** — `--remote <peer>` flag on `index list/add/rm` + new `index reindex` verb drives a peer's management API via `FederationClient` (`ManagementOutcome`: `Ok` / `HttpError{status,reason}` / `Unreachable`). Endpoints: `GET /status`, `POST /repos {path}`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex[?force=]`. `--json` on List/Reindex (requires `--remote`). Without `--remote`, every `index` verb is unchanged (local).
+- **Local `index rm <alias>`** — resolves the argument as a registered alias before falling back to path interpretation.
+- **CLI aliases** — `ls` is a visible alias for `list` (`index`/`groups`/`remote`); `rm` for `remove` (pre-existing).
+
+> ℹ️ **Remote write verbs** (`add`, `reindex --force`) require a read-write peer; the restore-only cloud peer rejects them (`--force` → HTTP 500 "could only be opened read-only; cannot force-reindex"). `list` is always safe. `rm` is not durable — the next cold start re-registers from the restored snapshot. Per-vendor sub-path registration is scripted against a writable peer.
+
+## Known issue — `docs` repo status stuck on `open`/`write` after cold start (cloud)
+
+**Repro (2026-07-01):** on the cloud `codesearch-serve` (restore-only mode), forced two cold
+restarts via `az containerapp revision restart`. After each restart:
+- `repo-a` repo (custom KB, smaller corpus) flips `open` → `warm` quickly, as expected.
+- `docs` repo (6 harvested vendor sources, 9977 chunks / 2509 files) **stayed on
+  `status: "open"`, `lock_mode: "write"`** for 4+ minutes straight (polled every 5-7s) and
+  never flipped to `warm` in the observation window.
+
+**But this does NOT block queries** — `/search` against `project=docs` returned correct
+results with ~280-300ms latency starting within ~1s of the new replica becoming reachable,
+the entire time `status` claimed `open`/`write`. Cold-start-to-working-search was measured at
+**~10-25s total** (restart trigger → first real search result), which is fine; the confusing
+part is purely the status field, not actual availability.
+
+**Hypothesis:** a stuck/orphaned warmup or lock flag specific to multi-file corpora on the
+restore-only path — possibly the incremental-warmup routine that's supposed to flip the repo
+from `open`→`warm` post-snapshot-restore never completes/clears for `docs`, while `repo-a`
+(fewer files) finishes fast enough that the flag clears normally. Needs investigation:
+- Check `evict_idle_repos` / warmup-completion logic in `src/serve/mod.rs` for a path that
+  can leave `status` and `lock_mode` desynced from actual query-readiness.
+- Confirm whether `docs`'s size (2509 files) crosses some batch/chunking threshold that
+  `repo-a` doesn't.
+- Add a regression check: after cold start, poll `/repos/<alias>/info` + `/status` until
+  `warm`, with a timeout — if it never flips, that itself is the bug reproduction.
+
+**Priority:** low (cosmetic/status-only, not a functional blocker) but worth fixing since it
+undermines trust in the `/status` health signal for monitoring/alerting.
+
+> ⚠️ **No Azure/PIM access needed to investigate this.** The fix is pure code analysis
+> (`src/serve/mod.rs` warmup/lock logic) and can be reproduced **locally** first — this repo
+> already has large multi-file local repos registered (e.g. `repo-large`, 25751 chunks /
+> 2831 files) that can be cold-restarted via local `codesearch serve` to check whether the
+> same `open`/`write`-stuck behavior reproduces without touching the cloud at all. Only reach
+> for the cloud (and thus PIM) if the bug turns out to be specific to the restore-only /
+> snapshot-restore cold-start path and doesn't reproduce locally.
+
+---
 
 ## ⚠️ Branching & PR workflow (READ FIRST)
 
@@ -20,63 +69,12 @@ This repo uses a **`develop`-based** gitflow. The GitHub default branch is `mast
 
 Common mistake: a subagent runs `/git pr create` with no explicit `--base`, the tooling picks `master` (GitHub default), and the PR lands against the wrong branch. Always specify `--base develop`.
 
-## Features for this branch
+## Notes for OpenCode / agents
 
-Addresses GitHub Issue #115 (flupkede/codesearch).
-
-### Feature 1: Global `.codesearchignore` + FileWatcher bug fix
-
-**Status:** ✅ Done (commit 4cbfa57)
-
-- `~/.codesearch/.codesearchignore` — global ignore file with lowest priority
-- FileWalker (`src/file/mod.rs`) loads it via `WalkBuilder::add_ignore()`
-- FileWatcher (`src/watch/mod.rs`) loads it in `build_gitignore()` alongside repo-local `.codesearchignore` (which was previously missing — bug fix)
-- Precedence: global < .git/info/exclude < .gitignore < repo-local .codesearchignore
-
-### Feature 2: Jupyter Notebook (.ipynb) support
-
-**Status:** ✅ Done (commits 67ec214, 7d96538)
-
-- `Language::Jupyter` variant added to enum, `"ipynb"` extension mapped
-- `src/chunker/jupyter.rs` — custom cell extraction (no tree-sitter):
-  - Parses .ipynb JSON via serde_json
-  - Extracts code and markdown cells
-  - Tags chunks with `# [code]` / `# [markdown]` prefix
-  - Merges adjacent same-type cells < 50 lines
-  - Malformed JSON → `warn!` log + empty Vec
-- Integrated in `semantic.rs` alongside Markdown special-case path
-- 9 unit tests passing
-
-## Architecture (relevant parts only)
-
-### Ignore pipeline
-
-**FileWalker** (src/file/mod.rs): Uses `ignore::WalkBuilder` with built-in gitignore + custom filenames:
-- `.gitignore`, `.git/info/exclude`, global gitignore (via git config)
-- `.codesearchignore`, `.osgrepignore` (repo-local)
-- `~/.codesearch/.codesearchignore` (global, via `add_ignore()`)
-
-**FileWatcher** (src/watch/mod.rs): Manually builds `Gitignore` matcher from:
-- `~/.codesearch/.codesearchignore` (global, lowest priority)
-- `.git/info/exclude` (worktree-aware via `resolve_git_dir()`)
-- `.gitignore` (repo root)
-- `.codesearchignore` (repo-local, highest priority)
-
-### Jupyter chunker pipeline
-
-`chunk_semantic()` → `Language::Jupyter` → `jupyter::chunk_jupyter()` → JSON parse → cell extraction → merge → chunk creation
-
-### Key constants
-
-- `GLOBAL_CODESEARCHIGNORE_FILE` = `".codesearchignore"` (src/constants.rs)
-- `global_codesearchignore_path()` → `~/.codesearch/.codesearchignore` (src/constants.rs)
-- `MERGE_LINE_LIMIT` = 50 (src/chunker/jupyter.rs)
-
-## Notes for OpenCode
-
-- **Validation:** `cargo check` and `cargo clippy` for iteration. No `--release` builds — always dev/debug.
+- **Validation:** `cargo check` and `cargo clippy` for iteration. No `--release` builds — always dev/debug until the very end.
 - **Runtime:** `C:\Users\develterf\.local\bin\` — `codesearch.exe` + `helpers/csharp/scip-csharp.exe`
 - **Build:** `target/release/` — outside repo (via `CARGO_TARGET_DIR`)
-- **Deploy:** `..\copy-to-common.ps1` — builds + copies both binaries to `~/.local/bin/`
+- **Deploy:** `..\copy-to-common.ps1` — builds + copies both binaries to `~/.local/bin/`. A running `codesearch.exe` is file-locked on Windows; stop serve before deploying.
 - **Canonical paths:** NEVER call `.canonicalize()` directly. Always use `safe_canonicalize()`.
 - **LMDB rule:** No two `EnvOpenOptions::open()` on same dir in same process. All access via `get_or_open_stores()` → `Arc<SharedStores>`.
+- **Tooling:** do not use the bundled `codesearch` binary to investigate this repo (it's the project under development). Use codesearch MCP tools when available, else `grep`/`Glob`/`Read`.

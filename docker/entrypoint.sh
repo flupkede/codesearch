@@ -27,7 +27,7 @@
 #
 # Optional env:
 #   CODESEARCH_RUN_MODE       "serve" (default) | "index-job".
-#   KB_GIT_URL / GIT_PAT      Curated KB git repo (cloned to /data/aprimo).
+#   KB_GIT_URL / GIT_PAT      Curated KB git repo (cloned to /data/custom-kb).
 #   KB_PULL_INTERVAL_SECS     serve mode: git-pull the KB this often so the periodic
 #                             incremental reindex picks up new entries (default 900).
 #   DATA_DIR                  Working root (default /data).
@@ -41,7 +41,7 @@ MODE="${CODESEARCH_RUN_MODE:-serve}"
 DATA_DIR="${DATA_DIR:-/data}"
 PORT="${CODESEARCH_SERVE_PORT:-39725}"
 DOCS_DIR="${DATA_DIR}/docs"
-KB_DIR="${DATA_DIR}/aprimo"
+KB_DIR="${DATA_DIR}/custom-kb"
 SNAPSHOT_NAME="codesearch-snapshot.tgz"
 SNAPSHOT_LOCAL="/tmp/${SNAPSHOT_NAME}"
 CONFIG_DIR="${HOME}/.codesearch"
@@ -315,7 +315,7 @@ run_serve() {
   if [ -n "${KB_GIT_URL:-}" ]; then
     KB_PULL_INTERVAL_SECS="${KB_PULL_INTERVAL_SECS:-900}"
     ( while sleep "${KB_PULL_INTERVAL_SECS}"; do sync_kb; done ) &
-    log "KB auto-pull loop started (git pull every ${KB_PULL_INTERVAL_SECS}s -> /data/aprimo)"
+    log "KB auto-pull loop started (git pull every ${KB_PULL_INTERVAL_SECS}s -> /data/custom-kb)"
   fi
 
   log "starting codesearch serve on 0.0.0.0:${PORT}"

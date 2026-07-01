@@ -444,7 +444,7 @@ A group then references a peer via `@`-prefix (`"groups": { "docs": ["@cloud"] }
 codesearch index list --remote cloud
 
 # register a path on the peer's filesystem (NOT your local FS)
-codesearch index add /data/docs/aprimo-docs --remote cloud
+codesearch index add /data/docs/vendor-docs --remote cloud
 
 # remove a repo by its alias on the peer (NOT a local path)
 codesearch index rm inriver --remote cloud
@@ -463,7 +463,7 @@ codesearch index reindex inriver --remote cloud --force  # force full
 **Per-vendor layout on a peer.** Instead of registering one mixed corpus, register each vendor's sub-folder as its own repo so the peer's layout mirrors your local one. (Requires a **writable** peer — see the note above; a read-only restore-only peer rejects `add`.)
 
 ```bash
-for v in aprimo-docs inriver-docs akeneo-docs; do
+for v in vendor-a-docs vendor-b-docs vendor-c-docs; do
   codesearch index add "/data/docs/$v" --remote cloud
 done
 codesearch index list --remote cloud   # one alias per vendor

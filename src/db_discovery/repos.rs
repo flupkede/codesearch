@@ -519,7 +519,7 @@ impl ReposConfig {
     /// Inverse index: map each registered repo alias to the **named** group(s)
     /// it belongs to (sorted, de-duplicated). Used by discoverability surfaces
     /// (`status`, the `scope_required` error) so an agent can tell that, e.g.,
-    /// `"BAYR.Aprimo"` is a member of group `"BAYER"` and prefer a cross-repo
+    /// `"repo-a"` is a member of group `"group-a"` and prefer a cross-repo
     /// `group=` query over a single-repo `project=` query.
     ///
     /// Deliberate exclusions:
@@ -1497,30 +1497,30 @@ mod tests {
     fn project_groups_maps_aliases_to_named_groups() {
         let mut cfg = ReposConfig::default();
         cfg.repos
-            .insert("BAYR.Aprimo".to_string(), PathBuf::from("/tmp/bayr"));
+            .insert("repo-a".to_string(), PathBuf::from("/tmp/a"));
         cfg.repos
-            .insert("BAYR.CONFIG.APRIMO".to_string(), PathBuf::from("/tmp/cfg"));
+            .insert("repo-b".to_string(), PathBuf::from("/tmp/b"));
         cfg.repos
             .insert("lonely".to_string(), PathBuf::from("/tmp/lonely"));
-        // BAYR.Aprimo is a member of two named groups.
+        // repo-a is a member of two named groups.
         cfg.add_group(
-            "BAYER".to_string(),
-            vec!["BAYR.Aprimo".to_string(), "BAYR.CONFIG.APRIMO".to_string()],
+            "group-x".to_string(),
+            vec!["repo-a".to_string(), "repo-b".to_string()],
         )
         .unwrap();
-        cfg.add_group("aprimo".to_string(), vec!["BAYR.Aprimo".to_string()])
+        cfg.add_group("group-y".to_string(), vec!["repo-a".to_string()])
             .unwrap();
 
         let pg = cfg.project_groups();
 
         // Multi-group membership is sorted + de-duplicated.
         assert_eq!(
-            pg.get("BAYR.Aprimo"),
-            Some(&vec!["BAYER".to_string(), "aprimo".to_string()])
+            pg.get("repo-a"),
+            Some(&vec!["group-x".to_string(), "group-y".to_string()])
         );
         assert_eq!(
-            pg.get("BAYR.CONFIG.APRIMO"),
-            Some(&vec!["BAYER".to_string()])
+            pg.get("repo-b"),
+            Some(&vec!["group-x".to_string()])
         );
         // A repo in no named group is omitted entirely (no empty entry).
         assert!(!pg.contains_key("lonely"));
