@@ -183,6 +183,17 @@ pub(crate) struct ServeState {
     /// Repo alias → timestamp of last query that touched this repo.
     /// Used by the idle-reaper to evict repos after `REPO_IDLE_TIMEOUT_SECS`.
     last_access: DashMap<String, std::time::Instant>,
+    /// Repo alias → `JoinHandle` of its background file-system-watcher (FSW) task.
+    ///
+    /// The FSW task holds its own clones of `Arc<SharedStores>` and
+    /// `Arc<IndexManager>`. On Windows those Arcs keep the LMDB mmap files
+    /// (`data.mdb` / `lock.mdb`) open, which blocks deletion of the DB
+    /// directory — the OS refuses to delete a file mmap'd by the very process
+    /// asking for the delete. Tracking the handle lets `remove_repo` /
+    /// `restart_fsw` await the task's completion (after signalling stop via
+    /// `stop_fsw`) so the LMDB `Environment` drops and releases the file
+    /// handles BEFORE the DB directory is deleted. See `await_fsw_shutdown`.
+    fsw_tasks: DashMap<String, tokio::task::JoinHandle<()>>,
     /// Loaded repos config (alias → path).
     config: std::sync::RwLock<ReposConfig>,
     /// Last observed mtime of the repos config file.
@@ -286,6 +297,7 @@ impl ServeState {
         Self {
             repos: DashMap::new(),
             last_access: DashMap::new(),
+            fsw_tasks: DashMap::new(),
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
@@ -1198,7 +1210,11 @@ impl ServeState {
             if let Some((_, RepoState::Write { cancel_token, .. })) = self.repos.remove(alias) {
                 cancel_token.cancel();
             }
-            // Warm, Readonly, Conflicted just drop
+            // Warm, Readonly, Conflicted just drop.
+            // Also detach the FSW task handle so it doesn't leak across a config
+            // shrink. Reload never deletes DB dirs, so a still-draining task
+            // holding LMDB open briefly is harmless (no delete to race with).
+            self.fsw_tasks.remove(alias);
         }
 
         // Swap in the new config and mtime.
@@ -1248,6 +1264,11 @@ impl ServeState {
         }
         self.repos.remove(alias);
         self.last_access.remove(alias);
+        // Await the FSW task's exit so its Arc<SharedStores>/Arc<IndexManager>
+        // clones drop → the LMDB Environment closes → Windows releases the mmap
+        // file handles BEFORE we delete the DB directory below. stop_fsw above
+        // already cancelled the task; this waits for it to actually finish.
+        self.await_fsw_shutdown(alias).await;
         tracing::info!("Evicted repo '{}' from memory", alias);
 
         // 3. Unregister from repos.json
@@ -1343,12 +1364,56 @@ impl ServeState {
         }
     }
 
+    /// Await the completion of a repo's background FSW task (if any) and drop
+    /// its handle.
+    ///
+    /// MUST be called AFTER the task has been signalled to stop — i.e. the
+    /// caller has already invoked [`Self::stop_fsw`] (which cancels the
+    /// `CancellationToken`) or otherwise cancelled the token. Once the task
+    /// observes the cancellation and returns, the `Arc<SharedStores>` /
+    /// `Arc<IndexManager>` clones it holds are dropped → the LMDB
+    /// `Environment` drops synchronously (`mdb_env_close`) → Windows releases
+    /// the mmap file handles → the DB directory can be deleted.
+    ///
+    /// Bounded to 5 s so a stuck task can never wedge `remove_repo`; on
+    /// timeout the handle is dropped (detaching the task) and a warning is
+    /// logged. The DB delete retry-loop in `remove_repo` remains as a
+    /// fallback for that edge case.
+    async fn await_fsw_shutdown(&self, alias: &str) {
+        if let Some((_, handle)) = self.fsw_tasks.remove(alias) {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => {
+                    tracing::debug!("FSW task for '{}' exited cleanly", alias);
+                }
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        "FSW task for '{}' panicked during shutdown: {}",
+                        alias,
+                        join_err
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "FSW task for '{}' did not exit within 5s; LMDB handles may stay locked",
+                        alias
+                    );
+                }
+            }
+        }
+    }
+
     /// Spawn the FSW background task for a repo after it has been stopped.
     ///
     /// Creates a fresh IndexManager, performs an initial incremental refresh,
     /// then starts the continuous file watcher loop. Updates the RepoState with
     /// the new cancel token and IndexManager.
     async fn restart_fsw(&self, alias: &str, stores: Arc<SharedStores>) {
+        // The caller already cancelled the previous FSW task via stop_fsw.
+        // Await its exit so its Arc<SharedStores>/Arc<IndexManager> clones drop
+        // before we spawn a new task against the same stores (and so the old
+        // handle is removed from fsw_tasks before we insert a fresh one below).
+        self.await_fsw_shutdown(alias).await;
+
         let path = {
             let config = match self.config.read() {
                 Ok(c) => c,
@@ -1384,7 +1449,7 @@ impl ServeState {
                 let notifier = self.make_csharp_notifier(alias);
                 let indexing_cb = self.make_indexing_status_callback(alias);
 
-                tokio::spawn(async move {
+                let fsw_handle = tokio::spawn(async move {
                     if let Err(e) = im_for_task.start_watching().await {
                         tracing::warn!("Could not pre-start FSW for '{}': {}", alias_bg, e);
                     }
@@ -1410,6 +1475,8 @@ impl ServeState {
                         tracing::error!("File watcher for '{}' stopped: {}", alias_bg, e);
                     }
                 });
+
+                self.fsw_tasks.insert(alias.to_string(), fsw_handle);
 
                 if let Some(mut entry) = self.repos.get_mut(alias) {
                     *entry.value_mut() = RepoState::Write {
@@ -1692,7 +1759,7 @@ impl ServeState {
                     let notifier = self.make_csharp_notifier(alias);
                     let indexing_cb = self.make_indexing_status_callback(alias);
 
-                    tokio::spawn(async move {
+                    let fsw_handle = tokio::spawn(async move {
                         // Pre-start FSW so changes during initial refresh aren't lost
                         if let Err(e) = im_for_task.start_watching().await {
                             tracing::warn!("Could not pre-start FSW for '{}': {}", alias_clone, e);
@@ -1721,6 +1788,7 @@ impl ServeState {
                             tracing::error!("File watcher for '{}' stopped: {}", alias_clone, e);
                         }
                     });
+                    self.fsw_tasks.insert(alias.to_string(), fsw_handle);
 
                     (Some(im_arc), token)
                 }
@@ -1772,7 +1840,7 @@ impl ServeState {
 
         // Fire-and-forget: create IndexManager + start FSW in background.
         // We don't block the first query — the repo is already searchable from the Warm state.
-        tokio::spawn(async move {
+        let fsw_handle = tokio::spawn(async move {
             if token_for_task.is_cancelled() {
                 return;
             }
@@ -1814,6 +1882,7 @@ impl ServeState {
                 }
             }
         });
+        self.fsw_tasks.insert(alias.to_string(), fsw_handle);
 
         // Transition to Write immediately so future requests see this repo as active.
         // The IndexManager is created inside the spawned task, so we store None here.
