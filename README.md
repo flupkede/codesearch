@@ -66,10 +66,11 @@ graph TB
     FindImpact -->|C# symbols| CSharpHelper[scip-csharp helper]
     CSharpHelper -->|SCIP index| ScipLMDB[(LMDB scip_symbols)]
 
-    subgraph "Serve Mode (multi-repo)"
+    subgraph "Serve Mode (multi-repo + federation)"
         ServeRouter[HTTP Router] -->|project/group routing| Repo1[Repo A]
         ServeRouter --> Repo2[Repo B]
         ServeRouter --> RepoN[Repo N]
+        ServeRouter -->|"@peer fan-out · TLS"| CloudPeer["Cloud serve peer<br/>results merged via RRF"]
     end
 
     Router -->|client mode| ServeRouter

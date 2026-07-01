@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Federation — remote peers.** Register peers with `codesearch remote add/rm/list` (local `~/.codesearch/repos.json` config), reference them from groups via `@peer` (e.g. `"docs": ["@cloud"]`), and `codesearch` fans `search`/`get_chunk` out over TLS, merging remote and local results with Reciprocal Rank Fusion (RRF). Remote misses degrade to local-only results with a `warnings` field — they never hard-fail.
 - **Remote index management (`--remote`).** The `index` verbs now take `--remote <peer>` to operate against a peer: `index list/add/rm/reindex --remote cloud` drive the peer's management REST API (`GET /status`, `POST /repos`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex`). New `index reindex` verb (local + remote). `--json` on `list`/`reindex` (requires `--remote`).
-- **Cloud deployment topology** — split indexer job (4 vCPU/8 GiB, builds + uploads a snapshot) and read-only restore-only serve replica (1 vCPU/2 GiB) for scale-to-zero hosting. See `docs/federation-cloud-deployment.md`.
+- **Cloud deployment topology** — split indexer job (4 vCPU/8 GiB, builds + uploads a snapshot) and read-only restore-only serve replica (1 vCPU/2 GiB) for scale-to-zero hosting. See `integrations/cloud/README.md`.
 - **README `## Security` section** documenting the federation trust model, secret storage/transport, redirect handling, serve-side enforcement, and cross-instance isolation.
 
 ### Fixed
