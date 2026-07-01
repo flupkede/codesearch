@@ -1,6 +1,6 @@
 # codesearch — Federation Feature Plan
 
-**Status:** Phase 1 + Phase 2 (search/get_chunk) shipped · **Scope:** codesearch Rust repo · **Related:** `codesearch-federation-aprimo-mcp.md` (aprimo_mcp + ops side, in the aprimo_mcp repo)
+**Status:** Phase 1 + Phase 2 (search/get_chunk) shipped · **Scope:** codesearch Rust repo (generic engine spec) · **Related:** the canonical, current-state deployment + end-to-end architecture doc is **`aprimo_mcp/docs/knowledge-base-architecture.md`** (with SVG). It supersedes the former `federation-cloud-deployment.md` (this repo) and `codesearch-federation-aprimo-mcp.md` (aprimo_mcp), both now deleted. This file remains the generic Rust federation-feature spec.
 
 > **Phase status:** Phase 1 (REST endpoints) — ✅ done · Phase 2 (federation dispatch) — ✅ done for `search` + `get_chunk`; `find`/`explore`/`find_impact` federation deferred (see Open items) · Phase 3 (TLS + ops hardening) — ⏳ planned.
 
