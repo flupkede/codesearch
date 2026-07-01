@@ -822,6 +822,11 @@ impl ServeState {
                         let _ = self.stop_fsw(alias);
                         self.repos.remove(alias);
                         self.last_access.remove(alias);
+                        // Detach the FSW handle (stop_fsw already cancelled
+                        // the task). The DB dir is already gone (the prune
+                        // condition was db_missing || path_gone), so there is
+                        // no delete to race with — the task just drains.
+                        self.fsw_tasks.remove(alias);
 
                         // Unregister from repos.json — route through persist_config
                         // so the config_path_override is honoured (same as all
@@ -1288,6 +1293,17 @@ impl ServeState {
         }
 
         // 4. Delete the database directory with retries.
+        //
+        // `await_fsw_shutdown` above dropped the *persistent* holders (the FSW
+        // task + this RepoState), which is the fix for the Windows
+        // sharing-violation. A *transient* holder can still defeat a single
+        // delete attempt: a search / warmup in flight at this instant may hold
+        // its own clone of the Arc<SharedStores> (or an inner
+        // Arc<RwLock<VectorStore>> captured in a spawn_blocking), keeping the
+        // LMDB env open past the await. The retry-loop below is the fallback
+        // for that race; if it still fails (warned, non-fatal) the DB dir
+        // stays on disk and is cleaned up on the next serve restart. The repo
+        // is already unregistered from config, so this is cosmetic.
         if db_path.exists() {
             for attempt in 0..5 {
                 if attempt > 0 {
@@ -2417,6 +2433,11 @@ impl ServeState {
         }
 
         for alias in &to_evict {
+            // Detach the FSW handle (no-op for Warm/Readonly/Conflicted — they
+            // have no FSW task). Eviction frees memory; the DB dir is NOT
+            // deleted (the repo can be re-opened on the next query), so we
+            // don't need to await — the cancelled task drains on its own.
+            self.fsw_tasks.remove(alias);
             match self.repos.remove(alias) {
                 Some((_, RepoState::Write { cancel_token, .. })) => {
                     cancel_token.cancel();
@@ -4087,6 +4108,43 @@ mod tests {
             0,
             "tracked session did not balance"
         );
+    }
+
+    #[tokio::test]
+    async fn await_fsw_shutdown_joins_exited_task_and_removes_entry() {
+        // `await_fsw_shutdown` must (a) remove the alias from `fsw_tasks` and
+        // (b) actually await (join) the task to completion — not just drop the
+        // handle. We prove the join happened by observing a side-effect the
+        // task sets on exit. Regression guard for the Windows DB-delete fix:
+        // if someone removes the join, the LMDB env stays open and the task's
+        // Arc<SharedStores> clone keeps the mmap handle locked on Windows.
+        let state = ServeState::new(ReposConfig::default(), None);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_clone = done.clone();
+        let handle = tokio::spawn(async move {
+            // Yield once so the task isn't already-finished at insert time.
+            tokio::task::yield_now().await;
+            done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        state.fsw_tasks.insert("repo-x".to_string(), handle);
+        state.await_fsw_shutdown("repo-x").await;
+        assert!(
+            !state.fsw_tasks.contains_key("repo-x"),
+            "fsw_tasks entry not removed"
+        );
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "FSW task was not joined to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_fsw_shutdown_noop_on_missing_alias() {
+        // A repo that never had an FSW task (Warm/Readonly/Conflicted) must
+        // not panic — the map lookup is the no-op guard.
+        let state = ServeState::new(ReposConfig::default(), None);
+        state.await_fsw_shutdown("never-spawned").await;
+        assert!(state.fsw_tasks.is_empty());
     }
 
     fn state_with_config(config: ReposConfig) -> ServeState {
