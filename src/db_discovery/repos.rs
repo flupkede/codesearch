@@ -1518,10 +1518,7 @@ mod tests {
             pg.get("repo-a"),
             Some(&vec!["group-x".to_string(), "group-y".to_string()])
         );
-        assert_eq!(
-            pg.get("repo-b"),
-            Some(&vec!["group-x".to_string()])
-        );
+        assert_eq!(pg.get("repo-b"), Some(&vec!["group-x".to_string()]));
         // A repo in no named group is omitted entirely (no empty entry).
         assert!(!pg.contains_key("lonely"));
     }
