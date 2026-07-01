@@ -41,6 +41,7 @@ use crate::constants::{
     MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
     REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
     STATUS_PATH,
+    REMOTES_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -2587,6 +2588,57 @@ async fn status_handler(
     }))
 }
 
+/// Projection of a federation peer that is safe to expose over `GET /remotes`.
+///
+/// This is a **dedicated, deliberately narrow type** rather than a reuse of
+/// [`crate::db_discovery::repos::RemotePeer`]: `RemotePeer` carries the
+/// `api_key` shared secret, which must NEVER leave the process via this
+/// observability endpoint. By construction this struct has no `api_key` field,
+/// so the secret cannot be serialized even by accident. Only the four
+/// operator-relevant fields are projected here.
+#[derive(serde::Serialize)]
+struct RemotePeerInfo {
+    alias: String,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_secs: Option<u64>,
+}
+
+/// Remotes handler: GET /remotes
+///
+/// Observability companion to [`status_handler`]: lists the federation peers
+/// this serve fans out to (the `remotes` map from `repos.json`), sorted by
+/// alias for stable output. On a config read error the endpoint degrades
+/// gracefully to `{"remotes": []}` rather than returning a 500, since the peer
+/// list is purely informational.
+///
+/// Read-only and status-like: same auth policy as `/status` (no admin key on
+/// localhost, protected by `require_auth_for_network` on network binds). Does
+/// not touch in-memory [`ServeState`], so it takes no state extractor.
+async fn remotes_handler() -> AxumJson<serde_json::Value> {
+    // Load the on-disk peer config; a read failure is non-fatal for an
+    // observability endpoint — report an empty peer list instead of a 500.
+    let cfg = crate::db_discovery::load_repos_config().unwrap_or_default();
+
+    // Project each peer into the api_key-less `RemotePeerInfo` view, then sort
+    // by alias for deterministic output.
+    let mut remotes: Vec<RemotePeerInfo> = cfg
+        .remotes
+        .iter()
+        .map(|(alias, p)| RemotePeerInfo {
+            alias: alias.clone(),
+            url: p.url.clone(),
+            group: p.group.clone(),
+            timeout_secs: p.timeout_secs,
+        })
+        .collect();
+    remotes.sort_by(|a, b| a.alias.cmp(&b.alias));
+
+    AxumJson(json!({ "remotes": remotes }))
+}
+
 /// Info handler: GET /repos/{alias}/info
 ///
 /// Returns live index stats for a single repo, mirroring the TUI info overlay
@@ -3842,6 +3894,13 @@ pub async fn run_serve(
         .route(HEALTH_PATH, axum::routing::get(health_handler))
         .route(HEALTHZ_PATH, axum::routing::get(healthz_handler))
         .route(STATUS_PATH, axum::routing::get(status_handler))
+        // /remotes is a status-like read-only observability endpoint (lists the
+        // configured federation peers). It is NOT in require_admin_auth's
+        // `is_management` set, so it inherits exactly the same auth policy as
+        // /status, /repos/:alias/info and /repos/:alias/doctor: reachable
+        // without the admin key on localhost, protected by
+        // require_auth_for_network on network binds. See REMOTES_PATH doc.
+        .route(REMOTES_PATH, axum::routing::get(remotes_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
         .route("/reload", axum::routing::post(reload_handler))

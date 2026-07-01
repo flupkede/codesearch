@@ -248,6 +248,17 @@ pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 /// Returns JSON snapshot of all repo states, sessions, and CPU usage.
 pub const STATUS_PATH: &str = "/status";
 
+/// Remotes endpoint path served by `codesearch serve`.
+///
+/// Observability companion to [`STATUS_PATH`]: lists the configured federation
+/// peers (the `remotes` map from `repos.json`) so an operator can see which
+/// remotes this serve fans out to. Read-only and status-like — reachable
+/// without the admin key on localhost, protected only by
+/// `require_auth_for_network` on network binds (NOT in the `is_management`
+/// set). **Never** exposes `api_key`: the handler projects each peer into a
+/// dedicated `RemotePeerInfo` struct that structurally omits the secret.
+pub const REMOTES_PATH: &str = "/remotes";
+
 /// REST search endpoint (federation-friendly HTTP mirror of the `search` MCP
 /// tool). POST a `SearchRequest` body; returns the tool's JSON payload.
 pub const SEARCH_PATH: &str = "/search";
