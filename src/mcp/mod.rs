@@ -2608,6 +2608,13 @@ pub struct CodesearchService {
     // helper-detection cache. In serve mode, cloned from ServeState; in
     // standalone mode, a locally owned Arc.
     symbol_registry: Arc<SymbolIndexerRegistry>,
+    // True ONLY for services created by the serve-mode MCP session factory,
+    // which pairs `session_connected()` (on create) with `session_disconnected()`
+    // (in Drop). Per-request REST services built via `make_service` leave this
+    // false so `Drop` does NOT decrement `active_sessions` — otherwise that
+    // AtomicU64 underflows (0 - 1 wraps to u64::MAX) on every REST request,
+    // corrupting the `/status` health signal.
+    tracks_session: bool,
 }
 
 impl std::fmt::Debug for CodesearchService {
@@ -2624,10 +2631,15 @@ impl std::fmt::Debug for CodesearchService {
 
 impl Drop for CodesearchService {
     fn drop(&mut self) {
-        // When a session ends (CodesearchService is dropped), decrement the active session counter.
-        // This pairs with the session_connected() call in the service factory in serve/mod.rs.
-        if let Some(ref serve_state) = self.serve_state {
-            serve_state.session_disconnected();
+        // Only genuine MCP sessions (created by the serve factory, which calls
+        // session_connected() + mark_session_tracked()) balance the counter.
+        // Per-request REST services (make_service → new_for_serve) never
+        // increment it, so must NOT decrement here — otherwise active_sessions
+        // underflows (the AtomicU64 wraps to u64::MAX) on every REST request.
+        if self.tracks_session {
+            if let Some(ref serve_state) = self.serve_state {
+                serve_state.session_disconnected();
+            }
         }
     }
 }
@@ -3495,6 +3507,7 @@ impl CodesearchService {
             shared_stores,
             serve_state: None,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
+            tracks_session: false,
         })
     }
 
@@ -3514,7 +3527,19 @@ impl CodesearchService {
             shared_stores: None,
             serve_state: Some(serve_state),
             symbol_registry,
+            tracks_session: false,
         })
+    }
+
+    /// Mark this service as owning a session slot so `Drop` will balance the
+    /// `session_connected()` the caller already made.
+    ///
+    /// Only the serve-mode MCP session factory (`run_serve`) should call this:
+    /// it calls `session_connected()` and then this. Per-request REST services
+    /// built via `make_service` must NOT — they never increment the counter, so
+    /// decrementing it on drop would underflow `active_sessions` to `u64::MAX`.
+    pub(crate) fn mark_session_tracked(&mut self) {
+        self.tracks_session = true;
     }
 
     /// Get or initialize the embedding service

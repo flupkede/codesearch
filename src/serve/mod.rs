@@ -3712,9 +3712,14 @@ pub async fn run_serve(
             let session_id = state_for_factory.session_connected();
             info!("🔌 MCP client connected (session #{})", session_id);
             // We create a minimal service; actual repo routing is handled inside
-            // the tool handlers via serve_state.
-            crate::mcp::CodesearchService::new_for_serve(state_for_factory.clone())
-                .map_err(std::io::Error::other)
+            // the tool handlers via serve_state. Marking it session-tracked pairs
+            // the session_connected() above with session_disconnected() in Drop —
+            // per-request REST services (make_service) are NOT marked, so they
+            // never decrement active_sessions (which would underflow it to MAX).
+            let mut svc = crate::mcp::CodesearchService::new_for_serve(state_for_factory.clone())
+                .map_err(std::io::Error::other)?;
+            svc.mark_session_tracked();
+            Ok(svc)
         };
 
     // Build session manager without keep_alive timeout. The default rmcp timeout
@@ -3979,6 +3984,40 @@ mod tests {
         assert!(api_key_matches("", "")); // both empty digests are equal
                                           // Case-sensitive and exact.
         assert!(!api_key_matches("Secret-Key", "secret-key"));
+    }
+
+    #[test]
+    fn rest_service_drop_does_not_touch_active_sessions() {
+        // Per-request REST services (built via make_service for /search /find
+        // /explore /chunk, NOT the serve MCP session factory) must never touch
+        // active_sessions: their Drop must NOT decrement the counter, or it
+        // underflows to u64::MAX. Regression guard for the tracks_session fix.
+        let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+        {
+            let _svc = crate::mcp::CodesearchService::new_for_serve(state.clone()).unwrap();
+        }
+        assert_eq!(
+            state.active_session_count(),
+            0,
+            "REST service drop underflowed active_sessions"
+        );
+    }
+
+    #[test]
+    fn tracked_session_drop_balances_active_sessions() {
+        // A genuine MCP session increments on connect and the serve factory
+        // marks it tracked, so Drop decrements and the counter returns to 0.
+        let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+        let _id = state.session_connected();
+        {
+            let mut svc = crate::mcp::CodesearchService::new_for_serve(state.clone()).unwrap();
+            svc.mark_session_tracked();
+        }
+        assert_eq!(
+            state.active_session_count(),
+            0,
+            "tracked session did not balance"
+        );
     }
 
     fn state_with_config(config: ReposConfig) -> ServeState {
