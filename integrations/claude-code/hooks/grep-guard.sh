@@ -40,18 +40,26 @@ fi
 [ "$is_internal" = false ] && exit 0
 
 # ------------------------------------------------------------------
-# 2. Is codesearch actually available?
+# 2. Is codesearch actually available FOR THIS REPO?
+#
+# NOTE: we deliberately do NOT treat "a codesearch process is running" as
+# sufficient. codesearch commonly runs as a persistent background `serve`
+# hub covering many registered repos (`codesearch index list`) — that
+# process is alive nearly all the time on a dev machine, regardless of
+# whether the CURRENT directory is one of the repos it actually indexes.
+# Using process-presence alone made this hook fire in every directory on
+# the machine, including ones with no index at all. A local `.codesearch.db`
+# at the git root is the precise, fast signal that THIS repo is indexed.
 # ------------------------------------------------------------------
 codesearch_available=false
-if pgrep -x codesearch >/dev/null 2>&1; then
+git_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -n "$git_root" ] && [ -d "$git_root/.codesearch.db" ]; then
     codesearch_available=true
 elif [ -n "${CODESEARCH_SERVER:-}" ]; then
+    # Explicit opt-in escape hatch for pure remote-serve setups with no local
+    # .codesearch.db. Requires the user to consciously set this env var, so
+    # it can't spuriously fire the way "any process running" did.
     codesearch_available=true
-else
-    git_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    if [ -n "$git_root" ] && [ -d "$git_root/.codesearch.db" ]; then
-        codesearch_available=true
-    fi
 fi
 
 [ "$codesearch_available" = false ] && exit 0

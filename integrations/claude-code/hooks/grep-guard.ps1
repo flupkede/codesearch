@@ -71,14 +71,18 @@ if ($path -and $path -ne '.' -and $path -ne './') {
 if (-not $isInternal) { exit 0 }
 
 # ------------------------------------------------------------------
-# 2. Is codesearch actually available? Don't block if it isn't.
+# 2. Is codesearch actually available FOR THIS REPO? Don't block if it isn't.
+#
+# NOTE: we deliberately do NOT treat "a codesearch process is running" as
+# sufficient. codesearch commonly runs as a persistent background `serve`
+# hub covering many registered repos (`codesearch index list`) — that
+# process is alive nearly all the time on a dev machine, regardless of
+# whether the CURRENT directory is one of the repos it actually indexes.
+# Using process-presence alone made this hook fire in every directory on
+# the machine, including ones with no index at all. A local `.codesearch.db`
+# at the git root is the precise, fast signal that THIS repo is indexed.
 # ------------------------------------------------------------------
 function Test-CodesearchAvailable {
-    $proc = Get-Process -Name 'codesearch' -ErrorAction SilentlyContinue
-    if ($proc) { return $true }
-
-    if ($env:CODESEARCH_SERVER) { return $true }
-
     try {
         $gr = (& git rev-parse --show-toplevel 2>$null)
         if ($LASTEXITCODE -eq 0 -and $gr) {
@@ -86,6 +90,12 @@ function Test-CodesearchAvailable {
             if (Test-Path (Join-Path $gr '.codesearch.db')) { return $true }
         }
     } catch {}
+
+    # Explicit opt-in escape hatch for pure remote-serve setups with no local
+    # .codesearch.db (this repo's index lives only on a remote `codesearch
+    # serve` host). Requires the user to consciously set this env var, so it
+    # can't spuriously fire the way "any process running" did.
+    if ($env:CODESEARCH_SERVER) { return $true }
 
     return $false
 }

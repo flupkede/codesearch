@@ -110,12 +110,20 @@ points at `hooks/codesearch/`) from `settings.json`, and delete
 
 ## Caveats
 
-- `grep-guard` detects "codesearch is available" via a running `codesearch`
-  process, a `CODESEARCH_SERVER` env var, or a `.codesearch.db` at the git
-  root. If your setup connects to a remote `codesearch serve` instance
-  without any of these local signals, the guard won't fire — grep will work
-  unblocked, but you also won't get the enforcement. Set `CODESEARCH_SERVER`
-  in that case to opt back in.
+- `grep-guard` detects "codesearch is available **for the current repo**" via
+  a local `.codesearch.db` at the git root, or an explicit `CODESEARCH_SERVER`
+  env var for pure remote-serve setups with no local index. It deliberately
+  does **not** treat "a `codesearch` process is running" as sufficient —
+  `codesearch serve` commonly runs as a persistent background hub covering
+  many registered repos (`codesearch index list`), so that process is alive
+  on a dev machine almost all the time regardless of whether the current
+  directory is one of the repos it actually indexes. Checking process
+  presence alone made the hook fire in every directory on the machine,
+  including unindexed ones — this was found and fixed after exactly that
+  false-positive showed up in real use.
+  If your setup connects to a remote `codesearch serve` instance with no
+  local `.codesearch.db`, set `CODESEARCH_SERVER` to opt back into
+  enforcement for that repo.
 - Both hooks are per-machine, not per-repo: install once at user scope and
   every project benefits, including ones without a local `.codesearch.db`
   (the guard simply won't block Grep there, since step 2 fails open).
