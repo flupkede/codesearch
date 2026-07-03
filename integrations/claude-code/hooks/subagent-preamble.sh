@@ -41,6 +41,11 @@ Then use:
   mcp__codesearch__explore(target, kind="outline")             -- file/class structure
   mcp__codesearch__get_chunk(chunk_id)                         -- read a specific code chunk
 
+Multi-repo serve mode: if a call returns "scope_required" or "Unknown alias",
+add project="<repo-alias>" (single repo) or group="<group>" (cross-repo). The
+error response lists the valid available_projects / available_groups — pick
+from that list; the alias may differ from the folder name.
+
 Fall back to Grep/Glob only after codesearch returns no useful results,
 or when the path is outside the current repo (codesearch covers internal
 paths only unless you're in multi-repo serve mode with an explicit group).

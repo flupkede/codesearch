@@ -148,6 +148,13 @@ Step 2 — search:
   mcp__codesearch__find(symbol="...", kind="definition")                 -- symbol definition
   mcp__codesearch__find(symbol="...", kind="usages")                     -- all call sites
 
+Multi-repo serve mode: if the search returns a "scope_required" or
+"Unknown alias" error, you MUST pass project="<repo-alias>" (single repo) or
+group="<group>" (cross-repo). The error response LISTS the valid
+available_projects / available_groups — pick from that list (the alias may
+differ from the folder name). Example:
+  mcp__codesearch__search(query="$pattern", mode="semantic", project="<alias-from-error>")
+
 This exact Grep call is auto-unblocked if you retry it within 5 minutes
 (i.e. codesearch returned nothing useful — go ahead and grep).
 Grep is always allowed for paths outside the current repo.
