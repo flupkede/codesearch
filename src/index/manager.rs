@@ -702,8 +702,8 @@ impl IndexManager {
                 // are not needed on the async side and may not be `Send`.
                 let files_for_embed = file_batch.to_vec();
                 let cache_dir_for_batch = cache_dir.clone();
-                let embedded_chunks =
-                    tokio::task::spawn_blocking(move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
+                let embedded_chunks = tokio::task::spawn_blocking(
+                    move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
                         let mut chunker = SemanticChunker::new(100, 2000, 10);
                         let mut all_chunks = Vec::new();
 
@@ -712,7 +712,8 @@ impl IndexManager {
                                 Ok(c) => c,
                                 Err(_) => continue,
                             };
-                            let chunks = chunker.chunk_semantic(file.language, &file.path, &content)?;
+                            let chunks =
+                                chunker.chunk_semantic(file.language, &file.path, &content)?;
                             all_chunks.extend(chunks);
                         }
 
@@ -725,16 +726,17 @@ impl IndexManager {
                             Some(cache_dir_for_batch.as_path()),
                         )?;
                         embedding_service.embed_chunks(all_chunks)
-                    })
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "chunk+embed task panicked (batch {}/{}): {}",
-                            batch_idx + 1,
-                            total_batches,
-                            e
-                        )
-                    })??;
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "chunk+embed task panicked (batch {}/{}): {}",
+                        batch_idx + 1,
+                        total_batches,
+                        e
+                    )
+                })??;
 
                 if !embedded_chunks.is_empty() {
                     info!(
