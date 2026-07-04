@@ -60,6 +60,37 @@ narrower serve/mod.rs theory.
 > restarted via local `codesearch serve`. Only touch the cloud (and thus PIM) to verify a fix
 > against the real corpus size.
 
+**Actual root cause found + fixed (2026-07-04):** `IndexManager::perform_incremental_refresh_with_stores`
+(`src/index/manager.rs`) chunked + embedded the ENTIRE changed-file delta in one unbounded
+in-memory `Vec` before writing anything to the stores. A normal incremental delta (tens of
+files) is harmless; a vendor sync dropping thousands of files at once is not — that unbounded
+batch is what OOM'd the 1 vCPU/2 GiB `codesearch-serve` container. Fixed by batching: the loop
+now processes `changed_files.chunks(batch_size)` sequentially (chunk+embed+insert+commit per
+batch, single `build_index()` at the end), bounding peak memory to O(batch) regardless of
+delta size. Batch size defaults to `INCREMENTAL_REFRESH_BATCH_SIZE = 200`
+(`src/constants.rs`), override via `CODESEARCH_INCREMENTAL_BATCH_SIZE`. `cargo check` +
+`cargo clippy -D warnings` + `cargo test --lib --bins` all clean. This fix is independent of
+which container runs it — it protects `codesearch-serve`'s in-process warmup **and**
+`codesearch-indexer`'s full rebuild against the same failure mode as the corpus keeps growing.
+No test added for the multi-batch path itself: existing `manager.rs` tests deliberately avoid
+invoking real embedding (slow/ONNX-model-dependent, same reasoning as the gated
+`csharp_helper_integration` test) — verify end-to-end on a real large corpus if in doubt.
+
+## Still open — automating the "manual scaling" question
+
+Confirmed (2026-07-04): `codesearch-indexer` job has `triggerType: "Manual"` — nothing runs it
+automatically today; every rebuild has been a human running `az containerapp job start` by
+hand. The code fix above means a large batch can no longer crash anything, but staleness is
+still only resolved manually. Options discussed, not yet decided (needs vendor content
+update-cadence info the agent doesn't have):
+- **Schedule trigger** on the existing job (`az containerapp job update --trigger-type Schedule
+  --cron-expression "..."`) — no new Azure resources, just a cron cadence. Cost/staleness
+  tradeoff depends on how often the vendor ServiceNow export actually changes upstream.
+- **Event-driven** (Event Grid on the blob source triggering job start) — more precise, needs
+  a new Event Grid subscription + small trigger function/Logic App.
+- The previously-proposed single-app scale-up/poll/snapshot/scale-down redesign for
+  `codesearch-serve` itself (below) remains a separate, bigger follow-up.
+
 ## Proposed redesign — collapse indexer job + serve into one scalable app
 
 **Problem with the current split:** `codesearch-indexer` (4 vCPU/8GiB, full/incremental build

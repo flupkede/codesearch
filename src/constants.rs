@@ -415,6 +415,27 @@ pub const CSHARP_PREWARM_ENABLED_ENV: &str = "CSHARP_PREWARM_ENABLED";
 /// Limits the batch size to avoid excessive memory usage on large solutions.
 pub const CSHARP_PREWARM_MAX_SYMBOLS: usize = 5000;
 
+/// Maximum number of changed files chunked + embedded in a single in-memory
+/// batch during `IndexManager::perform_incremental_refresh_with_stores`.
+///
+/// Without this cap, a single incremental refresh pass would read, chunk, and
+/// embed the ENTIRE delta (every changed/new file since the last refresh) in
+/// one unbounded `Vec`, before writing anything to the stores. This is safe
+/// for normal incremental deltas (tens of files) but OOM'd a 1 vCPU / 2 GiB
+/// `codesearch-serve` container when a vendor `docs` corpus roughly doubled in
+/// one sync (2509 -> 5666 files): the in-process warmup tried to chunk+embed
+/// thousands of files at once, exceeded available memory, and crash-looped.
+///
+/// Batching bounds peak memory to O(batch), not O(total delta), so a corpus
+/// delta of any size can no longer OOM the process — it just takes longer,
+/// spread across sequential batches.
+///
+/// Override at runtime with `CODESEARCH_INCREMENTAL_BATCH_SIZE`.
+pub const INCREMENTAL_REFRESH_BATCH_SIZE: usize = 200;
+
+/// Environment variable to override `INCREMENTAL_REFRESH_BATCH_SIZE`.
+pub const INCREMENTAL_REFRESH_BATCH_SIZE_ENV: &str = "CODESEARCH_INCREMENTAL_BATCH_SIZE";
+
 /// Default LMDB map size (MB) for the SCIP symbol index per repo.
 ///
 /// This is virtual address space, not physical memory. On POSIX and Windows the
