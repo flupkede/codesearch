@@ -43,16 +43,59 @@ from `open`→`warm` post-snapshot-restore never completes/clears for `docs`, wh
 - Add a regression check: after cold start, poll `/repos/<alias>/info` + `/status` until
   `warm`, with a timeout — if it never flips, that itself is the bug reproduction.
 
-**Priority:** low (cosmetic/status-only, not a functional blocker) but worth fixing since it
-undermines trust in the `/status` health signal for monitoring/alerting.
+**Priority: escalated to HIGH (2026-07-04).** Originally filed as cosmetic/status-only. Now
+confirmed as the same underlying mechanism behind a real crash-loop: after the vendor `docs`
+corpus roughly doubled (2509 -> 5666 files), `codesearch-serve` (1 vCPU/2GiB) entered a crash
+loop on cold start — the "serve startup warmup is incrementally refreshing it" step tries to
+re-embed the delta in-process, took >120s (past the entrypoint's own wait-for-`indexing`-flag
+window, logged as `WARN: no 'indexing' observed within 120s — proceeding cautiously`), and the
+container OOM'd/restarted repeatedly, re-running the full azcopy sync every time. `/status` and
+`/search` were unreachable (timeouts / 503) for several minutes until a manual
+`codesearch-indexer` job run produced a fresh snapshot. Root cause and fix below supersede the
+narrower serve/mod.rs theory.
 
-> ⚠️ **No Azure/PIM access needed to investigate this.** The fix is pure code analysis
-> (`src/serve/mod.rs` warmup/lock logic) and can be reproduced **locally** first — this repo
-> already has large multi-file local repos registered (e.g. `repo-large`, 25751 chunks /
-> 2831 files) that can be cold-restarted via local `codesearch serve` to check whether the
-> same `open`/`write`-stuck behavior reproduces without touching the cloud at all. Only reach
-> for the cloud (and thus PIM) if the bug turns out to be specific to the restore-only /
-> snapshot-restore cold-start path and doesn't reproduce locally.
+> ⚠️ **No Azure/PIM access needed to investigate the code path.** `src/serve/mod.rs` and
+> `docker/entrypoint.sh` warmup/lock logic can be reasoned about from source. Reproducing the
+> crash locally needs a large-enough local repo (e.g. `repo-large`, 25751 chunks / 2831 files)
+> restarted via local `codesearch serve`. Only touch the cloud (and thus PIM) to verify a fix
+> against the real corpus size.
+
+## Proposed redesign — collapse indexer job + serve into one scalable app
+
+**Problem with the current split:** `codesearch-indexer` (4 vCPU/8GiB, full/incremental build
++ snapshot upload) and `codesearch-serve` (1 vCPU/2GiB, restore-only) are two separate Container
+Apps resources that only talk to each other via a blob-storage snapshot round-trip. Every
+content update pays for a full tar-upload + download-untar cycle, and `serve`'s own "helpful"
+incremental-warmup step duplicates part of the indexer's job on hardware sized for read-only
+serving — which is what caused the crash-loop above.
+
+**Why the round-trip exists at all:** the index store is **LMDB** (mmap-based). LMDB is not
+safe on network-mounted volumes (Azure Files/NFS) — mmap needs local POSIX byte-range locking
+guarantees a network share can't reliably provide, risking corruption. So the index must live
+on local ephemeral disk, and ephemeral disk does **not** survive a Container Apps revision
+change (which is what any `--cpu`/`--memory` update triggers) — hence *some* durable handoff
+(blob snapshot) is unavoidable across a resource-tier change.
+
+**Proposed design (single app, no separate job):**
+1. `az containerapp update -n codesearch-serve --cpu 2.0 --memory 4Gi` — new revision, cold
+   start (restore last snapshot, sync corpus, start incremental reindex in-process).
+2. Poll `GET /status` every ~10-15s with a generous timeout (e.g. 15 min) until **all repos
+   report `"status": "warm"`** — replaces the fragile in-process `indexing`-flag/120s-timeout
+   detection in `entrypoint.sh` that's the proximate cause of the crash above.
+3. Once warm, trigger a snapshot upload (existing `upload_snapshot` logic).
+4. `az containerapp update -n codesearch-serve --cpu 1.0 --memory 2Gi` — new revision, cold
+   start, restore-only from the snapshot just uploaded (small/fast since it's current).
+
+**What this fixes:** one Container App resource instead of two; a robust, externally-observable
+completion signal instead of a flaky internal flag; the blob round-trip still happens (ACA
+ephemeral disk can't survive a resource-tier change, so a durable handoff is structurally
+required) but now happens exactly once per deliberate scale-cycle instead of as an accidental
+side effect of a separate job existing.
+
+**Not yet decided:** whether to retire `codesearch-indexer` entirely or keep it only for
+disaster-recovery-style full rebuilds. Whether the scale-up/poll/snapshot/scale-down cycle
+should be a scheduled script, a Logic App, or a small wrapper CLI command
+(`codesearch cloud rebuild --remote <peer>`?) is open for the next session.
 
 ---
 
