@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+**Project-level federation + cloud reindex hardening.** Builds on the 1.1.0 federation release: a peer's individual projects can now be *mounted* and queried by name, the serve TUI surfaces and inspects those mounts, and the cloud indexer was reworked to reindex reliably without OOM-killing itself.
+
+### Added
+
+- **Mounted remote projects (1-to-1 federation passthrough).** A remote peer's individual projects can be queried locally by name as `project=<peer>/<alias>` (e.g. `cloud/akeneo`), routed directly to that peer — complementing the existing group-level `@peer` fan-out. Mounts are auto-discovered from each configured peer's `GET /status` on a slow background cadence (never blocking a render frame) and cached with a last-known fallback so a transient peer blip doesn't make a mount vanish.
+- **TUI: mounted remote projects.** Mounts render in **italic/cyan** in the serve status table to signal they live on a peer (not a local index). The `i` (info) key now works on a mount, opening a **Remote Mount** panel showing the peer URL and the peer-reported live status (status / lock / changes / calls / last call) instead of local on-disk stats. When a mount is selected, the footer renders the local-index actions **doctor / reindex / remove struck-through (disabled)** so it's clear those don't apply to a peer-hosted index; info / reload / quit / navigation stay enabled.
+
+### Changed
+
+- **Cloud indexer job: one federated project per vendor.** The cloud indexer now builds each vendor as a separate federated project (`akeneo`, `aprimo`, `bynder`, `digizuite`, `inriver`, `keyshot`, plus the custom KB) rather than one monolithic index, and builds them **sequentially** so the serve replica only ever holds one embedding model in memory at a time.
+- **Cloud deployment docs** generalised for public release (customer identifiers scrubbed) and consolidated under `integrations/cloud/`.
+- **Docker image** now built locally with **BuildKit** (`docker buildx --push`) instead of `az acr build`: the model-cache warmup is folded into the builder stage and shipped as a single tarball, working around ACR's classic builder failing to `COPY --from` a chained stage / symlink tree.
+
+### Fixed
+
+- **Indexer job OOM-kill on reindex.** The container entrypoint submitted all vendor index builds at once (async HTTP 202), so the serve process held every vendor's embedding model + working set simultaneously and got OOM-killed on 8 GiB — leaving the job stuck "indexing" forever. Builds now run sequentially, waiting for each to settle before starting the next.
+- **Incremental-refresh OOM crash-loop.** Bounded incremental-refresh embedding batches so a large change set no longer exhausts the heap.
+- **claude-code grep-guard hook** now ignores an already-running codesearch process and requires a local index before nudging toward codesearch, so it stops blocking `grep` when codesearch can't actually serve the current repo.
+
 ## [1.1.0] - 2026-07-01
 
 **Federation release.** This version lands **federation** — the ability to fan read queries out to remote `codesearch serve` peers and manage their indexes from the local CLI — plus a README security analysis of the feature and several fixes.

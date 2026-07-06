@@ -43,25 +43,32 @@ competition.
   Stage 2 as one "routing" commit since dispatch can't compile without the client method.
 - **Stage 4 ✅** — TUI: `is_remote` on `RepoRow`, italic (cyan) rendering in table + detail,
   background peer-`/status` discovery (30s cadence, capacity-1 channel, in-memory last-known
-  fallback) appending mounted remote projects to the local dashboard.
+  fallback) appending mounted remote projects to the local dashboard. Mount rows also support
+  `i` (info → `OverlayState::RemoteInfo` panel: peer URL + peer-reported status) and render the
+  footer's `doctor`/`reindex`/`remove` hints struck-through/disabled, since those act on a
+  local index a mount doesn't have.
 - **Stage 5 ✅** — Indexer-job split (`docker/entrypoint.sh`): builds one index per
   `/data/docs/<vendor>` subfolder (loop + fail-fast on none; verify-every-vendor before
   upload) instead of a single monolithic `docs` repo. Coupled azcopy `--exclude-path` fix
   (`docs_index_exclusions`) protects each `<vendor>/.codesearch.db` from `--delete-destination`
-  on both job and serve cold-start restore.
+  on both job and serve cold-start restore. Vendors are built **sequentially** (each build is
+  awaited to "settle" before the next starts): a parallel-submit variant OOM-killed the 8 GiB
+  serve replica by making it hold every vendor's embedding model + working set at once.
 
 **Deferred (post-merge / future cleanup, non-blocking):**
 - Persist discovery to `remote_project_cache` in `repos.json` for cross-restart fallback
   (Stage 4 uses in-memory last-known only — sufficient for blips, not process restarts).
 - Extract a shared `build_remote_search_body(request, mode)` in `src/mcp/mod.rs` (the group
   and single-project fan-out bodies are identical 11-field blocks — drift risk only).
-- Deploy step: register per-vendor subpaths against a writable peer + run the split index-job
-  to seed per-vendor snapshots (replaces the monolithic `docs` snapshot).
+- Persist remote-project discovery across serve restarts (see cache note above).
+- Clean up the now-unused `wait_until_indexed()` dead code in `docker/entrypoint.sh` (superseded
+  by the sequential `wait_active_build_done()` loop).
 
 ## Current state
 
 - **Branch:** `features/codesearch-federation`
-- **Version:** v1.1.0 (federation GA)
+- **Version:** v1.1.9 (post-1.1.0 GA: project-level mounting + cloud reindex hardening; pre-commit hook auto-bumps patch per commit)
+- **Deploy:** cloud peer redeployed with the per-vendor federation split (akeneo/aprimo/bynder/digizuite/inriver/keyshot + custom KB), image built locally via BuildKit `docker buildx --push`, all vendors reindexed and federation validated end-to-end (`project=cloud/<vendor>`).
 - **Status:** `cargo check` + `cargo clippy` clean
 - **Validation:** `cargo check` for iteration, `cargo clippy` for lint. No `--release` builds during the fix loop; build only at the very end.
 

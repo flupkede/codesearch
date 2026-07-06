@@ -469,6 +469,15 @@ done
 codesearch index list --remote cloud   # one alias per vendor
 ```
 
+**Mounting a peer's projects (query one by name).** Beyond group-level `@peer` fan-out, you can address a *single* project on a peer directly as `project=<peer>/<alias>` — a 1-to-1 passthrough to that peer's index. With a peer named `cloud` hosting the per-vendor layout above:
+
+```bash
+# search only the peer's akeneo docs, by name
+codesearch search "import products" --project cloud/akeneo
+```
+
+These **mounted remote projects** are auto-discovered from the peer's `GET /status` and appear in the `codesearch serve` TUI in **italic/cyan**, distinguishing them from local indexes. Press `i` on a mount to see its **Remote Mount** info (peer URL + peer-reported status); the local-index actions (`doctor` / `reindex` / `remove`) are shown struck-through/disabled for a mount, since they act on a local index and a mount has none — manage a peer's indexes with `--remote` (above) instead.
+
 ## CLI Reference
 
 | Command | Description |
