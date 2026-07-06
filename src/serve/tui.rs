@@ -224,8 +224,15 @@ async fn run_tui_loop(
                         let _ = state.reload_if_changed();
                     }
                     KeyAction::ShowInfo(idx) => {
-                        if let Some(ov) = build_info_overlay(idx, &repos, &state) {
-                            overlay = Some(ov);
+                        if idx < repos.len() {
+                            // Local repo — gather live on-disk index stats.
+                            if let Some(ov) = build_info_overlay(idx, &repos, &state) {
+                                overlay = Some(ov);
+                            }
+                        } else if let Some(row) = rows.get(idx) {
+                            // Mounted remote project (appended after local rows).
+                            // No local index → show federation coordinates.
+                            overlay = Some(build_remote_info_overlay(row));
                         }
                     }
                     KeyAction::RunDoctor(idx) => {
@@ -607,6 +614,27 @@ fn build_info_overlay(
         lock,
         index_age,
     })
+}
+
+/// Build a `RemoteInfo` overlay for a mounted remote project row.
+///
+/// Remote mounts have no local index on disk (chunks / db size / model live on
+/// the peer), so this surfaces the federation coordinates (peer URL) plus the
+/// peer-reported live status already carried on the `RepoRow`.
+fn build_remote_info_overlay(row: &RepoRow) -> OverlayState {
+    OverlayState::RemoteInfo {
+        alias: row.alias.clone(),
+        peer_url: row.path.clone(),
+        status: row.status.clone(),
+        lock: if row.lock_mode.is_empty() {
+            "—".to_string()
+        } else {
+            row.lock_mode.clone()
+        },
+        changes: row.changes,
+        tool_call_count: row.tool_call_count,
+        last_tool_call: row.last_tool_call.clone(),
+    }
 }
 
 /// Format an ISO 8601 timestamp as a human-readable age string.

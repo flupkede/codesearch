@@ -106,6 +106,19 @@ pub enum OverlayState {
         lock: String,
         index_age: String,
     },
+    /// Info modal for a *mounted remote project* (federation peer). Remote
+    /// mounts have no local on-disk index, so there are no chunk/db/model stats
+    /// to show — instead we surface the federation coordinates (peer URL) plus
+    /// the peer-reported live status carried on the `RepoRow`.
+    RemoteInfo {
+        alias: String,
+        peer_url: String,
+        status: String,
+        lock: String,
+        changes: u64,
+        tool_call_count: u64,
+        last_tool_call: Option<String>,
+    },
     /// Doctor is running in background — show spinner.
     DoctorRunning { alias: String },
     /// Doctor results: per-check pass/warn/fail lines.
@@ -554,6 +567,45 @@ pub fn render_detail(
     }
 }
 
+/// Build the mnemonic hint spans for one footer action (e.g. `before="rei"`,
+/// `key="n"`, `after="dex  "` → "rei**n**dex").
+///
+/// When `enabled` is false the whole hint is dimmed and struck through
+/// (`CROSSED_OUT`) to signal the action does not apply to the current selection
+/// — e.g. `doctor`/`reindex`/`remove` on a mounted remote project, which lives
+/// on a federation peer and has no local index to act on.
+fn hint(before: &str, key: &str, after: &str, enabled: bool) -> Vec<Span<'static>> {
+    if enabled {
+        let mut spans = Vec::new();
+        if !before.is_empty() {
+            spans.push(Span::styled(
+                before.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ));
+        spans.push(Span::styled(
+            after.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans
+    } else {
+        // Disabled: no mnemonic underline, struck through so it reads as "not
+        // available here" rather than "press this key".
+        vec![Span::styled(
+            format!("{before}{key}{after}"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::CROSSED_OUT),
+        )]
+    }
+}
+
 // Footer renders many independent display fields (hints, scroll, sessions, CPU,
 // C# indicator, transient flash); grouping them into a struct would add
 // ceremony without improving clarity.
@@ -591,6 +643,13 @@ pub fn render_footer(
     // A transient flash message (e.g. "reindex started") takes over the left
     // line while active, so the user gets immediate confirmation of an action
     // even before the status column updates on the next redraw.
+    // Actions that operate on a *local* index (doctor/reindex/remove) don't
+    // apply to a mounted remote project — those live on a federation peer. When
+    // such a row is selected, render those hints disabled (struck through) so
+    // it's clear which keys do anything on this selection.
+    let is_remote_selected = repos.get(selected).map(|r| r.is_remote).unwrap_or(false);
+    let local_only = !is_remote_selected;
+
     let left_line = if let Some(msg) = flash {
         Line::from(vec![Span::styled(
             msg.to_string(),
@@ -599,59 +658,24 @@ pub fn render_footer(
                 .add_modifier(Modifier::BOLD),
         )])
     } else {
-        Line::from(vec![
-            Span::styled(
-                "i",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
-            Span::styled("nfo  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "d",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
-            Span::styled("octor  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("rei", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "n",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
-            Span::styled("dex  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "r",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
-            Span::styled("emove  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("re", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "l",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
-            Span::styled("oad  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "q",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
-            Span::styled("uit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "↑↓",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
-            Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
-        ])
+        let mut spans: Vec<Span> = Vec::new();
+        spans.extend(hint("", "i", "nfo  ", true));
+        spans.extend(hint("", "d", "octor  ", local_only));
+        spans.extend(hint("rei", "n", "dex  ", local_only));
+        spans.extend(hint("", "r", "emove  ", local_only));
+        spans.extend(hint("re", "l", "oad  ", true));
+        spans.extend(hint("", "q", "uit  ", true));
+        spans.push(Span::styled(
+            "↑↓",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        ));
+        spans.push(Span::styled(
+            scroll_indicator,
+            Style::default().fg(Color::Yellow),
+        ));
+        Line::from(spans)
     };
 
     let csharp_indicator = if csharp_helper {
@@ -737,6 +761,71 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                     Span::styled("  Index age:   ", Style::default().fg(Color::DarkGray)),
                     Span::styled(index_age.clone(), Style::default().fg(Color::White)),
                 ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [Esc] close",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            render_centered_modal(f, area, &title, lines);
+        }
+        OverlayState::RemoteInfo {
+            alias,
+            peer_url,
+            status,
+            lock,
+            changes,
+            tool_call_count,
+            last_tool_call,
+        } => {
+            let title = format!(" {} — Remote Mount ", alias);
+            let last = last_tool_call.as_deref().unwrap_or("—");
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("  Peer URL:    ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(peer_url.clone(), Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Status:      ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(status.clone(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Lock:        ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        lock.clone(),
+                        Style::default().fg(if lock == "write" {
+                            Color::Cyan
+                        } else {
+                            Color::White
+                        }),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Changes:     ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{}", changes), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Tool calls:  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{}", tool_call_count),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Last call:   ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(last.to_string(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Mounted from a federation peer (read-only view).",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )),
+                Line::from(Span::styled(
+                    "  Doctor / reindex / remove don't apply to mounts.",
+                    Style::default().fg(Color::DarkGray),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  [Esc] close",
