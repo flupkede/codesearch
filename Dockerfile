@@ -3,10 +3,12 @@
 # codesearch federation cloud image.
 #
 # Multi-stage:
-#   1. builder   — compile the release binary
-#   2. warmer    — pre-download the fastembed model into the image (fast, offline
-#                  cold starts; no HuggingFace dependency at runtime)
-#   3. runtime   — slim Debian + git + azcopy + the binary + the cached model
+#   1. builder   — compile the release binary AND pre-download the fastembed
+#                  model into the image (fast, offline cold starts; no
+#                  HuggingFace dependency at runtime). The warm-up lives here,
+#                  not in a separate stage: ACR's classic builder cannot
+#                  reliably COPY --from a chained (FROM builder) stage.
+#   2. runtime   — slim Debian + git + azcopy + the binary + the cached model
 #
 # Runs `docker/entrypoint.sh`, which syncs the source corpus from Azure Blob
 # (SAS URL) into /data and serves it. See docs/federation-cloud-deployment.md.
@@ -43,25 +45,33 @@ RUN cargo build --release --bin codesearch \
     && (find /src/target/release -maxdepth 2 -name 'libonnxruntime*.so*' -exec cp {} /out/lib/ \; || true)
 
 # ---------------------------------------------------------------------------
-# 2. Warmer — bake the default embedding model into the image
+# 2. Warm the embedding model INTO the builder stage
 # ---------------------------------------------------------------------------
-FROM builder AS warmer
+# Bake the default embedding model into /home/app/.codesearch/models for fast,
+# offline cold starts (no HuggingFace dependency at runtime). This runs inside
+# the builder stage ON PURPOSE: ACR Tasks' classic builder cannot reliably
+# `COPY --from` a *chained* stage (a `FROM builder AS warmer` stage) — it fails
+# at export with "failed to get layer <sha>: layer does not exist". Copying from
+# the builder stage (a base-image stage) is proven reliable — see the binary and
+# lib copies in the runtime stage below, which succeed where the warmer COPY did not.
 ENV HOME=/home/app
-RUN mkdir -p /home/app
-# Indexing a tiny throwaway repo forces fastembed to download the default model
-# into ~/.codesearch/models. We discard the index; we only want the model cache.
 RUN set -eux; \
-    mkdir -p /tmp/warm; \
+    mkdir -p /home/app /tmp/warm; \
     printf '# warmup\nhello world\n' > /tmp/warm/README.md; \
-    # Silence index-add's own output: it prints a U+2795 (➕) emoji that breaks
-    # `az acr build`'s log streamer on a Windows cp1252 console (colorama
-    # UnicodeEncodeError → the build driver dies → ACR marks the run Failed).
-    # The build log must not depend on the app's decorative output.
+    # Indexing a throwaway repo forces fastembed to download the default model
+    # into ~/.codesearch/models. Silence index-add's decorative U+2795 (➕)
+    # output — it crashes `az acr build`'s cp1252 log streamer (colorama
+    # UnicodeEncodeError). Tolerate index-add's own exit code, but then
+    # HARD-VERIFY the model cache actually populated, so a failed download fails
+    # the build loudly HERE instead of surfacing later as a confusing COPY
+    # "layer does not exist" error.
     LD_LIBRARY_PATH=/out/lib codesearch index add /tmp/warm > /dev/null 2>&1 || true; \
-    rm -rf /tmp/warm/.codesearch.db
+    test -d /home/app/.codesearch/models && [ -n "$(ls -A /home/app/.codesearch/models)" ] \
+        || { echo 'ERROR: warmup did not populate /home/app/.codesearch/models' >&2; exit 1; }; \
+    rm -rf /tmp/warm
 
 # ---------------------------------------------------------------------------
-# 3. Runtime
+# 2. Runtime
 # ---------------------------------------------------------------------------
 FROM debian:trixie-slim AS runtime
 ENV HOME=/home/app \
@@ -98,7 +108,7 @@ COPY --from=builder /out/lib/ /usr/local/lib/
 # Copy ONLY the models cache (model weights + embedding cache), NOT the whole
 # ~/.codesearch — the warmup also writes a repos.json registering "/tmp/warm",
 # which would otherwise bake a stale "warm" repo into the runtime image.
-COPY --from=warmer  /home/app/.codesearch/models /home/app/.codesearch/models
+COPY --from=builder /home/app/.codesearch/models /home/app/.codesearch/models
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh \
     && mkdir -p /data \
