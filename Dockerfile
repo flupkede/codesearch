@@ -47,13 +47,11 @@ RUN cargo build --release --bin codesearch \
 # ---------------------------------------------------------------------------
 # 2. Warm the embedding model INTO the builder stage
 # ---------------------------------------------------------------------------
-# Bake the default embedding model into /home/app/.codesearch/models for fast,
-# offline cold starts (no HuggingFace dependency at runtime). This runs inside
-# the builder stage ON PURPOSE: ACR Tasks' classic builder cannot reliably
-# `COPY --from` a *chained* stage (a `FROM builder AS warmer` stage) — it fails
-# at export with "failed to get layer <sha>: layer does not exist". Copying from
-# the builder stage (a base-image stage) is proven reliable — see the binary and
-# lib copies in the runtime stage below, which succeed where the warmer COPY did not.
+# Bake the default embedding model into the image for fast, offline cold starts
+# (no HuggingFace dependency at runtime). The model is downloaded here in the
+# builder stage (which has the binary + onnxruntime lib), then packed into a
+# SINGLE tarball and transferred to the runtime stage. See the tar step below
+# for why a direct directory `COPY --from` of the cache cannot be used.
 ENV HOME=/home/app
 RUN set -eux; \
     mkdir -p /home/app /tmp/warm; \
@@ -63,11 +61,18 @@ RUN set -eux; \
     # output — it crashes `az acr build`'s cp1252 log streamer (colorama
     # UnicodeEncodeError). Tolerate index-add's own exit code, but then
     # HARD-VERIFY the model cache actually populated, so a failed download fails
-    # the build loudly HERE instead of surfacing later as a confusing COPY
-    # "layer does not exist" error.
+    # the build loudly HERE.
     LD_LIBRARY_PATH=/out/lib codesearch index add /tmp/warm > /dev/null 2>&1 || true; \
     test -d /home/app/.codesearch/models && [ -n "$(ls -A /home/app/.codesearch/models)" ] \
         || { echo 'ERROR: warmup did not populate /home/app/.codesearch/models' >&2; exit 1; }; \
+    # Pack the model cache into a SINGLE tarball. The fastembed/HuggingFace cache
+    # is a symlink tree (snapshots/ -> blobs/); ACR's classic builder cannot
+    # export a cross-stage `COPY --from` of a symlinked directory tree — it fails
+    # at export with "failed to get layer <sha>: layer does not exist" (a single
+    # regular file like the binary copies fine — that is Step "COPY codesearch").
+    # tar preserves the symlinks inside the archive; runtime copies the one file
+    # and untars it.
+    tar czf /models.tar.gz -C /home/app/.codesearch models; \
     rm -rf /tmp/warm
 
 # ---------------------------------------------------------------------------
@@ -105,10 +110,15 @@ RUN useradd --create-home --home-dir /home/app --shell /usr/sbin/nologin app
 # Binary + onnxruntime lib + pre-warmed model cache + entrypoint.
 COPY --from=builder /usr/local/bin/codesearch /usr/local/bin/codesearch
 COPY --from=builder /out/lib/ /usr/local/lib/
-# Copy ONLY the models cache (model weights + embedding cache), NOT the whole
+# Restore ONLY the model cache (model weights + embedding cache), NOT the whole
 # ~/.codesearch — the warmup also writes a repos.json registering "/tmp/warm",
-# which would otherwise bake a stale "warm" repo into the runtime image.
-COPY --from=builder /home/app/.codesearch/models /home/app/.codesearch/models
+# which would otherwise bake a stale "warm" repo into the runtime image. The
+# cache ships as a single tarball (see the builder stage): a directory
+# `COPY --from` of its symlink tree breaks ACR's classic builder at export.
+COPY --from=builder /models.tar.gz /tmp/models.tar.gz
+RUN mkdir -p /home/app/.codesearch \
+    && tar xzf /tmp/models.tar.gz -C /home/app/.codesearch \
+    && rm /tmp/models.tar.gz
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh \
     && mkdir -p /data \
