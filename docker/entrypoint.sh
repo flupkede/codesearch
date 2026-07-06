@@ -289,6 +289,27 @@ wait_until_indexed() {
 # =============================================================================
 # index-job mode: build/refresh the index on a big replica, snapshot, exit.
 # =============================================================================
+# Sequential-safe build wait: block until the single in-flight build finishes.
+# The index-job builds ONE vendor at a time, so a "indexing" status anywhere in
+# /status can only be that one build — no per-alias parsing needed. (This is why
+# we don't reuse wait_until_indexed here: its start-detection short-circuits as
+# "already ready" the moment ANY earlier vendor is open, which would let the next
+# build be submitted before the current one finishes — reintroducing the parallel
+# builds that OOM-killed serve.)
+wait_active_build_done() {
+  local base="http://127.0.0.1:${PORT}" waited=0 body
+  sleep 5   # let the 202 flip the repo into "indexing" before we start checking
+  while [ "${waited}" -lt "${INDEX_JOB_MAX_WAIT_SECS}" ]; do
+    body="$(api "${base}/status" 2>/dev/null || true)"
+    if ! printf '%s' "${body}" | grep -q '"status":"indexing"'; then
+      log "build settled after ~$((waited + 5))s"; return 0
+    fi
+    sleep 10; waited=$((waited + 10))
+  done
+  log "WARN: build still 'indexing' after ${waited}s — proceeding to verify"
+  return 0
+}
+
 run_index_job() {
   log "MODE=index-job — heavy build + snapshot, then exit"
   restore_snapshot   # incremental: re-embed only deltas when a prior snapshot exists
@@ -308,27 +329,30 @@ run_index_job() {
   # quicker on the serve side, and rank fairly (a small vendor is no longer
   # drowned by a large one). Each vendor is registered under its folder name and
   # is queryable as its own project / mounted remotely as <peer>/<vendor>.
-  local vendor found=0
+  # Build STRICTLY ONE AT A TIME: submit → wait for THIS build to finish →
+  # verify → next. Submitting all vendors at once made serve hold every vendor's
+  # embedding model + working set simultaneously and get OOM-killed (SIGKILL) on
+  # the job memory limit. Sequential build caps peak memory to a single index.
+  # verify_index_ready runs inline (empty/broken vendor aborts before upload, so
+  # one bad build can never clobber the good snapshot).
+  local vendor found=0 vname
   for vendor in "${DOCS_DIR}"/*/; do
     [ -d "${vendor}" ] || continue     # empty ${DOCS_DIR} → glob stays literal
+    vname="$(basename "${vendor%/}")"
     rebuild_repo "${vendor%/}"         # strip trailing slash so basename is clean
+    wait_active_build_done             # block until this single build completes
+    verify_index_ready "${vname}" \
+      || die "index verification failed for '${vname}' (empty/broken) — refusing to upload over the good snapshot"
     found=1
   done
   [ "${found}" -eq 1 ] \
     || die "no vendor subfolders under ${DOCS_DIR} — nothing to index (expected ${DOCS_DIR}/<vendor>/…)"
-  [ -d "${KB_DIR}/.git" ] && rebuild_repo "${KB_DIR}"
-  wait_until_indexed
-
-  # Never overwrite a good snapshot with a broken one: confirm EVERY vendor index
-  # is populated before uploading. (Incremental reindex never empties an index,
-  # so this should always pass — it's a backstop against a regressed build.) A
-  # single empty vendor aborts the upload so one bad build can't clobber the
-  # whole good snapshot.
-  for vendor in "${DOCS_DIR}"/*/; do
-    [ -d "${vendor}" ] || continue
-    verify_index_ready "$(basename "${vendor%/}")" \
-      || die "index verification failed for '$(basename "${vendor%/}")' (empty/broken) — refusing to upload over the good snapshot"
-  done
+  if [ -d "${KB_DIR}/.git" ]; then
+    rebuild_repo "${KB_DIR}"
+    wait_active_build_done
+    verify_index_ready "$(basename "${KB_DIR}")" \
+      || die "index verification failed for custom-kb (empty/broken) — refusing to upload over the good snapshot"
+  fi
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"
 
   log "index-job done — shutting down local serve"
