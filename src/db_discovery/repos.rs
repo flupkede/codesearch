@@ -42,13 +42,39 @@ pub enum Target {
     /// A local repo, identified by alias and on-disk path.
     Local { alias: String, path: PathBuf },
     /// A remote peer, identified by the peer name under which it was declared
-    /// in `remotes`, together with its full connection config.
+    /// in `remotes`, together with its full connection config. Represents the
+    /// **whole peer** (its configured group) — produced by group federation.
     Remote { peer_name: String, peer: RemotePeer },
+    /// A specific project on a remote peer, mounted locally as `<peer>/<alias>`.
+    /// Produced by single-project resolution
+    /// ([`ReposConfig::resolve_remote_project`]), never by group resolution.
+    /// `remote_alias` is the project's bare, un-namespaced name **on the peer** —
+    /// exactly what gets forwarded as `project=` to the peer's API.
+    // Fields read starting in Stage 2 (dispatch/federation); allow removed then.
+    #[allow(dead_code)]
+    RemoteProject {
+        peer_name: String,
+        peer: RemotePeer,
+        remote_alias: String,
+    },
 }
 
 /// Prefix that marks a group member as a reference to a remote peer rather than
 /// a local alias (e.g. `"@cloud"` → remote peer named `cloud`).
 pub const REMOTE_REF_PREFIX: &str = "@";
+
+/// Separator between a peer name and a remote project alias in a mounted remote
+/// project's namespaced local name (e.g. `cloud/aprimo`). Aliases are sanitized
+/// to `[A-Za-z0-9._-]` (see [`sanitize_alias`]), so `/` can never collide with a
+/// real alias or peer name.
+pub const REMOTE_PROJECT_SEPARATOR: &str = "/";
+
+/// Build the namespaced local name for a remote project: `"<peer>/<alias>"`.
+// dead_code allow removed in Stage 2 when MCP dispatch wires these in.
+#[allow(dead_code)]
+pub fn remote_project_name(peer_name: &str, remote_alias: &str) -> String {
+    format!("{peer_name}{REMOTE_PROJECT_SEPARATOR}{remote_alias}")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReposConfig {
@@ -61,6 +87,20 @@ pub struct ReposConfig {
     /// reference these via the `"@<peer_name>"` convention.
     #[serde(default)]
     pub remotes: HashMap<String, RemotePeer>,
+    /// Mounted remote projects the user has hidden locally, as namespaced
+    /// `"<peer>/<alias>"` names. Auto-discovery mounts everything a peer exposes;
+    /// entries listed here are subtracted (the user's local filter).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_hidden: Vec<String>,
+    /// Optional local rename of a mounted remote project: canonical
+    /// `"<peer>/<alias>"` -> the custom local name shown/queried instead. The
+    /// underlying bare alias sent to the peer is unaffected.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub remote_alias_overrides: HashMap<String, String>,
+    /// Last-known remote project lists per peer, for offline fallback when a
+    /// peer is unreachable at startup. `peer_name` -> `[bare remote alias, ...]`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub remote_project_cache: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,9 +154,7 @@ impl ReposConfig {
 
             let mut config = Self {
                 repos,
-                groups: HashMap::new(),
-                repos_meta: HashMap::new(),
-                remotes: HashMap::new(),
+                ..Default::default()
             };
             config.reconcile();
             return Ok(config);
@@ -462,9 +500,90 @@ impl ReposConfig {
             match t {
                 Target::Local { alias, path } => locals.push((alias, path)),
                 Target::Remote { peer_name, peer } => remotes.push((peer_name, peer)),
+                // Group resolution never yields RemoteProject today, but keep the
+                // match exhaustive: a mounted project maps to its peer.
+                Target::RemoteProject {
+                    peer_name, peer, ..
+                } => remotes.push((peer_name, peer)),
             }
         }
         (locals, remotes)
+    }
+
+    /// Produce the mounted remote projects from per-peer discovered project
+    /// lists (bare aliases), as `(local_name, Target::RemoteProject)` pairs.
+    ///
+    /// - Namespaces each project as `<peer>/<alias>`.
+    /// - Skips entries hidden via [`remote_hidden`](Self::remote_hidden).
+    /// - Applies [`remote_alias_overrides`](Self::remote_alias_overrides) so
+    ///   `local_name` is the user's chosen rename (the bare `remote_alias`
+    ///   forwarded to the peer is unchanged).
+    /// - Only includes peers still present in `remotes`.
+    ///
+    /// Result is sorted by `local_name` for stable display/ordering.
+    // dead_code allow removed in Stage 2 when MCP dispatch + TUI wire these in.
+    #[allow(dead_code)]
+    pub fn mounted_remote_projects(
+        &self,
+        discovered: &HashMap<String, Vec<String>>,
+    ) -> Vec<(String, Target)> {
+        let mut out = Vec::new();
+        for (peer_name, aliases) in discovered {
+            let Some(peer) = self.remotes.get(peer_name) else {
+                continue;
+            };
+            for remote_alias in aliases {
+                let canonical = remote_project_name(peer_name, remote_alias);
+                if self.remote_hidden.iter().any(|h| h == &canonical) {
+                    continue;
+                }
+                let local_name = self
+                    .remote_alias_overrides
+                    .get(&canonical)
+                    .cloned()
+                    .unwrap_or_else(|| canonical.clone());
+                out.push((
+                    local_name,
+                    Target::RemoteProject {
+                        peer_name: peer_name.clone(),
+                        peer: peer.clone(),
+                        remote_alias: remote_alias.clone(),
+                    },
+                ));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Resolve a project name to a [`Target::RemoteProject`], if it names one.
+    ///
+    /// Accepts either the canonical `"<peer>/<alias>"` form or a user rename
+    /// declared in [`remote_alias_overrides`](Self::remote_alias_overrides).
+    /// Returns `None` for local aliases, hidden projects, unknown peers, and any
+    /// name that does not resolve to a known remote project.
+    // dead_code allow removed in Stage 2 when MCP dispatch wires these in.
+    #[allow(dead_code)]
+    pub fn resolve_remote_project(&self, name: &str) -> Option<Target> {
+        // A rename override maps a custom local name back to its canonical
+        // "<peer>/<alias>" key; fall back to treating `name` as canonical.
+        let canonical: &str = self
+            .remote_alias_overrides
+            .iter()
+            .find(|(_, custom)| custom.as_str() == name)
+            .map(|(canonical, _)| canonical.as_str())
+            .unwrap_or(name);
+
+        if self.remote_hidden.iter().any(|h| h == canonical) {
+            return None;
+        }
+        let (peer_name, remote_alias) = canonical.split_once(REMOTE_PROJECT_SEPARATOR)?;
+        let peer = self.remotes.get(peer_name)?;
+        Some(Target::RemoteProject {
+            peer_name: peer_name.to_string(),
+            peer: peer.clone(),
+            remote_alias: remote_alias.to_string(),
+        })
     }
 
     pub fn add_group(&mut self, name: String, aliases: Vec<String>) -> Result<()> {
@@ -1609,6 +1728,95 @@ mod tests {
         assert_eq!(locals.len(), 2);
         assert_eq!(remotes.len(), 1);
         assert_eq!(remotes[0].0, "cloud");
+    }
+
+    fn cfg_with_cloud() -> ReposConfig {
+        let mut cfg = ReposConfig::default();
+        cfg.remotes
+            .insert("cloud".to_string(), make_peer("https://cloud"));
+        cfg
+    }
+
+    #[test]
+    fn mounted_remote_projects_namespaces_and_sorts() {
+        let cfg = cfg_with_cloud();
+        let discovered = HashMap::from([(
+            "cloud".to_string(),
+            vec!["bynder".to_string(), "akeneo".to_string()],
+        )]);
+        let mounts = cfg.mounted_remote_projects(&discovered);
+        // Sorted by local name: cloud/akeneo before cloud/bynder.
+        let names: Vec<&str> = mounts.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["cloud/akeneo", "cloud/bynder"]);
+        match &mounts[0].1 {
+            Target::RemoteProject {
+                peer_name,
+                remote_alias,
+                peer,
+            } => {
+                assert_eq!(peer_name, "cloud");
+                assert_eq!(remote_alias, "akeneo"); // bare alias, un-namespaced
+                assert_eq!(peer.url, "https://cloud");
+            }
+            other => panic!("expected RemoteProject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mounted_remote_projects_skips_hidden_and_unknown_peer() {
+        let mut cfg = cfg_with_cloud();
+        cfg.remote_hidden.push("cloud/bynder".to_string());
+        let discovered = HashMap::from([
+            (
+                "cloud".to_string(),
+                vec!["bynder".to_string(), "akeneo".to_string()],
+            ),
+            // Unknown peer must be ignored entirely.
+            ("ghost".to_string(), vec!["x".to_string()]),
+        ]);
+        let mounts = cfg.mounted_remote_projects(&discovered);
+        let names: Vec<&str> = mounts.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["cloud/akeneo"]);
+    }
+
+    #[test]
+    fn mounted_remote_projects_applies_rename_override() {
+        let mut cfg = cfg_with_cloud();
+        cfg.remote_alias_overrides
+            .insert("cloud/akeneo".to_string(), "pim".to_string());
+        let discovered = HashMap::from([("cloud".to_string(), vec!["akeneo".to_string()])]);
+        let mounts = cfg.mounted_remote_projects(&discovered);
+        assert_eq!(mounts[0].0, "pim"); // local name is the rename
+        match &mounts[0].1 {
+            // ...but the peer still receives the bare original alias.
+            Target::RemoteProject { remote_alias, .. } => assert_eq!(remote_alias, "akeneo"),
+            other => panic!("expected RemoteProject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_remote_project_canonical_rename_and_negatives() {
+        let mut cfg = cfg_with_cloud();
+        cfg.remote_alias_overrides
+            .insert("cloud/akeneo".to_string(), "pim".to_string());
+        cfg.remote_hidden.push("cloud/secret".to_string());
+        cfg.repos
+            .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+
+        // Canonical "<peer>/<alias>" resolves.
+        assert!(matches!(
+            cfg.resolve_remote_project("cloud/bynder"),
+            Some(Target::RemoteProject { ref remote_alias, .. }) if remote_alias == "bynder"
+        ));
+        // A user rename resolves back to the canonical peer/alias.
+        assert!(matches!(
+            cfg.resolve_remote_project("pim"),
+            Some(Target::RemoteProject { ref remote_alias, .. }) if remote_alias == "akeneo"
+        ));
+        // Hidden, unknown peer, and plain local aliases do not resolve remotely.
+        assert!(cfg.resolve_remote_project("cloud/secret").is_none());
+        assert!(cfg.resolve_remote_project("ghost/x").is_none());
+        assert!(cfg.resolve_remote_project("local-a").is_none());
     }
 
     #[test]
