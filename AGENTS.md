@@ -1,5 +1,47 @@
 # AGENTS.md — codesearch (features/codesearch-federation)
 
+## Current Plan — remote project mounting (1-to-1 passthrough)
+
+**Goal.** Move federation from *group-level* (`docs = [@cloud]`, all remote repos hidden
+behind one reference) to *project-level mounting*: each index a peer exposes appears locally
+as a first-class project, routable with `project=<peer>/<alias>` **as if it were local**, and
+shown *italic* in the local TUI to signal it lives on a peer. The server-imposed `docs` bundle
+is dropped; grouping becomes a purely-local, user-owned composition (a local `docs` group with
+several remote members stays possible — the user decides).
+
+**Locked design decisions (2026-07-06):**
+- **Discovery = auto-discover + local filter.** On startup the local instance queries each
+  peer's `GET /status`, enumerates its repos, and mounts them as remote projects. The user can
+  hide/rename specific mounts locally. Peer unreachable at startup → fall back to last-known
+  cached list (never hard-fail).
+- **Naming = peer-namespaced.** Remote projects are named `<peer>/<alias>` (e.g. `cloud/aprimo`)
+  — always unambiguous, never shadows a local repo, TUI shows the source at a glance.
+
+**Why (beyond ranking):** smaller per-vendor indexes → smaller/faster rebuilds, per-vendor
+incremental reindex, lower peak memory (synergy with the incremental-refresh batching fix).
+Tradeoff: N snapshots/blobs instead of 1 → more azcopy/sync overhead. Fair cross-repo RRF (small
+vendors no longer drowned by large ones) + `project=<vendor>` routing with zero cross-vendor
+competition.
+
+**Current code gaps (verified):**
+- `ReposConfig::resolve(project)` is **local-only** (`self.repos.get`) — never yields a
+  `Target::Remote`. Only `resolve_group_targets` federates. This is the core gap.
+- MCP `project=` dispatch (`src/mcp/mod.rs` ~3989) routes single projects locally only.
+- `FederationClient` fans out *group* queries; needs a single-remote-project query path
+  (the peer's `/search` already accepts `project=`).
+- TUI `RepoRow` / `tui_common::render_table` has no `is_remote`/italic styling; the local
+  dashboard doesn't include mounted remote projects. (`tui_remote.rs` is a *separate* standalone
+  remote dashboard, not the inline-mount view.)
+
+**Staged execution:**
+- **Stage 1** — Config model: mounted remote projects + auto-discovery + local hide/rename
+  filter in `repos.rs` (`RemotePeer` discovery, `<peer>/<alias>` namespace, cache fallback).
+- **Stage 2** — Single-project remote resolution + MCP `project=<peer>/<alias>` dispatch routing.
+- **Stage 3** — `FederationClient` single-remote-project query (forward `project=<alias>` to peer).
+- **Stage 4** — TUI: `is_remote` on `RepoRow`, italic rendering, include mounts in local dashboard.
+- **Stage 5** — Indexer-job split (`docker/entrypoint.sh`): register+rebuild one repo per
+  `/data/docs/<vendor>` subfolder instead of a single monolithic `docs` repo.
+
 ## Current state
 
 - **Branch:** `features/codesearch-federation`
