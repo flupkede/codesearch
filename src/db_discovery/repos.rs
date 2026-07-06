@@ -50,7 +50,6 @@ pub enum Target {
     /// ([`ReposConfig::resolve_remote_project`]), never by group resolution.
     /// `remote_alias` is the project's bare, un-namespaced name **on the peer** —
     /// exactly what gets forwarded as `project=` to the peer's API.
-    // Fields read starting in Stage 2 (dispatch/federation); allow removed then.
     RemoteProject {
         peer_name: String,
         peer: RemotePeer,

@@ -4122,9 +4122,11 @@ impl CodesearchService {
     /// Query a single mounted remote project (`project=<peer>/<alias>`).
     ///
     /// A 1-to-1 passthrough: the query is forwarded to `peer` scoped to its own
-    /// `remote_alias` project, and the peer's results are returned verbatim (only
-    /// re-namespaced so `chunk_ref`s route back through `federated_get_chunk`).
-    /// There is no local list to merge; an unreachable peer yields a warning with
+    /// `remote_alias` project, and the peer's results are re-namespaced so
+    /// `chunk_ref`s route back through `federated_get_chunk`. There is no local
+    /// list to merge, but results still pass through `merge_ranked_lists` (a
+    /// single list), so item `score`s are the RRF rank score, keeping rendering
+    /// identical to the group path. An unreachable peer yields a warning with
     /// zero results rather than a hard error.
     async fn federated_project_search(
         &self,
