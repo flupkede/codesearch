@@ -64,9 +64,11 @@ pub enum Target {
 pub const REMOTE_REF_PREFIX: &str = "@";
 
 /// Separator between a peer name and a remote project alias in a mounted remote
-/// project's namespaced local name (e.g. `cloud/aprimo`). Aliases are sanitized
-/// to `[A-Za-z0-9._-]` (see [`sanitize_alias`]), so `/` can never collide with a
-/// real alias or peer name.
+/// project's namespaced local name (e.g. `cloud/aprimo`). Both sides are
+/// guaranteed `/`-free: bare aliases are sanitized to `[A-Za-z0-9._-]` (see
+/// [`sanitize_alias`]), and peer names are validated to reject `/` in
+/// [`ReposConfig::add_remote`]. So the first `/` unambiguously splits
+/// `<peer>/<alias>`.
 pub const REMOTE_PROJECT_SEPARATOR: &str = "/";
 
 /// Build the namespaced local name for a remote project: `"<peer>/<alias>"`.
@@ -562,6 +564,11 @@ impl ReposConfig {
     /// declared in [`remote_alias_overrides`](Self::remote_alias_overrides).
     /// Returns `None` for local aliases, hidden projects, unknown peers, and any
     /// name that does not resolve to a known remote project.
+    ///
+    /// **Precedence:** this method does not consult local repos, so a rename
+    /// override whose custom value equals a local alias would resolve here to a
+    /// remote target. Callers (MCP dispatch, Stage 2) MUST resolve local aliases
+    /// first and only fall back to this, so local repos always win a name clash.
     // dead_code allow removed in Stage 2 when MCP dispatch wires these in.
     #[allow(dead_code)]
     pub fn resolve_remote_project(&self, name: &str) -> Option<Target> {
@@ -698,6 +705,17 @@ impl ReposConfig {
                 "Remote peer name must not start with '{}' — that prefix is only used inside group references (e.g. group member \"@{}\")",
                 REMOTE_REF_PREFIX,
                 trimmed.trim_start_matches(REMOTE_REF_PREFIX)
+            ));
+        }
+        // A peer name is the first segment of a mounted project's namespaced name
+        // (`<peer>/<alias>`). Allowing `/` here would break `resolve_remote_project`,
+        // which splits on the FIRST separator — enforce the invariant the
+        // REMOTE_PROJECT_SEPARATOR doc-comment promises.
+        if trimmed.contains(REMOTE_PROJECT_SEPARATOR) {
+            return Err(anyhow::anyhow!(
+                "Remote peer name '{}' must not contain '{}' — that separator delimits <peer>/<alias> in mounted remote projects",
+                trimmed,
+                REMOTE_PROJECT_SEPARATOR
             ));
         }
         if peer.url.trim().is_empty() {
@@ -1935,6 +1953,10 @@ mod tests {
         let mut blank = make_peer("https://cloud");
         blank.url = "  ".to_string();
         assert!(cfg.add_remote("cloud".to_string(), blank).is_err());
+        // A '/' in a peer name would break <peer>/<alias> namespacing — rejected.
+        assert!(cfg
+            .add_remote("a/b".to_string(), make_peer("https://cloud"))
+            .is_err());
         assert!(cfg.remotes.is_empty());
     }
 
