@@ -53,7 +53,11 @@ RUN mkdir -p /home/app
 RUN set -eux; \
     mkdir -p /tmp/warm; \
     printf '# warmup\nhello world\n' > /tmp/warm/README.md; \
-    LD_LIBRARY_PATH=/out/lib codesearch index add /tmp/warm || true; \
+    # Silence index-add's own output: it prints a U+2795 (➕) emoji that breaks
+    # `az acr build`'s log streamer on a Windows cp1252 console (colorama
+    # UnicodeEncodeError → the build driver dies → ACR marks the run Failed).
+    # The build log must not depend on the app's decorative output.
+    LD_LIBRARY_PATH=/out/lib codesearch index add /tmp/warm > /dev/null 2>&1 || true; \
     rm -rf /tmp/warm/.codesearch.db
 
 # ---------------------------------------------------------------------------
