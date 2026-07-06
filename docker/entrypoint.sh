@@ -64,21 +64,43 @@ snapshot_blob_url() {
 }
 
 # --- Source acquisition helpers ----------------------------------------------
+
+# Build the azcopy --exclude-path list that protects every codesearch index dir
+# living inside ${DOCS_DIR} from --delete-destination.
+#
+# --exclude-path matches by RELATIVE-PATH PREFIX (no wildcards), so a single
+# ".codesearch.db" only covers a root-level index (the legacy MONOLITHIC layout,
+# ${DOCS_DIR}/.codesearch.db). In the PER-VENDOR layout each index lives one level
+# down (${DOCS_DIR}/<vendor>/.codesearch.db), so every one needs its own prefix
+# entry — otherwise --delete-destination would treat the restored vendor indexes
+# as "extra" and DELETE them (the blob holds only source .md, never the index).
+# We enumerate the vendor subdirs present locally (post-restore) and emit one
+# "<vendor>/.codesearch.db" prefix each, keeping the bare root entry for the
+# legacy layout. Semicolon-separated, as azcopy expects.
+docs_index_exclusions() {
+  local excl=".codesearch.db" d
+  for d in "${DOCS_DIR}"/*/; do
+    [ -d "${d}" ] || continue                       # no subdirs → glob stays literal
+    excl="${excl};$(basename "${d%/}")/.codesearch.db"
+  done
+  printf '%s' "${excl}"
+}
+
 sync_blob() {
-  log "azcopy sync blob -> ${DOCS_DIR}"
+  local exclusions
+  exclusions="$(docs_index_exclusions)"
+  log "azcopy sync blob -> ${DOCS_DIR} (protecting: ${exclusions})"
   # --delete-destination keeps the local mirror in lock-step with the blob so
   # deletions propagate. No --compare-hash=MD5 — that needs a user_xattr the
   # container overlayfs lacks (transfer fails); size+mtime compare needs none.
   #
-  # CRITICAL: --exclude-path=".codesearch.db" — the search index lives INSIDE the
-  # synced directory (${DOCS_DIR}/.codesearch.db) but the blob holds only source
-  # (.md) files, so without this exclusion --delete-destination would treat the
-  # whole restored index as "extra" and DELETE it. The index must be owned by the
-  # snapshot/indexer, never clobbered by the corpus sync (this also protects the
-  # serve app's restored index on cold start).
+  # CRITICAL: the exclusion list (see docs_index_exclusions) keeps every
+  # codesearch index dir under ${DOCS_DIR} from being deleted — the index is
+  # owned by the snapshot/indexer and must never be clobbered by the corpus sync
+  # (this also protects the serve app's restored indexes on cold start).
   azcopy sync "${BLOB_SAS_URL}" "${DOCS_DIR}" \
     --delete-destination=true \
-    --exclude-path=".codesearch.db" 2>&1 | sed 's/^/[azcopy] /' || \
+    --exclude-path="${exclusions}" 2>&1 | sed 's/^/[azcopy] /' || \
     log "WARN: azcopy sync failed (continuing with existing local copy)"
 }
 
@@ -274,15 +296,34 @@ run_index_job() {
   trap 'kill "${serve_pid}" 2>/dev/null || true' EXIT
 
   wait_healthz 90 || { log "serve never came up"; exit 1; }
-  rebuild_repo "${DOCS_DIR}"
+
+  # PER-VENDOR SPLIT: build/refresh one index per immediate subfolder of
+  # ${DOCS_DIR} (akeneo, bynder, …) instead of a single monolithic "docs" repo.
+  # Smaller per-vendor indexes rebuild faster, use less peak memory, warm up
+  # quicker on the serve side, and rank fairly (a small vendor is no longer
+  # drowned by a large one). Each vendor is registered under its folder name and
+  # is queryable as its own project / mounted remotely as <peer>/<vendor>.
+  local vendor found=0
+  for vendor in "${DOCS_DIR}"/*/; do
+    [ -d "${vendor}" ] || continue     # empty ${DOCS_DIR} → glob stays literal
+    rebuild_repo "${vendor%/}"         # strip trailing slash so basename is clean
+    found=1
+  done
+  [ "${found}" -eq 1 ] \
+    || die "no vendor subfolders under ${DOCS_DIR} — nothing to index (expected ${DOCS_DIR}/<vendor>/…)"
   [ -d "${KB_DIR}/.git" ] && rebuild_repo "${KB_DIR}"
   wait_until_indexed
 
-  # Never overwrite a good snapshot with a broken one: confirm the docs index is
-  # populated before uploading. (Incremental reindex never empties the index, so
-  # this should always pass — it's a backstop against a regressed build.)
-  verify_index_ready "$(basename "${DOCS_DIR}")" \
-    || die "index verification failed (empty/broken) — refusing to upload over the good snapshot"
+  # Never overwrite a good snapshot with a broken one: confirm EVERY vendor index
+  # is populated before uploading. (Incremental reindex never empties an index,
+  # so this should always pass — it's a backstop against a regressed build.) A
+  # single empty vendor aborts the upload so one bad build can't clobber the
+  # whole good snapshot.
+  for vendor in "${DOCS_DIR}"/*/; do
+    [ -d "${vendor}" ] || continue
+    verify_index_ready "$(basename "${vendor%/}")" \
+      || die "index verification failed for '$(basename "${vendor%/}")' (empty/broken) — refusing to upload over the good snapshot"
+  done
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"
 
   log "index-job done — shutting down local serve"
