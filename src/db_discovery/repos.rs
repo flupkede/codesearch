@@ -51,7 +51,6 @@ pub enum Target {
     /// `remote_alias` is the project's bare, un-namespaced name **on the peer** —
     /// exactly what gets forwarded as `project=` to the peer's API.
     // Fields read starting in Stage 2 (dispatch/federation); allow removed then.
-    #[allow(dead_code)]
     RemoteProject {
         peer_name: String,
         peer: RemotePeer,
@@ -570,7 +569,6 @@ impl ReposConfig {
     /// remote target. Callers (MCP dispatch, Stage 2) MUST resolve local aliases
     /// first and only fall back to this, so local repos always win a name clash.
     // dead_code allow removed in Stage 2 when MCP dispatch wires these in.
-    #[allow(dead_code)]
     pub fn resolve_remote_project(&self, name: &str) -> Option<Target> {
         // A rename override maps a custom local name back to its canonical
         // "<peer>/<alias>" key; fall back to treating `name` as canonical.

@@ -236,6 +236,39 @@ impl FederationClient {
             obj.insert("group".into(), serde_json::Value::String(g));
             obj.remove("project");
         }
+        self.post_search(peer, body).await
+    }
+
+    /// Query a remote peer's `/search` endpoint scoped to a SINGLE remote
+    /// project (project-level federation / mounted remote project).
+    ///
+    /// Unlike [`search`](Self::search), this forces `project=<remote_alias>` and
+    /// strips `group`: the peer resolves the project in its own namespace and
+    /// returns only that project's results. `remote_alias` is the project's bare
+    /// name on the peer (the `<alias>` half of the local `<peer>/<alias>` mount).
+    pub async fn search_project(
+        &self,
+        peer: &RemotePeer,
+        mut body: serde_json::Value,
+        remote_alias: &str,
+    ) -> Outcome<Vec<RemoteSearchItem>> {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "project".into(),
+                serde_json::Value::String(remote_alias.to_string()),
+            );
+            obj.remove("group");
+        }
+        self.post_search(peer, body).await
+    }
+
+    /// Shared POST + parse for `/search` (group- and project-scoped variants
+    /// prepare the body differently, then funnel through here).
+    async fn post_search(
+        &self,
+        peer: &RemotePeer,
+        body: serde_json::Value,
+    ) -> Outcome<Vec<RemoteSearchItem>> {
         let url = Self::peer_url(peer, crate::constants::SEARCH_PATH);
         let req = self
             .client
@@ -572,6 +605,63 @@ mod tests {
             }
             other => panic!("expected Ok, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn search_project_forces_project_and_strips_group() {
+        use std::sync::{Arc, Mutex};
+
+        // Capture the exact body the peer receives so we can assert on scoping.
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let app = axum::Router::new().route(
+            crate::constants::SEARCH_PATH,
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    *cap.lock().unwrap() = Some(body);
+                    axum::Json(serde_json::json!({ "results": [] }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Peer carries a group; search_project MUST override it with the project.
+        let mut p = peer(format!("http://{addr}"));
+        p.group = Some("some-remote-group".into());
+
+        let outcome = client_new()
+            .search_project(
+                &p,
+                serde_json::json!({ "query": "x", "group": "leftover", "mode": "semantic" }),
+                "aprimo",
+            )
+            .await;
+        assert!(matches!(outcome, Outcome::Ok(_)));
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("peer received a body");
+        assert_eq!(
+            body.get("project").and_then(|v| v.as_str()),
+            Some("aprimo"),
+            "project must be forced to the remote alias"
+        );
+        assert!(
+            body.get("group").is_none(),
+            "group must be stripped for single-project routing, got: {body}"
+        );
+    }
+
+    fn client_new() -> FederationClient {
+        FederationClient::new().unwrap()
     }
 
     #[tokio::test]

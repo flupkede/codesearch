@@ -4119,6 +4119,76 @@ impl CodesearchService {
         Ok(self.build_federated_response(merged, warnings))
     }
 
+    /// Query a single mounted remote project (`project=<peer>/<alias>`).
+    ///
+    /// A 1-to-1 passthrough: the query is forwarded to `peer` scoped to its own
+    /// `remote_alias` project, and the peer's results are returned verbatim (only
+    /// re-namespaced so `chunk_ref`s route back through `federated_get_chunk`).
+    /// There is no local list to merge; an unreachable peer yields a warning with
+    /// zero results rather than a hard error.
+    async fn federated_project_search(
+        &self,
+        request: &SearchRequest,
+        peer_name: String,
+        peer: crate::db_discovery::repos::RemotePeer,
+        remote_alias: String,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::federation::{FederationClient, Outcome};
+        use crate::rerank::DEFAULT_RRF_K;
+
+        let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
+        let limit = request.limit.unwrap_or(10);
+
+        // Same shape as the group fan-out body; the federation client forces
+        // `project=<remote_alias>` and strips `group`.
+        let body = serde_json::json!({
+            "query": request.query,
+            "mode": mode,
+            "compact": request.compact,
+            "semantic_mode": request.semantic_mode,
+            "filter_path": request.filter_path,
+            "regex": request.regex,
+            "phrase": request.phrase,
+            "file_glob": request.file_glob,
+            "language": request.language,
+            "format": request.format,
+            "limit": request.limit,
+        });
+
+        let client = match FederationClient::new() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(self.build_federated_response(
+                    vec![],
+                    vec![format!("federation disabled (http client error): {e}")],
+                ));
+            }
+        };
+
+        let outcome = client.search_project(&peer, body, &remote_alias).await;
+        let (items, warnings) = match outcome {
+            Outcome::Ok(items) => (
+                items
+                    .into_iter()
+                    .map(|it| convert_remote_item(&peer_name, it))
+                    .collect::<Vec<_>>(),
+                Vec::new(),
+            ),
+            Outcome::Unreachable(reason) => (
+                Vec::new(),
+                vec![format!(
+                    "remote project '{}/{}' unreachable: {}",
+                    peer_name, remote_alias, reason
+                )],
+            ),
+        };
+
+        // Single ranked list — RRF here is order-preserving and just caps to
+        // `limit`, keeping rendering identical to the group path.
+        let merged = merge_ranked_lists(vec![items], DEFAULT_RRF_K, limit);
+        Ok(self.build_federated_response(merged, warnings))
+    }
+
     /// Fetch a chunk from a remote peer by its namespaced `chunk_ref`.
     async fn federated_get_chunk(
         &self,
@@ -4235,6 +4305,27 @@ impl CodesearchService {
             if Self::group_has_remotes(&cfg, group) {
                 let remotes = cfg.split_group_targets(group).1;
                 return self.federated_search(&request, &cfg, remotes).await;
+            }
+        }
+
+        // Project-level federation (mounted remote project): a `project` of the
+        // form "<peer>/<alias>" transparently routes to that single peer's own
+        // `<alias>` project — a 1-to-1 passthrough, as if the index were local.
+        // Local repos ALWAYS win a name clash: only route remotely when the name
+        // does not resolve to a local project.
+        if let Some(proj) = request.project.as_deref() {
+            let cfg = self.federation_config();
+            if cfg.resolve(proj).is_none() {
+                if let Some(crate::db_discovery::repos::Target::RemoteProject {
+                    peer_name,
+                    peer,
+                    remote_alias,
+                }) = cfg.resolve_remote_project(proj)
+                {
+                    return self
+                        .federated_project_search(&request, peer_name, peer, remote_alias)
+                        .await;
+                }
             }
         }
 
