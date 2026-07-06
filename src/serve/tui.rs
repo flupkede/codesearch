@@ -24,6 +24,12 @@ use crate::cli::doctor;
 use crate::constants::{DB_DIR_NAME, LANG_CSHARP};
 use crate::index::IndexManager;
 
+/// Footer flash shown when a local-index action key (doctor / reindex / remove)
+/// is pressed while a mounted remote project is selected. Those actions operate
+/// on a local index, which a peer-hosted mount doesn't have — this confirms the
+/// no-op the struck-through footer hint already signals.
+const REMOTE_ACTION_NA: &str = "✗ doctor / reindex / remove don't apply to a remote mount";
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -247,6 +253,10 @@ async fn run_tui_loop(
                             // applied if this request is still the current one.
                             doctor_gen += 1;
                             spawn_doctor(alias, state.clone(), doctor_tx.clone(), doctor_gen);
+                        } else {
+                            // Remote mount (appended after local rows) — the
+                            // footer already greys this out; confirm the no-op.
+                            flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
                     }
                     KeyAction::ForceReindex(idx) => {
@@ -264,12 +274,16 @@ async fn run_tui_loop(
                                 }
                             };
                             flash = Some((msg, std::time::Instant::now()));
+                        } else {
+                            flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
                     }
                     KeyAction::RequestRemove(idx) => {
                         if idx < repos.len() {
                             let alias = repos[idx].0.clone();
                             overlay = Some(OverlayState::ConfirmRemove { alias });
+                        } else {
+                            flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
                     }
                     KeyAction::None => {}
