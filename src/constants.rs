@@ -316,6 +316,12 @@ pub const KEEP_WARM_INTERVAL_SECS: u64 = 2 * 60; // 2 minutes
 /// and the `remote` CLI command so both report/apply the same default.
 pub const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 15;
 
+/// How often the embedded TUI re-discovers mounted remote projects (queries each
+/// peer's `/status` in the background). Slow enough that per-peer HTTP never
+/// competes with the ~500ms render tick; a peer blip is masked by the in-memory
+/// last-known list until the next successful poll.
+pub const REMOTE_DISCOVERY_INTERVAL_SECS: u64 = 30;
+
 /// Maximum wall-clock duration a single reindex may take before its
 /// `active_reindexes` entry is considered **stale** (leaked).
 ///

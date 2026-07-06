@@ -71,8 +71,6 @@ pub const REMOTE_REF_PREFIX: &str = "@";
 pub const REMOTE_PROJECT_SEPARATOR: &str = "/";
 
 /// Build the namespaced local name for a remote project: `"<peer>/<alias>"`.
-// dead_code allow removed in Stage 2 when MCP dispatch wires these in.
-#[allow(dead_code)]
 pub fn remote_project_name(peer_name: &str, remote_alias: &str) -> String {
     format!("{peer_name}{REMOTE_PROJECT_SEPARATOR}{remote_alias}")
 }
@@ -522,8 +520,6 @@ impl ReposConfig {
     /// - Only includes peers still present in `remotes`.
     ///
     /// Result is sorted by `local_name` for stable display/ordering.
-    // dead_code allow removed in Stage 2 when MCP dispatch + TUI wire these in.
-    #[allow(dead_code)]
     pub fn mounted_remote_projects(
         &self,
         discovered: &HashMap<String, Vec<String>>,

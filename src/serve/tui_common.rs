@@ -68,6 +68,10 @@ pub struct RepoRow {
     pub lock_mode: String,
     /// Resolved filesystem path (embedded TUI only, empty for remote)
     pub path: String,
+    /// True when this row is a *mounted remote project* (lives on a federation
+    /// peer, surfaced locally via `project=<peer>/<alias>`). Rendered italic to
+    /// signal it is not a local index.
+    pub is_remote: bool,
 }
 
 /// Actions returned by key handling.
@@ -308,34 +312,44 @@ pub fn render_table(
                 .style(Style::default().fg(Color::DarkGray));
             let lock_cell = lock_cell(&repo.lock_mode);
 
-            // Alias cell with optional C# indicator
-            let alias_cell = match repo.csharp_index.as_str() {
-                "ready" => Cell::from(format!("{} C#·", repo.alias))
-                    .style(Style::default().fg(Color::White)),
-                "error" => {
-                    Cell::from(format!("{} C#!", repo.alias)).style(Style::default().fg(Color::Red))
-                }
+            // Alias text with optional C# indicator suffix, plus its base style.
+            let (alias_text, mut alias_style) = match repo.csharp_index.as_str() {
+                "ready" => (
+                    format!("{} C#·", repo.alias),
+                    Style::default().fg(Color::White),
+                ),
+                "error" => (
+                    format!("{} C#!", repo.alias),
+                    Style::default().fg(Color::Red),
+                ),
                 "indexing" => {
-                    if pulse_bright() {
-                        Cell::from(format!("{} C#…", repo.alias)).style(
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        )
+                    let s = if pulse_bright() {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
                     } else {
-                        Cell::from(format!("{} C#…", repo.alias))
-                            .style(Style::default().fg(Color::DarkGray))
-                    }
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    (format!("{} C#…", repo.alias), s)
                 }
-                _ => Cell::from(repo.alias.clone()).style(Style::default().fg(Color::White)),
+                _ => (repo.alias.clone(), Style::default().fg(Color::White)),
             };
 
-            // Red alias if the repo has errors
-            let alias_cell = if repo.status == "error" {
-                alias_cell.style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-            } else {
-                alias_cell
-            };
+            // Red bold alias if the repo is in an error state.
+            if repo.status == "error" {
+                alias_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+            }
+
+            // Mounted remote projects render italic to signal they live on a
+            // peer (cyan unless an error already claimed the color).
+            if repo.is_remote {
+                alias_style = alias_style.add_modifier(Modifier::ITALIC);
+                if repo.status != "error" {
+                    alias_style = alias_style.fg(Color::Cyan);
+                }
+            }
+
+            let alias_cell = Cell::from(alias_text).style(alias_style);
 
             Row::new(vec![
                 alias_cell,
@@ -416,14 +430,19 @@ pub fn render_detail(
         repo.path.clone()
     };
 
+    // Mounted remote projects show italic + cyan here too (matches the table).
+    let alias_style = if repo.is_remote {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD | Modifier::ITALIC)
+    } else {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    };
     let mut detail_spans = vec![
         Span::styled(" ▶ ", Style::default().fg(Color::Yellow)),
-        Span::styled(
-            repo.alias.clone(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(repo.alias.clone(), alias_style),
         Span::styled("  ", Style::default()),
         Span::styled(status_label, Style::default().fg(status_color)),
     ];

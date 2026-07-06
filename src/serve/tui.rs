@@ -90,11 +90,25 @@ async fn run_tui_loop(
     // Monotonic id of the most recent doctor request; bumped on every spawn.
     let mut doctor_gen: u64 = 0;
 
+    // Mounted remote projects (peer-hosted indexes, shown italic). Discovered on
+    // a slow background cadence so per-peer HTTP never blocks the render tick;
+    // the latest snapshot is cached here and appended after the local rows.
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel::<Vec<RepoRow>>(1);
+    let mut remote_rows: Vec<RepoRow> = Vec::new();
+    spawn_remote_discovery(state.clone(), remote_tx, cancel_token.clone());
+
     // Main loop
     loop {
-        // Draw the UI
+        // Absorb the newest remote-projects snapshot, if the background task
+        // produced one since the last tick (keep the previous list otherwise).
+        while let Ok(latest) = remote_rx.try_recv() {
+            remote_rows = latest;
+        }
+
+        // Draw the UI — local repos first, mounted remote projects appended.
         let repos = state.repo_statuses_lightweight();
-        let rows = map_repo_rows(&repos, &state);
+        let mut rows = map_repo_rows(&repos, &state);
+        rows.extend(remote_rows.iter().cloned());
 
         // Clamp selection
         if !rows.is_empty() {
@@ -326,6 +340,137 @@ fn map_repo_rows(
                 last_tool_call: info.last_tool_call.clone(),
                 lock_mode,
                 path,
+                is_remote: false,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Mounted remote projects (federation) — background discovery
+// ---------------------------------------------------------------------------
+
+/// Spawn the background task that periodically re-discovers mounted remote
+/// projects and pushes the latest `RepoRow` list through `tx`.
+///
+/// Runs off the render loop so per-peer HTTP never blocks a frame. Each round
+/// queries every configured peer's `/status` concurrently; peers that answer
+/// refresh an in-memory "last-known" alias list, and peers that fail this round
+/// reuse it — so a transient blip doesn't make a mount vanish from the table.
+fn spawn_remote_discovery(
+    state: Arc<ServeState>,
+    tx: tokio::sync::mpsc::Sender<Vec<RepoRow>>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let client = match crate::federation::FederationClient::new() {
+            Ok(c) => c,
+            // No HTTP client (e.g. TLS init failure) → no remote mounts, ever.
+            Err(_) => return,
+        };
+        let interval = Duration::from_secs(crate::constants::REMOTE_DISCOVERY_INTERVAL_SECS);
+        // Peer → last successfully-discovered alias list (blip fallback).
+        let mut last_good: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+
+        loop {
+            let cfg = state.config_snapshot();
+            if !cfg.remotes.is_empty() {
+                let rows = discover_remote_rows(&client, &cfg, &mut last_good).await;
+                // Capacity-1 channel: replace the pending snapshot if the render
+                // loop hasn't consumed it yet (try_send drops on Full — fine, the
+                // next round supersedes it anyway).
+                let _ = tx.try_send(rows);
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    });
+}
+
+/// Query every peer's `/status`, then map the discovered repos into mounted
+/// remote-project rows (honoring local hide/rename filters). Peers unreachable
+/// this round fall back to their `last_good` alias list.
+async fn discover_remote_rows(
+    client: &crate::federation::FederationClient,
+    cfg: &crate::db_discovery::repos::ReposConfig,
+    last_good: &mut std::collections::HashMap<String, Vec<String>>,
+) -> Vec<RepoRow> {
+    use crate::db_discovery::repos::Target;
+    use crate::federation::ManagementOutcome;
+
+    // 1) Fan out /status to all peers concurrently.
+    let mut discovered: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    // (peer, remote_alias) → the peer's reported repo state, for row display.
+    let mut status_lookup: std::collections::HashMap<
+        (String, String),
+        crate::federation::RemoteRepoStatus,
+    > = std::collections::HashMap::new();
+
+    let mut join = tokio::task::JoinSet::new();
+    for (peer_name, peer) in cfg.remotes.iter() {
+        let client = client.clone();
+        let peer = peer.clone();
+        let peer_name = peer_name.clone();
+        join.spawn(async move {
+            let outcome = client.list_repos(&peer).await;
+            (peer_name, outcome)
+        });
+    }
+    while let Some(res) = join.join_next().await {
+        if let Ok((peer_name, ManagementOutcome::Ok(status))) = res {
+            let aliases: Vec<String> = status.repos.iter().map(|r| r.alias.clone()).collect();
+            for r in status.repos {
+                status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
+            }
+            last_good.insert(peer_name.clone(), aliases.clone());
+            discovered.insert(peer_name, aliases);
+        }
+    }
+
+    // 2) Peers that didn't answer this round reuse their last-known list.
+    for peer_name in cfg.remotes.keys() {
+        if !discovered.contains_key(peer_name) {
+            if let Some(cached) = last_good.get(peer_name) {
+                discovered.insert(peer_name.clone(), cached.clone());
+            }
+        }
+    }
+
+    // 3) Apply hide/rename filters and build display rows.
+    cfg.mounted_remote_projects(&discovered)
+        .into_iter()
+        .map(|(local_name, target)| {
+            let Target::RemoteProject {
+                peer_name,
+                peer,
+                remote_alias,
+            } = target
+            else {
+                // mounted_remote_projects only ever yields RemoteProject.
+                unreachable!("mounted_remote_projects yielded a non-RemoteProject target");
+            };
+            let st = status_lookup.get(&(peer_name, remote_alias));
+            RepoRow {
+                alias: local_name,
+                // Reuse the peer's own status vocabulary (open/warm/…); default
+                // to "warm" for a cached-but-unreachable peer.
+                status: st
+                    .map(|s| s.status.clone())
+                    .unwrap_or_else(|| "warm".to_string()),
+                csharp_index: "none".to_string(),
+                csharp_error: None,
+                changes: st.map(|s| s.changes).unwrap_or(0),
+                tool_call_count: st.and_then(|s| s.tool_call_count).unwrap_or(0),
+                last_tool_call: st.and_then(|s| s.last_tool_call.clone()),
+                lock_mode: st.map(|s| s.lock_mode.clone()).unwrap_or_default(),
+                // Detail panel shows where the mount lives.
+                path: peer.url.clone(),
+                is_remote: true,
             }
         })
         .collect()
