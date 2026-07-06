@@ -33,14 +33,30 @@ competition.
   dashboard doesn't include mounted remote projects. (`tui_remote.rs` is a *separate* standalone
   remote dashboard, not the inline-mount view.)
 
-**Staged execution:**
-- **Stage 1** — Config model: mounted remote projects + auto-discovery + local hide/rename
+**Staged execution — ALL STAGES COMPLETE (branch `features/codesearch-federation`):**
+- **Stage 1 ✅** — Config model: mounted remote projects + auto-discovery + local hide/rename
   filter in `repos.rs` (`RemotePeer` discovery, `<peer>/<alias>` namespace, cache fallback).
-- **Stage 2** — Single-project remote resolution + MCP `project=<peer>/<alias>` dispatch routing.
-- **Stage 3** — `FederationClient` single-remote-project query (forward `project=<alias>` to peer).
-- **Stage 4** — TUI: `is_remote` on `RepoRow`, italic rendering, include mounts in local dashboard.
-- **Stage 5** — Indexer-job split (`docker/entrypoint.sh`): register+rebuild one repo per
-  `/data/docs/<vendor>` subfolder instead of a single monolithic `docs` repo.
+- **Stage 2 ✅** — Single-project remote resolution + MCP `project=<peer>/<alias>` dispatch
+  routing (local-first precedence: a local alias always wins a name clash).
+- **Stage 3 ✅** — `FederationClient::search_project` single-remote-project query (forwards
+  `project=<alias>` to the peer, strips `group`; shared `post_search` helper). Merged with
+  Stage 2 as one "routing" commit since dispatch can't compile without the client method.
+- **Stage 4 ✅** — TUI: `is_remote` on `RepoRow`, italic (cyan) rendering in table + detail,
+  background peer-`/status` discovery (30s cadence, capacity-1 channel, in-memory last-known
+  fallback) appending mounted remote projects to the local dashboard.
+- **Stage 5 ✅** — Indexer-job split (`docker/entrypoint.sh`): builds one index per
+  `/data/docs/<vendor>` subfolder (loop + fail-fast on none; verify-every-vendor before
+  upload) instead of a single monolithic `docs` repo. Coupled azcopy `--exclude-path` fix
+  (`docs_index_exclusions`) protects each `<vendor>/.codesearch.db` from `--delete-destination`
+  on both job and serve cold-start restore.
+
+**Deferred (post-merge / future cleanup, non-blocking):**
+- Persist discovery to `remote_project_cache` in `repos.json` for cross-restart fallback
+  (Stage 4 uses in-memory last-known only — sufficient for blips, not process restarts).
+- Extract a shared `build_remote_search_body(request, mode)` in `src/mcp/mod.rs` (the group
+  and single-project fan-out bodies are identical 11-field blocks — drift risk only).
+- Deploy step: register per-vendor subpaths against a writable peer + run the split index-job
+  to seed per-vendor snapshots (replaces the monolithic `docs` snapshot).
 
 ## Current state
 

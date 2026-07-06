@@ -77,6 +77,11 @@ snapshot_blob_url() {
 # We enumerate the vendor subdirs present locally (post-restore) and emit one
 # "<vendor>/.codesearch.db" prefix each, keeping the bare root entry for the
 # legacy layout. Semicolon-separated, as azcopy expects.
+#
+# DATA-SAFETY COUPLING: the ".codesearch.db" literal below MUST match the Rust
+# DB_DIR_NAME constant (src/constants.rs). If that constant is ever renamed and
+# this is not, the exclusion stops matching and --delete-destination wipes every
+# index. Keep the two in lockstep.
 docs_index_exclusions() {
   local excl=".codesearch.db" d
   for d in "${DOCS_DIR}"/*/; do
