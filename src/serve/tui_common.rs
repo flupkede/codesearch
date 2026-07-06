@@ -430,10 +430,17 @@ pub fn render_detail(
         repo.path.clone()
     };
 
-    // Mounted remote projects show italic + cyan here too (matches the table).
+    // Mounted remote projects show italic here too (matches the table): cyan
+    // normally, red when in error state so the color stays consistent with the
+    // table's error highlight. Local rows are unchanged (white bold).
     let alias_style = if repo.is_remote {
+        let color = if repo.status == "error" {
+            Color::Red
+        } else {
+            Color::Cyan
+        };
         Style::default()
-            .fg(Color::Cyan)
+            .fg(color)
             .add_modifier(Modifier::BOLD | Modifier::ITALIC)
     } else {
         Style::default()

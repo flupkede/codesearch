@@ -366,7 +366,10 @@ fn spawn_remote_discovery(
         let client = match crate::federation::FederationClient::new() {
             Ok(c) => c,
             // No HTTP client (e.g. TLS init failure) → no remote mounts, ever.
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("remote discovery disabled: HTTP client init failed: {e}");
+                return;
+            }
         };
         let interval = Duration::from_secs(crate::constants::REMOTE_DISCOVERY_INTERVAL_SECS);
         // Peer → last successfully-discovered alias list (blip fallback).
@@ -432,7 +435,10 @@ async fn discover_remote_rows(
         }
     }
 
-    // 2) Peers that didn't answer this round reuse their last-known list.
+    // 2) Forget peers dropped from config so `last_good` can't grow unbounded
+    //    in a long-lived serve, then let peers that didn't answer this round
+    //    reuse their last-known list.
+    last_good.retain(|peer_name, _| cfg.remotes.contains_key(peer_name));
     for peer_name in cfg.remotes.keys() {
         if !discovered.contains_key(peer_name) {
             if let Some(cached) = last_good.get(peer_name) {

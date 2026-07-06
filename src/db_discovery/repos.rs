@@ -564,7 +564,6 @@ impl ReposConfig {
     /// override whose custom value equals a local alias would resolve here to a
     /// remote target. Callers (MCP dispatch, Stage 2) MUST resolve local aliases
     /// first and only fall back to this, so local repos always win a name clash.
-    // dead_code allow removed in Stage 2 when MCP dispatch wires these in.
     pub fn resolve_remote_project(&self, name: &str) -> Option<Target> {
         // A rename override maps a custom local name back to its canonical
         // "<peer>/<alias>" key; fall back to treating `name` as canonical.
