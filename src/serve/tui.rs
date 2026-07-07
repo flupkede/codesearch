@@ -18,7 +18,9 @@ use crossterm::terminal::{self, EnterAlternateScreen};
 
 use tokio_util::sync::CancellationToken;
 
-use super::tui_common::{self, KeyAction, OverlayKeyAction, OverlayState, RepoRow};
+use super::tui_common::{
+    self, KeyAction, OverlayKeyAction, OverlayState, RemoteIndexStats, RemoteStatsState, RepoRow,
+};
 use super::ServeState;
 use crate::cli::doctor;
 use crate::constants::{DB_DIR_NAME, LANG_CSHARP};
@@ -178,7 +180,16 @@ async fn run_tui_loop(
         // the user is still waiting on the current request (spinner showing and
         // generation matches); otherwise the result is stale — drain and drop it.
         if let Ok((gen, result)) = doctor_rx.try_recv() {
-            if gen == doctor_gen && matches!(overlay, Some(OverlayState::DoctorRunning { .. })) {
+            // Apply async results (doctor diagnostics OR remote-mount index stats)
+            // only if the user is still viewing the matching overlay and the
+            // generation matches; otherwise the result is stale — drop it.
+            if gen == doctor_gen
+                && matches!(
+                    overlay,
+                    Some(OverlayState::DoctorRunning { .. })
+                        | Some(OverlayState::RemoteInfo { .. })
+                )
+            {
                 overlay = Some(result);
             }
         }
@@ -237,8 +248,24 @@ async fn run_tui_loop(
                             }
                         } else if let Some(row) = rows.get(idx) {
                             // Mounted remote project (appended after local rows).
-                            // No local index → show federation coordinates.
+                            // Show federation coordinates immediately, then fetch
+                            // the peer's on-disk index stats in the background.
                             overlay = Some(build_remote_info_overlay(row));
+                            if let Some(crate::db_discovery::repos::Target::RemoteProject {
+                                peer,
+                                remote_alias,
+                                ..
+                            }) = state.config_snapshot().resolve_remote_project(&row.alias)
+                            {
+                                doctor_gen += 1;
+                                spawn_remote_info(
+                                    build_remote_info_overlay(row),
+                                    peer,
+                                    remote_alias,
+                                    doctor_tx.clone(),
+                                    doctor_gen,
+                                );
+                            }
                         }
                     }
                     KeyAction::RunDoctor(idx) => {
@@ -630,6 +657,9 @@ fn build_remote_info_overlay(row: &RepoRow) -> OverlayState {
         changes: row.changes,
         tool_call_count: row.tool_call_count,
         last_tool_call: row.last_tool_call.clone(),
+        // Index stats (chunks/files/db-size/model) live on the peer and are
+        // fetched asynchronously; start in the loading state.
+        stats: RemoteStatsState::Loading,
     }
 }
 
@@ -774,6 +804,69 @@ fn spawn_doctor(
         // Send result back to TUI loop (non-blocking — if channel closed, just drop it)
         let _ = tx.send((gen, result_overlay)).await;
     });
+}
+
+/// Spawn a background task to fetch a mounted remote project's on-disk index
+/// stats from the peer's `GET /repos/{alias}/info`, then send an enriched
+/// `RemoteInfo` overlay back via `tx` tagged with `gen` (so a stale or dismissed
+/// request's result is discarded by the receiver). On any failure the overlay
+/// falls back to `RemoteStatsState::Unavailable` — the mount coordinates already
+/// shown remain intact.
+fn spawn_remote_info(
+    base: OverlayState,
+    peer: crate::db_discovery::repos::RemotePeer,
+    remote_alias: String,
+    tx: tokio::sync::mpsc::Sender<(u64, OverlayState)>,
+    gen: u64,
+) {
+    tokio::spawn(async move {
+        use crate::federation::{FederationClient, ManagementOutcome};
+        let stats = match FederationClient::new() {
+            Ok(client) => match client.repo_info(&peer, &remote_alias).await {
+                ManagementOutcome::Ok(info) => RemoteStatsState::Ready(RemoteIndexStats {
+                    chunks: info.chunks,
+                    files: info.files,
+                    db_size_human: info.db_size_human,
+                    model: info.model,
+                }),
+                // Peer unreachable / non-2xx / unparseable — surface as unavailable.
+                _ => RemoteStatsState::Unavailable,
+            },
+            // No HTTP client (e.g. TLS init failure) → stats can't be fetched.
+            Err(_) => RemoteStatsState::Unavailable,
+        };
+        let enriched = with_remote_stats(base, stats);
+        let _ = tx.send((gen, enriched)).await;
+    });
+}
+
+/// Replace the `stats` field of a `RemoteInfo` overlay, leaving any other overlay
+/// variant untouched.
+fn with_remote_stats(overlay: OverlayState, stats: RemoteStatsState) -> OverlayState {
+    if let OverlayState::RemoteInfo {
+        alias,
+        peer_url,
+        status,
+        lock,
+        changes,
+        tool_call_count,
+        last_tool_call,
+        ..
+    } = overlay
+    {
+        OverlayState::RemoteInfo {
+            alias,
+            peer_url,
+            status,
+            lock,
+            changes,
+            tool_call_count,
+            last_tool_call,
+            stats,
+        }
+    } else {
+        overlay
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -141,6 +141,21 @@ pub struct RemoteRepoStatus {
     pub tool_call_count: Option<u64>,
 }
 
+/// `GET /repos/:alias/info` payload — on-disk index stats for one repo on the
+/// peer. Only the fields the TUI mount-info overlay renders are typed; every
+/// field is optional/defaulted so an older/newer remote still parses.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RemoteRepoInfo {
+    #[serde(default)]
+    pub chunks: usize,
+    #[serde(default)]
+    pub files: usize,
+    #[serde(default)]
+    pub db_size_human: String,
+    #[serde(default)]
+    pub model: String,
+}
+
 /// `POST /repos` success payload (HTTP 202).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteRepoAdded {
@@ -449,6 +464,23 @@ impl FederationClient {
         // (not REPO_REINDEX_PATH_PREFIX, whose name implies reindex-only use).
         let suffix = format!("{}/{}", crate::constants::REPOS_PATH, urlencoding(alias));
         self.send_management(peer, reqwest::Method::DELETE, &suffix, None, None)
+            .await
+    }
+
+    /// `GET /repos/:alias/info` — fetch on-disk index stats (chunks/files/db
+    /// size/model) for one repo on the peer. `alias` is the peer's repo alias.
+    pub async fn repo_info(
+        &self,
+        peer: &RemotePeer,
+        alias: &str,
+    ) -> ManagementOutcome<RemoteRepoInfo> {
+        let suffix = format!(
+            "{}/{}{}",
+            crate::constants::REPOS_PATH,
+            urlencoding(alias),
+            crate::constants::REPO_INFO_PATH_SUFFIX,
+        );
+        self.send_management(peer, reqwest::Method::GET, &suffix, None, None)
             .await
     }
 

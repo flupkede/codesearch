@@ -228,6 +228,10 @@ pub const REPO_REINDEX_PATH_PREFIX: &str = "/repos/";
 /// Path suffix for the per-repo reindex HTTP API route.
 pub const REPO_REINDEX_PATH_SUFFIX: &str = "/reindex";
 
+/// Path suffix for the per-repo info HTTP API route.
+/// Full path: `{REPOS_PATH}/{alias}{REPO_INFO_PATH_SUFFIX}`.
+pub const REPO_INFO_PATH_SUFFIX: &str = "/info";
+
 /// Health-check path served by `codesearch serve`.
 pub const HEALTH_PATH: &str = "/health";
 
