@@ -755,6 +755,58 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn get_chunk_legacy_no_alias_falls_back_to_group() {
+        // A legacy (non-namespaced) chunk_ref yields `remote_alias == None`; the
+        // lookup must then fall back to the peer's group scope and NOT send a
+        // `project` param — preserving pre-fix behaviour for old refs.
+        let app = axum::Router::new().route(
+            "/chunk/:id",
+            axum::routing::get(
+                |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    axum::Json(serde_json::json!({
+                        "chunk_id": 7,
+                        "received_project": params.get("project"),
+                        "received_group": params.get("group"),
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .get_chunk(&peer(format!("http://{addr}")), None, 7, None)
+            .await;
+        match outcome {
+            Outcome::Ok(value) => {
+                assert!(
+                    value
+                        .get("received_project")
+                        .map(|v| v.is_null())
+                        .unwrap_or(true),
+                    "legacy lookup must not send a project param, got: {value}"
+                );
+                // `peer()` configures group "all" (or the peer's group), which must be forwarded.
+                assert!(
+                    value
+                        .get("received_group")
+                        .and_then(|v| v.as_str())
+                        .is_some(),
+                    "legacy lookup must forward a group scope, got: {value}"
+                );
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
     // --- management methods (list/add/remove/reindex) ---
 
     #[tokio::test]
