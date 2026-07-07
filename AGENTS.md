@@ -1,4 +1,30 @@
-# AGENTS.md — codesearch (features/codesearch-federation)
+# AGENTS.md — codesearch (features/remote-mount-selection)
+
+## Current Plan — opt-in remote mount selection (2026-07-07) ✅ CODE COMPLETE
+
+**Refines the project-mounting work below.** The earlier design auto-discovered and mounted
+*every* project a peer exposed (opt-out via `remote_hidden`). Per user intent, selection is now
+**opt-in**: after `remote add`, the local user explicitly chooses which individual per-vendor
+indexes to use.
+
+**Locked decisions (2026-07-07):**
+- **`remote_mounts` allowlist = single source of truth** (canonical `<peer>/<alias>` in
+  `repos.json`). Replaces the opt-out `remote_hidden`; nothing auto-mounts.
+- **Group fan-out restricted to mounts:** an `@peer` reference in a group federates only that
+  peer's *mounted* indexes (each as its own `project=` query), never the whole peer.
+- **Non-mounted = unroutable:** `resolve_remote_project` gates on the allowlist.
+
+**Done (commit `1a5b3fc`):**
+- `repos.rs`: `remote_mounts`; `mounted_remote_projects()` allowlist-driven (no discovery arg);
+  `resolve_remote_project()` allowlist gate; `group_remote_projects()`; `mount_remote_project()`/
+  `unmount_remote_project()`; `reconcile()` prunes stale/unknown-peer/malformed mounts + orphan
+  rename overrides.
+- `mcp/mod.rs`: `federated_search` fans out per mounted project (`search_project`); obsolete
+  whole-peer `FederationClient::search` removed; `list_projects` gains a `remote_projects` array;
+  `scope_required` advertises mounted names in `available_projects`.
+- `cli/mod.rs`: `remote available|mount|unmount|mounts`.
+- `serve/tui.rs`: rows come from the allowlist; peer discovery only enriches live status.
+- Docs: CHANGELOG / README / AGENTS updated.
 
 ## Current Plan — remote project mounting (1-to-1 passthrough)
 
@@ -10,10 +36,11 @@ is dropped; grouping becomes a purely-local, user-owned composition (a local `do
 several remote members stays possible — the user decides).
 
 **Locked design decisions (2026-07-06):**
-- **Discovery = auto-discover + local filter.** On startup the local instance queries each
-  peer's `GET /status`, enumerates its repos, and mounts them as remote projects. The user can
-  hide/rename specific mounts locally. Peer unreachable at startup → fall back to last-known
-  cached list (never hard-fail).
+- **Discovery = auto-discover + local filter.** *(SUPERSEDED by the opt-in plan above —
+  selection is now an explicit `remote_mounts` allowlist, not auto-discover-everything.)* On
+  startup the local instance queries each peer's `GET /status`, enumerates its repos, and mounts
+  them as remote projects. The user can hide/rename specific mounts locally. Peer unreachable at
+  startup → fall back to last-known cached list (never hard-fail).
 - **Naming = peer-namespaced.** Remote projects are named `<peer>/<alias>` (e.g. `cloud/vendor-a`)
   — always unambiguous, never shadows a local repo, TUI shows the source at a glance.
 
@@ -66,8 +93,8 @@ competition.
 
 ## Current state
 
-- **Branch:** `features/codesearch-federation`
-- **Version:** v1.1.9 (post-1.1.0 GA: project-level mounting + cloud reindex hardening; pre-commit hook auto-bumps patch per commit)
+- **Branch:** `features/remote-mount-selection` (branched from `develop` after the federation merge)
+- **Version:** v1.1.11 (opt-in remote mount selection; pre-commit hook auto-bumps patch per commit)
 - **Deploy:** cloud peer redeployed with the per-vendor federation split (akeneo/vendor-a/bynder/digizuite/inriver/keyshot + custom KB), image built locally via BuildKit `docker buildx --push`, all vendors reindexed and federation validated end-to-end (`project=cloud/<vendor>`).
 - **Status:** `cargo check` + `cargo clippy` clean
 - **Validation:** `cargo check` for iteration, `cargo clippy` for lint. No `--release` builds during the fix loop; build only at the very end.

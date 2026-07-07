@@ -8,15 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-**Project-level federation + cloud reindex hardening.** Builds on the 1.1.0 federation release: a peer's individual projects can now be *mounted* and queried by name, the serve TUI surfaces and inspects those mounts, and the cloud indexer was reworked to reindex reliably without OOM-killing itself.
+**Project-level federation + cloud reindex hardening.** Builds on the 1.1.0 federation release: a peer's individual projects can now be **opt-in mounted** and queried by name, the serve TUI surfaces and inspects those mounts, and the cloud indexer was reworked to reindex reliably without OOM-killing itself.
 
 ### Added
 
-- **Mounted remote projects (1-to-1 federation passthrough).** A remote peer's individual projects can be queried locally by name as `project=<peer>/<alias>` (e.g. `cloud/akeneo`), routed directly to that peer — complementing the existing group-level `@peer` fan-out. Mounts are auto-discovered from each configured peer's `GET /status` on a slow background cadence (never blocking a render frame) and cached with a last-known fallback so a transient peer blip doesn't make a mount vanish.
+- **Opt-in mounting of individual remote projects.** After adding a peer, the local user **explicitly picks** which of its individual projects to use, via a new `remote_mounts` allowlist in `repos.json` — nothing is auto-exposed. A mounted project is queried locally by name as `project=<peer>/<alias>` (e.g. `cloud/akeneo`), a 1-to-1 passthrough routed directly to that peer; a **non-mounted** project is unroutable even if the peer exposes it. The allowlist is the single source of truth for routing, discoverability, TUI display, and group fan-out.
+- **`codesearch remote available|mount|unmount|mounts`.** Inspect the individual projects a peer exposes (marking which are mounted), then opt in/out. `remote available <peer>` queries the peer's `GET /status`; `mount`/`unmount` edit the allowlist; `mounts` lists the current selection (and any local rename).
+- **Mounts are discoverable.** `list_projects` gains a `remote_projects` array (name + peer + peer URL), and the `scope_required` error advertises mounted names in `available_projects`, so an agent can find and route to a mounted project as a first-class `project=` target.
+- **Group fan-out restricted to mounts.** A whole-peer `@peer` group reference (e.g. `docs → [@cloud]`) now federates only the individual indexes you mounted for that peer — each queried as its own project — instead of the peer's entire corpus.
 - **TUI: mounted remote projects.** Mounts render in **italic/cyan** in the serve status table to signal they live on a peer (not a local index). The `i` (info) key now works on a mount, opening a **Remote Mount** panel showing the peer URL and the peer-reported live status (status / lock / changes / calls / last call) instead of local on-disk stats. When a mount is selected, the footer renders the local-index actions **doctor / reindex / remove struck-through (disabled)** so it's clear those don't apply to a peer-hosted index; info / reload / quit / navigation stay enabled.
 
 ### Changed
 
+- **Remote mount selection is opt-in.** Replaced the earlier auto-discover-everything / opt-out `remote_hidden` filter with the explicit `remote_mounts` allowlist. Live peer discovery now only **enriches** TUI status; it no longer defines which projects are mounted (mounts resolve from config even while a peer is unreachable).
 - **Cloud indexer job: one federated project per vendor.** The cloud indexer now builds each vendor as a separate federated project (`akeneo`, `vendor-a`, `bynder`, `digizuite`, `inriver`, `keyshot`, plus the custom KB) rather than one monolithic index, and builds them **sequentially** so the serve replica only ever holds one embedding model in memory at a time.
 - **Cloud deployment docs** generalised for public release (customer identifiers scrubbed) and consolidated under `integrations/cloud/`.
 - **Docker image** now built locally with **BuildKit** (`docker buildx --push`) instead of `az acr build`: the model-cache warmup is folded into the builder stage and shipped as a single tarball, working around ACR's classic builder failing to `COPY --from` a chained stage / symlink tree.

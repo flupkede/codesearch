@@ -469,14 +469,25 @@ done
 codesearch index list --remote cloud   # one alias per vendor
 ```
 
-**Mounting a peer's projects (query one by name).** Beyond group-level `@peer` fan-out, you can address a *single* project on a peer directly as `project=<peer>/<alias>` — a 1-to-1 passthrough to that peer's index. With a peer named `cloud` hosting the per-vendor layout above:
+**Mounting a peer's projects (opt-in, query one by name).** Adding a peer does **not** expose its projects automatically — you pick the individual indexes you want. Inspect what a peer offers, then mount the ones you care about:
+
+```bash
+codesearch remote available cloud          # list the peer's projects, ✓ marks mounted
+codesearch remote mount cloud/akeneo       # opt in to a single index
+codesearch remote mounts                   # show what you've mounted
+codesearch remote unmount cloud/akeneo     # opt back out
+```
+
+A **mounted** project is addressable directly as `project=<peer>/<alias>` — a 1-to-1 passthrough to that peer's index:
 
 ```bash
 # search only the peer's akeneo docs, by name
 codesearch search "import products" --project cloud/akeneo
 ```
 
-These **mounted remote projects** are auto-discovered from the peer's `GET /status` and appear in the `codesearch serve` TUI in **italic/cyan**, distinguishing them from local indexes. Press `i` on a mount to see its **Remote Mount** info (peer URL + peer-reported status); the local-index actions (`doctor` / `reindex` / `remove`) are shown struck-through/disabled for a mount, since they act on a local index and a mount has none — manage a peer's indexes with `--remote` (above) instead.
+The `remote_mounts` allowlist in `~/.codesearch/repos.json` is the single source of truth: a **non-mounted** project is unroutable (even if the peer exposes it), and a whole-peer `@peer` group reference (e.g. `docs → [@cloud]`) federates **only your mounted indexes** for that peer, not its whole corpus. Mounted projects are surfaced by `list_projects` (a `remote_projects` array) and advertised in the `scope_required` error, so agents can discover them.
+
+In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing them from local indexes. Press `i` on a mount to see its **Remote Mount** info (peer URL + peer-reported status); the local-index actions (`doctor` / `reindex` / `remove`) are shown struck-through/disabled for a mount, since they act on a local index and a mount has none — manage a peer's indexes with `--remote` (above) instead.
 
 ## CLI Reference
 
