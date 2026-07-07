@@ -87,9 +87,9 @@ These indexed mounts often answer product/API/docs questions more precisely
 Step 1 — load the deferred MCP tool schemas (one-time per conversation):
   ToolSearch("select:mcp__codesearch__search,mcp__codesearch__get_chunk")
 
-Step 2 — search the relevant mount. Use compact=false to read matching content
-inline; follow up with get_chunk on a returned chunk_ref for full context:
+Step 2 — search the relevant mount (compact=false reads matching content inline):
   mcp__codesearch__search(query="${q}", project="<peer/alias>", compact=false)
+  mcp__codesearch__get_chunk(chunk_ref="<peer/alias:id from a result>")  # full context
 
 Pick the relevant project from the mounted remotes above.
 
