@@ -250,21 +250,32 @@ async fn run_tui_loop(
                             // Mounted remote project (appended after local rows).
                             // Show federation coordinates immediately, then fetch
                             // the peer's on-disk index stats in the background.
-                            overlay = Some(build_remote_info_overlay(row));
+                            let base = build_remote_info_overlay(row);
+                            // Bump the generation UNCONDITIONALLY: this invalidates
+                            // any still-in-flight doctor/remote-info result (they
+                            // share one channel + counter) so a late reply can't
+                            // clobber this overlay via the recv guard below.
+                            doctor_gen += 1;
                             if let Some(crate::db_discovery::repos::Target::RemoteProject {
                                 peer,
                                 remote_alias,
                                 ..
                             }) = state.config_snapshot().resolve_remote_project(&row.alias)
                             {
-                                doctor_gen += 1;
+                                overlay = Some(base.clone());
                                 spawn_remote_info(
-                                    build_remote_info_overlay(row),
+                                    base,
                                     peer,
                                     remote_alias,
                                     doctor_tx.clone(),
                                     doctor_gen,
                                 );
+                            } else {
+                                // Mount no longer resolves (misconfig, or a config
+                                // reload raced this keypress). No fetch will run, so
+                                // don't leave the overlay stuck on "fetching…".
+                                overlay =
+                                    Some(with_remote_stats(base, RemoteStatsState::Unavailable));
                             }
                         }
                     }

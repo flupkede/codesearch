@@ -116,6 +116,7 @@ pub enum RemoteStatsState {
     Unavailable,
 }
 
+#[derive(Debug, Clone)]
 pub enum OverlayState {
     /// Info modal: repo name, chunks, files, db size, model, dims, etc.
     Info {
@@ -841,7 +842,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                 RemoteStatsState::Unavailable => vec![Line::from(vec![
                     Span::styled("  Index:       ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        "unavailable (peer unreachable)",
+                        "stats unavailable from peer",
                         Style::default().fg(Color::Yellow),
                     ),
                 ])],
