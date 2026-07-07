@@ -62,7 +62,7 @@ pub enum Target {
 pub const REMOTE_REF_PREFIX: &str = "@";
 
 /// Separator between a peer name and a remote project alias in a mounted remote
-/// project's namespaced local name (e.g. `cloud/aprimo`). Both sides are
+/// project's namespaced local name (e.g. `cloud/vendor-a`). Both sides are
 /// guaranteed `/`-free: bare aliases are sanitized to `[A-Za-z0-9._-]` (see
 /// [`sanitize_alias`]), and peer names are validated to reject `/` in
 /// [`ReposConfig::add_remote`]. So the first `/` unambiguously splits

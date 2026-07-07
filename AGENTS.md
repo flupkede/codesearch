@@ -14,7 +14,7 @@ several remote members stays possible — the user decides).
   peer's `GET /status`, enumerates its repos, and mounts them as remote projects. The user can
   hide/rename specific mounts locally. Peer unreachable at startup → fall back to last-known
   cached list (never hard-fail).
-- **Naming = peer-namespaced.** Remote projects are named `<peer>/<alias>` (e.g. `cloud/aprimo`)
+- **Naming = peer-namespaced.** Remote projects are named `<peer>/<alias>` (e.g. `cloud/vendor-a`)
   — always unambiguous, never shadows a local repo, TUI shows the source at a glance.
 
 **Why (beyond ranking):** smaller per-vendor indexes → smaller/faster rebuilds, per-vendor
@@ -68,7 +68,7 @@ competition.
 
 - **Branch:** `features/codesearch-federation`
 - **Version:** v1.1.9 (post-1.1.0 GA: project-level mounting + cloud reindex hardening; pre-commit hook auto-bumps patch per commit)
-- **Deploy:** cloud peer redeployed with the per-vendor federation split (akeneo/aprimo/bynder/digizuite/inriver/keyshot + custom KB), image built locally via BuildKit `docker buildx --push`, all vendors reindexed and federation validated end-to-end (`project=cloud/<vendor>`).
+- **Deploy:** cloud peer redeployed with the per-vendor federation split (akeneo/vendor-a/bynder/digizuite/inriver/keyshot + custom KB), image built locally via BuildKit `docker buildx --push`, all vendors reindexed and federation validated end-to-end (`project=cloud/<vendor>`).
 - **Status:** `cargo check` + `cargo clippy` clean
 - **Validation:** `cargo check` for iteration, `cargo clippy` for lint. No `--release` builds during the fix loop; build only at the very end.
 

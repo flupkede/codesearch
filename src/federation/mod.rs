@@ -639,7 +639,7 @@ mod tests {
             .search_project(
                 &p,
                 serde_json::json!({ "query": "x", "group": "leftover", "mode": "semantic" }),
-                "aprimo",
+                "vendor-a",
             )
             .await;
         assert!(matches!(outcome, Outcome::Ok(_)));
@@ -651,7 +651,7 @@ mod tests {
             .expect("peer received a body");
         assert_eq!(
             body.get("project").and_then(|v| v.as_str()),
-            Some("aprimo"),
+            Some("vendor-a"),
             "project must be forced to the remote alias"
         );
         assert!(

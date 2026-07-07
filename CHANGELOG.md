@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Cloud indexer job: one federated project per vendor.** The cloud indexer now builds each vendor as a separate federated project (`akeneo`, `aprimo`, `bynder`, `digizuite`, `inriver`, `keyshot`, plus the custom KB) rather than one monolithic index, and builds them **sequentially** so the serve replica only ever holds one embedding model in memory at a time.
+- **Cloud indexer job: one federated project per vendor.** The cloud indexer now builds each vendor as a separate federated project (`akeneo`, `vendor-a`, `bynder`, `digizuite`, `inriver`, `keyshot`, plus the custom KB) rather than one monolithic index, and builds them **sequentially** so the serve replica only ever holds one embedding model in memory at a time.
 - **Cloud deployment docs** generalised for public release (customer identifiers scrubbed) and consolidated under `integrations/cloud/`.
 - **Docker image** now built locally with **BuildKit** (`docker buildx --push`) instead of `az acr build`: the model-cache warmup is folded into the builder stage and shipped as a single tarball, working around ACR's classic builder failing to `COPY --from` a chained stage / symlink tree.
 
