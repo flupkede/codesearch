@@ -257,7 +257,6 @@ impl ReposConfig {
         //    is malformed (no "<peer>/<alias>" split). A hand-edited or stale
         //    `remote_mounts` entry must never make an un-routable name look
         //    available.
-        let before = self.remote_mounts.len();
         self.remote_mounts.retain(|canonical| {
             match canonical.split_once(REMOTE_PROJECT_SEPARATOR) {
                 Some((peer_name, remote_alias))
@@ -276,12 +275,14 @@ impl ReposConfig {
                 }
             }
         });
-        if self.remote_mounts.len() != before {
-            // Drop rename overrides orphaned by the prune above.
-            let mounted: std::collections::HashSet<&String> = self.remote_mounts.iter().collect();
-            self.remote_alias_overrides
-                .retain(|canonical, _| mounted.contains(canonical));
-        }
+        // Drop rename overrides that no longer point at a mounted project —
+        // orphaned by the prune above OR by a hand-edited `remote_mounts`. An
+        // override is only ever consulted for an allowlisted entry, so a stale
+        // one is dead config; clearing it unconditionally also prevents a
+        // surprise rename resurfacing if the project is later re-mounted.
+        let mounted: std::collections::HashSet<&String> = self.remote_mounts.iter().collect();
+        self.remote_alias_overrides
+            .retain(|canonical, _| mounted.contains(canonical));
     }
 
     pub fn save(&self) -> Result<()> {
