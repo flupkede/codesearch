@@ -1,0 +1,14 @@
+# Build artifacts and tool-generated dirs — never send to the Docker build context.
+target/
+**/.codesearch.db/
+**/.fastembed_cache/
+.git/
+.github/
+helpers/
+docs/
+tests/
+**/*.md
+# Hidden tool dirs
+.*/
+**/.*/
+!.dockerignore

@@ -266,7 +266,7 @@ pub struct SimilarChunksRequest {
 // ═══════════════════════════════════════════════════════════════════
 
 /// Search result item — returned by semantic search
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResultItem {
     pub chunk_id: u32,
     pub path: String,
@@ -282,6 +282,17 @@ pub struct SearchResultItem {
     pub context_prev: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_next: Option<String>,
+    /// Federation source tag: `None` for local results, `Some("<peer_name>")`
+    /// for results merged in from a remote peer. Lets the agent tell where a
+    /// hit originated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Federated chunk reference for retrieval, of the form `"<peer>:<chunk_id>"`
+    /// (e.g. `"cloud:12345"`). Present only for remote results; pass it back to
+    /// `get_chunk(chunk_ref=...)` to fetch the chunk content from the peer.
+    /// Local results are fetched with the plain numeric `chunk_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_ref: Option<String>,
 }
 
 /// Reference/call site item — returned by find_references, find_definition, find_usages
@@ -376,6 +387,12 @@ pub struct SemanticSearchResponse {
     pub low_confidence: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_tool: Option<String>,
+    /// Federation health warnings — populated when one or more remote peers in
+    /// the queried group were unreachable. The query still returns (degraded)
+    /// local + remaining-remote results; these warnings explain the gap so an
+    /// agent doesn't mistake a partial result set for exhaustive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
 }
 
 /// File outline entry
@@ -391,7 +408,15 @@ pub struct FileOutlineItem {
 /// Request to fetch a chunk by ID
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct GetChunkRequest {
+    /// Local chunk id. Ignored when `chunk_ref` is set (federated fetch).
+    #[serde(default)]
     pub chunk_id: u32,
+    /// Federated chunk reference `"<peer>:<chunk_id>"` (e.g. `"cloud:12345"`),
+    /// as returned in a remote search result's `chunk_ref`. When set, the chunk
+    /// is fetched from the named remote peer and `chunk_id`/`project`/`group`
+    /// are ignored.
+    #[serde(default)]
+    pub chunk_ref: Option<String>,
     pub context_lines: Option<usize>,
     pub project: Option<String>,
     #[serde(default)]
@@ -455,6 +480,12 @@ pub struct RepoInfo {
     pub total_files: usize,
     pub model: String,
     pub lock_status: String,
+    /// Named group(s) this repo belongs to (sorted; excludes the virtual "all"
+    /// group). Lets an agent see that a single repo is part of a larger group
+    /// and prefer a cross-repo `group=` query — e.g. a separate config /
+    /// import-data repo that shares a group with the main project. Empty when
+    /// the repo is in no named group.
+    pub groups: Vec<String>,
 }
 
 /// Health response served by `codesearch serve` at GET /health.

@@ -35,11 +35,12 @@ use tracing::{info, warn};
 
 use crate::cache::safe_canonicalize;
 use crate::constants::{
-    ALLOWED_ROOTS_ENV, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
+    ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
     CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
-    HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH,
-    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS,
-    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    EXPLORE_PATH, FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS,
+    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
+    REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV,
+    SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -182,6 +183,17 @@ pub(crate) struct ServeState {
     /// Repo alias → timestamp of last query that touched this repo.
     /// Used by the idle-reaper to evict repos after `REPO_IDLE_TIMEOUT_SECS`.
     last_access: DashMap<String, std::time::Instant>,
+    /// Repo alias → `JoinHandle` of its background file-system-watcher (FSW) task.
+    ///
+    /// The FSW task holds its own clones of `Arc<SharedStores>` and
+    /// `Arc<IndexManager>`. On Windows those Arcs keep the LMDB mmap files
+    /// (`data.mdb` / `lock.mdb`) open, which blocks deletion of the DB
+    /// directory — the OS refuses to delete a file mmap'd by the very process
+    /// asking for the delete. Tracking the handle lets `remove_repo` /
+    /// `restart_fsw` await the task's completion (after signalling stop via
+    /// `stop_fsw`) so the LMDB `Environment` drops and releases the file
+    /// handles BEFORE the DB directory is deleted. See `await_fsw_shutdown`.
+    fsw_tasks: DashMap<String, tokio::task::JoinHandle<()>>,
     /// Loaded repos config (alias → path).
     config: std::sync::RwLock<ReposConfig>,
     /// Last observed mtime of the repos config file.
@@ -214,6 +226,12 @@ pub(crate) struct ServeState {
     /// `find_impact` to reuse helper-detection cache instead of creating fresh
     /// instances per request.
     symbol_registry: Arc<SymbolIndexerRegistry>,
+    /// Shared embedding service — used by MCP sessions AND the REST handlers so
+    /// the ONNX embedding model is loaded ONCE per serve instance (lazily, on
+    /// the first semantic query) and reused across all requests. Without this,
+    /// per-request `CodesearchService` construction (REST handlers) would reload
+    /// the model on every call (~100ms–2s). Mirrors the `symbol_registry` pattern.
+    embedding_service: Arc<std::sync::Mutex<Option<crate::embed::EmbeddingService>>>,
     /// Per-repo total tool call count.
     tool_call_counts: DashMap<String, AtomicU64>,
     /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
@@ -279,6 +297,7 @@ impl ServeState {
         Self {
             repos: DashMap::new(),
             last_access: DashMap::new(),
+            fsw_tasks: DashMap::new(),
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
@@ -289,6 +308,7 @@ impl ServeState {
             total_sessions: AtomicU64::new(0),
             sysinfo_system: std::sync::Mutex::new(sys),
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
+            embedding_service: Arc::new(std::sync::Mutex::new(None)),
             tool_call_counts: DashMap::new(),
             csharp_index_status: Arc::new(DashMap::new()),
             csharp_index_error: Arc::new(DashMap::new()),
@@ -306,6 +326,16 @@ impl ServeState {
     /// helper-detection cache instead of creating fresh instances per request.
     pub(crate) fn symbol_registry(&self) -> Arc<SymbolIndexerRegistry> {
         Arc::clone(&self.symbol_registry)
+    }
+
+    /// Return a clone of the shared embedding-service Arc.
+    /// Shared across MCP sessions AND REST handlers so the ONNX model is loaded
+    /// once per serve instance (lazily on first semantic query) instead of being
+    /// reloaded per request/session.
+    pub(crate) fn embedding_service(
+        &self,
+    ) -> Arc<std::sync::Mutex<Option<crate::embed::EmbeddingService>>> {
+        Arc::clone(&self.embedding_service)
     }
 
     /// Return the instant when serve started, used to compute uptime.
@@ -792,6 +822,11 @@ impl ServeState {
                         let _ = self.stop_fsw(alias);
                         self.repos.remove(alias);
                         self.last_access.remove(alias);
+                        // Detach the FSW handle (stop_fsw already cancelled
+                        // the task). The DB dir is already gone (the prune
+                        // condition was db_missing || path_gone), so there is
+                        // no delete to race with — the task just drains.
+                        self.fsw_tasks.remove(alias);
 
                         // Unregister from repos.json — route through persist_config
                         // so the config_path_override is honoured (same as all
@@ -1180,7 +1215,11 @@ impl ServeState {
             if let Some((_, RepoState::Write { cancel_token, .. })) = self.repos.remove(alias) {
                 cancel_token.cancel();
             }
-            // Warm, Readonly, Conflicted just drop
+            // Warm, Readonly, Conflicted just drop.
+            // Also detach the FSW task handle so it doesn't leak across a config
+            // shrink. Reload never deletes DB dirs, so a still-draining task
+            // holding LMDB open briefly is harmless (no delete to race with).
+            self.fsw_tasks.remove(alias);
         }
 
         // Swap in the new config and mtime.
@@ -1230,6 +1269,11 @@ impl ServeState {
         }
         self.repos.remove(alias);
         self.last_access.remove(alias);
+        // Await the FSW task's exit so its Arc<SharedStores>/Arc<IndexManager>
+        // clones drop → the LMDB Environment closes → Windows releases the mmap
+        // file handles BEFORE we delete the DB directory below. stop_fsw above
+        // already cancelled the task; this waits for it to actually finish.
+        self.await_fsw_shutdown(alias).await;
         tracing::info!("Evicted repo '{}' from memory", alias);
 
         // 3. Unregister from repos.json
@@ -1249,6 +1293,17 @@ impl ServeState {
         }
 
         // 4. Delete the database directory with retries.
+        //
+        // `await_fsw_shutdown` above dropped the *persistent* holders (the FSW
+        // task + this RepoState), which is the fix for the Windows
+        // sharing-violation. A *transient* holder can still defeat a single
+        // delete attempt: a search / warmup in flight at this instant may hold
+        // its own clone of the Arc<SharedStores> (or an inner
+        // Arc<RwLock<VectorStore>> captured in a spawn_blocking), keeping the
+        // LMDB env open past the await. The retry-loop below is the fallback
+        // for that race; if it still fails (warned, non-fatal) the DB dir
+        // stays on disk and is cleaned up on the next serve restart. The repo
+        // is already unregistered from config, so this is cosmetic.
         if db_path.exists() {
             for attempt in 0..5 {
                 if attempt > 0 {
@@ -1325,12 +1380,56 @@ impl ServeState {
         }
     }
 
+    /// Await the completion of a repo's background FSW task (if any) and drop
+    /// its handle.
+    ///
+    /// MUST be called AFTER the task has been signalled to stop — i.e. the
+    /// caller has already invoked [`Self::stop_fsw`] (which cancels the
+    /// `CancellationToken`) or otherwise cancelled the token. Once the task
+    /// observes the cancellation and returns, the `Arc<SharedStores>` /
+    /// `Arc<IndexManager>` clones it holds are dropped → the LMDB
+    /// `Environment` drops synchronously (`mdb_env_close`) → Windows releases
+    /// the mmap file handles → the DB directory can be deleted.
+    ///
+    /// Bounded to 5 s so a stuck task can never wedge `remove_repo`; on
+    /// timeout the handle is dropped (detaching the task) and a warning is
+    /// logged. The DB delete retry-loop in `remove_repo` remains as a
+    /// fallback for that edge case.
+    async fn await_fsw_shutdown(&self, alias: &str) {
+        if let Some((_, handle)) = self.fsw_tasks.remove(alias) {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => {
+                    tracing::debug!("FSW task for '{}' exited cleanly", alias);
+                }
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        "FSW task for '{}' panicked during shutdown: {}",
+                        alias,
+                        join_err
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "FSW task for '{}' did not exit within 5s; LMDB handles may stay locked",
+                        alias
+                    );
+                }
+            }
+        }
+    }
+
     /// Spawn the FSW background task for a repo after it has been stopped.
     ///
     /// Creates a fresh IndexManager, performs an initial incremental refresh,
     /// then starts the continuous file watcher loop. Updates the RepoState with
     /// the new cancel token and IndexManager.
     async fn restart_fsw(&self, alias: &str, stores: Arc<SharedStores>) {
+        // The caller already cancelled the previous FSW task via stop_fsw.
+        // Await its exit so its Arc<SharedStores>/Arc<IndexManager> clones drop
+        // before we spawn a new task against the same stores (and so the old
+        // handle is removed from fsw_tasks before we insert a fresh one below).
+        self.await_fsw_shutdown(alias).await;
+
         let path = {
             let config = match self.config.read() {
                 Ok(c) => c,
@@ -1366,7 +1465,7 @@ impl ServeState {
                 let notifier = self.make_csharp_notifier(alias);
                 let indexing_cb = self.make_indexing_status_callback(alias);
 
-                tokio::spawn(async move {
+                let fsw_handle = tokio::spawn(async move {
                     if let Err(e) = im_for_task.start_watching().await {
                         tracing::warn!("Could not pre-start FSW for '{}': {}", alias_bg, e);
                     }
@@ -1392,6 +1491,8 @@ impl ServeState {
                         tracing::error!("File watcher for '{}' stopped: {}", alias_bg, e);
                     }
                 });
+
+                self.fsw_tasks.insert(alias.to_string(), fsw_handle);
 
                 if let Some(mut entry) = self.repos.get_mut(alias) {
                     *entry.value_mut() = RepoState::Write {
@@ -1674,7 +1775,7 @@ impl ServeState {
                     let notifier = self.make_csharp_notifier(alias);
                     let indexing_cb = self.make_indexing_status_callback(alias);
 
-                    tokio::spawn(async move {
+                    let fsw_handle = tokio::spawn(async move {
                         // Pre-start FSW so changes during initial refresh aren't lost
                         if let Err(e) = im_for_task.start_watching().await {
                             tracing::warn!("Could not pre-start FSW for '{}': {}", alias_clone, e);
@@ -1703,6 +1804,7 @@ impl ServeState {
                             tracing::error!("File watcher for '{}' stopped: {}", alias_clone, e);
                         }
                     });
+                    self.fsw_tasks.insert(alias.to_string(), fsw_handle);
 
                     (Some(im_arc), token)
                 }
@@ -1754,7 +1856,7 @@ impl ServeState {
 
         // Fire-and-forget: create IndexManager + start FSW in background.
         // We don't block the first query — the repo is already searchable from the Warm state.
-        tokio::spawn(async move {
+        let fsw_handle = tokio::spawn(async move {
             if token_for_task.is_cancelled() {
                 return;
             }
@@ -1796,6 +1898,7 @@ impl ServeState {
                 }
             }
         });
+        self.fsw_tasks.insert(alias.to_string(), fsw_handle);
 
         // Transition to Write immediately so future requests see this repo as active.
         // The IndexManager is created inside the spawned task, so we store None here.
@@ -1992,6 +2095,19 @@ impl ServeState {
                 c.fetch_add(1, Ordering::Relaxed);
             })
             .or_insert_with(|| AtomicU64::new(1));
+    }
+
+    /// Most recent real tool-call time across all repos, if any.
+    ///
+    /// Used by the cloud keep-warm task to decide whether the server is still
+    /// "active". Only genuine tool calls update `last_tool_call`; health/status
+    /// probes and the keep-warm self-ping do not, so this reflects real query
+    /// activity — not the keep-warm traffic that keeps the replica alive.
+    pub(crate) fn most_recent_tool_call(&self) -> Option<Instant> {
+        self.last_tool_call
+            .iter()
+            .map(|entry| entry.value().1)
+            .max()
     }
 
     /// Record that changes were made to a repo (index/reindex).
@@ -2317,6 +2433,11 @@ impl ServeState {
         }
 
         for alias in &to_evict {
+            // Detach the FSW handle (no-op for Warm/Readonly/Conflicted — they
+            // have no FSW task). Eviction frees memory; the DB dir is NOT
+            // deleted (the repo can be re-opened on the next query), so we
+            // don't need to await — the cancelled task drains on its own.
+            self.fsw_tasks.remove(alias);
             match self.repos.remove(alias) {
                 Some((_, RepoState::Write { cancel_token, .. })) => {
                     cancel_token.cancel();
@@ -2352,6 +2473,16 @@ async fn health_handler() -> AxumJson<serde_json::Value> {
         codesearch_server: true,
         version: env!("CARGO_PKG_VERSION").to_string(),
     }))
+}
+
+/// Unauthenticated liveness-probe handler: GET /healthz
+///
+/// Always returns `200 {"status":"ok"}` with no version or repo information.
+/// Exempted from `require_auth_for_network`, so container-orchestrator probes
+/// (e.g. Azure Container Apps) can reach it on a network bind without the
+/// Bearer key. Keep this body free of any sensitive/identifying data.
+async fn healthz_handler() -> AxumJson<serde_json::Value> {
+    AxumJson(json!({ "status": "ok" }))
 }
 
 /// Status handler: GET /status
@@ -2454,6 +2585,57 @@ async fn status_handler(
         "csharp_helper": csharp_helper,
         "uptime_secs": uptime_secs,
     }))
+}
+
+/// Projection of a federation peer that is safe to expose over `GET /remotes`.
+///
+/// This is a **dedicated, deliberately narrow type** rather than a reuse of
+/// [`crate::db_discovery::repos::RemotePeer`]: `RemotePeer` carries the
+/// `api_key` shared secret, which must NEVER leave the process via this
+/// observability endpoint. By construction this struct has no `api_key` field,
+/// so the secret cannot be serialized even by accident. Only the four
+/// operator-relevant fields are projected here.
+#[derive(serde::Serialize)]
+struct RemotePeerInfo {
+    alias: String,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_secs: Option<u64>,
+}
+
+/// Remotes handler: GET /remotes
+///
+/// Observability companion to [`status_handler`]: lists the federation peers
+/// this serve fans out to (the `remotes` map from `repos.json`), sorted by
+/// alias for stable output. On a config read error the endpoint degrades
+/// gracefully to `{"remotes": []}` rather than returning a 500, since the peer
+/// list is purely informational.
+///
+/// Read-only and status-like: same auth policy as `/status` (no admin key on
+/// localhost, protected by `require_auth_for_network` on network binds). Does
+/// not touch in-memory [`ServeState`], so it takes no state extractor.
+async fn remotes_handler() -> AxumJson<serde_json::Value> {
+    // Load the on-disk peer config; a read failure is non-fatal for an
+    // observability endpoint — report an empty peer list instead of a 500.
+    let cfg = crate::db_discovery::load_repos_config().unwrap_or_default();
+
+    // Project each peer into the api_key-less `RemotePeerInfo` view, then sort
+    // by alias for deterministic output.
+    let mut remotes: Vec<RemotePeerInfo> = cfg
+        .remotes
+        .iter()
+        .map(|(alias, p)| RemotePeerInfo {
+            alias: alias.clone(),
+            url: p.url.clone(),
+            group: p.group.clone(),
+            timeout_secs: p.timeout_secs,
+        })
+        .collect();
+    remotes.sort_by(|a, b| a.alias.cmp(&b.alias));
+
+    AxumJson(json!({ "remotes": remotes }))
 }
 
 /// Info handler: GET /repos/{alias}/info
@@ -3450,6 +3632,13 @@ async fn require_auth_for_network(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // Public liveness probe: always unauthenticated, even on a network bind.
+    // Container orchestrators (e.g. Azure Container Apps) hit this without the
+    // Bearer key. The handler returns no sensitive info.
+    if req.uri().path() == HEALTHZ_PATH {
+        return next.run(req).await;
+    }
+
     // Localhost binding: no auth required.
     if !auth_config.is_network_bind {
         return next.run(req).await;
@@ -3503,7 +3692,7 @@ async fn log_mcp_requests(
 
     let response = next.run(req).await;
 
-    if path != crate::constants::HEALTH_PATH {
+    if path != crate::constants::HEALTH_PATH && path != crate::constants::HEALTHZ_PATH {
         let status = response.status().as_u16();
         tracing::info!("{} {} → {}", method, path, status);
     }
@@ -3551,6 +3740,8 @@ pub async fn run_serve(
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
     no_tui: bool,
+    keep_warm_url: Option<String>,
+    idle_suspend_secs: Option<u64>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     use crate::constants::{resolve_serve_host, SERVE_HOST_ENV};
@@ -3662,9 +3853,14 @@ pub async fn run_serve(
             let session_id = state_for_factory.session_connected();
             info!("🔌 MCP client connected (session #{})", session_id);
             // We create a minimal service; actual repo routing is handled inside
-            // the tool handlers via serve_state.
-            crate::mcp::CodesearchService::new_for_serve(state_for_factory.clone())
-                .map_err(std::io::Error::other)
+            // the tool handlers via serve_state. Marking it session-tracked pairs
+            // the session_connected() above with session_disconnected() in Drop —
+            // per-request REST services (make_service) are NOT marked, so they
+            // never decrement active_sessions (which would underflow it to MAX).
+            let mut svc = crate::mcp::CodesearchService::new_for_serve(state_for_factory.clone())
+                .map_err(std::io::Error::other)?;
+            svc.mark_session_tracked();
+            Ok(svc)
         };
 
     // Build session manager without keep_alive timeout. The default rmcp timeout
@@ -3695,7 +3891,15 @@ pub async fn run_serve(
     // Auth failures are logged because log_mcp_requests wraps the admin-auth layer.
     let app = axum::Router::new()
         .route(HEALTH_PATH, axum::routing::get(health_handler))
+        .route(HEALTHZ_PATH, axum::routing::get(healthz_handler))
         .route(STATUS_PATH, axum::routing::get(status_handler))
+        // /remotes is a status-like read-only observability endpoint (lists the
+        // configured federation peers). It is NOT in require_admin_auth's
+        // `is_management` set, so it inherits exactly the same auth policy as
+        // /status, /repos/:alias/info and /repos/:alias/doctor: reachable
+        // without the admin key on localhost, protected by
+        // require_auth_for_network on network binds. See REMOTES_PATH doc.
+        .route(REMOTES_PATH, axum::routing::get(remotes_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
         .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
         .route("/reload", axum::routing::post(reload_handler))
@@ -3710,6 +3914,27 @@ pub async fn run_serve(
         // protected by require_auth_for_network on network binds. If doctor ever
         // gains a mutating mode, add it to `is_management` in require_admin_auth.
         .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
+        // REST endpoints — federation-friendly HTTP+JSON mirror of the read-only
+        // MCP tools (search/find/explore/get_chunk). Lets a remote codesearch
+        // serve be queried WITHOUT an MCP session. Same auth layers as /mcp &
+        // /status (require_auth_for_network on network binds). Read-only by
+        // construction (the underlying tools never mutate the index).
+        .route(
+            SEARCH_PATH,
+            axum::routing::post(crate::mcp::rest_search_handler),
+        )
+        .route(
+            FIND_PATH,
+            axum::routing::post(crate::mcp::rest_find_handler),
+        )
+        .route(
+            EXPLORE_PATH,
+            axum::routing::post(crate::mcp::rest_explore_handler),
+        )
+        .route(
+            CHUNK_PATH,
+            axum::routing::get(crate::mcp::rest_get_chunk_handler),
+        )
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(require_admin_auth))
         .layer(axum::middleware::from_fn(log_mcp_requests))
@@ -3793,6 +4018,59 @@ pub async fn run_serve(
         });
     }
 
+    // ── Cloud keep-warm (scale-to-zero suspend after idle) ──
+    // On a scale-to-zero host (e.g. Azure Container Apps) no ingress traffic
+    // means the platform suspends the replica. While the most recent real tool
+    // call is younger than the idle window, self-ping our own ingress FQDN to
+    // generate traffic and stay warm; once idle exceeds the window, stop and let
+    // the host suspend. The next real request wakes us automatically.
+    let keep_warm_url = keep_warm_url
+        .filter(|u| !u.is_empty())
+        .or_else(|| std::env::var(crate::constants::KEEP_WARM_URL_ENV).ok())
+        .filter(|u| !u.is_empty());
+    if let Some(base_url) = keep_warm_url {
+        let idle_suspend = idle_suspend_secs
+            .or_else(|| {
+                std::env::var(crate::constants::IDLE_SUSPEND_SECS_ENV)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(crate::constants::DEFAULT_IDLE_SUSPEND_SECS);
+        let ping_url = format!("{}{}", base_url.trim_end_matches('/'), HEALTHZ_PATH);
+        let kw_state = serve_state.clone();
+        let kw_cancel = cancel_token.clone();
+        let start = Instant::now();
+        info!(
+            "🔥 keep-warm enabled: pinging {} every {}s while idle < {}s",
+            ping_url,
+            crate::constants::KEEP_WARM_INTERVAL_SECS,
+            idle_suspend
+        );
+        tokio::spawn(async move {
+            let interval =
+                std::time::Duration::from_secs(crate::constants::KEEP_WARM_INTERVAL_SECS);
+            let client = reqwest::Client::new();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        // Fall back to the server start time when no query has
+                        // happened yet, so a freshly deployed replica stays warm
+                        // for the full idle window before first use.
+                        let last = kw_state.most_recent_tool_call().unwrap_or(start);
+                        if last.elapsed().as_secs() < idle_suspend {
+                            let _ = client
+                                .get(&ping_url)
+                                .timeout(std::time::Duration::from_secs(10))
+                                .send()
+                                .await;
+                        }
+                    }
+                    _ = kw_cancel.cancelled() => break,
+                }
+            }
+        });
+    }
+
     // Graceful shutdown
     //
     // axum::serve::with_graceful_shutdown stops accepting new connections when the
@@ -3854,6 +4132,126 @@ mod tests {
         assert!(api_key_matches("", "")); // both empty digests are equal
                                           // Case-sensitive and exact.
         assert!(!api_key_matches("Secret-Key", "secret-key"));
+    }
+
+    #[test]
+    fn rest_service_drop_does_not_touch_active_sessions() {
+        // Per-request REST services (built via make_service for /search /find
+        // /explore /chunk, NOT the serve MCP session factory) must never touch
+        // active_sessions: their Drop must NOT decrement the counter, or it
+        // underflows to u64::MAX. Regression guard for the tracks_session fix.
+        let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+        {
+            let _svc = crate::mcp::CodesearchService::new_for_serve(state.clone()).unwrap();
+        }
+        assert_eq!(
+            state.active_session_count(),
+            0,
+            "REST service drop underflowed active_sessions"
+        );
+    }
+
+    #[test]
+    fn tracked_session_drop_balances_active_sessions() {
+        // A genuine MCP session increments on connect and the serve factory
+        // marks it tracked, so Drop decrements and the counter returns to 0.
+        let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+        let _id = state.session_connected();
+        {
+            let mut svc = crate::mcp::CodesearchService::new_for_serve(state.clone()).unwrap();
+            svc.mark_session_tracked();
+        }
+        assert_eq!(
+            state.active_session_count(),
+            0,
+            "tracked session did not balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_fsw_shutdown_joins_exited_task_and_removes_entry() {
+        // `await_fsw_shutdown` must (a) remove the alias from `fsw_tasks` and
+        // (b) actually await (join) the task to completion — not just drop the
+        // handle. We prove the join happened by observing a side-effect the
+        // task sets on exit. Regression guard for the Windows DB-delete fix:
+        // if someone removes the join, the LMDB env stays open and the task's
+        // Arc<SharedStores> clone keeps the mmap handle locked on Windows.
+        let state = ServeState::new(ReposConfig::default(), None);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_clone = done.clone();
+        let handle = tokio::spawn(async move {
+            // Yield once so the task isn't already-finished at insert time.
+            tokio::task::yield_now().await;
+            done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        state.fsw_tasks.insert("repo-x".to_string(), handle);
+        state.await_fsw_shutdown("repo-x").await;
+        assert!(
+            !state.fsw_tasks.contains_key("repo-x"),
+            "fsw_tasks entry not removed"
+        );
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "FSW task was not joined to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_fsw_shutdown_noop_on_missing_alias() {
+        // A repo that never had an FSW task (Warm/Readonly/Conflicted) must
+        // not panic — the map lookup is the no-op guard.
+        let state = ServeState::new(ReposConfig::default(), None);
+        state.await_fsw_shutdown("never-spawned").await;
+        assert!(state.fsw_tasks.is_empty());
+    }
+
+    /// Regression guard: `GET /remotes` must NEVER expose a peer's `api_key`.
+    ///
+    /// `RemotePeerInfo` is a dedicated projection struct with no `api_key`
+    /// field — serde cannot serialize a field that doesn't exist, so the
+    /// shared secret cannot leak even by accident. This test locks that
+    /// defense-in-depth: if a future change adds an `api_key` field to
+    /// `RemotePeerInfo` (or otherwise lets the key into the response shape),
+    /// this assertion fails.
+    #[test]
+    fn remote_peer_info_never_serializes_api_key() {
+        use crate::db_discovery::repos::RemotePeer;
+
+        // Build a peer carrying a real-looking secret, exactly as it lives in
+        // repos.json, then project it the same way `remotes_handler` does.
+        let peer = RemotePeer {
+            url: "https://codesearch-serve.example.internal".to_string(),
+            api_key: "supersecret-LEAK-MARKER-do-not-serialize".to_string(),
+            group: Some("all".to_string()),
+            timeout_secs: Some(90),
+        };
+        let info = RemotePeerInfo {
+            alias: "cloud".to_string(),
+            url: peer.url.clone(),
+            group: peer.group.clone(),
+            timeout_secs: peer.timeout_secs,
+        };
+
+        let json = serde_json::to_string(&info).expect("RemotePeerInfo must serialize");
+
+        // The four whitelisted fields are present:
+        assert!(json.contains("cloud"), "alias missing: {json}");
+        assert!(
+            json.contains("codesearch-serve.example.internal"),
+            "url missing: {json}"
+        );
+        assert!(json.contains("all"), "group missing: {json}");
+        assert!(json.contains("90"), "timeout_secs missing: {json}");
+
+        // The secret is NOT present — neither the field name nor the value:
+        assert!(
+            !json.contains("api_key"),
+            "api_key FIELD leaked into /remotes response shape: {json}"
+        );
+        assert!(
+            !json.contains("supersecret-LEAK-MARKER"),
+            "api_key VALUE leaked into /remotes response: {json}"
+        );
     }
 
     fn state_with_config(config: ReposConfig) -> ServeState {
@@ -4297,6 +4695,61 @@ mod tests {
         );
     }
 
+    /// `/healthz` is exempt from `require_auth_for_network`: reachable without a
+    /// key even on a (simulated) network bind, while `/health` stays protected.
+    #[tokio::test]
+    async fn healthz_is_unauthenticated_on_network_bind() {
+        let network_auth = NetworkAuthConfig {
+            is_network_bind: true,
+            api_key: Some("secret-key".to_string()),
+        };
+
+        let app = axum::Router::new()
+            .route(HEALTH_PATH, axum::routing::get(health_handler))
+            .route(HEALTHZ_PATH, axum::routing::get(healthz_handler))
+            .layer(axum::middleware::from_fn(require_auth_for_network))
+            .layer(axum::Extension(network_auth));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // /healthz reachable WITHOUT a key on a network bind.
+        let resp = client
+            .get(format!("http://{}/healthz", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "/healthz must be public on a network bind"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body.get("status").and_then(|v| v.as_str()),
+            Some("ok"),
+            "/healthz body must be {{\"status\":\"ok\"}}"
+        );
+
+        // /health stays protected on a network bind (401 without a key).
+        let resp = client
+            .get(format!("http://{}/health", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "/health must still require auth on a network bind"
+        );
+    }
+
     /// Verify that the /repos/:alias/info and /repos/:alias/doctor routes are
     /// registered and reachable. Starts a real axum server on a random port and
     /// asserts that an unknown alias yields our handler's 404 (not axum's 404).
@@ -4378,6 +4831,146 @@ mod tests {
             "expected JSON error body from doctor handler, got: {}",
             body
         );
+    }
+
+    /// Verify that the federation REST endpoints (/search, /find, /explore,
+    /// /chunk/:id) are registered and reachable. Each must dispatch to OUR
+    /// handler (returning a JSON body) rather than axum's built-in empty 404.
+    /// Starts a real axum server on a random port.
+    #[tokio::test]
+    async fn rest_routes_are_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("myrepo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+            .unwrap();
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+
+        let state = Arc::new(ServeState::new(config, Some(config_file)));
+
+        let app = axum::Router::new()
+            .route(
+                crate::constants::HEALTH_PATH,
+                axum::routing::get(health_handler),
+            )
+            .route(
+                crate::constants::SEARCH_PATH,
+                axum::routing::post(crate::mcp::rest_search_handler),
+            )
+            .route(
+                crate::constants::FIND_PATH,
+                axum::routing::post(crate::mcp::rest_find_handler),
+            )
+            .route(
+                crate::constants::EXPLORE_PATH,
+                axum::routing::post(crate::mcp::rest_explore_handler),
+            )
+            .route(
+                crate::constants::CHUNK_PATH,
+                axum::routing::get(crate::mcp::rest_get_chunk_handler),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+
+        // Helper: a response from OUR handler is either 200 (success) or 500
+        // (McpError mapped), but ALWAYS a parseable JSON body — never axum's
+        // built-in empty 404. The repo has no index, so the tools return
+        // error/scope JSON; we only assert the route + handler are wired.
+        async fn assert_our_handler(client: &reqwest::Client, url: String) -> serde_json::Value {
+            let resp = client.get(&url).send().await.unwrap();
+            // GET endpoints: must reach our handler (JSON body), status 200/500.
+            assert!(
+                resp.status() == reqwest::StatusCode::OK
+                    || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "GET {} -> unexpected status {} (route not registered?)",
+                url,
+                resp.status()
+            );
+            resp.json().await.unwrap_or_else(|e| {
+                panic!(
+                    "GET {} did not return a JSON body from our handler: {}",
+                    url, e
+                )
+            })
+        }
+
+        // POST /search — dispatches to rest_search_handler.
+        let resp = client
+            .post(format!("http://{}/search", addr))
+            .json(&serde_json::json!({"query": "foo", "project": "testalias"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == reqwest::StatusCode::OK
+                || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "POST /search -> unexpected status {} (route not registered?)",
+            resp.status()
+        );
+        let _body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("POST /search should return JSON from our handler, not axum's 404");
+
+        // POST /find — dispatches to rest_find_handler.
+        let resp = client
+            .post(format!("http://{}/find", addr))
+            .json(
+                &serde_json::json!({"kind": "definition", "symbol": "foo", "project": "testalias"}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == reqwest::StatusCode::OK
+                || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "POST /find -> unexpected status {} (route not registered?)",
+            resp.status()
+        );
+        let _: serde_json::Value = resp
+            .json()
+            .await
+            .expect("POST /find should return JSON from our handler");
+
+        // POST /explore — dispatches to rest_explore_handler.
+        let resp = client
+            .post(format!("http://{}/explore", addr))
+            .json(&serde_json::json!({"kind": "outline", "target": "somefile", "project": "testalias"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == reqwest::StatusCode::OK
+                || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "POST /explore -> unexpected status {} (route not registered?)",
+            resp.status()
+        );
+        let _: serde_json::Value = resp
+            .json()
+            .await
+            .expect("POST /explore should return JSON from our handler");
+
+        // GET /chunk/1 — dispatches to rest_get_chunk_handler.
+        let _ = assert_our_handler(
+            &client,
+            format!("http://{}/chunk/1?project=testalias", addr),
+        )
+        .await;
     }
 
     #[test]

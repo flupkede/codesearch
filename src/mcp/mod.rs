@@ -190,6 +190,7 @@ mod tests {
             results: vec![],
             low_confidence: Some(true),
             suggested_tool: Some("literal_search".to_string()),
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"low_confidence\":true"));
@@ -210,9 +211,12 @@ mod tests {
                 content: None,
                 context_prev: None,
                 context_next: None,
+                source: None,
+                chunk_ref: None,
             }],
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("low_confidence"));
@@ -954,9 +958,12 @@ mod tests {
                 content: None,
                 context_prev: None,
                 context_next: None,
+                source: None,
+                chunk_ref: None,
             }],
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"results\""));
@@ -970,6 +977,7 @@ mod tests {
             results: vec![],
             low_confidence: Some(true),
             suggested_tool: Some("find_definition".to_string()),
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"low_confidence\":true"));
@@ -2591,7 +2599,7 @@ pub struct CodesearchService {
     model_type: ModelType,
     dimensions: usize,
     // Lazily initialized on first search
-    embedding_service: Mutex<Option<EmbeddingService>>,
+    embedding_service: Arc<Mutex<Option<EmbeddingService>>>,
     // Shared stores for concurrent access (optional - only set when running with IndexManager)
     shared_stores: Option<Arc<SharedStores>>,
     // Serve-mode state (set when running inside `codesearch serve`)
@@ -2600,6 +2608,13 @@ pub struct CodesearchService {
     // helper-detection cache. In serve mode, cloned from ServeState; in
     // standalone mode, a locally owned Arc.
     symbol_registry: Arc<SymbolIndexerRegistry>,
+    // True ONLY for services created by the serve-mode MCP session factory,
+    // which pairs `session_connected()` (on create) with `session_disconnected()`
+    // (in Drop). Per-request REST services built via `make_service` leave this
+    // false so `Drop` does NOT decrement `active_sessions` — otherwise that
+    // AtomicU64 underflows (0 - 1 wraps to u64::MAX) on every REST request,
+    // corrupting the `/status` health signal.
+    tracks_session: bool,
 }
 
 impl std::fmt::Debug for CodesearchService {
@@ -2616,10 +2631,15 @@ impl std::fmt::Debug for CodesearchService {
 
 impl Drop for CodesearchService {
     fn drop(&mut self) {
-        // When a session ends (CodesearchService is dropped), decrement the active session counter.
-        // This pairs with the session_connected() call in the service factory in serve/mod.rs.
-        if let Some(ref serve_state) = self.serve_state {
-            serve_state.session_disconnected();
+        // Only genuine MCP sessions (created by the serve factory, which calls
+        // session_connected() + mark_session_tracked()) balance the counter.
+        // Per-request REST services (make_service → new_for_serve) never
+        // increment it, so must NOT decrement here — otherwise active_sessions
+        // underflows (the AtomicU64 wraps to u64::MAX) on every REST request.
+        if self.tracks_session {
+            if let Some(ref serve_state) = self.serve_state {
+                serve_state.session_disconnected();
+            }
         }
     }
 }
@@ -3483,10 +3503,11 @@ impl CodesearchService {
             project_path,
             model_type,
             dimensions,
-            embedding_service: Mutex::new(None),
+            embedding_service: Arc::new(Mutex::new(None)),
             shared_stores,
             serve_state: None,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
+            tracks_session: false,
         })
     }
 
@@ -3502,11 +3523,23 @@ impl CodesearchService {
             project_path: PathBuf::from("serve://multi-repo"),
             model_type: ModelType::default(),
             dimensions: crate::constants::DEFAULT_EMBEDDING_DIMENSIONS,
-            embedding_service: Mutex::new(None),
+            embedding_service: serve_state.embedding_service(),
             shared_stores: None,
             serve_state: Some(serve_state),
             symbol_registry,
+            tracks_session: false,
         })
+    }
+
+    /// Mark this service as owning a session slot so `Drop` will balance the
+    /// `session_connected()` the caller already made.
+    ///
+    /// Only the serve-mode MCP session factory (`run_serve`) should call this:
+    /// it calls `session_connected()` and then this. Per-request REST services
+    /// built via `make_service` must NOT — they never increment the counter, so
+    /// decrementing it on drop would underflow `active_sessions` to `u64::MAX`.
+    pub(crate) fn mark_session_tracked(&mut self) {
+        self.tracks_session = true;
     }
 
     /// Get or initialize the embedding service
@@ -3715,18 +3748,22 @@ impl CodesearchService {
     /// Build a structured `scope_required` error JSON for multi-repo mode.
     ///
     /// Returns a JSON string containing `error_code`, `message`, `available_projects`,
-    /// `available_groups`, and `hint_for_agent` so that LLM agents can programmatically
-    /// react to the scope requirement.
+    /// `available_groups`, `project_groups`, and `hint_for_agent` so that LLM
+    /// agents can programmatically react to the scope requirement. `project_groups`
+    /// maps each project to the named group(s) it belongs to, so an agent can tell
+    /// that picking a single project would miss sibling repos in the same group
+    /// (e.g. a separate config / import-data repo).
     fn format_scope_error(&self) -> String {
-        let (projects, mut groups) = if let Some(ref serve_state) = self.serve_state {
+        let (projects, mut groups, project_groups) = if let Some(ref serve_state) = self.serve_state
+        {
             let cfg = serve_state.config_snapshot();
             let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
             projects.sort();
             let mut groups: Vec<String> = cfg.groups.keys().cloned().collect();
             groups.sort();
-            (projects, groups)
+            (projects, groups, cfg.project_groups())
         } else {
-            (vec![], vec![])
+            (vec![], vec![], std::collections::HashMap::new())
         };
         // The "all" virtual group is always available when there are projects to
         // search — advertise it so agents discover the cross-repo shortcut.
@@ -3742,7 +3779,8 @@ impl CodesearchService {
             "message": "Specify project= for a single repository or group= for cross-repo search.",
             "available_projects": projects,
             "available_groups": groups,
-            "hint_for_agent": "If the user has not indicated which repository to search, ask them to choose. Show available_projects and available_groups as options."
+            "project_groups": project_groups,
+            "hint_for_agent": "If the user has not indicated which repository to search, ask them to choose. Show available_projects and available_groups as options. IMPORTANT: project_groups maps each project to the group(s) it belongs to — if the project you would pick is listed there, prefer group= over project= so related repos (e.g. a separate config or import-data repo) are searched too."
         });
         payload.to_string()
     }
@@ -3933,6 +3971,314 @@ impl CodesearchService {
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // Federation — cross-instance query merging (remote peers in a group).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Load the current repos config: from the live serve state when available,
+    /// else straight from disk (stdio mode). A missing disk file yields the
+    /// default (empty) config — federation simply has no peers to query.
+    fn federation_config(&self) -> crate::db_discovery::repos::ReposConfig {
+        if let Some(ref ss) = self.serve_state {
+            return ss.config_snapshot();
+        }
+        crate::db_discovery::repos::ReposConfig::load().unwrap_or_default()
+    }
+
+    /// True when the given group resolves to at least one remote peer.
+    fn group_has_remotes(cfg: &crate::db_discovery::repos::ReposConfig, group: &str) -> bool {
+        cfg.resolve_group_targets(group)
+            .iter()
+            .any(|t| matches!(t, crate::db_discovery::repos::Target::Remote { .. }))
+    }
+
+    /// Merge local + remote search results for a group that has `@<peer>`
+    /// members. Runs the local query (restricted to the group's local repos),
+    /// fans out to every remote peer in parallel, then RRF-interleaves the
+    /// disjoint ranked lists. One unreachable peer becomes a `warning`, never a
+    /// hard failure.
+    async fn federated_search(
+        &self,
+        request: &SearchRequest,
+        cfg: &crate::db_discovery::repos::ReposConfig,
+        remotes: Vec<(String, crate::db_discovery::repos::RemotePeer)>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::federation::{FederationClient, Outcome};
+        use crate::rerank::DEFAULT_RRF_K;
+
+        let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
+        let limit = request.limit.unwrap_or(10);
+        let group = request.group.clone().unwrap_or_default();
+
+        // 1) Local results — internal handlers ignore `@remote` group members
+        //    (they aren't local aliases), so they search only the group's local
+        //    repos. Skip entirely when the group has no local repos.
+        let (locals, _) = cfg.split_group_targets(&group);
+        let mut local_items: Vec<SearchResultItem> = Vec::new();
+        if !locals.is_empty() {
+            let local_result = match mode.as_str() {
+                "semantic" => {
+                    let req = SemanticSearchRequest {
+                        query: request.query.clone(),
+                        limit: request.limit,
+                        compact: request.compact,
+                        filter_path: request.filter_path.clone(),
+                        mode: request.semantic_mode.clone(),
+                        project: None,
+                        group: Some(group.clone()),
+                    };
+                    self.semantic_search(Parameters(req)).await?
+                }
+                "literal" => {
+                    let req = LiteralSearchRequest {
+                        query: request.query.clone(),
+                        regex: request.regex,
+                        phrase: request.phrase,
+                        limit: request.limit,
+                        file_glob: request.file_glob.clone(),
+                        language: request.language.clone(),
+                        format: request.format.clone(),
+                        project: None,
+                        group: Some(group.clone()),
+                    };
+                    self.literal_search(Parameters(req)).await?
+                }
+                _ => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Unknown search mode '{}'. Use `semantic` or `literal`.",
+                        mode
+                    ))]));
+                }
+            };
+            local_items = parse_search_items_from_call_result(&local_result, &mode);
+        }
+
+        // 2) Build the request body shipped to each remote (group forced to the
+        //    peer's own scope + project stripped by the federation client).
+        let body = serde_json::json!({
+            "query": request.query,
+            "mode": mode,
+            "compact": request.compact,
+            "semantic_mode": request.semantic_mode,
+            "filter_path": request.filter_path,
+            "regex": request.regex,
+            "phrase": request.phrase,
+            "file_glob": request.file_glob,
+            "language": request.language,
+            "format": request.format,
+            "limit": request.limit,
+        });
+
+        let client = match FederationClient::new() {
+            Ok(c) => c,
+            Err(e) => {
+                // Can't build the HTTP client at all — degrade to local-only.
+                return Ok(self.build_federated_response(
+                    local_items,
+                    vec![format!("federation disabled (http client error): {e}")],
+                ));
+            }
+        };
+
+        // 3) Fan out to all remote peers concurrently.
+        let mut join = tokio::task::JoinSet::new();
+        for (peer_name, peer) in remotes.into_iter() {
+            let body = body.clone();
+            let client = client.clone();
+            join.spawn(async move {
+                let outcome = client.search(&peer, body).await;
+                (peer_name, outcome)
+            });
+        }
+
+        let mut warnings: Vec<String> = Vec::new();
+        let mut all_lists: Vec<Vec<SearchResultItem>> = vec![local_items];
+        while let Some(res) = join.join_next().await {
+            match res {
+                Ok((peer_name, Outcome::Ok(items))) => {
+                    all_lists.push(
+                        items
+                            .into_iter()
+                            .map(|it| convert_remote_item(&peer_name, it))
+                            .collect(),
+                    );
+                }
+                Ok((peer_name, Outcome::Unreachable(reason))) => {
+                    warnings.push(format!(
+                        "remote peer '{}' unreachable: {}",
+                        peer_name, reason
+                    ));
+                }
+                Err(joinerr) => {
+                    warnings.push(format!("federation task failed: {joinerr}"));
+                }
+            }
+        }
+
+        // 4) RRF-interleave the disjoint ranked lists and render.
+        let merged = merge_ranked_lists(all_lists, DEFAULT_RRF_K, limit);
+        Ok(self.build_federated_response(merged, warnings))
+    }
+
+    /// Query a single mounted remote project (`project=<peer>/<alias>`).
+    ///
+    /// A 1-to-1 passthrough: the query is forwarded to `peer` scoped to its own
+    /// `remote_alias` project, and the peer's results are re-namespaced so
+    /// `chunk_ref`s route back through `federated_get_chunk`. There is no local
+    /// list to merge, but results still pass through `merge_ranked_lists` (a
+    /// single list), so item `score`s are the RRF rank score, keeping rendering
+    /// identical to the group path. An unreachable peer yields a warning with
+    /// zero results rather than a hard error.
+    async fn federated_project_search(
+        &self,
+        request: &SearchRequest,
+        peer_name: String,
+        peer: crate::db_discovery::repos::RemotePeer,
+        remote_alias: String,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::federation::{FederationClient, Outcome};
+        use crate::rerank::DEFAULT_RRF_K;
+
+        let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
+        let limit = request.limit.unwrap_or(10);
+
+        // Same shape as the group fan-out body; the federation client forces
+        // `project=<remote_alias>` and strips `group`.
+        let body = serde_json::json!({
+            "query": request.query,
+            "mode": mode,
+            "compact": request.compact,
+            "semantic_mode": request.semantic_mode,
+            "filter_path": request.filter_path,
+            "regex": request.regex,
+            "phrase": request.phrase,
+            "file_glob": request.file_glob,
+            "language": request.language,
+            "format": request.format,
+            "limit": request.limit,
+        });
+
+        let client = match FederationClient::new() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(self.build_federated_response(
+                    vec![],
+                    vec![format!("federation disabled (http client error): {e}")],
+                ));
+            }
+        };
+
+        let outcome = client.search_project(&peer, body, &remote_alias).await;
+        let (items, warnings) = match outcome {
+            Outcome::Ok(items) => (
+                items
+                    .into_iter()
+                    .map(|it| convert_remote_item(&peer_name, it))
+                    .collect::<Vec<_>>(),
+                Vec::new(),
+            ),
+            Outcome::Unreachable(reason) => (
+                Vec::new(),
+                vec![format!(
+                    "remote project '{}/{}' unreachable: {}",
+                    peer_name, remote_alias, reason
+                )],
+            ),
+        };
+
+        // Single ranked list — RRF here is order-preserving and just caps to
+        // `limit`, keeping rendering identical to the group path.
+        let merged = merge_ranked_lists(vec![items], DEFAULT_RRF_K, limit);
+        Ok(self.build_federated_response(merged, warnings))
+    }
+
+    /// Fetch a chunk from a remote peer by its namespaced `chunk_ref`.
+    async fn federated_get_chunk(
+        &self,
+        chunk_ref: &str,
+        context_lines: Option<usize>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::federation::{FederationClient, Outcome};
+
+        let (peer_name, id_str) = match chunk_ref.split_once(':') {
+            Some((p, i)) => (p, i),
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Invalid chunk_ref '{}': expected '<peer>:<chunk_id>'.",
+                    chunk_ref
+                ))]));
+            }
+        };
+        let chunk_id: u32 = match id_str.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Invalid chunk_ref '{}': chunk_id is not a number.",
+                    chunk_ref
+                ))]));
+            }
+        };
+        let cfg = self.federation_config();
+        let peer = match cfg.remotes.get(peer_name) {
+            Some(p) => p.clone(),
+            None => {
+                let known: Vec<String> = cfg.remotes.keys().cloned().collect();
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Unknown remote peer '{}' in chunk_ref '{}'. Known remotes: {}",
+                    peer_name,
+                    chunk_ref,
+                    known.join(", ")
+                ))]));
+            }
+        };
+        let client = match FederationClient::new() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "federation disabled (http client error): {e}"
+                ))]));
+            }
+        };
+        match client.get_chunk(&peer, chunk_id, context_lines).await {
+            Outcome::Ok(value) => Ok(CallToolResult::success(vec![Content::text(
+                value.to_string(),
+            )])),
+            Outcome::Unreachable(reason) => {
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Could not fetch chunk from remote peer '{}': {}",
+                    peer_name, reason
+                ))]))
+            }
+        }
+    }
+
+    /// Render the merged federated results as a `SemanticSearchResponse` JSON.
+    ///
+    /// `low_confidence` is only flagged when the merged set is empty: RRF-fused
+    /// scores (`1/(k+rank+1)`, max ≈ 0.048 for k=20) are NOT comparable to the
+    /// single-source embedding/BM25 thresholds, so applying any score cutoff
+    /// here would be meaningless. An empty result, however, is a genuine signal
+    /// to the agent that federation yielded nothing and it should try a broader
+    /// query or a different scope.
+    fn build_federated_response(
+        &self,
+        items: Vec<SearchResultItem>,
+        warnings: Vec<String>,
+    ) -> CallToolResult {
+        let response = SemanticSearchResponse {
+            low_confidence: if items.is_empty() { Some(true) } else { None },
+            results: items,
+            suggested_tool: None,
+            warnings: if warnings.is_empty() {
+                None
+            } else {
+                Some(warnings)
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+        CallToolResult::success(vec![Content::text(json)])
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // Consolidated tools (the primary 5-tool surface)
     // ─────────────────────────────────────────────────────────────────
 
@@ -3951,6 +4297,40 @@ impl CodesearchService {
             request.project,
             request.group,
         );
+
+        // Federation: when the query targets a group that resolves to one or more
+        // remote peers, merge local + remote results (RRF-interleave) instead of
+        // searching local repos only. Only `group` federates; `project` stays
+        // local because project aliases are instance-local.
+        if let Some(group) = request.group.as_deref() {
+            let cfg = self.federation_config();
+            if Self::group_has_remotes(&cfg, group) {
+                let remotes = cfg.split_group_targets(group).1;
+                return self.federated_search(&request, &cfg, remotes).await;
+            }
+        }
+
+        // Project-level federation (mounted remote project): a `project` of the
+        // form "<peer>/<alias>" transparently routes to that single peer's own
+        // `<alias>` project — a 1-to-1 passthrough, as if the index were local.
+        // Local repos ALWAYS win a name clash: only route remotely when the name
+        // does not resolve to a local project.
+        if let Some(proj) = request.project.as_deref() {
+            let cfg = self.federation_config();
+            if cfg.resolve(proj).is_none() {
+                if let Some(crate::db_discovery::repos::Target::RemoteProject {
+                    peer_name,
+                    peer,
+                    remote_alias,
+                }) = cfg.resolve_remote_project(proj)
+                {
+                    return self
+                        .federated_project_search(&request, peer_name, peer, remote_alias)
+                        .await;
+                }
+            }
+        }
+
         let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
         match mode.as_str() {
             "semantic" => {
@@ -4816,6 +5196,7 @@ impl CodesearchService {
                 results: vec![],
                 low_confidence: Some(true),
                 suggested_tool: Some("literal_search".to_string()),
+                warnings: None,
             };
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
             return Ok(CallToolResult::success(vec![Content::text(json)]));
@@ -4852,6 +5233,8 @@ impl CodesearchService {
                 content: if compact { None } else { Some(r.content) },
                 context_prev: if compact { None } else { r.context_prev },
                 context_next: if compact { None } else { r.context_next },
+                source: None,
+                chunk_ref: None,
             })
             .collect();
 
@@ -4876,6 +5259,7 @@ impl CodesearchService {
             results: items,
             low_confidence,
             suggested_tool,
+            warnings: None,
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -5403,6 +5787,15 @@ impl CodesearchService {
             request.chunk_id,
             request.project,
         );
+
+        // Federation: a `chunk_ref` of the form "<peer>:<chunk_id>" (returned by
+        // a federated search result) fetches the chunk from a remote peer rather
+        // than the local index.
+        if let Some(chunk_ref) = request.chunk_ref.as_deref() {
+            return self
+                .federated_get_chunk(chunk_ref, request.context_lines)
+                .await;
+        }
 
         // In multi-repo serve mode, require explicit project or group scope.
         // Unscoped get_chunk would fan-out over all repos, opening all DBs unnecessarily.
@@ -6245,6 +6638,8 @@ impl CodesearchService {
                                     content: None,
                                     context_prev: None,
                                     context_next: None,
+                                    source: None,
+                                    chunk_ref: None,
                                 });
                             }
                         }
@@ -6291,6 +6686,8 @@ impl CodesearchService {
                                 content: None,
                                 context_prev: None,
                                 context_next: None,
+                                source: None,
+                                chunk_ref: None,
                             })
                             .collect::<Vec<_>>();
                         Ok(items)
@@ -7006,6 +7403,7 @@ impl CodesearchService {
         // When serve is active, use ServeState as source of truth for lock status
         if let Some(ref serve_state) = self.serve_state {
             let config = serve_state.config_snapshot();
+            let project_groups = config.project_groups();
             let mut repos_info = Vec::new();
 
             for (alias, path) in &config.repos {
@@ -7061,6 +7459,7 @@ impl CodesearchService {
                     total_files,
                     model,
                     lock_status,
+                    groups: project_groups.get(alias).cloned().unwrap_or_default(),
                 });
             }
 
@@ -7078,6 +7477,7 @@ impl CodesearchService {
 
         // Stdio mode: fall back to disk-based lock detection
         let config = load_repos_config().unwrap_or_default();
+        let project_groups = config.project_groups();
         let mut repos_info = Vec::new();
         for (alias, path) in &config.repos {
             let db_path = path.join(crate::constants::DB_DIR_NAME);
@@ -7118,6 +7518,7 @@ impl CodesearchService {
                 total_files,
                 model,
                 lock_status,
+                groups: project_groups.get(alias).cloned().unwrap_or_default(),
             });
         }
 
@@ -7278,6 +7679,275 @@ Project: {project}
 Database: {db} ({exists})
 Model: {model} ({dims}d)
 "#;
+
+// ════════════════════════════════════════════════════════════════
+// Federation helpers (module-scope) — merge / parse / convert.
+// ════════════════════════════════════════════════════════════════
+
+/// RRF-interleave several disjoint ranked lists into one ranked list.
+///
+/// Each list is assumed already ranked best-first and disjoint from the others
+/// (local repos vs. distinct remote peers). An item's merged score is
+/// `1/(k + rank_in_own_list + 1)` (classic Reciprocal Rank Fusion with a `+1`
+/// so the top hit never exceeds `1/k`). The union is sorted by score desc with a
+/// stable source-order tiebreak, then truncated to `limit`.
+fn merge_ranked_lists(
+    lists: Vec<Vec<SearchResultItem>>,
+    k: f32,
+    limit: usize,
+) -> Vec<SearchResultItem> {
+    let mut merged: Vec<(f32, usize, SearchResultItem)> = Vec::new();
+    let mut order = 0usize;
+    for list in lists {
+        for (rank, item) in list.into_iter().enumerate() {
+            let score = 1.0 / (k + rank as f32 + 1.0);
+            merged.push((score, order, item));
+            order += 1;
+        }
+    }
+    // Sort by score desc; tiebreak on insertion order for stable, predictable
+    // output (local list first, then remotes in config order).
+    merged.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    merged
+        .into_iter()
+        .take(limit)
+        .map(|(score, _, mut it)| {
+            it.score = score;
+            it
+        })
+        .collect()
+}
+
+/// Extract the rendered tool payload from a `CallToolResult` and re-parse it as
+/// local `SearchResultItem`s. Works for both semantic and literal modes — the
+/// rendered JSON always has a top-level `results` array.
+fn parse_search_items_from_call_result(
+    result: &CallToolResult,
+    mode: &str,
+) -> Vec<SearchResultItem> {
+    let text = extract_call_tool_text(result);
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let results = match value.get("results").and_then(|r| r.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    match mode {
+        "semantic" => results
+            .iter()
+            .filter_map(|v| serde_json::from_value::<SearchResultItem>(v.clone()).ok())
+            .collect(),
+        // Literal items lack `chunk_id`; map their `snippet` into `content` so
+        // the merged list renders uniformly.
+        _ => results
+            .iter()
+            .map(|v| SearchResultItem {
+                chunk_id: v.get("chunk_id").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+                path: v
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                start_line: v.get("start_line").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+                end_line: v.get("end_line").and_then(|n| n.as_u64()).unwrap_or(0) as usize,
+                kind: v
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                score: v.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0) as f32,
+                signature: v
+                    .get("signature")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string()),
+                content: v
+                    .get("snippet")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string()),
+                context_prev: None,
+                context_next: None,
+                source: None,
+                chunk_ref: None,
+            })
+            .collect(),
+    }
+}
+
+/// Convert a remote search hit into a local `SearchResultItem`, tagging it with
+/// its origin (`source`) and a namespaced `chunk_ref` for later retrieval.
+fn convert_remote_item(
+    peer_name: &str,
+    item: crate::federation::RemoteSearchItem,
+) -> SearchResultItem {
+    let chunk_ref = item.chunk_id.map(|id| format!("{peer_name}:{id}"));
+    SearchResultItem {
+        chunk_id: item.chunk_id.unwrap_or(0),
+        path: item.path,
+        start_line: item.start_line,
+        end_line: item.end_line,
+        kind: item.kind.unwrap_or_default(),
+        score: item.score,
+        signature: item.signature,
+        content: item.content.or(item.snippet),
+        context_prev: item.context_prev,
+        context_next: item.context_next,
+        source: Some(peer_name.to_string()),
+        chunk_ref,
+    }
+}
+
+/// Best-effort extraction of the concatenated text content of a
+/// `CallToolResult`. Resilient to rmcp's internal content enum shape.
+fn extract_call_tool_text(result: &CallToolResult) -> String {
+    serde_json::to_value(result)
+        .ok()
+        .and_then(|v| {
+            v.get("content").and_then(|c| c.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        })
+        .unwrap_or_default()
+}
+
+// ════════════════════════════════════════════════════════════════
+// REST API handlers (federation-friendly HTTP+JSON mirror of MCP tools).
+//
+// Expose the same logic over plain HTTP so a remote codesearch serve can be
+// queried for federation WITHOUT an MCP session. Each handler constructs a
+// throwaway `CodesearchService` bound to the live `ServeState`, invokes the
+// existing `#[tool]` method, and returns the tool's JSON payload unwrapped
+// from `CallToolResult`. Protected by serve's `require_auth_for_network`
+// layer (same as /status, /mcp) — no separate auth code needed.
+// ════════════════════════════════════════════════════════════════
+use axum::extract::{Path as AxumPath, Query as AxumQuery, State as AxumState};
+use axum::http::StatusCode;
+use axum::response::Json as AxumJson;
+
+type RestResponse = AxumJson<serde_json::Value>;
+type RestError = (StatusCode, AxumJson<serde_json::Value>);
+
+/// Unwrap a `CallToolResult` into the JSON a federation client wants.
+///
+/// `CallToolResult` carries its payload as `Content::text(json_string)`. The
+/// normal case for search/find/explore/get_chunk is a single text item whose
+/// value parses as JSON, so we parse it back and return the structured value
+/// (clients get clean objects instead of a JSON-in-string). When the tool set
+/// `is_error` (e.g. a `scope_required` error) we still parse the body but mark
+/// it with `"_mcp_is_error": true` so a federation caller can distinguish tool
+/// errors from HTTP errors. Non-JSON payloads fall back to `{content, is_error}`.
+pub(crate) fn call_tool_result_to_json(result: CallToolResult) -> serde_json::Value {
+    let is_error = result.is_error.unwrap_or(false);
+    let val = serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({}));
+    let text = val
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(mut parsed) => {
+            if is_error {
+                if let Some(obj) = parsed.as_object_mut() {
+                    obj.insert("_mcp_is_error".into(), serde_json::json!(true));
+                }
+            }
+            parsed
+        }
+        Err(_) => serde_json::json!({ "content": text, "is_error": is_error }),
+    }
+}
+
+/// Build a per-request `CodesearchService` bound to the live serve state.
+fn make_service(
+    state: &std::sync::Arc<crate::serve::ServeState>,
+) -> Result<CodesearchService, RestError> {
+    CodesearchService::new_for_serve(state.clone()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({"error": format!("failed to build service: {e}")})),
+        )
+    })
+}
+
+/// Map an MCP-layer error to an HTTP 500. `McpError` (= `rmcp::ErrorData`)
+/// derives `Serialize`, so round-trip it through a JSON value for the body.
+fn mcp_err_to_http(e: McpError) -> RestError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        AxumJson(serde_json::json!({
+            "error": serde_json::to_value(&e).unwrap_or(serde_json::Value::Null)
+        })),
+    )
+}
+
+pub(crate) async fn rest_search_handler(
+    AxumState(state): AxumState<std::sync::Arc<crate::serve::ServeState>>,
+    AxumJson(req): AxumJson<SearchRequest>,
+) -> Result<RestResponse, RestError> {
+    let service = make_service(&state)?;
+    let result = service
+        .search(Parameters(req))
+        .await
+        .map_err(mcp_err_to_http)?;
+    Ok(AxumJson(call_tool_result_to_json(result)))
+}
+
+pub(crate) async fn rest_find_handler(
+    AxumState(state): AxumState<std::sync::Arc<crate::serve::ServeState>>,
+    AxumJson(req): AxumJson<FindRequest>,
+) -> Result<RestResponse, RestError> {
+    let service = make_service(&state)?;
+    let result = service
+        .find(Parameters(req))
+        .await
+        .map_err(mcp_err_to_http)?;
+    Ok(AxumJson(call_tool_result_to_json(result)))
+}
+
+pub(crate) async fn rest_explore_handler(
+    AxumState(state): AxumState<std::sync::Arc<crate::serve::ServeState>>,
+    AxumJson(req): AxumJson<ExploreRequest>,
+) -> Result<RestResponse, RestError> {
+    let service = make_service(&state)?;
+    let result = service
+        .explore(Parameters(req))
+        .await
+        .map_err(mcp_err_to_http)?;
+    Ok(AxumJson(call_tool_result_to_json(result)))
+}
+
+pub(crate) async fn rest_get_chunk_handler(
+    AxumState(state): AxumState<std::sync::Arc<crate::serve::ServeState>>,
+    AxumPath(chunk_id): AxumPath<u32>,
+    AxumQuery(params): AxumQuery<std::collections::HashMap<String, String>>,
+) -> Result<RestResponse, RestError> {
+    let req = GetChunkRequest {
+        chunk_id,
+        chunk_ref: params.get("chunk_ref").cloned(),
+        context_lines: params.get("context_lines").and_then(|s| s.parse().ok()),
+        project: params.get("project").cloned(),
+        group: params.get("group").cloned(),
+    };
+    let service = make_service(&state)?;
+    let result = service
+        .get_chunk(Parameters(req))
+        .await
+        .map_err(mcp_err_to_http)?;
+    Ok(AxumJson(call_tool_result_to_json(result)))
+}
 
 #[tool_handler]
 impl ServerHandler for CodesearchService {
@@ -7871,4 +8541,103 @@ pub async fn run_mcp_server(
 
     tracing::info!("✅ MCP server shut down cleanly");
     Ok(())
+}
+
+#[cfg(test)]
+mod federation_helpers_tests {
+    //! Unit tests for the federation merge/parse/convert helpers. The
+    //! FederationClient HTTP layer + resolve_group_targets are covered
+    //! separately (federation/mod.rs and db_discovery/repos.rs respectively).
+    use super::{convert_remote_item, merge_ranked_lists};
+    use crate::federation::RemoteSearchItem;
+    use crate::mcp::types::SearchResultItem;
+
+    fn local_item(chunk_id: u32, score: f32) -> SearchResultItem {
+        SearchResultItem {
+            chunk_id,
+            path: format!("local/{chunk_id}.rs"),
+            start_line: 1,
+            end_line: 2,
+            kind: "Function".to_string(),
+            score,
+            signature: None,
+            content: None,
+            context_prev: None,
+            context_next: None,
+            source: None,
+            chunk_ref: None,
+        }
+    }
+
+    #[test]
+    fn merge_interleaves_disjoint_lists_by_rank() {
+        // Two disjoint ranked lists. RRF must interleave by rank, not by raw
+        // score (scores aren't comparable across systems).
+        let local = vec![
+            local_item(1, 0.99),
+            local_item(2, 0.50),
+            local_item(3, 0.10),
+        ];
+        let remote = vec![local_item(10, 0.88), local_item(11, 0.60)];
+        let merged = merge_ranked_lists(vec![local, remote], 20.0, 10);
+
+        // Top of each list should rank highest; order alternates by rank.
+        assert_eq!(merged.len(), 5);
+        // Rank-0 of each list: score 1/(20+0+1) = 1/21 ≈ 0.0476 — both rank 0
+        // tiebreak on insertion order (local list first).
+        let top_ids: Vec<u32> = merged.iter().map(|i| i.chunk_id).collect();
+        assert_eq!(top_ids, vec![1, 10, 2, 11, 3]);
+        // Scores must be reassigned to the RRF value.
+        assert!((merged[0].score - 1.0 / 21.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn merge_respects_limit() {
+        let a = vec![local_item(1, 0.9), local_item(2, 0.8), local_item(3, 0.7)];
+        let merged = merge_ranked_lists(vec![a], 20.0, 2);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn convert_tags_source_and_namespaced_chunk_ref() {
+        let remote = RemoteSearchItem {
+            chunk_id: Some(42),
+            path: "cloud/kb.md".to_string(),
+            start_line: 5,
+            end_line: 9,
+            kind: Some("Section".to_string()),
+            score: 0.7,
+            signature: None,
+            content: Some("body".to_string()),
+            snippet: None,
+            context_prev: None,
+            context_next: None,
+        };
+        let item = convert_remote_item("cloud", remote);
+        assert_eq!(item.source.as_deref(), Some("cloud"));
+        assert_eq!(item.chunk_ref.as_deref(), Some("cloud:42"));
+        assert_eq!(item.chunk_id, 42); // local id preserved for rendering
+        assert_eq!(item.path, "cloud/kb.md");
+    }
+
+    #[test]
+    fn convert_falls_back_to_snippet_as_content() {
+        // Literal-mode remote hits have `snippet` but no `content`.
+        let remote = RemoteSearchItem {
+            chunk_id: None,
+            path: "x".to_string(),
+            start_line: 0,
+            end_line: 0,
+            kind: None,
+            score: 0.1,
+            signature: None,
+            content: None,
+            snippet: Some("matched line".to_string()),
+            context_prev: None,
+            context_next: None,
+        };
+        let item = convert_remote_item("peer", remote);
+        assert_eq!(item.content.as_deref(), Some("matched line"));
+        assert!(item.chunk_ref.is_none(), "no chunk_ref without chunk_id");
+    }
 }

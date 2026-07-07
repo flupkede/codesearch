@@ -32,7 +32,7 @@ The MCP code-search ecosystem grew rapidly in late 2025 / early 2026 and many pr
 | Symbol navigation | `find` (def/usages/imports/dependents) co-located with semantic search | Often a separate code-graph tool |
 | Token cost per call | `compact=true` by default; chunks fetched on demand | Frequently dumps full snippets |
 
-Other projects in the same niche may go deeper on call-graph traversal, polished standalone CLIs, or memory/knowledge-graph features. codesearch is intentionally narrower — it picks "lightweight, multi-repo, MCP-native, fully offline" and stays on that lane.
+codesearch is intentionally narrower than full code-graph or knowledge-graph tools — it picks "lightweight, multi-repo, MCP-native, fully offline" and stays on that lane.
 
 ## Architecture
 
@@ -66,10 +66,11 @@ graph TB
     FindImpact -->|C# symbols| CSharpHelper[scip-csharp helper]
     CSharpHelper -->|SCIP index| ScipLMDB[(LMDB scip_symbols)]
 
-    subgraph "Serve Mode (multi-repo)"
+    subgraph "Serve Mode (multi-repo + federation)"
         ServeRouter[HTTP Router] -->|project/group routing| Repo1[Repo A]
         ServeRouter --> Repo2[Repo B]
         ServeRouter --> RepoN[Repo N]
+        ServeRouter -->|"@peer fan-out · TLS"| CloudPeer["Cloud serve peer<br/>results merged via RRF"]
     end
 
     Router -->|client mode| ServeRouter
@@ -112,21 +113,9 @@ codesearch index /path/to/my-project
 
 # Full rebuild
 codesearch index /path/to/my-project --force
-
-# Remove a repo
-codesearch index rm /path/to/my-project
-
-# List registered repos
-codesearch index list
-
-# Remove stale entries (relocates moved repos first, then drops the rest)
-codesearch index prune
 ```
 
-`codesearch index add` is intended to be run from inside the repo you want to register.
-If you're launching it from somewhere else, pass the repo path explicitly.
-
-First-time indexing takes 2–5 minutes. Subsequent runs are incremental (10–30s). Branch switches trigger automatic re-indexing.
+`codesearch index add` is intended to be run from inside the repo you want to register — pass the path explicitly if launched from elsewhere. First-time indexing takes 2–5 minutes; subsequent runs are incremental (10–30s) and branch switches re-index automatically. Use `codesearch index list/rm/prune` to manage registrations (see [Serve Mode](#serve-mode-multi-repo)).
 
 ## MCP Configuration
 
@@ -155,20 +144,7 @@ The agent spawns `codesearch mcp` as a subprocess. It auto-detects the nearest i
 }
 ```
 
-**Claude Code** — `~/.config/claude-code/config.json`:
-
-```json
-{
-  "mcpServers": {
-    "codesearch": {
-      "command": "codesearch",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-**Claude Desktop** — `claude_desktop_config.json`:
+**Claude Code / Claude Desktop** — `~/.config/claude-code/config.json` or `claude_desktop_config.json` (identical schema):
 
 ```json
 {
@@ -221,31 +197,31 @@ codesearch serve
 
 ### Agent Guidance (making agents use codesearch, not grep)
 
-codesearch publishes **instructions** to every MCP client on connect (via the `initialize` handshake). These tell the agent *when* to reach for codesearch vs grep/glob, *which* tool to pick, and the service-mode caveats (paths are from the server's filesystem; not every directory is indexed). Most clients (OpenCode, Cursor) surface these automatically.
+codesearch publishes **instructions** to every MCP client on connect (via the `initialize` handshake) — *when* to reach for codesearch vs grep/glob, *which* tool to pick, and the serve-mode caveats. Most clients (OpenCode, Cursor) surface these automatically.
 
-If your agent **skips codesearch** and falls back to grep/glob too often, add this quickstart to its project rules (`AGENTS.md` for Claude Code / OpenCode, `.cursorrules` for Cursor, custom instructions for others):
+If your agent skips codesearch and falls back to grep/glob too often, paste this quickstart into its rules (`AGENTS.md` for Claude Code/OpenCode, `.cursorrules` for Cursor):
 
-```markdown
-## Codesearch quickstart
+> Prefer codesearch for semantic, cross-file, or symbol-oriented lookup ("where is X implemented", "find usages of Y", "how does Z flow"). Use plain grep/glob for a single known file, trivial one-line edits, or exact literal searches. In remote-serve mode, returned paths are from the **server's** filesystem — read content via `get_chunk` rather than opening paths locally, and unindexed dirs (`.venv`, `node_modules`, `build/`) simply return nothing.
 
-Prefer codesearch over manual grep/glob for:
-- semantic, cross-file, or symbol-oriented lookup
-- cases where you don't know the exact file path
-- "where is X implemented", "find usages of Y", "how does Z flow through the code"
+OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies across all projects). Claude Code reads a project-level `AGENTS.md`, so add it per-project (or symlink a shared one).
 
-Use plain grep/glob instead for:
-- a single known file
-- trivial one-line edits
-- exact literal searches
+**Claude Code specifically** tends to ignore this advice more than other clients — its MCP tool schemas are deferred (an extra `ToolSearch` call is needed before codesearch tools are even callable), while Grep/Glob are always fully loaded and zero-friction, and spawned subagents don't inherit `AGENTS.md` or the MCP `initialize` instructions at all.
 
-When codesearch runs as a remote service (`codesearch serve` on another host),
-the paths it returns are from the SERVER's filesystem. Use the `get_chunk` tool
-to read content — don't try to open returned paths locally. Not every directory
-is indexed (e.g. `.venv`, `node_modules`, `build/`); if a search returns nothing,
-the dir may simply be unindexed.
+To make the preference **structural** instead of advisory, this repo ships two Claude Code hooks in [`integrations/claude-code/`](integrations/claude-code/):
+
+- **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks the first grep against an in-repo path when codesearch looks available (a local `.codesearch.db` at the git root, or a `CODESEARCH_SERVER` env var for remote-serve setups), with a message telling the model how to load and call codesearch instead. A retry of the same query within 5 minutes is let through unblocked — the legitimate "codesearch found nothing, falling back" path. Greps outside the current repo are never blocked, and the hook fails open (never traps the model).
+- **`subagent-preamble`** — a `PreToolUse` hook on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all.
+
+Install (idempotent — user scope applies to every project; project scope is this repo only):
+
+```bash
+pwsh -File integrations/claude-code/install.ps1                 # Windows — user scope (~/.claude)
+pwsh -File integrations/claude-code/install.ps1 -Scope project  # Windows — project scope (./.claude)
+bash integrations/claude-code/install.sh                        # macOS/Linux — user scope
+bash integrations/claude-code/install.sh --project              # macOS/Linux — project scope
 ```
 
-> **OpenCode users:** the user-level `~/.config/opencode/AGENTS.md` is the right place for this — it applies across all projects. Claude Code reads a project-level `AGENTS.md` instead, so add the quickstart per-project (or symlink a shared one).
+Note: the guard detects "codesearch is available **for this repo**" via a local `.codesearch.db` or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory). For a remote-serve setup with no local index, set `CODESEARCH_SERVER` to opt back into enforcement.
 
 ## MCP Tools Reference
 
@@ -445,6 +421,63 @@ codesearch mcp --mode client  # force serve connection
 
 The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 
+### Federation (remote peers)
+
+codesearch can fan-out read queries (`search`, `get_chunk`) to **remote peers** — other `codesearch serve` instances (e.g. a cloud-hosted docs/KB peer) — and merge results with local indexes via RRF. This lets a team share one knowledge base while each dev keeps code search local.
+
+**Manage peer entries** (pure local config — does not call the remote):
+
+```bash
+codesearch remote add cloud \
+  --url https://codesearch-serve.<env>.<region>.azurecontainerapps.io \
+  --api-key $API_KEY --timeout-secs 90
+codesearch remote list          # show configured peers
+codesearch remote rm cloud      # remove a peer entry
+```
+
+A group then references a peer via `@`-prefix (`"groups": { "docs": ["@cloud"] }`), and `group="docs"` fans the query out over TLS. Remote misses never hard-fail — they degrade to local-only results with a `warnings` field.
+
+**Manage indexes ON a peer** — the same `index` verbs, scoped with `--remote <peer>`:
+
+```bash
+# list the repos living on the cloud peer
+codesearch index list --remote cloud
+
+# register a path on the peer's filesystem (NOT your local FS)
+codesearch index add /data/docs/vendor-docs --remote cloud
+
+# remove a repo by its alias on the peer (NOT a local path)
+codesearch index rm inriver --remote cloud
+
+# trigger a background reindex of one repo on the peer
+codesearch index reindex inriver --remote cloud          # incremental
+codesearch index reindex inriver --remote cloud --force  # force full
+```
+
+- `--remote` resolves `<peer>` against the peers you configured with `codesearch remote add`. An unknown peer produces a clear error listing the known ones.
+- With `--remote`, `add` takes a **path on the peer's filesystem** and `rm`/`reindex` take a **remote alias** (never your local path).
+- Without `--remote`, every `index` command behaves exactly as today (local).
+- `index list` and `index reindex` accept `--json` for agent-friendly output (**requires `--remote`**).
+- The write verbs (`add`, `reindex`, `--force`) require the peer to hold the repo **read-write**. A read-only / restore-only peer (e.g. a snapshot-restore cloud serve) rejects them — `--force` returns a clean HTTP 500 with a message, and `add` (a full embed) may OOM or time out a small replica. Use them against a writable peer; `list` is always safe.
+
+**Per-vendor layout on a peer.** Instead of registering one mixed corpus, register each vendor's sub-folder as its own repo so the peer's layout mirrors your local one. (Requires a **writable** peer — see the note above; a read-only restore-only peer rejects `add`.)
+
+```bash
+for v in vendor-a-docs vendor-b-docs vendor-c-docs; do
+  codesearch index add "/data/docs/$v" --remote cloud
+done
+codesearch index list --remote cloud   # one alias per vendor
+```
+
+**Mounting a peer's projects (query one by name).** Beyond group-level `@peer` fan-out, you can address a *single* project on a peer directly as `project=<peer>/<alias>` — a 1-to-1 passthrough to that peer's index. With a peer named `cloud` hosting the per-vendor layout above:
+
+```bash
+# search only the peer's akeneo docs, by name
+codesearch search "import products" --project cloud/akeneo
+```
+
+These **mounted remote projects** are auto-discovered from the peer's `GET /status` and appear in the `codesearch serve` TUI in **italic/cyan**, distinguishing them from local indexes. Press `i` on a mount to see its **Remote Mount** info (peer URL + peer-reported status); the local-index actions (`doctor` / `reindex` / `remove`) are shown struck-through/disabled for a mount, since they act on a local index and a mount has none — manage a peer's indexes with `--remote` (above) instead.
+
 ## CLI Reference
 
 | Command | Description |
@@ -478,19 +511,6 @@ The serve endpoint is available at `/mcp` (Streamable HTTP transport).
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
 
-### Security
-
-When `codesearch serve` is exposed beyond a single trusted user (e.g. shared dev machines, a network bind), two environment variables harden access:
-
-- **`CODESEARCH_SERVE_API_KEY`** — gates access depending on how serve is bound:
-  - **Non-localhost bind** (`--host 0.0.0.0`, a LAN IP, etc.) — **ALL endpoints** require the key (health, status, MCP search, and management). Setting this variable is *required* when binding to a non-localhost address; serve refuses to start without it.
-  - **Localhost bind** (default) — only **management endpoints** (`POST /repos`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex`, `POST /reload`) require the key. Health, status, and MCP search remain open.
-  - Send the key on every request via `Authorization: Bearer <key>` or `X-API-Key: <key>`.
-  - **Client side:** `codesearch index add/rm/reindex` delegate to a running serve, so the CLI must send the same key. Set `CODESEARCH_SERVE_API_KEY` in the client's environment (same value as the server) and the CLI attaches it automatically. Without it, delegation returns `401` and falls back to local indexing — which risks LMDB file-lock conflicts if serve is still running.
-- **`CODESEARCH_ALLOWED_ROOTS`** — semicolon-separated list of filesystem roots. Repo registration is rejected for paths outside these roots. Prevents indexing arbitrary directories.
-
-Both are backward compatible: unset means no restriction (on a localhost bind).
-
 ### `.codesearchignore`
 
 Place in repo root. Gitignore syntax. Excludes paths from indexing:
@@ -509,6 +529,57 @@ A **global** `.codesearchignore` can be placed at `~/.codesearch/.codesearchigno
 ### `repos.json`
 
 Located at `~/.codesearch/repos.json`. Managed by `codesearch index add/rm`. Contains repo aliases → paths and group definitions. See [Serve Mode](#serve-mode-multi-repo).
+
+## Security
+
+This section documents the security model of **federation / remote peers** — the largest network surface in codesearch — followed by serve access control.
+
+### Serve access control
+
+When `codesearch serve` is exposed beyond a single trusted user (shared dev machines, a network bind), two environment variables harden access:
+
+- **`CODESEARCH_SERVE_API_KEY`** — gates access depending on how serve is bound:
+  - **Non-localhost bind** (`--host 0.0.0.0`, a LAN IP, etc.) — **ALL endpoints** require the key (health, status, MCP search, and management). Setting this variable is *required* when binding to a non-localhost address; serve refuses to start without it.
+  - **Localhost bind** (default) — only **management endpoints** (`POST /repos`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex`, `POST /reload`) require the key. Health, status, and MCP search remain open.
+  - Send the key on every request via `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+  - **Client side:** `codesearch index add/rm/reindex` delegate to a running serve, so the CLI must send the same key. Set `CODESEARCH_SERVE_API_KEY` in the client's environment (same value as the server) and the CLI attaches it automatically. Without it, delegation returns `401` and falls back to local indexing — which risks LMDB file-lock conflicts if serve is still running.
+- **`CODESEARCH_ALLOWED_ROOTS`** — semicolon-separated list of filesystem roots. Repo registration is rejected for paths outside these roots. Prevents indexing arbitrary directories.
+
+Both are backward compatible: unset means no restriction (on a localhost bind).
+
+### Federation security model
+
+Federation is **operator-to-operator**, not end-user-facing. The only inputs that decide *where* requests go and *which key* they carry are the peer entries you register locally with `codesearch remote add` (stored in `~/.codesearch/repos.json`). No search query, MCP argument, or remote response ever becomes a request target or selects a key.
+
+- **Trust model.** Peers see your search queries (they must, to answer them) and return chunks. Register only peers whose operator you trust with that query visibility.
+- **No SSRF from queries.** Outbound calls go solely to URLs you configured; a search term cannot redirect the client to an attacker host.
+
+#### Secrets
+
+- **Storage.** Each peer's `api_key` is stored in **plaintext** in `~/.codesearch/repos.json` (your home directory, outside any git repo — it is never committed). Protect it with filesystem permissions, the same way you would an SSH key or a `.env` file. On the server side, inject the key from a secret store — the reference cloud deployment sets it as an Azure Container Apps secret (`secretref:api-key`), so it never sits in the image or in source.
+- **Transport.** The key is sent only as an `Authorization: Bearer <key>` header, over HTTPS. Use `https://` peer URLs; the federation client uses **rustls with certificate verification enabled** — there is no certificate-bypass (`danger_accept_invalid_certs`) anywhere in the codebase.
+- **Never in URLs or logs.** The key is not appended to query strings and is not written to logs; it lives only in the `Authorization` header of the in-flight request.
+
+#### Redirects
+
+The HTTP client follows up to 10 redirects by default (reqwest's standard policy) but **strips the `Authorization` header on cross-host redirects**. A peer that answers with a `3xx` to a different host therefore cannot exfiltrate the bearer token there; same-host redirects (e.g. path canonicalisation) preserve it. *Defense-in-depth:* if you suspect a peer's host or DNS has been compromised, rotate that peer's key.
+
+#### Serve-side enforcement
+
+The remote serve instance enforces its own auth on every inbound request from federation:
+
+- **Non-localhost bind** (any cloud/LAN deployment): **all** endpoints — including `/search` and `/chunk/:id` — require the key. The reference cloud peer binds `0.0.0.0`, so every federation fan-out carries the key and is rejected without it.
+- **Management endpoints** (`POST /repos`, `DELETE /repos/:alias`, `POST .../reindex`, `POST /reload`) require the key on every bind, localhost included.
+
+The `@peer` fan-out attaches the configured key via the same `bearer_auth` path the local CLI uses, so it satisfies both layers automatically.
+
+#### Write verbs (`index … --remote`)
+
+`add`, `rm`, and `reindex` against a peer are **authenticated management calls**. They carry the key like any other request and the *peer* decides whether to act (a read-only / restore-only peer rejects writes — see [Federation](#federation-remote-peers)). The local CLI only sends a path or alias for the peer to act on; it executes nothing on your machine and writes nothing to your filesystem.
+
+#### Cross-instance isolation
+
+On fan-out, the client strips the local `project` and forces `group` to the value configured for that peer (or `all`). Projects are local to each instance, so this prevents one instance's project names from leaking into another's query namespace.
 
 ## C# Semantic Search
 

@@ -1613,7 +1613,30 @@ pub async fn add_to_index(
 
 /// Remove the index (local or global, auto-detected)
 pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Result<()> {
-    let project_path = path.clone().unwrap_or_else(|| PathBuf::from("."));
+    // If the argument names a registered alias, resolve it to that repo's path;
+    // otherwise treat it as a filesystem path (existing behavior). This lets
+    // `codesearch index rm <alias>` work by alias in addition to by path.
+    let effective_path: Option<PathBuf> = match &path {
+        Some(p) => {
+            let raw = p.to_string_lossy();
+            match crate::db_discovery::repos::ReposConfig::load() {
+                Ok(cfg) => match cfg.resolve(&raw) {
+                    Some(resolved) => {
+                        println!(
+                            "{}",
+                            format!("🏷️  Resolved alias '{}' → {}", raw, resolved.display()).cyan()
+                        );
+                        Some(resolved)
+                    }
+                    None => path.clone(),
+                },
+                Err(_) => path.clone(),
+            }
+        }
+        None => path.clone(),
+    };
+
+    let project_path = effective_path.clone().unwrap_or_else(|| PathBuf::from("."));
     let canonical_path = safe_canonicalize(&project_path)?;
 
     println!("{}", "➖ Remove Index".bright_red().bold());
@@ -1623,7 +1646,7 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
     // Try delegating to a running serve instance first (unless --keep-config,
     // which the serve endpoint doesn't support — serve always unregisters).
     if !keep_config {
-        match try_delegate_rm_to_serve(&path).await {
+        match try_delegate_rm_to_serve(&effective_path).await {
             Ok((alias, _)) => {
                 println!("\n{}", "✅ Delegated to running serve instance.".green());
                 println!("   Removed alias '{}'.", alias);
@@ -1924,7 +1947,7 @@ fn build_serve_client(
 /// Inner, testable form of [`build_serve_client`]: build a client that attaches
 /// `Authorization: Bearer <key>` (when `key` is `Some`) as a default header, so
 /// every request — health probe, POST, DELETE — carries it automatically.
-fn build_serve_client_with_key(
+pub(crate) fn build_serve_client_with_key(
     timeout: std::time::Duration,
     key: Option<&str>,
 ) -> std::result::Result<reqwest::Client, String> {

@@ -214,8 +214,15 @@ pub const ALLOWED_ROOTS_ENV: &str = "CODESEARCH_ALLOWED_ROOTS";
 /// from `DEFAULT_SERVE_PORT`, so bumping one without the other will fail `cargo test`.
 pub const DEFAULT_SERVE_URL: &str = "http://127.0.0.1:39725";
 
+/// Management collection route served by `codesearch serve`:
+/// `POST /repos { path, alias?, model? }` registers + indexes a new repo.
+///
+/// Per-repo routes are derived from this: `DELETE {REPOS_PATH}/:alias`,
+/// `POST {REPOS_PATH}/:alias/reindex`, `GET {REPOS_PATH}/:alias/info`.
+pub const REPOS_PATH: &str = "/repos";
+
 /// Path prefix for the per-repo reindex HTTP API route.
-/// Full path: `{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}`.
+/// Full path: `{REPOS_PATH}/{alias}{REPO_REINDEX_PATH_SUFFIX}`.
 pub const REPO_REINDEX_PATH_PREFIX: &str = "/repos/";
 
 /// Path suffix for the per-repo reindex HTTP API route.
@@ -224,12 +231,49 @@ pub const REPO_REINDEX_PATH_SUFFIX: &str = "/reindex";
 /// Health-check path served by `codesearch serve`.
 pub const HEALTH_PATH: &str = "/health";
 
+/// Unauthenticated liveness-probe path served by `codesearch serve`.
+///
+/// Unlike `HEALTH_PATH` (which reports the version and sits behind the
+/// network-auth layer), this endpoint is ALWAYS reachable without an API key —
+/// even on a non-localhost bind — and returns a fixed `{"status":"ok"}` body
+/// with no version or repo information. Intended for container-orchestrator
+/// liveness/readiness probes (e.g. Azure Container Apps) that cannot present
+/// the Bearer key.
+pub const HEALTHZ_PATH: &str = "/healthz";
+
 /// MCP endpoint path served by `codesearch serve` (streamable HTTP).
 pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 
 /// Status endpoint path served by `codesearch serve`.
 /// Returns JSON snapshot of all repo states, sessions, and CPU usage.
 pub const STATUS_PATH: &str = "/status";
+
+/// Remotes endpoint path served by `codesearch serve`.
+///
+/// Observability companion to [`STATUS_PATH`]: lists the configured federation
+/// peers (the `remotes` map from `repos.json`) so an operator can see which
+/// remotes this serve fans out to. Read-only and status-like — reachable
+/// without the admin key on localhost, protected only by
+/// `require_auth_for_network` on network binds (NOT in the `is_management`
+/// set). **Never** exposes `api_key`: the handler projects each peer into a
+/// dedicated `RemotePeerInfo` struct that structurally omits the secret.
+pub const REMOTES_PATH: &str = "/remotes";
+
+/// REST search endpoint (federation-friendly HTTP mirror of the `search` MCP
+/// tool). POST a `SearchRequest` body; returns the tool's JSON payload.
+pub const SEARCH_PATH: &str = "/search";
+
+/// REST find endpoint (HTTP mirror of the `find` MCP tool).
+/// POST a `FindRequest` body.
+pub const FIND_PATH: &str = "/find";
+
+/// REST explore endpoint (HTTP mirror of the `explore` MCP tool).
+/// POST an `ExploreRequest` body.
+pub const EXPLORE_PATH: &str = "/explore";
+
+/// REST get-chunk endpoint (HTTP mirror of the `get_chunk` MCP tool).
+/// GET `/chunk/:id?context_lines=&project=&group=`.
+pub const CHUNK_PATH: &str = "/chunk/:id";
 
 /// How long an open repo may remain idle (no queries) before it is evicted.
 /// Eviction closes the DB handles, stops the FSW, and releases memory.
@@ -242,6 +286,41 @@ pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 
 /// Environment variable to override the repo idle timeout.
 pub const REPO_IDLE_TIMEOUT_ENV: &str = "CODESEARCH_REPO_IDLE_TIMEOUT_SECS";
+
+// --- Cloud keep-warm (scale-to-zero suspend after idle) ----------------------
+
+/// URL serve self-pings (its own ingress FQDN) to stay warm while active.
+///
+/// In a scale-to-zero host (e.g. Azure Container Apps), no ingress traffic →
+/// the platform suspends the replica after its cooldown. While the most recent
+/// real tool call is younger than `IDLE_SUSPEND_SECS_ENV`, serve periodically
+/// GETs `<url>/healthz` to generate ingress traffic and stay warm. Once idle
+/// exceeds that window it stops, letting the host suspend; the next real
+/// request wakes it automatically. Empty/unset disables keep-warm.
+///
+/// Set via `--keep-warm-url` or this env var (flag takes precedence).
+pub const KEEP_WARM_URL_ENV: &str = "CODESEARCH_KEEP_WARM_URL";
+
+/// Environment variable to override the idle-before-suspend window.
+pub const IDLE_SUSPEND_SECS_ENV: &str = "CODESEARCH_IDLE_SUSPEND_SECS";
+
+/// Default idle window before serve stops self-pinging and lets the host
+/// suspend the replica (2 hours).
+pub const DEFAULT_IDLE_SUSPEND_SECS: u64 = 2 * 60 * 60;
+
+/// How often the keep-warm task pings its own ingress while active.
+pub const KEEP_WARM_INTERVAL_SECS: u64 = 2 * 60; // 2 minutes
+
+/// Default per-peer federation request timeout (seconds) when a remote peer
+/// does not specify its own `timeout_secs`. Shared by the federation client
+/// and the `remote` CLI command so both report/apply the same default.
+pub const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 15;
+
+/// How often the embedded TUI re-discovers mounted remote projects (queries each
+/// peer's `/status` in the background). Slow enough that per-peer HTTP never
+/// competes with the ~500ms render tick; a peer blip is masked by the in-memory
+/// last-known list until the next successful poll.
+pub const REMOTE_DISCOVERY_INTERVAL_SECS: u64 = 30;
 
 /// Maximum wall-clock duration a single reindex may take before its
 /// `active_reindexes` entry is considered **stale** (leaked).
@@ -341,6 +420,27 @@ pub const CSHARP_PREWARM_ENABLED_ENV: &str = "CSHARP_PREWARM_ENABLED";
 /// Maximum number of symbols to resolve per repo in Phase 3 pre-warm.
 /// Limits the batch size to avoid excessive memory usage on large solutions.
 pub const CSHARP_PREWARM_MAX_SYMBOLS: usize = 5000;
+
+/// Maximum number of changed files chunked + embedded in a single in-memory
+/// batch during `IndexManager::perform_incremental_refresh_with_stores`.
+///
+/// Without this cap, a single incremental refresh pass would read, chunk, and
+/// embed the ENTIRE delta (every changed/new file since the last refresh) in
+/// one unbounded `Vec`, before writing anything to the stores. This is safe
+/// for normal incremental deltas (tens of files) but OOM'd a 1 vCPU / 2 GiB
+/// `codesearch-serve` container when a vendor `docs` corpus roughly doubled in
+/// one sync (2509 -> 5666 files): the in-process warmup tried to chunk+embed
+/// thousands of files at once, exceeded available memory, and crash-looped.
+///
+/// Batching bounds peak memory to O(batch), not O(total delta), so a corpus
+/// delta of any size can no longer OOM the process — it just takes longer,
+/// spread across sequential batches.
+///
+/// Override at runtime with `CODESEARCH_INCREMENTAL_BATCH_SIZE`.
+pub const INCREMENTAL_REFRESH_BATCH_SIZE: usize = 200;
+
+/// Environment variable to override `INCREMENTAL_REFRESH_BATCH_SIZE`.
+pub const INCREMENTAL_REFRESH_BATCH_SIZE_ENV: &str = "CODESEARCH_INCREMENTAL_BATCH_SIZE";
 
 /// Default LMDB map size (MB) for the SCIP symbol index per repo.
 ///

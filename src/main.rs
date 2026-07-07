@@ -5,6 +5,7 @@ mod cli;
 mod constants;
 mod db_discovery;
 mod embed;
+mod federation;
 mod file;
 mod fts;
 mod index;

@@ -6,6 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+**Project-level federation + cloud reindex hardening.** Builds on the 1.1.0 federation release: a peer's individual projects can now be *mounted* and queried by name, the serve TUI surfaces and inspects those mounts, and the cloud indexer was reworked to reindex reliably without OOM-killing itself.
+
+### Added
+
+- **Mounted remote projects (1-to-1 federation passthrough).** A remote peer's individual projects can be queried locally by name as `project=<peer>/<alias>` (e.g. `cloud/akeneo`), routed directly to that peer — complementing the existing group-level `@peer` fan-out. Mounts are auto-discovered from each configured peer's `GET /status` on a slow background cadence (never blocking a render frame) and cached with a last-known fallback so a transient peer blip doesn't make a mount vanish.
+- **TUI: mounted remote projects.** Mounts render in **italic/cyan** in the serve status table to signal they live on a peer (not a local index). The `i` (info) key now works on a mount, opening a **Remote Mount** panel showing the peer URL and the peer-reported live status (status / lock / changes / calls / last call) instead of local on-disk stats. When a mount is selected, the footer renders the local-index actions **doctor / reindex / remove struck-through (disabled)** so it's clear those don't apply to a peer-hosted index; info / reload / quit / navigation stay enabled.
+
+### Changed
+
+- **Cloud indexer job: one federated project per vendor.** The cloud indexer now builds each vendor as a separate federated project (`akeneo`, `aprimo`, `bynder`, `digizuite`, `inriver`, `keyshot`, plus the custom KB) rather than one monolithic index, and builds them **sequentially** so the serve replica only ever holds one embedding model in memory at a time.
+- **Cloud deployment docs** generalised for public release (customer identifiers scrubbed) and consolidated under `integrations/cloud/`.
+- **Docker image** now built locally with **BuildKit** (`docker buildx --push`) instead of `az acr build`: the model-cache warmup is folded into the builder stage and shipped as a single tarball, working around ACR's classic builder failing to `COPY --from` a chained stage / symlink tree.
+
+### Fixed
+
+- **Indexer job OOM-kill on reindex.** The container entrypoint submitted all vendor index builds at once (async HTTP 202), so the serve process held every vendor's embedding model + working set simultaneously and got OOM-killed on 8 GiB — leaving the job stuck "indexing" forever. Builds now run sequentially, waiting for each to settle before starting the next.
+- **Incremental-refresh OOM crash-loop.** Bounded incremental-refresh embedding batches so a large change set no longer exhausts the heap.
+- **claude-code grep-guard hook** now ignores an already-running codesearch process and requires a local index before nudging toward codesearch, so it stops blocking `grep` when codesearch can't actually serve the current repo.
+
+## [1.1.0] - 2026-07-01
+
+**Federation release.** This version lands **federation** — the ability to fan read queries out to remote `codesearch serve` peers and manage their indexes from the local CLI — plus a README security analysis of the feature and several fixes.
+
+### Added
+
+- **Federation — remote peers.** Register peers with `codesearch remote add/rm/list` (local `~/.codesearch/repos.json` config), reference them from groups via `@peer` (e.g. `"docs": ["@cloud"]`), and `codesearch` fans `search`/`get_chunk` out over TLS, merging remote and local results with Reciprocal Rank Fusion (RRF). Remote misses degrade to local-only results with a `warnings` field — they never hard-fail.
+- **Remote index management (`--remote`).** The `index` verbs now take `--remote <peer>` to operate against a peer: `index list/add/rm/reindex --remote cloud` drive the peer's management REST API (`GET /status`, `POST /repos`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex`). New `index reindex` verb (local + remote). `--json` on `list`/`reindex` (requires `--remote`).
+- **Cloud deployment topology** — split indexer job (4 vCPU/8 GiB, builds + uploads a snapshot) and read-only restore-only serve replica (1 vCPU/2 GiB) for scale-to-zero hosting. See `integrations/cloud/README.md`.
+- **README `## Security` section** documenting the federation trust model, secret storage/transport, redirect handling, serve-side enforcement, and cross-instance isolation.
+
+### Fixed
+
+- **`active_sessions` overflowed to `u64::MAX`** on every REST (`/search`, `/find`, `/explore`, `/get_chunk`) request: per-request `CodesearchService`s were decrementing the session counter on `Drop` without ever incrementing it. Gated the decrement behind a `tracks_session` flag so only genuine MCP sessions balance the counter.
+- **`index rm <arg>`** now resolves the argument as a **registered alias first**, falling back to path interpretation only when it isn't one (previously a bare alias failed with an OS path error).
+- Added an `ls` visible alias to the `index`/`groups`/`remote` `list` subcommands.
+
+### Changed
+
+- Pre-GA changelog history (`[1.0.72]`–`[1.0.208]`) condensed to one-line summaries to mark the GA cutover; no entry was dropped and the key facts survive in the summaries. Full detail for the latest pre-GA release (`[1.0.209]`) is preserved verbatim below.
+
 ## [1.0.212] - 2026-06-21
 
 ### Added
@@ -66,742 +108,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   freshly-refreshed entry.
 
 ## [1.0.208] - 2026-06-14
-
-### Fixed
-
-- **`doctor` in the embedded TUI failed with "LMDB double-open prevented"**:
-  running `doctor` while `serve` held the embedding cache open tried to open a
-  second LMDB environment on the same directory. `check_embedding_cache` now
-  reads live stats from a process-global registry (no env open) when the cache
-  is already open, falls back to on-disk `data.mdb` metadata, and only opens a
-  new environment in the standalone CLI path. Adds `lmdb_registry::is_open`,
-  `PersistentEmbeddingCache::live_stats` / `cache_dir_for` / `file_stats`, and a
-  process-global `LIVE_CACHE_STATS` registry updated on open/put/clear/evict and
-  cleaned up on `Drop`.
-
-### Changed
-
-- Documented the `develop`-based gitflow in `AGENTS.md` and
-  `AGENTS.develop.md`: all PRs target `develop` (`--base develop`), `master`
-  receives release merges only, merge style is merge commits, plus the repo-owner
-  review override. Prevents PRs from defaulting to `master` (the GitHub default
-  branch).
+- Fixed `doctor` LMDB double-open in the embedded TUI (live-stats registry fallback); documented develop-based gitflow in `AGENTS.md`/`AGENTS.develop.md`.
 
 ## [1.0.207] - 2026-06-12
-
-### Added
-
-- **`serve --host` — bind beyond localhost (#114)**: `codesearch serve` now
-  accepts `--host` (env `CODESEARCH_SERVE_HOST`); set `0.0.0.0` to bind all
-  interfaces (e.g. inside a container). IPv4 and IPv6 literals are supported
-  (`[::]`). Because this exposes the management endpoints, pair it with
-  `CODESEARCH_SERVE_API_KEY` to require an API key on `POST /repos`, `/reindex`,
-  and `/reload`.
-- **Global `.codesearchignore`**: `~/.codesearch/.codesearchignore` is now loaded
-  as the lowest-priority ignore file, applying to all indexed repositories.
-  Precedence: global < `.git/info/exclude` < `.gitignore` < repo-local
-  `.codesearchignore`.
-- **Jupyter Notebook (`.ipynb`) support**: `.ipynb` files are parsed as JSON,
-  extracting code and markdown cells as separate chunks with `# [code]` /
-  `# [markdown]` prefixes. Adjacent same-type cells under 50 lines are merged.
-- **Dart language support**: Tree-sitter semantic chunking for Dart — classes,
-  mixins, enums, extensions, extension types, and top-level functions are
-  extracted as definition chunks with full breadcrumb context.
-- **TUI 'r' key — Remove repo from index**: Pressing `r` in the TUI shows a
-  confirmation dialog. On confirm, the repo is fully removed (FSW stopped,
-  memory evicted, unregistered from config, database deleted).
-- **Git worktree auto-index hook**: `codesearch hook install` writes a
-  `post-checkout` hook that auto-registers new worktrees with a running serve
-  instance via `POST /repos`.
-- **`ServeState::remove_repo()` method**: extracted from `remove_repo_handler`
-  for reuse by both the HTTP endpoint and the embedded TUI.
-- **Immediate reindex feedback in the embedded TUI**: pressing `n` now shows a
-  transient footer confirmation (`⟳ Reindex started for '<alias>' …`,
-  `already running`, or a failure notice) instead of silently spawning the
-  background task. The pulsing `⟳ idx…` status label is unchanged.
-
-### Fixed
-
-- **`500 "an environment is already opened with different options"` on repo
-  reopen**: reopening a database (e.g. the idle reaper dropping a repo while a
-  force-reindex reopens it) could fail with a raw heed error. Two causes fixed:
-  `TrackedEnv::drop` now releases the underlying `heed::Env` *before* freeing its
-  registry slot (closing a drop-order window), and the LMDB `map_size` is now
-  pinned per canonical path for the process lifetime (monotonic, capped at MAX)
-  so every reopen uses a consistent size and never mismatches a still-live env.
-- **FileWatcher missing repo-local `.codesearchignore`**: `build_gitignore()` now
-  loads `.codesearchignore` from the repository root alongside the global file.
-  Previously only the global file was loaded, causing repo-local ignores to be
-  silently skipped in the file watcher.
-- **`.git/info/exclude` broken for worktrees**: `FileWatcher::build_gitignore`
-  now resolves the actual git directory (following `gitdir:` pointers in
-  worktree `.git` files) before accessing `info/exclude`.
+- Added `serve --host`, global `.codesearchignore`, Jupyter/Dart language support, TUI `r` (remove) key, and git worktree auto-index hook; fixed LMDB reopen "already opened with different options" 500 and FSW repo-local `.codesearchignore`/`.git/info/exclude` loading.
 
 ## [1.0.171] - 2026-06-04
-
-### Security
-
-- **API key authentication for management endpoints** — management HTTP
-  routes (`POST /repos`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex`,
-  `POST /reload`) now require an API key when the `CODESEARCH_SERVE_API_KEY`
-  environment variable is set. Supports both `Authorization: Bearer <key>` and
-  `X-API-Key: <key>` headers. Backward compatible: unset/empty env var = no
-  authentication required. Health, status, and MCP endpoints remain
-  unauthenticated.
-- **Path containment validation for repo registration** — `POST /repos` and
-  `--register` now validate the requested filesystem path against a configurable
-  allowlist. Set `CODESEARCH_ALLOWED_ROOTS` to a semicolon-separated list of
-  allowed root directories. Paths resolving outside any configured root are
-  rejected with 403 Forbidden. Backward compatible: unset/empty env var = all
-  paths allowed. Fails closed when all configured roots are invalid.
-- **Path traversal fix in C# indexing helper** — `ParseSolutionProjects` in
-  `Program.cs` now validates that each `.sln` project path resolves within the
-  repository root, preventing `..` traversal from indexing files outside the
-  repository. Defense-in-depth: the fallback `OpenProjectAsync` path also
-  validates containment.
-- **Command injection fix in C# helper detection** — `validate_helper_path` in
-  `csharp.rs` verifies that helper binaries resolved from the `CODESEARCH_SCIP_CSHARP`
-  env var or PATH lookup have the expected filename (`scip-csharp` /
-  `scip-csharp.exe`), preventing an attacker who controls the env var or PATH
-  from redirecting execution to an arbitrary binary.
-- **GitHub Actions pinned to commit SHAs** — all third-party actions in
-  `release.yml` and `ci.yml` are now referenced by immutable commit SHA instead
-  of mutable version tags, with `# pin@<version>` comments for traceability.
-- **Least-privilege GitHub Actions permissions** — `release.yml` and `ci.yml`
-  now default to `contents: read` at the top level. Only the release job
-  escalates to `contents: write` when publishing a GitHub release.
-
-### Changed
-
-- **C# helper: `ParseSolutionProjects` signature** — now takes an additional
-  `solutionDir` parameter for path containment validation. Callers updated.
-
+- Security hardening: API key auth on management endpoints, path-containment allowlist (`CODESEARCH_ALLOWED_ROOTS`), C# path-traversal and command-injection fixes, and GitHub Actions pinned to SHAs with least-privilege permissions.
 
 ## [1.0.162] - 2026-06-02
-
-### Fixed
-
-- **Windows: flaky relocation tests eliminated** — `std::fs::rename` and
-  `std::fs::remove_dir_all` on Windows fail with "Access is denied" when a
-  git subprocess from `init_git_remote` keeps a directory handle open after
-  exit. All 7 rename calls in `repos.rs` tests now use a `rename_retry()`
-  helper that retries up to 10 times with exponential back-off; the one
-  `remove_dir_all` call is now best-effort (the test assertion holds either
-  way). Verified stable across 3 consecutive full-suite runs (432 passed,
-  0 failed).
+- Eliminated flaky Windows relocation tests via a `rename_retry()` exponential back-off helper (432 passed / 0 failed).
 
 ## [1.0.160] - 2026-06-02
-
-### Fixed
-
-- **`evaluate_csharp_rebuild` no longer holds `config.write()` during git/fs I/O** —
-  the bootstrap timestamp computation (git subprocess + ≤10 000-entry filesystem
-  walk) previously ran while holding the `config` write-lock, blocking every
-  concurrent `config.read()` caller for the full scan duration. The lock is now
-  acquired only for the brief config update; the slow work runs with no lock held.
-- **`evaluate_csharp_rebuild` offloaded to `spawn_blocking` in phase 2** — even
-  after the lock fix, the function ran synchronously on a Tokio worker thread.
-  Wrapped in `spawn_blocking` at the call site in `run_phase_2_csharp_scip` so
-  the async runtime stays responsive while processing all C# candidates.
-- **`build_index()` in warmup and add-repo background task now use `spawn_blocking`** —
-  two sites called the CPU-heavy HNSW `build_index()` directly on async threads.
-  Both now follow the established pattern (`spawn_blocking` + `blocking_write()`).
-- **`reload_if_changed` uses `safe_canonicalize`** — replaces the raw
-  `std::fs::canonicalize` that could leave Windows `\\?\` UNC prefixes on the
-  config path, causing path comparisons to silently fail.
-- **Accurate doc-comments on `relocate_missing` / `prune_stale`** — both
-  methods perform disk I/O (filesystem traversal, git subprocess) and should
-  be called via `spawn_blocking` in async contexts; the comments now say so.
-- **`ensure_hnsw_index_if_needed` extracted and tested** — the safety-net HNSW
-  rebuild logic (detects and repairs a DB with chunks but no index, e.g. after
-  cancellation) is now a named `pub(crate)` function with 3 unit tests
-  (unindexed-with-chunks rebuilds, already-indexed is idempotent, empty DB skips).
-- **`metadata.json` schema consistency** — the normal index path now writes
-  `"partial": false` so readers always find the field regardless of whether
-  indexing completed or was cancelled.
-- **Cancellation finalisation is best-effort** — metadata write, FileMetaStore
-  save, and stats read in the cancel path now log-and-continue on failure
-  instead of propagating `Err`, so the partial chunks remain searchable even
-  if any recovery step fails.
+- Offloaded `evaluate_csharp_rebuild`/`build_index` to `spawn_blocking`, stopped holding the config write-lock during git/fs I/O, routed `reload_if_changed` through `safe_canonicalize`, extracted+tested `ensure_hnsw_index_if_needed`, made cancellation finalisation best-effort.
 
 ## [1.0.156] - 2026-06-02
-
-### Fixed
-
-- **`reconcile_all_paths` no longer blocks the Tokio async runtime** — the
-  function spawns git subprocesses and holds the config `RwLock` write-guard
-  while scanning the filesystem. It is now offloaded via
-  `tokio::task::spawn_blocking` so Tokio worker threads stay responsive during
-  startup reconciliation.
-- **Phase 1 auto-prune now honours `config_path_override`** — the prune path
-  wrote `repos.json` via `config.save()`, bypassing `ServeState::persist_config`.
-  All save sites in `ServeState` must route through `persist_config` so the
-  override (used in integration tests) is respected. Fixed to use
-  `self.persist_config(&config)`.
-
-
+- Fixed `reconcile_all_paths` blocking the Tokio runtime (now `spawn_blocking`); Phase 1 auto-prune now honours `config_path_override` via `persist_config`.
 
 ## [1.0.154] - 2026-06-02
-
-### Fixed
-
-- **Windows CI: path-comparison failures in relocation tests** — `scan_for_remote`
-  now canonicalizes discovered paths via `safe_canonicalize()` before recording
-  them, resolving 8.3 short names (e.g. `RUNNER~1`) to their long-name form
-  (`runneradmin`). Test assertions updated to use the same canonicalization so
-  `tempfile::tempdir()` short-name paths and `read_dir` long-name paths compare
-  equal on Windows.
+- Fixed Windows CI path-comparison failures by canonicalizing discovered paths via `safe_canonicalize()` (8.3 short-name → long-name).
 
 ## [1.0.153] - 2026-06-02
-
-### Added
-
-- **Auto-prune stale repos during Phase 1 warmup** — when a repo fails warmup
-  because its path or database no longer exists, `codesearch serve` now
-  automatically removes it from `repos.json` and logs a warning, instead of
-  silently retrying on every restart. Works in concert with the relocation pass
-  (reconcile_all_paths): relocatable repos are rewritten first, truly missing
-  ones are pruned.
-
-### Fixed
-
-- **Missing `YELLOW` color variable in `scripts/qc.sh`** — the variable was
-  referenced but never declared, causing a visual glitch in QC output.
+- Added auto-prune of stale repos during Phase 1 warmup; fixed missing `YELLOW` var in `scripts/qc.sh`.
 
 ## [1.0.152] - 2026-06-02
-
-### Added
-
-- **Best-effort relocation of moved/renamed repositories** — every repo's git
-  remote (`remote.origin.url`) is now captured at registration. When a
-  registered folder is renamed or moved, `codesearch serve` no longer crashes:
-  on startup it reconciles all paths, and for each missing path it scans nearby
-  folders (bounded depth, override with `CODESEARCH_RELOCATE_MAX_DEPTH`, default
-  `3`) for a git checkout with the same remote. A single unambiguous match is
-  rewritten into `repos.json`; ambiguous/absent matches are logged and skipped
-  (the dead path is never indexed). Phase-2 (C# SCIP) and Phase-3 (pre-warm)
-  also guard `path.exists()` so a stale path can never reach heavy code paths.
-- **`codesearch index prune`** — new command that relocates moved repos first,
-  then unregisters any remaining stale entries, printing a summary.
-
-### Changed
-
-- **The user-settable `--alias`/`-a` flag was removed from `index add`** — the
-  alias (the `repos.json` key, used by groups and the MCP `project` argument) is
-  now always derived from the repository directory name. In practice the alias
-  always had to equal the directory name, so a custom alias only caused
-  downstream mismatches. The `index symbol <alias>` positional (a lookup key) is
-  unchanged.
-
-### Fixed
-
-- **A hand-edited or corrupt-ish `repos.json` no longer crashes the app** — on
-  load the config is reconciled in memory: entries with empty/blank alias keys
-  are dropped, orphaned `repos_meta` is removed, and group members referencing
-  unknown aliases (and groups left empty) are pruned. Valid aliases are never
-  renamed (that would break group references).
+- Added best-effort relocation of moved/renamed repos and `codesearch index prune`; REMOVED user-settable `--alias`/`-a` flag from `index add` (alias always derived from dir name); corrupt `repos.json` now reconciled instead of crashing.
 
 ## [1.0.146] - 2026-06-02
-
-### Added
-
-- **Semantic Markdown chunking** — Markdown files (`.md`, `.markdown`, `.txt`) are
-  now parsed with the **tree-sitter-md block grammar**, so chunks align to sections,
-  headings, and code fences instead of arbitrary line ranges. `Language::Markdown`
-  now reports `supports_tree_sitter() == true` and has a compiled-in grammar.
-
-### Changed
-
-- **Supported-languages documentation corrected** — the README language table now
-  lists all 15 tree-sitter languages actually supported (Rust, Python, JavaScript,
-  TypeScript, C, C++, C#, Go, Java, Shell, Ruby, PHP, YAML, JSON, Markdown);
-  it previously showed only 9, omitting Shell, Ruby, PHP, YAML, JSON, and Markdown.
+- Added semantic Markdown chunking via the tree-sitter-md block grammar; corrected README language table (15 tree-sitter languages).
 
 ## [1.0.142] - 2026-06-01
-
-### Fixed
-
-- **`codesearch serve` became unresponsive during startup warmup** — heavy
-  synchronous work (`FileWalker::walk`, `VectorStore::build_index` HNSW
-  construction, and fastembed/ONNX embedding which saturates all CPU cores)
-  ran directly on tokio worker threads while warming up repos at startup. This
-  starved the async runtime so `/health` timed out (>3s), causing
-  `codesearch index` to report "serve did not respond in time". That work is
-  now offloaded to `tokio::task::spawn_blocking`, keeping the async executor
-  responsive: serve answers `/health` and accepts `POST /repos[/:alias/reindex]`
-  immediately during warmup, returning 202 and running the index job in the
-  background (accept-and-defer) instead of making the client wait or fail.
-  Lock safety: every async `RwLock` guard is released before the blocking task
-  acquires `blocking_write()` on the same store, so there is no lock-over-await
-  deadlock.
-
+- Fixed serve unresponsive during startup warmup by offloading heavy sync work (FileWalker, HNSW `build_index`, ONNX embedding) to `spawn_blocking`; serve now answers `/health` and accept-and-defers `POST /repos` immediately.
 
 ## [1.0.141] - 2026-06-01
-
-### Fixed
-
-- **`codesearch index` aborted instead of waiting when serve was warming up** —
-  on `ServeUnresponsive` the CLI returned an error. It now waits patiently
-  (`serve_delegate_with_warmup_wait`): prints progress and retries every 8s up
-  to ~2 min, delegating as soon as serve becomes ready, and only erroring if the
-  budget is exhausted. (Superseded for the responsiveness root cause by 1.0.142.)
-- **409 Conflict when recreating a missing database** — when a registered repo's
-  database was gone, the CLI's auto-register returned 409 ("already registered")
-  and fell back to a local duplicate. It now retries as
-  `POST /repos/{alias}/reindex?force=true`, which recreates the DB via serve.
-
+- CLI now waits patiently (≤~2 min) instead of aborting when serve is warming up; 409 on a missing DB now retried as `POST /repos/{alias}/reindex?force=true`.
 
 ## [1.0.140] - 2026-06-01
-
-### Fixed
-
-- **Last raw `.canonicalize()` eliminated** — `get_db_path_smart` still used the
-  old `normalize_path(&p.canonicalize()...)` pattern. Routed through the central
-  `safe_canonicalize()` so no raw `.canonicalize()` remains outside its own
-  definition.
-
+- Eliminated the last raw `.canonicalize()` by routing `get_db_path_smart` through the central `safe_canonicalize()`.
 
 ## [1.0.139] - 2026-06-01
-
-### Changed
-
-- **Central path canonicalization** — introduced `safe_canonicalize()` and
-  `strip_unc_prefix()` in `crate::cache` as the single approved way to
-  canonicalize paths, and replaced all 16+ raw `.canonicalize()` call sites
-  across `repos.rs`, `db_discovery/mod.rs`, `index/mod.rs`, `lmdb_registry.rs`,
-  and `serve/mod.rs`. This structurally prevents the recurring Windows UNC-path
-  (`\\?\`) bug class. Policy documented in `AGENTS.md`; 6 regression tests added.
-
+- Added central `safe_canonicalize()`/`strip_unc_prefix()` in `crate::cache`, replaced 16+ raw `.canonicalize()` call sites, and documented the policy in `AGENTS.md` with 6 regression tests.
 
 ## [1.0.138] - 2026-06-01
-
-### Fixed
-
-- **`\\?\`-prefixed UNC paths stored in repos.json caused spurious "Database
-  not found" errors** — `Path::canonicalize()` on Windows returns an
-  extended-length UNC path (`\\?\C:\...`). When stored verbatim in
-  `repos.json`, downstream `.join(".codesearch.db")` and `Path::exists()`
-  calls failed inconsistently (e.g. `\\?\C:\foo\.codesearch.db` returned
-  `false` even when `C:\foo\.codesearch.db` existed). This affected 7 repos
-  in repos.json and caused a cascade of "Database not found" 500 errors and
-  fallbacks to local duplicate indexes. `register()` and `register_with_alias()`
-  now strip the `\\?\` prefix before storage so repos.json always holds plain
-  `C:\...` paths. Existing UNC entries are automatically corrected at the next
-  registration. (Existing repos.json was also patched in-place.)
-- **500 "Database not found" on reindex caused a local duplicate index** —
-  when a registered repo's database was deleted externally (e.g. serve killed
-  mid-index), the reindex endpoint returned 500 "Database not found". The CLI
-  treated this as a generic failure and fell back to local indexing, recreating
-  the duplicate. It now triggers the same auto-register (`POST /repos`) path as
-  a 404, which recreates the database via serve without any local fallback.
-
-
+- Fixed `\\?\` UNC paths stored in `repos.json` causing "Database not found" (prefix stripped at registration); fixed the 500 "Database not found" reindex local-duplicate fallback (now auto-registers via serve).
 
 ## [1.0.137] - 2026-06-01
-
-### Fixed
-
-- **`codesearch index` silently created a local duplicate index when `serve`
-  was busy starting up** — the CLI probes `serve`'s `/health` before delegating.
-  Any failure (including a *timeout* while `serve` was warming up its repos) was
-  treated as "serve is not running", so the CLI silently fell back to creating a
-  **local index** — a duplicate that `serve` does not manage and that can cause
-  LMDB file-lock conflicts. The health probe now distinguishes three cases:
-  *responsive* (delegate), *connection refused / not running* (index locally —
-  detected immediately, so the local path is not slowed down), and *listening
-  but unresponsive* (serve is up but busy). In the last case the CLI now
-  **refuses to create a local duplicate** and asks you to retry shortly or stop
-  `serve` first, instead of silently duplicating. The fallback is never silent
-  anymore.
-- **`codesearch index` could not register a brand-new repo via a running
-  `serve` instance** — when `serve` was running and you indexed a repo that
-  was not yet known to it, the auto-register call (`POST /repos`) failed with
-  a misleading *"Database is locked by another process"* error and HTTP 500.
-  Root cause: `SharedStores::new()` tried to acquire the writer lock
-  (`.writer.lock`) *before* the `.codesearch.db` directory existed, so opening
-  the lock file failed with "path not found" and was reported as a lock
-  conflict. Consequences: the `repos.json` registration was rolled back (the
-  alias was never persisted) and the CLI silently fell back to creating a
-  **local duplicate index** instead of handing control to `serve`. Existing
-  repos (whose database directory already existed) and local-only indexing
-  were unaffected. The database directory is now created before the writer
-  lock is acquired.
-- **Genuine filesystem errors during database creation were masked as lock
-  contention** — a real I/O failure (e.g. permission denied) while creating
-  the database directory now surfaces as itself instead of the misleading
-  "Database is locked by another process" message.
-
-### Changed
-
-- **Serve config writes now honor the configured config path** — all
-  `repos.json` writes from the register/remove/metadata-persist paths route
-  through `ServeState::persist_config()`, which respects the active config
-  path override. Production behavior is unchanged; this makes the
-  register/remove path hermetically testable.
-
-### Tests
-
-- Added regression guards that exercise the brand-new-repo store-creation and
-  register path with the `.codesearch.db` directory genuinely absent
-  (`try_open_stores`, `SharedStores::new`, `acquire_writer_lock`, and an
-  end-to-end `add_repo_handler` test asserting 202 + no `repos.json`
-  rollback). These were verified to fail against the pre-fix code.
-- Added guards for the serve `/health` probe classification: a responsive
-  endpoint → delegate, and a listening-but-slow endpoint → "unresponsive"
-  (caller refuses to create a local duplicate).
-
+- CLI no longer silently creates a local duplicate when serve is busy (health probe now distinguishes refused vs listening-but-unresponsive); fixed brand-new-repo "Database is locked" 500 (writer lock acquired after dir creation); serve config writes honour the configured path override; added regression guards.
 
 ## [1.0.135] - 2026-05-27
-
-### Fixed
-
-- **MCP local/stdio mode ignores `project`/`group` params** — when running
-  `codesearch mcp` without `codesearch serve` (Local mode), passing `project` or
-  `group` parameters caused a hard error: *"project/group routing requires
-  `codesearch serve` to be running."* The LLM (Claude Code) auto-fills these
-  params from the tool schema. Now they are silently ignored with a warning log,
-  and the local database is used. Closes #65.
-- **QC script `YELLOW` color variable undefined** — `scripts/qc.sh` referenced
-  `YELLOW` without defining it, causing `set -u` failures on Linux. Fixed by
-  adding the missing color constant.
-
-### Changed
-
-- **`protect-master.yml` allows `release/*` branches** — CI branch protection
-  workflow now accepts PRs from both `develop` and `release/*` branches into
-  `master`, enabling clean release branches when develop has diverged.
-
+- Fixed MCP local/stdio mode erroring on `project`/`group` params (now ignored with warning, closes #65); fixed `YELLOW` var in `scripts/qc.sh`; `protect-master.yml` now allows `release/*` branches.
 
 ## [1.0.132] - 2026-05-22
-
-### Added
-
-- **Tree-sitter grammars for Bash, Ruby, PHP, YAML, JSON** — codesearch now
-  supports AST-aware chunking for 14 languages total (previously 9: Rust,
-  Python, JavaScript, TypeScript, C, C++, C#, Go, Java). Closes #55.
-- **Bash equivalents of QC and bump-version scripts** — `scripts/qc.sh` and
-  `scripts/bump-version.sh` for Linux/macOS environments, complementing the
-  existing PowerShell scripts.
-- **Platform-aware pre-push hook** — `.git/hooks/pre-push` auto-detects the
-  platform and calls the appropriate QC script before allowing a push.
-- **CodeQL configuration** — added `.github/codeql/codeql-config.yml` to
-  suppress `rust/path-injection` false positives (codesearch is a local dev
-  tool, not a web-facing server).
-
-### Changed
-
-- **SCIP LMDB map_size raised from 64 MB to 512 MB** — the SCIP symbol index
-  LMDB environment now defaults to 512 MB virtual address space, up from 64 MB.
-  This prevents `MDB_MAP_FULL` errors on large solutions. Override with
-  `CODESEARCH_SCIP_LMDB_MAP_MB` environment variable.
-- **Centralized DB open/create logic** — extracted `try_open_stores()` to
-  eliminate duplicate LMDB open paths across the codebase. All serve-context
-  LMDB access now goes through a single entry point.
-
-### Fixed
-
-- **LMDB double-open race in `add_repo_handler`** — a concurrent guard with
-  cancel token now prevents two simultaneous `add_repo` calls from opening the
-  same LMDB database, which caused panics and corrupted indexes.
-- **LMDB double-open in MCP fallback path** — blocked a code path where the
-  MCP handler could open a second LMDB environment on the same directory when
-  `SharedStores` initialization failed.
-- **`TrackedEnv` runtime guard** — a new runtime guard detects LMDB
-  double-open attempts at runtime, producing a clear error instead of a panic.
-- **Force-reindex on missing database** — `try_open_stores()` now creates the
-  database on the fly when it's missing, fixing the case where a previously
-  registered repo had no `.codesearch.db` directory yet.
-- **Explore two-pass fallback** — `explore outline` now falls back to a
-  second lookup strategy when the alias name matches a package subdirectory,
-  preventing empty results on certain project layouts.
-- **TUI C# indexing status** — Phase 2 SCIP rebuilds and Phase 3 pre-warm now
-  correctly signal the TUI `indexing_cb`, so the UI shows "C# Indexing"
-  during background symbol operations.
-- **FSW SCIP rebuild TUI signal** — file-watcher-triggered symbol rebuilds now
-  update `active_reindexes` so the TUI displays the correct indexing state.
-- **CI test resilience** — `test_indexer_returns_empty_when_db_missing` is now
-  resilient to LMDB lock contention on CI runners.
-- **Protect-master workflow** — GitHub Actions workflow that only allows PRs
-  from `develop` to `master`, preventing accidental direct pushes.
-- **`config.save()` failure warnings** — `add_repo_handler` now logs warnings
-  when `config.save()` fails instead of silently dropping the error.
-
-
+- Added tree-sitter grammars for Bash/Ruby/PHP/YAML/JSON (14 langs total), bash QC/bump scripts + platform-aware pre-push hook, CodeQL config; raised SCIP LMDB map_size 64→512 MB; fixed LMDB double-open races (`TrackedEnv` runtime guard) and several explore/FSW/TUI status bugs.
 
 ## [1.0.97] - 2026-05-15
-
-### Fixed
-
-- **CLI auto-register retry race** — after auto-registering a new repo (POST
-  `/repos` → 202 Accepted), the CLI no longer retries the reindex immediately.
-  The previous retry raced with the background indexing task and always failed
-  with "Database not found" because the LMDB database hadn't been created yet.
-- **`cargo fmt` CI failures** — pinned toolchain in `rust-toolchain.toml` and
-  updated local rustfmt (1.92 → 1.95) to match CI.
-
-
+- Fixed CLI auto-register retry race (no longer re-reindexes before the LMDB DB exists); pinned toolchain for `cargo fmt` CI.
 
 ## [1.0.96] - 2026-05-14
-
-### Fixed
-
-- **`add_repo_handler` deadlock** — POST `/repos` was calling `index_quiet()`
-  inline, causing a deadlock when the serve's own startup (Phase 1) still held
-  the LMDB lock. Indexing now runs in a `tokio::spawn` background task and the
-  handler returns `202 Accepted` immediately, matching the `reindex_handler`
-  pattern. This fixes the "fresh install → serve hangs" scenario on both Linux
-  and Windows.
-
-
+- Fixed `add_repo_handler` deadlock by moving indexing to a `tokio::spawn` background task and returning `202 Accepted` immediately (fixes "fresh install → serve hangs").
 
 ## [1.0.95] - 2026-05-14
-
-### Added
-
-- **POST /reload endpoint** — forces `repos.json` reload from disk, even if
-  the file mtime hasn't changed. Used by the TUI `[s]` key to pick up
-  externally added/removed repos without restarting serve.
-- **TUI `[s]` key** — both embedded and remote TUIs now support `[s]` to
-  manually reload `repos.json`, picking up repos added via `codesearch index add`
-  or other external changes.
-- **CLI auto-register on 404** — `codesearch index -f` from a directory not
-  yet in `repos.json` now auto-registers the repo with the running serve
-  instance (via `POST /repos`) instead of falling back to local indexing,
-  which caused LMDB file-lock conflicts.
-
-### Changed
-
-- **Removed vendor name references** from docs and comments for a cleaner
-  public repository.
-
-
+- Added `POST /reload` endpoint and TUI `[s]` key for manual `repos.json` reload; CLI auto-registers on 404 with a running serve (no local-duplicate fallback).
 
 ## [1.0.94] - 2026-05-08
-
-### Added
-
-- **C# semantic analysis helper (`scip-csharp`)** — a small .NET 10 CLI tool
-  that wraps Roslyn's `SymbolFinder.FindReferencesAsync()` and produces a
-  symbol reference index. Framework-dependent, ~5–15 MB. Bundled in the new
-  `-with-csharp` release variants, or available via `$PATH` / env var override.
-- **`-with-csharp` release variants** — pre-built release archives that include
-  the `scip-csharp` helper alongside the codesearch binary. There are now 6
-  release archives total: 3 plain `codesearch` packages and 3
-  `codesearch-with-csharp` packages (Windows, Linux, macOS). The plain
-  packages are unchanged for users who don't need C# symbol references.
-- **Dedicated C# README** — all C#-specific goal, operation, installation, and
-  testing instructions now live in `README_CSharp.md`; the main README only
-  links there so non-C# users can skip the extra detail.
-- **`.cs` file watcher debounce** — 60-second quiet period after `.cs` file
-  changes triggers an automatic symbol index rebuild. Buffer is cleared on git
-  branch switches to avoid stale rebuilds.
-- **`symbols=true` query parameter** on the serve reindex endpoint
-  (`POST /repos/:alias/reindex?force=true&symbols=true`) for forced symbol
-  index rebuilds.
-
-### Changed
-
-- **Architecture is language-agnostic**: the `SymbolIndexer` trait and
-  per-language adapter pattern are in place. Future branches can add Python
-  (scip-python), TypeScript (scip-typescript), Rust (scip-rust), etc. without
-  redesigning.
-
-### Breaking
-
-- **LMDB format change** — existing `scip` LMDB databases require a
-  full rebuild after this upgrade. The first `find_impact` call (or
-  explicit `reindex?symbols=true`) will trigger an automatic rebuild.
-  No manual data migration is needed.
-
-### Fixed
-
-- **`status(projects)` now returns real chunk counts** for unopened repos by
-  persisting them in `metadata.json` after every indexing operation (B2).
-- **Double chunks on reindex** — guard clears both stores when `FileMetaStore`
-  is empty but `VectorStore` has data, preventing full duplication (B1).
-- **Regex `\w+`/`\b`/`\d` broken in literal mode** — extracts clean BM25 tokens
-  from regex patterns for candidate generation while preserving full regex for
-  post-filter (B3).
-- **Duplicate definitions in `find_impact`** — `FindCommonRoot` now uses all
-  solution projects instead of filtered subset for consistent relative paths (B4).
-- **`codesearch index` now always delegates to running serve** (not just `-f`),
-  preventing LMDB file-lock conflicts between CLI and serve.
-- **`release.ps1` path resolution** — fixed .NET `ReadAllText` resolving against
-  wrong CWD by using absolute paths derived from script location.
-- **JSON version validation** — `parse_json_index()` now rejects scip-csharp
-  index versions other than `"1.0"`, preventing silent breakage when the
-  helper is updated to an incompatible format.
-- **Helper detection failure cache** — `detect_helper()` now caches
-  "helper not found" results, eliminating repeated PATH lookups and
-  subprocess probes on every MCP `find_impact` request when the helper
-  is missing.
-- **Bincode schema versioning** — all LMDB payloads now include a
-  version byte. Reading data from a future schema version produces a
-  clear error with rebuild instructions instead of silent corruption.
-- **Shared `SymbolIndexerRegistry`** — `find_impact` (MCP) and
-  `trigger_symbol_rebuild` (HTTP) now reuse the shared registry from
-  `ServeState` instead of creating fresh instances per request,
-  restoring cache effectiveness.
-- **O(1) position lookup** — `find_references_by_position` now uses a
-  secondary `scip_positions` LMDB table instead of iterating and
-  deserializing every symbol in the database.
-- **O(1) fuzzy lookup** — `find_references` fuzzy fallback now uses a
-  secondary `scip_simple_names` LMDB table instead of a full-table
-  scan with bincode deserialization.
-- **Removed `#[allow(dead_code)]`** on 5 SCIP constants in
-  `constants.rs` that are now actively referenced from `csharp.rs`.
-
-
+- Added C# `scip-csharp` helper, `-with-csharp` release variants, and `.cs` watcher debounce (60s quiet period). BREAKING: LMDB format change — existing `scip` databases require a full rebuild (auto-triggered on first `find_impact`/`reindex?symbols=true`). Plus many `find_impact`, regex-literal, O(1) lookup, and reindex fixes.
 
 ## [1.0.93] - 2026-05-08
-
-### Changed
-
-- **Local QC gate** (`scripts/qc.ps1`) — mirrors CI checks locally
-  (`fmt → check → clippy → test --lib → test --test *`) and
-  includes pre-push hook (`scripts/pre-push`) that blocks pushes when QC fails.
-  Prevents recurring "local pass, CI fail" problems.
-- **CodeQL configuration** — added `.github/codeql/codeql-config.yml` to suppress
-  `rust/path-injection` false positives (codesearch is a local dev tool,
-  not a web-facing server). In-repo CodeQL workflow configured to use this config.
-
-### Fixed
-
-- **`test_gitignore_rules_respected`** — gitignore directory patterns like `obj/`,
-  `bin/`, `.claude/` now correctly match nested files. The `is_gitignored()`
-  method iterates over all path components with `is_dir=true` so that
-  directory-only patterns match files inside them.
-- **Clippy `unnecessary_sort_by`** — replaced `sort_by()` with `sort_by_key()`
-  in two locations in `src/serve/mod.rs` to avoid lint failure on CI.
-
-
+- Added local QC gate (`scripts/qc.ps1`) mirroring CI + pre-push hook, and CodeQL config; fixed gitignore directory-pattern matching (`obj/`, `bin/`, `.claude/`) and clippy lints.
 
 ## [1.0.81] - 2026-05-02
-
-### Added
-
-- **`codesearch serve tui`** — standalone sub-action that opens the ratatui TUI
-  connected to a running serve instance via HTTP polling. The TUI can be opened
-  and closed independently of the server.
-- **`codesearch serve --no-tui`** — start serve headless even when a TTY is
-  available. Typical workflow: `codesearch serve --no-tui` in one terminal,
-  `codesearch serve tui` in another.
-- **`GET /status` endpoint** on serve returns a JSON snapshot of all repo
-  states, sessions, and CPU usage — usable for external monitoring and the
-  standalone TUI.
-
-### Fixed
-
-- **Idle eviction now covers warmed-but-never-queried repos**: `warmup_repo`
-  starts the idle timer at warmup so background-warmed aliases (ExampleRepo,
-  DPS, ExampleRepo and others showing `Last Tool Call = -` indefinitely) are
-  evicted by the idle reaper instead of holding LMDB envs and embedder state
-  forever.
-- **Ctrl-C no longer quits the TUI**: crossterm's raw mode delivers Ctrl-C as
-  a key event, bypassing the OS-level handler. Treating it as quit was a
-  foot-gun: a stray Ctrl-C in the wrong terminal would tear down the whole
-  serve. Use `q` only.
-
-### Changed
-
-- **`unsafe` blocks documented**: SAFETY comments added to the three LMDB
-  env-open `unsafe` blocks in `src/embed/cache.rs` and `src/vectordb/store.rs`.
-
-
+- Added `codesearch serve tui` standalone sub-action, `serve --no-tui`, and `GET /status`; fixed idle eviction for warmed-but-never-queried repos and Ctrl-C no longer quits the TUI.
 
 ## [1.0.77] - 2026-05-01
-
-### Removed
-
-- Stale planning documents (`.docs/`) and old benchmark results (`benchmarks/`)
-  removed from the repository. These were internal working documents with no
-  value for contributors.
-
-
+- Removed stale planning documents (`.docs/`) and old benchmark results (`benchmarks/`) from the repository.
 
 ## [1.0.74] - 2026-05-01
-
-### Fixed
-
-- **MCP session keep_alive timeout removed**: the previous 30-minute idle timeout
-  was killing sessions mid-working-day. Sessions now live until TCP dies, which
-  is the correct behaviour for a local single-user long-running serve process.
-
-
+- Removed the 30-minute MCP session keep_alive timeout; sessions now live until TCP dies (correct for a local single-user long-running serve).
 
 ## [1.0.72] - 2026-05-01
-
-First stable release of codesearch — a Rust-based hybrid (vector + BM25 + AST)
-code search MCP server, optimised for AI coding agents working across many
-repositories.
-
-### Added
-
-- **Multi-repository serve mode** (`codesearch serve`): a long-running HTTP/SSE
-  process that holds many indexed repositories warm at the same time, with
-  per-project routing via `project=…`, group routing via `group=…`, and
-  cross-repository search using RRF fusion across project boundaries.
-- **Stdio proxy with auto-reconnect**: `codesearch mcp` (stdio mode) detects a
-  running `serve` process and proxies tool calls to it. The proxy now performs
-  client-side retries with a forced reconnect when it sees a transport-level
-  failure (broken TCP keep-alive, stale session 404, server restart, laptop
-  suspend) so MCP clients like Claude Desktop self-heal transparently. After a
-  serve restart the first call returns a clear "reconnecting" message and the
-  next call succeeds.
-- **MCP tool surface optimised for agents** to reduce grep-fallback behaviour:
-  - `search` (semantic / hybrid / lexical / pure-literal regex modes)
-  - `find` (definition / usages / imports / dependents)
-  - `explore` (file outline / similar chunks)
-  - `get_chunk` for cheap follow-up reads of a specific code chunk
-  - `status` (index / projects)
-- **Tree-sitter AST-aware chunking** for 9 languages: Rust, Python, JavaScript,
-  TypeScript, C, C++, C#, Go, Java.
-- **Persistent embedding cache** keyed on SHA-256 of chunk content, surviving
-  `--force` rebuilds and per-file re-indexes.
-- **Git worktree support**: when `.git` is a worktree marker file (not a
-  directory), the project root is correctly resolved to the worktree itself.
-- **Long UNC-path support** on Windows for repositories under `\\?\C:\…` paths.
-- **Repository groups** for cross-repo search across user-defined sets of
-  projects (e.g. all related microservice repos).
-
-### Changed
-
-- **Search quality**: re-tuned RRF fusion of the vector / BM25 / exact-identifier
-  signals so common tool names and exact strings are no longer drowned out by
-  semantic neighbours, reducing the rate at which agents fall back to external
-  grep.
-- **Idle eviction**: only refreshes a project's "last accessed" timestamp on a
-  direct query against that project, not on fan-out queries that touch the
-  index merely because they routed through the same group.
-- **TUI CPU%**: now normalised by core count.
-
-### Fixed
-
-- **Security**: validate `CODESEARCH_CONFIG` environment variable against a path
-  traversal pattern (CodeQL finding). Config path is now rejected if it contains
-  `..` segments, preventing a directory traversal via env var.
-- **Issue #30** ([LMDB resize crash on large repositories](https://github.com/flupkede/codesearch/issues/30)):
-  When the database grew beyond its initial allocation (`MDB_MAP_FULL`), the
-  resize failed with `"an environment is already opened with different options"`.
-  The fix closes and reopens the LMDB environment around the resize, allowing
-  codesearch to index large repositories (tested: 4400+ files, 89 MB) without
-  crashing.
-- File-change tracking and reaper visibility in `serve` mode.
-
-### Removed
-
-- Server-side transparent MCP session-reconnect middleware: replaced by the
-  client-side retry in the stdio proxy. The middleware could not reach
-  non-compliant remote MCP clients (their HTTP pool gives up at the TCP layer
-  before the request hits the server) and added a session-counter leak.
-
-### Known limitations
-
-- Remote MCP clients that do not handle 404 "Session not found" per the MCP
-  spec (e.g. OpenCode 1.14.x at the time of writing) need to be restarted after
-  a `codesearch serve` restart.
-- `codesearch serve` keeps one writer per database (LMDB invariant). Concurrent
-  reindex from a second process is rejected.
+- Initial multi-repo release: multi-repo `serve` (HTTP/SSE, per-project/group routing, RRF cross-repo search), stdio MCP proxy with client-side auto-reconnect, tree-sitter chunking (9 langs), persistent SHA-256 embedding cache, repository groups, re-tuned RRF, and LMDB resize crash fix (#30, `MDB_MAP_FULL`).
 
 [1.0.171]: https://github.com/flupkede/codesearch/compare/v1.0.162...v1.0.171
 [1.0.162]: https://github.com/flupkede/codesearch/compare/v1.0.160...v1.0.162

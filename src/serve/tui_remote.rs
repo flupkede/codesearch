@@ -64,6 +64,9 @@ impl RepoInfo {
             last_tool_call: self.last_tool_call.clone(),
             lock_mode: self.lock_mode.clone(),
             path: self.path.clone(),
+            // The standalone remote dashboard shows ONE peer's own repos (local
+            // from that peer's view), not projects mounted into another instance.
+            is_remote: false,
         }
     }
 }

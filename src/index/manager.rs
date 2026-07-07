@@ -665,115 +665,165 @@ impl IndexManager {
             fts_store.commit()?;
         }
 
-        // Chunk changed files
+        // Chunk changed files — in bounded batches, not one unbounded pass.
+        //
+        // A single incremental refresh may need to absorb a corpus delta of
+        // any size (a normal edit touches a handful of files; a vendor sync
+        // can drop thousands of new files at once). Reading+chunking+embedding
+        // the ENTIRE delta into one in-memory Vec before writing anything out
+        // is what OOM'd a 1 vCPU/2 GiB `codesearch-serve` container when a
+        // vendor `docs` corpus roughly doubled (2509 -> 5666 files) in one
+        // sync. Batching bounds peak memory to O(batch), not O(total delta),
+        // so a delta of any size is now safe — it just takes longer, spread
+        // across sequential batches. See `INCREMENTAL_REFRESH_BATCH_SIZE`.
         if !changed_files.is_empty() {
-            info!("🔄 Processing {} changed files...", changed_files.len());
+            let batch_size = std::env::var(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE);
+            let total_batches = changed_files.len().div_ceil(batch_size);
+            info!(
+                "🔄 Processing {} changed files in {} batch(es) of up to {} file(s) each...",
+                changed_files.len(),
+                total_batches,
+                batch_size
+            );
 
-            // Read + chunk + embed is synchronous, CPU/I/O-heavy work
-            // (file reads, tree-sitter parsing, fastembed/ONNX inference that
-            // saturates all cores). Offload the whole block to `spawn_blocking`
-            // so it never runs on a tokio worker thread. The `EmbeddingService`
-            // and `SemanticChunker` are built inside the closure because they
-            // are not needed on the async side and may not be `Send`.
             let cache_dir = crate::constants::get_global_models_cache_dir()?;
-            let files_for_embed = changed_files.clone();
-            let embedded_chunks =
-                tokio::task::spawn_blocking(move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
-                    let mut chunker = SemanticChunker::new(100, 2000, 10);
-                    let mut all_chunks = Vec::new();
+            let mut total_indexed = 0usize;
 
-                    for file in &files_for_embed {
-                        let content = match std::fs::read_to_string(&file.path) {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        };
-                        let chunks = chunker.chunk_semantic(file.language, &file.path, &content)?;
-                        all_chunks.extend(chunks);
-                    }
+            for (batch_idx, file_batch) in changed_files.chunks(batch_size).enumerate() {
+                // Read + chunk + embed is synchronous, CPU/I/O-heavy work
+                // (file reads, tree-sitter parsing, fastembed/ONNX inference that
+                // saturates all cores). Offload the whole block to `spawn_blocking`
+                // so it never runs on a tokio worker thread. The `EmbeddingService`
+                // and `SemanticChunker` are built inside the closure because they
+                // are not needed on the async side and may not be `Send`.
+                let files_for_embed = file_batch.to_vec();
+                let cache_dir_for_batch = cache_dir.clone();
+                let embedded_chunks = tokio::task::spawn_blocking(
+                    move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
+                        let mut chunker = SemanticChunker::new(100, 2000, 10);
+                        let mut all_chunks = Vec::new();
 
-                    if all_chunks.is_empty() {
-                        return Ok(Vec::new());
-                    }
+                        for file in &files_for_embed {
+                            let content = match std::fs::read_to_string(&file.path) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            let chunks =
+                                chunker.chunk_semantic(file.language, &file.path, &content)?;
+                            all_chunks.extend(chunks);
+                        }
 
+                        if all_chunks.is_empty() {
+                            return Ok(Vec::new());
+                        }
+
+                        let mut embedding_service = EmbeddingService::with_cache_dir(
+                            embed_model,
+                            Some(cache_dir_for_batch.as_path()),
+                        )?;
+                        embedding_service.embed_chunks(all_chunks)
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "chunk+embed task panicked (batch {}/{}): {}",
+                        batch_idx + 1,
+                        total_batches,
+                        e
+                    )
+                })??;
+
+                if !embedded_chunks.is_empty() {
                     info!(
-                        "📦 Embedding {} chunks with model {}...",
-                        all_chunks.len(),
+                        "📦 Batch {}/{}: embedding {} chunks with model {}...",
+                        batch_idx + 1,
+                        total_batches,
+                        embedded_chunks.len(),
                         embed_model.short_name()
                     );
-                    let mut embedding_service =
-                        EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
-                    embedding_service.embed_chunks(all_chunks)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("chunk+embed task panicked: {}", e))??;
 
-            if !embedded_chunks.is_empty() {
-                // Insert into vector store. The HNSW `build_index()` is CPU-heavy,
-                // so it is offloaded to `spawn_blocking`; the insert itself needs
-                // the async RwLock and stays here.
-                let chunk_ids = {
-                    let mut store = stores.vector_store.write().await;
-                    store.insert_chunks_with_ids(embedded_chunks.clone())?
-                };
-                {
-                    let vector_store = Arc::clone(&stores.vector_store);
-                    tokio::task::spawn_blocking(move || {
-                        let mut store = vector_store.blocking_write();
-                        store.build_index()
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
-                }
+                    // Insert into vector store. `build_index()` (HNSW graph
+                    // construction) is deliberately deferred until ALL batches
+                    // are inserted — it rebuilds the whole graph from current
+                    // storage, so doing it once at the end avoids O(batches)
+                    // redundant rebuilds.
+                    let chunk_ids = {
+                        let mut store = stores.vector_store.write().await;
+                        store.insert_chunks_with_ids(embedded_chunks.clone())?
+                    };
 
-                // Insert into FTS
-                {
-                    let mut fts_store = stores.fts_store.write().await;
-                    for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-                        let path_str = chunk.chunk.path.to_string();
-                        let signature = chunk.chunk.signature.as_deref();
-                        let kind = format!("{:?}", chunk.chunk.kind);
-                        fts_store.add_chunk(
-                            *chunk_id,
-                            &chunk.chunk.content,
-                            &path_str,
-                            signature,
-                            &kind,
-                        )?;
+                    // Insert into FTS
+                    {
+                        let mut fts_store = stores.fts_store.write().await;
+                        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
+                            let path_str = chunk.chunk.path.to_string();
+                            let signature = chunk.chunk.signature.as_deref();
+                            let kind = format!("{:?}", chunk.chunk.kind);
+                            fts_store.add_chunk(
+                                *chunk_id,
+                                &chunk.chunk.content,
+                                &path_str,
+                                signature,
+                                &kind,
+                            )?;
+                        }
+                        fts_store.commit()?;
                     }
-                    fts_store.commit()?;
-                }
 
-                // Update file metadata
-                // Group chunks by file path (normalize for consistent lookup)
-                let mut chunks_by_file: std::collections::HashMap<String, Vec<u32>> =
-                    std::collections::HashMap::new();
-                for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-                    chunks_by_file
-                        .entry(normalize_path_str(&chunk.chunk.path))
-                        .or_default()
-                        .push(*chunk_id);
-                }
+                    // Update file metadata for this batch's files.
+                    // Group chunks by file path (normalize for consistent lookup)
+                    let mut chunks_by_file: std::collections::HashMap<String, Vec<u32>> =
+                        std::collections::HashMap::new();
+                    for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
+                        chunks_by_file
+                            .entry(normalize_path_str(&chunk.chunk.path))
+                            .or_default()
+                            .push(*chunk_id);
+                    }
 
-                for file in &changed_files {
-                    let path_str = normalize_path(&file.path);
-                    if let Some(ids) = chunks_by_file.get(&path_str) {
-                        file_meta_store.update_file(&file.path, ids.clone())?;
-                    } else {
-                        // File was processed but produced 0 chunks (e.g. minified JS,
-                        // empty file). Track it with empty chunk list so it is not
-                        // re-processed on every run and doctor doesn't flag it.
+                    for file in file_batch {
+                        let path_str = normalize_path(&file.path);
+                        if let Some(ids) = chunks_by_file.get(&path_str) {
+                            file_meta_store.update_file(&file.path, ids.clone())?;
+                        } else {
+                            // File was processed but produced 0 chunks (e.g. minified JS,
+                            // empty file). Track it with empty chunk list so it is not
+                            // re-processed on every run and doctor doesn't flag it.
+                            file_meta_store.update_file(&file.path, vec![])?;
+                        }
+                    }
+
+                    total_indexed += embedded_chunks.len();
+                } else {
+                    // ALL files in this batch produced 0 chunks — still track
+                    // them so they are not flagged as unindexed on every
+                    // subsequent run.
+                    for file in file_batch {
                         file_meta_store.update_file(&file.path, vec![])?;
                     }
                 }
-
-                info!("✅ Indexed {} chunks", embedded_chunks.len());
-            } else {
-                // ALL changed files produced 0 chunks — still track them so they
-                // are not flagged as unindexed on every subsequent run.
-                for file in &changed_files {
-                    file_meta_store.update_file(&file.path, vec![])?;
-                }
             }
+
+            // Build the HNSW index once, after every batch has been inserted.
+            if total_indexed > 0 {
+                let vector_store = Arc::clone(&stores.vector_store);
+                tokio::task::spawn_blocking(move || {
+                    let mut store = vector_store.blocking_write();
+                    store.build_index()
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
+            }
+
+            info!(
+                "✅ Indexed {} chunks across {} batch(es)",
+                total_indexed, total_batches
+            );
         }
 
         // Save file metadata
