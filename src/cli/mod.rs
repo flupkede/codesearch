@@ -204,14 +204,40 @@ pub enum RemoteCommands {
     Mounts,
 }
 
-/// Hook subcommands
+/// `hooks` subcommands — grouped by integration target.
 #[derive(Subcommand, Debug)]
 pub enum HookCommands {
+    /// Manage the git hooks (post-checkout worktree auto-registration)
+    Git {
+        #[command(subcommand)]
+        command: HookGitCommands,
+    },
+    /// Manage the Claude Code integration hooks (codesearch-first guards)
+    Claude {
+        #[command(subcommand)]
+        command: HookClaudeCommands,
+    },
+}
+
+/// `hooks git` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum HookGitCommands {
     /// Install a post-checkout hook that auto-registers new git worktrees with codesearch serve
     Install {
         /// Path to the git repository (defaults to current directory)
         #[arg(long)]
         path: Option<PathBuf>,
+    },
+}
+
+/// `hooks claude` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum HookClaudeCommands {
+    /// Install the Claude Code PreToolUse guard hooks (codesearch-first) into settings.json
+    Install {
+        /// Install into the project's ./.claude instead of the user-level ~/.claude
+        #[arg(long)]
+        project: bool,
     },
 }
 
@@ -515,7 +541,8 @@ pub enum Commands {
         command: CacheCommands,
     },
 
-    /// Install git hooks for automatic codesearch integration
+    /// Manage codesearch integration hooks (git worktree auto-index, Claude Code guards)
+    #[command(name = "hooks", alias = "hook")]
     Hook {
         #[command(subcommand)]
         command: HookCommands,
@@ -1123,7 +1150,14 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Groups { command } => run_groups_command(command).await,
         Commands::Remote { command } => run_remote_command(command).await,
         Commands::Hook { command } => match command {
-            HookCommands::Install { path } => run_hook_install(path).await,
+            HookCommands::Git { command } => match command {
+                HookGitCommands::Install { path } => run_hook_git_install(path).await,
+            },
+            HookCommands::Claude { command } => match command {
+                HookClaudeCommands::Install { project } => {
+                    claude_hooks::run_claude_install(project)
+                }
+            },
         },
     }
 }
@@ -1523,8 +1557,9 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
     Ok(())
 }
 
-/// Install the post-checkout git hook for codesearch worktree auto-indexing.
-async fn run_hook_install(path: Option<PathBuf>) -> Result<()> {
+/// Install the post-checkout git hook for codesearch worktree auto-indexing
+/// (`codesearch hooks git install`).
+async fn run_hook_git_install(path: Option<PathBuf>) -> Result<()> {
     use colored::Colorize;
 
     let repo_path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -1576,7 +1611,7 @@ async fn run_hook_install(path: Option<PathBuf>) -> Result<()> {
     let hook_script = r#"#!/bin/bash
 # codesearch post-checkout hook
 # Auto-registers new worktrees with codesearch serve.
-# Installed by: codesearch hook install
+# Installed by: codesearch hooks git install
 # $1 = prev_ref, $2 = new_ref, $3 = flag (1=branch checkout)
 
 SERVE_URL_FILE="$HOME/.codesearch/serve_url"
@@ -1621,6 +1656,7 @@ fi
     Ok(())
 }
 
+pub mod claude_hooks;
 pub mod doctor;
 pub mod setup;
 

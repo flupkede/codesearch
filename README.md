@@ -395,7 +395,7 @@ When using `git worktree add` to create parallel working directories, codesearch
 **Setup** (run inside any repo you want worktree auto-indexing for):
 
 ```bash
-codesearch hook install
+codesearch hooks git install
 ```
 
 This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
@@ -404,6 +404,17 @@ This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path
 1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` on startup (deletes on shutdown)
 2. The `post-checkout` hook reads that file and POSTs the working directory to `POST /repos`
 3. Serve registers the worktree path and begins indexing (deduped — won't re-register existing paths)
+
+### Claude Code Guard Hooks
+
+Install the Claude Code PreToolUse guard hooks so agents reach for codesearch before falling back to `Grep` (and, once enabled, before `WebSearch`/`WebFetch` when remote doc mounts are available):
+
+```bash
+codesearch hooks claude install            # into ~/.claude (user scope)
+codesearch hooks claude install --project  # into ./.claude (project scope)
+```
+
+This writes the guard scripts to `<claude_dir>/hooks/codesearch/` and merges the matching `PreToolUse` registrations into `settings.json` (backed up first, idempotent — re-running never duplicates). Restart Claude Code for the hooks to take effect.
 
 ### MCP Connection Modes
 
@@ -503,7 +514,8 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `codesearch setup` | Download embedding models |
 | `codesearch cache stats\|clear` | Manage embedding cache |
 | `codesearch groups list\|add\|remove` | Manage repository groups |
-| `codesearch hook install` | Install git post-checkout hook for worktree auto-indexing |
+| `codesearch hooks git install` | Install git post-checkout hook for worktree auto-indexing |
+| `codesearch hooks claude install` | Install Claude Code codesearch-first guard hooks into settings.json |
 
 ## Configuration
 
