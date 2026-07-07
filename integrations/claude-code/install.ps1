@@ -35,11 +35,16 @@ $settingsPath = Join-Path $claudeDir 'settings.json'
 
 New-Item -ItemType Directory -Force -Path $hooksDest | Out-Null
 
+# NOTE: `codesearch hooks claude install` is the preferred, self-contained way
+# to install these hooks (no source tree needed). This script remains as the
+# from-source equivalent and must stay in sync with src/cli/claude_hooks.rs.
 Copy-Item -Path (Join-Path $hooksSrc 'grep-guard.ps1')        -Destination $hooksDest -Force
 Copy-Item -Path (Join-Path $hooksSrc 'subagent-preamble.ps1') -Destination $hooksDest -Force
+Copy-Item -Path (Join-Path $hooksSrc 'web-guard.ps1')         -Destination $hooksDest -Force
 
 $grepGuardCmd = "pwsh -NoProfile -NonInteractive -File `"$($hooksDest -replace '\\','/')/grep-guard.ps1`""
 $preambleCmd  = "pwsh -NoProfile -NonInteractive -File `"$($hooksDest -replace '\\','/')/subagent-preamble.ps1`""
+$webGuardCmd  = "pwsh -NoProfile -NonInteractive -File `"$($hooksDest -replace '\\','/')/web-guard.ps1`""
 
 # Load or initialize settings.json
 if (Test-Path $settingsPath) {
@@ -71,8 +76,9 @@ function Add-MatcherHook($matcher, $command) {
     Write-Host "Registered $matcher hook -> $command"
 }
 
-Add-MatcherHook -matcher 'Grep'  -command $grepGuardCmd
-Add-MatcherHook -matcher 'Agent' -command $preambleCmd
+Add-MatcherHook -matcher 'Grep'              -command $grepGuardCmd
+Add-MatcherHook -matcher 'Agent'             -command $preambleCmd
+Add-MatcherHook -matcher 'WebSearch|WebFetch' -command $webGuardCmd
 
 $settings['hooks']['PreToolUse'] = @($preToolUse)
 

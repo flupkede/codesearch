@@ -207,21 +207,22 @@ OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies acr
 
 **Claude Code specifically** tends to ignore this advice more than other clients — its MCP tool schemas are deferred (an extra `ToolSearch` call is needed before codesearch tools are even callable), while Grep/Glob are always fully loaded and zero-friction, and spawned subagents don't inherit `AGENTS.md` or the MCP `initialize` instructions at all.
 
-To make the preference **structural** instead of advisory, this repo ships two Claude Code hooks in [`integrations/claude-code/`](integrations/claude-code/):
+To make the preference **structural** instead of advisory, this repo ships three Claude Code `PreToolUse` hooks:
 
-- **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks the first grep against an in-repo path when codesearch looks available (a local `.codesearch.db` at the git root, or a `CODESEARCH_SERVER` env var for remote-serve setups), with a message telling the model how to load and call codesearch instead. A retry of the same query within 5 minutes is let through unblocked — the legitimate "codesearch found nothing, falling back" path. Greps outside the current repo are never blocked, and the hook fails open (never traps the model).
-- **`subagent-preamble`** — a `PreToolUse` hook on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all.
+- **`grep-guard`** — on `Grep`. Blocks the first grep against an in-repo path when codesearch looks available (a local `.codesearch.db` at the git root, or a `CODESEARCH_SERVER` env var for remote-serve setups), with a message telling the model how to load and call codesearch instead. A retry of the same query within 5 minutes is let through unblocked — the legitimate "codesearch found nothing, falling back" path. Greps outside the current repo are never blocked, and the hook fails open (never traps the model).
+- **`subagent-preamble`** — on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all.
+- **`web-guard`** — on `WebSearch`/`WebFetch`. When you have remote documentation projects mounted (`codesearch remote mount`, e.g. `cloud/inriver`, `cloud/aprimo`), it blocks the first web call with guidance to search those indexed mounts first — often more precise and current than the open web. Same 5-minute retry-escape; when no mounts are configured it does nothing.
 
-Install (idempotent — user scope applies to every project; project scope is this repo only):
+Install (idempotent — user scope applies to every project; `--project` is this repo only):
 
 ```bash
-pwsh -File integrations/claude-code/install.ps1                 # Windows — user scope (~/.claude)
-pwsh -File integrations/claude-code/install.ps1 -Scope project  # Windows — project scope (./.claude)
-bash integrations/claude-code/install.sh                        # macOS/Linux — user scope
-bash integrations/claude-code/install.sh --project              # macOS/Linux — project scope
+codesearch hooks claude install            # preferred — self-contained, all platforms
+codesearch hooks claude install --project  # project scope (./.claude)
 ```
 
-Note: the guard detects "codesearch is available **for this repo**" via a local `.codesearch.db` or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory). For a remote-serve setup with no local index, set `CODESEARCH_SERVER` to opt back into enforcement.
+The native command embeds the hook scripts in the binary (no source tree needed) and merges the registrations into `settings.json`. The equivalent from-source installers still live in [`integrations/claude-code/`](integrations/claude-code/) (`install.ps1` / `install.sh`) if you'd rather run them directly.
+
+Note: the grep-guard detects "codesearch is available **for this repo**" via a local `.codesearch.db` or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory). For a remote-serve setup with no local index, set `CODESEARCH_SERVER` to opt back into enforcement.
 
 ## MCP Tools Reference
 
@@ -407,14 +408,7 @@ This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path
 
 ### Claude Code Guard Hooks
 
-Install the Claude Code PreToolUse guard hooks so agents reach for codesearch before falling back to `Grep` (and, once enabled, before `WebSearch`/`WebFetch` when remote doc mounts are available):
-
-```bash
-codesearch hooks claude install            # into ~/.claude (user scope)
-codesearch hooks claude install --project  # into ./.claude (project scope)
-```
-
-This writes the guard scripts to `<claude_dir>/hooks/codesearch/` and merges the matching `PreToolUse` registrations into `settings.json` (backed up first, idempotent — re-running never duplicates). Restart Claude Code for the hooks to take effect.
+`codesearch hooks claude install` (`--project` for repo scope) installs the `PreToolUse` guard hooks that steer agents to codesearch before `Grep`/`WebSearch`/`WebFetch`. See [Agent Guidance](#agent-guidance-making-agents-use-codesearch-not-grep) above for what each guard does.
 
 ### MCP Connection Modes
 

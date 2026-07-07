@@ -26,6 +26,8 @@ const GREP_GUARD_PS1: &str = include_str!("../../integrations/claude-code/hooks/
 const PREAMBLE_SH: &str = include_str!("../../integrations/claude-code/hooks/subagent-preamble.sh");
 const PREAMBLE_PS1: &str =
     include_str!("../../integrations/claude-code/hooks/subagent-preamble.ps1");
+const WEB_GUARD_SH: &str = include_str!("../../integrations/claude-code/hooks/web-guard.sh");
+const WEB_GUARD_PS1: &str = include_str!("../../integrations/claude-code/hooks/web-guard.ps1");
 
 /// A PreToolUse guard hook to install: the tool matcher it fires on, the script
 /// basename, and the per-platform script files to write out.
@@ -38,8 +40,10 @@ struct GuardHook {
     files: &'static [(&'static str, &'static str)],
 }
 
-/// The guards installed by `hooks claude install`. Stage B adds the WebSearch/
-/// WebFetch guard here.
+/// The guards installed by `hooks claude install`:
+/// - `Grep` → codesearch-first for internal code discovery.
+/// - `Agent` → inject a codesearch-first preamble into subagent prompts.
+/// - `WebSearch`/`WebFetch` → steer to remote doc mounts before the open web.
 static GUARD_HOOKS: &[GuardHook] = &[
     GuardHook {
         matcher: "Grep",
@@ -55,6 +59,15 @@ static GUARD_HOOKS: &[GuardHook] = &[
         files: &[
             ("subagent-preamble.sh", PREAMBLE_SH),
             ("subagent-preamble.ps1", PREAMBLE_PS1),
+        ],
+    },
+    GuardHook {
+        // A single matcher entry matching both web tools (regex over tool name).
+        matcher: "WebSearch|WebFetch",
+        stem: "web-guard",
+        files: &[
+            ("web-guard.sh", WEB_GUARD_SH),
+            ("web-guard.ps1", WEB_GUARD_PS1),
         ],
     },
 ];
@@ -167,8 +180,7 @@ pub fn run_claude_install(project: bool) -> Result<()> {
     }
 
     // 2. Merge the PreToolUse registrations into settings.json.
-    std::fs::create_dir_all(&claude_dir)
-        .with_context(|| format!("creating {}", claude_dir.display()))?;
+    // (`claude_dir` already exists — creating `hooks_dest` above made it.)
     let settings_path = claude_dir.join("settings.json");
     let mut settings = load_or_init_settings(&settings_path)?;
 
@@ -241,9 +253,41 @@ mod tests {
     }
 
     #[test]
-    fn add_matcher_hook_rejects_bad_shape() {
+    fn add_matcher_hook_rejects_bad_pretooluse_shape() {
         let mut settings = json!({ "hooks": { "PreToolUse": "not-an-array" } });
         assert!(add_matcher_hook(&mut settings, "Grep", "cmd").is_err());
+    }
+
+    #[test]
+    fn add_matcher_hook_rejects_non_object_hooks() {
+        let mut settings = json!({ "hooks": "not-an-object" });
+        assert!(add_matcher_hook(&mut settings, "Grep", "cmd").is_err());
+    }
+
+    #[test]
+    fn add_matcher_hook_rejects_non_object_root() {
+        let mut settings = json!(["not", "an", "object"]);
+        assert!(add_matcher_hook(&mut settings, "Grep", "cmd").is_err());
+    }
+
+    #[test]
+    fn guard_hooks_cover_grep_agent_and_web() {
+        let matchers: Vec<&str> = GUARD_HOOKS.iter().map(|g| g.matcher).collect();
+        assert!(matchers.contains(&"Grep"));
+        assert!(matchers.contains(&"Agent"));
+        assert!(matchers.contains(&"WebSearch|WebFetch"));
+        // Every guard ships both a .sh and a .ps1 with non-empty embedded bodies.
+        for g in GUARD_HOOKS {
+            assert_eq!(
+                g.files.len(),
+                2,
+                "guard {} must ship both shells",
+                g.matcher
+            );
+            for (name, body) in g.files {
+                assert!(!body.is_empty(), "{name} embedded body is empty");
+            }
+        }
     }
 
     #[test]
