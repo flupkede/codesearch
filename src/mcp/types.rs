@@ -282,13 +282,15 @@ pub struct SearchResultItem {
     pub context_prev: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_next: Option<String>,
-    /// Federation source tag: `None` for local results, `Some("<peer_name>")`
-    /// for results merged in from a remote peer. Lets the agent tell where a
-    /// hit originated.
+    /// Federation source tag: `None` for local results,
+    /// `Some("<peer>/<remote_alias>")` for results merged in from a remote peer
+    /// (e.g. `Some("cloud/inriver")`). Lets the agent tell where a hit
+    /// originated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Federated chunk reference for retrieval, of the form `"<peer>:<chunk_id>"`
-    /// (e.g. `"cloud:12345"`). Present only for remote results; pass it back to
+    /// Federated chunk reference for retrieval, of the form
+    /// `"<peer>/<remote_alias>:<chunk_id>"` (e.g. `"cloud/inriver:12345"`).
+    /// Present only for remote results; pass it back to
     /// `get_chunk(chunk_ref=...)` to fetch the chunk content from the peer.
     /// Local results are fetched with the plain numeric `chunk_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
