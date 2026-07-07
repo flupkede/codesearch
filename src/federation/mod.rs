@@ -222,30 +222,15 @@ impl FederationClient {
     /// `body` is the local search request, serialised as JSON; `group` on the
     /// body is forced to the peer's configured group (or `"all"` when unset) and
     /// `project` is stripped, because projects are local to each instance.
-    pub async fn search(
-        &self,
-        peer: &RemotePeer,
-        mut body: serde_json::Value,
-    ) -> Outcome<Vec<RemoteSearchItem>> {
-        // Force the scope onto the remote's own group/namespace.
-        if let Some(obj) = body.as_object_mut() {
-            let g = peer
-                .group
-                .clone()
-                .unwrap_or_else(|| crate::constants::ALL_GROUP_NAME.to_string());
-            obj.insert("group".into(), serde_json::Value::String(g));
-            obj.remove("project");
-        }
-        self.post_search(peer, body).await
-    }
-
     /// Query a remote peer's `/search` endpoint scoped to a SINGLE remote
     /// project (project-level federation / mounted remote project).
     ///
-    /// Unlike [`search`](Self::search), this forces `project=<remote_alias>` and
-    /// strips `group`: the peer resolves the project in its own namespace and
-    /// returns only that project's results. `remote_alias` is the project's bare
-    /// name on the peer (the `<alias>` half of the local `<peer>/<alias>` mount).
+    /// Forces `project=<remote_alias>` and strips `group`: the peer resolves the
+    /// project in its own namespace and returns only that project's results.
+    /// `remote_alias` is the project's bare name on the peer (the `<alias>` half
+    /// of the local `<peer>/<alias>` mount). This is the ONLY search path —
+    /// group federation fans out to each mounted project via this method, so a
+    /// query only ever touches the individual indexes the user opted into.
     pub async fn search_project(
         &self,
         peer: &RemotePeer,
@@ -555,9 +540,10 @@ mod tests {
 
         let client = FederationClient::new().unwrap();
         let outcome = client
-            .search(
+            .search_project(
                 &peer(format!("http://{addr}")),
                 serde_json::json!({"query": "x"}),
+                "kb",
             )
             .await;
         match outcome {
@@ -592,9 +578,10 @@ mod tests {
 
         let client = FederationClient::new().unwrap();
         let outcome = client
-            .search(
+            .search_project(
                 &peer(format!("http://{addr}")),
                 serde_json::json!({"query": "x"}),
+                "kb",
             )
             .await;
         match outcome {

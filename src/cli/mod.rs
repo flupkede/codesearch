@@ -179,6 +179,29 @@ pub enum RemoteCommands {
         /// Peer name
         name: String,
     },
+
+    /// List the individual projects a peer exposes, marking which are mounted
+    #[command(visible_alias = "avail")]
+    Available {
+        /// Peer name (as configured with `remote add`)
+        peer: String,
+    },
+
+    /// Mount an individual remote project locally (opt-in), by "<peer>/<alias>"
+    Mount {
+        /// Canonical name "<peer>/<alias>" (see `remote available`)
+        name: String,
+    },
+
+    /// Unmount a previously mounted remote project, by "<peer>/<alias>"
+    #[command(visible_alias = "umount")]
+    Unmount {
+        /// Canonical name "<peer>/<alias>"
+        name: String,
+    },
+
+    /// List the remote projects currently mounted locally
+    Mounts,
 }
 
 /// Hook subcommands
@@ -1403,6 +1426,97 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
                 println!("Remote peer '{}' removed.", name);
             } else {
                 eprintln!("Remote peer '{}' not found.", name);
+            }
+        }
+        RemoteCommands::Available { peer } => {
+            use crate::db_discovery::repos::remote_project_name;
+            use crate::federation::{FederationClient, ManagementOutcome};
+
+            let peer_name = peer.trim();
+            let config = crate::db_discovery::load_repos_config()?;
+            let Some(peer_cfg) = config.remotes.get(peer_name) else {
+                anyhow::bail!(
+                    "Unknown remote peer '{}'. Add it first with `codesearch remote add`.",
+                    peer_name
+                );
+            };
+            let client = FederationClient::new()
+                .map_err(|e| anyhow::anyhow!("failed to init HTTP client: {e}"))?;
+            match client.list_repos(peer_cfg).await {
+                ManagementOutcome::Ok(status) => {
+                    if status.repos.is_empty() {
+                        println!("Peer '{}' exposes no projects.", peer_name);
+                        return Ok(());
+                    }
+                    let mounted: std::collections::HashSet<&String> =
+                        config.remote_mounts.iter().collect();
+                    let mut repos = status.repos;
+                    repos.sort_by(|a, b| a.alias.cmp(&b.alias));
+                    println!("Projects on '{}':", peer_name);
+                    for r in &repos {
+                        let canonical = remote_project_name(peer_name, &r.alias);
+                        let mark = if mounted.contains(&canonical) {
+                            "✓ mounted"
+                        } else {
+                            "  -      "
+                        };
+                        println!("  {mark}  {canonical}  [{}]", r.status);
+                    }
+                    println!("\nMount one with: codesearch remote mount <peer>/<alias>");
+                }
+                ManagementOutcome::HttpError { status, reason } => {
+                    anyhow::bail!("Peer '{}' returned HTTP {}: {}", peer_name, status, reason);
+                }
+                ManagementOutcome::Unreachable(reason) => {
+                    anyhow::bail!("Peer '{}' unreachable: {}", peer_name, reason);
+                }
+            }
+        }
+        RemoteCommands::Mount { name } => {
+            let name = name.trim();
+            let mut config = crate::db_discovery::load_repos_config()?;
+            config.mount_remote_project(name)?;
+            config.save()?;
+            println!(
+                "Mounted remote project '{}'. Query it with `project={}`.",
+                name, name
+            );
+            println!("  (If `codesearch serve` is running, press 'l' in its TUI to reload.)");
+        }
+        RemoteCommands::Unmount { name } => {
+            let name = name.trim();
+            let mut config = crate::db_discovery::load_repos_config()?;
+            if config.unmount_remote_project(name) {
+                config.save()?;
+                println!("Unmounted remote project '{}'.", name);
+            } else {
+                eprintln!("Remote project '{}' was not mounted.", name);
+            }
+        }
+        RemoteCommands::Mounts => {
+            use crate::db_discovery::repos::{remote_project_name, Target};
+
+            let config = crate::db_discovery::load_repos_config()?;
+            if config.remote_mounts.is_empty() {
+                println!("No remote projects mounted. See `codesearch remote available <peer>`.");
+                return Ok(());
+            }
+            println!("Mounted remote projects:");
+            for (name, target) in config.mounted_remote_projects() {
+                if let Target::RemoteProject {
+                    peer_name,
+                    peer,
+                    remote_alias,
+                } = target
+                {
+                    let canonical = remote_project_name(&peer_name, &remote_alias);
+                    if name == canonical {
+                        println!("  {name}  ({})", peer.url);
+                    } else {
+                        // A local rename override is in effect.
+                        println!("  {name}  → {canonical}  ({})", peer.url);
+                    }
+                }
             }
         }
     }

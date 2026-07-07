@@ -464,10 +464,29 @@ pub struct DependentItem {
 pub struct ListProjectsResponse {
     pub repos: Vec<RepoInfo>,
     pub groups: HashMap<String, Vec<String>>,
+    /// Mounted remote projects (opt-in federation), each routable by `name` as a
+    /// first-class `project=`. Empty when nothing is mounted. Kept separate from
+    /// `repos` so an agent can tell local indexes from federated ones.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub remote_projects: Vec<RemoteProjectInfo>,
     pub serve_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve_url: Option<String>,
     pub current_directory: String,
+}
+
+/// A mounted remote project surfaced as a first-class, routable project.
+#[derive(Debug, Serialize)]
+pub struct RemoteProjectInfo {
+    /// Local name to pass as `project=` — the canonical `<peer>/<alias>` or the
+    /// user's rename.
+    pub name: String,
+    /// The federation peer this project lives on.
+    pub peer: String,
+    /// The bare project alias on the peer (what is forwarded as `project=`).
+    pub remote_alias: String,
+    /// The peer's base URL.
+    pub peer_url: String,
 }
 
 /// Information about a single registered project/repo.

@@ -3758,7 +3758,15 @@ impl CodesearchService {
         {
             let cfg = serve_state.config_snapshot();
             let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
+            // Include opt-in mounted remote projects so an agent can discover and
+            // route to them by name (they are first-class `project=` targets).
+            projects.extend(
+                cfg.mounted_remote_projects()
+                    .into_iter()
+                    .map(|(name, _)| name),
+            );
             projects.sort();
+            projects.dedup();
             let mut groups: Vec<String> = cfg.groups.keys().cloned().collect();
             groups.sort();
             (projects, groups, cfg.project_groups())
@@ -3984,23 +3992,24 @@ impl CodesearchService {
         crate::db_discovery::repos::ReposConfig::load().unwrap_or_default()
     }
 
-    /// True when the given group resolves to at least one remote peer.
+    /// True when the given group fans out to at least one **mounted** remote
+    /// project. A group that references `@peer` but where the user has mounted
+    /// none of that peer's individual indexes is treated as local-only.
     fn group_has_remotes(cfg: &crate::db_discovery::repos::ReposConfig, group: &str) -> bool {
-        cfg.resolve_group_targets(group)
-            .iter()
-            .any(|t| matches!(t, crate::db_discovery::repos::Target::Remote { .. }))
+        !cfg.group_remote_projects(group).is_empty()
     }
 
     /// Merge local + remote search results for a group that has `@<peer>`
     /// members. Runs the local query (restricted to the group's local repos),
-    /// fans out to every remote peer in parallel, then RRF-interleaves the
-    /// disjoint ranked lists. One unreachable peer becomes a `warning`, never a
-    /// hard failure.
+    /// fans out in parallel to each **mounted** remote project of the referenced
+    /// peers (`<peer>/<alias>`, opt-in `remote_mounts`), then RRF-interleaves the
+    /// disjoint ranked lists. One unreachable project becomes a `warning`, never
+    /// a hard failure.
     async fn federated_search(
         &self,
         request: &SearchRequest,
         cfg: &crate::db_discovery::repos::ReposConfig,
-        remotes: Vec<(String, crate::db_discovery::repos::RemotePeer)>,
+        remote_projects: Vec<(String, crate::db_discovery::repos::RemotePeer, String)>,
     ) -> Result<CallToolResult, McpError> {
         use crate::federation::{FederationClient, Outcome};
         use crate::rerank::DEFAULT_RRF_K;
@@ -4079,14 +4088,16 @@ impl CodesearchService {
             }
         };
 
-        // 3) Fan out to all remote peers concurrently.
+        // 3) Fan out to each mounted remote project concurrently. Each is a
+        //    project-scoped query (`project=<remote_alias>`) to its peer, so a
+        //    group only ever searches the indexes the user opted into.
         let mut join = tokio::task::JoinSet::new();
-        for (peer_name, peer) in remotes.into_iter() {
+        for (peer_name, peer, remote_alias) in remote_projects.into_iter() {
             let body = body.clone();
             let client = client.clone();
             join.spawn(async move {
-                let outcome = client.search(&peer, body).await;
-                (peer_name, outcome)
+                let outcome = client.search_project(&peer, body, &remote_alias).await;
+                (peer_name, remote_alias, outcome)
             });
         }
 
@@ -4094,7 +4105,7 @@ impl CodesearchService {
         let mut all_lists: Vec<Vec<SearchResultItem>> = vec![local_items];
         while let Some(res) = join.join_next().await {
             match res {
-                Ok((peer_name, Outcome::Ok(items))) => {
+                Ok((peer_name, _remote_alias, Outcome::Ok(items))) => {
                     all_lists.push(
                         items
                             .into_iter()
@@ -4102,10 +4113,10 @@ impl CodesearchService {
                             .collect(),
                     );
                 }
-                Ok((peer_name, Outcome::Unreachable(reason))) => {
+                Ok((peer_name, remote_alias, Outcome::Unreachable(reason))) => {
                     warnings.push(format!(
-                        "remote peer '{}' unreachable: {}",
-                        peer_name, reason
+                        "remote project '{}/{}' unreachable: {}",
+                        peer_name, remote_alias, reason
                     ));
                 }
                 Err(joinerr) => {
@@ -4305,8 +4316,8 @@ impl CodesearchService {
         if let Some(group) = request.group.as_deref() {
             let cfg = self.federation_config();
             if Self::group_has_remotes(&cfg, group) {
-                let remotes = cfg.split_group_targets(group).1;
-                return self.federated_search(&request, &cfg, remotes).await;
+                let remote_projects = cfg.group_remote_projects(group);
+                return self.federated_search(&request, &cfg, remote_projects).await;
             }
         }
 
@@ -7390,6 +7401,29 @@ impl CodesearchService {
     }
 
     /// List all registered projects and groups. Called by `status(kind="projects")`.
+    /// Build the `remote_projects` listing (opt-in mounts) for `list_projects`.
+    fn remote_projects_listing(
+        config: &crate::db_discovery::repos::ReposConfig,
+    ) -> Vec<RemoteProjectInfo> {
+        config
+            .mounted_remote_projects()
+            .into_iter()
+            .filter_map(|(name, target)| match target {
+                crate::db_discovery::repos::Target::RemoteProject {
+                    peer_name,
+                    peer,
+                    remote_alias,
+                } => Some(RemoteProjectInfo {
+                    name,
+                    peer: peer_name,
+                    remote_alias,
+                    peer_url: peer.url,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn list_projects(&self) -> Result<CallToolResult, McpError> {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -7466,6 +7500,7 @@ impl CodesearchService {
             let response = ListProjectsResponse {
                 repos: repos_info,
                 groups: config.groups_with_virtual_all(),
+                remote_projects: Self::remote_projects_listing(&config),
                 serve_active,
                 serve_url,
                 current_directory: current_dir.display().to_string(),
@@ -7525,6 +7560,7 @@ impl CodesearchService {
         let response = ListProjectsResponse {
             repos: repos_info,
             groups: config.groups_with_virtual_all(),
+            remote_projects: Self::remote_projects_listing(&config),
             serve_active,
             serve_url,
             current_directory: current_dir.display().to_string(),

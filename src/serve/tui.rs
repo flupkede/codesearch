@@ -393,14 +393,11 @@ fn spawn_remote_discovery(
             }
         };
         let interval = Duration::from_secs(crate::constants::REMOTE_DISCOVERY_INTERVAL_SECS);
-        // Peer → last successfully-discovered alias list (blip fallback).
-        let mut last_good: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
 
         loop {
             let cfg = state.config_snapshot();
             if !cfg.remotes.is_empty() {
-                let rows = discover_remote_rows(&client, &cfg, &mut last_good).await;
+                let rows = discover_remote_rows(&client, &cfg).await;
                 // Capacity-1 channel: replace the pending snapshot if the render
                 // loop hasn't consumed it yet (try_send drops on Full — fine, the
                 // next round supersedes it anyway).
@@ -415,21 +412,21 @@ fn spawn_remote_discovery(
     });
 }
 
-/// Query every peer's `/status`, then map the discovered repos into mounted
-/// remote-project rows (honoring local hide/rename filters). Peers unreachable
-/// this round fall back to their `last_good` alias list.
+/// Build the mounted remote-project rows for the TUI.
+///
+/// Rows come from the opt-in [`remote_mounts`](crate::db_discovery::repos::ReposConfig::remote_mounts)
+/// allowlist (config-driven, so they always show). Every peer's `/status` is
+/// polled concurrently only to *enrich* those rows with live per-repo state;
+/// a mount whose peer is unreachable this round simply falls back to a "warm"
+/// default. Discovery never defines which projects are mounted.
 async fn discover_remote_rows(
     client: &crate::federation::FederationClient,
     cfg: &crate::db_discovery::repos::ReposConfig,
-    last_good: &mut std::collections::HashMap<String, Vec<String>>,
 ) -> Vec<RepoRow> {
     use crate::db_discovery::repos::Target;
     use crate::federation::ManagementOutcome;
 
-    // 1) Fan out /status to all peers concurrently.
-    let mut discovered: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    // (peer, remote_alias) → the peer's reported repo state, for row display.
+    // 1) Fan out /status to all peers concurrently, keyed (peer, remote_alias).
     let mut status_lookup: std::collections::HashMap<
         (String, String),
         crate::federation::RemoteRepoStatus,
@@ -447,29 +444,14 @@ async fn discover_remote_rows(
     }
     while let Some(res) = join.join_next().await {
         if let Ok((peer_name, ManagementOutcome::Ok(status))) = res {
-            let aliases: Vec<String> = status.repos.iter().map(|r| r.alias.clone()).collect();
             for r in status.repos {
                 status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
             }
-            last_good.insert(peer_name.clone(), aliases.clone());
-            discovered.insert(peer_name, aliases);
         }
     }
 
-    // 2) Forget peers dropped from config so `last_good` can't grow unbounded
-    //    in a long-lived serve, then let peers that didn't answer this round
-    //    reuse their last-known list.
-    last_good.retain(|peer_name, _| cfg.remotes.contains_key(peer_name));
-    for peer_name in cfg.remotes.keys() {
-        if !discovered.contains_key(peer_name) {
-            if let Some(cached) = last_good.get(peer_name) {
-                discovered.insert(peer_name.clone(), cached.clone());
-            }
-        }
-    }
-
-    // 3) Apply hide/rename filters and build display rows.
-    cfg.mounted_remote_projects(&discovered)
+    // 2) Build one row per mounted project, enriched with live status.
+    cfg.mounted_remote_projects()
         .into_iter()
         .map(|(local_name, target)| {
             let Target::RemoteProject {
