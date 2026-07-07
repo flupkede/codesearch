@@ -411,10 +411,13 @@ pub struct GetChunkRequest {
     /// Local chunk id. Ignored when `chunk_ref` is set (federated fetch).
     #[serde(default)]
     pub chunk_id: u32,
-    /// Federated chunk reference `"<peer>:<chunk_id>"` (e.g. `"cloud:12345"`),
-    /// as returned in a remote search result's `chunk_ref`. When set, the chunk
-    /// is fetched from the named remote peer and `chunk_id`/`project`/`group`
-    /// are ignored.
+    /// Federated chunk reference `"<peer>/<remote_alias>:<chunk_id>"`
+    /// (e.g. `"cloud/inriver:12345"`), as returned verbatim in a remote search
+    /// result's `chunk_ref`. The `<remote_alias>` segment scopes the fetch to a
+    /// single remote project so the multi-repo peer can disambiguate the
+    /// chunk_id. When set, the chunk is fetched from the named remote peer and
+    /// `chunk_id`/`project`/`group` are ignored. (A legacy `"<peer>:<chunk_id>"`
+    /// ref without an alias is still accepted for backward compatibility.)
     #[serde(default)]
     pub chunk_ref: Option<String>,
     pub context_lines: Option<usize>,

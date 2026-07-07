@@ -302,25 +302,39 @@ impl FederationClient {
 
     /// Fetch a single chunk from a remote peer's `/chunk/:id` endpoint.
     ///
-    /// `group` is forced to the peer's configured group so the remote searches
-    /// the right scope. Returns the raw `GetChunkResponse` JSON produced by the
-    /// remote tool.
+    /// Scoping mirrors [`Self::search_project`]:
+    /// - When `remote_alias` is `Some`, the lookup is scoped to that single
+    ///   project via `project=<alias>` and `group` is omitted. This is required
+    ///   because the peer is multi-repo and chunk_ids collide across its
+    ///   indexes — a group/`all`-scoped lookup returns `ambiguous_chunk_id`.
+    /// - When `remote_alias` is `None` (legacy non-namespaced `chunk_ref`), the
+    ///   lookup falls back to the peer's configured group (or `all`).
+    ///
+    /// Returns the raw `GetChunkResponse` JSON produced by the remote tool.
     pub async fn get_chunk(
         &self,
         peer: &RemotePeer,
+        remote_alias: Option<&str>,
         chunk_id: u32,
         context_lines: Option<usize>,
     ) -> Outcome<serde_json::Value> {
-        let group = peer
-            .group
-            .clone()
-            .unwrap_or_else(|| crate::constants::ALL_GROUP_NAME.to_string());
         let mut url = Self::peer_url(
             peer,
             &crate::constants::CHUNK_PATH.replace(":id", &chunk_id.to_string()),
         );
-        // Build a query string: group always, context_lines when present.
-        let mut qs = vec![("group".to_string(), group)];
+        // Scope the lookup: prefer a single-project scope (`project=<alias>`)
+        // so the multi-repo peer can disambiguate the chunk_id; fall back to
+        // the peer's group only for legacy non-namespaced refs.
+        let mut qs: Vec<(String, String)> = match remote_alias {
+            Some(alias) => vec![("project".to_string(), alias.to_string())],
+            None => {
+                let group = peer
+                    .group
+                    .clone()
+                    .unwrap_or_else(|| crate::constants::ALL_GROUP_NAME.to_string());
+                vec![("group".to_string(), group)]
+            }
+        };
         if let Some(cl) = context_lines {
             qs.push(("context_lines".to_string(), cl.to_string()));
         }
@@ -685,16 +699,25 @@ mod tests {
 
     #[tokio::test]
     async fn get_chunk_fetches_from_a_live_peer() {
+        // The handler echoes back the scoping query params it received so the
+        // test can assert the client forwards `project=<alias>` (and NOT a
+        // `group`) for a namespaced lookup — the fix for `ambiguous_chunk_id`
+        // on a multi-repo peer.
         let app = axum::Router::new().route(
-            // axum route for /chunk/:id
             "/chunk/:id",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({
-                    "chunk_id": 7,
-                    "path": "kb/doc.md",
-                    "content": "the chunk body"
-                }))
-            }),
+            axum::routing::get(
+                |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    axum::Json(serde_json::json!({
+                        "chunk_id": 7,
+                        "path": "kb/doc.md",
+                        "content": "the chunk body",
+                        "received_project": params.get("project"),
+                        "received_group": params.get("group"),
+                    }))
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -705,7 +728,7 @@ mod tests {
 
         let client = FederationClient::new().unwrap();
         let outcome = client
-            .get_chunk(&peer(format!("http://{addr}")), 7, None)
+            .get_chunk(&peer(format!("http://{addr}")), Some("inriver"), 7, None)
             .await;
         match outcome {
             Outcome::Ok(value) => {
@@ -713,6 +736,19 @@ mod tests {
                 assert_eq!(
                     value.get("content").and_then(|v| v.as_str()),
                     Some("the chunk body")
+                );
+                // Namespaced lookup: project scope forwarded, group omitted.
+                assert_eq!(
+                    value.get("received_project").and_then(|v| v.as_str()),
+                    Some("inriver"),
+                    "project=<alias> must be forwarded to disambiguate the multi-repo peer"
+                );
+                assert!(
+                    value
+                        .get("received_group")
+                        .map(|v| v.is_null())
+                        .unwrap_or(true),
+                    "group must be omitted when a project scope is used, got: {value}"
                 );
             }
             other => panic!("expected Ok, got {:?}", other),

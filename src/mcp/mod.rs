@@ -4105,11 +4105,11 @@ impl CodesearchService {
         let mut all_lists: Vec<Vec<SearchResultItem>> = vec![local_items];
         while let Some(res) = join.join_next().await {
             match res {
-                Ok((peer_name, _remote_alias, Outcome::Ok(items))) => {
+                Ok((peer_name, remote_alias, Outcome::Ok(items))) => {
                     all_lists.push(
                         items
                             .into_iter()
-                            .map(|it| convert_remote_item(&peer_name, it))
+                            .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
                             .collect(),
                     );
                 }
@@ -4183,7 +4183,7 @@ impl CodesearchService {
             Outcome::Ok(items) => (
                 items
                     .into_iter()
-                    .map(|it| convert_remote_item(&peer_name, it))
+                    .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
                     .collect::<Vec<_>>(),
                 Vec::new(),
             ),
@@ -4210,20 +4210,11 @@ impl CodesearchService {
     ) -> Result<CallToolResult, McpError> {
         use crate::federation::{FederationClient, Outcome};
 
-        let (peer_name, id_str) = match chunk_ref.split_once(':') {
-            Some((p, i)) => (p, i),
+        let (peer_name, remote_alias, chunk_id) = match parse_federated_chunk_ref(chunk_ref) {
+            Some(parts) => parts,
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Invalid chunk_ref '{}': expected '<peer>:<chunk_id>'.",
-                    chunk_ref
-                ))]));
-            }
-        };
-        let chunk_id: u32 = match id_str.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Invalid chunk_ref '{}': chunk_id is not a number.",
+                    "Invalid chunk_ref '{}': expected '<peer>/<alias>:<chunk_id>'.",
                     chunk_ref
                 ))]));
             }
@@ -4249,7 +4240,10 @@ impl CodesearchService {
                 ))]));
             }
         };
-        match client.get_chunk(&peer, chunk_id, context_lines).await {
+        match client
+            .get_chunk(&peer, remote_alias, chunk_id, context_lines)
+            .await
+        {
             Outcome::Ok(value) => Ok(CallToolResult::success(vec![Content::text(
                 value.to_string(),
             )])),
@@ -5799,9 +5793,10 @@ impl CodesearchService {
             request.project,
         );
 
-        // Federation: a `chunk_ref` of the form "<peer>:<chunk_id>" (returned by
-        // a federated search result) fetches the chunk from a remote peer rather
-        // than the local index.
+        // Federation: a `chunk_ref` of the form "<peer>/<remote_alias>:<chunk_id>"
+        // (returned by a federated search result) fetches the chunk from a remote
+        // peer rather than the local index. The alias scopes the fetch to a single
+        // remote project so the multi-repo peer can disambiguate the chunk_id.
         if let Some(chunk_ref) = request.chunk_ref.as_deref() {
             return self
                 .federated_get_chunk(chunk_ref, request.context_lines)
@@ -7816,12 +7811,23 @@ fn parse_search_items_from_call_result(
 }
 
 /// Convert a remote search hit into a local `SearchResultItem`, tagging it with
-/// its origin (`source`) and a namespaced `chunk_ref` for later retrieval.
+/// its origin (`source`) and a project-namespaced `chunk_ref` for later
+/// retrieval.
+///
+/// The `chunk_ref` is `"<peer>/<remote_alias>:<chunk_id>"`. The `remote_alias`
+/// segment is essential: the peer is itself multi-repo and chunk_ids are only
+/// unique *within* a single index, so `federated_get_chunk` must forward the
+/// alias as a `project=` scope to disambiguate. Omitting it (the old
+/// `"<peer>:<id>"` shape) made every remote `get_chunk` fail with
+/// `ambiguous_chunk_id` whenever the peer hosted more than one project.
 fn convert_remote_item(
     peer_name: &str,
+    remote_alias: &str,
     item: crate::federation::RemoteSearchItem,
 ) -> SearchResultItem {
-    let chunk_ref = item.chunk_id.map(|id| format!("{peer_name}:{id}"));
+    let chunk_ref = item
+        .chunk_id
+        .map(|id| format!("{peer_name}/{remote_alias}:{id}"));
     SearchResultItem {
         chunk_id: item.chunk_id.unwrap_or(0),
         path: item.path,
@@ -7833,8 +7839,29 @@ fn convert_remote_item(
         content: item.content.or(item.snippet),
         context_prev: item.context_prev,
         context_next: item.context_next,
-        source: Some(peer_name.to_string()),
+        source: Some(format!("{peer_name}/{remote_alias}")),
         chunk_ref,
+    }
+}
+
+/// Parse a federated `chunk_ref` into its `(peer, remote_alias, chunk_id)`
+/// parts.
+///
+/// Accepts the current project-namespaced shape `"<peer>/<alias>:<id>"` and,
+/// for backward compatibility, the legacy `"<peer>:<id>"` shape (no alias →
+/// `None`, which falls back to group-scoped lookup on the peer).
+///
+/// The `chunk_id` is taken after the *last* `':'` so peer/alias segments that
+/// themselves contain a colon are not misparsed; the peer/alias split is on the
+/// *first* `'/'`.
+fn parse_federated_chunk_ref(chunk_ref: &str) -> Option<(&str, Option<&str>, u32)> {
+    let (left, id_str) = chunk_ref.rsplit_once(':')?;
+    let chunk_id: u32 = id_str.parse().ok()?;
+    match left.split_once('/') {
+        Some((peer, alias)) if !peer.is_empty() && !alias.is_empty() => {
+            Some((peer, Some(alias), chunk_id))
+        }
+        _ => Some((left, None, chunk_id)),
     }
 }
 
@@ -8649,9 +8676,9 @@ mod federation_helpers_tests {
             context_prev: None,
             context_next: None,
         };
-        let item = convert_remote_item("cloud", remote);
-        assert_eq!(item.source.as_deref(), Some("cloud"));
-        assert_eq!(item.chunk_ref.as_deref(), Some("cloud:42"));
+        let item = convert_remote_item("cloud", "inriver", remote);
+        assert_eq!(item.source.as_deref(), Some("cloud/inriver"));
+        assert_eq!(item.chunk_ref.as_deref(), Some("cloud/inriver:42"));
         assert_eq!(item.chunk_id, 42); // local id preserved for rendering
         assert_eq!(item.path, "cloud/kb.md");
     }
@@ -8672,8 +8699,41 @@ mod federation_helpers_tests {
             context_prev: None,
             context_next: None,
         };
-        let item = convert_remote_item("peer", remote);
+        let item = convert_remote_item("peer", "someproj", remote);
         assert_eq!(item.content.as_deref(), Some("matched line"));
         assert!(item.chunk_ref.is_none(), "no chunk_ref without chunk_id");
+    }
+
+    #[test]
+    fn parse_federated_chunk_ref_namespaced() {
+        // Current shape: "<peer>/<alias>:<id>" → alias forwarded as project scope.
+        let (peer, alias, id) = super::parse_federated_chunk_ref("cloud/inriver:390").unwrap();
+        assert_eq!(peer, "cloud");
+        assert_eq!(alias, Some("inriver"));
+        assert_eq!(id, 390);
+    }
+
+    #[test]
+    fn parse_federated_chunk_ref_legacy_no_alias() {
+        // Backward compat: bare "<peer>:<id>" → no alias, group-scoped fallback.
+        let (peer, alias, id) = super::parse_federated_chunk_ref("cloud:42").unwrap();
+        assert_eq!(peer, "cloud");
+        assert_eq!(alias, None);
+        assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn parse_federated_chunk_ref_id_after_last_colon() {
+        // The id is taken after the LAST ':' so a colon in the alias is safe.
+        let (peer, alias, id) = super::parse_federated_chunk_ref("cloud/a:b:7").unwrap();
+        assert_eq!(peer, "cloud");
+        assert_eq!(alias, Some("a:b"));
+        assert_eq!(id, 7);
+    }
+
+    #[test]
+    fn parse_federated_chunk_ref_rejects_garbage() {
+        assert!(super::parse_federated_chunk_ref("no-colon-here").is_none());
+        assert!(super::parse_federated_chunk_ref("cloud:notanumber").is_none());
     }
 }
