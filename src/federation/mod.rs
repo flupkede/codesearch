@@ -568,6 +568,25 @@ mod tests {
         }
     }
 
+    /// Bind an ephemeral port, serve `app`, and return the address only once the
+    /// listener actually accepts a TCP connection. This bounded readiness poll
+    /// replaces a fixed `sleep(50ms)`, which occasionally lost the startup race
+    /// when the suite ran many tests (and other `cargo` processes) in parallel.
+    async fn spawn_test_server(app: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return addr;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("test server at {addr} never became ready");
+    }
+
     #[test]
     fn urlencoding_encodes_reserved_and_passes_unreserved() {
         assert_eq!(urlencoding("a-b_c.d~"), "a-b_c.d~");
@@ -615,12 +634,7 @@ mod tests {
                 }))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -657,12 +671,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         // Peer carries a group; search_project MUST override it with the project.
         let mut p = peer(format!("http://{addr}"));
@@ -719,12 +728,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -774,12 +778,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -825,12 +824,7 @@ mod tests {
                 }))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client.list_repos(&peer(format!("http://{addr}"))).await;
@@ -870,12 +864,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -910,12 +899,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -946,12 +930,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -988,12 +967,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         // force=true must arrive at the peer.
@@ -1024,12 +998,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -1061,12 +1030,7 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
