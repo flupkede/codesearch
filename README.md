@@ -508,6 +508,9 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `codesearch setup` | Download embedding models |
 | `codesearch cache stats\|clear` | Manage embedding cache |
 | `codesearch groups list\|add\|remove` | Manage repository groups |
+| `codesearch remote add\|list\|rm` | Manage federation peers (`--url`, `--api-key`, `--group`, `--into-group`, `--timeout-secs`) |
+| `codesearch remote available\|mount\|mounts\|unmount` | Inspect a peer's projects and opt-in mount them as `<peer>/<alias>` |
+| `codesearch index ... --remote <peer>` | Run `index list\|add\|rm\|reindex` against a peer's filesystem instead of local |
 | `codesearch hooks git install` | Install git post-checkout hook for worktree auto-indexing |
 | `codesearch hooks claude install` | Install Claude Code codesearch-first guard hooks into settings.json |
 
