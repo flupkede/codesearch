@@ -14,9 +14,12 @@ cp scripts/pre-commit .git/hooks/pre-commit
 ```
 
 Behavior:
-- **Always**: runs `cargo fmt`, stages formatted files
-- **Feature branches** (`fix/*`, `feature/*`, `features/*`): auto-bumps patch version + rebuilds binary
-- **develop / master / release/***: only fmt, no version bump
+- Runs `cargo fmt` and stages any reformatting (keeps CI's fmt-check green).
+- Does **not** bump the version or build a binary. Every build already gets a
+  unique `+<commit_count>` suffix from `build.rs` (`git rev-list --count HEAD`),
+  so a per-commit auto-bump added churn (and a slow debug rebuild that blocked
+  each commit) for no traceability gain. The base version is bumped deliberately
+  — see **Version bumps** under Rules.
 
 ## Step-by-step
 
@@ -26,7 +29,7 @@ Behavior:
 git checkout -b fix/my-fix origin/develop
 # ... make code changes ...
 git commit -m "fix: describe the change"
-# pre-commit hook auto-bumps version + rebuilds
+# pre-commit hook runs cargo fmt only (fast; no version bump, no build)
 git push -u origin fix/my-fix
 ```
 
@@ -53,8 +56,10 @@ CI (`release.yml`) builds binaries and creates a GitHub Release with auto-genera
 
 ## Rules
 
-- **Version bumps** happen only on feature branches (pre-commit hook)
+- **Version bumps are manual + deliberate** — edit `version` in `Cargo.toml`
+  when it's meaningful (typically when cutting a release branch), then
+  `cargo update --workspace` to sync `Cargo.lock`. There is no per-commit
+  auto-bump; per-commit uniqueness comes from `build.rs`'s `+<commit_count>`.
 - **No manual CHANGELOG.md edits** — GitHub Releases auto-generate release notes
-- **No version bumps** on develop, master, or release branches
 - **Squash merge** all PRs to keep history linear
 - **Tag format**: `v1.0.X` on master HEAD
