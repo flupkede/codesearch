@@ -8,3 +8,9 @@ AGENTS.md merge=ours
 # the local autocrlf setting.
 *.sh text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# Extensionless shell scripts (git hooks + their tracked sources) — same LF
+# requirement: a CRLF shebang silently breaks the hook when copied into
+# .git/hooks on Windows.
+scripts/pre-commit text eol=lf
+.githooks/** text eol=lf
