@@ -30,6 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Cache dependencies separately from source for faster rebuilds.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+# Hook scripts are embedded at compile time via include_str! in
+# src/cli/claude_hooks.rs (path ../../integrations/claude-code/hooks/*). They
+# MUST be present in the build context or the release compile fails with
+# "couldn't read ... No such file or directory". Only this subtree is needed.
+COPY integrations/claude-code/hooks ./integrations/claude-code/hooks
 # build.rs sets CARGO_PKG_VERSION_FULL (consumed by env!() in main.rs/cli). It
 # shells out to git for the commit count/hash but falls back to "0"/"unknown"
 # when .git is absent (it is — excluded by .dockerignore), so the build is
