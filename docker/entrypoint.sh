@@ -31,9 +31,16 @@
 # Optional env:
 #   CODESEARCH_RUN_MODE       "serve" (default) | "index-job".
 #   KB_GIT_URL / GIT_PAT      Curated KB git repo (cloned to /data/custom-kb).
-#   KB_PULL_INTERVAL_SECS     serve mode: git-pull the KB this often; when the pull
-#                             brings new commits, serve incrementally reindexes the
-#                             custom-kb repo so new entries are searchable (default 900).
+#   KB_POLL_INTERVAL_SECS     serve mode: how often to CHEAPLY poll the KB remote
+#                             HEAD (git ls-remote — ref advertisement only, no
+#                             objects). On a change, pull + incremental reindex fire
+#                             immediately, so a pushed KB edit becomes searchable in
+#                             ~this many seconds instead of the full pull interval
+#                             (default 30).
+#   KB_PULL_INTERVAL_SECS     serve mode: safety-net cadence — force a full git pull
+#                             (+ reindex-on-change) even when the cheap poll saw no
+#                             change or failed, self-healing a missed ls-remote
+#                             (default 900).
 #   DATA_DIR                  Working root (default /data).
 #   CODESEARCH_SERVE_PORT     Serve port (default 39725).
 #   INDEX_JOB_MAX_WAIT_SECS   Max seconds the job waits for indexing to finish
@@ -415,17 +422,34 @@ run_serve() {
   # interval, long after Phase-1 startup warmup has released the KB write lock,
   # so there is no contention with warmup.
   if [ -n "${KB_GIT_URL:-}" ]; then
+    # Near-instant propagation: cheaply poll the remote HEAD every
+    # KB_POLL_INTERVAL_SECS (git ls-remote = ref advertisement only, no objects),
+    # and only do the expensive pull + reindex when the remote SHA actually moved.
+    # KB_PULL_INTERVAL_SECS is kept as a safety-net: force a full pull at least that
+    # often even if the cheap poll saw nothing (self-heals a failed/missed ls-remote).
+    # ls-remote uses the stored 'origin' remote so the PAT never lands on argv.
+    KB_POLL_INTERVAL_SECS="${KB_POLL_INTERVAL_SECS:-30}"
     KB_PULL_INTERVAL_SECS="${KB_PULL_INTERVAL_SECS:-900}"
-    ( while sleep "${KB_PULL_INTERVAL_SECS}"; do
-        before="$(git -C "${KB_DIR}" rev-parse HEAD 2>/dev/null || true)"
-        sync_kb
-        after="$(git -C "${KB_DIR}" rev-parse HEAD 2>/dev/null || true)"
-        if [ -n "${after}" ] && [ "${before}" != "${after}" ]; then
-          log "custom-kb changed (${before:-<none>} -> ${after}) — triggering incremental reindex"
-          reindex_kb
+    ( kb_branch="$(git -C "${KB_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+      secs_since_pull=0
+      while sleep "${KB_POLL_INTERVAL_SECS}"; do
+        secs_since_pull=$(( secs_since_pull + KB_POLL_INTERVAL_SECS ))
+        remote_sha="$(git -C "${KB_DIR}" ls-remote origin "${kb_branch}" 2>/dev/null | awk 'NR==1{print $1}')"
+        local_sha="$(git -C "${KB_DIR}" rev-parse HEAD 2>/dev/null || true)"
+        force_pull=0
+        [ "${secs_since_pull}" -ge "${KB_PULL_INTERVAL_SECS}" ] && force_pull=1
+        if { [ -n "${remote_sha}" ] && [ "${remote_sha}" != "${local_sha}" ]; } || [ "${force_pull}" -eq 1 ]; then
+          before="${local_sha}"
+          sync_kb
+          secs_since_pull=0
+          after="$(git -C "${KB_DIR}" rev-parse HEAD 2>/dev/null || true)"
+          if [ -n "${after}" ] && [ "${before}" != "${after}" ]; then
+            log "custom-kb changed (${before:-<none>} -> ${after}) — triggering incremental reindex"
+            reindex_kb
+          fi
         fi
       done ) &
-    log "KB auto-pull loop started (git pull + reindex-on-change every ${KB_PULL_INTERVAL_SECS}s -> ${KB_DIR})"
+    log "KB auto-pull loop started (remote-HEAD poll every ${KB_POLL_INTERVAL_SECS}s; forced full pull every ${KB_PULL_INTERVAL_SECS}s; reindex-on-change -> ${KB_DIR})"
   fi
 
   log "starting codesearch serve on 0.0.0.0:${PORT}"

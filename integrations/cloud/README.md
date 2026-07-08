@@ -79,7 +79,7 @@ Replace every `<...>` placeholder with your own values.
    git credentials as container app secrets. The container's `entrypoint.sh` reads these as
    environment variables — see the image's `docker/entrypoint.sh` for the canonical contract:
    `CODESEARCH_SERVE_API_KEY`, `BLOB_SAS_URL`, `KB_GIT_URL`, `KB_PAT`,
-   `KB_PULL_INTERVAL_SECS`.
+   `KB_POLL_INTERVAL_SECS`, `KB_PULL_INTERVAL_SECS`.
 
 ## Deploy the indexer job
 
@@ -192,8 +192,12 @@ codesearch index reindex <alias> [--force] --remote cloud     # POST /repos/:ali
   replica restores it on the next cold start. To force a refresh, re-run the indexer job, then
   restart the serve replica (or let scale-to-zero + the next request pick it up).
 - **Curated KB auto-refresh** — if you host a curated knowledge base in a git repo
-  (`KB_GIT_URL`), the serve app runs a background `git pull` loop every
-  `KB_PULL_INTERVAL_SECS`. When a pull brings **new commits**, it fires an **incremental**
+  (`KB_GIT_URL`), the serve app runs a background loop that **cheaply polls the remote
+  `HEAD`** every `KB_POLL_INTERVAL_SECS` (default 30 — `git ls-remote`, ref advertisement
+  only, no object transfer) and only does the real `git pull` when the remote SHA moved, so
+  a pushed KB edit propagates in ~seconds instead of minutes. `KB_PULL_INTERVAL_SECS`
+  (default 900) is kept as a safety-net that forces a full pull at least that often even if a
+  poll was missed. When a pull brings **new commits**, it fires an **incremental**
   `POST /repos/custom-kb/reindex` against its own local API (fire-and-forget, HTTP 202) so
   fresh KB articles become searchable without a redeploy. It reindexes only when `HEAD` moved,
   incremental only (never `--force`), and never aborts the loop on error (a `409` means a
