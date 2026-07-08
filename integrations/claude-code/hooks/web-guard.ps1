@@ -1,7 +1,7 @@
 # PreToolUse hook: steer WebSearch/WebFetch toward codesearch remote doc mounts.
 #
 # Why this exists: when codesearch has remote documentation projects mounted
-# (e.g. cloud/inriver, cloud/aprimo), those indexes usually answer product /
+# (e.g. cloud/inriver, cloud/example-dam), those indexes usually answer product /
 # API / docs questions more precisely — and more currently — than an open web
 # search. Nothing structurally stops the model from reaching for the always-on
 # WebSearch/WebFetch tools first, so this hook makes the preference structural:

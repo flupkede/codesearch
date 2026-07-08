@@ -211,7 +211,7 @@ To make the preference **structural** instead of advisory, this repo ships three
 
 - **`grep-guard`** — on `Grep`. Blocks the first grep against an in-repo path when codesearch looks available (a local `.codesearch.db` at the git root, or a `CODESEARCH_SERVER` env var for remote-serve setups), with a message telling the model how to load and call codesearch instead. A retry of the same query within 5 minutes is let through unblocked — the legitimate "codesearch found nothing, falling back" path. Greps outside the current repo are never blocked, and the hook fails open (never traps the model).
 - **`subagent-preamble`** — on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all.
-- **`web-guard`** — on `WebSearch`/`WebFetch`. When you have remote documentation projects mounted (`codesearch remote mount`, e.g. `cloud/inriver`, `cloud/aprimo`), it blocks the first web call with guidance to search those indexed mounts first — often more precise and current than the open web. Same 5-minute retry-escape; when no mounts are configured it does nothing.
+- **`web-guard`** — on `WebSearch`/`WebFetch`. When you have remote documentation projects mounted (`codesearch remote mount`, e.g. `cloud/inriver`, `cloud/example-dam`), it blocks the first web call with guidance to search those indexed mounts first — often more precise and current than the open web. Same 5-minute retry-escape; when no mounts are configured it does nothing.
 
 Install (idempotent — user scope applies to every project; `--project` is this repo only):
 
