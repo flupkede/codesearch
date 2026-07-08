@@ -12,17 +12,22 @@ the same image but run with different entrypoint modes:
 | Component | Shape | Job | Writes the index? |
 |---|---|---|---|
 | **Indexer job** | heavier (e.g. 4 vCPU / 8 GiB); runs on a schedule or trigger | builds/rebuilds the full embed index from source content and uploads a snapshot to blob storage | yes |
-| **Serve replica** | light (e.g. 1 vCPU / 1–2 GiB); long-running; scale-to-zero | restores the latest snapshot **read-only** and serves `search` / `get_chunk` / management REST | no |
+| **Serve replica** | light (e.g. 1 vCPU / 1–2 GiB); long-running; scale-to-zero | restores the latest snapshot and serves `search` / `get_chunk` / management REST | DOCS: no · custom-kb: incremental only |
 
 Why split:
 
 - Building a fresh semantic index is memory-heavy (embedding model + LMDB vector store). You
   only need that capacity during a rebuild, so it runs as a short-lived **job**.
-- Serving queries from a restored index is cheap and read-only, so the **serve replica** runs
-  on minimal resources and can scale to zero when idle.
-- The serve replica opens its LMDB stores **read-only** (restore-only mode): it never
-  registers, full-indexes, or reindexes on its own, so it cannot corrupt the snapshot and
-  survives restarts by re-restoring.
+- Serving queries from a restored index is cheap, so the **serve replica** runs on minimal
+  resources and can scale to zero when idle.
+- The serve replica never **rebuilds the heavy DOCS corpus** and never uploads a snapshot, so
+  it cannot corrupt the published snapshot and survives restarts by re-restoring. The one
+  exception is the small **custom-KB** repo: after each `git pull` that brings new commits, the
+  serve replica runs a cheap **incremental** reindex of just that repo in-process (see
+  *Curated KB auto-refresh* below), so new KB articles become searchable without a redeploy.
+  Incremental refresh is memory-bounded (`INCREMENTAL_REFRESH_BATCH_SIZE`), so it stays within
+  the 1–2 GiB replica; the DOCS corpus full build stays job-only precisely because re-embedding
+  thousands of files at once is what a small replica cannot afford.
 
 The two components communicate only via the **snapshot blob** (produced by the indexer,
 consumed by the serve replica). There is no shared filesystem or database between them.
@@ -120,9 +125,12 @@ az containerapp create \
 
 - `--min-replicas 0` enables **scale-to-zero**: the replica suspends when idle and wakes on
   the next request (cold-start wake is typically ~20–45s).
-- The serve app is **restore-only / read-only**: it restores the snapshot on cold start and
-  never writes the index. Write operations (`index add`, `index reindex --force`) against this
-  peer are **rejected** — content lifecycle is owned by the indexer job + blob sync.
+- The serve app is **restore-first**: it restores the snapshot on cold start and never rebuilds
+  the DOCS corpus or uploads a snapshot. Heavy write operations (`index add`, `index reindex
+  --force`) against this peer are **rejected** — the DOCS content lifecycle is owned by the
+  indexer job + blob sync. The sole write it performs on its own is a memory-bounded incremental
+  reindex of the small **custom-KB** repo after each KB `git pull` (see *Curated KB
+  auto-refresh*).
 
 Read its FQDN:
 
@@ -171,10 +179,12 @@ codesearch index rm      <alias> --remote cloud               # DELETE /repos/:a
 codesearch index reindex <alias> [--force] --remote cloud     # POST /repos/:alias/reindex
 ```
 
-> ⚠️ On the **restore-only** serve replica, only `list` is reliably supported: `add` /
-> `reindex` / `--force` require a **read-write** peer. Content changes are made by editing
-> what the indexer job consumes (source content / KB repo), then re-running the indexer to
-> publish a fresh snapshot.
+> ⚠️ On the serve replica, `list` is always safe and an **incremental** `reindex` of an
+> already-registered repo succeeds (this is exactly the custom-KB auto-refresh mechanism —
+> memory-bounded, so it fits the small replica). `add` (register a new repo) and `reindex
+> --force` (destructive full rebuild) still require a **read-write** peer and are rejected here.
+> DOCS content changes are made by editing what the indexer job consumes, then re-running the
+> indexer to publish a fresh snapshot.
 
 ## Operational notes
 
@@ -183,12 +193,20 @@ codesearch index reindex <alias> [--force] --remote cloud     # POST /repos/:ali
   restart the serve replica (or let scale-to-zero + the next request pick it up).
 - **Curated KB auto-refresh** — if you host a curated knowledge base in a git repo
   (`KB_GIT_URL`), the serve app runs a background `git pull` loop every
-  `KB_PULL_INTERVAL_SECS` so periodic re-indexes pick up fresh KB content without a redeploy.
+  `KB_PULL_INTERVAL_SECS`. When a pull brings **new commits**, it fires an **incremental**
+  `POST /repos/custom-kb/reindex` against its own local API (fire-and-forget, HTTP 202) so
+  fresh KB articles become searchable without a redeploy. It reindexes only when `HEAD` moved,
+  incremental only (never `--force`), and never aborts the loop on error (a `409` means a
+  reindex is already running; a `404` means the KB repo isn't in the restored snapshot yet and
+  will be picked up once the next index-job snapshot includes it). The heavy DOCS corpus is not
+  touched by this loop.
 - **Cold starts** — with `--min-replicas 0`, the first request after idle wakes the replica
   (~20–45s). Health probes (`/healthz`) stay green once warm; expect the first query after
   wake to be slower.
-- **Read-only safety** — because the serve replica never writes the index, you can run
-  multiple replicas or restart freely without risking the snapshot.
+- **Snapshot safety** — the serve replica never rebuilds the DOCS index and never uploads a
+  snapshot, so the published snapshot is never at risk. The only write it performs is the
+  incremental custom-KB reindex, which touches only that replica's own local LMDB copy (rebuilt
+  from git on each replica) — so you can still run multiple replicas or restart freely.
 
 ## See also
 

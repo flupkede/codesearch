@@ -102,12 +102,12 @@ competition.
 ## Implemented on this branch
 
 - **Federation peers** — `codesearch remote add/rm/list` (local `repos.json` peer config: `alias → url, api_key, group, into_group`) + `@peer` group references; `FederationClient` search/get_chunk fan-out with RRF.
-- **Cloud indexer-job split** — heavy 4 vCPU/8 GiB build job uploads a snapshot; light 1 vCPU/2 GiB serve restores it read-only; snapshot refresh/verify loop. Cloud peer live + validated. See `integrations/cloud/README.md`.
+- **Cloud indexer-job split** — heavy 4 vCPU/8 GiB build job uploads a snapshot; light 1 vCPU/2 GiB serve restores it (DOCS corpus read-only). The serve replica additionally runs a **memory-bounded incremental reindex of the small custom-kb repo** after each KB `git pull` moves `HEAD` (fire-and-forget `POST /repos/custom-kb/reindex`), so new KB articles are searchable without a redeploy; the heavy DOCS corpus stays job-only. Snapshot refresh/verify loop. Cloud peer live + validated. See `integrations/cloud/README.md`.
 - **Remote index management (`--remote`)** — `--remote <peer>` flag on `index list/add/rm` + new `index reindex` verb drives a peer's management API via `FederationClient` (`ManagementOutcome`: `Ok` / `HttpError{status,reason}` / `Unreachable`). Endpoints: `GET /status`, `POST /repos {path}`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex[?force=]`. `--json` on List/Reindex (requires `--remote`). Without `--remote`, every `index` verb is unchanged (local).
 - **Local `index rm <alias>`** — resolves the argument as a registered alias before falling back to path interpretation.
 - **CLI aliases** — `ls` is a visible alias for `list` (`index`/`groups`/`remote`); `rm` for `remove` (pre-existing).
 
-> ℹ️ **Remote write verbs** (`add`, `reindex --force`) require a read-write peer; the restore-only cloud peer rejects them (`--force` → HTTP 500 "could only be opened read-only; cannot force-reindex"). `list` is always safe. `rm` is not durable — the next cold start re-registers from the restored snapshot. Per-vendor sub-path registration is scripted against a writable peer.
+> ℹ️ **Remote write verbs** (`add`, `reindex --force`) require a read-write peer; the cloud peer rejects them (`--force` → HTTP 500 "could only be opened read-only; cannot force-reindex"). An **incremental** `reindex` (no `--force`) of an already-registered repo *does* succeed on the cloud peer — that is the custom-kb auto-refresh path. `list` is always safe. `rm` is not durable — the next cold start re-registers from the restored snapshot. Per-vendor sub-path registration is scripted against a writable peer.
 
 ## Known issue — `docs` repo status stuck on `open`/`write` after cold start (cloud)
 
@@ -219,6 +219,15 @@ side effect of a separate job existing.
 disaster-recovery-style full rebuilds. Whether the scale-up/poll/snapshot/scale-down cycle
 should be a scheduled script, a Logic App, or a small wrapper CLI command
 (`codesearch cloud rebuild --remote <peer>`?) is open for the next session.
+
+**Scoped first step shipped (2026-07-08):** the "incremental reindex in-process on serve" idea
+is now live — but *only* for the small **custom-kb** repo. `docker/entrypoint.sh`'s serve-mode
+KB pull loop fires an incremental `POST /repos/custom-kb/reindex` whenever a `git pull` moves
+`HEAD`. This is safe on the 1–2 GiB replica because (a) incremental refresh is memory-bounded
+(`INCREMENTAL_REFRESH_BATCH_SIZE`, see the crash-loop fix above) and (b) the KB corpus is tiny.
+The heavy DOCS corpus deliberately stays job-only — re-embedding thousands of files in-process
+is exactly the OOM that motivated the split. The full single-app self-scaling redesign for the
+DOCS corpus (above) remains a separate, undecided follow-up.
 
 ---
 

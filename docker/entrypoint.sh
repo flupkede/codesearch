@@ -144,6 +144,7 @@ reindex_kb() {
   case "${code}" in
     200|201|202) log "incremental reindex accepted for '${name}' (HTTP ${code})" ;;
     409) log "reindex already in progress for '${name}' (HTTP 409) — skipping" ;;
+    404) log "'${name}' not yet registered on serve — awaiting a snapshot that includes it (HTTP 404, expected during bootstrap)" ;;
     *) log "WARN: reindex request for '${name}' failed — HTTP ${code:-<none>}: ${resp%$'\n'*}" ;;
   esac
 }
