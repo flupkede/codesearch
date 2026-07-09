@@ -242,7 +242,17 @@ Note: the grep-guard detects "codesearch is available **for this repo**" via a l
 | `project` | string | Target specific repo (multi-repo) |
 | `group` | string | Search across repo group (multi-repo) |
 
-> **Federated `filter_path`:** when `project` (or a group's `@peer` fan-out) resolves to a **federated/mounted remote project**, `filter_path` is matched **client-side on the namespaced result path** (`<peer>/<alias>/…`) — i.e. exactly the path you see in the results — because the peer matches only its own un-namespaced store paths. The hub over-fetches from the peer and post-filters, so a federated `filter_path` behaves as expected; no client-side workaround is needed. (A separate, non-federated case — `filter_path` on a *local* project routed through `codesearch serve` — is still being addressed; see CHANGELOG `[Unreleased] > Known limitations`.)
+> **`filter_path` semantics by routing mode:**
+> - **Local** project (stdio, or `project=<local-alias>`/local group on a `serve` hub): `filter_path`
+>   is a **repo-relative** prefix (e.g. `src`, `docs/api`) — matched against the routed project's own
+>   root, not the `<alias>/…` prefix shown in results.
+> - **Federated / mounted** project (`project=<peer>/<alias>` or an `@peer` group fan-out): `filter_path`
+>   is matched **client-side on the namespaced result path** (`<peer>/<alias>/…`) — i.e. exactly the
+>   path you see in the results — because the peer only matches its own un-namespaced store paths. The
+>   hub over-fetches from the peer and post-filters.
+>
+> Both modes now work without any client-side workaround; earlier releases dropped every hit when
+> `filter_path` was combined with a serve-routed or federated project.
 
 **Semantic mode** combines vector similarity (fastembed) + BM25 lexical scoring + exact identifier boosting, fused with RRF. Best for conceptual queries and mixed natural-language + symbol searches.
 
