@@ -1577,7 +1577,10 @@ fn codesearch_hook_block() -> String {
         r#"# Auto-registers the checked-out worktree with codesearch serve.
 # Installed by: codesearch hooks git install
 # $1 = prev_ref, $2 = new_ref, $3 = flag (1 = branch checkout)
-if [ -f "$HOME/.codesearch/serve_url" ]; then
+# Only react to branch/worktree checkouts ($3 = 1). `git worktree add` fires
+# post-checkout with flag 1; a file checkout (`git checkout -- path`) fires with
+# flag 0 and must not re-register (it changes no repo location, just wastes a POST).
+if [ "$3" = "1" ] && [ -f "$HOME/.codesearch/serve_url" ]; then
     __cs_url=$(cat "$HOME/.codesearch/serve_url")
     if [ -n "$__cs_url" ]; then
         # Git Bash `pwd` yields an msys path (/c/...) that codesearch serve
@@ -1628,6 +1631,9 @@ fn chain_hook_block(existing: &str, block: &str) -> String {
     let lines: Vec<&str> = existing.lines().collect();
     let last_nonempty = lines.iter().rposition(|l| !l.trim().is_empty());
     if let Some(idx) = last_nonempty {
+        // Assumes a standalone/top-level trailing `exit 0`. A well-formed nested
+        // `exit 0` (inside an if/function) is followed by its `fi`/`}`, which
+        // becomes the last non-empty line instead — so this won't match it.
         if lines[idx].trim() == "exit 0" {
             let head = lines[..idx].join("\n");
             let tail = lines[idx..].join("\n");
@@ -1805,6 +1811,11 @@ mod tests {
         // Delimited so it can be found again for idempotent upgrades/chaining.
         assert!(block.starts_with(HOOK_BEGIN));
         assert!(block.trim_end().ends_with(HOOK_END));
+        // Only reacts to branch/worktree checkouts (flag 1), not file checkouts.
+        assert!(
+            block.contains("[ \"$3\" = \"1\" ]"),
+            "hook must gate on the branch-checkout flag"
+        );
     }
 
     #[test]
