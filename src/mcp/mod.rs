@@ -154,18 +154,23 @@ mod tests {
         // Federated results carry the `<peer>/<alias>/…` path the caller sees;
         // the filter must match against THAT, with an empty project root.
         let mut items = vec![
-            ns_item("aprimo/dam_help/Rendition-Presets.htm"),
-            ns_item("aprimo/mo_help/Approvals.htm"),
+            ns_item("vendor-a/dam_help/Rendition-Presets.htm"),
+            ns_item("vendor-a/mo_help/Approvals.htm"),
             ns_item("custom-kb/howto/foo.md"),
         ];
-        super::retain_by_filter_path(&mut items, Some("aprimo/dam_help"));
+        super::retain_by_filter_path(&mut items, Some("vendor-a/dam_help"));
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].path, "aprimo/dam_help/Rendition-Presets.htm");
+        assert_eq!(items[0].path, "vendor-a/dam_help/Rendition-Presets.htm");
     }
 
     #[test]
     fn retain_by_filter_path_none_and_blank_are_noops() {
-        let pair = || vec![ns_item("aprimo/dam_help/x.htm"), ns_item("custom-kb/y.md")];
+        let pair = || {
+            vec![
+                ns_item("vendor-a/dam_help/x.htm"),
+                ns_item("custom-kb/y.md"),
+            ]
+        };
 
         let mut a = pair();
         super::retain_by_filter_path(&mut a, None);
@@ -182,7 +187,7 @@ mod tests {
 
     #[test]
     fn retain_by_filter_path_no_match_yields_empty() {
-        let mut items = vec![ns_item("aprimo/dam_help/x.htm")];
+        let mut items = vec![ns_item("vendor-a/dam_help/x.htm")];
         super::retain_by_filter_path(&mut items, Some("nonexistent/segment"));
         assert!(items.is_empty());
     }
