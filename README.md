@@ -242,7 +242,7 @@ Note: the grep-guard detects "codesearch is available **for this repo**" via a l
 | `project` | string | Target specific repo (multi-repo) |
 | `group` | string | Search across repo group (multi-repo) |
 
-> **Known limitation:** `filter_path` is unreliable when `project` (or a group's `@peer` fan-out) resolves to a **federated/mounted remote project** — it has been observed to return zero results regardless of the value passed, even though the same query without `filter_path` returns hits. Root cause not yet isolated. Until fixed, scope federated results client-side instead: over-fetch (e.g. `limit=50`) without `filter_path` and post-filter on the returned `path`/`source` fields. `filter_path` against a local (non-federated) project is unaffected. See CHANGELOG `[Unreleased] > Known limitations`.
+> **Federated `filter_path`:** when `project` (or a group's `@peer` fan-out) resolves to a **federated/mounted remote project**, `filter_path` is matched **client-side on the namespaced result path** (`<peer>/<alias>/…`) — i.e. exactly the path you see in the results — because the peer matches only its own un-namespaced store paths. The hub over-fetches from the peer and post-filters, so a federated `filter_path` behaves as expected; no client-side workaround is needed. (A separate, non-federated case — `filter_path` on a *local* project routed through `codesearch serve` — is still being addressed; see CHANGELOG `[Unreleased] > Known limitations`.)
 
 **Semantic mode** combines vector similarity (fastembed) + BM25 lexical scoring + exact identifier boosting, fused with RRF. Best for conceptual queries and mixed natural-language + symbol searches.
 

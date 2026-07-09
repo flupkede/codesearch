@@ -74,6 +74,63 @@ mod tests {
         ));
     }
 
+    // === retain_by_filter_path (federated client-side path scoping) tests ===
+
+    fn ns_item(path: &str) -> super::SearchResultItem {
+        super::SearchResultItem {
+            chunk_id: 1,
+            path: path.to_string(),
+            start_line: 1,
+            end_line: 2,
+            kind: String::new(),
+            score: 0.5,
+            signature: None,
+            content: None,
+            context_prev: None,
+            context_next: None,
+            source: None,
+            chunk_ref: None,
+        }
+    }
+
+    #[test]
+    fn retain_by_filter_path_keeps_only_matching_namespaced_prefix() {
+        // Federated results carry the `<peer>/<alias>/…` path the caller sees;
+        // the filter must match against THAT, with an empty project root.
+        let mut items = vec![
+            ns_item("aprimo/dam_help/Rendition-Presets.htm"),
+            ns_item("aprimo/mo_help/Approvals.htm"),
+            ns_item("custom-kb/howto/foo.md"),
+        ];
+        super::retain_by_filter_path(&mut items, Some("aprimo/dam_help"));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "aprimo/dam_help/Rendition-Presets.htm");
+    }
+
+    #[test]
+    fn retain_by_filter_path_none_and_blank_are_noops() {
+        let pair = || vec![ns_item("aprimo/dam_help/x.htm"), ns_item("custom-kb/y.md")];
+
+        let mut a = pair();
+        super::retain_by_filter_path(&mut a, None);
+        assert_eq!(a.len(), 2, "None filter must not drop anything");
+
+        let mut b = pair();
+        super::retain_by_filter_path(&mut b, Some("   "));
+        assert_eq!(b.len(), 2, "blank/whitespace filter must be a no-op");
+
+        let mut c = pair();
+        super::retain_by_filter_path(&mut c, Some("/"));
+        assert_eq!(c.len(), 2, "root-only filter normalises to empty → no-op");
+    }
+
+    #[test]
+    fn retain_by_filter_path_no_match_yields_empty() {
+        let mut items = vec![ns_item("aprimo/dam_help/x.htm")];
+        super::retain_by_filter_path(&mut items, Some("nonexistent/segment"));
+        assert!(items.is_empty());
+    }
+
     // === is_definition_chunk tests ===
 
     #[test]
@@ -4018,6 +4075,18 @@ impl CodesearchService {
         let limit = request.limit.unwrap_or(10);
         let group = request.group.clone().unwrap_or_default();
 
+        // `filter_path` is applied CLIENT-SIDE (retain_by_filter_path) on the
+        // namespaced result paths for BOTH the local and remote lists, never
+        // forwarded to a peer nor down into the local group search — matching
+        // against a store's own paths (wrong project root in serve mode) drops
+        // everything. Over-fetch when a filter is set so enough survives.
+        let has_filter = is_meaningful_filter(request.filter_path.as_deref());
+        let fetch_limit = if has_filter {
+            Some(request.limit.map(|l| (l * 10).max(50)).unwrap_or(50))
+        } else {
+            request.limit
+        };
+
         // 1) Local results — internal handlers ignore `@remote` group members
         //    (they aren't local aliases), so they search only the group's local
         //    repos. Skip entirely when the group has no local repos.
@@ -4028,9 +4097,9 @@ impl CodesearchService {
                 "semantic" => {
                     let req = SemanticSearchRequest {
                         query: request.query.clone(),
-                        limit: request.limit,
+                        limit: fetch_limit,
                         compact: request.compact,
-                        filter_path: request.filter_path.clone(),
+                        filter_path: None,
                         mode: request.semantic_mode.clone(),
                         project: None,
                         group: Some(group.clone()),
@@ -4042,7 +4111,7 @@ impl CodesearchService {
                         query: request.query.clone(),
                         regex: request.regex,
                         phrase: request.phrase,
-                        limit: request.limit,
+                        limit: fetch_limit,
                         file_glob: request.file_glob.clone(),
                         language: request.language.clone(),
                         format: request.format.clone(),
@@ -4059,22 +4128,23 @@ impl CodesearchService {
                 }
             };
             local_items = parse_search_items_from_call_result(&local_result, &mode);
+            retain_by_filter_path(&mut local_items, request.filter_path.as_deref());
         }
 
         // 2) Build the request body shipped to each remote (group forced to the
         //    peer's own scope + project stripped by the federation client).
+        //    `filter_path` intentionally omitted — applied client-side below.
         let body = serde_json::json!({
             "query": request.query,
             "mode": mode,
             "compact": request.compact,
             "semantic_mode": request.semantic_mode,
-            "filter_path": request.filter_path,
             "regex": request.regex,
             "phrase": request.phrase,
             "file_glob": request.file_glob,
             "language": request.language,
             "format": request.format,
-            "limit": request.limit,
+            "limit": fetch_limit,
         });
 
         let client = match FederationClient::new() {
@@ -4106,12 +4176,12 @@ impl CodesearchService {
         while let Some(res) = join.join_next().await {
             match res {
                 Ok((peer_name, remote_alias, Outcome::Ok(items))) => {
-                    all_lists.push(
-                        items
-                            .into_iter()
-                            .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
-                            .collect(),
-                    );
+                    let mut converted: Vec<SearchResultItem> = items
+                        .into_iter()
+                        .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
+                        .collect();
+                    retain_by_filter_path(&mut converted, request.filter_path.as_deref());
+                    all_lists.push(converted);
                 }
                 Ok((peer_name, remote_alias, Outcome::Unreachable(reason))) => {
                     warnings.push(format!(
@@ -4152,20 +4222,32 @@ impl CodesearchService {
         let mode = request.mode.as_deref().unwrap_or("semantic").to_lowercase();
         let limit = request.limit.unwrap_or(10);
 
+        // `filter_path` is applied CLIENT-SIDE (see retain_by_filter_path) on the
+        // namespaced result paths, NOT forwarded to the peer — a server-side
+        // match against the peer's own store paths returns 0 for any value. When
+        // a filter is set we over-fetch from the peer so enough survives the
+        // post-filter to still fill `limit`.
+        let has_filter = is_meaningful_filter(request.filter_path.as_deref());
+        let peer_limit = if has_filter {
+            Some(request.limit.map(|l| (l * 10).max(50)).unwrap_or(50))
+        } else {
+            request.limit
+        };
+
         // Same shape as the group fan-out body; the federation client forces
-        // `project=<remote_alias>` and strips `group`.
+        // `project=<remote_alias>` and strips `group`. `filter_path` is
+        // intentionally omitted — applied client-side below.
         let body = serde_json::json!({
             "query": request.query,
             "mode": mode,
             "compact": request.compact,
             "semantic_mode": request.semantic_mode,
-            "filter_path": request.filter_path,
             "regex": request.regex,
             "phrase": request.phrase,
             "file_glob": request.file_glob,
             "language": request.language,
             "format": request.format,
-            "limit": request.limit,
+            "limit": peer_limit,
         });
 
         let client = match FederationClient::new() {
@@ -4179,7 +4261,7 @@ impl CodesearchService {
         };
 
         let outcome = client.search_project(&peer, body, &remote_alias).await;
-        let (items, warnings) = match outcome {
+        let (mut items, warnings) = match outcome {
             Outcome::Ok(items) => (
                 items
                     .into_iter()
@@ -4195,6 +4277,9 @@ impl CodesearchService {
                 )],
             ),
         };
+
+        // Client-side path scoping on the namespaced result paths.
+        retain_by_filter_path(&mut items, request.filter_path.as_deref());
 
         // Single ranked list — RRF here is order-preserving and just caps to
         // `limit`, keeping rendering identical to the group path.
@@ -7842,6 +7927,40 @@ fn convert_remote_item(
         source: Some(format!("{peer_name}/{remote_alias}")),
         chunk_ref,
     }
+}
+
+/// Apply a `filter_path` prefix filter to federated results **client-side**,
+/// on the namespaced paths the caller actually sees.
+///
+/// Federated `filter_path` cannot be forwarded to the peer: the peer matches
+/// against its own un-namespaced store paths (and, in serve mode, against the
+/// wrong project root), so a server-side match returns nothing for any value.
+/// Here we match against the `<peer>/<alias>/…` path carried on each converted
+/// item, with an empty project root (the namespaced path is already relative),
+/// so the filter means exactly what the caller reads back in the results.
+///
+/// A blank/whitespace filter is a no-op. Returns immediately when `filter_path`
+/// is `None`, so the non-filtered fast path pays nothing.
+fn retain_by_filter_path(items: &mut Vec<SearchResultItem>, filter_path: Option<&str>) {
+    let Some(raw) = filter_path else { return };
+    if raw.trim().is_empty() {
+        return;
+    }
+    let normalized = crate::cache::normalize_filter_path(raw);
+    if normalized.is_empty() {
+        return;
+    }
+    items.retain(|it| crate::cache::path_matches_filter(&it.path, &normalized, ""));
+}
+
+/// True when `filter_path` carries a meaningful prefix (non-blank, non-empty
+/// after normalization) — the single predicate the federated search paths use
+/// to decide whether to over-fetch and post-filter. Mirrors the no-op guards in
+/// [`retain_by_filter_path`] so `has_filter` and the retain stay in lockstep.
+fn is_meaningful_filter(filter_path: Option<&str>) -> bool {
+    filter_path
+        .map(|f| !f.trim().is_empty() && !crate::cache::normalize_filter_path(f).is_empty())
+        .unwrap_or(false)
 }
 
 /// Parse a federated `chunk_ref` into its `(peer, remote_alias, chunk_id)`
