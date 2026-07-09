@@ -141,6 +141,21 @@ pub struct RemoteRepoStatus {
     pub tool_call_count: Option<u64>,
 }
 
+/// `GET /repos/:alias/info` payload — on-disk index stats for one repo on the
+/// peer. Only the fields the TUI mount-info overlay renders are typed; every
+/// field is optional/defaulted so an older/newer remote still parses.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RemoteRepoInfo {
+    #[serde(default)]
+    pub chunks: usize,
+    #[serde(default)]
+    pub files: usize,
+    #[serde(default)]
+    pub db_size_human: String,
+    #[serde(default)]
+    pub model: String,
+}
+
 /// `POST /repos` success payload (HTTP 202).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteRepoAdded {
@@ -222,30 +237,15 @@ impl FederationClient {
     /// `body` is the local search request, serialised as JSON; `group` on the
     /// body is forced to the peer's configured group (or `"all"` when unset) and
     /// `project` is stripped, because projects are local to each instance.
-    pub async fn search(
-        &self,
-        peer: &RemotePeer,
-        mut body: serde_json::Value,
-    ) -> Outcome<Vec<RemoteSearchItem>> {
-        // Force the scope onto the remote's own group/namespace.
-        if let Some(obj) = body.as_object_mut() {
-            let g = peer
-                .group
-                .clone()
-                .unwrap_or_else(|| crate::constants::ALL_GROUP_NAME.to_string());
-            obj.insert("group".into(), serde_json::Value::String(g));
-            obj.remove("project");
-        }
-        self.post_search(peer, body).await
-    }
-
     /// Query a remote peer's `/search` endpoint scoped to a SINGLE remote
     /// project (project-level federation / mounted remote project).
     ///
-    /// Unlike [`search`](Self::search), this forces `project=<remote_alias>` and
-    /// strips `group`: the peer resolves the project in its own namespace and
-    /// returns only that project's results. `remote_alias` is the project's bare
-    /// name on the peer (the `<alias>` half of the local `<peer>/<alias>` mount).
+    /// Forces `project=<remote_alias>` and strips `group`: the peer resolves the
+    /// project in its own namespace and returns only that project's results.
+    /// `remote_alias` is the project's bare name on the peer (the `<alias>` half
+    /// of the local `<peer>/<alias>` mount). This is the ONLY search path —
+    /// group federation fans out to each mounted project via this method, so a
+    /// query only ever touches the individual indexes the user opted into.
     pub async fn search_project(
         &self,
         peer: &RemotePeer,
@@ -302,25 +302,39 @@ impl FederationClient {
 
     /// Fetch a single chunk from a remote peer's `/chunk/:id` endpoint.
     ///
-    /// `group` is forced to the peer's configured group so the remote searches
-    /// the right scope. Returns the raw `GetChunkResponse` JSON produced by the
-    /// remote tool.
+    /// Scoping mirrors [`Self::search_project`]:
+    /// - When `remote_alias` is `Some`, the lookup is scoped to that single
+    ///   project via `project=<alias>` and `group` is omitted. This is required
+    ///   because the peer is multi-repo and chunk_ids collide across its
+    ///   indexes — a group/`all`-scoped lookup returns `ambiguous_chunk_id`.
+    /// - When `remote_alias` is `None` (legacy non-namespaced `chunk_ref`), the
+    ///   lookup falls back to the peer's configured group (or `all`).
+    ///
+    /// Returns the raw `GetChunkResponse` JSON produced by the remote tool.
     pub async fn get_chunk(
         &self,
         peer: &RemotePeer,
+        remote_alias: Option<&str>,
         chunk_id: u32,
         context_lines: Option<usize>,
     ) -> Outcome<serde_json::Value> {
-        let group = peer
-            .group
-            .clone()
-            .unwrap_or_else(|| crate::constants::ALL_GROUP_NAME.to_string());
         let mut url = Self::peer_url(
             peer,
             &crate::constants::CHUNK_PATH.replace(":id", &chunk_id.to_string()),
         );
-        // Build a query string: group always, context_lines when present.
-        let mut qs = vec![("group".to_string(), group)];
+        // Scope the lookup: prefer a single-project scope (`project=<alias>`)
+        // so the multi-repo peer can disambiguate the chunk_id; fall back to
+        // the peer's group only for legacy non-namespaced refs.
+        let mut qs: Vec<(String, String)> = match remote_alias {
+            Some(alias) => vec![("project".to_string(), alias.to_string())],
+            None => {
+                let group = peer
+                    .group
+                    .clone()
+                    .unwrap_or_else(|| crate::constants::ALL_GROUP_NAME.to_string());
+                vec![("group".to_string(), group)]
+            }
+        };
         if let Some(cl) = context_lines {
             qs.push(("context_lines".to_string(), cl.to_string()));
         }
@@ -467,6 +481,23 @@ impl FederationClient {
             .await
     }
 
+    /// `GET /repos/:alias/info` — fetch on-disk index stats (chunks/files/db
+    /// size/model) for one repo on the peer. `alias` is the peer's repo alias.
+    pub async fn repo_info(
+        &self,
+        peer: &RemotePeer,
+        alias: &str,
+    ) -> ManagementOutcome<RemoteRepoInfo> {
+        let suffix = format!(
+            "{}/{}{}",
+            crate::constants::REPOS_PATH,
+            urlencoding(alias),
+            crate::constants::REPO_INFO_PATH_SUFFIX,
+        );
+        self.send_management(peer, reqwest::Method::GET, &suffix, None, None)
+            .await
+    }
+
     /// `POST /repos/:alias/reindex[?force=true]` — trigger a background
     /// incremental (or forced full) reindex of a repo on the peer.
     pub async fn reindex(
@@ -537,6 +568,25 @@ mod tests {
         }
     }
 
+    /// Bind an ephemeral port, serve `app`, and return the address only once the
+    /// listener actually accepts a TCP connection. This bounded readiness poll
+    /// replaces a fixed `sleep(50ms)`, which occasionally lost the startup race
+    /// when the suite ran many tests (and other `cargo` processes) in parallel.
+    async fn spawn_test_server(app: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return addr;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("test server at {addr} never became ready");
+    }
+
     #[test]
     fn urlencoding_encodes_reserved_and_passes_unreserved() {
         assert_eq!(urlencoding("a-b_c.d~"), "a-b_c.d~");
@@ -555,9 +605,10 @@ mod tests {
 
         let client = FederationClient::new().unwrap();
         let outcome = client
-            .search(
+            .search_project(
                 &peer(format!("http://{addr}")),
                 serde_json::json!({"query": "x"}),
+                "kb",
             )
             .await;
         match outcome {
@@ -583,18 +634,14 @@ mod tests {
                 }))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
-            .search(
+            .search_project(
                 &peer(format!("http://{addr}")),
                 serde_json::json!({"query": "x"}),
+                "kb",
             )
             .await;
         match outcome {
@@ -624,12 +671,7 @@ mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         // Peer carries a group; search_project MUST override it with the project.
         let mut p = peer(format!("http://{addr}"));
@@ -666,27 +708,31 @@ mod tests {
 
     #[tokio::test]
     async fn get_chunk_fetches_from_a_live_peer() {
+        // The handler echoes back the scoping query params it received so the
+        // test can assert the client forwards `project=<alias>` (and NOT a
+        // `group`) for a namespaced lookup — the fix for `ambiguous_chunk_id`
+        // on a multi-repo peer.
         let app = axum::Router::new().route(
-            // axum route for /chunk/:id
             "/chunk/:id",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({
-                    "chunk_id": 7,
-                    "path": "kb/doc.md",
-                    "content": "the chunk body"
-                }))
-            }),
+            axum::routing::get(
+                |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    axum::Json(serde_json::json!({
+                        "chunk_id": 7,
+                        "path": "kb/doc.md",
+                        "content": "the chunk body",
+                        "received_project": params.get("project"),
+                        "received_group": params.get("group"),
+                    }))
+                },
+            ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
-            .get_chunk(&peer(format!("http://{addr}")), 7, None)
+            .get_chunk(&peer(format!("http://{addr}")), Some("inriver"), 7, None)
             .await;
         match outcome {
             Outcome::Ok(value) => {
@@ -694,6 +740,66 @@ mod tests {
                 assert_eq!(
                     value.get("content").and_then(|v| v.as_str()),
                     Some("the chunk body")
+                );
+                // Namespaced lookup: project scope forwarded, group omitted.
+                assert_eq!(
+                    value.get("received_project").and_then(|v| v.as_str()),
+                    Some("inriver"),
+                    "project=<alias> must be forwarded to disambiguate the multi-repo peer"
+                );
+                assert!(
+                    value
+                        .get("received_group")
+                        .map(|v| v.is_null())
+                        .unwrap_or(true),
+                    "group must be omitted when a project scope is used, got: {value}"
+                );
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_chunk_legacy_no_alias_falls_back_to_group() {
+        // A legacy (non-namespaced) chunk_ref yields `remote_alias == None`; the
+        // lookup must then fall back to the peer's group scope and NOT send a
+        // `project` param — preserving pre-fix behaviour for old refs.
+        let app = axum::Router::new().route(
+            "/chunk/:id",
+            axum::routing::get(
+                |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    axum::Json(serde_json::json!({
+                        "chunk_id": 7,
+                        "received_project": params.get("project"),
+                        "received_group": params.get("group"),
+                    }))
+                },
+            ),
+        );
+        let addr = spawn_test_server(app).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .get_chunk(&peer(format!("http://{addr}")), None, 7, None)
+            .await;
+        match outcome {
+            Outcome::Ok(value) => {
+                assert!(
+                    value
+                        .get("received_project")
+                        .map(|v| v.is_null())
+                        .unwrap_or(true),
+                    "legacy lookup must not send a project param, got: {value}"
+                );
+                // `peer()` configures group "all" (or the peer's group), which must be forwarded.
+                assert!(
+                    value
+                        .get("received_group")
+                        .and_then(|v| v.as_str())
+                        .is_some(),
+                    "legacy lookup must forward a group scope, got: {value}"
                 );
             }
             other => panic!("expected Ok, got {:?}", other),
@@ -718,12 +824,7 @@ mod tests {
                 }))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client.list_repos(&peer(format!("http://{addr}"))).await;
@@ -763,12 +864,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -803,12 +899,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -839,12 +930,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -881,12 +967,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         // force=true must arrive at the peer.
@@ -917,12 +998,7 @@ mod tests {
                 },
             ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client
@@ -954,12 +1030,7 @@ mod tests {
                 )
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let addr = spawn_test_server(app).await;
 
         let client = FederationClient::new().unwrap();
         let outcome = client

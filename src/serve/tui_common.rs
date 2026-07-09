@@ -93,6 +93,30 @@ pub enum KeyAction {
 
 /// Modal overlay shown on top of the normal TUI content.
 /// `Esc` dismisses it.
+/// On-disk index stats for a mounted remote project, fetched on demand from the
+/// peer's `GET /repos/{alias}/info` (the local instance has no local index for a
+/// mount, so these live on the peer).
+#[derive(Debug, Clone)]
+pub struct RemoteIndexStats {
+    pub chunks: usize,
+    pub files: usize,
+    pub db_size_human: String,
+    pub model: String,
+}
+
+/// Fetch state of a mounted remote project's index stats, so the info panel can
+/// distinguish "still loading" from "peer unreachable / no info".
+#[derive(Debug, Clone)]
+pub enum RemoteStatsState {
+    /// Fetch in flight — the panel shows a placeholder.
+    Loading,
+    /// Peer answered with stats.
+    Ready(RemoteIndexStats),
+    /// Peer unreachable or `/info` unavailable.
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
 pub enum OverlayState {
     /// Info modal: repo name, chunks, files, db size, model, dims, etc.
     Info {
@@ -107,9 +131,10 @@ pub enum OverlayState {
         index_age: String,
     },
     /// Info modal for a *mounted remote project* (federation peer). Remote
-    /// mounts have no local on-disk index, so there are no chunk/db/model stats
-    /// to show — instead we surface the federation coordinates (peer URL) plus
-    /// the peer-reported live status carried on the `RepoRow`.
+    /// mounts have no local on-disk index, so the chunk/file/db-size/model stats
+    /// are fetched on demand from the peer's `GET /repos/{alias}/info` and carried
+    /// in `stats`. We also surface the federation coordinates (peer URL) plus the
+    /// peer-reported live status carried on the `RepoRow`.
     RemoteInfo {
         alias: String,
         peer_url: String,
@@ -118,6 +143,8 @@ pub enum OverlayState {
         changes: u64,
         tool_call_count: u64,
         last_tool_call: Option<String>,
+        /// On-disk index stats fetched from the peer (loading / ready / unavailable).
+        stats: RemoteStatsState,
     },
     /// Doctor is running in background — show spinner.
     DoctorRunning { alias: String },
@@ -777,10 +804,50 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             changes,
             tool_call_count,
             last_tool_call,
+            stats,
         } => {
             let title = format!(" {} — Remote Mount ", alias);
             let last = last_tool_call.as_deref().unwrap_or("—");
-            let lines = vec![
+            // Index stats live on the peer; render them (or a placeholder) right
+            // after the status line so remote mounts get the same chunk/file/
+            // db-size/model detail a local repo shows in its Info overlay.
+            let stat_lines: Vec<Line> = match stats {
+                RemoteStatsState::Ready(s) => vec![
+                    Line::from(vec![
+                        Span::styled("  Chunks:      ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{}", s.chunks), Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Files:       ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{}", s.files), Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  DB size:     ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(s.db_size_human.clone(), Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Model:       ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(s.model.clone(), Style::default().fg(Color::White)),
+                    ]),
+                ],
+                RemoteStatsState::Loading => vec![Line::from(vec![
+                    Span::styled("  Index:       ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "fetching from peer…",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ])],
+                RemoteStatsState::Unavailable => vec![Line::from(vec![
+                    Span::styled("  Index:       ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "stats unavailable from peer",
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ])],
+            };
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled("  Peer URL:    ", Style::default().fg(Color::DarkGray)),
                     Span::styled(peer_url.clone(), Style::default().fg(Color::Cyan)),
@@ -789,6 +856,9 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                     Span::styled("  Status:      ", Style::default().fg(Color::DarkGray)),
                     Span::styled(status.clone(), Style::default().fg(Color::White)),
                 ]),
+            ];
+            lines.extend(stat_lines);
+            lines.extend(vec![
                 Line::from(vec![
                     Span::styled("  Lock:        ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
@@ -831,7 +901,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                     "  [Esc] close",
                     Style::default().fg(Color::DarkGray),
                 )),
-            ];
+            ]);
             render_centered_modal(f, area, &title, lines);
         }
         OverlayState::Doctor { alias, results } => {

@@ -27,12 +27,17 @@ HOOKS_DEST="$CLAUDE_DIR/hooks/codesearch"
 SETTINGS_PATH="$CLAUDE_DIR/settings.json"
 
 mkdir -p "$HOOKS_DEST"
+# NOTE: `codesearch hooks claude install` is the preferred, self-contained way
+# to install these hooks (no source tree needed). This script remains as the
+# from-source equivalent and must stay in sync with src/cli/claude_hooks.rs.
 cp "$HOOKS_SRC/grep-guard.sh" "$HOOKS_DEST/"
 cp "$HOOKS_SRC/subagent-preamble.sh" "$HOOKS_DEST/"
-chmod +x "$HOOKS_DEST/grep-guard.sh" "$HOOKS_DEST/subagent-preamble.sh"
+cp "$HOOKS_SRC/web-guard.sh" "$HOOKS_DEST/"
+chmod +x "$HOOKS_DEST/grep-guard.sh" "$HOOKS_DEST/subagent-preamble.sh" "$HOOKS_DEST/web-guard.sh"
 
 GREP_GUARD_CMD="bash \"$HOOKS_DEST/grep-guard.sh\""
 PREAMBLE_CMD="bash \"$HOOKS_DEST/subagent-preamble.sh\""
+WEB_GUARD_CMD="bash \"$HOOKS_DEST/web-guard.sh\""
 
 mkdir -p "$CLAUDE_DIR"
 if [ -f "$SETTINGS_PATH" ]; then
@@ -65,8 +70,9 @@ add_matcher_hook() {
     echo "Registered $matcher hook -> $cmd"
 }
 
-add_matcher_hook "Grep"  "$GREP_GUARD_CMD"
-add_matcher_hook "Agent" "$PREAMBLE_CMD"
+add_matcher_hook "Grep"             "$GREP_GUARD_CMD"
+add_matcher_hook "Agent"            "$PREAMBLE_CMD"
+add_matcher_hook "WebSearch|WebFetch" "$WEB_GUARD_CMD"
 
 echo "$settings" | jq '.' > "$SETTINGS_PATH"
 

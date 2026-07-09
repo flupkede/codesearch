@@ -3758,7 +3758,15 @@ impl CodesearchService {
         {
             let cfg = serve_state.config_snapshot();
             let mut projects: Vec<String> = cfg.repos.keys().cloned().collect();
+            // Include opt-in mounted remote projects so an agent can discover and
+            // route to them by name (they are first-class `project=` targets).
+            projects.extend(
+                cfg.mounted_remote_projects()
+                    .into_iter()
+                    .map(|(name, _)| name),
+            );
             projects.sort();
+            projects.dedup();
             let mut groups: Vec<String> = cfg.groups.keys().cloned().collect();
             groups.sort();
             (projects, groups, cfg.project_groups())
@@ -3984,23 +3992,24 @@ impl CodesearchService {
         crate::db_discovery::repos::ReposConfig::load().unwrap_or_default()
     }
 
-    /// True when the given group resolves to at least one remote peer.
+    /// True when the given group fans out to at least one **mounted** remote
+    /// project. A group that references `@peer` but where the user has mounted
+    /// none of that peer's individual indexes is treated as local-only.
     fn group_has_remotes(cfg: &crate::db_discovery::repos::ReposConfig, group: &str) -> bool {
-        cfg.resolve_group_targets(group)
-            .iter()
-            .any(|t| matches!(t, crate::db_discovery::repos::Target::Remote { .. }))
+        !cfg.group_remote_projects(group).is_empty()
     }
 
     /// Merge local + remote search results for a group that has `@<peer>`
     /// members. Runs the local query (restricted to the group's local repos),
-    /// fans out to every remote peer in parallel, then RRF-interleaves the
-    /// disjoint ranked lists. One unreachable peer becomes a `warning`, never a
-    /// hard failure.
+    /// fans out in parallel to each **mounted** remote project of the referenced
+    /// peers (`<peer>/<alias>`, opt-in `remote_mounts`), then RRF-interleaves the
+    /// disjoint ranked lists. One unreachable project becomes a `warning`, never
+    /// a hard failure.
     async fn federated_search(
         &self,
         request: &SearchRequest,
         cfg: &crate::db_discovery::repos::ReposConfig,
-        remotes: Vec<(String, crate::db_discovery::repos::RemotePeer)>,
+        remote_projects: Vec<(String, crate::db_discovery::repos::RemotePeer, String)>,
     ) -> Result<CallToolResult, McpError> {
         use crate::federation::{FederationClient, Outcome};
         use crate::rerank::DEFAULT_RRF_K;
@@ -4079,14 +4088,16 @@ impl CodesearchService {
             }
         };
 
-        // 3) Fan out to all remote peers concurrently.
+        // 3) Fan out to each mounted remote project concurrently. Each is a
+        //    project-scoped query (`project=<remote_alias>`) to its peer, so a
+        //    group only ever searches the indexes the user opted into.
         let mut join = tokio::task::JoinSet::new();
-        for (peer_name, peer) in remotes.into_iter() {
+        for (peer_name, peer, remote_alias) in remote_projects.into_iter() {
             let body = body.clone();
             let client = client.clone();
             join.spawn(async move {
-                let outcome = client.search(&peer, body).await;
-                (peer_name, outcome)
+                let outcome = client.search_project(&peer, body, &remote_alias).await;
+                (peer_name, remote_alias, outcome)
             });
         }
 
@@ -4094,18 +4105,18 @@ impl CodesearchService {
         let mut all_lists: Vec<Vec<SearchResultItem>> = vec![local_items];
         while let Some(res) = join.join_next().await {
             match res {
-                Ok((peer_name, Outcome::Ok(items))) => {
+                Ok((peer_name, remote_alias, Outcome::Ok(items))) => {
                     all_lists.push(
                         items
                             .into_iter()
-                            .map(|it| convert_remote_item(&peer_name, it))
+                            .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
                             .collect(),
                     );
                 }
-                Ok((peer_name, Outcome::Unreachable(reason))) => {
+                Ok((peer_name, remote_alias, Outcome::Unreachable(reason))) => {
                     warnings.push(format!(
-                        "remote peer '{}' unreachable: {}",
-                        peer_name, reason
+                        "remote project '{}/{}' unreachable: {}",
+                        peer_name, remote_alias, reason
                     ));
                 }
                 Err(joinerr) => {
@@ -4172,7 +4183,7 @@ impl CodesearchService {
             Outcome::Ok(items) => (
                 items
                     .into_iter()
-                    .map(|it| convert_remote_item(&peer_name, it))
+                    .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
                     .collect::<Vec<_>>(),
                 Vec::new(),
             ),
@@ -4199,20 +4210,11 @@ impl CodesearchService {
     ) -> Result<CallToolResult, McpError> {
         use crate::federation::{FederationClient, Outcome};
 
-        let (peer_name, id_str) = match chunk_ref.split_once(':') {
-            Some((p, i)) => (p, i),
+        let (peer_name, remote_alias, chunk_id) = match parse_federated_chunk_ref(chunk_ref) {
+            Some(parts) => parts,
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Invalid chunk_ref '{}': expected '<peer>:<chunk_id>'.",
-                    chunk_ref
-                ))]));
-            }
-        };
-        let chunk_id: u32 = match id_str.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Invalid chunk_ref '{}': chunk_id is not a number.",
+                    "Invalid chunk_ref '{}': expected '<peer>/<alias>:<chunk_id>'.",
                     chunk_ref
                 ))]));
             }
@@ -4238,7 +4240,10 @@ impl CodesearchService {
                 ))]));
             }
         };
-        match client.get_chunk(&peer, chunk_id, context_lines).await {
+        match client
+            .get_chunk(&peer, remote_alias, chunk_id, context_lines)
+            .await
+        {
             Outcome::Ok(value) => Ok(CallToolResult::success(vec![Content::text(
                 value.to_string(),
             )])),
@@ -4305,8 +4310,8 @@ impl CodesearchService {
         if let Some(group) = request.group.as_deref() {
             let cfg = self.federation_config();
             if Self::group_has_remotes(&cfg, group) {
-                let remotes = cfg.split_group_targets(group).1;
-                return self.federated_search(&request, &cfg, remotes).await;
+                let remote_projects = cfg.group_remote_projects(group);
+                return self.federated_search(&request, &cfg, remote_projects).await;
             }
         }
 
@@ -5788,9 +5793,10 @@ impl CodesearchService {
             request.project,
         );
 
-        // Federation: a `chunk_ref` of the form "<peer>:<chunk_id>" (returned by
-        // a federated search result) fetches the chunk from a remote peer rather
-        // than the local index.
+        // Federation: a `chunk_ref` of the form "<peer>/<remote_alias>:<chunk_id>"
+        // (returned by a federated search result) fetches the chunk from a remote
+        // peer rather than the local index. The alias scopes the fetch to a single
+        // remote project so the multi-repo peer can disambiguate the chunk_id.
         if let Some(chunk_ref) = request.chunk_ref.as_deref() {
             return self
                 .federated_get_chunk(chunk_ref, request.context_lines)
@@ -7390,6 +7396,29 @@ impl CodesearchService {
     }
 
     /// List all registered projects and groups. Called by `status(kind="projects")`.
+    /// Build the `remote_projects` listing (opt-in mounts) for `list_projects`.
+    fn remote_projects_listing(
+        config: &crate::db_discovery::repos::ReposConfig,
+    ) -> Vec<RemoteProjectInfo> {
+        config
+            .mounted_remote_projects()
+            .into_iter()
+            .filter_map(|(name, target)| match target {
+                crate::db_discovery::repos::Target::RemoteProject {
+                    peer_name,
+                    peer,
+                    remote_alias,
+                } => Some(RemoteProjectInfo {
+                    name,
+                    peer: peer_name,
+                    remote_alias,
+                    peer_url: peer.url,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn list_projects(&self) -> Result<CallToolResult, McpError> {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -7466,6 +7495,7 @@ impl CodesearchService {
             let response = ListProjectsResponse {
                 repos: repos_info,
                 groups: config.groups_with_virtual_all(),
+                remote_projects: Self::remote_projects_listing(&config),
                 serve_active,
                 serve_url,
                 current_directory: current_dir.display().to_string(),
@@ -7525,6 +7555,7 @@ impl CodesearchService {
         let response = ListProjectsResponse {
             repos: repos_info,
             groups: config.groups_with_virtual_all(),
+            remote_projects: Self::remote_projects_listing(&config),
             serve_active,
             serve_url,
             current_directory: current_dir.display().to_string(),
@@ -7780,12 +7811,23 @@ fn parse_search_items_from_call_result(
 }
 
 /// Convert a remote search hit into a local `SearchResultItem`, tagging it with
-/// its origin (`source`) and a namespaced `chunk_ref` for later retrieval.
+/// its origin (`source`) and a project-namespaced `chunk_ref` for later
+/// retrieval.
+///
+/// The `chunk_ref` is `"<peer>/<remote_alias>:<chunk_id>"`. The `remote_alias`
+/// segment is essential: the peer is itself multi-repo and chunk_ids are only
+/// unique *within* a single index, so `federated_get_chunk` must forward the
+/// alias as a `project=` scope to disambiguate. Omitting it (the old
+/// `"<peer>:<id>"` shape) made every remote `get_chunk` fail with
+/// `ambiguous_chunk_id` whenever the peer hosted more than one project.
 fn convert_remote_item(
     peer_name: &str,
+    remote_alias: &str,
     item: crate::federation::RemoteSearchItem,
 ) -> SearchResultItem {
-    let chunk_ref = item.chunk_id.map(|id| format!("{peer_name}:{id}"));
+    let chunk_ref = item
+        .chunk_id
+        .map(|id| format!("{peer_name}/{remote_alias}:{id}"));
     SearchResultItem {
         chunk_id: item.chunk_id.unwrap_or(0),
         path: item.path,
@@ -7797,8 +7839,29 @@ fn convert_remote_item(
         content: item.content.or(item.snippet),
         context_prev: item.context_prev,
         context_next: item.context_next,
-        source: Some(peer_name.to_string()),
+        source: Some(format!("{peer_name}/{remote_alias}")),
         chunk_ref,
+    }
+}
+
+/// Parse a federated `chunk_ref` into its `(peer, remote_alias, chunk_id)`
+/// parts.
+///
+/// Accepts the current project-namespaced shape `"<peer>/<alias>:<id>"` and,
+/// for backward compatibility, the legacy `"<peer>:<id>"` shape (no alias →
+/// `None`, which falls back to group-scoped lookup on the peer).
+///
+/// The `chunk_id` is taken after the *last* `':'` so peer/alias segments that
+/// themselves contain a colon are not misparsed; the peer/alias split is on the
+/// *first* `'/'`.
+fn parse_federated_chunk_ref(chunk_ref: &str) -> Option<(&str, Option<&str>, u32)> {
+    let (left, id_str) = chunk_ref.rsplit_once(':')?;
+    let chunk_id: u32 = id_str.parse().ok()?;
+    match left.split_once('/') {
+        Some((peer, alias)) if !peer.is_empty() && !alias.is_empty() => {
+            Some((peer, Some(alias), chunk_id))
+        }
+        _ => Some((left, None, chunk_id)),
     }
 }
 
@@ -8613,9 +8676,9 @@ mod federation_helpers_tests {
             context_prev: None,
             context_next: None,
         };
-        let item = convert_remote_item("cloud", remote);
-        assert_eq!(item.source.as_deref(), Some("cloud"));
-        assert_eq!(item.chunk_ref.as_deref(), Some("cloud:42"));
+        let item = convert_remote_item("cloud", "inriver", remote);
+        assert_eq!(item.source.as_deref(), Some("cloud/inriver"));
+        assert_eq!(item.chunk_ref.as_deref(), Some("cloud/inriver:42"));
         assert_eq!(item.chunk_id, 42); // local id preserved for rendering
         assert_eq!(item.path, "cloud/kb.md");
     }
@@ -8636,8 +8699,41 @@ mod federation_helpers_tests {
             context_prev: None,
             context_next: None,
         };
-        let item = convert_remote_item("peer", remote);
+        let item = convert_remote_item("peer", "someproj", remote);
         assert_eq!(item.content.as_deref(), Some("matched line"));
         assert!(item.chunk_ref.is_none(), "no chunk_ref without chunk_id");
+    }
+
+    #[test]
+    fn parse_federated_chunk_ref_namespaced() {
+        // Current shape: "<peer>/<alias>:<id>" → alias forwarded as project scope.
+        let (peer, alias, id) = super::parse_federated_chunk_ref("cloud/inriver:390").unwrap();
+        assert_eq!(peer, "cloud");
+        assert_eq!(alias, Some("inriver"));
+        assert_eq!(id, 390);
+    }
+
+    #[test]
+    fn parse_federated_chunk_ref_legacy_no_alias() {
+        // Backward compat: bare "<peer>:<id>" → no alias, group-scoped fallback.
+        let (peer, alias, id) = super::parse_federated_chunk_ref("cloud:42").unwrap();
+        assert_eq!(peer, "cloud");
+        assert_eq!(alias, None);
+        assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn parse_federated_chunk_ref_id_after_last_colon() {
+        // The id is taken after the LAST ':' so a colon in the alias is safe.
+        let (peer, alias, id) = super::parse_federated_chunk_ref("cloud/a:b:7").unwrap();
+        assert_eq!(peer, "cloud");
+        assert_eq!(alias, Some("a:b"));
+        assert_eq!(id, 7);
+    }
+
+    #[test]
+    fn parse_federated_chunk_ref_rejects_garbage() {
+        assert!(super::parse_federated_chunk_ref("no-colon-here").is_none());
+        assert!(super::parse_federated_chunk_ref("cloud:notanumber").is_none());
     }
 }

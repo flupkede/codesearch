@@ -18,7 +18,9 @@ use crossterm::terminal::{self, EnterAlternateScreen};
 
 use tokio_util::sync::CancellationToken;
 
-use super::tui_common::{self, KeyAction, OverlayKeyAction, OverlayState, RepoRow};
+use super::tui_common::{
+    self, KeyAction, OverlayKeyAction, OverlayState, RemoteIndexStats, RemoteStatsState, RepoRow,
+};
 use super::ServeState;
 use crate::cli::doctor;
 use crate::constants::{DB_DIR_NAME, LANG_CSHARP};
@@ -178,7 +180,16 @@ async fn run_tui_loop(
         // the user is still waiting on the current request (spinner showing and
         // generation matches); otherwise the result is stale — drain and drop it.
         if let Ok((gen, result)) = doctor_rx.try_recv() {
-            if gen == doctor_gen && matches!(overlay, Some(OverlayState::DoctorRunning { .. })) {
+            // Apply async results (doctor diagnostics OR remote-mount index stats)
+            // only if the user is still viewing the matching overlay and the
+            // generation matches; otherwise the result is stale — drop it.
+            if gen == doctor_gen
+                && matches!(
+                    overlay,
+                    Some(OverlayState::DoctorRunning { .. })
+                        | Some(OverlayState::RemoteInfo { .. })
+                )
+            {
                 overlay = Some(result);
             }
         }
@@ -237,8 +248,35 @@ async fn run_tui_loop(
                             }
                         } else if let Some(row) = rows.get(idx) {
                             // Mounted remote project (appended after local rows).
-                            // No local index → show federation coordinates.
-                            overlay = Some(build_remote_info_overlay(row));
+                            // Show federation coordinates immediately, then fetch
+                            // the peer's on-disk index stats in the background.
+                            let base = build_remote_info_overlay(row);
+                            // Bump the generation UNCONDITIONALLY: this invalidates
+                            // any still-in-flight doctor/remote-info result (they
+                            // share one channel + counter) so a late reply can't
+                            // clobber this overlay via the recv guard below.
+                            doctor_gen += 1;
+                            if let Some(crate::db_discovery::repos::Target::RemoteProject {
+                                peer,
+                                remote_alias,
+                                ..
+                            }) = state.config_snapshot().resolve_remote_project(&row.alias)
+                            {
+                                overlay = Some(base.clone());
+                                spawn_remote_info(
+                                    base,
+                                    peer,
+                                    remote_alias,
+                                    doctor_tx.clone(),
+                                    doctor_gen,
+                                );
+                            } else {
+                                // Mount no longer resolves (misconfig, or a config
+                                // reload raced this keypress). No fetch will run, so
+                                // don't leave the overlay stuck on "fetching…".
+                                overlay =
+                                    Some(with_remote_stats(base, RemoteStatsState::Unavailable));
+                            }
                         }
                     }
                     KeyAction::RunDoctor(idx) => {
@@ -393,14 +431,11 @@ fn spawn_remote_discovery(
             }
         };
         let interval = Duration::from_secs(crate::constants::REMOTE_DISCOVERY_INTERVAL_SECS);
-        // Peer → last successfully-discovered alias list (blip fallback).
-        let mut last_good: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
 
         loop {
             let cfg = state.config_snapshot();
             if !cfg.remotes.is_empty() {
-                let rows = discover_remote_rows(&client, &cfg, &mut last_good).await;
+                let rows = discover_remote_rows(&client, &cfg).await;
                 // Capacity-1 channel: replace the pending snapshot if the render
                 // loop hasn't consumed it yet (try_send drops on Full — fine, the
                 // next round supersedes it anyway).
@@ -415,21 +450,21 @@ fn spawn_remote_discovery(
     });
 }
 
-/// Query every peer's `/status`, then map the discovered repos into mounted
-/// remote-project rows (honoring local hide/rename filters). Peers unreachable
-/// this round fall back to their `last_good` alias list.
+/// Build the mounted remote-project rows for the TUI.
+///
+/// Rows come from the opt-in [`remote_mounts`](crate::db_discovery::repos::ReposConfig::remote_mounts)
+/// allowlist (config-driven, so they always show). Every peer's `/status` is
+/// polled concurrently only to *enrich* those rows with live per-repo state;
+/// a mount whose peer is unreachable this round simply falls back to a "warm"
+/// default. Discovery never defines which projects are mounted.
 async fn discover_remote_rows(
     client: &crate::federation::FederationClient,
     cfg: &crate::db_discovery::repos::ReposConfig,
-    last_good: &mut std::collections::HashMap<String, Vec<String>>,
 ) -> Vec<RepoRow> {
     use crate::db_discovery::repos::Target;
     use crate::federation::ManagementOutcome;
 
-    // 1) Fan out /status to all peers concurrently.
-    let mut discovered: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    // (peer, remote_alias) → the peer's reported repo state, for row display.
+    // 1) Fan out /status to all peers concurrently, keyed (peer, remote_alias).
     let mut status_lookup: std::collections::HashMap<
         (String, String),
         crate::federation::RemoteRepoStatus,
@@ -447,29 +482,14 @@ async fn discover_remote_rows(
     }
     while let Some(res) = join.join_next().await {
         if let Ok((peer_name, ManagementOutcome::Ok(status))) = res {
-            let aliases: Vec<String> = status.repos.iter().map(|r| r.alias.clone()).collect();
             for r in status.repos {
                 status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
             }
-            last_good.insert(peer_name.clone(), aliases.clone());
-            discovered.insert(peer_name, aliases);
         }
     }
 
-    // 2) Forget peers dropped from config so `last_good` can't grow unbounded
-    //    in a long-lived serve, then let peers that didn't answer this round
-    //    reuse their last-known list.
-    last_good.retain(|peer_name, _| cfg.remotes.contains_key(peer_name));
-    for peer_name in cfg.remotes.keys() {
-        if !discovered.contains_key(peer_name) {
-            if let Some(cached) = last_good.get(peer_name) {
-                discovered.insert(peer_name.clone(), cached.clone());
-            }
-        }
-    }
-
-    // 3) Apply hide/rename filters and build display rows.
-    cfg.mounted_remote_projects(&discovered)
+    // 2) Build one row per mounted project, enriched with live status.
+    cfg.mounted_remote_projects()
         .into_iter()
         .map(|(local_name, target)| {
             let Target::RemoteProject {
@@ -648,6 +668,9 @@ fn build_remote_info_overlay(row: &RepoRow) -> OverlayState {
         changes: row.changes,
         tool_call_count: row.tool_call_count,
         last_tool_call: row.last_tool_call.clone(),
+        // Index stats (chunks/files/db-size/model) live on the peer and are
+        // fetched asynchronously; start in the loading state.
+        stats: RemoteStatsState::Loading,
     }
 }
 
@@ -792,6 +815,69 @@ fn spawn_doctor(
         // Send result back to TUI loop (non-blocking — if channel closed, just drop it)
         let _ = tx.send((gen, result_overlay)).await;
     });
+}
+
+/// Spawn a background task to fetch a mounted remote project's on-disk index
+/// stats from the peer's `GET /repos/{alias}/info`, then send an enriched
+/// `RemoteInfo` overlay back via `tx` tagged with `gen` (so a stale or dismissed
+/// request's result is discarded by the receiver). On any failure the overlay
+/// falls back to `RemoteStatsState::Unavailable` — the mount coordinates already
+/// shown remain intact.
+fn spawn_remote_info(
+    base: OverlayState,
+    peer: crate::db_discovery::repos::RemotePeer,
+    remote_alias: String,
+    tx: tokio::sync::mpsc::Sender<(u64, OverlayState)>,
+    gen: u64,
+) {
+    tokio::spawn(async move {
+        use crate::federation::{FederationClient, ManagementOutcome};
+        let stats = match FederationClient::new() {
+            Ok(client) => match client.repo_info(&peer, &remote_alias).await {
+                ManagementOutcome::Ok(info) => RemoteStatsState::Ready(RemoteIndexStats {
+                    chunks: info.chunks,
+                    files: info.files,
+                    db_size_human: info.db_size_human,
+                    model: info.model,
+                }),
+                // Peer unreachable / non-2xx / unparseable — surface as unavailable.
+                _ => RemoteStatsState::Unavailable,
+            },
+            // No HTTP client (e.g. TLS init failure) → stats can't be fetched.
+            Err(_) => RemoteStatsState::Unavailable,
+        };
+        let enriched = with_remote_stats(base, stats);
+        let _ = tx.send((gen, enriched)).await;
+    });
+}
+
+/// Replace the `stats` field of a `RemoteInfo` overlay, leaving any other overlay
+/// variant untouched.
+fn with_remote_stats(overlay: OverlayState, stats: RemoteStatsState) -> OverlayState {
+    if let OverlayState::RemoteInfo {
+        alias,
+        peer_url,
+        status,
+        lock,
+        changes,
+        tool_call_count,
+        last_tool_call,
+        ..
+    } = overlay
+    {
+        OverlayState::RemoteInfo {
+            alias,
+            peer_url,
+            status,
+            lock,
+            changes,
+            tool_call_count,
+            last_tool_call,
+            stats,
+        }
+    } else {
+        overlay
+    }
 }
 
 // ---------------------------------------------------------------------------

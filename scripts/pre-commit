@@ -1,68 +1,28 @@
 #!/bin/bash
-# Pre-commit hook:
-#   1. Run cargo fmt (prevents CI fmt-check failures)
-#   2. On feature branches only: auto-bump patch version + rebuild binary
-#      On develop/master/release: only fmt, no version bump
+# Pre-commit hook: format Rust code only.
+#
+# Runs `cargo fmt` and stages any reformatting so CI's fmt-check can't fail.
+#
+# This hook deliberately does NOT bump the version or build a binary. It used
+# to auto-bump the Cargo.toml patch version and run `cargo build` on every
+# feature-branch commit, which blocked each commit for minutes (a debug build
+# nobody deploys) and made the deployed binary constantly drift from HEAD.
+#
+# The auto-bump was also redundant: build.rs already appends a unique
+# "+<commit_count>" suffix (git rev-list --count HEAD) to every build, so each
+# commit is uniquely identifiable without churning the base version. The base
+# version in Cargo.toml is now bumped deliberately at release time — see
+# RELEASING.md.
 
 set -e
 
-# ── Step 1: cargo fmt ────────────────────────────────────────────────────
 echo "pre-commit: running cargo fmt..."
 cargo fmt --all --quiet 2>/dev/null || cargo fmt --all --quiet
+
 FMT_CHANGED=$(git diff --name-only -- '*.rs')
 if [ -n "$FMT_CHANGED" ]; then
     git add -- '*.rs'
     echo "pre-commit: staged rustfmt changes ($FMT_CHANGED)"
 fi
 
-# ── Step 2: version bump (feature branches only) ─────────────────────────
-BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
-IS_FEATURE=false
-case "$BRANCH" in
-    fix/*|feature/*|features/*) IS_FEATURE=true ;;
-esac
-
-if [ "$IS_FEATURE" = false ]; then
-    echo "pre-commit: branch '$BRANCH' — skipping version bump (feature branches only)"
-    exit 0
-fi
-
-CARGO_TOML="Cargo.toml"
-
-# Working tree version (what's on disk right now)
-WT_VER=$(grep -m1 '^version = ' "$CARGO_TOML" | sed 's/version = "\(.*\)"/\1/')
-if [ -z "$WT_VER" ]; then
-    echo "pre-commit: could not read version from $CARGO_TOML" >&2
-    exit 1
-fi
-
-# HEAD version (last committed)
-HEAD_VER=$(git show HEAD:"$CARGO_TOML" 2>/dev/null | grep -m1 '^version = ' | sed 's/version = "\(.*\)"/\1/' || echo "")
-
-if [ "$WT_VER" != "$HEAD_VER" ]; then
-    # Developer already changed the version — don't bump again
-    echo "pre-commit: version already changed ($HEAD_VER -> $WT_VER), skipping auto-bump"
-    NEED_REBUILD=true
-else
-    IFS='.' read -r MAJOR MINOR PATCH <<< "$WT_VER"
-    NEW_PATCH=$((PATCH + 1))
-    NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
-
-    sed -i "0,/^version = \"$WT_VER\"/s//version = \"$NEW_VERSION\"/" "$CARGO_TOML"
-    cargo update --workspace --quiet 2>/dev/null || true
-    echo "pre-commit: bumped $WT_VER -> $NEW_VERSION"
-    NEED_REBUILD=true
-fi
-
-# Rebuild
-if [ "$NEED_REBUILD" = true ]; then
-    CURRENT_VER=$(grep -m1 '^version = ' "$CARGO_TOML" | sed 's/version = "\(.*\)"/\1/')
-    echo "pre-commit: rebuilding binary at $CURRENT_VER..."
-    if cargo build --bin codesearch --quiet; then
-        git add "$CARGO_TOML" Cargo.lock
-        echo "pre-commit: binary rebuilt at $CURRENT_VER"
-    else
-        echo "pre-commit: cargo build failed" >&2
-        exit 1
-    fi
-fi
+exit 0

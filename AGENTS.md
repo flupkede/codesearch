@@ -1,4 +1,30 @@
-# AGENTS.md — codesearch (features/codesearch-federation)
+# AGENTS.md — codesearch (features/remote-mount-selection)
+
+## Current Plan — opt-in remote mount selection (2026-07-07) ✅ CODE COMPLETE
+
+**Refines the project-mounting work below.** The earlier design auto-discovered and mounted
+*every* project a peer exposed (opt-out via `remote_hidden`). Per user intent, selection is now
+**opt-in**: after `remote add`, the local user explicitly chooses which individual per-vendor
+indexes to use.
+
+**Locked decisions (2026-07-07):**
+- **`remote_mounts` allowlist = single source of truth** (canonical `<peer>/<alias>` in
+  `repos.json`). Replaces the opt-out `remote_hidden`; nothing auto-mounts.
+- **Group fan-out restricted to mounts:** an `@peer` reference in a group federates only that
+  peer's *mounted* indexes (each as its own `project=` query), never the whole peer.
+- **Non-mounted = unroutable:** `resolve_remote_project` gates on the allowlist.
+
+**Done (commit `1a5b3fc`):**
+- `repos.rs`: `remote_mounts`; `mounted_remote_projects()` allowlist-driven (no discovery arg);
+  `resolve_remote_project()` allowlist gate; `group_remote_projects()`; `mount_remote_project()`/
+  `unmount_remote_project()`; `reconcile()` prunes stale/unknown-peer/malformed mounts + orphan
+  rename overrides.
+- `mcp/mod.rs`: `federated_search` fans out per mounted project (`search_project`); obsolete
+  whole-peer `FederationClient::search` removed; `list_projects` gains a `remote_projects` array;
+  `scope_required` advertises mounted names in `available_projects`.
+- `cli/mod.rs`: `remote available|mount|unmount|mounts`.
+- `serve/tui.rs`: rows come from the allowlist; peer discovery only enriches live status.
+- Docs: CHANGELOG / README / AGENTS updated.
 
 ## Current Plan — remote project mounting (1-to-1 passthrough)
 
@@ -10,10 +36,11 @@ is dropped; grouping becomes a purely-local, user-owned composition (a local `do
 several remote members stays possible — the user decides).
 
 **Locked design decisions (2026-07-06):**
-- **Discovery = auto-discover + local filter.** On startup the local instance queries each
-  peer's `GET /status`, enumerates its repos, and mounts them as remote projects. The user can
-  hide/rename specific mounts locally. Peer unreachable at startup → fall back to last-known
-  cached list (never hard-fail).
+- **Discovery = auto-discover + local filter.** *(SUPERSEDED by the opt-in plan above —
+  selection is now an explicit `remote_mounts` allowlist, not auto-discover-everything.)* On
+  startup the local instance queries each peer's `GET /status`, enumerates its repos, and mounts
+  them as remote projects. The user can hide/rename specific mounts locally. Peer unreachable at
+  startup → fall back to last-known cached list (never hard-fail).
 - **Naming = peer-namespaced.** Remote projects are named `<peer>/<alias>` (e.g. `cloud/vendor-a`)
   — always unambiguous, never shadows a local repo, TUI shows the source at a glance.
 
@@ -66,8 +93,8 @@ competition.
 
 ## Current state
 
-- **Branch:** `features/codesearch-federation`
-- **Version:** v1.1.9 (post-1.1.0 GA: project-level mounting + cloud reindex hardening; pre-commit hook auto-bumps patch per commit)
+- **Branch:** `features/remote-mount-selection` (branched from `develop` after the federation merge)
+- **Version:** v1.1.11 (opt-in remote mount selection; pre-commit hook auto-bumps patch per commit)
 - **Deploy:** cloud peer redeployed with the per-vendor federation split (akeneo/vendor-a/bynder/digizuite/inriver/keyshot + custom KB), image built locally via BuildKit `docker buildx --push`, all vendors reindexed and federation validated end-to-end (`project=cloud/<vendor>`).
 - **Status:** `cargo check` + `cargo clippy` clean
 - **Validation:** `cargo check` for iteration, `cargo clippy` for lint. No `--release` builds during the fix loop; build only at the very end.
@@ -75,12 +102,12 @@ competition.
 ## Implemented on this branch
 
 - **Federation peers** — `codesearch remote add/rm/list` (local `repos.json` peer config: `alias → url, api_key, group, into_group`) + `@peer` group references; `FederationClient` search/get_chunk fan-out with RRF.
-- **Cloud indexer-job split** — heavy 4 vCPU/8 GiB build job uploads a snapshot; light 1 vCPU/2 GiB serve restores it read-only; snapshot refresh/verify loop. Cloud peer live + validated. See `integrations/cloud/README.md`.
+- **Cloud indexer-job split** — heavy 4 vCPU/8 GiB build job uploads a snapshot; light 1 vCPU/2 GiB serve restores it (DOCS corpus read-only). The serve replica additionally runs a **memory-bounded incremental reindex of the small custom-kb repo** after each KB `git pull` moves `HEAD` (fire-and-forget `POST /repos/custom-kb/reindex`), so new KB articles are searchable without a redeploy; the heavy DOCS corpus stays job-only. Snapshot refresh/verify loop. Cloud peer live + validated. See `integrations/cloud/README.md`.
 - **Remote index management (`--remote`)** — `--remote <peer>` flag on `index list/add/rm` + new `index reindex` verb drives a peer's management API via `FederationClient` (`ManagementOutcome`: `Ok` / `HttpError{status,reason}` / `Unreachable`). Endpoints: `GET /status`, `POST /repos {path}`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex[?force=]`. `--json` on List/Reindex (requires `--remote`). Without `--remote`, every `index` verb is unchanged (local).
 - **Local `index rm <alias>`** — resolves the argument as a registered alias before falling back to path interpretation.
 - **CLI aliases** — `ls` is a visible alias for `list` (`index`/`groups`/`remote`); `rm` for `remove` (pre-existing).
 
-> ℹ️ **Remote write verbs** (`add`, `reindex --force`) require a read-write peer; the restore-only cloud peer rejects them (`--force` → HTTP 500 "could only be opened read-only; cannot force-reindex"). `list` is always safe. `rm` is not durable — the next cold start re-registers from the restored snapshot. Per-vendor sub-path registration is scripted against a writable peer.
+> ℹ️ **Remote write verbs** (`add`, `reindex --force`) require a read-write peer; the cloud peer rejects them (`--force` → HTTP 500 "could only be opened read-only; cannot force-reindex"). An **incremental** `reindex` (no `--force`) of an already-registered repo *does* succeed on the cloud peer — that is the custom-kb auto-refresh path. `list` is always safe. `rm` is not durable — the next cold start re-registers from the restored snapshot. Per-vendor sub-path registration is scripted against a writable peer.
 
 ## Known issue — `docs` repo status stuck on `open`/`write` after cold start (cloud)
 
@@ -192,6 +219,15 @@ side effect of a separate job existing.
 disaster-recovery-style full rebuilds. Whether the scale-up/poll/snapshot/scale-down cycle
 should be a scheduled script, a Logic App, or a small wrapper CLI command
 (`codesearch cloud rebuild --remote <peer>`?) is open for the next session.
+
+**Scoped first step shipped (2026-07-08):** the "incremental reindex in-process on serve" idea
+is now live — but *only* for the small **custom-kb** repo. `docker/entrypoint.sh`'s serve-mode
+KB pull loop fires an incremental `POST /repos/custom-kb/reindex` whenever a `git pull` moves
+`HEAD`. This is safe on the 1–2 GiB replica because (a) incremental refresh is memory-bounded
+(`INCREMENTAL_REFRESH_BATCH_SIZE`, see the crash-loop fix above) and (b) the KB corpus is tiny.
+The heavy DOCS corpus deliberately stays job-only — re-embedding thousands of files in-process
+is exactly the OOM that motivated the split. The full single-app self-scaling redesign for the
+DOCS corpus (above) remains a separate, undecided follow-up.
 
 ---
 

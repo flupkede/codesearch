@@ -282,13 +282,15 @@ pub struct SearchResultItem {
     pub context_prev: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_next: Option<String>,
-    /// Federation source tag: `None` for local results, `Some("<peer_name>")`
-    /// for results merged in from a remote peer. Lets the agent tell where a
-    /// hit originated.
+    /// Federation source tag: `None` for local results,
+    /// `Some("<peer>/<remote_alias>")` for results merged in from a remote peer
+    /// (e.g. `Some("cloud/inriver")`). Lets the agent tell where a hit
+    /// originated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Federated chunk reference for retrieval, of the form `"<peer>:<chunk_id>"`
-    /// (e.g. `"cloud:12345"`). Present only for remote results; pass it back to
+    /// Federated chunk reference for retrieval, of the form
+    /// `"<peer>/<remote_alias>:<chunk_id>"` (e.g. `"cloud/inriver:12345"`).
+    /// Present only for remote results; pass it back to
     /// `get_chunk(chunk_ref=...)` to fetch the chunk content from the peer.
     /// Local results are fetched with the plain numeric `chunk_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -411,10 +413,13 @@ pub struct GetChunkRequest {
     /// Local chunk id. Ignored when `chunk_ref` is set (federated fetch).
     #[serde(default)]
     pub chunk_id: u32,
-    /// Federated chunk reference `"<peer>:<chunk_id>"` (e.g. `"cloud:12345"`),
-    /// as returned in a remote search result's `chunk_ref`. When set, the chunk
-    /// is fetched from the named remote peer and `chunk_id`/`project`/`group`
-    /// are ignored.
+    /// Federated chunk reference `"<peer>/<remote_alias>:<chunk_id>"`
+    /// (e.g. `"cloud/inriver:12345"`), as returned verbatim in a remote search
+    /// result's `chunk_ref`. The `<remote_alias>` segment scopes the fetch to a
+    /// single remote project so the multi-repo peer can disambiguate the
+    /// chunk_id. When set, the chunk is fetched from the named remote peer and
+    /// `chunk_id`/`project`/`group` are ignored. (A legacy `"<peer>:<chunk_id>"`
+    /// ref without an alias is still accepted for backward compatibility.)
     #[serde(default)]
     pub chunk_ref: Option<String>,
     pub context_lines: Option<usize>,
@@ -464,10 +469,29 @@ pub struct DependentItem {
 pub struct ListProjectsResponse {
     pub repos: Vec<RepoInfo>,
     pub groups: HashMap<String, Vec<String>>,
+    /// Mounted remote projects (opt-in federation), each routable by `name` as a
+    /// first-class `project=`. Empty when nothing is mounted. Kept separate from
+    /// `repos` so an agent can tell local indexes from federated ones.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub remote_projects: Vec<RemoteProjectInfo>,
     pub serve_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve_url: Option<String>,
     pub current_directory: String,
+}
+
+/// A mounted remote project surfaced as a first-class, routable project.
+#[derive(Debug, Serialize)]
+pub struct RemoteProjectInfo {
+    /// Local name to pass as `project=` — the canonical `<peer>/<alias>` or the
+    /// user's rename.
+    pub name: String,
+    /// The federation peer this project lives on.
+    pub peer: String,
+    /// The bare project alias on the peer (what is forwarded as `project=`).
+    pub remote_alias: String,
+    /// The peer's base URL.
+    pub peer_url: String,
 }
 
 /// Information about a single registered project/repo.

@@ -2,12 +2,15 @@
 #
 # codesearch federation cloud entrypoint — TWO modes (CODESEARCH_RUN_MODE):
 #
-#   serve      (default) — the long-running Container App. RESTORE-ONLY: pulls the
-#              prebuilt index snapshot from blob and serves it read-only. It never
-#              registers, full-indexes, reindexes, or snapshots, so it never does
-#              heavy (memory-hungry) work and can run on a SMALL replica (1-2 GiB).
-#              Fresh content arrives via a new snapshot, picked up on the next cold
-#              start (scale-to-zero makes cold starts frequent).
+#   serve      (default) — the long-running Container App. RESTORE-FIRST: pulls the
+#              prebuilt index snapshot from blob and serves it. It never registers
+#              or full-indexes the heavy DOCS corpus, and never snapshots, so it
+#              stays light and runs on a SMALL replica (1-2 GiB). The ONE exception
+#              is the small custom-KB repo: on each git pull (KB_PULL_INTERVAL_SECS)
+#              serve runs a cheap INCREMENTAL reindex of just the changed KB files so
+#              new articles become searchable WITHOUT a restart. Fresh DOCS content
+#              still arrives only via a new snapshot from the index-job, picked up on
+#              the next cold start (scale-to-zero makes cold starts frequent).
 #
 #   index-job  — a short-lived Container Apps JOB. Does the HEAVY lifting on a big
 #              replica (4-8 GiB): sync the corpus from blob, build/refresh the index
@@ -28,8 +31,16 @@
 # Optional env:
 #   CODESEARCH_RUN_MODE       "serve" (default) | "index-job".
 #   KB_GIT_URL / GIT_PAT      Curated KB git repo (cloned to /data/custom-kb).
-#   KB_PULL_INTERVAL_SECS     serve mode: git-pull the KB this often so the periodic
-#                             incremental reindex picks up new entries (default 900).
+#   KB_POLL_INTERVAL_SECS     serve mode: how often to CHEAPLY poll the KB remote
+#                             HEAD (git ls-remote — ref advertisement only, no
+#                             objects). On a change, pull + incremental reindex fire
+#                             immediately, so a pushed KB edit becomes searchable in
+#                             ~this many seconds instead of the full pull interval
+#                             (default 30).
+#   KB_PULL_INTERVAL_SECS     serve mode: safety-net cadence — force a full git pull
+#                             (+ reindex-on-change) even when the cheap poll saw no
+#                             change or failed, self-healing a missed ls-remote
+#                             (default 900).
 #   DATA_DIR                  Working root (default /data).
 #   CODESEARCH_SERVE_PORT     Serve port (default 39725).
 #   INDEX_JOB_MAX_WAIT_SECS   Max seconds the job waits for indexing to finish
@@ -122,6 +133,27 @@ sync_kb() {
     log "git clone KB -> ${KB_DIR}"
     git clone --depth 1 "${url}" "${KB_DIR}" 2>&1 | sed 's/^/[git] /' || log "WARN: git clone failed"
   fi
+}
+
+# serve mode: after a KB git pull brings new commits, ask the LOCAL serve to
+# incrementally re-embed the custom-kb repo so new/changed articles become
+# searchable WITHOUT a restart. Incremental only (no ?force): re-embeds just the
+# added/changed/removed files — cheap enough for the 1-2 GiB serve replica (the
+# KB corpus is small). Fire-and-forget: POST /repos/<alias>/reindex returns 202
+# and runs in the background. Never aborts the pull loop on error (logs a WARN
+# and retries next cycle). A 409 means a reindex is already running (e.g. a lazy
+# FSW pickup of the same pull) — expected and harmless.
+reindex_kb() {
+  local name base="http://127.0.0.1:${PORT}" resp code
+  name="$(basename "${KB_DIR}")"
+  resp="$(api_code -X POST "${base}/repos/${name}/reindex" || true)"
+  code="${resp##*$'\n'}"          # last line = HTTP status
+  case "${code}" in
+    200|201|202) log "incremental reindex accepted for '${name}' (HTTP ${code})" ;;
+    409) log "reindex already in progress for '${name}' (HTTP 409) — skipping" ;;
+    404) log "'${name}' not yet registered on serve — awaiting a snapshot that includes it (HTTP 404, expected during bootstrap)" ;;
+    *) log "WARN: reindex request for '${name}' failed — HTTP ${code:-<none>}: ${resp%$'\n'*}" ;;
+  esac
 }
 
 # --- Snapshot restore / upload -----------------------------------------------
@@ -362,14 +394,17 @@ run_index_job() {
 }
 
 # =============================================================================
-# serve mode (default): restore the prebuilt snapshot and serve read-only.
-# No register / no reindex / no snapshot — never does heavy work.
+# serve mode (default): restore the prebuilt snapshot and serve it. Never builds
+# the heavy DOCS corpus and never snapshots. The only write work is a cheap
+# INCREMENTAL reindex of the small custom-kb repo whenever a KB git pull brings
+# new commits.
 # =============================================================================
 run_serve() {
-  log "MODE=serve — restore-only, read-only serving"
+  log "MODE=serve — restore-first serving (docs read-only; custom-kb incrementally refreshed)"
   restore_snapshot
   # Keep the local .md mirror current for visibility/debugging, but do NOT index
-  # here — the index is whatever the snapshot carried. (Cheap file sync only.)
+  # the DOCS corpus here — that index is whatever the snapshot carried. (Cheap
+  # file sync only.) The custom-kb git clone below IS incrementally reindexed.
   sync_blob
   sync_kb
 
@@ -378,14 +413,43 @@ run_serve() {
     log "      Run the 'index-job' Container Apps Job first to seed the snapshot."
   fi
 
-  # Background: keep the custom-KB git clone fresh so serve's periodic
-  # incremental reindex (REINDEX_INTERVAL_SECS) picks up newly-pushed entries
-  # WITHOUT a restart. Cheap — the KB repo is small (only the custom/ corpus).
-  # Only runs when KB_GIT_URL is set; the heavy DOCS corpus stays job-only.
+  # Background: keep the custom-KB git clone fresh AND, when a pull brings new
+  # commits, ask the local serve to incrementally reindex it so new/changed KB
+  # articles become searchable WITHOUT a container restart. Cheap — the KB repo
+  # is small (only the custom/ corpus) and incremental refresh re-embeds only the
+  # delta, so it fits the 1-2 GiB serve replica. The heavy DOCS corpus stays
+  # job-only. Only runs when KB_GIT_URL is set. The first pull fires after the
+  # interval, long after Phase-1 startup warmup has released the KB write lock,
+  # so there is no contention with warmup.
   if [ -n "${KB_GIT_URL:-}" ]; then
+    # Near-instant propagation: cheaply poll the remote HEAD every
+    # KB_POLL_INTERVAL_SECS (git ls-remote = ref advertisement only, no objects),
+    # and only do the expensive pull + reindex when the remote SHA actually moved.
+    # KB_PULL_INTERVAL_SECS is kept as a safety-net: force a full pull at least that
+    # often even if the cheap poll saw nothing (self-heals a failed/missed ls-remote).
+    # ls-remote uses the stored 'origin' remote so the PAT never lands on argv.
+    KB_POLL_INTERVAL_SECS="${KB_POLL_INTERVAL_SECS:-30}"
     KB_PULL_INTERVAL_SECS="${KB_PULL_INTERVAL_SECS:-900}"
-    ( while sleep "${KB_PULL_INTERVAL_SECS}"; do sync_kb; done ) &
-    log "KB auto-pull loop started (git pull every ${KB_PULL_INTERVAL_SECS}s -> /data/custom-kb)"
+    ( kb_branch="$(git -C "${KB_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+      secs_since_pull=0
+      while sleep "${KB_POLL_INTERVAL_SECS}"; do
+        secs_since_pull=$(( secs_since_pull + KB_POLL_INTERVAL_SECS ))
+        remote_sha="$(git -C "${KB_DIR}" ls-remote origin "${kb_branch}" 2>/dev/null | awk 'NR==1{print $1}')"
+        local_sha="$(git -C "${KB_DIR}" rev-parse HEAD 2>/dev/null || true)"
+        force_pull=0
+        [ "${secs_since_pull}" -ge "${KB_PULL_INTERVAL_SECS}" ] && force_pull=1
+        if { [ -n "${remote_sha}" ] && [ "${remote_sha}" != "${local_sha}" ]; } || [ "${force_pull}" -eq 1 ]; then
+          before="${local_sha}"
+          sync_kb
+          secs_since_pull=0
+          after="$(git -C "${KB_DIR}" rev-parse HEAD 2>/dev/null || true)"
+          if [ -n "${after}" ] && [ "${before}" != "${after}" ]; then
+            log "custom-kb changed (${before:-<none>} -> ${after}) — triggering incremental reindex"
+            reindex_kb
+          fi
+        fi
+      done ) &
+    log "KB auto-pull loop started (remote-HEAD poll every ${KB_POLL_INTERVAL_SECS}s; forced full pull every ${KB_PULL_INTERVAL_SECS}s; reindex-on-change -> ${KB_DIR})"
   fi
 
   log "starting codesearch serve on 0.0.0.0:${PORT}"

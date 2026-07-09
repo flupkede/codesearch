@@ -1,2 +1,16 @@
 # AGENTS.md is branch-specific - never merge from feature branches into develop
 AGENTS.md merge=ours
+
+# Shell scripts run in Linux containers. Force LF in the working copy so a
+# Windows checkout with core.autocrlf=true cannot bake CRLF into the Docker
+# image and break the shebang at runtime (observed: `env: 'bash\r': No such
+# file or directory`, container fails to start). eol=lf applies regardless of
+# the local autocrlf setting.
+*.sh text eol=lf
+docker/entrypoint.sh text eol=lf
+
+# Extensionless shell scripts (git hooks + their tracked sources) — same LF
+# requirement: a CRLF shebang silently breaks the hook when copied into
+# .git/hooks on Windows.
+scripts/pre-commit text eol=lf
+.githooks/** text eol=lf

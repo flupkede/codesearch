@@ -207,21 +207,22 @@ OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies acr
 
 **Claude Code specifically** tends to ignore this advice more than other clients — its MCP tool schemas are deferred (an extra `ToolSearch` call is needed before codesearch tools are even callable), while Grep/Glob are always fully loaded and zero-friction, and spawned subagents don't inherit `AGENTS.md` or the MCP `initialize` instructions at all.
 
-To make the preference **structural** instead of advisory, this repo ships two Claude Code hooks in [`integrations/claude-code/`](integrations/claude-code/):
+To make the preference **structural** instead of advisory, this repo ships three Claude Code `PreToolUse` hooks:
 
-- **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks the first grep against an in-repo path when codesearch looks available (a local `.codesearch.db` at the git root, or a `CODESEARCH_SERVER` env var for remote-serve setups), with a message telling the model how to load and call codesearch instead. A retry of the same query within 5 minutes is let through unblocked — the legitimate "codesearch found nothing, falling back" path. Greps outside the current repo are never blocked, and the hook fails open (never traps the model).
-- **`subagent-preamble`** — a `PreToolUse` hook on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all.
+- **`grep-guard`** — on `Grep`. Blocks the first grep against an in-repo path when codesearch looks available (a local `.codesearch.db` at the git root, or a `CODESEARCH_SERVER` env var for remote-serve setups), with a message telling the model how to load and call codesearch instead. A retry of the same query within 5 minutes is let through unblocked — the legitimate "codesearch found nothing, falling back" path. Greps outside the current repo are never blocked, and the hook fails open (never traps the model).
+- **`subagent-preamble`** — on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all.
+- **`web-guard`** — on `WebSearch`/`WebFetch`. When you have remote documentation projects mounted (`codesearch remote mount`, e.g. `cloud/inriver`, `cloud/example-dam`), it blocks the first web call with guidance to search those indexed mounts first — often more precise and current than the open web. Same 5-minute retry-escape; when no mounts are configured it does nothing.
 
-Install (idempotent — user scope applies to every project; project scope is this repo only):
+Install (idempotent — user scope applies to every project; `--project` is this repo only):
 
 ```bash
-pwsh -File integrations/claude-code/install.ps1                 # Windows — user scope (~/.claude)
-pwsh -File integrations/claude-code/install.ps1 -Scope project  # Windows — project scope (./.claude)
-bash integrations/claude-code/install.sh                        # macOS/Linux — user scope
-bash integrations/claude-code/install.sh --project              # macOS/Linux — project scope
+codesearch hooks claude install            # preferred — self-contained, all platforms
+codesearch hooks claude install --project  # project scope (./.claude)
 ```
 
-Note: the guard detects "codesearch is available **for this repo**" via a local `.codesearch.db` or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory). For a remote-serve setup with no local index, set `CODESEARCH_SERVER` to opt back into enforcement.
+The native command embeds the hook scripts in the binary (no source tree needed) and merges the registrations into `settings.json`. The equivalent from-source installers still live in [`integrations/claude-code/`](integrations/claude-code/) (`install.ps1` / `install.sh`) if you'd rather run them directly.
+
+Note: the grep-guard detects "codesearch is available **for this repo**" via a local `.codesearch.db` or `CODESEARCH_SERVER` — **not** by checking whether a `codesearch` process is running (that runs almost constantly as a multi-repo hub and would false-fire in every directory). For a remote-serve setup with no local index, set `CODESEARCH_SERVER` to opt back into enforcement.
 
 ## MCP Tools Reference
 
@@ -395,7 +396,7 @@ When using `git worktree add` to create parallel working directories, codesearch
 **Setup** (run inside any repo you want worktree auto-indexing for):
 
 ```bash
-codesearch hook install
+codesearch hooks git install
 ```
 
 This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
@@ -404,6 +405,10 @@ This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path
 1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` on startup (deletes on shutdown)
 2. The `post-checkout` hook reads that file and POSTs the working directory to `POST /repos`
 3. Serve registers the worktree path and begins indexing (deduped — won't re-register existing paths)
+
+### Claude Code Guard Hooks
+
+`codesearch hooks claude install` (`--project` for repo scope) installs the `PreToolUse` guard hooks that steer agents to codesearch before `Grep`/`WebSearch`/`WebFetch`. See [Agent Guidance](#agent-guidance-making-agents-use-codesearch-not-grep) above for what each guard does.
 
 ### MCP Connection Modes
 
@@ -469,14 +474,25 @@ done
 codesearch index list --remote cloud   # one alias per vendor
 ```
 
-**Mounting a peer's projects (query one by name).** Beyond group-level `@peer` fan-out, you can address a *single* project on a peer directly as `project=<peer>/<alias>` — a 1-to-1 passthrough to that peer's index. With a peer named `cloud` hosting the per-vendor layout above:
+**Mounting a peer's projects (opt-in, query one by name).** Adding a peer does **not** expose its projects automatically — you pick the individual indexes you want. Inspect what a peer offers, then mount the ones you care about:
+
+```bash
+codesearch remote available cloud          # list the peer's projects, ✓ marks mounted
+codesearch remote mount cloud/akeneo       # opt in to a single index
+codesearch remote mounts                   # show what you've mounted
+codesearch remote unmount cloud/akeneo     # opt back out
+```
+
+A **mounted** project is addressable directly as `project=<peer>/<alias>` — a 1-to-1 passthrough to that peer's index:
 
 ```bash
 # search only the peer's akeneo docs, by name
 codesearch search "import products" --project cloud/akeneo
 ```
 
-These **mounted remote projects** are auto-discovered from the peer's `GET /status` and appear in the `codesearch serve` TUI in **italic/cyan**, distinguishing them from local indexes. Press `i` on a mount to see its **Remote Mount** info (peer URL + peer-reported status); the local-index actions (`doctor` / `reindex` / `remove`) are shown struck-through/disabled for a mount, since they act on a local index and a mount has none — manage a peer's indexes with `--remote` (above) instead.
+The `remote_mounts` allowlist in `~/.codesearch/repos.json` is the single source of truth: a **non-mounted** project is unroutable (even if the peer exposes it), and a whole-peer `@peer` group reference (e.g. `docs → [@cloud]`) federates **only your mounted indexes** for that peer, not its whole corpus. Mounted projects are surfaced by `list_projects` (a `remote_projects` array) and advertised in the `scope_required` error, so agents can discover them.
+
+In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing them from local indexes. Press `i` on a mount to see its **Remote Mount** info (peer URL + peer-reported status); the local-index actions (`doctor` / `reindex` / `remove`) are shown struck-through/disabled for a mount, since they act on a local index and a mount has none — manage a peer's indexes with `--remote` (above) instead.
 
 ## CLI Reference
 
@@ -492,7 +508,11 @@ These **mounted remote projects** are auto-discovered from the peer's `GET /stat
 | `codesearch setup` | Download embedding models |
 | `codesearch cache stats\|clear` | Manage embedding cache |
 | `codesearch groups list\|add\|remove` | Manage repository groups |
-| `codesearch hook install` | Install git post-checkout hook for worktree auto-indexing |
+| `codesearch remote add\|list\|rm` | Manage federation peers (`--url`, `--api-key`, `--group`, `--into-group`, `--timeout-secs`) |
+| `codesearch remote available\|mount\|mounts\|unmount` | Inspect a peer's projects and opt-in mount them as `<peer>/<alias>` |
+| `codesearch index ... --remote <peer>` | Run `index list\|add\|rm\|reindex` against a peer's filesystem instead of local |
+| `codesearch hooks git install` | Install git post-checkout hook for worktree auto-indexing |
+| `codesearch hooks claude install` | Install Claude Code codesearch-first guard hooks into settings.json |
 
 ## Configuration
 
