@@ -74,6 +74,62 @@ mod tests {
         ));
     }
 
+    // === pick_filter_root (routed filter_path root selection) tests ===
+
+    fn roots(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(a, r)| ((*a).to_string(), normalize_path_str(r)))
+            .collect()
+    }
+
+    #[test]
+    fn pick_filter_root_uses_routed_alias_root() {
+        // serve single-project: the routed alias's own root, NOT the service
+        // project_path fallback — this is the bug being fixed.
+        let ar = roots(&[("myrepo", r"C:\data\repos\myrepo")]);
+        let root = super::pick_filter_root(
+            r"C:\data\repos\myrepo\src\foo.rs",
+            Some("myrepo"),
+            &ar,
+            "/some/other/hub/path",
+        );
+        assert_eq!(root, normalize_path_str(r"C:\data\repos\myrepo"));
+        // …and the filter then matches a repo-relative prefix.
+        let filter = normalize_filter_path("src/");
+        assert!(path_matches_filter(
+            r"C:\data\repos\myrepo\src\foo.rs",
+            &filter,
+            &root
+        ));
+        // …while a non-matching repo-relative prefix is correctly dropped.
+        let other = normalize_filter_path("tests/");
+        assert!(!path_matches_filter(
+            r"C:\data\repos\myrepo\src\foo.rs",
+            &other,
+            &root
+        ));
+    }
+
+    #[test]
+    fn pick_filter_root_multi_picks_longest_matching_root() {
+        // serve multi/group: no project_alias; choose the alias root the path
+        // lives under, longest-match so nested roots resolve correctly.
+        let ar = roots(&[("outer", r"C:\data"), ("inner", r"C:\data\inner")]);
+        let root = super::pick_filter_root(r"C:\data\inner\pkg\x.rs", None, &ar, "/fallback");
+        assert_eq!(root, normalize_path_str(r"C:\data\inner"));
+    }
+
+    #[test]
+    fn pick_filter_root_stdio_falls_back_to_project_path() {
+        // stdio single-repo: alias_roots empty → the service project_path,
+        // preserving the (correct) pre-fix behaviour.
+        let ar = std::collections::HashMap::new();
+        let fallback = normalize_path_str(r"C:\repo");
+        let root = super::pick_filter_root(r"C:\repo\src\a.rs", Some("repo"), &ar, &fallback);
+        assert_eq!(root, fallback);
+    }
+
     // === retain_by_filter_path (federated client-side path scoping) tests ===
 
     fn ns_item(path: &str) -> super::SearchResultItem {
@@ -98,18 +154,23 @@ mod tests {
         // Federated results carry the `<peer>/<alias>/…` path the caller sees;
         // the filter must match against THAT, with an empty project root.
         let mut items = vec![
-            ns_item("aprimo/dam_help/Rendition-Presets.htm"),
-            ns_item("aprimo/mo_help/Approvals.htm"),
+            ns_item("vendor-a/dam_help/Rendition-Presets.htm"),
+            ns_item("vendor-a/mo_help/Approvals.htm"),
             ns_item("custom-kb/howto/foo.md"),
         ];
-        super::retain_by_filter_path(&mut items, Some("aprimo/dam_help"));
+        super::retain_by_filter_path(&mut items, Some("vendor-a/dam_help"));
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].path, "aprimo/dam_help/Rendition-Presets.htm");
+        assert_eq!(items[0].path, "vendor-a/dam_help/Rendition-Presets.htm");
     }
 
     #[test]
     fn retain_by_filter_path_none_and_blank_are_noops() {
-        let pair = || vec![ns_item("aprimo/dam_help/x.htm"), ns_item("custom-kb/y.md")];
+        let pair = || {
+            vec![
+                ns_item("vendor-a/dam_help/x.htm"),
+                ns_item("custom-kb/y.md"),
+            ]
+        };
 
         let mut a = pair();
         super::retain_by_filter_path(&mut a, None);
@@ -126,7 +187,7 @@ mod tests {
 
     #[test]
     fn retain_by_filter_path_no_match_yields_empty() {
-        let mut items = vec![ns_item("aprimo/dam_help/x.htm")];
+        let mut items = vec![ns_item("vendor-a/dam_help/x.htm")];
         super::retain_by_filter_path(&mut items, Some("nonexistent/segment"));
         assert!(items.is_empty());
     }
@@ -3006,6 +3067,43 @@ fn prefix_path_multi(
     normalized
 }
 
+/// Pick the project root to relativise a result path against for a `filter_path`
+/// prefix match, so `filter_path` is interpreted **relative to the repo root**
+/// in every routing mode:
+/// - serve single-project routing → the routed alias's root (`alias_roots[alias]`);
+/// - serve multi/group → the longest alias root the (absolute) path lives under;
+/// - stdio single-repo (no alias roots) → the service's own `project_path`
+///   (`fallback_root`).
+///
+/// Before this, the filter always used the service's `project_path`, which for a
+/// serve-routed project is NOT the routed repo's root — so the absolute stored
+/// path never relativised and every hit was dropped. The federated paths solve
+/// the same class of bug client-side (see `retain_by_filter_path`); this covers
+/// the local (non-federated) serve/multi case.
+fn pick_filter_root(
+    path: &str,
+    project_alias: Option<&str>,
+    alias_roots: &std::collections::HashMap<String, String>,
+    fallback_root: &str,
+) -> String {
+    if let Some(alias) = project_alias {
+        if let Some(root) = alias_roots.get(alias) {
+            return root.clone();
+        }
+    }
+    if !alias_roots.is_empty() {
+        let normalized = crate::cache::normalize_path_str(path);
+        if let Some(root) = alias_roots
+            .values()
+            .filter(|r| normalized.starts_with(r.as_str()))
+            .max_by_key(|r| r.len())
+        {
+            return root.clone();
+        }
+    }
+    fallback_root.to_string()
+}
+
 fn is_import_kind(kind: &str) -> bool {
     matches!(kind, "Import" | "Use" | "Require" | "Include" | "Imports")
 }
@@ -5303,11 +5401,19 @@ impl CodesearchService {
             .filter(|r| {
                 if let Some(ref fp) = request.filter_path {
                     let normalized_filter = crate::cache::normalize_filter_path(fp);
-                    crate::cache::path_matches_filter(
+                    if normalized_filter.is_empty() {
+                        return true;
+                    }
+                    // Relativise against the ROUTED project's root, not the
+                    // service's own project_path — otherwise a serve-routed
+                    // absolute path never strips and every hit is dropped.
+                    let filter_root = pick_filter_root(
                         &r.path,
-                        &normalized_filter,
+                        project_alias,
+                        alias_roots,
                         &project_root_normalized,
-                    )
+                    );
+                    crate::cache::path_matches_filter(&r.path, &normalized_filter, &filter_root)
                 } else {
                     true
                 }
