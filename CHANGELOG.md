@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Mounts are discoverable.** `list_projects` gains a `remote_projects` array (name + peer + peer URL), and the `scope_required` error advertises mounted names in `available_projects`, so an agent can find and route to a mounted project as a first-class `project=` target.
 - **Group fan-out restricted to mounts.** A whole-peer `@peer` group reference (e.g. `docs → [@cloud]`) now federates only the individual indexes you mounted for that peer — each queried as its own project — instead of the peer's entire corpus.
 - **TUI: mounted remote projects.** Mounts render in **italic/cyan** in the serve status table to signal they live on a peer (not a local index). The `i` (info) key now works on a mount, opening a **Remote Mount** panel showing the peer URL and the peer-reported live status (status / lock / changes / calls / last call). The panel also fetches the peer's on-disk index stats (**chunks / files / db size / model**) on demand from `GET /repos/{alias}/info`, giving remote mounts parity with the local Info overlay — with a loading placeholder while the fetch is in flight and a graceful "stats unavailable from peer" fallback if the peer can't answer. When a mount is selected, the footer renders the local-index actions **doctor / reindex / remove struck-through (disabled)** so it's clear those don't apply to a peer-hosted index; info / reload / quit / navigation stay enabled.
+- **KB near-instant propagation.** The custom-KB project now polls its remote `git` HEAD on a cheap `git ls-remote` interval (`KB_POLL_INTERVAL_SECS`) instead of waiting for the full reindex cadence, so a KB add/update/delete becomes visible to federated queries within seconds of the git push rather than up to ~15 minutes later.
 
 ### Changed
 
@@ -30,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Indexer job OOM-kill on reindex.** The container entrypoint submitted all vendor index builds at once (async HTTP 202), so the serve process held every vendor's embedding model + working set simultaneously and got OOM-killed on 8 GiB — leaving the job stuck "indexing" forever. Builds now run sequentially, waiting for each to settle before starting the next.
 - **Incremental-refresh OOM crash-loop.** Bounded incremental-refresh embedding batches so a large change set no longer exhausts the heap.
 - **claude-code grep-guard hook** now ignores an already-running codesearch process and requires a local index before nudging toward codesearch, so it stops blocking `grep` when codesearch can't actually serve the current repo.
+
+### Known limitations
+
+- **`filter_path` is unreliable on federated/mounted projects.** `search(project="<peer>/<alias>", filter_path=...)` forwards `filter_path` to the peer as a normal local search, but in live testing against a real peer it consistently returned zero results regardless of the value passed — root cause not yet isolated (needs a live hub+peer repro, not just static review). Until fixed, callers that need source-scoped federated search should **over-fetch without `filter_path` and post-filter client-side** on the returned `path`/`source` fields (see `aprimo_mcp`'s `_search_remote` for a reference implementation of this workaround). Non-federated (local-project) `filter_path` is unaffected.
 
 ## [1.1.0] - 2026-07-01
 

@@ -242,6 +242,8 @@ Note: the grep-guard detects "codesearch is available **for this repo**" via a l
 | `project` | string | Target specific repo (multi-repo) |
 | `group` | string | Search across repo group (multi-repo) |
 
+> **Known limitation:** `filter_path` is unreliable when `project` (or a group's `@peer` fan-out) resolves to a **federated/mounted remote project** — it has been observed to return zero results regardless of the value passed, even though the same query without `filter_path` returns hits. Root cause not yet isolated. Until fixed, scope federated results client-side instead: over-fetch (e.g. `limit=50`) without `filter_path` and post-filter on the returned `path`/`source` fields. `filter_path` against a local (non-federated) project is unaffected. See CHANGELOG `[Unreleased] > Known limitations`.
+
 **Semantic mode** combines vector similarity (fastembed) + BM25 lexical scoring + exact identifier boosting, fused with RRF. Best for conceptual queries and mixed natural-language + symbol searches.
 
 **Literal mode** uses Tantivy FTS. Use `regex=true` for patterns with punctuation (`foo::bar`, `Vec<T>`). Use `phrase=true` for multi-word exact matches.
