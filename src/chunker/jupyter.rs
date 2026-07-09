@@ -117,10 +117,8 @@ fn extract_cell(cell: &Value) -> Option<RawCell> {
     // (rare: old IPython notebooks, some programmatic generators).
     let content: String = if let Some(arr) = cell["source"].as_array() {
         arr.iter().filter_map(|v| v.as_str()).collect()
-    } else if let Some(s) = cell["source"].as_str() {
-        s.to_string()
     } else {
-        return None;
+        cell["source"].as_str()?.to_string()
     };
 
     // Normalize to at least 1 line even for an empty cell, so the two passes
