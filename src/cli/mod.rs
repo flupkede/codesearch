@@ -1557,99 +1557,228 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
     Ok(())
 }
 
-/// Install the post-checkout git hook for codesearch worktree auto-indexing
-/// (`codesearch hooks git install`).
-async fn run_hook_git_install(path: Option<PathBuf>) -> Result<()> {
-    use colored::Colorize;
+/// Delimiters marking the codesearch-managed region inside a `post-checkout`
+/// hook. Kept as constants so install/upgrade can locate the block precisely
+/// and re-runs stay idempotent. The begin line intentionally contains the
+/// phrase "codesearch post-checkout hook" so hooks written by older codesearch
+/// versions (which used that comment) are still recognised as ours.
+const HOOK_BEGIN: &str = "# >>> codesearch post-checkout hook >>>";
+const HOOK_END: &str = "# <<< codesearch post-checkout hook <<<";
 
-    let repo_path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+/// The codesearch-managed block that registers the checked-out worktree with
+/// `codesearch serve`. Written in POSIX `sh` (not bash) so it stays valid when
+/// chained into a foreign `#!/bin/sh` hook, and uses `pwd -W` so Git Bash sends
+/// a native `C:/…` path instead of an msys `/c/…` path that serve rejects.
+fn codesearch_hook_block() -> String {
+    let mut s = String::new();
+    s.push_str(HOOK_BEGIN);
+    s.push('\n');
+    s.push_str(
+        r#"# Auto-registers the checked-out worktree with codesearch serve.
+# Installed by: codesearch hooks git install
+# $1 = prev_ref, $2 = new_ref, $3 = flag (1 = branch checkout)
+# Only react to branch/worktree checkouts ($3 = 1). `git worktree add` fires
+# post-checkout with flag 1; a file checkout (`git checkout -- path`) fires with
+# flag 0 and must not re-register (it changes no repo location, just wastes a POST).
+if [ "$3" = "1" ] && [ -f "$HOME/.codesearch/serve_url" ]; then
+    __cs_url=$(cat "$HOME/.codesearch/serve_url")
+    if [ -n "$__cs_url" ]; then
+        # Git Bash `pwd` yields an msys path (/c/...) that codesearch serve
+        # cannot canonicalize (HTTP 400); `pwd -W` yields a native C:/ path.
+        # Fall back to plain `pwd` on Linux/macOS where -W is unsupported.
+        __cs_path=$(pwd -W 2>/dev/null || pwd)
+        # JSON-escape backslashes, then double quotes (POSIX sed: sh + bash).
+        __cs_path=$(printf '%s' "$__cs_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        curl -s -X POST "$__cs_url/repos" \
+            -H "Content-Type: application/json" \
+            -d "{\"path\":\"$__cs_path\"}" >/dev/null 2>&1 &
+    fi
+fi
+"#,
+    );
+    s.push_str(HOOK_END);
+    s
+}
+
+/// A complete standalone `post-checkout` hook (shebang + managed block).
+fn codesearch_full_hook() -> String {
+    format!("#!/bin/sh\n{}\n", codesearch_hook_block())
+}
+
+/// Replace the codesearch-managed region (BEGIN..=END, including the line the
+/// END marker sits on) with `block`, preserving everything around it. Returns
+/// `None` if the markers are not both present.
+fn replace_hook_block(existing: &str, block: &str) -> Option<String> {
+    let begin = existing.find(HOOK_BEGIN)?;
+    let end_marker = existing[begin..].find(HOOK_END)? + begin;
+    let after_end = end_marker + HOOK_END.len();
+    // Extend the removed region to include the rest of the END marker's line.
+    let line_end = existing[after_end..]
+        .find('\n')
+        .map(|n| after_end + n)
+        .unwrap_or(existing.len());
+    let mut out = String::with_capacity(existing.len() + block.len());
+    out.push_str(&existing[..begin]);
+    out.push_str(block);
+    out.push_str(&existing[line_end..]);
+    Some(out)
+}
+
+/// Chain the managed `block` into a foreign hook without clobbering it. If the
+/// hook ends with a standalone `exit 0`, insert the block just before it so it
+/// still runs; otherwise append at the end.
+fn chain_hook_block(existing: &str, block: &str) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+    let last_nonempty = lines.iter().rposition(|l| !l.trim().is_empty());
+    if let Some(idx) = last_nonempty {
+        // Assumes a standalone/top-level trailing `exit 0`. A well-formed nested
+        // `exit 0` (inside an if/function) is followed by its `fi`/`}`, which
+        // becomes the last non-empty line instead — so this won't match it.
+        if lines[idx].trim() == "exit 0" {
+            let head = lines[..idx].join("\n");
+            let tail = lines[idx..].join("\n");
+            let mut out = String::new();
+            out.push_str(head.trim_end());
+            out.push_str("\n\n");
+            out.push_str(block);
+            out.push_str("\n\n");
+            out.push_str(&tail);
+            out.push('\n');
+            return out;
+        }
+    }
+    let mut out = existing.trim_end().to_string();
+    out.push_str("\n\n");
+    out.push_str(block);
+    out.push('\n');
+    out
+}
+
+/// Resolve the directory git actually reads hooks from for `repo_path`. Uses
+/// `git rev-parse --git-path hooks`, which honours `core.hooksPath` AND, when
+/// run inside a linked worktree, returns the shared common-dir hooks (git never
+/// runs hooks from a per-worktree gitdir). Falls back to manual `.git`
+/// resolution only if the git binary is unavailable.
+fn resolve_hooks_dir(repo_path: &std::path::Path) -> Result<PathBuf> {
+    if let Some(dir) = git_hooks_dir(repo_path) {
+        return Ok(dir);
+    }
+    resolve_hooks_dir_manual(repo_path)
+}
+
+fn git_hooks_dir(repo_path: &std::path::Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(line))
+}
+
+/// Fallback used only when the git binary cannot be spawned: resolve the hooks
+/// dir from the `.git` entry, climbing to the common dir for a linked worktree.
+fn resolve_hooks_dir_manual(repo_path: &std::path::Path) -> Result<PathBuf> {
     let dot_git = repo_path.join(".git");
-
-    // Resolve the actual .git directory (handle worktrees where .git is a file)
     let git_dir = if dot_git.is_file() {
-        // Worktree: read "gitdir: <path>" from .git file
         let content = std::fs::read_to_string(&dot_git)?;
         let first_line = content.lines().next().unwrap_or("");
-        if let Some(rel) = first_line.strip_prefix("gitdir: ") {
-            let resolved = repo_path.join(rel.trim());
-            if resolved.exists() {
-                resolved
-            } else {
-                anyhow::bail!("Could not resolve git dir from worktree .git file");
+        let rel = first_line.strip_prefix("gitdir: ").ok_or_else(|| {
+            anyhow::anyhow!("Unexpected .git file format (expected 'gitdir: ...')")
+        })?;
+        let resolved = repo_path.join(rel.trim());
+        if !resolved.exists() {
+            anyhow::bail!("Could not resolve git dir from worktree .git file");
+        }
+        // A linked worktree's gitdir holds a `commondir` file pointing at the
+        // shared .git; hooks live there, not in the per-worktree dir.
+        match std::fs::read_to_string(resolved.join("commondir")) {
+            Ok(cd) => {
+                let common = resolved.join(cd.trim());
+                common.canonicalize().unwrap_or(common)
             }
-        } else {
-            anyhow::bail!("Unexpected .git file format (expected 'gitdir: ...')");
+            Err(_) => resolved,
         }
     } else if dot_git.is_dir() {
         dot_git
     } else {
         anyhow::bail!("Not a git repository: {}", repo_path.display());
     };
+    Ok(git_dir.join("hooks"))
+}
 
-    let hooks_dir = git_dir.join("hooks");
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &std::path::Path) -> Result<()> {
+    // On Windows Git Bash executes hooks by shebang; no mode bit to set.
+    Ok(())
+}
+
+/// Install the post-checkout git hook for codesearch worktree auto-indexing
+/// (`codesearch hooks git install`).
+async fn run_hook_git_install(path: Option<PathBuf>) -> Result<()> {
+    use colored::Colorize;
+
+    let repo_path = path.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let hooks_dir = resolve_hooks_dir(&repo_path)?;
     std::fs::create_dir_all(&hooks_dir)?;
 
     let hook_path = hooks_dir.join("post-checkout");
+    let block = codesearch_hook_block();
 
+    let action;
     if hook_path.exists() {
-        // Check if it's already our hook
         let existing = std::fs::read_to_string(&hook_path)?;
-        if existing.contains("codesearch post-checkout hook") {
-            eprintln!(
-                "{}",
-                "✓ codesearch post-checkout hook already installed.".green()
-            );
-            return Ok(());
+        if existing.contains(HOOK_BEGIN) && existing.contains(HOOK_END) {
+            // Our managed block is present — upgrade it in place (idempotent).
+            let updated = replace_hook_block(&existing, &block)
+                .ok_or_else(|| anyhow::anyhow!("Failed to locate codesearch hook block"))?;
+            if updated == existing {
+                eprintln!(
+                    "{}",
+                    "✓ codesearch post-checkout hook already up to date.".green()
+                );
+                return Ok(());
+            }
+            std::fs::write(&hook_path, updated)?;
+            action = "upgraded";
+        } else {
+            // Foreign post-checkout hook — chain our block in, don't clobber it.
+            let chained = chain_hook_block(&existing, &block);
+            std::fs::write(&hook_path, chained)?;
+            action = "chained into existing";
         }
-        anyhow::bail!(
-            "A post-checkout hook already exists at {}.\nRemove it first or merge manually.",
-            hook_path.display()
-        );
+    } else {
+        std::fs::write(&hook_path, codesearch_full_hook())?;
+        action = "installed";
     }
 
-    // Hook script: bash (works in Git Bash on Windows too)
-    let hook_script = r#"#!/bin/bash
-# codesearch post-checkout hook
-# Auto-registers new worktrees with codesearch serve.
-# Installed by: codesearch hooks git install
-# $1 = prev_ref, $2 = new_ref, $3 = flag (1=branch checkout)
-
-SERVE_URL_FILE="$HOME/.codesearch/serve_url"
-if [ -f "$SERVE_URL_FILE" ]; then
-    SERVE_URL=$(cat "$SERVE_URL_FILE")
-    if [ -n "$SERVE_URL" ]; then
-        # JSON-escape the repo path before embedding it in the request body.
-        # A path containing a double quote or backslash would otherwise break
-        # out of the JSON string literal (malformed body / injection). Use
-        # quoted variables as the search/replace operands so the patterns match
-        # LITERALLY — bare backslash patterns (${v//\\/..}) are unreliable across
-        # bash/msys builds. Escape backslashes first, then double quotes.
-        REPO_PATH="$(pwd)"
-        BS='\'
-        DQ='"'
-        REPO_PATH=${REPO_PATH//"$BS"/"$BS$BS"}
-        REPO_PATH=${REPO_PATH//"$DQ"/"$BS$DQ"}
-        curl -s -X POST "$SERVE_URL/repos" \
-            -H "Content-Type: application/json" \
-            -d "{\"path\":\"$REPO_PATH\"}" &>/dev/null &
-    fi
-fi
-"#;
-
-    std::fs::write(&hook_path, hook_script)?;
-
-    // Make executable (on Unix; on Windows Git Bash this is a no-op but harmless)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&hook_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&hook_path, perms)?;
-    }
+    make_executable(&hook_path)?;
 
     eprintln!(
         "{}",
-        format!("✓ Installed post-checkout hook at {}", hook_path.display()).green()
+        format!(
+            "✓ codesearch post-checkout hook {} at {}",
+            action,
+            hook_path.display()
+        )
+        .green()
     );
     eprintln!("  New worktrees will be auto-registered with codesearch serve.");
 
@@ -1663,6 +1792,108 @@ pub mod setup;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- post-checkout hook generation / install ---------------------------
+
+    #[test]
+    fn test_hook_block_uses_pwd_dash_w_not_bare_pwd() {
+        let block = codesearch_hook_block();
+        // The whole point of the fix: send a native path on Git Bash.
+        assert!(
+            block.contains("pwd -W 2>/dev/null || pwd"),
+            "hook must use `pwd -W` with a POSIX fallback"
+        );
+        // The old buggy form must be gone.
+        assert!(
+            !block.contains("REPO_PATH=\"$(pwd)\""),
+            "hook must not use the bare msys `$(pwd)` form"
+        );
+        // Delimited so it can be found again for idempotent upgrades/chaining.
+        assert!(block.starts_with(HOOK_BEGIN));
+        assert!(block.trim_end().ends_with(HOOK_END));
+        // Only reacts to branch/worktree checkouts (flag 1), not file checkouts.
+        assert!(
+            block.contains("[ \"$3\" = \"1\" ]"),
+            "hook must gate on the branch-checkout flag"
+        );
+    }
+
+    #[test]
+    fn test_full_hook_has_posix_shebang() {
+        let hook = codesearch_full_hook();
+        assert!(hook.starts_with("#!/bin/sh\n"));
+        assert!(hook.contains(HOOK_BEGIN) && hook.contains(HOOK_END));
+    }
+
+    #[test]
+    fn test_replace_hook_block_upgrades_in_place() {
+        let block = codesearch_hook_block();
+        // A foreign hook that already embeds a (stale) managed block.
+        let stale = format!(
+            "#!/bin/sh\n# user's own logic\necho hi\n{}\n{}\n{}\necho bye\n",
+            HOOK_BEGIN, "old body line", HOOK_END
+        );
+        let updated = replace_hook_block(&stale, &block).expect("markers present");
+        // Foreign lines preserved on both sides.
+        assert!(updated.contains("# user's own logic"));
+        assert!(updated.contains("echo hi"));
+        assert!(updated.contains("echo bye"));
+        // Fresh body swapped in, stale body gone.
+        assert!(updated.contains("pwd -W 2>/dev/null || pwd"));
+        assert!(!updated.contains("old body line"));
+        // Exactly one managed block remains.
+        assert_eq!(updated.matches(HOOK_BEGIN).count(), 1);
+        assert_eq!(updated.matches(HOOK_END).count(), 1);
+    }
+
+    #[test]
+    fn test_replace_hook_block_returns_none_without_markers() {
+        assert!(replace_hook_block("#!/bin/sh\necho hi\n", &codesearch_hook_block()).is_none());
+    }
+
+    #[test]
+    fn test_chain_inserts_before_trailing_exit_0() {
+        let block = codesearch_hook_block();
+        let foreign = "#!/bin/sh\n# copy config into worktree\ncp .env \"$1\"\nexit 0\n";
+        let chained = chain_hook_block(foreign, &block);
+        // Foreign logic kept.
+        assert!(chained.contains("cp .env"));
+        // Our block landed before the terminating exit 0.
+        let block_pos = chained.find(HOOK_BEGIN).unwrap();
+        let exit_pos = chained.rfind("exit 0").unwrap();
+        assert!(block_pos < exit_pos, "block must precede the final exit 0");
+        // exit 0 is still the last non-empty line.
+        let last = chained
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap();
+        assert_eq!(last.trim(), "exit 0");
+    }
+
+    #[test]
+    fn test_chain_appends_when_no_exit_0() {
+        let block = codesearch_hook_block();
+        let foreign = "#!/bin/sh\necho hello\n";
+        let chained = chain_hook_block(foreign, &block);
+        assert!(chained.contains("echo hello"));
+        assert!(chained.trim_end().ends_with(HOOK_END));
+    }
+
+    #[test]
+    fn test_chain_then_replace_is_idempotent() {
+        // Simulate: first run chains into a foreign hook, second run upgrades.
+        let block = codesearch_hook_block();
+        let foreign = "#!/bin/sh\ncp .env \"$1\"\nexit 0\n";
+        let after_first = chain_hook_block(foreign, &block);
+        // A re-run detects the markers and replaces the block in place.
+        let after_second = replace_hook_block(&after_first, &block).expect("markers present");
+        assert_eq!(
+            after_first, after_second,
+            "re-running install must be a no-op once the block is present"
+        );
+        assert_eq!(after_second.matches(HOOK_BEGIN).count(), 1);
+    }
 
     #[test]
     fn test_mcp_create_index_defaults_to_true() {
