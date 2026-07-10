@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.30] - 2026-07-10
+
 ### Added
 
 - **User-configurable extension→language map (#138).** A new optional `~/.codesearch/extensions.json` (or the path in `$CODESEARCH_EXTENSION_MAP`) maps a file extension to a language name, e.g. `{ "inc": "php", "h": "cpp" }`. Files with an unrecognised extension are `Unknown` and skipped **entirely** during indexing (there is no line-based fallback for `Unknown`), so a codebase using a non-standard convention — the reported case is legacy PHP in `*.class.inc` files — was previously invisible to codesearch. The map lets users opt in per codebase; entries take precedence over the built-in extension table (so a known extension can be remapped too). Kept **generic on purpose**: `.inc` is not hardcoded to PHP because it's language-agnostic (assembly, SQL, C/PHP includes). Missing/malformed maps and unknown language names are logged and ignored, never fatal.
