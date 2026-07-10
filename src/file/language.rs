@@ -249,7 +249,9 @@ fn load_extension_overrides() -> HashMap<String, Language> {
         }
     };
 
-    let raw: HashMap<String, String> = match serde_json::from_str(&text) {
+    // Parse into a generic object so a single bad value (e.g. `{"inc": 3}`)
+    // only drops that one entry rather than discarding the whole map.
+    let raw: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&text) {
         Ok(r) => r,
         Err(e) => {
             warn!(
@@ -260,12 +262,19 @@ fn load_extension_overrides() -> HashMap<String, Language> {
         }
     };
 
-    for (ext, lang_name) in raw {
+    for (ext, value) in raw {
         let key = ext.trim().trim_start_matches('.').to_lowercase();
         if key.is_empty() {
             continue;
         }
-        match Language::from_name(&lang_name) {
+        let Some(lang_name) = value.as_str() else {
+            warn!(
+                "Extension map {}: value for extension .{ext} must be a language name string — skipping",
+                path.display()
+            );
+            continue;
+        };
+        match Language::from_name(lang_name) {
             Some(lang) => {
                 map.insert(key, lang);
             }
@@ -277,11 +286,11 @@ fn load_extension_overrides() -> HashMap<String, Language> {
     }
 
     if !map.is_empty() {
-        tracing::info!("Loaded {} extension override(s) from {}", map.len(), {
-            global_extension_map_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        });
+        tracing::info!(
+            "Loaded {} extension override(s) from {}",
+            map.len(),
+            path.display()
+        );
     }
 
     map
@@ -292,13 +301,17 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Resolve a path against an *empty* override map — keeps `from_path`-style
+    /// tests hermetic (the real `from_path` reads process-global user config
+    /// from `~/.codesearch/extensions.json`, which must not influence tests).
+    fn detect(path: &str) -> Language {
+        Language::from_path_with_overrides(&PathBuf::from(path), &HashMap::new())
+    }
+
     #[test]
     fn test_rust_detection() {
         assert_eq!(Language::from_extension("rs"), Language::Rust);
-        assert_eq!(
-            Language::from_path(&PathBuf::from("main.rs")),
-            Language::Rust
-        );
+        assert_eq!(detect("main.rs"), Language::Rust);
     }
 
     #[test]
@@ -378,10 +391,7 @@ mod tests {
         assert_eq!(Language::from_extension("sh"), Language::Shell);
         assert_eq!(Language::from_extension("bash"), Language::Shell);
         assert_eq!(Language::from_extension("zsh"), Language::Shell);
-        assert_eq!(
-            Language::from_path(&PathBuf::from("scripts/deploy.sh")),
-            Language::Shell
-        );
+        assert_eq!(detect("scripts/deploy.sh"), Language::Shell);
         // Extensionless shell filenames
         assert_eq!(Language::from_filename("Dockerfile"), Language::Shell);
         assert_eq!(Language::from_filename("Makefile"), Language::Shell);
@@ -409,10 +419,7 @@ mod tests {
     #[test]
     fn test_jupyter_detection() {
         assert_eq!(Language::from_extension("ipynb"), Language::Jupyter);
-        assert_eq!(
-            Language::from_path(&PathBuf::from("analysis.ipynb")),
-            Language::Jupyter
-        );
+        assert_eq!(detect("analysis.ipynb"), Language::Jupyter);
         assert!(
             Language::Jupyter.is_indexable(),
             "Jupyter should be indexable"
