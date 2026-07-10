@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [Unreleased]
+## [1.1.29] - 2026-07-10
 
 **Project-level federation + cloud reindex hardening.** Builds on the 1.1.0 federation release: a peer's individual projects can now be **opt-in mounted** and queried by name, the serve TUI surfaces and inspects those mounts, and the cloud indexer was reworked to reindex reliably without OOM-killing itself.
 
@@ -36,84 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`filter_path` on a serve-routed local project returned zero results.** For a `search(project="<local-alias>")` (or local group) served by `codesearch serve`, `build_semantic_response` relativised result paths against the **service's own `project_path`** rather than the **routed project's root**, so the absolute stored path never stripped and every hit was filtered out. The filter now resolves the correct root per result (routed alias's root; the longest matching alias root for multi/group; the service path only as the stdio fallback), so `filter_path` behaves as a **repo-relative** prefix in every routing mode. stdio single-repo behaviour is unchanged.
 
 ## [1.1.0] - 2026-07-01
-
-**Federation release.** This version lands **federation** — the ability to fan read queries out to remote `codesearch serve` peers and manage their indexes from the local CLI — plus a README security analysis of the feature and several fixes.
-
-### Added
-
-- **Federation — remote peers.** Register peers with `codesearch remote add/rm/list` (local `~/.codesearch/repos.json` config), reference them from groups via `@peer` (e.g. `"docs": ["@cloud"]`), and `codesearch` fans `search`/`get_chunk` out over TLS, merging remote and local results with Reciprocal Rank Fusion (RRF). Remote misses degrade to local-only results with a `warnings` field — they never hard-fail.
-- **Remote index management (`--remote`).** The `index` verbs now take `--remote <peer>` to operate against a peer: `index list/add/rm/reindex --remote cloud` drive the peer's management REST API (`GET /status`, `POST /repos`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex`). New `index reindex` verb (local + remote). `--json` on `list`/`reindex` (requires `--remote`).
-- **Cloud deployment topology** — split indexer job (4 vCPU/8 GiB, builds + uploads a snapshot) and read-only restore-only serve replica (1 vCPU/2 GiB) for scale-to-zero hosting. See `integrations/cloud/README.md`.
-- **README `## Security` section** documenting the federation trust model, secret storage/transport, redirect handling, serve-side enforcement, and cross-instance isolation.
-
-### Fixed
-
-- **`active_sessions` overflowed to `u64::MAX`** on every REST (`/search`, `/find`, `/explore`, `/get_chunk`) request: per-request `CodesearchService`s were decrementing the session counter on `Drop` without ever incrementing it. Gated the decrement behind a `tracks_session` flag so only genuine MCP sessions balance the counter.
-- **`index rm <arg>`** now resolves the argument as a **registered alias first**, falling back to path interpretation only when it isn't one (previously a bare alias failed with an OS path error).
-- Added an `ls` visible alias to the `index`/`groups`/`remote` `list` subcommands.
-
-### Changed
-
-- Pre-GA changelog history (`[1.0.72]`–`[1.0.208]`) condensed to one-line summaries to mark the GA cutover; no entry was dropped and the key facts survive in the summaries. Full detail for the latest pre-GA release (`[1.0.209]`) is preserved verbatim below.
+- **Federation release.** Remote peer search fan-out (`search`/`get_chunk` over TLS, RRF-merged, never hard-fails), `--remote <peer>` index management (`list/add/rm/reindex`), split cloud indexer/serve topology, README `## Security` section; fixed `active_sessions` overflow to `u64::MAX`, `index rm <alias>` OS-path fallback bug, added `ls` alias.
 
 ## [1.0.212] - 2026-06-21
-
-### Added
-
-- **Reserved virtual `"all"` group (#131)**: `group="all"` now resolves to every
-  registered repository, without being stored in `repos.json`. The name is
-  reserved — `codesearch groups add all` / `groups remove all` are rejected. The
-  group is advertised in the `scope_required` error, the `status` tool's `groups`
-  map, and `codesearch groups list` (marked `(virtual)`). It is NOT the default
-  (safe-by-default scope_required behaviour is preserved); it auto-updates as
-  repos are registered/removed.
-
-### Changed
-
-- **MCP agent discoverability improvements (#130)**: the server instructions
-  published via the MCP `initialize` handshake now lead with a "WHEN TO USE
-  codesearch (prefer over grep/glob)" block — good queries vs. not-ideal-for
-  cases — and a "SERVICE-MODE NOTES" block (paths come from the server's
-  filesystem → use `get_chunk`; unindexed directories like `.venv`/`node_modules`
-  → ask, don't blindly grep). `find_impact` is reframed from "C# only" to "C#
-  today; use `find kind="usages"` as a text-based fallback for other languages".
-  The instruction template is extracted to a named const (`INSTRUCTIONS_TEMPLATE`)
-  enabling genuine tests; the previous `include_str!`-based tests were
-  self-referential no-ops (the marker they searched for existed only in the test
-  source, not the real instructions) and are now fixed. README gains an "Agent
-  Guidance" subsection with a copy-paste quickstart for `AGENTS.md`/`.cursorrules`.
-
-### Fixed
-
-- **CLI delegate functions now send `CODESEARCH_SERVE_API_KEY` (#132)**:
-  `index add`, `index rm`, and `index reindex` built their HTTP requests to a
-  running `codesearch serve` without the API key header, so delegation to a
-  network-bound serve (e.g. `--host 0.0.0.0`, where `require_auth_for_network`
-  guards ALL endpoints) returned 401 and fell back to local indexing — risking
-  LMDB file-lock conflicts. A new `build_serve_client()` helper attaches
-  `Authorization: Bearer <key>` as a default header on every request (health
-  probe + all POST/DELETE) when the env var is set. A new `auth_failure_hint()`
-  produces a friendly 401 message naming the env var. The README Security
-  section is corrected: it previously claimed health/status/MCP endpoints
-  remained open, but `require_auth_for_network` blocks everything when bound to
-  non-localhost.
+- Added reserved virtual `all` group (#131, always resolves to every registered repo); improved MCP agent discoverability instructions (#130, `INSTRUCTIONS_TEMPLATE` + README "Agent Guidance"); fixed `index add/rm/reindex` missing `CODESEARCH_SERVE_API_KEY` header on delegated serve requests (#132).
 
 ## [1.0.209] - 2026-06-17
-
-### Fixed
-
-- **Repo stuck showing "Indexing" in the TUI forever**: `ServeState.active_reindexes`
-  was an in-memory `DashSet<String>` with no expiry. Background indexing tasks run
-  inside fire-and-forget `tokio::spawn` calls whose `JoinHandle` is discarded, so a
-  panic or cancellation between insert and remove silently leaked the entry —
-  causing the TUI to show "Indexing" permanently and the `POST /repos/<alias>/reindex`
-  endpoint to return `409 Conflict` forever, even though the actual index was
-  complete. Converted to `Arc<DashMap<String, Instant>>` with self-healing
-  semantics: entries older than `MAX_INDEXING_SECS` (30 min, overridable via
-  `CODESEARCH_MAX_INDEXING_SECS`) are lazily evicted on read. Added
-  `begin_indexing` / `end_indexing` / `is_indexing` helpers; the eviction path
-  uses atomic `remove_if` to prevent a TOCTOU race that could wrongly drop a
-  freshly-refreshed entry.
+- Fixed repos stuck showing "Indexing" forever in the TUI: `active_reindexes` `DashSet` leaked entries on task panic/cancellation. Replaced with a self-healing `DashMap<String, Instant>` that lazily evicts stale entries (`CODESEARCH_MAX_INDEXING_SECS`, default 30 min).
 
 ## [1.0.208] - 2026-06-14
 - Fixed `doctor` LMDB double-open in the embedded TUI (live-stats registry fallback); documented develop-based gitflow in `AGENTS.md`/`AGENTS.develop.md`.
