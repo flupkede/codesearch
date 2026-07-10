@@ -541,6 +541,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
+| `CODESEARCH_EXTENSION_MAP` | Path to the extension→language map (default: `~/.codesearch/extensions.json`) — see [Extension map](#extension-map) |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
 
 ### `.codesearchignore`
@@ -557,6 +558,38 @@ node_modules/
 ```
 
 A **global** `.codesearchignore` can be placed at `~/.codesearch/.codesearchignore`. It applies to all repos with the lowest priority (repo-local `.codesearchignore`, `.gitignore`, and `.git/info/exclude` all override it). This is useful for patterns you want everywhere without modifying each repo.
+
+### Extension map
+
+By default codesearch recognises the fixed extension list in [Supported
+Languages](#supported-languages); any other extension is `Unknown` and is
+**skipped entirely** (never indexed). To teach codesearch about a non-standard
+extension — or to deliberately remap a known one — drop a small JSON object at
+`~/.codesearch/extensions.json` mapping extension → language name:
+
+```json
+{
+  "inc": "php",
+  "phtml": "php",
+  "h": "cpp"
+}
+```
+
+- Keys are file extensions, with or without a leading dot, case-insensitive
+  (`"inc"`, `".inc"`, `".INC"` are equivalent). Only the **last** dot-suffix is
+  matched, so `Foo.class.inc` maps via `"inc"`.
+- Values are language names — the names from the table above plus common aliases
+  (`php`, `cpp`/`c++`, `csharp`/`c#`, `golang`, `js`, `ts`, …), case-insensitive.
+- The map applies to **all** indexed repos, and user entries **take precedence**
+  over the built-ins (so `"h": "cpp"` overrides the default C mapping).
+- It's fully optional and fail-safe: a missing, empty, or malformed file simply
+  means "no overrides" and is logged, never fatal. Unknown language names are
+  skipped with a warning.
+- Set `CODESEARCH_EXTENSION_MAP` to load the file from a different path.
+
+> This is the supported answer to "my PHP is in `*.inc` files" (issue #138):
+> `.inc` is intentionally not a built-in because it's language-agnostic
+> (assembly, SQL, C/PHP includes all use it), so you opt in per your codebase.
 
 ### `repos.json`
 
@@ -648,6 +681,11 @@ headings, and code fences. Jupyter notebooks are parsed as JSON; code and
 markdown cells are extracted, tagged with `[code]` or `[markdown]`, and
 adjacent same-type cells under 50 lines are merged into single chunks.
 All other text files use line-based chunking as fallback.
+
+Files whose extension isn't recognised are treated as `Unknown` and **skipped
+entirely** (not indexed). If your codebase uses a non-standard extension for a
+supported language — e.g. legacy PHP in `*.inc` files, or `.h` you want parsed
+as C++ — map it explicitly with the [extension map](#extension-map).
 
 ## Core Technology
 
