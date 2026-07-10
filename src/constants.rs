@@ -115,6 +115,34 @@ pub fn global_codesearchignore_path() -> Option<PathBuf> {
     })
 }
 
+/// Name of the global extension→language map file in ~/.codesearch/
+pub const GLOBAL_EXTENSION_MAP_FILE: &str = "extensions.json";
+
+/// Env var overriding the location of the extension-map file.
+///
+/// Mainly for tests and power users who keep config outside `~/.codesearch/`.
+pub const EXTENSION_MAP_ENV: &str = "CODESEARCH_EXTENSION_MAP";
+
+/// Get the path to the global extension→language map.
+///
+/// This is a small JSON object mapping a file extension (with or without the
+/// leading dot) to a language name, e.g. `{ "inc": "php", "h": "cpp" }`. It is
+/// applied to every indexed repo and lets users teach codesearch about
+/// non-standard extensions (or deliberately remap known ones) without touching
+/// the binary. User overrides take precedence over the built-in extension table.
+///
+/// The path resolves to `$CODESEARCH_EXTENSION_MAP` when set and non-empty,
+/// otherwise `~/.codesearch/extensions.json`. Returns `None` only when neither
+/// the env var nor the home directory is available.
+pub fn global_extension_map_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(EXTENSION_MAP_ENV) {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    dirs::home_dir().map(|home| home.join(CONFIG_DIR_NAME).join(GLOBAL_EXTENSION_MAP_FILE))
+}
+
 /// Name of the repos configuration file
 pub const REPOS_CONFIG_FILE: &str = "repos.json";
 
