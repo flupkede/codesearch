@@ -18,6 +18,13 @@
 
 > ℹ️ **Remote write verbs** (`add`, `reindex --force`) require a read-write peer; the cloud peer rejects them (`--force` → HTTP 500 "could only be opened read-only; cannot force-reindex"). An **incremental** `reindex` (no `--force`) of an already-registered repo *does* succeed on the cloud peer — that is the custom-kb auto-refresh path. `list` is always safe. `rm` is not durable — the next cold start re-registers from the restored snapshot.
 
+## Deferred / follow-ups (non-blocking)
+
+Left over from the remote-project-mounting work; not yet done:
+- **Persist remote-project discovery** to a `remote_project_cache` in `repos.json` — the TUI's peer-`/status` discovery is currently in-memory-only (last-known-good survives a blip, not a process restart).
+- **Extract a shared `build_remote_search_body(request, mode)`** in `src/mcp/mod.rs` — the group fan-out and single-project fan-out request bodies are still two identical 11-field blocks; drift risk if one is edited without the other.
+- **Remove the now-dead `wait_until_indexed()`** in `docker/entrypoint.sh` — superseded by the sequential `wait_active_build_done()` loop, never called anymore.
+
 ## Fixed — incremental-refresh OOM crash-loop (2026-07-04)
 
 `IndexManager::perform_incremental_refresh_with_stores` (`src/index/manager.rs`) used to chunk + embed the ENTIRE changed-file delta in one unbounded in-memory `Vec` before writing anything to the stores. A normal incremental delta (tens of files) was harmless; a vendor sync dropping thousands of files at once OOM'd the 1 vCPU/2 GiB `codesearch-serve` container, which then crash-looped re-running the full azcopy sync every restart (`/status`/`/search` unreachable for minutes). Fixed by batching: `changed_files.chunks(batch_size)` processed sequentially (chunk+embed+insert+commit per batch, single `build_index()` at the end), bounding peak memory to O(batch) regardless of delta size. Batch size defaults to `INCREMENTAL_REFRESH_BATCH_SIZE = 200` (`src/constants.rs`), override via `CODESEARCH_INCREMENTAL_BATCH_SIZE`. Protects both `codesearch-serve`'s in-process warmup and `codesearch-indexer`'s full rebuild. No test for the multi-batch path itself (existing `manager.rs` tests avoid real embedding, same reasoning as the gated `csharp_helper_integration` test) — verify end-to-end on a real large corpus if in doubt.
@@ -64,7 +71,7 @@ This repo uses a **`develop`-based** gitflow. The GitHub default branch is `mast
 
 Common mistake: a subagent runs `/git pr create` with no explicit `--base`, the tooling picks `master` (GitHub default), and the PR lands against the wrong branch. Always specify `--base develop`.
 
-> **Note (2026-07-10):** release PRs (`develop → master`) are squash-merged, which means master's release commits never become ancestors of develop. Over time this regresses `git merge-base(master, develop)` and can produce a false `CONFLICTING` mergeable state on a release PR even when the content is identical. If that happens, do not merge `master` into `develop` directly (history rewrite) — cut a throwaway `release/vX.Y.Z` branch off `develop`, merge `origin/master -X ours` into *that* branch, verify an empty content diff, and PR it into `master` instead.
+> **Note (2026-07-10):** the "merge commits, not squash" rule above is about feature/fix PRs into `develop`. Release PRs (`develop → master`) are, by contrast, squash-merged — which means master's release commits never become ancestors of develop. Over time this regresses `git merge-base(master, develop)` and can produce a false `CONFLICTING` mergeable state on a release PR even when the content is identical. If that happens, do not merge `master` into `develop` directly (history rewrite) — cut a throwaway `release/vX.Y.Z` branch off `develop`, merge `origin/master -X ours` into *that* branch, verify an empty content diff, and PR it into `master` instead.
 
 ## Notes for OpenCode / agents
 
