@@ -129,6 +129,8 @@ codesearch --model embeddinggemma-q4 index /path/to/notes --force
 
 Changing models requires a full reindex because embedding dimensions and vector
 spaces are model-specific. Keep the same model selected for later indexing runs.
+Search rejects a `--model` value that differs from the indexed model and points
+to the required `--force` rebuild instead of mixing incompatible vector spaces.
 
 ## MCP Configuration
 
