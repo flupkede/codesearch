@@ -408,6 +408,14 @@ pub fn adapt_rrf_k(query: &str) -> (f64, f64) {
 /// Search the codebase
 pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) -> Result<()> {
     let (db_path, project_path) = get_db_path(path.clone())?;
+    let requested_model = options
+        .model_override
+        .as_deref()
+        .map(|name| {
+            ModelType::parse(name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown embedding model override '{name}'"))
+        })
+        .transpose()?;
 
     if !db_path.exists() {
         if options.create_index {
@@ -417,7 +425,8 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 "🚀 No index found, creating one...".bright_cyan()
             ));
             let cancel_token = tokio_util::sync::CancellationToken::new();
-            crate::index::index_quiet(path, false, false, cancel_token).await?;
+            crate::index::index_quiet_with_model(path, false, false, requested_model, cancel_token)
+                .await?;
             crate::output::print_info(format_args!("{}", "✅ Index created successfully!".green()));
         } else {
             println!("{}", "❌ No database found!".red());
@@ -437,21 +446,35 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // Read model metadata from database FIRST (needed for sync)
     let (model_type, dimensions, primary_language) =
-        if let Some(ref model_name) = options.model_override {
-            // User specified a model - use it (warning: may not match indexed data!)
-            let mt = ModelType::parse(model_name).unwrap_or_else(|| {
-                tracing::warn!(
-                    "Unrecognized model override '{}', falling back to default model",
-                    model_name
-                );
-                ModelType::default()
-            });
-            (mt, mt.dimensions(), None)
-        } else if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
+        if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
             // Use model from metadata
             if let Some(mt) = ModelType::parse(&model_name) {
+                if let Some(requested) = requested_model {
+                    if requested != mt {
+                        anyhow::bail!(
+                            "Index uses embedding model '{}', but '--model {}' was requested. \
+                             Rebuild the index with `codesearch --model {} index {} --force` \
+                             before searching.",
+                            mt.short_name(),
+                            requested.short_name(),
+                            requested.short_name(),
+                            project_path.display()
+                        );
+                    }
+                }
                 (mt, dims, lang)
             } else {
+                if let Some(requested) = requested_model {
+                    anyhow::bail!(
+                        "Index metadata names unknown embedding model '{}', so '--model {}' \
+                         cannot be verified. Rebuild the index with \
+                         `codesearch --model {} index {} --force`.",
+                        model_name,
+                        requested.short_name(),
+                        requested.short_name(),
+                        project_path.display()
+                    );
+                }
                 // Model name not recognized, fall back to default
                 tracing::warn!(
                     "Unrecognized model '{}' in database metadata, falling back to default model",
@@ -463,6 +486,14 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 );
                 (ModelType::default(), 384, None)
             }
+        } else if let Some(requested) = requested_model {
+            anyhow::bail!(
+                "Cannot verify '--model {}' because the index metadata is missing or invalid. \
+                 Rebuild the index with `codesearch --model {} index {} --force`.",
+                requested.short_name(),
+                requested.short_name(),
+                project_path.display()
+            );
         } else {
             // No metadata, fall back to default
             (ModelType::default(), 384, None)

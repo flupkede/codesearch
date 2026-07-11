@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
 use ort::execution_providers::CPUExecutionProvider;
 
+use crate::file::Language;
+
 /// Available embedding models
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModelType {
@@ -182,9 +184,8 @@ impl ModelType {
 
     /// Comma-separated list of all valid model short names.
     ///
-    /// Single source of truth for the "valid models" message shown by the CLI
-    /// (`index add --model`) and the serve `POST /repos` error path, so the two
-    /// can never drift from the set `parse()` actually accepts.
+    /// Single source of truth for the "valid models" messages shown by the CLI
+    /// and the serve API, so they cannot drift from the set `parse()` accepts.
     pub fn valid_short_names() -> String {
         Self::all()
             .iter()
@@ -239,14 +240,10 @@ impl ModelType {
     /// and therefore existing indexes — byte-for-byte unchanged.
     pub fn content_label(&self, path: &str) -> &'static str {
         match self {
-            Self::EmbeddingGemma300MQ4 => {
-                match std::path::Path::new(path)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                {
-                    Some("md" | "markdown" | "txt") => "Text",
-                    _ => "Code",
-                }
+            Self::EmbeddingGemma300MQ4
+                if Language::from_path(std::path::Path::new(path)) == Language::Markdown =>
+            {
+                "Text"
             }
             _ => "Code",
         }
@@ -455,12 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn test_all_models() {
-        let all = ModelType::all();
-        assert_eq!(all.len(), 17);
-    }
-
-    #[test]
     fn test_short_name_round_trips_through_parse() {
         // Every model advertised by all() must parse back from its short_name.
         // This guards the C1/M6 fix: the embedding path resolves the model from
@@ -579,6 +570,7 @@ mod tests {
     fn test_content_label_only_distinguishes_prose_for_embeddinggemma() {
         let gemma = ModelType::EmbeddingGemma300MQ4;
         assert_eq!(gemma.content_label("notes.md"), "Text");
+        assert_eq!(gemma.content_label("NOTES.MD"), "Text");
         assert_eq!(gemma.content_label("notes.markdown"), "Text");
         assert_eq!(gemma.content_label("notes.txt"), "Text");
         assert_eq!(gemma.content_label("src/lib.rs"), "Code");

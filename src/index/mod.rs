@@ -512,7 +512,18 @@ pub async fn index_quiet(
     global: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    index_with_options(path, false, force, global, None, true, cancel_token).await
+    index_quiet_with_model(path, force, global, None, cancel_token).await
+}
+
+/// Index a repository quietly while selecting the model for a new index.
+pub async fn index_quiet_with_model(
+    path: Option<PathBuf>,
+    force: bool,
+    global: bool,
+    model: Option<ModelType>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    index_with_options(path, false, force, global, model, true, cancel_token).await
 }
 
 /// Internal index function with all options

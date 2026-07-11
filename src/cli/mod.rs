@@ -261,10 +261,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub store: Option<String>,
 
-    /// Embedding model to use (e.g., bge-small, minilm-l6-q, jina-code)
-    /// Available: minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm,
-    ///            bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q,
-    ///            jina-code, e5-multilingual, mxbai-large, modernbert-large, embeddinggemma-q4
+    /// Embedding model to use (e.g., bge-small, jina-code, embeddinggemma-q4)
     #[arg(long, global = true)]
     pub model: Option<String>,
 }
@@ -893,9 +890,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             "Unknown model: '{}'. Available models:",
             cli.model.as_deref().unwrap_or_default()
         );
-        eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
-        eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
-        eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large, embeddinggemma-q4");
+        eprintln!("  {}", ModelType::valid_short_names());
         std::process::exit(1);
     }
 
@@ -942,7 +937,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 sync,
                 json,
                 filter_path,
-                model_override: model_type.map(|mt| format!("{:?}", mt)),
+                model_override: model_type.map(|mt| mt.short_name().to_string()),
                 vector_only,
                 rrf_k: if rrf_k == 60.0 {
                     None
