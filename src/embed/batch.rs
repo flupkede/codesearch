@@ -103,7 +103,7 @@ impl BatchEmbedder {
                 .embedder
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?
-                .embed_batch(texts)?;
+                .embed_documents(texts)?;
 
             // Combine chunks with embeddings
             for (chunk, embedding) in chunk_batch.iter().zip(embeddings) {
@@ -122,7 +122,10 @@ impl BatchEmbedder {
             .embedder
             .lock()
             .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?
-            .embed_one(&text)?;
+            .embed_documents(vec![text])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No embedding generated"))?;
         Ok(EmbeddedChunk::new(chunk, embedding))
     }
 
@@ -175,7 +178,14 @@ impl BatchEmbedder {
         }
 
         // Add main content
-        parts.push(format!("Code:\n{}", chunk.content));
+        let label = match std::path::Path::new(&chunk.path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            Some("md" | "markdown" | "txt") => "Text",
+            _ => "Code",
+        };
+        parts.push(format!("{label}:\n{}", chunk.content));
 
         parts.join("\n")
     }

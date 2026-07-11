@@ -172,7 +172,7 @@ impl EmbeddingService {
         let embedding = embedder_arc
             .lock()
             .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?
-            .embed_one(query)?;
+            .embed_query(query)?;
 
         // Store in cache
         self.query_cache.put(query, embedding.clone());
@@ -210,7 +210,7 @@ impl EmbeddingService {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?;
 
-            let new_embeddings = embedder.embed_batch(queries_to_embed)?;
+            let new_embeddings = embedder.embed_queries(queries_to_embed)?;
 
             // Store in cache and add to results
             for (i, embedding) in new_embeddings.into_iter().enumerate() {
