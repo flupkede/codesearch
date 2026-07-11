@@ -230,6 +230,32 @@ impl ModelType {
             _ => text.to_string(),
         }
     }
+
+    /// Label prefix for a chunk's main content when building the embedding input.
+    ///
+    /// EmbeddingGemma benefits from distinguishing prose from source code, so
+    /// Markdown and plain-text files are labeled `Text`. Every other model keeps
+    /// the historical `Code` label unconditionally, leaving their embeddings —
+    /// and therefore existing indexes — byte-for-byte unchanged.
+    pub fn content_label(&self, path: &str) -> &'static str {
+        match self {
+            Self::EmbeddingGemma300MQ4 => {
+                match std::path::Path::new(path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                {
+                    Some("md" | "markdown" | "txt") => "Text",
+                    _ => "Code",
+                }
+            }
+            _ => "Code",
+        }
+    }
+
+    /// Whether this model produces larger embeddings than the default model.
+    pub fn is_heavier_than_default(&self) -> bool {
+        self.dimensions() > Self::default().dimensions()
+    }
 }
 
 /// Fast embedding model using fastembed library
@@ -547,6 +573,28 @@ mod tests {
         let model = ModelType::AllMiniLML6V2Q;
         assert_eq!(model.prepare_query("search text"), "search text");
         assert_eq!(model.prepare_document("document text"), "document text");
+    }
+
+    #[test]
+    fn test_content_label_only_distinguishes_prose_for_embeddinggemma() {
+        let gemma = ModelType::EmbeddingGemma300MQ4;
+        assert_eq!(gemma.content_label("notes.md"), "Text");
+        assert_eq!(gemma.content_label("notes.markdown"), "Text");
+        assert_eq!(gemma.content_label("notes.txt"), "Text");
+        assert_eq!(gemma.content_label("src/lib.rs"), "Code");
+
+        let default = ModelType::default();
+        assert_eq!(default.content_label("notes.md"), "Code");
+        assert_eq!(default.content_label("notes.txt"), "Code");
+        assert_eq!(default.content_label("src/lib.rs"), "Code");
+    }
+
+    #[test]
+    fn test_heavier_than_default_tracks_vector_dimensions() {
+        assert!(!ModelType::default().is_heavier_than_default());
+        assert!(!ModelType::MultilingualE5Small.is_heavier_than_default());
+        assert!(ModelType::EmbeddingGemma300MQ4.is_heavier_than_default());
+        assert!(ModelType::ModernBertEmbedLarge.is_heavier_than_default());
     }
 
     #[test]
