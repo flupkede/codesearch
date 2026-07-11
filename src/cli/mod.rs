@@ -264,7 +264,7 @@ pub struct Cli {
     /// Embedding model to use (e.g., bge-small, minilm-l6-q, jina-code)
     /// Available: minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm,
     ///            bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q,
-    ///            jina-code, e5-multilingual, mxbai-large, modernbert-large
+    ///            jina-code, e5-multilingual, mxbai-large, modernbert-large, embeddinggemma-q4
     #[arg(long, global = true)]
     pub model: Option<String>,
 }
@@ -883,7 +883,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         );
         eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
         eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
-        eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large");
+        eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large, embeddinggemma-q4");
         std::process::exit(1);
     }
 

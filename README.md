@@ -117,6 +117,19 @@ codesearch index /path/to/my-project --force
 
 `codesearch index add` is intended to be run from inside the repo you want to register — pass the path explicitly if launched from elsewhere. First-time indexing takes 2–5 minutes; subsequent runs are incremental (10–30s) and branch switches re-index automatically. Use `codesearch index list/rm/prune` to manage registrations (see [Serve Mode](#serve-mode-multi-repo)).
 
+### Embedding model
+
+The default quantized MiniLM model favors startup speed and a small download. For
+multilingual text and notes, EmbeddingGemma 300M is available as a quantized ONNX
+model with retrieval-specific query and document prompts:
+
+```bash
+codesearch --model embeddinggemma-q4 index /path/to/notes --force
+```
+
+Changing models requires a full reindex because embedding dimensions and vector
+spaces are model-specific. Keep the same model selected for later indexing runs.
+
 ## MCP Configuration
 
 codesearch connects to AI agents via MCP. Two modes:
