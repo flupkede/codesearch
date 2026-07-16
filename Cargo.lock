@@ -650,6 +650,7 @@ dependencies = [
  "hf-hub 0.3.2",
  "ignore",
  "indicatif 0.17.11",
+ "libc",
  "moka",
  "ndarray 0.16.1",
  "notify",

@@ -3735,6 +3735,110 @@ pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
 /// Run the MCP serve mode.
 ///
 /// This is the entry point called from CLI when `codesearch serve` is invoked.
+/// Extra fds reserved for everything that is not a repo store:
+/// listener + accepted sockets, SSE sessions, log files, embedding
+/// model files, federation clients.
+#[cfg(unix)]
+const FD_HEADROOM: u64 = 256;
+
+/// Rough per-repo fd demand: LMDB env + tantivy FTS segments +
+/// file-watcher handles. Measured ~15-17 fds per warm repo on macOS;
+/// 20 leaves margin for segment churn.
+#[cfg(unix)]
+const FDS_PER_REPO_ESTIMATE: u64 = 20;
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit before opening
+/// repo stores or binding the listener.
+///
+/// serve's fd demand scales with registered repo count (LMDB +
+/// tantivy + watcher handles per repo — ~1000 fds at 60 repos).
+/// Under process supervisors the default soft limit is often 256
+/// (macOS launchd agents, some systemd/docker configs). Once the
+/// process saturates that limit, `accept(2)` fails with `EMFILE` and
+/// the axum accept loop retries silently — the daemon looks alive to
+/// its supervisor while every new connection is refused or reset.
+/// Raising soft → hard at startup is standard daemon practice
+/// (nginx, envoy, postgres all do it) and turns a silent wedge into
+/// an explicit, logged operator decision.
+///
+/// Never fails the startup: on error we log and continue with the
+/// inherited limit, then warn if it looks too small for the
+/// registered repo count.
+#[cfg(unix)]
+fn raise_fd_limit(repo_count: usize) {
+    // SAFETY: getrlimit/setrlimit with a locally owned rlimit struct.
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            warn!(
+                "Could not read RLIMIT_NOFILE ({}); continuing with inherited limit",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let before = lim.rlim_cur;
+        if lim.rlim_cur < lim.rlim_max {
+            // On macOS the kernel caps the effective per-process limit
+            // at kern.maxfilesperproc even when rlim_max is RLIM_INFINITY;
+            // clamp so setrlimit does not fail with EINVAL.
+            #[cfg(target_os = "macos")]
+            let target = {
+                let mut maxfiles: libc::c_int = 0;
+                let mut size = std::mem::size_of::<libc::c_int>();
+                let name = std::ffi::CString::new("kern.maxfilesperproc").unwrap();
+                if libc::sysctlbyname(
+                    name.as_ptr(),
+                    &mut maxfiles as *mut _ as *mut libc::c_void,
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                ) == 0
+                {
+                    lim.rlim_max.min(maxfiles as libc::rlim_t)
+                } else {
+                    lim.rlim_max
+                }
+            };
+            #[cfg(not(target_os = "macos"))]
+            let target = lim.rlim_max;
+
+            if target > lim.rlim_cur {
+                lim.rlim_cur = target;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                    warn!(
+                        "Could not raise RLIMIT_NOFILE {} → {} ({}); continuing with inherited limit",
+                        before,
+                        target,
+                        std::io::Error::last_os_error()
+                    );
+                    lim.rlim_cur = before;
+                } else {
+                    info!("Raised RLIMIT_NOFILE soft limit {} → {}", before, target);
+                }
+            }
+        }
+
+        let estimated = (repo_count as u64) * FDS_PER_REPO_ESTIMATE + FD_HEADROOM;
+        // rlim_t width is platform-dependent (u64 on macOS/Linux glibc,
+        // but not guaranteed everywhere) — keep the explicit widening.
+        #[allow(clippy::unnecessary_cast)]
+        let soft = lim.rlim_cur as u64;
+        if soft < estimated {
+            warn!(
+                "⚠️  RLIMIT_NOFILE soft limit is {} but {} registered repos need an estimated {} fds \
+                 (LMDB + FTS + watcher handles per repo). When the limit is exhausted, accept(2) fails \
+                 with EMFILE and serve stops answering connections WITHOUT crashing. Raise the limit for \
+                 this process (launchd: SoftResourceLimits.NumberOfFiles; systemd: LimitNOFILE; \
+                 shell: ulimit -n) or reduce the number of registered repos.",
+                soft, repo_count, estimated
+            );
+        }
+    }
+}
+
 pub async fn run_serve(
     host: Option<String>,
     port: Option<u16>,
@@ -3806,6 +3910,12 @@ pub async fn run_serve(
             warn!("Failed to save auto-discovered repos: {}", e);
         }
     }
+
+    // Raise the fd soft limit BEFORE opening any repo store or binding
+    // the listener — fd demand scales with repo count and a 256-fd
+    // supervisor default wedges accept(2) silently (EMFILE).
+    #[cfg(unix)]
+    raise_fd_limit(config.repos.len());
 
     let serve_state = Arc::new(ServeState::new(config, None));
 
