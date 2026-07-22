@@ -962,7 +962,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         let mut seen_files = std::collections::HashSet::new();
         for result in &results {
             if !seen_files.contains(&result.path) {
-                println!("{}", result.path);
+                println!("{}", sanitize_for_terminal(&result.path));
                 seen_files.insert(result.path.clone());
             }
         }
@@ -972,7 +972,10 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // Standard output
     println!("{}", "🔍 Search Results".bright_cyan().bold());
     println!("{}", "=".repeat(60));
-    println!("Query: \"{}\"", query.bright_yellow());
+    println!(
+        "Query: \"{}\"",
+        sanitize_for_terminal(query).bright_yellow()
+    );
     if let Some(pf) = options.per_file {
         println!(
             "Found {} results (showing up to {} per file)",
@@ -1094,7 +1097,10 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
         }
 
         changes += 1;
-        println!("  📝 {}", file.path.display());
+        println!(
+            "  📝 {}",
+            sanitize_for_terminal(&file.path.display().to_string())
+        );
 
         // Delete old chunks
         if !old_chunk_ids.is_empty() {
@@ -1124,7 +1130,7 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
     let deleted_files = file_meta.find_deleted_files();
     for (path, chunk_ids) in &deleted_files {
         changes += 1;
-        println!("  🗑️  {} (deleted)", path);
+        println!("  🗑️  {} (deleted)", sanitize_for_terminal(path));
         if !chunk_ids.is_empty() {
             store.delete_chunks(chunk_ids)?;
         }
@@ -1144,6 +1150,77 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
     Ok(())
 }
 
+/// Strip ANSI escape sequences and terminal-control bytes from a string.
+///
+/// Indexed content may contain CSI/OSC sequences (e.g. `\x1b[2J` clears the
+/// screen, `\x1b[8m` hides text, `\x1b]0;...\x07` rewrites the window title).
+/// If printed verbatim, the host terminal interprets them — enabling a range
+/// of attacks from screen-clearing DoS to hidden-text obfuscation. This
+/// helper strips:
+///   * CSI sequences: `ESC [ <params 0x30-0x3F> <intermediate 0x20-0x2F> <final 0x40-0x7E>`
+///   * OSC sequences: `ESC ] <data> (BEL | ESC \\)`
+///   * Single-char escape sequences: `ESC <0x40-0x5F>`
+///   * Stray control characters except `\n` and `\t`
+///
+/// Output is safe to feed into `Colorize` methods without risk of the inner
+/// content breaking out of the color wrapper. Mitigates Aikido group 30641757
+/// (ANSI escape sequence injection in search output).
+fn sanitize_for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if c == '\n' || c == '\t' || !c.is_control() {
+                out.push(c);
+            }
+            continue;
+        }
+        // ESC sequence — consume per ECMA-48
+        match chars.peek().copied() {
+            None => break,
+            Some('[') => {
+                chars.next();
+                while let Some(p) = chars.peek().copied() {
+                    let code = p as u32;
+                    if (0x30..=0x3f).contains(&code) || (0x20..=0x2f).contains(&code) {
+                        chars.next();
+                    } else if (0x40..=0x7e).contains(&code) {
+                        chars.next();
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some('\x07') => break,
+                        Some('\x1b') => {
+                            if matches!(chars.peek().copied(), Some('\\')) {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        Some(_) => continue,
+                        None => break,
+                    }
+                }
+            }
+            Some(c2) => {
+                let code = c2 as u32;
+                if (0x40..=0x5f).contains(&code) {
+                    chars.next();
+                }
+                // ESC followed by something unexpected: drop the ESC, leave
+                // the next char to be processed normally on the next loop.
+            }
+        }
+    }
+    out
+}
+
 fn print_result(
     result: &crate::vectordb::SearchResult,
     show_file: bool,
@@ -1152,20 +1229,22 @@ fn print_result(
 ) -> Result<()> {
     if show_file {
         println!("{}", "─".repeat(60));
-        let file_display = format!("📄 {}", result.path);
+        let file_display = format!("📄 {}", sanitize_for_terminal(&result.path));
         println!("{}", file_display.bright_green());
     }
 
     // Show location and kind
     let location = format!(
         "   Lines {}-{} • {}",
-        result.start_line, result.end_line, result.kind
+        result.start_line,
+        result.end_line,
+        sanitize_for_terminal(&result.kind)
     );
     println!("{}", location.dimmed());
 
     // Show signature if available
     if let Some(sig) = &result.signature {
-        println!("   {}", sig.bright_cyan());
+        println!("   {}", sanitize_for_terminal(sig).bright_cyan());
     }
 
     // Show score if requested
@@ -1191,7 +1270,7 @@ fn print_result(
 
     // Show context if available
     if let Some(ctx) = &result.context {
-        println!("   Context: {}", ctx.dimmed());
+        println!("   Context: {}", sanitize_for_terminal(ctx).dimmed());
     }
 
     // Show content if requested
@@ -1200,13 +1279,13 @@ fn print_result(
         if let Some(ctx_prev) = &result.context_prev {
             println!("\n   {}:", "Context (before)".dimmed());
             for line in ctx_prev.lines() {
-                println!("   │ {}", line.bright_black());
+                println!("   │ {}", sanitize_for_terminal(line).bright_black());
             }
         }
 
         println!("\n   {}:", "Content".bright_yellow());
         for line in result.content.lines().take(10) {
-            println!("   │ {}", line.dimmed());
+            println!("   │ {}", sanitize_for_terminal(line).dimmed());
         }
         if result.content.lines().count() > 10 {
             println!("   │ {}", "...".dimmed());
@@ -1216,12 +1295,18 @@ fn print_result(
         if let Some(ctx_next) = &result.context_next {
             println!("\n   {}:", "Context (after)".dimmed());
             for line in ctx_next.lines() {
-                println!("   │ {}", line.bright_black());
+                println!("   │ {}", sanitize_for_terminal(line).bright_black());
             }
         }
     } else {
         // Show a snippet
-        let snippet: String = result.content.lines().take(3).collect::<Vec<_>>().join(" ");
+        let snippet: String = result
+            .content
+            .lines()
+            .take(3)
+            .map(|l| sanitize_for_terminal(l))
+            .collect::<Vec<_>>()
+            .join(" ");
 
         let snippet = if snippet.len() > 100 {
             format!("{}...", &snippet[..100])
@@ -1492,5 +1577,81 @@ mod tests {
         let project_root = normalize_path_str("C:/WorkArea/AI/codesearch");
         let filter = normalize_filter_path("src/");
         assert!(path_matches_filter("./src/lib.rs", &filter, &project_root));
+    }
+
+    // ── sanitize_for_terminal ───────────────────────────────────────────────
+
+    #[test]
+    fn test_sanitize_strips_csi_clear_screen() {
+        // \x1b[2J = clear screen
+        assert_eq!(sanitize_for_terminal("hello\x1b[2Jworld"), "helloworld");
+    }
+
+    #[test]
+    fn test_sanitize_strips_csi_with_params() {
+        // \x1b[38;5;200m = set 256-color foreground
+        assert_eq!(
+            sanitize_for_terminal("\x1b[38;5;200mred\x1b[0m text"),
+            "red text"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_strips_osc_bel_terminator() {
+        // \x1b]0;title\x07 = set window title, BEL terminator
+        assert_eq!(sanitize_for_terminal("a\x1b]0;title\x07b"), "ab");
+    }
+
+    #[test]
+    fn test_sanitize_strips_osc_st_terminator() {
+        // \x1b]0;title\x1b\\ = set window title, ST terminator
+        assert_eq!(sanitize_for_terminal("a\x1b]0;title\x1b\\b"), "ab");
+    }
+
+    #[test]
+    fn test_sanitize_strips_single_char_escape() {
+        // ESC M = Reverse Index (RI), in the 0x40-0x5F documented range
+        assert_eq!(
+            sanitize_for_terminal("a\x1bM b".to_string()),
+            "a b".to_string()
+        );
+    }
+
+    #[test]
+    fn test_sanitize_strips_control_chars_except_newline_tab() {
+        // NUL, BEL, backspace, vertical tab, form feed, CR — all stripped
+        assert_eq!(
+            sanitize_for_terminal("a\x00b\x07c\x08d\x0be\x0cf\rg"),
+            "abcdefg"
+        );
+        // newline and tab preserved
+        assert_eq!(sanitize_for_terminal("a\nb\tc"), "a\nb\tc");
+    }
+
+    #[test]
+    fn test_sanitize_strips_back_to_back_escapes() {
+        // Two consecutive CSI sequences — both stripped
+        assert_eq!(sanitize_for_terminal("\x1b[2J\x1b[2Jcleared"), "cleared");
+    }
+
+    #[test]
+    fn test_sanitize_preserves_unicode() {
+        assert_eq!(sanitize_for_terminal("héllo → 世界 🦀"), "héllo → 世界 🦀");
+    }
+
+    #[test]
+    fn test_sanitize_preserves_empty_and_clean_strings() {
+        assert_eq!(sanitize_for_terminal(""), "");
+        assert_eq!(sanitize_for_terminal("clean string"), "clean string");
+    }
+
+    #[test]
+    fn test_sanitize_truncated_escape_dropped_safely() {
+        // Truncated CSI at end of string — should not panic
+        assert_eq!(sanitize_for_terminal("text\x1b["), "text");
+        // Truncated OSC at end of string
+        assert_eq!(sanitize_for_terminal("text\x1b]0;unterminated"), "text");
+        // Lone ESC at end
+        assert_eq!(sanitize_for_terminal("text\x1b"), "text");
     }
 }
