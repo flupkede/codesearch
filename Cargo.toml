@@ -99,7 +99,9 @@ arroy = "0.5"
 heed = "0.20"
 bincode = "1.3"
 rand = "0.8"
-rmcp = { version = "1.5.0", features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros"] }
+# Bumped floor from 1.5.0 to 1.8.0 for CVE patches (Aikido group: rmcp priority 82, 3 CVEs).
+# v2.x is available but is a breaking major bump — deferred.
+rmcp = { version = "1.8.0", features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros"] }
 schemars = { version = "1.1.0", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 sysinfo = { version = "0.38.4", default-features = true }
