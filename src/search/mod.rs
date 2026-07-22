@@ -1335,7 +1335,7 @@ fn print_result(
             .content
             .lines()
             .take(3)
-            .map(|l| sanitize_for_terminal(l))
+            .map(sanitize_for_terminal)
             .collect::<Vec<_>>()
             .join(" ");
 
