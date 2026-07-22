@@ -4287,17 +4287,20 @@ mod tests {
         );
         assert!(!state.repos.contains_key("testalias"));
 
-        // Create a minimal DB so next call succeeds
+        // Recreate the DB directory + metadata so the next call succeeds.
+        // Deliberately do NOT open SharedStores directly here: the reopen below
+        // (get_or_open_stores → try_open_stores) creates the LMDB env itself
+        // (proven by `try_open_stores_creates_db_for_brand_new_repo`). Opening
+        // it directly first would open the same LMDB env twice in one process,
+        // which the AGENTS.md LMDB rule forbids; on Linux the first env is not
+        // always released before the reopen, making this test flaky. One open =
+        // deterministic.
         let db_path = repo_path.join(DB_DIR_NAME);
         std::fs::create_dir(&db_path).unwrap();
         let meta = db_path.join("metadata.json");
         let mut f = std::fs::File::create(&meta).unwrap();
         write!(f, "{{\"dimensions\":384}}").unwrap();
         drop(f);
-
-        // Create the LMDB files (data.mdb and lock.mdb) by opening SharedStores directly
-        let _stores = SharedStores::new(&db_path, 384).unwrap();
-        drop(_stores);
 
         // Second call: should succeed without restart
         let res = state.get_or_open_stores("testalias", true).await;
