@@ -1,4 +1,4 @@
-use super::embedder::FastEmbedder;
+use super::embedder::{FastEmbedder, ModelType};
 use crate::chunker::Chunk;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -89,13 +89,18 @@ impl BatchEmbedder {
         let total = chunks.len();
         let _start = std::time::Instant::now();
         let mut embedded_chunks = Vec::with_capacity(total);
+        let model_type = self
+            .embedder
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?
+            .model_type();
 
         // Process in batches
         for chunk_batch in chunks.chunks(self.batch_size) {
             // Prepare texts for embedding
             let texts: Vec<String> = chunk_batch
                 .iter()
-                .map(|chunk| self.prepare_text(chunk))
+                .map(|chunk| Self::prepare_text(chunk, model_type))
                 .collect();
 
             // Generate embeddings
@@ -103,7 +108,7 @@ impl BatchEmbedder {
                 .embedder
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?
-                .embed_batch(texts)?;
+                .embed_documents(texts)?;
 
             // Combine chunks with embeddings
             for (chunk, embedding) in chunk_batch.iter().zip(embeddings) {
@@ -117,12 +122,16 @@ impl BatchEmbedder {
     /// Embed a single chunk
     #[allow(dead_code)] // Reserved for single-chunk embedding
     pub fn embed_chunk(&mut self, chunk: Chunk) -> Result<EmbeddedChunk> {
-        let text = self.prepare_text(&chunk);
-        let embedding = self
+        let mut embedder = self
             .embedder
             .lock()
-            .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?
-            .embed_one(&text)?;
+            .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?;
+        let text = Self::prepare_text(&chunk, embedder.model_type());
+        let embedding = embedder
+            .embed_documents(vec![text])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No embedding generated"))?;
         Ok(EmbeddedChunk::new(chunk, embedding))
     }
 
@@ -134,7 +143,7 @@ impl BatchEmbedder {
     /// - Signature (if available)
     /// - Docstring (if available)
     /// - Content
-    fn prepare_text(&self, chunk: &Chunk) -> String {
+    fn prepare_text(chunk: &Chunk, model_type: ModelType) -> String {
         let mut parts = Vec::new();
 
         // Add context breadcrumbs (e.g., "File: main.rs > Class: Server")
@@ -174,8 +183,10 @@ impl BatchEmbedder {
             }
         }
 
-        // Add main content
-        parts.push(format!("Code:\n{}", chunk.content));
+        // Add main content. Only EmbeddingGemma distinguishes prose from code;
+        // existing models retain their historical input representation.
+        let label = model_type.content_label(&chunk.path);
+        parts.push(format!("{label}:\n{}", chunk.content));
 
         parts.join("\n")
     }
@@ -274,44 +285,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires model — flaky on CI without model cache
-    fn test_prepare_text() {
-        // Set a temporary cache directory to avoid creating .fastembed_cache in project root
-        let temp_dir = std::env::temp_dir().join("codesearch_test_cache");
-        std::fs::create_dir_all(&temp_dir).ok();
-        std::env::set_var(
-            "FASTEMBED_CACHE_DIR",
-            temp_dir.to_string_lossy().to_string(),
-        );
-
-        let embedder = Arc::new(Mutex::new(FastEmbedder::new().unwrap_or_else(|_| {
-            // For tests, create a mock if real embedder fails
-            panic!("Cannot create embedder in test");
-        })));
-
-        let batch = BatchEmbedder::new(embedder);
-
+    fn test_prepare_text_preserves_existing_models_and_labels_gemma_notes() {
         let mut chunk = Chunk::new(
-            "fn test() { println!(\"test\"); }".to_string(),
+            "A durable personal note".to_string(),
             0,
             1,
-            ChunkKind::Function,
-            "test.rs".to_string(),
+            ChunkKind::Block,
+            "notes.md".to_string(),
         );
-        chunk.context = vec!["File: test.rs".to_string(), "Function: test".to_string()];
-        chunk.signature = Some("fn test()".to_string());
-        chunk.docstring = Some("/// Test function".to_string());
+        chunk.context = vec!["File: notes.md".to_string(), "Section: Ideas".to_string()];
 
-        let text = batch.prepare_text(&chunk);
+        let default_text = BatchEmbedder::prepare_text(&chunk, ModelType::default());
+        let gemma_text = BatchEmbedder::prepare_text(&chunk, ModelType::EmbeddingGemma300MQ4);
 
-        assert!(text.contains("Context: File: test.rs > Function: test"));
-        assert!(text.contains("Signature: fn test()"));
-        assert!(text.contains("Documentation: Test function"));
-        assert!(text.contains("Code:"));
-
-        // Clean up temp cache
-        let _ = std::fs::remove_dir_all(temp_dir);
-        std::env::remove_var("FASTEMBED_CACHE_DIR");
+        assert_eq!(
+            default_text,
+            "Context: File: notes.md > Section: Ideas\nCode:\nA durable personal note"
+        );
+        assert_eq!(
+            gemma_text,
+            "Context: File: notes.md > Section: Ideas\nText:\nA durable personal note"
+        );
     }
 
     fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {

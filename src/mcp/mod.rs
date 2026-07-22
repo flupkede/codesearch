@@ -52,12 +52,29 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_mcp_filter_matches_absolute_path_under_project_root() {
         let project_root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
         let filter = normalize_filter_path("src/");
         assert!(path_matches_filter(
             r"\\?\C:\WorkArea\AI\codesearch\src\mcp\mod.rs",
+            &filter,
+            &project_root,
+        ));
+    }
+
+    // Unix counterpart: same logic, native (forward-slash) absolute paths.
+    // normalize_path_str deliberately does NOT rewrite '\' on Unix (backslash
+    // is a legal filename char — see file_meta.rs Aikido rationale), so the
+    // Windows-path variant above is meaningless here and is gated off.
+    #[cfg(unix)]
+    #[test]
+    fn test_mcp_filter_matches_absolute_path_under_project_root() {
+        let project_root = normalize_path_str("/work/codesearch");
+        let filter = normalize_filter_path("src/");
+        assert!(path_matches_filter(
+            "/work/codesearch/src/mcp/mod.rs",
             &filter,
             &project_root,
         ));
@@ -83,6 +100,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(windows)]
     #[test]
     fn pick_filter_root_uses_routed_alias_root() {
         // serve single-project: the routed alias's own root, NOT the service
@@ -106,6 +124,32 @@ mod tests {
         let other = normalize_filter_path("tests/");
         assert!(!path_matches_filter(
             r"C:\data\repos\myrepo\src\foo.rs",
+            &other,
+            &root
+        ));
+    }
+
+    // Unix counterpart: native forward-slash paths (see cfg(windows) twin).
+    #[cfg(unix)]
+    #[test]
+    fn pick_filter_root_uses_routed_alias_root() {
+        let ar = roots(&[("myrepo", "/data/repos/myrepo")]);
+        let root = super::pick_filter_root(
+            "/data/repos/myrepo/src/foo.rs",
+            Some("myrepo"),
+            &ar,
+            "/some/other/hub/path",
+        );
+        assert_eq!(root, normalize_path_str("/data/repos/myrepo"));
+        let filter = normalize_filter_path("src/");
+        assert!(path_matches_filter(
+            "/data/repos/myrepo/src/foo.rs",
+            &filter,
+            &root
+        ));
+        let other = normalize_filter_path("tests/");
+        assert!(!path_matches_filter(
+            "/data/repos/myrepo/src/foo.rs",
             &other,
             &root
         ));
@@ -390,6 +434,10 @@ mod tests {
 
     // === prefix_path_with_alias tests ===
 
+    // Windows-only: backslash → '/' rewriting is a no-op on Unix by design
+    // (backslash is a legal Unix filename char). Forward-slash inputs are
+    // covered by test_path_prefix_no_alias / _empty_alias on all platforms.
+    #[cfg(windows)]
     #[test]
     fn test_path_prefix_windows_backslashes() {
         let result =
@@ -414,6 +462,8 @@ mod tests {
         );
     }
 
+    // Windows-only: mixed '/' and '\' only collapse to '/' on Windows.
+    #[cfg(windows)]
     #[test]
     fn test_path_prefix_mixed_separators() {
         let result =
