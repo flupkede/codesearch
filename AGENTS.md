@@ -81,4 +81,4 @@ Common mistake: a subagent runs `/git pr create` with no explicit `--base`, the 
 - **Deploy:** `..\copy-to-common.ps1` — builds + copies both binaries to `~/.local/bin/`. A running `codesearch.exe` is file-locked on Windows; stop serve before deploying.
 - **Canonical paths:** NEVER call `.canonicalize()` directly. Always use `safe_canonicalize()`.
 - **LMDB rule:** No two `EnvOpenOptions::open()` on same dir in same process. All access via `get_or_open_stores()` → `Arc<SharedStores>`.
-- **Tooling:** do not use the bundled `codesearch` binary to investigate this repo (it's the project under development). Use codesearch MCP tools when available, else `grep`/`Glob`/`Read`.
+- **Tooling:** never use the bundled `codesearch` binary to investigate this repo (it's the project under development). Use codesearch **MCP tools first** for discovery (server verified working; this repo indexed as `codesearch-git`). `grep`/`Glob`/`Read` stay correct for a specific git ref / fetched PR head (codesearch only indexes the on-disk working tree), exact literal matching, or when MCP returns nothing.

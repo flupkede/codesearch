@@ -564,6 +564,53 @@ public static class Program
         return args[++i];
     }
 
+    /// <summary>
+    /// Reads the next arg value and validates it as a filesystem path.
+    ///
+    /// SECURITY: All CLI path arguments must go through this helper instead of
+    /// <see cref="RequireValue"/>. <see cref="Path.GetFullPath"/> canonicalizes
+    /// the path (collapsing "..", resolving relative segments, rejecting
+    /// malformed inputs), which prevents path-traversal attacks where a
+    /// crafted argument could read or write outside expected directories
+    /// (Aikido group 30640677). The .NET helper is invoked by the Rust parent
+    /// process; this is defense-in-depth, not the primary boundary.
+    /// </summary>
+    /// <param name="mustExist">If true, the path must point to an existing file.</param>
+    /// <returns>The canonicalized absolute path, or null + stderr message on failure.</returns>
+    private static string? RequireValidPath(string[] args, ref int i, string flag, bool mustExist)
+    {
+        var raw = RequireValue(args, ref i, flag);
+        if (raw is null) return null;
+
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            Console.Error.WriteLine($"{flag} must not be empty or whitespace");
+            return null;
+        }
+
+        string full;
+        try
+        {
+            // GetFullPath normalizes separators, resolves relative segments
+            // (../..), and rejects malformed inputs. This is the central
+            // path-traversal defense for CLI args.
+            full = Path.GetFullPath(raw);
+        }
+        catch (Exception ex) when (ex is ArgumentException or PathTooLongException or NotSupportedException)
+        {
+            Console.Error.WriteLine($"{flag}: invalid path '{raw}': {ex.Message}");
+            return null;
+        }
+
+        if (mustExist && !File.Exists(full))
+        {
+            Console.Error.WriteLine($"{flag}: file not found: {full}");
+            return null;
+        }
+
+        return full;
+    }
+
     private static (string? SolutionPath, string? ProjectPath, string OutputPath, string? ProjectFilter)?
         ParseIndexArgs(string[] args)
     {
@@ -577,15 +624,15 @@ public static class Program
             switch (args[i])
             {
                 case "--solution":
-                    solutionPath = RequireValue(args, ref i, "--solution");
+                    solutionPath = RequireValidPath(args, ref i, "--solution", mustExist: true);
                     if (solutionPath is null) return null;
                     break;
                 case "--project":
-                    projectPath = RequireValue(args, ref i, "--project");
+                    projectPath = RequireValidPath(args, ref i, "--project", mustExist: true);
                     if (projectPath is null) return null;
                     break;
                 case "--output":
-                    outputPath = RequireValue(args, ref i, "--output");
+                    outputPath = RequireValidPath(args, ref i, "--output", mustExist: false);
                     if (outputPath is null) return null;
                     break;
                 case "--filter-project":
@@ -626,7 +673,7 @@ public static class Program
             switch (args[i])
             {
                 case "--solution":
-                    solutionPath = RequireValue(args, ref i, "--solution");
+                    solutionPath = RequireValidPath(args, ref i, "--solution", mustExist: true);
                     if (solutionPath is null) return null;
                     break;
                 case "--symbol":
@@ -634,7 +681,7 @@ public static class Program
                     if (symbol is null) return null;
                     break;
                 case "--output":
-                    outputPath = RequireValue(args, ref i, "--output");
+                    outputPath = RequireValidPath(args, ref i, "--output", mustExist: false);
                     if (outputPath is null) return null;
                     break;
                 case "--filter-project":
@@ -667,11 +714,11 @@ public static class Program
             switch (args[i])
             {
                 case "--solution":
-                    solutionPath = RequireValue(args, ref i, "--solution");
+                    solutionPath = RequireValidPath(args, ref i, "--solution", mustExist: true);
                     if (solutionPath is null) return null;
                     break;
                 case "--symbols-file":
-                    symbolsFile = RequireValue(args, ref i, "--symbols-file");
+                    symbolsFile = RequireValidPath(args, ref i, "--symbols-file", mustExist: true);
                     if (symbolsFile is null) return null;
                     break;
                 case "--symbols":
@@ -679,7 +726,7 @@ public static class Program
                     if (symbolsInline is null) return null;
                     break;
                 case "--output":
-                    outputPath = RequireValue(args, ref i, "--output");
+                    outputPath = RequireValidPath(args, ref i, "--output", mustExist: false);
                     if (outputPath is null) return null;
                     break;
                 default:
@@ -694,11 +741,8 @@ public static class Program
         IReadOnlyList<string> symbols;
         if (!string.IsNullOrEmpty(symbolsFile))
         {
-            if (!File.Exists(symbolsFile))
-            {
-                Console.Error.WriteLine($"batch-find-refs: symbols file not found: {symbolsFile}");
-                return null;
-            }
+            // Existence + canonicalization already enforced by RequireValidPath
+            // above (mustExist: true). No redundant File.Exists here.
             symbols = File.ReadAllLines(symbolsFile)
                 .Select(l => l.Trim())
                 .Where(l => !string.IsNullOrEmpty(l) && !l.StartsWith('#'))

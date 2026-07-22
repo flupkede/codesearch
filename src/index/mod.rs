@@ -88,8 +88,21 @@ fn get_db_path_smart(
     let project_path = path.as_deref().unwrap_or(Path::new("."));
 
     // Canonicalize and strip any Windows UNC prefix (\\?\) via the central helper.
-    let canonical_path =
-        safe_canonicalize(project_path).unwrap_or_else(|_| PathBuf::from(project_path));
+    //
+    // SECURITY: We deliberately propagate the error instead of falling back to
+    // the raw user-supplied path. The previous `unwrap_or_else` fallback silently
+    // bypassed canonicalization when the path did not exist or was inaccessible,
+    // which defeated every downstream `starts_with`/`join` containment check
+    // (Aikido group 30640695). Bailing here gives a clear error and guarantees
+    // every later comparison operates on a real, canonicalized absolute path.
+    let canonical_path = safe_canonicalize(project_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot resolve project path '{}': {}. \
+             Ensure the path exists and is accessible before indexing.",
+            project_path.display(),
+            e
+        )
+    })?;
 
     // Step 1: Handle --force flag — delete databases
     if force {

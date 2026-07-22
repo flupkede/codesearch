@@ -86,9 +86,9 @@ Quality gates: `cargo check`, `cargo clippy`, `cargo test --lib --bins`, `dotnet
 
 ## Tooling rules (IMPORTANT)
 
-- **Do NOT use the `codesearch` CLI/exe to investigate this repo.** Codesearch is the project under development and is currently potentially broken — using our own broken tool to debug itself is unreliable.
-- **Codesearch must always be used via its MCP server tools** (when available), never via the bundled binary at the shell.
-- **For this repo, fall back to `grep` / `Glob` / `Read`** for all discovery and navigation until codesearch is verified working again.
+- **Use codesearch MCP tools first for discovery** on this repo. The MCP server is verified working and this repo is indexed (alias `codesearch-git`) — `search` / `find` / `explore` are the default for "where/what/how" questions, per the global codesearch-first rule.
+- **Never use the bundled `codesearch` CLI/exe to investigate this repo.** It's the project under development and may be broken/locked; debugging it with its own shell binary is unreliable. MCP server tools only.
+- **`grep` / `Glob` / `Read` remain correct for:** inspecting a specific git ref or fetched PR head (e.g. `git show FETCH_HEAD:path` — codesearch only indexes the on-disk working tree, not arbitrary refs), exact literal/regex matching, and any case where codesearch returns nothing useful.
 
 ## Notes
 
