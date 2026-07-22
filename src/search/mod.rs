@@ -1581,12 +1581,28 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_filter_matches_absolute_windows_path_under_root() {
         let project_root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
         let filter = normalize_filter_path("src/");
         assert!(path_matches_filter(
             r"\\?\C:\WorkArea\AI\codesearch\src\index\mod.rs",
+            &filter,
+            &project_root,
+        ));
+    }
+
+    // Unix counterpart: native forward-slash absolute path. normalize_path_str
+    // intentionally leaves '\' untouched on Unix (see file_meta.rs Aikido
+    // rationale), so the Windows-path variant is gated off there.
+    #[cfg(unix)]
+    #[test]
+    fn test_path_filter_matches_absolute_unix_path_under_root() {
+        let project_root = normalize_path_str("/work/codesearch");
+        let filter = normalize_filter_path("src/");
+        assert!(path_matches_filter(
+            "/work/codesearch/src/index/mod.rs",
             &filter,
             &project_root,
         ));
