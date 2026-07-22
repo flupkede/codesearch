@@ -1642,10 +1642,7 @@ mod tests {
     #[test]
     fn test_sanitize_strips_single_char_escape() {
         // ESC M = Reverse Index (RI), in the 0x40-0x5F documented range
-        assert_eq!(
-            sanitize_for_terminal("a\x1bM b".to_string()),
-            "a b".to_string()
-        );
+        assert_eq!(sanitize_for_terminal("a\x1bM b"), "a b");
     }
 
     #[test]
