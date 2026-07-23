@@ -1340,7 +1340,12 @@ fn print_result(
             .join(" ");
 
         let snippet = if snippet.len() > 100 {
-            format!("{}...", &snippet[..100])
+            // Truncate at the largest UTF-8 char boundary <= 100 bytes.
+            // Plain `&snippet[..100]` panics if byte 100 falls inside a
+            // multi-byte character (box-drawing separators, CJK, emoji) —
+            // see issue #148.
+            let cut = snippet.floor_char_boundary(100);
+            format!("{}...", &snippet[..cut])
         } else {
             snippet
         };
@@ -1697,5 +1702,23 @@ mod tests {
         assert_eq!(sanitize_for_terminal("text\x1b]0;unterminated"), "text");
         // Lone ESC at end
         assert_eq!(sanitize_for_terminal("text\x1b"), "text");
+    }
+
+    #[test]
+    fn test_byte_truncation_preserves_char_boundary() {
+        // Regression for issue #148: `&snippet[..100]` panicked when byte
+        // offset 100 fell inside a multi-byte character (box-drawing U+2500
+        // in comment-art, CJK, emoji). 40 × U+2500 = 120 bytes, so byte 100
+        // is inside char #34 (bytes 99..102).
+        let s: String = std::iter::repeat_n('─', 40).collect();
+        assert!(s.len() > 100, "fixture must exceed 100 bytes");
+        let cut = s.floor_char_boundary(100);
+        assert!(cut <= 100);
+        assert!(s.is_char_boundary(cut), "cut must land on a char boundary");
+        let truncated = &s[..cut];
+        // All chars are 3 bytes; cut must be a multiple of 3.
+        assert_eq!(cut % 3, 0);
+        assert_eq!(truncated.chars().count(), cut / 3);
+        // The pre-fix code (`&s[..100]`) would panic on this fixture.
     }
 }
