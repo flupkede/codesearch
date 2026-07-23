@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.31] - 2026-07-23
+
+**Security hardening sweep (Aikido) + community bug/dependency fixes.**
+
+### Added
+
+- **EmbeddingGemma retrieval support (#155, original work by @markschroedr, superseding #147).** Adds support for Google's EmbeddingGemma embedding model as an additional embedder option, alongside model-selection hardening and improved error messages for unsupported/misconfigured embedding models.
+- **`CODESEARCH_ALLOWED_HOSTS` / `CODESEARCH_DISABLE_HOST_VALIDATION` (#149, reported by @stdweird).** rmcp's DNS-rebinding defence defaults the MCP transport's `Host`-header allowlist to loopback-only, rejecting container/service hostnames in containerised deployments. `CODESEARCH_ALLOWED_HOSTS` lets you extend the allowlist with a comma-separated hostname list; `CODESEARCH_DISABLE_HOST_VALIDATION=1` disables the check entirely (only safe behind a reverse proxy). See README `## Security`.
+- **`raise_fd_limit()` at serve startup (#150, contributed by @tony-nexartis).** `codesearch serve`'s fd demand scales with registered repo count; under process supervisors with a low default `ulimit -n` (notably macOS launchd, 256), this could silently exhaust file descriptors and wedge `accept()` with `EMFILE` while the daemon still looked healthy. Serve now raises its own soft `RLIMIT_NOFILE` to the hard limit at startup (Unix only) and warns if the effective limit still looks insufficient for the repo count.
+- **`persist-credentials: false`** added to every `actions/checkout` step across all GitHub Actions workflows, and the CodeQL workflow's floating `actions/checkout@v4` pinned to the same SHA already used elsewhere — reduces the blast radius of a compromised CI step and closes a supply-chain drift gap.
+- **CodeQL skipped on fork PRs.** Fork-originated PRs carry a restricted `GITHUB_TOKEN` that cannot upload SARIF results to the upstream repo, which was failing the CodeQL check on every external contribution (e.g. #150) with a confusing "Resource not accessible by integration" error unrelated to the PR's actual code. The analyze job is now skipped for fork PRs (still runs on `develop`/`master` push, same-repo PRs, and the schedule).
+
+### Fixed
+
+- **Panic on multi-byte UTF-8 boundary in search snippets (#148, reported by @tony-nexartis).** Search-result snippet truncation byte-sliced content at a fixed offset, panicking whenever that offset landed inside a multi-byte character (box-drawing glyphs, CJK, emoji). Now truncates on a char boundary.
+- **Path-traversal hardening (critical).** `codesearch index`'s project-path resolution no longer silently falls back to the raw, unvalidated path when canonicalization fails — it now fails fast with an actionable error. The `.NET` symbol-helper CLI (`scip-csharp`) now canonicalizes every path argument (`--solution`, `--project`, `--output`, `--symbols-file`) before use, closing several path-traversal vectors flagged by Aikido SAST.
+- **Registering a `.git`/build-artifact directory as a project root.** `codesearch index`/repo registration now rejects a root whose own directory name matches an always-excluded name (`.git`, `.svn`, `node_modules`, etc.), preventing accidental indexing and search-exposure of internal VCS metadata.
+- **ANSI/control-sequence injection in terminal output.** Search results and sync/reindex logs now strip ANSI escape sequences (CSI, OSC, Fe) and stray control characters from indexed file content before printing, so a maliciously crafted file can no longer manipulate the user's terminal (clear screen, hide output, rewrite the title bar, etc.).
+- **Unix path-cache key collision.** The path-normalization cache used for file metadata unconditionally converted `\` to `/`, which on Unix (where `\` is a legal filename character, not a separator) could collapse a literal-backslash filename with an unrelated subdirectory path into the same cache key. The conversion is now gated to Windows only.
+- **Dependency CVE remediation.** `rmcp` floor bumped `1.5.0 → 1.8.0` (3 CVEs fixed); ~100 transitive dependencies refreshed via `cargo update`, including security-relevant bumps to `quinn-proto`, `h2`, `hyper`, `tokio`, `rustls`, `openssl`, `zerocopy`, `zeroize`, `webpki-roots`, `aws-lc-rs`.
+
 ## [1.1.30] - 2026-07-10
 
 ### Added
