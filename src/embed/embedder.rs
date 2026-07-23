@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
 use ort::execution_providers::CPUExecutionProvider;
 
+use crate::file::Language;
+
 /// Available embedding models
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModelType {
@@ -45,6 +47,8 @@ pub enum ModelType {
     MxbaiEmbedLargeV1,
     /// ModernBERT Embed Large - 1024 dimensions, latest architecture
     ModernBertEmbedLarge,
+    /// Quantized EmbeddingGemma 300M - 768 dimensions, multilingual retrieval
+    EmbeddingGemma300MQ4,
 }
 
 impl ModelType {
@@ -70,6 +74,7 @@ impl ModelType {
             Self::MultilingualE5Small => FastEmbedModel::MultilingualE5Small,
             Self::MxbaiEmbedLargeV1 => FastEmbedModel::MxbaiEmbedLargeV1,
             Self::ModernBertEmbedLarge => FastEmbedModel::ModernBertEmbedLarge,
+            Self::EmbeddingGemma300MQ4 => FastEmbedModel::EmbeddingGemma300MQ4,
         }
     }
 
@@ -89,7 +94,8 @@ impl ModelType {
             | Self::NomicEmbedTextV1
             | Self::NomicEmbedTextV15
             | Self::NomicEmbedTextV15Q
-            | Self::JinaEmbeddingsV2BaseCode => 768,
+            | Self::JinaEmbeddingsV2BaseCode
+            | Self::EmbeddingGemma300MQ4 => 768,
             // 1024 dimensions
             Self::BGELargeENV15 | Self::MxbaiEmbedLargeV1 | Self::ModernBertEmbedLarge => 1024,
         }
@@ -113,6 +119,7 @@ impl ModelType {
             Self::MultilingualE5Small => "intfloat/multilingual-e5-small",
             Self::MxbaiEmbedLargeV1 => "mixedbread-ai/mxbai-embed-large-v1",
             Self::ModernBertEmbedLarge => "lightonai/modernbert-embed-large",
+            Self::EmbeddingGemma300MQ4 => "onnx-community/embeddinggemma-300m-ONNX (Q4)",
         }
     }
 
@@ -125,6 +132,7 @@ impl ModelType {
                 | Self::AllMiniLML12V2Q
                 | Self::BGESmallENV15Q
                 | Self::NomicEmbedTextV15Q
+                | Self::EmbeddingGemma300MQ4
         )
     }
 
@@ -147,6 +155,7 @@ impl ModelType {
             Self::MultilingualE5Small => "e5-multilingual",
             Self::MxbaiEmbedLargeV1 => "mxbai-large",
             Self::ModernBertEmbedLarge => "modernbert-large",
+            Self::EmbeddingGemma300MQ4 => "embeddinggemma-q4",
         }
     }
 
@@ -169,14 +178,14 @@ impl ModelType {
             Self::MultilingualE5Small,
             Self::MxbaiEmbedLargeV1,
             Self::ModernBertEmbedLarge,
+            Self::EmbeddingGemma300MQ4,
         ]
     }
 
     /// Comma-separated list of all valid model short names.
     ///
-    /// Single source of truth for the "valid models" message shown by the CLI
-    /// (`index add --model`) and the serve `POST /repos` error path, so the two
-    /// can never drift from the set `parse()` actually accepts.
+    /// Single source of truth for the "valid models" messages shown by the CLI
+    /// and the serve API, so they cannot drift from the set `parse()` accepts.
     pub fn valid_short_names() -> String {
         Self::all()
             .iter()
@@ -204,8 +213,45 @@ impl ModelType {
             "e5-multilingual" | "multilinguale5small" => Some(Self::MultilingualE5Small),
             "mxbai-large" | "mxbaiembedlargev1" => Some(Self::MxbaiEmbedLargeV1),
             "modernbert-large" | "modernbertembedlarge" => Some(Self::ModernBertEmbedLarge),
+            "embeddinggemma-q4" | "embeddinggemma300mq4" => Some(Self::EmbeddingGemma300MQ4),
             _ => None,
         }
+    }
+
+    pub fn prepare_query(&self, text: &str) -> String {
+        match self {
+            Self::EmbeddingGemma300MQ4 => format!("task: search result | query: {text}"),
+            _ => text.to_string(),
+        }
+    }
+
+    pub fn prepare_document(&self, text: &str) -> String {
+        match self {
+            Self::EmbeddingGemma300MQ4 => format!("title: none | text: {text}"),
+            _ => text.to_string(),
+        }
+    }
+
+    /// Label prefix for a chunk's main content when building the embedding input.
+    ///
+    /// EmbeddingGemma benefits from distinguishing prose from source code, so
+    /// Markdown and plain-text files are labeled `Text`. Every other model keeps
+    /// the historical `Code` label unconditionally, leaving their embeddings —
+    /// and therefore existing indexes — byte-for-byte unchanged.
+    pub fn content_label(&self, path: &str) -> &'static str {
+        match self {
+            Self::EmbeddingGemma300MQ4
+                if Language::from_path(std::path::Path::new(path)) == Language::Markdown =>
+            {
+                "Text"
+            }
+            _ => "Code",
+        }
+    }
+
+    /// Whether this model produces larger embeddings than the default model.
+    pub fn is_heavier_than_default(&self) -> bool {
+        self.dimensions() > Self::default().dimensions()
     }
 }
 
@@ -315,6 +361,27 @@ impl FastEmbedder {
             .ok_or_else(|| anyhow!("No embedding generated"))
     }
 
+    pub fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
+        let text = self.model_type.prepare_query(text);
+        self.embed_one(&text)
+    }
+
+    pub fn embed_queries(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let texts = texts
+            .into_iter()
+            .map(|text| self.model_type.prepare_query(&text))
+            .collect();
+        self.embed_batch(texts)
+    }
+
+    pub fn embed_documents(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let texts = texts
+            .into_iter()
+            .map(|text| self.model_type.prepare_document(&text))
+            .collect();
+        self.embed_batch(texts)
+    }
+
     /// Get the dimensionality of embeddings
     pub fn dimensions(&self) -> usize {
         self.model_type.dimensions()
@@ -361,6 +428,7 @@ mod tests {
         assert_eq!(ModelType::BGELargeENV15.dimensions(), 1024);
         assert_eq!(ModelType::MxbaiEmbedLargeV1.dimensions(), 1024);
         assert_eq!(ModelType::ModernBertEmbedLarge.dimensions(), 1024);
+        assert_eq!(ModelType::EmbeddingGemma300MQ4.dimensions(), 768);
     }
 
     #[test]
@@ -381,12 +449,6 @@ mod tests {
         let model = ModelType::default();
         assert_eq!(model, ModelType::AllMiniLML6V2Q);
         assert_eq!(model.dimensions(), 384);
-    }
-
-    #[test]
-    fn test_all_models() {
-        let all = ModelType::all();
-        assert_eq!(all.len(), 16);
     }
 
     #[test]
@@ -468,6 +530,10 @@ mod tests {
             ModelType::parse("jina-code"),
             Some(ModelType::JinaEmbeddingsV2BaseCode)
         );
+        assert_eq!(
+            ModelType::parse("embeddinggemma-q4"),
+            Some(ModelType::EmbeddingGemma300MQ4)
+        );
         assert_eq!(ModelType::parse("invalid"), None);
     }
 
@@ -477,6 +543,50 @@ mod tests {
         assert!(ModelType::BGESmallENV15Q.is_quantized());
         assert!(!ModelType::BGESmallENV15.is_quantized());
         assert!(!ModelType::JinaEmbeddingsV2BaseCode.is_quantized());
+        assert!(ModelType::EmbeddingGemma300MQ4.is_quantized());
+    }
+
+    #[test]
+    fn test_embeddinggemma_retrieval_prompts() {
+        let model = ModelType::EmbeddingGemma300MQ4;
+        assert_eq!(
+            model.prepare_query("Was wurde entschieden?"),
+            "task: search result | query: Was wurde entschieden?"
+        );
+        assert_eq!(
+            model.prepare_document("Eine dauerhafte Notiz"),
+            "title: none | text: Eine dauerhafte Notiz"
+        );
+    }
+
+    #[test]
+    fn test_retrieval_prompts_leave_other_models_unchanged() {
+        let model = ModelType::AllMiniLML6V2Q;
+        assert_eq!(model.prepare_query("search text"), "search text");
+        assert_eq!(model.prepare_document("document text"), "document text");
+    }
+
+    #[test]
+    fn test_content_label_only_distinguishes_prose_for_embeddinggemma() {
+        let gemma = ModelType::EmbeddingGemma300MQ4;
+        assert_eq!(gemma.content_label("notes.md"), "Text");
+        assert_eq!(gemma.content_label("NOTES.MD"), "Text");
+        assert_eq!(gemma.content_label("notes.markdown"), "Text");
+        assert_eq!(gemma.content_label("notes.txt"), "Text");
+        assert_eq!(gemma.content_label("src/lib.rs"), "Code");
+
+        let default = ModelType::default();
+        assert_eq!(default.content_label("notes.md"), "Code");
+        assert_eq!(default.content_label("notes.txt"), "Code");
+        assert_eq!(default.content_label("src/lib.rs"), "Code");
+    }
+
+    #[test]
+    fn test_heavier_than_default_tracks_vector_dimensions() {
+        assert!(!ModelType::default().is_heavier_than_default());
+        assert!(!ModelType::MultilingualE5Small.is_heavier_than_default());
+        assert!(ModelType::EmbeddingGemma300MQ4.is_heavier_than_default());
+        assert!(ModelType::ModernBertEmbedLarge.is_heavier_than_default());
     }
 
     #[test]

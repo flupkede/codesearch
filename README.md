@@ -117,6 +117,21 @@ codesearch index /path/to/my-project --force
 
 `codesearch index add` is intended to be run from inside the repo you want to register — pass the path explicitly if launched from elsewhere. First-time indexing takes 2–5 minutes; subsequent runs are incremental (10–30s) and branch switches re-index automatically. Use `codesearch index list/rm/prune` to manage registrations (see [Serve Mode](#serve-mode-multi-repo)).
 
+### Embedding model
+
+The default quantized MiniLM model favors startup speed and a small download. For
+multilingual text and notes, EmbeddingGemma 300M is available as a quantized ONNX
+model with retrieval-specific query and document prompts:
+
+```bash
+codesearch --model embeddinggemma-q4 index /path/to/notes --force
+```
+
+Changing models requires a full reindex because embedding dimensions and vector
+spaces are model-specific. Keep the same model selected for later indexing runs.
+Search rejects a `--model` value that differs from the indexed model and points
+to the required `--force` rebuild instead of mixing incompatible vector spaces.
+
 ## MCP Configuration
 
 codesearch connects to AI agents via MCP. Two modes:
@@ -535,6 +550,8 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_SERVE_PORT` | Serve mode port (default: 39725) |
 | `CODESEARCH_SERVE_API_KEY` | API key for management endpoints + all endpoints when serve binds to a non-localhost address (unset = no auth) |
 | `CODESEARCH_ALLOWED_ROOTS` | Semicolon-separated allowed roots for repo registration (unset = all allowed) |
+| `CODESEARCH_ALLOWED_HOSTS` | Comma-separated hostname allowlist for the MCP streamable-HTTP transport (unset = loopback only: `localhost`, `127.0.0.1`, `::1`). Set this to your container/service hostname when serve runs behind a container network or reverse proxy — see [Security](#security). |
+| `CODESEARCH_DISABLE_HOST_VALIDATION` | `1`/`true` disables the MCP transport's Host-header allowlist entirely (DNS-rebinding protection off). Only safe behind a reverse proxy/firewall that already restricts inbound Host headers — see [Security](#security). |
 | `CODESEARCH_MCP_MODE` | MCP mode: auto, client, local |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
@@ -611,6 +628,29 @@ When `codesearch serve` is exposed beyond a single trusted user (shared dev mach
 - **`CODESEARCH_ALLOWED_ROOTS`** — semicolon-separated list of filesystem roots. Repo registration is rejected for paths outside these roots. Prevents indexing arbitrary directories.
 
 Both are backward compatible: unset means no restriction (on a localhost bind).
+
+### MCP transport host allowlist (DNS-rebinding protection)
+
+The MCP streamable-HTTP transport (via `rmcp`) validates the incoming `Host` header against an allowlist to defend against DNS-rebinding attacks. By default this allowlist is **loopback-only** (`localhost`, `127.0.0.1`, `::1`), which rejects requests carrying a container hostname or service-discovery name — a common trip-up in containerised/orchestrated deployments (Docker, Kubernetes, etc.) where the client connects via a non-loopback Host header.
+
+- **`CODESEARCH_ALLOWED_HOSTS`** — comma-separated list of extra allowed hostnames (e.g. `codesearch-serve,codesearch-serve.internal`), replacing the loopback-only default. Prefer this over disabling validation.
+- **`CODESEARCH_DISABLE_HOST_VALIDATION`** — set to `1` or `true` to disable Host-header validation entirely. This removes the DNS-rebinding protection outright; only use it when serve is already fenced off by a reverse proxy or network policy that restricts which Host headers can reach it.
+
+Precedence: disable > custom allowlist > default (loopback-only).
+
+### Hardening against path traversal and injection
+
+Beyond the access-control gates above, codesearch applies several defense-in-depth mitigations at the filesystem and CLI boundary:
+
+- Project-path resolution (`index`, repo registration) fails fast on an unresolvable/malformed path instead of silently falling back to the raw, unvalidated input.
+- The `.NET` symbol-helper CLI (`scip-csharp`) canonicalizes every path argument (`--solution`, `--project`, `--output`, `--symbols-file`) before use.
+- Registering a project root that is itself a VCS/build-artifact directory (`.git`, `.svn`, `node_modules`, etc.) is rejected, preventing accidental indexing/exposure of internal VCS metadata.
+- Terminal output (search results, sync/reindex logs) strips ANSI/control-sequence injection from indexed file content before printing, so a maliciously crafted file can't manipulate the user's terminal.
+- On Unix, path-cache keys no longer collapse a literal backslash in a filename with a path separator (a Windows-only normalization rule is now gated to Windows).
+
+### Operational note: file-descriptor limits under process supervisors
+
+`codesearch serve`'s file-descriptor demand scales with the number of registered repos (each warm repo holds LMDB + full-text-index + file-watcher handles). Under a process supervisor with a low default open-file limit (notably **macOS launchd**, default soft `ulimit -n 256`), a large repo count can silently exhaust file descriptors: `accept()` then fails with `EMFILE` and the daemon looks alive to its supervisor while refusing new connections. Serve now raises its own soft `RLIMIT_NOFILE` to the hard limit at startup (Unix only) and logs a warning if the effective limit still looks insufficient for the registered repo count — but if you see repeated `EMFILE`/"Too many open files" in the logs, raise the **hard** limit for the service (e.g. launchd `SoftResourceLimits`/`HardResourceLimits`, systemd `LimitNOFILE=`, or `ulimit -n` in the service's environment).
 
 ### Federation security model
 

@@ -35,12 +35,13 @@ use tracing::{info, warn};
 
 use crate::cache::safe_canonicalize;
 use crate::constants::{
-    ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV, CSHARP_PREWARM_MAX_SYMBOLS,
-    CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT,
-    EXPLORE_PATH, FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS,
-    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
-    REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV,
-    SERVE_PORT_ENV, STATUS_PATH,
+    ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV,
+    CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
+    DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_PATH,
+    HEALTHZ_PATH, HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV,
+    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
+    STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -1507,7 +1508,7 @@ impl ServeState {
                 tracing::warn!(
                     "IndexManager init failed for '{}': {} - FSW not restarted, searches still work",
                     alias, e
-                );
+            );
             }
         }
     }
@@ -3735,6 +3736,168 @@ pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
 /// Run the MCP serve mode.
 ///
 /// This is the entry point called from CLI when `codesearch serve` is invoked.
+/// Extra fds reserved for everything that is not a repo store:
+/// listener + accepted sockets, SSE sessions, log files, embedding
+/// model files, federation clients.
+#[cfg(unix)]
+const FD_HEADROOM: u64 = 256;
+
+/// Rough per-repo fd demand: LMDB env + tantivy FTS segments +
+/// file-watcher handles. Measured ~15-17 fds per warm repo on macOS;
+/// 20 leaves margin for segment churn.
+#[cfg(unix)]
+const FDS_PER_REPO_ESTIMATE: u64 = 20;
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit before opening
+/// repo stores or binding the listener.
+///
+/// serve's fd demand scales with registered repo count (LMDB +
+/// tantivy + watcher handles per repo — ~1000 fds at 60 repos).
+/// Under process supervisors the default soft limit is often 256
+/// (macOS launchd agents, some systemd/docker configs). Once the
+/// process saturates that limit, `accept(2)` fails with `EMFILE` and
+/// the axum accept loop retries silently — the daemon looks alive to
+/// its supervisor while every new connection is refused or reset.
+/// Raising soft → hard at startup is standard daemon practice
+/// (nginx, envoy, postgres all do it) and turns a silent wedge into
+/// an explicit, logged operator decision.
+///
+/// Never fails the startup: on error we log and continue with the
+/// inherited limit, then warn if it looks too small for the
+/// registered repo count.
+#[cfg(unix)]
+fn raise_fd_limit(repo_count: usize) {
+    // SAFETY: getrlimit/setrlimit with a locally owned rlimit struct.
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            warn!(
+                "Could not read RLIMIT_NOFILE ({}); continuing with inherited limit",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let before = lim.rlim_cur;
+        if lim.rlim_cur < lim.rlim_max {
+            // On macOS the kernel caps the effective per-process limit
+            // at kern.maxfilesperproc even when rlim_max is RLIM_INFINITY;
+            // clamp so setrlimit does not fail with EINVAL.
+            #[cfg(target_os = "macos")]
+            let target = {
+                let mut maxfiles: libc::c_int = 0;
+                let mut size = std::mem::size_of::<libc::c_int>();
+                let name = std::ffi::CString::new("kern.maxfilesperproc").unwrap();
+                if libc::sysctlbyname(
+                    name.as_ptr(),
+                    &mut maxfiles as *mut _ as *mut libc::c_void,
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                ) == 0
+                {
+                    lim.rlim_max.min(maxfiles as libc::rlim_t)
+                } else {
+                    lim.rlim_max
+                }
+            };
+            #[cfg(not(target_os = "macos"))]
+            let target = lim.rlim_max;
+
+            if target > lim.rlim_cur {
+                lim.rlim_cur = target;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                    warn!(
+                        "Could not raise RLIMIT_NOFILE {} → {} ({}); continuing with inherited limit",
+                        before,
+                        target,
+                        std::io::Error::last_os_error()
+                    );
+                    lim.rlim_cur = before;
+                } else {
+                    info!("Raised RLIMIT_NOFILE soft limit {} → {}", before, target);
+                }
+            }
+        }
+
+        let estimated = (repo_count as u64) * FDS_PER_REPO_ESTIMATE + FD_HEADROOM;
+        // rlim_t width is platform-dependent (u64 on macOS/Linux glibc,
+        // but not guaranteed everywhere) — keep the explicit widening.
+        #[allow(clippy::unnecessary_cast)]
+        let soft = lim.rlim_cur as u64;
+        if soft < estimated {
+            warn!(
+                "⚠️  RLIMIT_NOFILE soft limit is {} but {} registered repos need an estimated {} fds \
+                 (LMDB + FTS + watcher handles per repo). When the limit is exhausted, accept(2) fails \
+                 with EMFILE and serve stops answering connections WITHOUT crashing. Raise the limit for \
+                 this process (launchd: SoftResourceLimits.NumberOfFiles; systemd: LimitNOFILE; \
+                 shell: ulimit -n) or reduce the number of registered repos.",
+                soft, repo_count, estimated
+            );
+        }
+    }
+}
+
+/// Build the rmcp `StreamableHttpServerConfig`, applying env-var overrides for
+/// the DNS-rebinding `Host` header validation (GHSA-89vp-x53w-74fx, fixed
+/// upstream in rmcp 1.4.0; default allowlist is loopback-only).
+///
+/// Resolution order (first match wins):
+/// 1. `CODESEARCH_DISABLE_HOST_VALIDATION=1|true` → `disable_allowed_hosts()`
+///    (only safe behind a reverse proxy that validates Host itself). Logged
+///    at WARN.
+/// 2. `CODESEARCH_ALLOWED_HOSTS=host[,host:port,...]` → `with_allowed_hosts(...)`
+///    (comma-separated, whitespace-trimmed, empties dropped). Logged at INFO.
+/// 3. Both unset (or `ALLOWED_HOSTS` empty after trim) → rmcp loopback-only
+///    default (`["localhost", "127.0.0.1", "::1"]`).
+///
+/// See issue #149.
+fn build_streamable_http_config() -> StreamableHttpServerConfig {
+    let config = StreamableHttpServerConfig::default();
+
+    if std::env::var(DISABLE_HOST_VALIDATION_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        warn!(
+            "DNS rebinding protection (rmcp allowed_hosts) DISABLED via {DISABLE_HOST_VALIDATION_ENV}. \
+             Only safe behind a reverse proxy that validates the Host header."
+        );
+        return config.disable_allowed_hosts();
+    }
+
+    match std::env::var(ALLOWED_HOSTS_ENV)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => {
+            let hosts: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if hosts.is_empty() {
+                warn!(
+                    "{ALLOWED_HOSTS_ENV} was set but contained no valid host entries; \
+                     using rmcp loopback-only default"
+                );
+                config
+            } else {
+                info!(
+                    "Overriding rmcp allowed_hosts with {} entry/entries from {ALLOWED_HOSTS_ENV}: [{}]",
+                    hosts.len(),
+                    hosts.join(", ")
+                );
+                config.with_allowed_hosts(hosts)
+            }
+        }
+        None => config,
+    }
+}
+
 pub async fn run_serve(
     host: Option<String>,
     port: Option<u16>,
@@ -3807,6 +3970,12 @@ pub async fn run_serve(
         }
     }
 
+    // Raise the fd soft limit BEFORE opening any repo store or binding
+    // the listener — fd demand scales with repo count and a 256-fd
+    // supervisor default wedges accept(2) silently (EMFILE).
+    #[cfg(unix)]
+    raise_fd_limit(config.repos.len());
+
     let serve_state = Arc::new(ServeState::new(config, None));
 
     // Construct the bind address from resolved host + port.
@@ -3870,7 +4039,10 @@ pub async fn run_serve(
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.keep_alive = None;
     let session_manager = Arc::new(session_manager);
-    let config = StreamableHttpServerConfig::default();
+
+    // Configure the rmcp Streamable HTTP server's DNS-rebinding defence
+    // (GHSA-89vp-x53w-74fx, fixed upstream in rmcp 1.4.0). See issue #149.
+    let config = build_streamable_http_config();
 
     let mcp_service = StreamableHttpService::new(service_factory, session_manager, config);
 
@@ -4287,17 +4459,20 @@ mod tests {
         );
         assert!(!state.repos.contains_key("testalias"));
 
-        // Create a minimal DB so next call succeeds
+        // Recreate the DB directory + metadata so the next call succeeds.
+        // Deliberately do NOT open SharedStores directly here: the reopen below
+        // (get_or_open_stores → try_open_stores) creates the LMDB env itself
+        // (proven by `try_open_stores_creates_db_for_brand_new_repo`). Opening
+        // it directly first would open the same LMDB env twice in one process,
+        // which the AGENTS.md LMDB rule forbids; on Linux the first env is not
+        // always released before the reopen, making this test flaky. One open =
+        // deterministic.
         let db_path = repo_path.join(DB_DIR_NAME);
         std::fs::create_dir(&db_path).unwrap();
         let meta = db_path.join("metadata.json");
         let mut f = std::fs::File::create(&meta).unwrap();
         write!(f, "{{\"dimensions\":384}}").unwrap();
         drop(f);
-
-        // Create the LMDB files (data.mdb and lock.mdb) by opening SharedStores directly
-        let _stores = SharedStores::new(&db_path, 384).unwrap();
-        drop(_stores);
 
         // Second call: should succeed without restart
         let res = state.get_or_open_stores("testalias", true).await;
@@ -5233,5 +5408,118 @@ mod tests {
 
         // "all" is never stored — an unknown real group still errors.
         assert!(state.resolve_group_aliases("does-not-exist").is_err());
+    }
+
+    /// Tests for `build_streamable_http_config` — DNS rebinding defence env vars
+    /// (`CODESEARCH_ALLOWED_HOSTS`, `CODESEARCH_DISABLE_HOST_VALIDATION`) added
+    /// for issue #149 / GHSA-89vp-x53w-74fx.
+    mod allowed_hosts_tests {
+        use super::*;
+        use std::sync::Mutex;
+
+        /// Serialize env var mutations across parallel test threads (same pattern
+        /// as `allowed_roots_tests`). Different env vars from `allowed_roots_tests`
+        /// so cross-module parallelism is safe.
+        static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        }
+
+        fn clear_env() {
+            std::env::remove_var(ALLOWED_HOSTS_ENV);
+            std::env::remove_var(DISABLE_HOST_VALIDATION_ENV);
+        }
+
+        #[test]
+        fn default_is_loopback_only() {
+            let _guard = lock();
+            clear_env();
+            let config = build_streamable_http_config();
+            assert_eq!(
+                config.allowed_hosts,
+                vec![
+                    "localhost".to_string(),
+                    "127.0.0.1".to_string(),
+                    "::1".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn custom_allowed_hosts_replaces_default() {
+            let _guard = lock();
+            clear_env();
+            std::env::set_var(ALLOWED_HOSTS_ENV, "codesearch.internal, codesearch:39725");
+            let config = build_streamable_http_config();
+            assert_eq!(
+                config.allowed_hosts,
+                vec![
+                    "codesearch.internal".to_string(),
+                    "codesearch:39725".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn disable_validation_clears_allowlist() {
+            let _guard = lock();
+            clear_env();
+            std::env::set_var(DISABLE_HOST_VALIDATION_ENV, "1");
+            let config = build_streamable_http_config();
+            assert!(
+                config.allowed_hosts.is_empty(),
+                "disable_allowed_hosts() should produce an empty allowlist"
+            );
+        }
+
+        #[test]
+        fn disable_validation_accepts_true_case_insensitive() {
+            let _guard = lock();
+            clear_env();
+            std::env::set_var(DISABLE_HOST_VALIDATION_ENV, "TRUE");
+            let config = build_streamable_http_config();
+            assert!(config.allowed_hosts.is_empty());
+        }
+
+        #[test]
+        fn disable_validation_ignores_other_values() {
+            let _guard = lock();
+            clear_env();
+            std::env::set_var(DISABLE_HOST_VALIDATION_ENV, "yes");
+            let config = build_streamable_http_config();
+            // Not "1" or "true" → rmcp default applies.
+            assert_eq!(config.allowed_hosts.len(), 3);
+        }
+
+        #[test]
+        fn empty_allowed_hosts_falls_back_to_default() {
+            let _guard = lock();
+            clear_env();
+            std::env::set_var(ALLOWED_HOSTS_ENV, "  ,  ,  ");
+            let config = build_streamable_http_config();
+            assert_eq!(
+                config.allowed_hosts,
+                vec![
+                    "localhost".to_string(),
+                    "127.0.0.1".to_string(),
+                    "::1".to_string(),
+                ],
+                "all-empty entries should leave the rmcp default intact"
+            );
+        }
+
+        #[test]
+        fn disable_overrides_allowed_hosts() {
+            let _guard = lock();
+            clear_env();
+            std::env::set_var(ALLOWED_HOSTS_ENV, "codesearch.internal");
+            std::env::set_var(DISABLE_HOST_VALIDATION_ENV, "true");
+            let config = build_streamable_http_config();
+            assert!(
+                config.allowed_hosts.is_empty(),
+                "DISABLE_HOST_VALIDATION takes precedence over ALLOWED_HOSTS"
+            );
+        }
     }
 }

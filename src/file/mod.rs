@@ -90,6 +90,27 @@ impl FileWalker {
 
     /// Walk files, returning detailed file information
     pub fn walk(&self) -> Result<(Vec<FileInfo>, WalkStats)> {
+        // Security (Aikido group 30641794): refuse to walk a root whose own
+        // name is on the always-excluded list (e.g. `.git`, `.svn`, `node_modules`).
+        // The `filter_entry` closure below skips these names at depth >= 1, but
+        // it short-circuits on `depth() == 0` (the root). Without this guard,
+        // `codesearch index ./.git` would happily index every object, ref, and
+        // config file under `.git/`, exposing internal/sensitive metadata via
+        // search results. Fail fast at the walker's entry point so every caller
+        // (CLI `index`, HTTP `/repos`, `doctor`, `sync_database`, watcher) is
+        // covered uniformly.
+        if let Some(name) = self.root.file_name().and_then(|n| n.to_str()) {
+            if ALWAYS_EXCLUDED.contains(&name) {
+                anyhow::bail!(
+                    "Refusing to index '{}' — this directory name is on the \
+                     always-excluded list (e.g. `.git`, `.svn`, `node_modules`). \
+                     Indexing it would expose internal/sensitive files via search. \
+                     Point the indexer at the parent project directory instead.",
+                    self.root.display()
+                );
+            }
+        }
+
         let mut files = Vec::new();
         let mut stats = WalkStats::new();
 
@@ -299,5 +320,35 @@ mod tests {
         // Should only get index.js, not the node_modules file
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path.file_name().unwrap(), "index.js");
+    }
+
+    /// A root whose own name matches an `ALWAYS_EXCLUDED` entry (e.g. `.git`)
+    /// must be rejected at `walk()` time — otherwise the depth==0 short-circuit
+    /// in `filter_entry` would let every internal file be indexed.
+    /// Covers Aikido group 30641794.
+    #[test]
+    fn test_rejects_excluded_named_root() {
+        let parent = TempDir::new().unwrap();
+        let git_root = parent.path().join(".git");
+        fs::create_dir(&git_root).unwrap();
+        fs::write(git_root.join("config"), "[core]").unwrap();
+        fs::write(git_root.join("HEAD"), "ref: refs/heads/main").unwrap();
+
+        let walker = FileWalker::new(&git_root);
+        let err = walker.walk().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Refusing to index"),
+            "expected refusal message, got: {}",
+            msg
+        );
+        assert!(msg.contains(".git"), "message should name the offender");
+
+        // Sanity: a non-excluded name in the same parent walks normally.
+        let ok_root = parent.path().join("real_project");
+        fs::create_dir(&ok_root).unwrap();
+        fs::write(ok_root.join("main.rs"), "fn main() {}").unwrap();
+        let (files, _) = FileWalker::new(&ok_root).walk().unwrap();
+        assert_eq!(files.len(), 1);
     }
 }

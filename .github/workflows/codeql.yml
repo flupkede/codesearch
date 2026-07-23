@@ -14,6 +14,14 @@ jobs:
     name: Analyze
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Skip on fork pull requests: the restricted GITHUB_TOKEN for fork PRs
+    # cannot write `security-events` back to the upstream repo, so the
+    # `github/codeql-action/analyze` upload step fails with
+    # "Resource not accessible by integration". CodeQL still runs on push
+    # events to develop/master (where the token has full write scopes per
+    # the `permissions:` block below), so merged code is still scanned —
+    # this only skips the redundant, upload-failing fork-PR run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       actions: read
       contents: read
@@ -26,7 +34,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # pin@v4
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3

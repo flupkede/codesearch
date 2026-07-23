@@ -408,6 +408,14 @@ pub fn adapt_rrf_k(query: &str) -> (f64, f64) {
 /// Search the codebase
 pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) -> Result<()> {
     let (db_path, project_path) = get_db_path(path.clone())?;
+    let requested_model = options
+        .model_override
+        .as_deref()
+        .map(|name| {
+            ModelType::parse(name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown embedding model override '{name}'"))
+        })
+        .transpose()?;
 
     if !db_path.exists() {
         if options.create_index {
@@ -417,7 +425,8 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 "🚀 No index found, creating one...".bright_cyan()
             ));
             let cancel_token = tokio_util::sync::CancellationToken::new();
-            crate::index::index_quiet(path, false, false, cancel_token).await?;
+            crate::index::index_quiet_with_model(path, false, false, requested_model, cancel_token)
+                .await?;
             crate::output::print_info(format_args!("{}", "✅ Index created successfully!".green()));
         } else {
             println!("{}", "❌ No database found!".red());
@@ -437,21 +446,35 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 
     // Read model metadata from database FIRST (needed for sync)
     let (model_type, dimensions, primary_language) =
-        if let Some(ref model_name) = options.model_override {
-            // User specified a model - use it (warning: may not match indexed data!)
-            let mt = ModelType::parse(model_name).unwrap_or_else(|| {
-                tracing::warn!(
-                    "Unrecognized model override '{}', falling back to default model",
-                    model_name
-                );
-                ModelType::default()
-            });
-            (mt, mt.dimensions(), None)
-        } else if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
+        if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
             // Use model from metadata
             if let Some(mt) = ModelType::parse(&model_name) {
+                if let Some(requested) = requested_model {
+                    if requested != mt {
+                        anyhow::bail!(
+                            "Index uses embedding model '{}', but '--model {}' was requested. \
+                             Rebuild the index with `codesearch --model {} index {} --force` \
+                             before searching.",
+                            mt.short_name(),
+                            requested.short_name(),
+                            requested.short_name(),
+                            project_path.display()
+                        );
+                    }
+                }
                 (mt, dims, lang)
             } else {
+                if let Some(requested) = requested_model {
+                    anyhow::bail!(
+                        "Index metadata names unknown embedding model '{}', so '--model {}' \
+                         cannot be verified. Rebuild the index with \
+                         `codesearch --model {} index {} --force`.",
+                        model_name,
+                        requested.short_name(),
+                        requested.short_name(),
+                        project_path.display()
+                    );
+                }
                 // Model name not recognized, fall back to default
                 tracing::warn!(
                     "Unrecognized model '{}' in database metadata, falling back to default model",
@@ -463,6 +486,14 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
                 );
                 (ModelType::default(), 384, None)
             }
+        } else if let Some(requested) = requested_model {
+            anyhow::bail!(
+                "Cannot verify '--model {}' because the index metadata is missing or invalid. \
+                 Rebuild the index with `codesearch --model {} index {} --force`.",
+                requested.short_name(),
+                requested.short_name(),
+                project_path.display()
+            );
         } else {
             // No metadata, fall back to default
             (ModelType::default(), 384, None)
@@ -962,7 +993,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         let mut seen_files = std::collections::HashSet::new();
         for result in &results {
             if !seen_files.contains(&result.path) {
-                println!("{}", result.path);
+                println!("{}", sanitize_for_terminal(&result.path));
                 seen_files.insert(result.path.clone());
             }
         }
@@ -972,7 +1003,10 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // Standard output
     println!("{}", "🔍 Search Results".bright_cyan().bold());
     println!("{}", "=".repeat(60));
-    println!("Query: \"{}\"", query.bright_yellow());
+    println!(
+        "Query: \"{}\"",
+        sanitize_for_terminal(query).bright_yellow()
+    );
     if let Some(pf) = options.per_file {
         println!(
             "Found {} results (showing up to {} per file)",
@@ -1094,7 +1128,10 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
         }
 
         changes += 1;
-        println!("  📝 {}", file.path.display());
+        println!(
+            "  📝 {}",
+            sanitize_for_terminal(&file.path.display().to_string())
+        );
 
         // Delete old chunks
         if !old_chunk_ids.is_empty() {
@@ -1124,7 +1161,7 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
     let deleted_files = file_meta.find_deleted_files();
     for (path, chunk_ids) in &deleted_files {
         changes += 1;
-        println!("  🗑️  {} (deleted)", path);
+        println!("  🗑️  {} (deleted)", sanitize_for_terminal(path));
         if !chunk_ids.is_empty() {
             store.delete_chunks(chunk_ids)?;
         }
@@ -1144,6 +1181,77 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
     Ok(())
 }
 
+/// Strip ANSI escape sequences and terminal-control bytes from a string.
+///
+/// Indexed content may contain CSI/OSC sequences (e.g. `\x1b[2J` clears the
+/// screen, `\x1b[8m` hides text, `\x1b]0;...\x07` rewrites the window title).
+/// If printed verbatim, the host terminal interprets them — enabling a range
+/// of attacks from screen-clearing DoS to hidden-text obfuscation. This
+/// helper strips:
+///   * CSI sequences: `ESC [ <params 0x30-0x3F> <intermediate 0x20-0x2F> <final 0x40-0x7E>`
+///   * OSC sequences: `ESC ] <data> (BEL | ESC \\)`
+///   * Single-char escape sequences: `ESC <0x40-0x5F>`
+///   * Stray control characters except `\n` and `\t`
+///
+/// Output is safe to feed into `Colorize` methods without risk of the inner
+/// content breaking out of the color wrapper. Mitigates Aikido group 30641757
+/// (ANSI escape sequence injection in search output).
+fn sanitize_for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if c == '\n' || c == '\t' || !c.is_control() {
+                out.push(c);
+            }
+            continue;
+        }
+        // ESC sequence — consume per ECMA-48
+        match chars.peek().copied() {
+            None => break,
+            Some('[') => {
+                chars.next();
+                while let Some(p) = chars.peek().copied() {
+                    let code = p as u32;
+                    if (0x30..=0x3f).contains(&code) || (0x20..=0x2f).contains(&code) {
+                        chars.next();
+                    } else if (0x40..=0x7e).contains(&code) {
+                        chars.next();
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some('\x07') => break,
+                        Some('\x1b') => {
+                            if matches!(chars.peek().copied(), Some('\\')) {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        Some(_) => continue,
+                        None => break,
+                    }
+                }
+            }
+            Some(c2) => {
+                let code = c2 as u32;
+                if (0x40..=0x5f).contains(&code) {
+                    chars.next();
+                }
+                // ESC followed by something unexpected: drop the ESC, leave
+                // the next char to be processed normally on the next loop.
+            }
+        }
+    }
+    out
+}
+
 fn print_result(
     result: &crate::vectordb::SearchResult,
     show_file: bool,
@@ -1152,20 +1260,22 @@ fn print_result(
 ) -> Result<()> {
     if show_file {
         println!("{}", "─".repeat(60));
-        let file_display = format!("📄 {}", result.path);
+        let file_display = format!("📄 {}", sanitize_for_terminal(&result.path));
         println!("{}", file_display.bright_green());
     }
 
     // Show location and kind
     let location = format!(
         "   Lines {}-{} • {}",
-        result.start_line, result.end_line, result.kind
+        result.start_line,
+        result.end_line,
+        sanitize_for_terminal(&result.kind)
     );
     println!("{}", location.dimmed());
 
     // Show signature if available
     if let Some(sig) = &result.signature {
-        println!("   {}", sig.bright_cyan());
+        println!("   {}", sanitize_for_terminal(sig).bright_cyan());
     }
 
     // Show score if requested
@@ -1191,7 +1301,7 @@ fn print_result(
 
     // Show context if available
     if let Some(ctx) = &result.context {
-        println!("   Context: {}", ctx.dimmed());
+        println!("   Context: {}", sanitize_for_terminal(ctx).dimmed());
     }
 
     // Show content if requested
@@ -1200,13 +1310,13 @@ fn print_result(
         if let Some(ctx_prev) = &result.context_prev {
             println!("\n   {}:", "Context (before)".dimmed());
             for line in ctx_prev.lines() {
-                println!("   │ {}", line.bright_black());
+                println!("   │ {}", sanitize_for_terminal(line).bright_black());
             }
         }
 
         println!("\n   {}:", "Content".bright_yellow());
         for line in result.content.lines().take(10) {
-            println!("   │ {}", line.dimmed());
+            println!("   │ {}", sanitize_for_terminal(line).dimmed());
         }
         if result.content.lines().count() > 10 {
             println!("   │ {}", "...".dimmed());
@@ -1216,15 +1326,26 @@ fn print_result(
         if let Some(ctx_next) = &result.context_next {
             println!("\n   {}:", "Context (after)".dimmed());
             for line in ctx_next.lines() {
-                println!("   │ {}", line.bright_black());
+                println!("   │ {}", sanitize_for_terminal(line).bright_black());
             }
         }
     } else {
         // Show a snippet
-        let snippet: String = result.content.lines().take(3).collect::<Vec<_>>().join(" ");
+        let snippet: String = result
+            .content
+            .lines()
+            .take(3)
+            .map(sanitize_for_terminal)
+            .collect::<Vec<_>>()
+            .join(" ");
 
         let snippet = if snippet.len() > 100 {
-            format!("{}...", &snippet[..100])
+            // Truncate at the largest UTF-8 char boundary <= 100 bytes.
+            // Plain `&snippet[..100]` panics if byte 100 falls inside a
+            // multi-byte character (box-drawing separators, CJK, emoji) —
+            // see issue #148.
+            let cut = snippet.floor_char_boundary(100);
+            format!("{}...", &snippet[..cut])
         } else {
             snippet
         };
@@ -1465,12 +1586,28 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_filter_matches_absolute_windows_path_under_root() {
         let project_root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
         let filter = normalize_filter_path("src/");
         assert!(path_matches_filter(
             r"\\?\C:\WorkArea\AI\codesearch\src\index\mod.rs",
+            &filter,
+            &project_root,
+        ));
+    }
+
+    // Unix counterpart: native forward-slash absolute path. normalize_path_str
+    // intentionally leaves '\' untouched on Unix (see file_meta.rs Aikido
+    // rationale), so the Windows-path variant is gated off there.
+    #[cfg(unix)]
+    #[test]
+    fn test_path_filter_matches_absolute_unix_path_under_root() {
+        let project_root = normalize_path_str("/work/codesearch");
+        let filter = normalize_filter_path("src/");
+        assert!(path_matches_filter(
+            "/work/codesearch/src/index/mod.rs",
             &filter,
             &project_root,
         ));
@@ -1492,5 +1629,96 @@ mod tests {
         let project_root = normalize_path_str("C:/WorkArea/AI/codesearch");
         let filter = normalize_filter_path("src/");
         assert!(path_matches_filter("./src/lib.rs", &filter, &project_root));
+    }
+
+    // ── sanitize_for_terminal ───────────────────────────────────────────────
+
+    #[test]
+    fn test_sanitize_strips_csi_clear_screen() {
+        // \x1b[2J = clear screen
+        assert_eq!(sanitize_for_terminal("hello\x1b[2Jworld"), "helloworld");
+    }
+
+    #[test]
+    fn test_sanitize_strips_csi_with_params() {
+        // \x1b[38;5;200m = set 256-color foreground
+        assert_eq!(
+            sanitize_for_terminal("\x1b[38;5;200mred\x1b[0m text"),
+            "red text"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_strips_osc_bel_terminator() {
+        // \x1b]0;title\x07 = set window title, BEL terminator
+        assert_eq!(sanitize_for_terminal("a\x1b]0;title\x07b"), "ab");
+    }
+
+    #[test]
+    fn test_sanitize_strips_osc_st_terminator() {
+        // \x1b]0;title\x1b\\ = set window title, ST terminator
+        assert_eq!(sanitize_for_terminal("a\x1b]0;title\x1b\\b"), "ab");
+    }
+
+    #[test]
+    fn test_sanitize_strips_single_char_escape() {
+        // ESC M = Reverse Index (RI), in the 0x40-0x5F documented range
+        assert_eq!(sanitize_for_terminal("a\x1bM b"), "a b");
+    }
+
+    #[test]
+    fn test_sanitize_strips_control_chars_except_newline_tab() {
+        // NUL, BEL, backspace, vertical tab, form feed, CR — all stripped
+        assert_eq!(
+            sanitize_for_terminal("a\x00b\x07c\x08d\x0be\x0cf\rg"),
+            "abcdefg"
+        );
+        // newline and tab preserved
+        assert_eq!(sanitize_for_terminal("a\nb\tc"), "a\nb\tc");
+    }
+
+    #[test]
+    fn test_sanitize_strips_back_to_back_escapes() {
+        // Two consecutive CSI sequences — both stripped
+        assert_eq!(sanitize_for_terminal("\x1b[2J\x1b[2Jcleared"), "cleared");
+    }
+
+    #[test]
+    fn test_sanitize_preserves_unicode() {
+        assert_eq!(sanitize_for_terminal("héllo → 世界 🦀"), "héllo → 世界 🦀");
+    }
+
+    #[test]
+    fn test_sanitize_preserves_empty_and_clean_strings() {
+        assert_eq!(sanitize_for_terminal(""), "");
+        assert_eq!(sanitize_for_terminal("clean string"), "clean string");
+    }
+
+    #[test]
+    fn test_sanitize_truncated_escape_dropped_safely() {
+        // Truncated CSI at end of string — should not panic
+        assert_eq!(sanitize_for_terminal("text\x1b["), "text");
+        // Truncated OSC at end of string
+        assert_eq!(sanitize_for_terminal("text\x1b]0;unterminated"), "text");
+        // Lone ESC at end
+        assert_eq!(sanitize_for_terminal("text\x1b"), "text");
+    }
+
+    #[test]
+    fn test_byte_truncation_preserves_char_boundary() {
+        // Regression for issue #148: `&snippet[..100]` panicked when byte
+        // offset 100 fell inside a multi-byte character (box-drawing U+2500
+        // in comment-art, CJK, emoji). 40 × U+2500 = 120 bytes, so byte 100
+        // is inside char #34 (bytes 99..102).
+        let s: String = std::iter::repeat_n('─', 40).collect();
+        assert!(s.len() > 100, "fixture must exceed 100 bytes");
+        let cut = s.floor_char_boundary(100);
+        assert!(cut <= 100);
+        assert!(s.is_char_boundary(cut), "cut must land on a char boundary");
+        let truncated = &s[..cut];
+        // All chars are 3 bytes; cut must be a multiple of 3.
+        assert_eq!(cut % 3, 0);
+        assert_eq!(truncated.chars().count(), cut / 3);
+        // The pre-fix code (`&s[..100]`) would panic on this fixture.
     }
 }

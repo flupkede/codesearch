@@ -261,10 +261,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub store: Option<String>,
 
-    /// Embedding model to use (e.g., bge-small, minilm-l6-q, jina-code)
-    /// Available: minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm,
-    ///            bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q,
-    ///            jina-code, e5-multilingual, mxbai-large, modernbert-large
+    /// Embedding model to use (e.g., bge-small, jina-code, embeddinggemma-q4)
     #[arg(long, global = true)]
     pub model: Option<String>,
 }
@@ -871,6 +868,18 @@ async fn run_remote_reindex(peer_name: &str, alias: &str, force: bool, json: boo
     Ok(())
 }
 
+fn warn_if_heavier_model(model_type: ModelType) {
+    if model_type.is_heavier_than_default() {
+        crate::warn_print!(
+            "Warning: model '{}' produces {}-dimensional vectors (default: {}). \
+             Expect higher vector-index RAM and disk usage.",
+            model_type.short_name(),
+            model_type.dimensions(),
+            ModelType::default().dimensions()
+        );
+    }
+}
+
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
     let cli = Cli::parse();
 
@@ -881,9 +890,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             "Unknown model: '{}'. Available models:",
             cli.model.as_deref().unwrap_or_default()
         );
-        eprintln!("  minilm-l6, minilm-l6-q, minilm-l12, minilm-l12-q, paraphrase-minilm");
-        eprintln!("  bge-small, bge-small-q, bge-base, nomic-v1, nomic-v1.5, nomic-v1.5-q");
-        eprintln!("  jina-code, e5-multilingual, mxbai-large, modernbert-large");
+        eprintln!("  {}", ModelType::valid_short_names());
         std::process::exit(1);
     }
 
@@ -918,6 +925,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             if json {
                 crate::output::set_quiet(true);
             }
+            if let Some(mt) = model_type {
+                warn_if_heavier_model(mt);
+            }
             let options = SearchOptions {
                 max_results,
                 per_file: if per_file == 0 { None } else { Some(per_file) },
@@ -927,7 +937,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 sync,
                 json,
                 filter_path,
-                model_override: model_type.map(|mt| format!("{:?}", mt)),
+                model_override: model_type.map(|mt| mt.short_name().to_string()),
                 vector_only,
                 rrf_k: if rrf_k == 60.0 {
                     None
@@ -981,6 +991,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                                     parsed
                                 })
                                 .or(model_type);
+                            if let Some(mt) = mt {
+                                warn_if_heavier_model(mt);
+                            }
                             crate::index::add_to_index(add_path, global, mt, cancel_token.clone())
                                 .await
                         }
@@ -1040,6 +1053,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
 
                 if add || is_add_cmd {
                     let effective_path = if is_add_cmd { None } else { path };
+                    if let Some(mt) = model_type {
+                        warn_if_heavier_model(mt);
+                    }
                     crate::index::add_to_index(
                         effective_path,
                         global,
@@ -1072,6 +1088,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         ),
                     }
                 } else {
+                    if let Some(mt) = model_type {
+                        warn_if_heavier_model(mt);
+                    }
                     crate::index::index(
                         path,
                         dry_run,

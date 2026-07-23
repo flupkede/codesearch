@@ -58,14 +58,37 @@ pub fn safe_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
 /// prefix (`\\?\C:\...`). Notify (FSW) events may use standard paths (`C:\...`).
 /// This function strips the UNC prefix and converts backslashes to forward slashes
 /// so that paths from different sources all map to the same key.
+///
+/// **Platform behavior** (Aikido group 30641757, priority 46):
+/// - **Windows**: backslash IS a path separator — converting it to `/` is
+///   required for HashMap consistency across APIs.
+/// - **Unix**: backslash is a **legal filename character** (not a separator).
+///   A file literally named `foo\bar.rs` is distinct from `foo/bar.rs` (which
+///   lives in subdirectory `foo`). Unconditionally converting `\` → `/` would
+///   collapse these two unrelated files into one HashMap key, causing silent
+///   metadata corruption (one file's chunks overwrite the other's).
 pub fn normalize_path(path: &Path) -> String {
     let s = path.to_string_lossy();
-    s.trim_start_matches(r"\\?\").replace('\\', "/")
+    normalize_path_str(&s)
 }
 
 /// Normalize a path string (same logic as `normalize_path` but for `&str` input).
+///
+/// See `normalize_path` for the platform-specific separator handling and
+/// the Aikido 30641757 rationale.
 pub fn normalize_path_str(path: &str) -> String {
-    path.trim_start_matches(r"\\?\").replace('\\', "/")
+    let trimmed = path.trim_start_matches(r"\\?\");
+    #[cfg(windows)]
+    {
+        trimmed.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        // Backslash is a legal filename char on Unix — preserve it literally.
+        // UNC prefix is already stripped above (it's a no-op on Unix in
+        // practice, but defensive in case a Windows-style path string leaks in).
+        trimmed.to_string()
+    }
 }
 
 /// Normalize a filter path for prefix matching.
@@ -451,6 +474,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_normalize_path_strips_unc_prefix() {
         let path = Path::new(r"\\?\C:\WorkArea\AI\codesearch\src\main.rs");
@@ -460,6 +484,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_normalize_path_converts_backslashes() {
         let path = Path::new(r"C:\WorkArea\AI\codesearch\src\main.rs");
@@ -479,6 +504,7 @@ mod tests {
         assert!(!result.starts_with(r"\\?\"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_normalize_path_str_strips_unc() {
         assert_eq!(normalize_path_str(r"\\?\C:\foo\bar.rs"), "C:/foo/bar.rs");
@@ -491,6 +517,25 @@ mod tests {
         assert_eq!(normalize_path(path), "/home/user/project/src/main.rs");
     }
 
+    /// Aikido 30641757 (priority 46): on Unix, a file whose name literally
+    /// contains a backslash (`foo\bar.rs`) is distinct from a file in a
+    /// subdirectory (`foo/bar.rs`). Both must NOT collapse to the same key.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_normalize_path_preserves_unix_backslash_filenames() {
+        // Subdirectory file — forward slash is the separator.
+        let subdir = normalize_path(Path::new("foo/bar.rs"));
+        // Literal-backslash filename — backslash is part of the name on Unix.
+        let literal = normalize_path(Path::new("foo\\bar.rs"));
+        assert_ne!(
+            subdir, literal,
+            "Unix must NOT collapse `foo/bar.rs` and `foo\\bar.rs` into the same key"
+        );
+        assert_eq!(subdir, "foo/bar.rs");
+        assert_eq!(literal, "foo\\bar.rs");
+    }
+
+    #[cfg(windows)]
     #[test]
     fn test_normalize_path_mixed_separators() {
         // Mixed separators should be normalized to forward slashes
@@ -498,6 +543,7 @@ mod tests {
         assert_eq!(normalize_path(path), "C:/Users/project/src/lib.rs");
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_normalize_path_str_mixed_separators() {
         assert_eq!(
@@ -516,6 +562,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_normalize_path_deeply_nested() {
         // Deeply nested paths
@@ -526,6 +573,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_normalize_path_consecutive_backslashes() {
         // Consecutive backslashes (edge case from file systems)
@@ -533,6 +581,7 @@ mod tests {
         assert_eq!(normalize_path(path), "C://Double//Backslashes//file.rs");
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_migrate_paths_normalizes_keys() {
         let mut store = FileMetaStore::new("test-model".to_string(), 384);
@@ -610,6 +659,7 @@ mod tests {
     // These test the exact bug patterns that have caused issues in production.
     // =========================================================================
 
+    #[cfg(windows)]
     #[test]
     fn test_path_comparison_unc_vs_normal() {
         // UNC prefix (from Windows canonicalize) must match normal path
@@ -618,6 +668,7 @@ mod tests {
         assert_eq!(unc, normal);
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_comparison_backslash_vs_forward() {
         let backslash = normalize_path(Path::new(r"C:\WorkArea\src\main.rs"));
@@ -625,6 +676,7 @@ mod tests {
         assert_eq!(backslash, forward);
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_str_comparison_unc_vs_normal() {
         let unc = normalize_path_str(r"\\?\C:\WorkArea\src\main.rs");
@@ -632,6 +684,7 @@ mod tests {
         assert_eq!(unc, normal);
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_comparison_stored_vs_walker() {
         // Simulates: FileMetaStore stored path vs FileWalker discovered path
@@ -645,6 +698,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_filter_starts_with() {
         // Simulates: --filter-path src/ matching against stored paths
@@ -657,6 +711,7 @@ mod tests {
         assert!(stored.starts_with(&filter_bs));
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_filter_with_unc_prefix() {
         // Agent sends UNC path as filter, stored paths are normalized
@@ -683,6 +738,7 @@ mod tests {
         assert_eq!(from_path, from_str);
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_normalize_path_relative_strips_project_root() {
         let root = normalize_path_str(r"C:\WorkArea\AI\codesearch");
@@ -709,6 +765,7 @@ mod tests {
         assert_eq!(normalize_filter_path("./src/"), "src/");
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_path_matches_filter_with_absolute_windows_path() {
         let root = normalize_path_str(r"C:\WorkArea\AI\codesearch");

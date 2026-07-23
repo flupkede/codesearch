@@ -234,6 +234,31 @@ pub const SERVE_API_KEY_ENV: &str = "CODESEARCH_SERVE_API_KEY";
 /// Example: `CODESEARCH_ALLOWED_ROOTS=/home/user/repos;/opt/code`
 pub const ALLOWED_ROOTS_ENV: &str = "CODESEARCH_ALLOWED_ROOTS";
 
+/// Environment variable to override the rmcp Streamable HTTP server's
+/// `allowed_hosts` list (DNS-rebinding defence, GHSA-89vp-x53w-74fx).
+///
+/// rmcp's default is loopback-only (`["localhost", "127.0.0.1", "::1"]`),
+/// which rejects the container hostname in containerised deployments with
+/// `WARN ... rejected request with disallowed Host header`. Setting this
+/// env var to a comma-separated list of hostnames / `host:port` replaces
+/// the default allowlist.
+///
+/// When unset or empty, the rmcp default applies. See issue #149.
+/// Example: `CODESEARCH_ALLOWED_HOSTS=codesearch.internal, codesearch:39725`
+pub const ALLOWED_HOSTS_ENV: &str = "CODESEARCH_ALLOWED_HOSTS";
+
+/// Environment variable to disable the rmcp Streamable HTTP server's
+/// `Host` header validation entirely.
+///
+/// **Dangerous**: turns off DNS-rebinding protection (GHSA-89vp-x53w-74fx).
+/// Only set when codesearch runs behind a reverse proxy (nginx, Caddy,
+/// Traefik) that itself validates the `Host` header against an allowlist.
+/// Any other value leaves validation enabled.
+///
+/// Accepts `1` or `true` (case-insensitive) to disable.
+/// Example: `CODESEARCH_DISABLE_HOST_VALIDATION=1`
+pub const DISABLE_HOST_VALIDATION_ENV: &str = "CODESEARCH_DISABLE_HOST_VALIDATION";
+
 /// Default base URL for connecting to a local `codesearch serve` instance.
 /// Used as the clap `--url` default and in `serve_base_url()`.
 ///
