@@ -306,7 +306,7 @@ In multi-repo mode: auto-routes when chunk_id is unique; returns candidates list
 
 ### `find_impact` — Symbol Reference Impact
 
-Find all call-sites and references to a symbol with file/line precision, powered by per-language semantic analysis. Currently supports **C#** (via the bundled `scip-csharp` helper).
+Find all call-sites and references to a symbol with file/line precision — the recommended tool for "who calls X?" / "what breaks if I rename X?". Powered by per-language SCIP semantic analysis; precision backends ship per language (**C#** today via the bundled `scip-csharp` helper, more planned). When no backend is available for a language, `find_impact` reports it — fall back to `find kind="usages"` (lexical) only then.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -318,7 +318,7 @@ Find all call-sites and references to a symbol with file/line precision, powered
 
 Returns a list of references with `file`, `start_line`, `end_line`, and `kind` (e.g. `"call"`, `"definition"`). Exposes `index_age_seconds` so agents can reason about staleness.
 
-> **Note:** Requires the `-with-csharp` release variant or a separately installed `scip-csharp` helper. See [C# Semantic Search](#c-semantic-search).
+> **Note:** SCIP precision requires the `-with-csharp` release variant (or a separately installed `scip-csharp` helper) for C#. Without a backend for a language, `find_impact` returns a clear message — use `find kind="usages"` as the lexical fallback. See [C# Semantic Search](#c-semantic-search).
 
 ### `status` — Index Info
 

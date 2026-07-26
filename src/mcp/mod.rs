@@ -4608,7 +4608,7 @@ impl CodesearchService {
 
     /// Unified symbol navigation — dispatches based on `kind`.
     #[tool(
-        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
+        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol (lexical/text-based; for IDE-precise call-graphs prefer `find_impact`)\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     async fn find(
         &self,
@@ -6233,7 +6233,7 @@ impl CodesearchService {
     /// architecture is language-agnostic and more languages will follow. For languages not
     /// yet supported, use `find` with `kind="usages"` as a text-based fallback.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands the language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nLanguages: C# today (requires the `scip-csharp` helper, bundled in `-with-csharp` releases). For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nPrecision backends (SCIP) ship per language; C# is available today (bundled `scip-csharp` helper, `-with-csharp` releases). If no backend is installed for the target language, the response says so — fall back to `find kind=\"usages\"` (lexical) only then.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -7928,7 +7928,7 @@ SERVICE-MODE NOTES (codesearch serve, esp. on another host):
 
 PICK THE RIGHT TOOL FOR THE TASK:
   "who calls X?" / "what breaks if I rename X?"
-    → find_impact (C# via SCIP; other languages: use find kind="usages")
+    → find_impact (precise SCIP call-graph; if no backend for the language, it says so → then use find kind="usages")
   "find code about X" / "how does X work" / "show me X"
     → search(mode="semantic") — concepts + synonyms + identifiers
   exact syntax like Vec<T> / foo = null / a::b
@@ -7942,7 +7942,7 @@ PICK THE RIGHT TOOL FOR THE TASK:
 
 RULES:
   - search(semantic) is the DEFAULT for code lookup. Don't skip it.
-  - find_impact for C# refactors; find(kind="usages") for other languages.
+  - For "who calls X" / impact analysis, try find_impact first; fall back to find(kind="usages") only if find_impact reports no backend.
   - NEVER use literal as first search unless you need exact syntax.
   - project or group is REQUIRED in multi-repo mode.
 
