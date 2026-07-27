@@ -9,6 +9,7 @@
 
 pub mod csharp;
 pub mod scip_parse;
+pub mod scip_proto;
 
 use std::path::{Path, PathBuf};
 
