@@ -28,7 +28,7 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 
 - [x] **T1: Remove dead `wait_until_indexed()`** in `docker/entrypoint.sh` — superseded by `wait_active_build_done()`. Confirmed no callers anywhere in the repo (only 3 comment references). Deleted the function + updated the comments.
 - [x] **T2: Extract shared `build_remote_search_body(request, mode, limit_value)`** in `src/mcp/mod.rs` — group fan-out (`federated_search`) and single-project fan-out (`federated_project_search`) duplicated the same `serde_json` body (differing only in the limit value); extracted to one shared builder.
-- [ ] **T3: Persist remote-project discovery** to a `remote_project_cache` in `repos.json` — TUI peer-`/status` discovery is currently in-memory only (last-known-good survives a blip, not a process restart).
+- [x] **T3: Persist remote-project discovery** to `remote_project_cache` in `repos.json` — the field already existed but was never read/written. Wired `ReposConfig::cache_remote_projects()`/`cached_remote_project_aliases()`; `codesearch remote available <peer>` now write-through-caches a peer's alias list on success and falls back to the last-known list (instead of hard-failing) when the peer is unreachable. `reconcile()` prunes cache entries for peers that no longer exist.
 - [ ] **T4: 0-chunk status bug + TUI `i`/`d`/`f` diagnostics** — `/status` reports 0 chunks in some cases; TUI diagnostic keys need verification/fix. (TODO card `6a26cce1…`)
 
 ### Code — 🔒 separate worktrees, do NOT touch here

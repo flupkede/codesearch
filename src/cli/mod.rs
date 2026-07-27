@@ -1486,8 +1486,8 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
             use crate::federation::{FederationClient, ManagementOutcome};
 
             let peer_name = peer.trim();
-            let config = crate::db_discovery::load_repos_config()?;
-            let Some(peer_cfg) = config.remotes.get(peer_name) else {
+            let mut config = crate::db_discovery::load_repos_config()?;
+            let Some(peer_cfg) = config.remotes.get(peer_name).cloned() else {
                 anyhow::bail!(
                     "Unknown remote peer '{}'. Add it first with `codesearch remote add`.",
                     peer_name
@@ -1495,8 +1495,17 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
             };
             let client = FederationClient::new()
                 .map_err(|e| anyhow::anyhow!("failed to init HTTP client: {e}"))?;
-            match client.list_repos(peer_cfg).await {
+            match client.list_repos(&peer_cfg).await {
                 ManagementOutcome::Ok(status) => {
+                    // Write-through: remember this peer's alias list so a later
+                    // call can fall back to it if the peer is temporarily down.
+                    let aliases: Vec<String> =
+                        status.repos.iter().map(|r| r.alias.clone()).collect();
+                    config.cache_remote_projects(peer_name, aliases);
+                    if let Err(e) = config.save() {
+                        tracing::warn!("failed to persist remote_project_cache: {e}");
+                    }
+
                     if status.repos.is_empty() {
                         println!("Peer '{}' exposes no projects.", peer_name);
                         return Ok(());
@@ -1521,7 +1530,31 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
                     anyhow::bail!("Peer '{}' returned HTTP {}: {}", peer_name, status, reason);
                 }
                 ManagementOutcome::Unreachable(reason) => {
-                    anyhow::bail!("Peer '{}' unreachable: {}", peer_name, reason);
+                    // Offline fallback: serve the last-known alias list (if any)
+                    // instead of hard-failing on a transient peer blip.
+                    match config.cached_remote_project_aliases(peer_name) {
+                        Some(aliases) if !aliases.is_empty() => {
+                            let mounted: std::collections::HashSet<&String> =
+                                config.remote_mounts.iter().collect();
+                            println!(
+                                "Peer '{}' unreachable ({}) — showing last known projects:",
+                                peer_name, reason
+                            );
+                            for alias in aliases {
+                                let canonical = remote_project_name(peer_name, alias);
+                                let mark = if mounted.contains(&canonical) {
+                                    "✓ mounted"
+                                } else {
+                                    "  -      "
+                                };
+                                println!("  {mark}  {canonical}  [cached]");
+                            }
+                            println!("\nMount one with: codesearch remote mount <peer>/<alias>");
+                        }
+                        _ => {
+                            anyhow::bail!("Peer '{}' unreachable: {}", peer_name, reason);
+                        }
+                    }
                 }
             }
         }
