@@ -459,6 +459,19 @@ pub const SCIP_REF_CACHE_DB_NAME: &str = "scip_ref_cache";
 /// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
 pub const LANG_CSHARP: &str = "csharp";
 
+/// Language identifier for the TypeScript symbol indexer.
+/// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
+pub const LANG_TYPESCRIPT: &str = "typescript";
+
+/// Environment variable override for the `scip-typescript` helper/CLI path.
+/// When unset, the indexer falls back to `npx scip-typescript`.
+pub const SCIP_TYPESCRIPT_HELPER_ENV: &str = "CODESEARCH_SCIP_TYPESCRIPT";
+
+/// LMDB metadata key for the TypeScript indexer's last rebuild timestamp.
+/// Namespaced per-language (unlike C#'s un-namespaced `SCIP_REBUILD_TIMESTAMP_KEY`)
+/// so both adapters can safely share the same `scip_meta` table if ever merged.
+pub const SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts:typescript";
+
 /// Environment variable controlling phase-2 C# SCIP rebuild concurrency.
 /// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].
 pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";

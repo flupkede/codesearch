@@ -6,13 +6,9 @@
 //! reusable. Unlike the C# helper's custom JSON, this reads the canonical
 //! SCIP protobuf wire format via the `scip` crate (rust-protobuf bindings).
 //!
-//! This module is not wired into `SymbolIndexerRegistry` yet — that happens
-//! in stage 3 (`TypeScriptSymbolIndexer`, stage 2, will call
-//! `parse_scip_protobuf`). Until then everything here is only exercised by
-//! its own unit tests, which trips `-D dead-code` under
-//! `cargo clippy --all-targets`. Remove this module-wide allow once
-//! `typescript.rs` calls into this module.
-#![allow(dead_code)]
+//! Wired into `SymbolIndexerRegistry` via `TypeScriptSymbolIndexer::rebuild()`
+//! (`typescript.rs`), which calls `parse_scip_protobuf` on the raw `.scip`
+//! bytes produced by `scip-typescript index`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
