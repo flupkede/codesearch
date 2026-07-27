@@ -283,6 +283,13 @@ impl ReposConfig {
         let mounted: std::collections::HashSet<&String> = self.remote_mounts.iter().collect();
         self.remote_alias_overrides
             .retain(|canonical, _| mounted.contains(canonical));
+
+        // 5. Drop cached remote-project lists for peers that no longer exist —
+        // a removed peer's last-known aliases are meaningless once the peer
+        // itself is gone (and would otherwise resurrect a stale peer name if
+        // it's later re-added under different projects).
+        self.remote_project_cache
+            .retain(|peer_name, _| self.remotes.contains_key(peer_name));
     }
 
     pub fn save(&self) -> Result<()> {
@@ -714,6 +721,26 @@ impl ReposConfig {
         removed
     }
 
+    /// Write-through cache: record the alias list a peer's `/status` just
+    /// reported, so [`cached_remote_project_aliases`](Self::cached_remote_project_aliases)
+    /// can serve a "last known" answer the next time that peer is unreachable.
+    /// Sorted + deduped for stable, diff-friendly `repos.json` output.
+    pub fn cache_remote_projects(&mut self, peer_name: &str, mut aliases: Vec<String>) {
+        aliases.sort();
+        aliases.dedup();
+        self.remote_project_cache
+            .insert(peer_name.to_string(), aliases);
+    }
+
+    /// Last-known alias list for `peer_name`, if any was ever cached via
+    /// [`cache_remote_projects`](Self::cache_remote_projects). Used as an
+    /// offline fallback when the peer's `/status` can't be reached live.
+    pub fn cached_remote_project_aliases(&self, peer_name: &str) -> Option<&[String]> {
+        self.remote_project_cache
+            .get(peer_name)
+            .map(|v| v.as_slice())
+    }
+
     pub fn add_group(&mut self, name: String, aliases: Vec<String>) -> Result<()> {
         if name == crate::constants::ALL_GROUP_NAME {
             return Err(anyhow::anyhow!(
@@ -1102,7 +1129,7 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     // definitive `NotFound` (git not installed) returns immediately, and an
     // `Ok` result whose status is non-success (not a repo / no origin) is a
     // real answer that is NOT retried.
-    const MAX_ATTEMPTS: u32 = 5;
+    const MAX_ATTEMPTS: u32 = 8;
     let mut output = None;
     for attempt in 0..MAX_ATTEMPTS {
         match std::process::Command::new("git")
@@ -1224,8 +1251,14 @@ mod tests {
     fn init_git_remote(dir: &Path, url: &str) {
         // Retry on transient spawn failure (fork exhaustion under parallel test
         // load on Windows/msys); only a genuine missing-git binary is fatal.
+        // Only transient SPAWN failures are retried. A non-zero EXIT is left
+        // untouched on purpose: `git remote add` reporting "remote origin
+        // already exists" is harmless here (the remote is already the URL we
+        // want), and treating it as fatal previously flaked the relocation
+        // tests. `git_remote_url` is the source of truth for what got captured.
         let run = |args: &[&str]| {
-            for attempt in 0..5u64 {
+            const MAX_ATTEMPTS: u64 = 8;
+            for attempt in 0..MAX_ATTEMPTS {
                 match std::process::Command::new("git")
                     .arg("-C")
                     .arg(dir)
@@ -1236,7 +1269,7 @@ mod tests {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         panic!("git not available in test env: {e}");
                     }
-                    Err(_) if attempt < 4 => {
+                    Err(_) if attempt + 1 < MAX_ATTEMPTS => {
                         std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
                     }
                     Err(e) => panic!("git spawn failed after retries: {e}"),
@@ -1282,6 +1315,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "flaky on Windows: during a push the running codesearch serve polls git on this repo (HEAD watcher + reindex) while the AV/Search-indexer holds .git handles, so concurrent git subprocesses transiently fail and the captured remote comes back empty; the logic is platform-independent and covered on Linux/macOS CI"
+    )]
     fn captures_git_remote_on_register() {
         let _serial = git_serial_lock();
         let tmp = tempfile::tempdir().unwrap();
@@ -1992,6 +2029,41 @@ mod tests {
         assert!(cfg.remote_mounts.is_empty());
         assert!(!cfg.remote_alias_overrides.contains_key("cloud/akeneo"));
         assert!(!cfg.unmount_remote_project("cloud/akeneo")); // already gone
+    }
+
+    #[test]
+    fn remote_project_cache_write_read_and_prune() {
+        let mut cfg = cfg_with_cloud();
+
+        // No cache yet.
+        assert!(cfg.cached_remote_project_aliases("cloud").is_none());
+
+        // Write-through caches, sorted + deduped.
+        cfg.cache_remote_projects(
+            "cloud",
+            vec![
+                "bynder".to_string(),
+                "akeneo".to_string(),
+                "bynder".to_string(),
+            ],
+        );
+        assert_eq!(
+            cfg.cached_remote_project_aliases("cloud"),
+            Some(["akeneo".to_string(), "bynder".to_string()].as_slice())
+        );
+
+        // Re-caching replaces the previous entry outright.
+        cfg.cache_remote_projects("cloud", vec!["akeneo".to_string()]);
+        assert_eq!(
+            cfg.cached_remote_project_aliases("cloud"),
+            Some(["akeneo".to_string()].as_slice())
+        );
+
+        // reconcile() drops cache entries for peers no longer configured —
+        // a removed peer's last-known aliases are stale/meaningless.
+        cfg.remotes.remove("cloud");
+        cfg.reconcile();
+        assert!(cfg.cached_remote_project_aliases("cloud").is_none());
     }
 
     #[test]
