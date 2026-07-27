@@ -61,7 +61,7 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 
 ### Defensive / low priority
 
-- [ ] **D1: Apply same cp-retry pattern to Linux `with-csharp` step** in `release.yml` (lines 103-109) — same `cp ... staging/` pattern as the macOS step that broke v1.1.31. Linux has 84GB disk + ext4 (no `fcopyfile`), so low risk; preventive consistency only.
+- [x] **D1: Apply same cp-retry pattern to Linux `with-csharp` step** in `release.yml` — the "Package with-csharp (Linux)" step now retries the binary `cp` up to 3x with `df -h` diagnostics on failure and a hard `test -f` check, mirroring the macOS step's C3 pattern. Preventive consistency only (Linux runner has 84GB disk + ext4, no `fcopyfile` EIO failure mode) — no observed Linux failure, just aligning both platforms' failure behavior.
 
 ### Historical context (for C1/C2 above)
 
