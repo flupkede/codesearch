@@ -28,6 +28,7 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 - [ ] **T2: Extract shared `build_remote_search_body(request, mode)`** in `src/mcp/mod.rs` — group fan-out and single-project fan-out (`FederationClient::search_project` at `src/federation/mod.rs:248`, call site `src/mcp/mod.rs:4317`) duplicate an 11-field `serde_json` body; drift risk. Extract to one shared builder.
 - [ ] **T3: Persist remote-project discovery** to a `remote_project_cache` in `repos.json` — TUI peer-`/status` discovery is currently in-memory only (last-known-good survives a blip, not a process restart).
 - [ ] **T4: 0-chunk status bug + TUI `i`/`d`/`f` diagnostics** — `/status` reports 0 chunks in some cases; TUI diagnostic keys need verification/fix. (TODO card `6a26cce1…`)
+- [ ] **T5: Extract shared `fuzzy_symbol_match`/`open_scip_env` between C# and TypeScript SCIP adapters** — `src/symbols/csharp.rs:1649`/`398` and `src/symbols/typescript.rs:152`/`269` currently carry byte-for-byte-copied logic (fuzzy symbol matching heuristic, LMDB env open/create-databases boilerplate). Flagged in the TypeScript SCIP indexing MVP final review as an Important, non-blocking finding — extract to a shared `src/symbols/scip_common.rs` (or similar) used by both adapters to avoid drift the next time either copy is bugfixed. Deliberately deferred out of the MVP branch to avoid touching stable, already-tested `csharp.rs` at the tail end of a large feature.
 
 ### Code — 🔒 separate worktrees, do NOT touch here
 
