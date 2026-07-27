@@ -6227,11 +6227,12 @@ impl CodesearchService {
 
     /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
     ///
-    /// Uses language-specific semantic analysis (SCIP) to find all references to a symbol,
-    /// enabling agents to plan refactors with IDE-class accuracy instead of text-matching
-    /// grep heuristics. C# is supported today (via the bundled `scip-csharp` helper); the
-    /// architecture is language-agnostic and more languages will follow. For languages not
-    /// yet supported, use `find` with `kind="usages"` as a text-based fallback.
+    /// The recommended tool for "who calls X?" / "what breaks if I rename X?". Uses
+    /// language-specific semantic analysis (SCIP) to find all references, enabling agents
+    /// to plan refactors with IDE-class accuracy instead of text-matching grep heuristics.
+    /// Precision backends ship per language; C# is available today (bundled `scip-csharp`
+    /// helper, `-with-csharp` releases). If no backend is installed for the target language,
+    /// the response reports it — fall back to `find` with `kind="usages"` (lexical) only then.
     #[tool(
         description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nPrecision backends (SCIP) ship per language; C# is available today (bundled `scip-csharp` helper, `-with-csharp` releases). If no backend is installed for the target language, the response says so — fall back to `find kind=\"usages\"` (lexical) only then.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
