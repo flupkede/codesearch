@@ -177,12 +177,12 @@ pub struct TypeScriptSymbolIndexer {
 }
 
 /// How to invoke `scip-typescript`: either a direct binary path (env override)
-/// or via `npx scip-typescript` (the default, no bundled binary required).
+/// or via `npx @sourcegraph/scip-typescript` (the default, no bundled binary required).
 #[derive(Debug, Clone)]
 enum HelperInvocation {
     /// Direct path to a `scip-typescript` executable (env override).
     Direct(PathBuf),
-    /// Invoke via `npx scip-typescript` (requires Node/npm on PATH).
+    /// Invoke via `npx @sourcegraph/scip-typescript` (requires Node/npm on PATH).
     Npx,
 }
 
@@ -301,9 +301,28 @@ impl TypeScriptSymbolIndexer {
         let mut cmd = match invocation {
             HelperInvocation::Direct(path) => Command::new(path),
             HelperInvocation::Npx => {
-                let mut c = Command::new("npx");
-                c.arg("scip-typescript");
-                c
+                // On Windows, `npx` is a shell shim (`npx.cmd`/`npx.ps1`), not a bare
+                // `.exe` — `std::process::Command` does NOT consult `PATHEXT` the way
+                // `cmd.exe` does, so `Command::new("npx")` fails with "program not
+                // found" even though `where npx` (used in `resolve_helper`) succeeds.
+                // Route through `cmd /C` on Windows so the shell resolves the shim.
+                // NOTE: the unscoped npm name `scip-typescript` is a squatted
+                // security placeholder (0.0.1-security, no functionality) — the
+                // real Sourcegraph package is published as the scoped package
+                // `@sourcegraph/scip-typescript` (bin name `scip-typescript`).
+                // `-y` avoids an interactive "ok to install?" prompt.
+                if cfg!(windows) {
+                    let mut c = Command::new("cmd");
+                    c.arg("/C")
+                        .arg("npx")
+                        .arg("-y")
+                        .arg("@sourcegraph/scip-typescript");
+                    c
+                } else {
+                    let mut c = Command::new("npx");
+                    c.arg("-y").arg("@sourcegraph/scip-typescript");
+                    c
+                }
             }
         };
 
