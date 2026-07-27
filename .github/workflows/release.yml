@@ -160,6 +160,21 @@ jobs:
         env:
           CARGO_TARGET_DIR: target
 
+      # C1 + C4 — Stage binary out of target/, then cargo clean to free ~5-10GB on
+      # the 14GB macOS runner. APFS fcopyfile() can return EIO under disk pressure
+      # (instead of the clean ENOSPC), which is what broke v1.1.31's macOS packaging.
+      # df -h logging for post-mortem diagnosis. Binary is moved (atomic rename within
+      # the same filesystem — no copyfile syscall) before clean, so it survives.
+      - name: Stage binary & free disk space
+        run: |
+          echo "=== Disk usage before staging ==="
+          df -h /
+          mkdir -p staging-release
+          mv target/aarch64-apple-darwin/release/codesearch staging-release/codesearch
+          cargo clean
+          echo "=== Disk usage after cargo clean ==="
+          df -h /
+
       - name: Setup .NET
         # pin@v4
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
@@ -169,13 +184,29 @@ jobs:
       - name: Publish C# helper (self-contained single-file)
         run: dotnet publish helpers/csharp -c Release -r osx-arm64 --self-contained -p:PublishSingleFile=true -o helpers-publish
 
+      # C3 — Retry loop on tar/cp. set -e safe via if/then (failed condition doesn't
+      # trigger exit-on-error). df -h on each failure for diagnosis. Final test -f
+      # forces a hard failure if all 3 attempts failed.
       - name: Package kale
-        run: tar czf codesearch-macos-arm64.tar.gz -C target/aarch64-apple-darwin/release codesearch
+        run: |
+          for i in 1 2 3; do
+            if tar czf codesearch-macos-arm64.tar.gz -C staging-release codesearch; then break; fi
+            echo "tar attempt $i/3 failed, retrying in 5s…"
+            df -h /
+            sleep 5
+          done
+          test -f codesearch-macos-arm64.tar.gz
 
       - name: Package with-csharp
         run: |
           mkdir -p staging/helpers/csharp
-          cp target/aarch64-apple-darwin/release/codesearch staging/
+          for i in 1 2 3; do
+            if cp staging-release/codesearch staging/codesearch; then break; fi
+            echo "cp attempt $i/3 failed, retrying in 5s…"
+            df -h /
+            sleep 5
+          done
+          test -f staging/codesearch
           cp -r helpers-publish/* staging/helpers/csharp/
           tar czf codesearch-macos-arm64-with-csharp.tar.gz -C staging .
 
