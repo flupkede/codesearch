@@ -18,43 +18,54 @@
 
 > ℹ️ **Remote write verbs** (`add`, `reindex --force`) require a read-write peer; the cloud peer rejects them (`--force` → HTTP 500 "could only be opened read-only; cannot force-reindex"). An **incremental** `reindex` (no `--force`) of an already-registered repo *does* succeed on the cloud peer — that is the custom-kb auto-refresh path. `list` is always safe. `rm` is not durable — the next cold start re-registers from the restored snapshot.
 
-## Deferred / follow-ups (non-blocking)
+## Open TODOs
 
-Left over from the remote-project-mounting work; not yet done:
-- **Persist remote-project discovery** to a `remote_project_cache` in `repos.json` — the TUI's peer-`/status` discovery is currently in-memory-only (last-known-good survives a blip, not a process restart).
-- **Extract a shared `build_remote_search_body(request, mode)`** in `src/mcp/mod.rs` — the group fan-out and single-project fan-out request bodies are still two identical 11-field blocks; drift risk if one is edited without the other.
-- **Remove the now-dead `wait_until_indexed()`** in `docker/entrypoint.sh` — superseded by the sequential `wait_active_build_done()` loop, never called anymore.
+Single source of truth for outstanding codesearch work. Items marked 🔒 live in a separate worktree — **do not touch on this branch**.
 
-## Fixed — incremental-refresh OOM crash-loop (2026-07-04)
+### Code — small, ready to pick up
 
-`IndexManager::perform_incremental_refresh_with_stores` (`src/index/manager.rs`) used to chunk + embed the ENTIRE changed-file delta in one unbounded in-memory `Vec` before writing anything to the stores. A normal incremental delta (tens of files) was harmless; a vendor sync dropping thousands of files at once OOM'd the 1 vCPU/2 GiB `codesearch-serve` container, which then crash-looped re-running the full azcopy sync every restart (`/status`/`/search` unreachable for minutes). Fixed by batching: `changed_files.chunks(batch_size)` processed sequentially (chunk+embed+insert+commit per batch, single `build_index()` at the end), bounding peak memory to O(batch) regardless of delta size. Batch size defaults to `INCREMENTAL_REFRESH_BATCH_SIZE = 200` (`src/constants.rs`), override via `CODESEARCH_INCREMENTAL_BATCH_SIZE`. Protects both `codesearch-serve`'s in-process warmup and `codesearch-indexer`'s full rebuild. No test for the multi-batch path itself (existing `manager.rs` tests avoid real embedding, same reasoning as the gated `csharp_helper_integration` test) — verify end-to-end on a real large corpus if in doubt.
+- [ ] **T1: Remove dead `wait_until_indexed()`** in `docker/entrypoint.sh` (lines 287-319, ~33 lines) — superseded by `wait_active_build_done()` (line 331). Confirmed no callers anywhere in the repo (only 3 comment references at 225, 237, 327). Delete the function + update the comments.
+- [ ] **T2: Extract shared `build_remote_search_body(request, mode)`** in `src/mcp/mod.rs` — group fan-out and single-project fan-out (`FederationClient::search_project` at `src/federation/mod.rs:248`, call site `src/mcp/mod.rs:4317`) duplicate an 11-field `serde_json` body; drift risk. Extract to one shared builder.
+- [ ] **T3: Persist remote-project discovery** to a `remote_project_cache` in `repos.json` — TUI peer-`/status` discovery is currently in-memory only (last-known-good survives a blip, not a process restart).
+- [ ] **T4: 0-chunk status bug + TUI `i`/`d`/`f` diagnostics** — `/status` reports 0 chunks in some cases; TUI diagnostic keys need verification/fix. (TODO card `6a26cce1…`)
 
-This also explains an earlier cosmetic-looking symptom: the `docs` repo's `/status` staying on `open`/`write` for 4+ minutes after a cold start (never blocked queries — search worked within ~10-25s of the replica becoming reachable). Root cause was the same unbounded-batch warmup path, not a separate status-tracking bug.
+### Code — 🔒 separate worktrees, do NOT touch here
 
-## Still open — automating the "manual scaling" question
+- 🔒 **find_impact routing diagnose/fix** — `DIAGNOSE_FIND_IMPACT_ROUTING.md` (repo root). Diagnose complete (root cause: self-discouraging tool-description at `src/mcp/mod.rs:6236` + asymmetric framing vs `find` at `4611` + `INSTRUCTIONS_TEMPLATE` at `7915-7953` routing non-C# away). Fix-opties A (text-layer rewrite) / B (transparent SCIP delegation in `find kind=usages`) / C (merge tools) / D (nudges) ready to pick. **Lives in its own worktree.**
+- 🔒 **TypeScript SCIP indexing** — `PLAN_TYPESCRIPT_SCIP.md` (repo root). 8-stage plan to mirror the C# pipeline with `scip-typescript` (Sourcegraph npm CLI); MVP = stages 1-6. **Lives in its own worktree.**
 
-Confirmed (2026-07-04): `codesearch-indexer` job has `triggerType: "Manual"` — nothing runs it automatically today; every rebuild has been a human running `az containerapp job start` by hand. The batching fix above means a large batch can no longer crash anything, but staleness is still only resolved manually. Options discussed, not yet decided (needs vendor content update-cadence info the agent doesn't have):
-- **Schedule trigger** on the existing job (`az containerapp job update --trigger-type Schedule --cron-expression "..."`) — no new Azure resources, just a cron cadence. Cost/staleness tradeoff depends on how often the vendor export actually changes upstream.
-- **Event-driven** (Event Grid on the blob source triggering job start) — more precise, needs a new Event Grid subscription + small trigger function/Logic App.
-- The single-app scale-up/poll/snapshot/scale-down redesign for `codesearch-serve` itself (below) remains a separate, bigger follow-up.
+### Cloud / infra — needs decision before pickup
 
-## Proposed redesign — collapse indexer job + serve into one scalable app
+- [ ] **C1: Automate the manual `codesearch-indexer` trigger** — currently `triggerType: "Manual"`; every rebuild today is a human running `az containerapp job start` by hand. The 2026-07-04 batching fix (see "Historical context" below) means large batches can no longer crash anything, but staleness is still only resolved manually. Options, not yet decided (needs vendor content update-cadence info):
+  - **Schedule trigger** on the existing job (`az containerapp job update --trigger-type Schedule --cron-expression "..."`) — no new Azure resources, just a cron cadence.
+  - **Event-driven** (Event Grid on the blob source triggering job start) — more precise, needs a new Event Grid subscription + small trigger function/Logic App.
+  - The single-app redesign (C2) remains a separate, bigger follow-up.
+- [ ] **C2: Single-app collapse redesign** (collapse indexer job + serve into one scalable app) — proposed design ready:
+  1. `az containerapp update -n codesearch-serve --cpu 2.0 --memory 4Gi` — new revision, cold start (restore last snapshot, sync corpus, start incremental reindex in-process).
+  2. Poll `GET /status` every ~10-15s (timeout e.g. 15 min) until **all repos report `"status": "warm"`** — replaces the fragile in-process `indexing`-flag/120s-timeout detection in `entrypoint.sh` that caused the 2026-07-04 crash.
+  3. Once warm, trigger a snapshot upload (existing `upload_snapshot` logic).
+  4. `az containerapp update -n codesearch-serve --cpu 1.0 --memory 2Gi` — new revision, cold start, restore-only.
 
-**Problem with the current split:** `codesearch-indexer` (4 vCPU/8GiB, full/incremental build + snapshot upload) and `codesearch-serve` (1 vCPU/2GiB, restore-only) only talk to each other via a blob-storage snapshot round-trip. Every content update pays for a full tar-upload + download-untar cycle, and `serve`'s own incremental-warmup step duplicates part of the indexer's job on hardware sized for read-only serving — which is what caused the crash-loop above.
+  **Why the blob round-trip is unavoidable:** LMDB (mmap-based) is not safe on network-mounted volumes (Azure Files/NFS — mmap needs local POSIX byte-range locking a network share can't reliably provide). The index must live on local ephemeral disk, and ephemeral disk does not survive a Container Apps revision change (any `--cpu`/`--memory` update triggers one) — hence some durable handoff (blob snapshot) is structurally required.
 
-**Why the round-trip exists at all:** the index store is **LMDB** (mmap-based), which is not safe on network-mounted volumes (Azure Files/NFS — mmap needs local POSIX byte-range locking a network share can't reliably provide). So the index must live on local ephemeral disk, and ephemeral disk does not survive a Container Apps revision change (any `--cpu`/`--memory` update triggers one) — hence some durable handoff (blob snapshot) is unavoidable across a resource-tier change.
+  **Scoped first step shipped (2026-07-08):** incremental reindex in-process on serve is live — but *only* for the small **custom-kb** repo (`docker/entrypoint.sh`'s serve-mode KB pull loop fires `POST /repos/custom-kb/reindex` whenever `git pull` moves `HEAD`). Safe on the 1-2 GiB replica because incremental refresh is memory-bounded. The heavy DOCS corpus deliberately stays job-only.
 
-**Proposed design (single app, no separate job):**
-1. `az containerapp update -n codesearch-serve --cpu 2.0 --memory 4Gi` — new revision, cold start (restore last snapshot, sync corpus, start incremental reindex in-process).
-2. Poll `GET /status` every ~10-15s (generous timeout, e.g. 15 min) until **all repos report `"status": "warm"`** — replaces the fragile in-process `indexing`-flag/120s-timeout detection in `entrypoint.sh` that caused the crash above.
-3. Once warm, trigger a snapshot upload (existing `upload_snapshot` logic).
-4. `az containerapp update -n codesearch-serve --cpu 1.0 --memory 2Gi` — new revision, cold start, restore-only from the snapshot just uploaded.
+  **Still open:** retire `codesearch-indexer` entirely or keep for DR; scheduled script vs Logic App vs wrapper CLI command (`codesearch cloud rebuild --remote <peer>`?).
 
-**What this fixes:** one Container App resource instead of two; a robust, externally-observable completion signal instead of a flaky internal flag; the blob round-trip still happens (structurally required — see above) but only once per deliberate scale-cycle instead of as a side effect of a separate job existing.
+### GitHub issues
 
-**Not yet decided:** whether to retire `codesearch-indexer` entirely or keep it only for disaster-recovery-style full rebuilds, and whether the scale-up/poll/snapshot/scale-down cycle should be a scheduled script, a Logic App, or a wrapper CLI command (`codesearch cloud rebuild --remote <peer>`?).
+- [ ] **#162: include protobuf as a language aware** — feature request (opened 2026-07-27). Scope: should `.proto` files be indexed as a first-class language? Needs scoping discussion.
+- (resolved locally, pending push) **#161: missing macOS binary in v1.1.31** — fixed via C1+C3+C4 on `release.yml` (commit `a68b022`, merged to develop locally in `d0500e3`, not yet pushed).
 
-**Scoped first step shipped (2026-07-08):** the "incremental reindex in-process on serve" idea is live — but *only* for the small **custom-kb** repo (`docker/entrypoint.sh`'s serve-mode KB pull loop fires `POST /repos/custom-kb/reindex` whenever `git pull` moves `HEAD`). Safe on the 1-2 GiB replica because incremental refresh is memory-bounded (see fix above) and the KB corpus is tiny. The heavy DOCS corpus deliberately stays job-only — re-embedding thousands of files in-process is exactly the OOM that motivated the split. The full self-scaling redesign for the DOCS corpus (above) remains a separate, undecided follow-up.
+### Defensive / low priority
+
+- [ ] **D1: Apply same cp-retry pattern to Linux `with-csharp` step** in `release.yml` (lines 103-109) — same `cp ... staging/` pattern as the macOS step that broke v1.1.31. Linux has 84GB disk + ext4 (no `fcopyfile`), so low risk; preventive consistency only.
+
+### Historical context (for C1/C2 above)
+
+**Fixed — incremental-refresh OOM crash-loop (2026-07-04):** `IndexManager::perform_incremental_refresh_with_stores` (`src/index/manager.rs`) used to chunk + embed the ENTIRE changed-file delta in one unbounded in-memory `Vec` before writing anything to the stores. A normal incremental delta was harmless; a vendor sync dropping thousands of files at once OOM'd the 1 vCPU/2 GiB `codesearch-serve` container, which then crash-looped. Fixed by batching: `changed_files.chunks(batch_size)` processed sequentially (chunk+embed+insert+commit per batch, single `build_index()` at the end), bounding peak memory to O(batch) regardless of delta size. Batch size defaults to `INCREMENTAL_REFRESH_BATCH_SIZE = 200` (`src/constants.rs`), override via `CODESEARCH_INCREMENTAL_BATCH_SIZE`. No test for the multi-batch path itself (existing `manager.rs` tests avoid real embedding, same reasoning as the gated `csharp_helper_integration` test) — verify end-to-end on a real large corpus if in doubt.
+
+This also explains an earlier cosmetic symptom: the `docs` repo's `/status` staying on `open`/`write` for 4+ minutes after a cold start (never blocked queries — search worked within ~10-25s of the replica becoming reachable). Root cause was the same unbounded-batch warmup path, not a separate status-tracking bug.
 
 ---
 
