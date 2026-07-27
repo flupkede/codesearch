@@ -17,8 +17,8 @@
 
 use crate::cache::{normalize_path, normalize_path_str};
 use crate::constants::{
-    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, SCIP_CSHARP_DEBOUNCE_MS,
-    WRITER_LOCK_FILE,
+    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
+    SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS, WRITER_LOCK_FILE,
 };
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
@@ -281,6 +281,16 @@ pub struct IndexManager {
     stores: Arc<SharedStores>,
     /// Per-language symbol indexer registry (C# etc.)
     symbol_registry: Arc<SymbolIndexerRegistry>,
+}
+
+/// Returns true if `path` has one of the TypeScript extensions tracked by the
+/// file-watcher's symbol-rebuild debounce (`.ts`, `.tsx`, `.mts`, `.cts`).
+/// Mirrors the inline `.cs` extension check used for the C# adapter.
+fn is_ts_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("ts") | Some("tsx") | Some("mts") | Some("cts")
+    )
 }
 
 impl IndexManager {
@@ -1053,6 +1063,18 @@ impl IndexManager {
             let mut cs_last_event_time: Option<std::time::Instant> = None;
             let cs_debounce = std::time::Duration::from_millis(SCIP_CSHARP_DEBOUNCE_MS);
 
+            // Symbol indexer debounce: .ts/.tsx/.mts/.cts files are buffered separately
+            // and flushed after SCIP_TYPESCRIPT_DEBOUNCE_MS of quiet time. Unlike C#'s
+            // per-.csproj grouping, the TypeScript MVP only supports a single root
+            // tsconfig.json (no monorepo multi-project resolution), so any tracked
+            // change simply triggers one full rebuild — there is no per-file grouping
+            // to compute, and `ts_files_modified`/`ts_files_deleted` only exist to
+            // decide *whether* to flush and to log counts.
+            let mut ts_files_modified: HashSet<PathBuf> = HashSet::new();
+            let mut ts_files_deleted: HashSet<PathBuf> = HashSet::new();
+            let mut ts_last_event_time: Option<std::time::Instant> = None;
+            let ts_debounce = std::time::Duration::from_millis(SCIP_TYPESCRIPT_DEBOUNCE_MS);
+
             loop {
                 // Check if shutdown was requested
                 if cancel_token.is_cancelled() {
@@ -1087,6 +1109,9 @@ impl IndexManager {
                             cs_files_modified.clear();
                             cs_files_deleted.clear();
                             cs_last_event_time = None;
+                            ts_files_modified.clear();
+                            ts_files_deleted.clear();
+                            ts_last_event_time = None;
                         }
                     }
                 }
@@ -1126,6 +1151,10 @@ impl IndexManager {
                                     cs_files_deleted.remove(&p);
                                     cs_files_modified.insert(p);
                                     cs_last_event_time = Some(now);
+                                } else if is_ts_extension(&p) {
+                                    ts_files_deleted.remove(&p);
+                                    ts_files_modified.insert(p);
+                                    ts_last_event_time = Some(now);
                                 }
                             }
                             FileEvent::Deleted(p) => {
@@ -1139,6 +1168,10 @@ impl IndexManager {
                                     cs_files_modified.remove(&p);
                                     cs_files_deleted.insert(p);
                                     cs_last_event_time = Some(now);
+                                } else if is_ts_extension(&p) {
+                                    ts_files_modified.remove(&p);
+                                    ts_files_deleted.insert(p);
+                                    ts_last_event_time = Some(now);
                                 }
                             }
                             FileEvent::Renamed(old_p, new_p) => {
@@ -1162,6 +1195,22 @@ impl IndexManager {
                                         cs_files_modified.insert(new_p);
                                     }
                                     cs_last_event_time = Some(now);
+                                } else {
+                                    // Track .ts/.tsx/.mts/.cts renames: old path is a
+                                    // deletion, new path is a modification.
+                                    let old_is_ts = is_ts_extension(&old_p);
+                                    let new_is_ts = is_ts_extension(&new_p);
+                                    if old_is_ts || new_is_ts {
+                                        if old_is_ts {
+                                            ts_files_modified.remove(&old_p);
+                                            ts_files_deleted.insert(old_p);
+                                        }
+                                        if new_is_ts {
+                                            ts_files_deleted.remove(&new_p);
+                                            ts_files_modified.insert(new_p);
+                                        }
+                                        ts_last_event_time = Some(now);
+                                    }
                                 }
                             }
                         }
@@ -1368,6 +1417,79 @@ impl IndexManager {
                                     }
                                     // Clear "Indexing" now that all groups are done
                                     if let Some(ref cb) = indexing_cb_scip {
+                                        cb(false);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // Check if we should flush the .ts/.tsx/.mts/.cts symbol rebuild debounce.
+                // Unlike the C# path there is no per-.csproj grouping: TypeScript MVP
+                // only supports a single root tsconfig.json, so any tracked change
+                // simply triggers one full rebuild via the registry's TypeScript
+                // indexer (RebuildScope::Files would fall back to Full internally
+                // anyway — passing Full directly here is more honest about what
+                // actually happens).
+                let has_ts_changes = !ts_files_modified.is_empty() || !ts_files_deleted.is_empty();
+                if has_ts_changes {
+                    if let Some(ts_last) = ts_last_event_time {
+                        let elapsed = now.duration_since(ts_last);
+                        if elapsed >= ts_debounce {
+                            let modified_count = ts_files_modified.len();
+                            let deleted_count = ts_files_deleted.len();
+                            ts_files_modified.clear();
+                            ts_files_deleted.clear();
+                            ts_last_event_time = None;
+
+                            info!(
+                                "🔬 {} modified + {} deleted .ts/.tsx/.mts/.cts file(s), triggering full symbol rebuild (after {}s debounce)",
+                                modified_count, deleted_count,
+                                ts_debounce.as_secs()
+                            );
+
+                            let reg = symbol_registry.clone();
+                            let rp = path.clone();
+                            let dp = db_path.clone();
+                            let indexing_cb_ts = indexing_cb.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(indexer) = reg.get(LANG_TYPESCRIPT) {
+                                    if !indexer.applies_to(&rp) {
+                                        info!(
+                                            "🔬 TypeScript symbol rebuild skipped: not applicable (no tsconfig.json)"
+                                        );
+                                        return;
+                                    }
+                                    if !indexer.is_available() {
+                                        info!(
+                                            "🔬 TypeScript symbol rebuild skipped: scip-typescript not available"
+                                        );
+                                        return;
+                                    }
+
+                                    // Signal "Indexing" to the TUI now that we know
+                                    // a real SCIP rebuild will actually run.
+                                    if let Some(ref cb) = indexing_cb_ts {
+                                        cb(true);
+                                    }
+
+                                    match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
+                                        Ok(summary) => {
+                                            info!(
+                                                "✅ TypeScript symbol rebuild complete: {} symbols, {} refs in {}ms",
+                                                summary.symbols_indexed,
+                                                summary.references_stored,
+                                                summary.duration_ms
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!("⚠️ TypeScript symbol rebuild failed: {}", e);
+                                        }
+                                    }
+
+                                    // Clear "Indexing" regardless of outcome
+                                    if let Some(ref cb) = indexing_cb_ts {
                                         cb(false);
                                     }
                                 }

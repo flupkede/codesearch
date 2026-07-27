@@ -472,6 +472,11 @@ pub const SCIP_TYPESCRIPT_HELPER_ENV: &str = "CODESEARCH_SCIP_TYPESCRIPT";
 /// so both adapters can safely share the same `scip_meta` table if ever merged.
 pub const SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts:typescript";
 
+/// Debounce window (ms) for the TypeScript file-watcher symbol rebuild.
+/// Mirrors `SCIP_CSHARP_DEBOUNCE_MS` — a single quiet-period flush avoids
+/// spawning `scip-typescript` once per saved file during a burst of edits.
+pub const SCIP_TYPESCRIPT_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
+
 /// Environment variable controlling phase-2 C# SCIP rebuild concurrency.
 /// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].
 pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";
