@@ -726,13 +726,75 @@ fn unwrap_management<T>(
     }
 }
 
+/// Print one `<peer>/<alias>` project row for `codesearch remote available`
+/// and `codesearch index list --remote`, marking whether it's mounted.
+/// `tag` is the live peer status (e.g. "warm") or "cached" for an offline
+/// fallback row.
+fn print_remote_project_row(canonical: &str, mounted: bool, tag: &str) {
+    let mark = if mounted { "✓ mounted" } else { "  -      " };
+    println!("  {mark}  {canonical}  [{tag}]");
+}
+
 /// `codesearch index list --remote <peer>` — list repos registered on a peer.
 async fn run_remote_list(peer_name: &str, json: bool) -> Result<()> {
+    use crate::federation::ManagementOutcome;
     use colored::Colorize;
 
     let peer = resolve_remote_peer(peer_name)?;
+    let mut config = crate::db_discovery::load_repos_config()?;
     let client = crate::federation::FederationClient::new().map_err(anyhow::Error::msg)?;
-    let status = unwrap_management(peer_name, client.list_repos(&peer).await)?;
+
+    let status = match client.list_repos(&peer).await {
+        ManagementOutcome::Ok(status) => {
+            // Write-through: remember this peer's alias list so a later call
+            // can fall back to it if the peer is temporarily unreachable.
+            let aliases: Vec<String> = status.repos.iter().map(|r| r.alias.clone()).collect();
+            config.cache_remote_projects(peer_name, aliases);
+            if let Err(e) = config.save() {
+                tracing::warn!("failed to persist remote_project_cache: {e}");
+            }
+            status
+        }
+        ManagementOutcome::Unreachable(reason) => {
+            // Offline fallback: we only ever cached bare aliases (no live
+            // status/lock/changes), so this degrades to an alias-only listing
+            // rather than the full table below.
+            match config.cached_remote_project_aliases(peer_name) {
+                Some(aliases) if !aliases.is_empty() => {
+                    if json {
+                        let cached = serde_json::json!({
+                            "peer": peer_name,
+                            "unreachable": true,
+                            "reason": reason,
+                            "cached_aliases": aliases,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&cached)?);
+                        return Ok(());
+                    }
+                    println!(
+                        "Remote '{}' ({}) is unreachable ({}) — showing last known projects:",
+                        peer_name.bright_cyan(),
+                        peer.url,
+                        reason
+                    );
+                    let mounted: std::collections::HashSet<&String> =
+                        config.remote_mounts.iter().collect();
+                    for alias in aliases {
+                        let canonical =
+                            crate::db_discovery::repos::remote_project_name(peer_name, alias);
+                        print_remote_project_row(
+                            &canonical,
+                            mounted.contains(&canonical),
+                            "cached",
+                        );
+                    }
+                    return Ok(());
+                }
+                _ => anyhow::bail!("Cannot reach peer '{}': {}", peer_name, reason),
+            }
+        }
+        outcome @ ManagementOutcome::HttpError { .. } => unwrap_management(peer_name, outcome)?,
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -1517,12 +1579,11 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
                     println!("Projects on '{}':", peer_name);
                     for r in &repos {
                         let canonical = remote_project_name(peer_name, &r.alias);
-                        let mark = if mounted.contains(&canonical) {
-                            "✓ mounted"
-                        } else {
-                            "  -      "
-                        };
-                        println!("  {mark}  {canonical}  [{}]", r.status);
+                        print_remote_project_row(
+                            &canonical,
+                            mounted.contains(&canonical),
+                            &r.status,
+                        );
                     }
                     println!("\nMount one with: codesearch remote mount <peer>/<alias>");
                 }
@@ -1542,12 +1603,11 @@ async fn run_remote_command(command: RemoteCommands) -> Result<()> {
                             );
                             for alias in aliases {
                                 let canonical = remote_project_name(peer_name, alias);
-                                let mark = if mounted.contains(&canonical) {
-                                    "✓ mounted"
-                                } else {
-                                    "  -      "
-                                };
-                                println!("  {mark}  {canonical}  [cached]");
+                                print_remote_project_row(
+                                    &canonical,
+                                    mounted.contains(&canonical),
+                                    "cached",
+                                );
                             }
                             println!("\nMount one with: codesearch remote mount <peer>/<alias>");
                         }
