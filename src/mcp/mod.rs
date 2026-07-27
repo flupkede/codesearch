@@ -4210,6 +4210,32 @@ impl CodesearchService {
     /// peers (`<peer>/<alias>`, opt-in `remote_mounts`), then RRF-interleaves the
     /// disjoint ranked lists. One unreachable project becomes a `warning`, never
     /// a hard failure.
+    /// Build the JSON body shipped to a remote peer for a federated search
+    /// (group fan-out or single-project fan-out). Both call sites forward the
+    /// same fields — `mode` and `limit_value` are passed explicitly because
+    /// each caller computes them slightly differently (single lowercased
+    /// `mode` string shared across a whole request; a per-call `limit_value`
+    /// that may be over-fetched to compensate for client-side `filter_path`
+    /// filtering). Extracted so the two bodies can't drift out of sync.
+    fn build_remote_search_body(
+        request: &SearchRequest,
+        mode: &str,
+        limit_value: Option<usize>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "query": request.query,
+            "mode": mode,
+            "compact": request.compact,
+            "semantic_mode": request.semantic_mode,
+            "regex": request.regex,
+            "phrase": request.phrase,
+            "file_glob": request.file_glob,
+            "language": request.language,
+            "format": request.format,
+            "limit": limit_value,
+        })
+    }
+
     async fn federated_search(
         &self,
         request: &SearchRequest,
@@ -4282,18 +4308,7 @@ impl CodesearchService {
         // 2) Build the request body shipped to each remote (group forced to the
         //    peer's own scope + project stripped by the federation client).
         //    `filter_path` intentionally omitted — applied client-side below.
-        let body = serde_json::json!({
-            "query": request.query,
-            "mode": mode,
-            "compact": request.compact,
-            "semantic_mode": request.semantic_mode,
-            "regex": request.regex,
-            "phrase": request.phrase,
-            "file_glob": request.file_glob,
-            "language": request.language,
-            "format": request.format,
-            "limit": fetch_limit,
-        });
+        let body = Self::build_remote_search_body(request, &mode, fetch_limit);
 
         let client = match FederationClient::new() {
             Ok(c) => c,
@@ -4385,18 +4400,7 @@ impl CodesearchService {
         // Same shape as the group fan-out body; the federation client forces
         // `project=<remote_alias>` and strips `group`. `filter_path` is
         // intentionally omitted — applied client-side below.
-        let body = serde_json::json!({
-            "query": request.query,
-            "mode": mode,
-            "compact": request.compact,
-            "semantic_mode": request.semantic_mode,
-            "regex": request.regex,
-            "phrase": request.phrase,
-            "file_glob": request.file_glob,
-            "language": request.language,
-            "format": request.format,
-            "limit": peer_limit,
-        });
+        let body = Self::build_remote_search_body(request, &mode, peer_limit);
 
         let client = match FederationClient::new() {
             Ok(c) => c,

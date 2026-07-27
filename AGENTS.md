@@ -26,9 +26,9 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 
 ### Code — small, ready to pick up
 
-- [ ] **T1: Remove dead `wait_until_indexed()`** in `docker/entrypoint.sh` (lines 287-319, ~33 lines) — superseded by `wait_active_build_done()` (line 331). Confirmed no callers anywhere in the repo (only 3 comment references at 225, 237, 327). Delete the function + update the comments.
-- [ ] **T2: Extract shared `build_remote_search_body(request, mode)`** in `src/mcp/mod.rs` — group fan-out and single-project fan-out (`FederationClient::search_project` at `src/federation/mod.rs:248`, call site `src/mcp/mod.rs:4317`) duplicate an 11-field `serde_json` body; drift risk. Extract to one shared builder.
-- [ ] **T3: Persist remote-project discovery** to a `remote_project_cache` in `repos.json` — TUI peer-`/status` discovery is currently in-memory only (last-known-good survives a blip, not a process restart).
+- [x] **T1: Remove dead `wait_until_indexed()`** in `docker/entrypoint.sh` — superseded by `wait_active_build_done()`. Confirmed no callers anywhere in the repo (only 3 comment references). Deleted the function + updated the comments.
+- [x] **T2: Extract shared `build_remote_search_body(request, mode, limit_value)`** in `src/mcp/mod.rs` — group fan-out (`federated_search`) and single-project fan-out (`federated_project_search`) duplicated the same `serde_json` body (differing only in the limit value); extracted to one shared builder.
+- [x] **T3: Persist remote-project discovery** to `remote_project_cache` in `repos.json` — the field already existed but was never read/written. Wired `ReposConfig::cache_remote_projects()`/`cached_remote_project_aliases()`; both `codesearch remote available <peer>` and `codesearch index list --remote <peer>` now write-through-cache a peer's alias list on success and fall back to the last-known list (instead of hard-failing) when the peer is unreachable. `reconcile()` prunes cache entries for peers that no longer exist. Shared the mounted/cached row printing into `print_remote_project_row()` to keep the two CLI commands in sync.
 - [ ] **T4: 0-chunk status bug + TUI `i`/`d`/`f` diagnostics** — `/status` reports 0 chunks in some cases; TUI diagnostic keys need verification/fix. (TODO card `6a26cce1…`)
 
 ### Code — 🔒 separate worktrees, do NOT touch here
