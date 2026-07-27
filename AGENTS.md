@@ -1,5 +1,7 @@
 # AGENTS.md — codesearch (features/remote-mount-selection)
 
+_Last updated: 2026-07-27_
+
 ## Current state
 
 - **Version:** see `Cargo.toml` (pre-commit hook auto-bumps patch per commit on feature branches).
