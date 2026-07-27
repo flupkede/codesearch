@@ -6229,11 +6229,13 @@ impl CodesearchService {
     ///
     /// Uses language-specific semantic analysis (SCIP) to find all references to a symbol,
     /// enabling agents to plan refactors with IDE-class accuracy instead of text-matching
-    /// grep heuristics. C# is supported today (via the bundled `scip-csharp` helper); the
-    /// architecture is language-agnostic and more languages will follow. For languages not
-    /// yet supported, use `find` with `kind="usages"` as a text-based fallback.
+    /// grep heuristics. C# is supported today (via the bundled `scip-csharp` helper);
+    /// TypeScript is also supported (via `scip-typescript`, resolved through `npx` or
+    /// `CODESEARCH_SCIP_TYPESCRIPT`). The architecture is language-agnostic and more
+    /// languages will follow. For languages not yet supported, use `find` with
+    /// `kind="usages"` as a text-based fallback.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands the language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nLanguages: C# today (requires the `scip-csharp` helper, bundled in `-with-csharp` releases). For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands the language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nLanguages: C# (requires the `scip-csharp` helper, bundled in `-with-csharp` releases) and TypeScript (requires `scip-typescript`, resolved via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`). For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -6294,6 +6296,9 @@ impl CodesearchService {
                 let ext = Path::new(f).extension()?.to_str()?.to_lowercase();
                 match ext.as_str() {
                     "cs" => Some(crate::constants::LANG_CSHARP.to_string()),
+                    "ts" | "tsx" | "mts" | "cts" => {
+                        Some(crate::constants::LANG_TYPESCRIPT.to_string())
+                    }
                     _ => None,
                 }
             })
@@ -6315,10 +6320,10 @@ impl CodesearchService {
                 let installed = registry.installed_languages();
                 if installed.is_empty() {
                     return Ok(CallToolResult::success(vec![Content::text(
-                        "No symbol indexers installed. Install the `scip-csharp` helper for C# support.".to_string(),
+                        "No symbol indexers installed. Install the `scip-csharp` helper for C# support, or `scip-typescript` (via npx) for TypeScript support.".to_string(),
                     )]));
                 }
-                // Use the first installed language (MVP: only C#)
+                // Use the first installed language (MVP: C# or TypeScript)
                 match registry.get(&installed[0]) {
                     Some(i) => i,
                     None => {
