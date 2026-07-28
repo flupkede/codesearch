@@ -1042,6 +1042,102 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Trigger a fire-and-forget FULL symbol rebuild for every applicable
+    /// language, used when a branch switch invalidates the symbol index wholesale.
+    ///
+    /// A branch change rewrites arbitrary files in the working tree, so an
+    /// incremental (per-file / per-`.csproj`) scope cannot be computed — the
+    /// buffered `.cs`/`.ts` events were discarded by the branch-change handler.
+    /// A `RebuildScope::Full` is the honest, correct choice here: it re-derives
+    /// the entire symbol index for the new branch. Runs in a detached blocking
+    /// task so the watcher loop is never blocked by the (potentially 35–84s)
+    /// scip-csharp / scip-typescript invocation.
+    ///
+    /// `indexing_cb` (if any) toggles the general TUI "Indexing" label around
+    /// the whole rebuild; `csharp_notifier` (if any) drives the C#-specific
+    /// indicator (`Started`/`Succeeded`/`Failed`). Non-applicable languages
+    /// (no `.sln` / no `tsconfig.json`) or an unavailable helper are skipped
+    /// without touching any status — mirroring the debounce path.
+    fn spawn_branch_change_symbol_rebuild(
+        symbol_registry: Arc<SymbolIndexerRegistry>,
+        repo_path: PathBuf,
+        db_path: PathBuf,
+        repo_label: String,
+        csharp_notifier: Option<CSharpRebuildNotifier>,
+        indexing_cb: Option<IndexingStatusCallback>,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            // Resolve applicable + available indexers up front so we only toggle
+            // the "Indexing" label when there is real work to do.
+            let csharp = symbol_registry
+                .get(LANG_CSHARP)
+                .filter(|i| i.applies_to(&repo_path) && i.is_available());
+            let typescript = symbol_registry
+                .get(LANG_TYPESCRIPT)
+                .filter(|i| i.applies_to(&repo_path) && i.is_available());
+
+            if csharp.is_none() && typescript.is_none() {
+                // Nothing to rebuild — don't flash the TUI or touch status.
+                return;
+            }
+
+            if let Some(ref cb) = indexing_cb {
+                cb(true);
+            }
+
+            if let Some(indexer) = csharp {
+                if let Some(ref n) = csharp_notifier {
+                    n(SymbolRebuildSignal::Started);
+                }
+                match indexer.rebuild(&repo_path, &db_path, RebuildScope::Full) {
+                    Ok(summary) => {
+                        info!(
+                            "✅ [{}] branch-change C# symbol rebuild complete: {} symbols, {} refs in {}ms",
+                            repo_label,
+                            summary.symbols_indexed,
+                            summary.references_stored,
+                            summary.duration_ms
+                        );
+                        if let Some(ref n) = csharp_notifier {
+                            n(SymbolRebuildSignal::Succeeded);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "⚠️ [{}] branch-change C# symbol rebuild failed: {}",
+                            repo_label, e
+                        );
+                        if let Some(ref n) = csharp_notifier {
+                            n(SymbolRebuildSignal::Failed(e.to_string()));
+                        }
+                    }
+                }
+            }
+
+            if let Some(indexer) = typescript {
+                // The TypeScript path has no serve-side status notifier yet, so
+                // only the general "Indexing" label reflects it (via indexing_cb).
+                match indexer.rebuild(&repo_path, &db_path, RebuildScope::Full) {
+                    Ok(summary) => info!(
+                        "✅ [{}] branch-change TypeScript symbol rebuild complete: {} symbols, {} refs in {}ms",
+                        repo_label,
+                        summary.symbols_indexed,
+                        summary.references_stored,
+                        summary.duration_ms
+                    ),
+                    Err(e) => warn!(
+                        "⚠️ [{}] branch-change TypeScript symbol rebuild failed: {}",
+                        repo_label, e
+                    ),
+                }
+            }
+
+            if let Some(ref cb) = indexing_cb {
+                cb(false);
+            }
+        });
+    }
+
     /// Start the background file watcher.
     ///
     /// This is the **second method call** - should be called after `new()`.
@@ -1183,6 +1279,22 @@ impl IndexManager {
                             ts_files_modified.clear();
                             ts_files_deleted.clear();
                             ts_last_event_time = None;
+
+                            // A branch switch can change arbitrary source files, so
+                            // the symbol index is now stale — but no incremental
+                            // scope can be computed (the working tree changed wholesale
+                            // and the buffered .cs/.ts events were just discarded above).
+                            // Trigger a fire-and-forget FULL symbol rebuild for every
+                            // language that applies, so `find_impact` reflects the new
+                            // branch instead of silently serving stale references.
+                            Self::spawn_branch_change_symbol_rebuild(
+                                symbol_registry.clone(),
+                                path.clone(),
+                                db_path.clone(),
+                                repo_label.clone(),
+                                csharp_notifier.clone(),
+                                indexing_cb.clone(),
+                            );
                         }
                     }
                 }
