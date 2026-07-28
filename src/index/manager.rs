@@ -36,15 +36,33 @@ use tracing::{debug, error, info, warn};
 // Import Result from the parent module
 use super::Result;
 
-/// Callback invoked after each watcher-triggered C# symbol rebuild completes.
+/// Signal sent to the serve layer about a watcher-triggered symbol rebuild.
 ///
-/// Arguments: `(success: bool, error_msg: Option<String>)`.
-/// - `(true, None)` on success.
-/// - `(false, Some(msg))` on failure.
+/// Unlike the old two-argument `(success, error)` callback, this carries a
+/// `Started` variant so the serve layer can flip the C# indicator to
+/// `Indexing` for the *duration* of the rebuild — matching what the
+/// serve-side `trigger_symbol_rebuild` already does for the phase-2 /
+/// POST-/reindex paths. Without `Started`, a watcher-triggered rebuild only
+/// ever reported its terminal state, so the C#-specific indicator never showed
+/// "Indexing" while the (35–84s) rebuild was actually running.
+pub enum SymbolRebuildSignal {
+    /// A rebuild is about to run (helper available and project applies).
+    Started,
+    /// Rebuild finished successfully.
+    Succeeded,
+    /// Rebuild failed with the given message.
+    Failed(String),
+}
+
+/// Callback invoked around each watcher-triggered C# symbol rebuild.
+///
+/// Called with [`SymbolRebuildSignal::Started`] just before the rebuild runs,
+/// then exactly once more with [`SymbolRebuildSignal::Succeeded`] or
+/// [`SymbolRebuildSignal::Failed`] when it finishes.
 ///
 /// The serve layer uses this to update `csharp_index_status` / `csharp_index_error`
 /// without coupling `IndexManager` to `ServeState`.
-pub type CSharpRebuildNotifier = Arc<dyn Fn(bool, Option<String>) + Send + Sync>;
+pub type CSharpRebuildNotifier = Arc<dyn Fn(SymbolRebuildSignal) + Send + Sync>;
 
 /// Callback to notify the serve layer that text/vector indexing is active or idle.
 ///
@@ -1323,8 +1341,8 @@ impl IndexManager {
                             cs_last_event_time = None;
 
                             info!(
-                                "🔬 {} modified + {} deleted .cs file(s), triggering incremental symbol rebuild (after {}s debounce)",
-                                modified_count, deleted_count,
+                                "🔬 [{}] {} modified + {} deleted .cs file(s), triggering incremental symbol rebuild (after {}s debounce)",
+                                repo_label, modified_count, deleted_count,
                                 cs_debounce.as_secs()
                             );
 
@@ -1339,6 +1357,9 @@ impl IndexManager {
                             let reg = symbol_registry.clone();
                             let rp = path.clone();
                             let dp = db_path.clone();
+                            // Clone the repo label into the blocking task (the outer
+                            // binding is reused by later loop iterations).
+                            let repo_label = repo_label.clone();
                             let notifier = csharp_notifier.clone();
                             // Clone indexing_cb so the SCIP rebuild can signal
                             // active_reindexes (and therefore show "Indexing" in
@@ -1350,19 +1371,29 @@ impl IndexManager {
                                 if let Some(indexer) = reg.get(LANG_CSHARP) {
                                     if !indexer.applies_to(&rp) {
                                         info!(
-                                            "🔬 symbol rebuild skipped: not applicable (no .sln)"
+                                            "🔬 [{}] symbol rebuild skipped: not applicable (no .sln)",
+                                            repo_label
                                         );
                                         return;
                                     }
                                     if !indexer.is_available() {
-                                        info!("🔬 symbol rebuild skipped: helper not available");
+                                        info!(
+                                            "🔬 [{}] symbol rebuild skipped: helper not available",
+                                            repo_label
+                                        );
                                         return;
                                     }
 
                                     // Signal "Indexing" to the TUI now that we know
-                                    // a real SCIP rebuild will actually run.
+                                    // a real SCIP rebuild will actually run. This
+                                    // toggles both the general repo-state label
+                                    // (indexing_cb → active_reindexes) and the
+                                    // C#-specific indicator (notifier → Indexing).
                                     if let Some(ref cb) = indexing_cb_scip {
                                         cb(true);
+                                    }
+                                    if let Some(ref n) = notifier {
+                                        n(SymbolRebuildSignal::Started);
                                     }
 
                                     // Group modified files by their containing .csproj
@@ -1388,25 +1419,30 @@ impl IndexManager {
                                     // files.first() and silently ignored the rest).
                                     if !ungrouped.is_empty() {
                                         info!(
-                                            "🔬 {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                            "🔬 [{}] {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                            repo_label,
                                             ungrouped.len()
                                         );
                                         match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
                                             Ok(summary) => {
                                                 info!(
-                                                    "✅ Symbol rebuild complete: {} symbols, {} refs in {}ms",
+                                                    "✅ [{}] Symbol rebuild complete: {} symbols, {} refs in {}ms",
+                                                    repo_label,
                                                     summary.symbols_indexed,
                                                     summary.references_stored,
                                                     summary.duration_ms
                                                 );
                                                 if let Some(ref n) = notifier {
-                                                    n(true, None);
+                                                    n(SymbolRebuildSignal::Succeeded);
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!("⚠️ Symbol rebuild failed: {}", e);
+                                                warn!(
+                                                    "⚠️ [{}] Symbol rebuild failed: {}",
+                                                    repo_label, e
+                                                );
                                                 if let Some(ref n) = notifier {
-                                                    n(false, Some(e.to_string()));
+                                                    n(SymbolRebuildSignal::Failed(e.to_string()));
                                                 }
                                             }
                                         }
@@ -1428,7 +1464,8 @@ impl IndexManager {
                                             .map(|n| n.to_string_lossy().into_owned())
                                             .unwrap_or_default();
                                         info!(
-                                            "🔬 incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
+                                            "🔬 [{}] incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
+                                            repo_label,
                                             i + 1,
                                             total_groups,
                                             csproj_name,
@@ -1476,8 +1513,8 @@ impl IndexManager {
                                     // Notify serve layer about overall outcome
                                     if let Some(ref n) = notifier {
                                         match last_error {
-                                            None => n(true, None),
-                                            Some(msg) => n(false, Some(msg)),
+                                            None => n(SymbolRebuildSignal::Succeeded),
+                                            Some(msg) => n(SymbolRebuildSignal::Failed(msg)),
                                         }
                                     }
                                     // Clear "Indexing" now that all groups are done

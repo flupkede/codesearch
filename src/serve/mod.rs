@@ -44,7 +44,9 @@ use crate::constants::{
     SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
-use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
+use crate::index::{
+    CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
+};
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
 
@@ -349,21 +351,27 @@ impl ServeState {
     ///
     /// The notifier captures `Arc` clones of the two status maps so it can be sent
     /// into the file-watcher background task without holding a reference to `&self`.
-    /// When the watcher-triggered rebuild completes it calls the closure, which updates
-    /// `csharp_index_status` and `csharp_index_error` — making the outcome visible in
-    /// the TUI and in `/status` without any extra polling.
+    /// The watcher calls it with [`SymbolRebuildSignal::Started`] just before a
+    /// rebuild runs (→ `Indexing`) and again with `Succeeded`/`Failed` when it
+    /// finishes (→ `Ready`/`Error`), updating `csharp_index_status` /
+    /// `csharp_index_error` — making both the in-progress and terminal states
+    /// visible in the TUI and in `/status` without any extra polling.
     fn make_csharp_notifier(&self, alias: &str) -> CSharpRebuildNotifier {
         let status_map = Arc::clone(&self.csharp_index_status);
         let error_map = Arc::clone(&self.csharp_index_error);
         let alias_key = alias.to_string();
-        Arc::new(move |success: bool, error_msg: Option<String>| {
-            if success {
+        Arc::new(move |signal: SymbolRebuildSignal| match signal {
+            SymbolRebuildSignal::Started => {
+                // Flip the C# indicator to "Indexing" for the duration of the
+                // watcher-triggered rebuild, matching `trigger_symbol_rebuild`.
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Indexing);
+            }
+            SymbolRebuildSignal::Succeeded => {
                 status_map.insert(alias_key.clone(), CSharpIndexStatus::Ready);
                 error_map.remove(&alias_key);
-            } else {
-                if let Some(msg) = error_msg {
-                    error_map.insert(alias_key.clone(), msg);
-                }
+            }
+            SymbolRebuildSignal::Failed(msg) => {
+                error_map.insert(alias_key.clone(), msg);
                 status_map.insert(alias_key.clone(), CSharpIndexStatus::Error);
             }
         })
@@ -372,9 +380,10 @@ impl ServeState {
     /// Build an `IndexingStatusCallback` for the given repo `alias`.
     ///
     /// The callback captures a clone of `active_reindexes` so it can be sent
-    /// into the file-watcher background task. When the watcher triggers a refresh
-    /// (branch change, significant batch), it calls this closure to insert/remove
-    /// the alias — making "Indexing" visible in the TUI.
+    /// into the file-watcher background task. The watcher calls this closure to
+    /// insert/remove the alias around every reindex — branch-change refresh,
+    /// text-batch flush, and symbol rebuild — making "Indexing" visible in the
+    /// TUI status column.
     fn make_indexing_status_callback(&self, alias: &str) -> IndexingStatusCallback {
         let reindexes = self.active_reindexes.clone();
         let alias_key = alias.to_string();

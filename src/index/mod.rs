@@ -21,6 +21,7 @@ use crate::vectordb::{merge_metadata_atomic, VectorStore};
 mod manager;
 pub use manager::{
     is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores,
+    SymbolRebuildSignal,
 };
 
 /// Ensure the HNSW vector index is built if it was never built in a previous
