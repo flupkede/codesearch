@@ -22,7 +22,7 @@ use crate::constants::{
 };
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
-use crate::symbols::{RebuildScope, SymbolIndexerRegistry};
+use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
 use crate::watch::{FileEvent, FileWatcher, GitHeadWatcher};
 use std::collections::HashSet;
@@ -1086,56 +1086,82 @@ impl IndexManager {
             }
 
             if let Some(indexer) = csharp {
+                // C# drives the serve-side status indicator: Started now,
+                // terminal signal inside run_full_rebuild_logged.
                 if let Some(ref n) = csharp_notifier {
                     n(SymbolRebuildSignal::Started);
                 }
-                match indexer.rebuild(&repo_path, &db_path, RebuildScope::Full) {
-                    Ok(summary) => {
-                        info!(
-                            "✅ [{}] branch-change C# symbol rebuild complete: {} symbols, {} refs in {}ms",
-                            repo_label,
-                            summary.symbols_indexed,
-                            summary.references_stored,
-                            summary.duration_ms
-                        );
-                        if let Some(ref n) = csharp_notifier {
-                            n(SymbolRebuildSignal::Succeeded);
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "⚠️ [{}] branch-change C# symbol rebuild failed: {}",
-                            repo_label, e
-                        );
-                        if let Some(ref n) = csharp_notifier {
-                            n(SymbolRebuildSignal::Failed(e.to_string()));
-                        }
-                    }
-                }
+                Self::run_full_rebuild_logged(
+                    indexer,
+                    &repo_path,
+                    &db_path,
+                    &repo_label,
+                    "C#",
+                    csharp_notifier.as_ref(),
+                );
             }
 
             if let Some(indexer) = typescript {
                 // The TypeScript path has no serve-side status notifier yet, so
                 // only the general "Indexing" label reflects it (via indexing_cb).
-                match indexer.rebuild(&repo_path, &db_path, RebuildScope::Full) {
-                    Ok(summary) => info!(
-                        "✅ [{}] branch-change TypeScript symbol rebuild complete: {} symbols, {} refs in {}ms",
-                        repo_label,
-                        summary.symbols_indexed,
-                        summary.references_stored,
-                        summary.duration_ms
-                    ),
-                    Err(e) => warn!(
-                        "⚠️ [{}] branch-change TypeScript symbol rebuild failed: {}",
-                        repo_label, e
-                    ),
-                }
+                Self::run_full_rebuild_logged(
+                    indexer,
+                    &repo_path,
+                    &db_path,
+                    &repo_label,
+                    "TypeScript",
+                    None,
+                );
             }
 
             if let Some(ref cb) = indexing_cb {
                 cb(false);
             }
         });
+    }
+
+    /// Run a `RebuildScope::Full` rebuild for one language's indexer, log the
+    /// outcome with the repo + language label, and (when `notifier` is `Some`,
+    /// i.e. C#) emit the terminal [`SymbolRebuildSignal`] (`Succeeded`/`Failed`).
+    ///
+    /// This is the shared body behind every full-scope rebuild in the watcher
+    /// (branch-change C#/TS and the `.cs` debounce full-solution fallback), so
+    /// the log wording and notifier semantics stay in one place. The caller
+    /// owns the *in-progress* signalling (`indexing_cb(true/false)` and the C#
+    /// `Started` signal), because a single caller may batch several rebuilds
+    /// under one "Indexing" window.
+    fn run_full_rebuild_logged(
+        indexer: &dyn SymbolIndexer,
+        repo_path: &Path,
+        db_path: &Path,
+        repo_label: &str,
+        lang_label: &str,
+        notifier: Option<&CSharpRebuildNotifier>,
+    ) {
+        match indexer.rebuild(repo_path, db_path, RebuildScope::Full) {
+            Ok(summary) => {
+                info!(
+                    "✅ [{}] {} symbol rebuild complete: {} symbols, {} refs in {}ms",
+                    repo_label,
+                    lang_label,
+                    summary.symbols_indexed,
+                    summary.references_stored,
+                    summary.duration_ms
+                );
+                if let Some(n) = notifier {
+                    n(SymbolRebuildSignal::Succeeded);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️ [{}] {} symbol rebuild failed: {}",
+                    repo_label, lang_label, e
+                );
+                if let Some(n) = notifier {
+                    n(SymbolRebuildSignal::Failed(e.to_string()));
+                }
+            }
+        }
     }
 
     /// Start the background file watcher.
@@ -1535,29 +1561,14 @@ impl IndexManager {
                                             repo_label,
                                             ungrouped.len()
                                         );
-                                        match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
-                                            Ok(summary) => {
-                                                info!(
-                                                    "✅ [{}] Symbol rebuild complete: {} symbols, {} refs in {}ms",
-                                                    repo_label,
-                                                    summary.symbols_indexed,
-                                                    summary.references_stored,
-                                                    summary.duration_ms
-                                                );
-                                                if let Some(ref n) = notifier {
-                                                    n(SymbolRebuildSignal::Succeeded);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "⚠️ [{}] Symbol rebuild failed: {}",
-                                                    repo_label, e
-                                                );
-                                                if let Some(ref n) = notifier {
-                                                    n(SymbolRebuildSignal::Failed(e.to_string()));
-                                                }
-                                            }
-                                        }
+                                        Self::run_full_rebuild_logged(
+                                            indexer,
+                                            &rp,
+                                            &dp,
+                                            &repo_label,
+                                            "C#",
+                                            notifier.as_ref(),
+                                        );
                                         // Clear "Indexing" regardless of outcome
                                         if let Some(ref cb) = indexing_cb_scip {
                                             cb(false);
