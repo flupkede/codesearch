@@ -1069,7 +1069,19 @@ impl IndexManager {
 
         // Spawn background task
         tokio::spawn(async move {
-            info!("👀 File watcher task started for: {}", path.display());
+            // Short human-readable repo label for log attribution in a
+            // multi-repo hub. In serve mode the alias == directory name, so the
+            // last path component is the alias for the common case; fall back to
+            // the full path when there is no file name (e.g. a root path).
+            let repo_label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            info!(
+                "👀 File watcher task started for '{}': {}",
+                repo_label,
+                path.display()
+            );
 
             // Start the watcher inside the task (if not already started by start_watching)
             {
@@ -1124,7 +1136,10 @@ impl IndexManager {
                 if let Some(watcher) = &git_head_watcher {
                     if let Ok(branch_changed) = watcher.check().await {
                         if branch_changed.is_some() {
-                            info!("🔀 Git branch changed, triggering full incremental refresh...");
+                            info!(
+                                "🔀 [{}] Git branch changed, triggering full incremental refresh...",
+                                repo_label
+                            );
                             // Notify serve layer: indexing active
                             if let Some(ref cb) = indexing_cb {
                                 cb(true);
@@ -1134,7 +1149,7 @@ impl IndexManager {
                             if let Err(e) =
                                 Self::refresh_index_with_stores(&path, &db_path, &stores).await
                             {
-                                error!("❌ Branch change refresh failed: {}", e);
+                                error!("❌ [{}] Branch change refresh failed: {}", repo_label, e);
                             }
                             // Notify serve layer: indexing idle
                             if let Some(ref cb) = indexing_cb {
@@ -1265,18 +1280,30 @@ impl IndexManager {
                     let to_remove: Vec<PathBuf> = files_to_remove.drain().collect();
 
                     info!(
-                        "📦 Flushing batch: {} to index, {} to remove",
+                        "📦 [{}] Flushing batch: {} to index, {} to remove",
+                        repo_label,
                         to_index.len(),
                         to_remove.len()
                     );
 
+                    // Signal "Indexing" to the TUI for the duration of the text
+                    // batch refresh. Without this, ordinary file edits (the most
+                    // common watcher activity) never surface in the TUI status
+                    // column — only branch changes and symbol rebuilds did.
+                    if let Some(ref cb) = indexing_cb {
+                        cb(true);
+                    }
                     // Process batch using shared stores
                     if let Err(e) = Self::process_batch_with_stores(
                         &path, &db_path, &stores, to_index, to_remove,
                     )
                     .await
                     {
-                        error!("❌ Batch processing failed: {}", e);
+                        error!("❌ [{}] Batch processing failed: {}", repo_label, e);
+                    }
+                    // Clear "Indexing" regardless of outcome.
+                    if let Some(ref cb) = indexing_cb {
+                        cb(false);
                     }
 
                     // Reset timer
