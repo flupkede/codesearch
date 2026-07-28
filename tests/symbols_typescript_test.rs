@@ -161,3 +161,83 @@ fn test_typescript_pipeline_ts_sample_roundtrip() {
         "Expected a call-site in other.ts"
     );
 }
+
+// ── Real-project smoke test (opt-in via env var) ──────────────────────
+
+/// Smoke test against a real-world TypeScript project pointed at by the
+/// `CODESEARCH_TS_TEST_REAL` env var. Gated by the feature flag AND the env
+/// var, so it never runs in CI unless explicitly opted in.
+///
+/// Verifies: rebuild succeeds on a non-trivial codebase, `find_references`
+/// returns sensible multi-file results for a commonly-used symbol.
+#[test]
+#[cfg_attr(not(feature = "typescript_helper_integration"), ignore)]
+fn test_typescript_pipeline_real_project() {
+    let project_root = match std::env::var("CODESEARCH_TS_TEST_REAL") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            eprintln!("skipping real-project test: set CODESEARCH_TS_TEST_REAL=<path> to enable");
+            return;
+        }
+    };
+    assert!(
+        project_root.join("tsconfig.json").is_file(),
+        "CODESEARCH_TS_TEST_REAL does not point at a TS project root (no tsconfig.json): {}",
+        project_root.display()
+    );
+
+    let indexer = TypeScriptSymbolIndexer::new();
+    assert!(indexer.is_available(), "scip-typescript not resolvable");
+    assert!(
+        indexer.applies_to(&project_root),
+        "Indexer did not recognize the project as TypeScript"
+    );
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path();
+
+    let started = std::time::Instant::now();
+    let summary = indexer
+        .rebuild(&project_root, db_path, RebuildScope::Full)
+        .expect("rebuild failed");
+    let elapsed = started.elapsed();
+
+    eprintln!(
+        "rebuild: {} symbols, {} references stored in {:.2}s",
+        summary.symbols_indexed,
+        summary.references_stored,
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        summary.symbols_indexed > 50,
+        "Expected >50 symbols for a real project, got {}",
+        summary.symbols_indexed
+    );
+
+    // `log` is a very commonly used symbol in the target project — expect
+    // many call-sites across many files.
+    for sym in &["log", "configureLogger"] {
+        let refs = indexer
+            .find_references(db_path, sym)
+            .unwrap_or_else(|e| panic!("find_references({sym}) failed: {e:#}"));
+        let distinct_files: std::collections::HashSet<_> =
+            refs.iter().map(|r| r.file.clone()).collect();
+        eprintln!(
+            "find_references({sym:?}): {} occurrences across {} files",
+            refs.len(),
+            distinct_files.len()
+        );
+        // Sanity: each queried symbol should have at least one hit.
+        assert!(
+            !refs.is_empty(),
+            "Expected at least one reference for `{sym}`, got 0"
+        );
+    }
+
+    // Negative test: unknown symbol returns empty, no panic.
+    let unknown = indexer
+        .find_references(db_path, "thisSymbolDoesNotExist_xyzzy_12345")
+        .expect("find_references on unknown symbol should not error");
+    assert!(unknown.is_empty(), "Unknown symbol should return empty");
+    eprintln!("negative test OK: unknown symbol returned 0 results");
+}
