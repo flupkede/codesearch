@@ -23,7 +23,7 @@ use super::tui_common::{
 };
 use super::ServeState;
 use crate::cli::doctor;
-use crate::constants::{DB_DIR_NAME, LANG_CSHARP};
+use crate::constants::{DB_DIR_NAME, LANG_CSHARP, LANG_TYPESCRIPT};
 use crate::index::IndexManager;
 
 /// Footer flash shown when a local-index action key (doctor / reindex / remove)
@@ -137,6 +137,12 @@ async fn run_tui_loop(
             .map(|i| i.is_available())
             .unwrap_or(false);
 
+        let ts_helper = state
+            .symbol_registry
+            .get(LANG_TYPESCRIPT)
+            .map(|i| i.is_available())
+            .unwrap_or(false);
+
         // Expire a stale flash, then borrow the live message (if any) for render.
         if flash
             .as_ref()
@@ -167,6 +173,7 @@ async fn run_tui_loop(
                 active,
                 &cpu,
                 csharp_helper,
+                ts_helper,
                 flash_msg,
             );
 
@@ -377,6 +384,14 @@ fn map_repo_rows(
             }
             .to_string();
 
+            let ts_str = match info.typescript_index {
+                super::CSharpIndexStatus::Ready => "ready",
+                super::CSharpIndexStatus::Indexing => "indexing",
+                super::CSharpIndexStatus::Error => "error",
+                super::CSharpIndexStatus::None => "none",
+            }
+            .to_string();
+
             let lock_mode = match info.status {
                 super::RepoStateLabel::Open | super::RepoStateLabel::Indexing => "write",
                 super::RepoStateLabel::Warm | super::RepoStateLabel::Readonly => "read",
@@ -394,6 +409,7 @@ fn map_repo_rows(
                 status: status_str,
                 csharp_index: csharp_str,
                 csharp_error: info.csharp_error.clone(),
+                typescript_index: ts_str,
                 changes: info.changes,
                 tool_call_count: info.tool_call_count,
                 last_tool_call: info.last_tool_call.clone(),
@@ -511,6 +527,7 @@ async fn discover_remote_rows(
                     .unwrap_or_else(|| "warm".to_string()),
                 csharp_index: "none".to_string(),
                 csharp_error: None,
+                typescript_index: "none".to_string(),
                 changes: st.map(|s| s.changes).unwrap_or(0),
                 tool_call_count: st.and_then(|s| s.tool_call_count).unwrap_or(0),
                 last_tool_call: st.and_then(|s| s.last_tool_call.clone()),

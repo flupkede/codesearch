@@ -34,6 +34,8 @@ struct StatusResponse {
     cpu_percent: String,
     csharp_helper: bool,
     #[serde(default)]
+    ts_helper: bool,
+    #[serde(default)]
     uptime_secs: u64,
 }
 
@@ -49,6 +51,8 @@ struct RepoInfo {
     #[serde(default)]
     csharp_error: Option<String>,
     #[serde(default)]
+    typescript_index: String,
+    #[serde(default)]
     path: String,
 }
 
@@ -59,6 +63,7 @@ impl RepoInfo {
             status: self.status.clone(),
             csharp_index: self.csharp_index.clone(),
             csharp_error: self.csharp_error.clone(),
+            typescript_index: self.typescript_index.clone(),
             changes: self.changes,
             tool_call_count: self.tool_call_count,
             last_tool_call: self.last_tool_call.clone(),
@@ -170,6 +175,7 @@ async fn run_remote_tui_loop(
         let active = data.as_ref().map(|d| d.active_sessions).unwrap_or(0);
         let cpu = data.as_ref().map(|d| d.cpu_percent.as_str()).unwrap_or("—");
         let csharp_helper = data.as_ref().map(|d| d.csharp_helper).unwrap_or(false);
+        let ts_helper = data.as_ref().map(|d| d.ts_helper).unwrap_or(false);
         let uptime_str = data
             .as_ref()
             .map(|d| tui_common::format_uptime_secs(d.uptime_secs))
@@ -197,6 +203,7 @@ async fn run_remote_tui_loop(
                     active,
                     cpu,
                     csharp_helper,
+                    ts_helper,
                     None,
                 );
             } else {
@@ -213,7 +220,17 @@ async fn run_remote_tui_loop(
                     ),
                 ]));
                 f.render_widget(connecting, chunks[1]);
-                tui_common::render_footer(f, chunks[3], &[], &table_state, 0, "—", false, None);
+                tui_common::render_footer(
+                    f,
+                    chunks[3],
+                    &[],
+                    &table_state,
+                    0,
+                    "—",
+                    false,
+                    false,
+                    None,
+                );
             }
 
             // Render overlay on top if active
