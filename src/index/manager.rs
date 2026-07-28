@@ -1669,8 +1669,8 @@ impl IndexManager {
                             ts_last_event_time = None;
 
                             info!(
-                                "🔬 {} modified + {} deleted .ts/.tsx/.mts/.cts file(s), triggering full symbol rebuild (after {}s debounce)",
-                                modified_count, deleted_count,
+                                "🔬 [{}] {} modified + {} deleted .ts/.tsx/.mts/.cts file(s), triggering full symbol rebuild (after {}s debounce)",
+                                repo_label, modified_count, deleted_count,
                                 ts_debounce.as_secs()
                             );
 
@@ -1678,17 +1678,22 @@ impl IndexManager {
                             let rp = path.clone();
                             let dp = db_path.clone();
                             let indexing_cb_ts = indexing_cb.clone();
+                            // Clone the repo label into the blocking task (the outer
+                            // binding is reused by later loop iterations).
+                            let repo_label = repo_label.clone();
                             tokio::task::spawn_blocking(move || {
                                 if let Some(indexer) = reg.get(LANG_TYPESCRIPT) {
                                     if !indexer.applies_to(&rp) {
                                         info!(
-                                            "🔬 TypeScript symbol rebuild skipped: not applicable (no tsconfig.json)"
+                                            "🔬 [{}] TypeScript symbol rebuild skipped: not applicable (no tsconfig.json)",
+                                            repo_label
                                         );
                                         return;
                                     }
                                     if !indexer.is_available() {
                                         info!(
-                                            "🔬 TypeScript symbol rebuild skipped: scip-typescript not available"
+                                            "🔬 [{}] TypeScript symbol rebuild skipped: scip-typescript not available",
+                                            repo_label
                                         );
                                         return;
                                     }
@@ -1699,19 +1704,17 @@ impl IndexManager {
                                         cb(true);
                                     }
 
-                                    match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
-                                        Ok(summary) => {
-                                            info!(
-                                                "✅ TypeScript symbol rebuild complete: {} symbols, {} refs in {}ms",
-                                                summary.symbols_indexed,
-                                                summary.references_stored,
-                                                summary.duration_ms
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!("⚠️ TypeScript symbol rebuild failed: {}", e);
-                                        }
-                                    }
+                                    // The TypeScript path has no serve-side status
+                                    // notifier yet, so only the general "Indexing"
+                                    // label reflects it (via indexing_cb_ts).
+                                    Self::run_full_rebuild_logged(
+                                        indexer,
+                                        &rp,
+                                        &dp,
+                                        &repo_label,
+                                        "TypeScript",
+                                        None,
+                                    );
 
                                     // Clear "Indexing" regardless of outcome
                                     if let Some(ref cb) = indexing_cb_ts {
