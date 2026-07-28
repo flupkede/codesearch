@@ -8,9 +8,12 @@
   B) the C# indicator never shows "Indexing" during a watcher rebuild;
   C) symbol-rebuild log lines lack a repo label;
   plus (gap #1) ordinary text-batch reindexes never signal "Indexing" in the TUI.
-- **Status:** all 3 stages implemented + committed; Stage 3 review pending.
+- **Status:** ✅ COMPLETE — all 3 stages + DRY refactor committed; every per-stage
+  review and the final full-branch review PASSED. Not pushed (awaiting user).
 - **Latest test result:** `cargo fmt --all --check`, `cargo check --all-targets`,
-  `cargo clippy --all-targets -- -D warnings` all clean after Stage 3.
+  `cargo clippy --all-targets -- -D warnings` clean; 609 lib tests pass.
+- **Final review:** ✅ PASS on full diff `09b451a..78c9310` (holistic signal/label
+  balance, single-source-of-truth rebuild helper, no stale 2-arg notifier sites).
 
 ## Root cause (from code, not memory)
 
@@ -52,7 +55,10 @@ in `IndexManager` cannot reach it — it only holds the two callbacks.
 - Commits: `928273d6ee0e66f6f66f64fdcc8126a2e063919b` (feature) —
   review: ⚠️ PASS WITH REMARKS (1 Important: duplicated full-rebuild block);
   `a5f66c819d45bf0c9d49d74293ee299e5f06f9e9` (remark fix) — extracted
-  `IndexManager::run_full_rebuild_logged`, re-review pending. 609 lib tests pass.
+  `IndexManager::run_full_rebuild_logged`; re-review ⚠️ PASS WITH REMARKS
+  (one 4th copy left in the `.ts` path); `78c9310aa5f45b452d0929a586a96b7fb8a4b6cc`
+  (fold-in) — routed the `.ts` debounce rebuild through the same helper →
+  single source of truth for all four full-rebuild paths. 609 lib tests pass.
 - Added `IndexManager::spawn_branch_change_symbol_rebuild(...)`: after the
   branch-change text refresh, a fire-and-forget `spawn_blocking` runs a
   `RebuildScope::Full` rebuild for every applicable+available language (C# + TS).
