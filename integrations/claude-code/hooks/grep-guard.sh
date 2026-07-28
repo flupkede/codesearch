@@ -21,7 +21,6 @@ raw="$(cat)"
 tool=$(echo "$raw" | jq -r '.tool_name // empty')
 [ "$tool" != "Grep" ] && exit 0
 
-pattern=$(echo "$raw" | jq -r '.tool_input.pattern // empty')
 path=$(echo "$raw" | jq -r '.tool_input.path // empty')
 
 # ------------------------------------------------------------------

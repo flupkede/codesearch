@@ -48,9 +48,8 @@ $inp  = $data.tool_input
 if ($tool -ne 'Grep') { exit 0 }
 if ($null -eq $inp)   { exit 0 }
 
-$names   = @($inp.PSObject.Properties.Name)
-$path    = if ($names -contains 'path')    { [string]$inp.path }    else { '' }
-$pattern = if ($names -contains 'pattern') { [string]$inp.pattern } else { '' }
+$names = @($inp.PSObject.Properties.Name)
+$path  = if ($names -contains 'path') { [string]$inp.path } else { '' }
 
 # ------------------------------------------------------------------
 # 1. Is the path internal to the current repo?
