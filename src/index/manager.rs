@@ -856,18 +856,7 @@ impl IndexManager {
         // — a failed write only affects display/status, not searchability.
         {
             if let Err(e) = crate::vectordb::merge_metadata_atomic(db_path, |obj| {
-                obj.insert(
-                    "model_short_name".to_string(),
-                    serde_json::Value::String(embed_model.short_name().to_string()),
-                );
-                obj.insert(
-                    "model_name".to_string(),
-                    serde_json::Value::String(embed_model.name().to_string()),
-                );
-                obj.insert(
-                    "dimensions".to_string(),
-                    serde_json::Value::Number(embed_model.dimensions().into()),
-                );
+                embed_model.write_metadata_fields(obj);
             }) {
                 warn!("metadata.json model write warning: {}", e);
             }
@@ -924,10 +913,9 @@ impl IndexManager {
 
         // Apply model override if provided (e.g. from `index add --model`)
         if let Some(ref mt) = model_override {
-            preserved_metadata["model_short_name"] =
-                serde_json::Value::String(mt.short_name().to_string());
-            preserved_metadata["model_name"] = serde_json::Value::String(mt.name().to_string());
-            preserved_metadata["dimensions"] = serde_json::Value::Number(mt.dimensions().into());
+            if let Some(obj) = preserved_metadata.as_object_mut() {
+                mt.write_metadata_fields(obj);
+            }
             info!(
                 "📝 Model override applied: {} ({} dims)",
                 mt.short_name(),
@@ -948,12 +936,9 @@ impl IndexManager {
         // override was given (the override block above already populated these).
         if preserved_metadata.get("model_short_name").is_none() {
             let default_model = ModelType::default();
-            preserved_metadata["model_short_name"] =
-                serde_json::Value::String(default_model.short_name().to_string());
-            preserved_metadata["model_name"] =
-                serde_json::Value::String(default_model.name().to_string());
-            preserved_metadata["dimensions"] =
-                serde_json::Value::Number(default_model.dimensions().into());
+            if let Some(obj) = preserved_metadata.as_object_mut() {
+                default_model.write_metadata_fields(obj);
+            }
             info!(
                 "📝 metadata.json had no model_short_name (pre-created by schema-version bootstrap) — stamping default model {} ({} dims)",
                 default_model.short_name(),

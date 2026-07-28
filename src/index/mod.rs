@@ -1003,18 +1003,7 @@ async fn index_with_options(
         // partial chunks we already built are still searchable.
         // Uses read-modify-write so existing stats (total_chunks/total_files) are preserved.
         if let Err(e) = merge_metadata_atomic(&db_path, |obj| {
-            obj.insert(
-                "model_short_name".to_string(),
-                serde_json::Value::String(model_type.short_name().to_string()),
-            );
-            obj.insert(
-                "model_name".to_string(),
-                serde_json::Value::String(model_type.name().to_string()),
-            );
-            obj.insert(
-                "dimensions".to_string(),
-                serde_json::Value::Number(model_type.dimensions().into()),
-            );
+            model_type.write_metadata_fields(obj);
             obj.insert(
                 "indexed_at".to_string(),
                 serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
@@ -1085,11 +1074,6 @@ async fn index_with_options(
 
         return Ok(());
     }
-
-    // Capture model info before dropping the ONNX model
-    let model_short_name = embedding_service.model_short_name().to_string();
-    let model_name = embedding_service.model_name().to_string();
-    let model_dimensions = embedding_service.dimensions();
 
     // Free ONNX model + arena allocator memory before final index operations
     // This releases hundreds of MB of inference buffers
@@ -1172,18 +1156,7 @@ async fn index_with_options(
     // (which writes `partial: true`); readers can always check the field
     // regardless of how indexing completed.
     merge_metadata_atomic(&db_path, |obj| {
-        obj.insert(
-            "model_short_name".to_string(),
-            serde_json::Value::String(model_short_name.to_string()),
-        );
-        obj.insert(
-            "model_name".to_string(),
-            serde_json::Value::String(model_name.to_string()),
-        );
-        obj.insert(
-            "dimensions".to_string(),
-            serde_json::Value::Number(model_dimensions.into()),
-        );
+        model_type.write_metadata_fields(obj);
         obj.insert(
             "indexed_at".to_string(),
             serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
