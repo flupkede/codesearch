@@ -100,11 +100,23 @@ jobs:
           Copy-Item -Recurse helpers-publish\* staging\helpers\csharp\
           Compress-Archive -Path staging\* -DestinationPath ${{ matrix.artifact_csharp }}
 
+      # D1 — same cp-retry pattern as the macOS "Package with-csharp" step (which
+      # broke v1.1.31 under APFS disk pressure, see build-macos job below). The
+      # Linux runner has ~84GB disk and ext4 (no fcopyfile EIO failure mode), so
+      # this isn't fixing an observed failure — it's preventive consistency so
+      # both platforms fail the same transient-copy-error way instead of one
+      # silently hard-failing on the first attempt.
       - name: Package with-csharp (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p staging/helpers/csharp
-          cp target/${{ matrix.target }}/release/codesearch staging/
+          for i in 1 2 3; do
+            if cp target/${{ matrix.target }}/release/codesearch staging/codesearch; then break; fi
+            echo "cp attempt $i/3 failed, retrying in 5s…"
+            df -h /
+            sleep 5
+          done
+          test -f staging/codesearch
           cp -r helpers-publish/* staging/helpers/csharp/
           tar czf ${{ matrix.artifact_csharp }} -C staging .
 

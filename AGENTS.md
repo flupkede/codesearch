@@ -1,5 +1,7 @@
 # AGENTS.md — codesearch (features/remote-mount-selection)
 
+_Last updated: 2026-07-27_
+
 ## Current state
 
 - **Version:** see `Cargo.toml` (pre-commit hook auto-bumps patch per commit on feature branches).
@@ -24,11 +26,11 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 
 ### Code — small, ready to pick up
 
-- [ ] **T1: Remove dead `wait_until_indexed()`** in `docker/entrypoint.sh` (lines 287-319, ~33 lines) — superseded by `wait_active_build_done()` (line 331). Confirmed no callers anywhere in the repo (only 3 comment references at 225, 237, 327). Delete the function + update the comments.
-- [ ] **T2: Extract shared `build_remote_search_body(request, mode)`** in `src/mcp/mod.rs` — group fan-out and single-project fan-out (`FederationClient::search_project` at `src/federation/mod.rs:248`, call site `src/mcp/mod.rs:4317`) duplicate an 11-field `serde_json` body; drift risk. Extract to one shared builder.
-- [ ] **T3: Persist remote-project discovery** to a `remote_project_cache` in `repos.json` — TUI peer-`/status` discovery is currently in-memory only (last-known-good survives a blip, not a process restart).
-- [ ] **T4: 0-chunk status bug + TUI `i`/`d`/`f` diagnostics** — `/status` reports 0 chunks in some cases; TUI diagnostic keys need verification/fix. (TODO card `6a26cce1…`)
-- [ ] **T5: Extract shared `fuzzy_symbol_match`/`open_scip_env` between C# and TypeScript SCIP adapters** — `src/symbols/csharp.rs:1649`/`398` and `src/symbols/typescript.rs:152`/`269` currently carry byte-for-byte-copied logic (fuzzy symbol matching heuristic, LMDB env open/create-databases boilerplate). Flagged in the TypeScript SCIP indexing MVP final review as an Important, non-blocking finding — extract to a shared `src/symbols/scip_common.rs` (or similar) used by both adapters to avoid drift the next time either copy is bugfixed. Deliberately deferred out of the MVP branch to avoid touching stable, already-tested `csharp.rs` at the tail end of a large feature.
+- [x] **T1: Remove dead `wait_until_indexed()`** in `docker/entrypoint.sh` — superseded by `wait_active_build_done()`. Confirmed no callers anywhere in the repo (only 3 comment references). Deleted the function + updated the comments.
+- [x] **T2: Extract shared `build_remote_search_body(request, mode, limit_value)`** in `src/mcp/mod.rs` — group fan-out (`federated_search`) and single-project fan-out (`federated_project_search`) duplicated the same `serde_json` body (differing only in the limit value); extracted to one shared builder.
+- [x] **T3: Persist remote-project discovery** to `remote_project_cache` in `repos.json` — the field already existed but was never read/written. Wired `ReposConfig::cache_remote_projects()`/`cached_remote_project_aliases()`; both `codesearch remote available <peer>` and `codesearch index list --remote <peer>` now write-through-cache a peer's alias list on success and fall back to the last-known list (instead of hard-failing) when the peer is unreachable. `reconcile()` prunes cache entries for peers that no longer exist. Shared the mounted/cached row printing into `print_remote_project_row()` to keep the two CLI commands in sync.
+- [ ] **T4: 0-chunk status bug** — `index_status_impl` (`src/mcp/mod.rs:7519-7619`) reports `status: "building"` whenever `stats.total_chunks == 0`, for both the single-store and multi-store (group) paths. Traced the surrounding call graph looking for a staleness/race defect: `VectorStore::stats()` (`src/vectordb/store.rs:755-778`) opens a fresh LMDB read-txn per call (no cached/stale count); `with_vector_store_read_for` (`src/mcp/mod.rs:4003-4053`) resolves the store fresh via `store_override`/`shared_stores` per call, no cross-request caching; `force_reindex_with_stores` (`src/index/manager.rs:954-963`) takes `&SharedStores` and rewrites the *existing* store in place rather than swapping the `Arc`, so no stale-handle-after-reindex scenario either. **No concrete defect confirmed via static tracing** — the reported symptom needs a live repro (cold-start race or concurrent reload) to pin down before attempting a fix; do not blind-fix based on the title alone. (TODO card `6a26cce1…`)
+- [x] ~~TUI `i`/`d`/`f` diagnostics~~ — investigated, this was a stale reference in the TODO title, not a code bug. Actual TUI keybindings (`src/serve/tui_common.rs`: `handle_key` + `render_footer`) are `i` (info), `d` (doctor), `n` (reindex), `r` (remove), `l` (reload), `q` (quit) — footer hints match the handler exactly. No `f` binding exists or ever existed in the codebase; the title's "f" doesn't correspond to anything real.
 
 ### Code — 🔒 separate worktrees, do NOT touch here
 
@@ -60,7 +62,7 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 
 ### Defensive / low priority
 
-- [ ] **D1: Apply same cp-retry pattern to Linux `with-csharp` step** in `release.yml` (lines 103-109) — same `cp ... staging/` pattern as the macOS step that broke v1.1.31. Linux has 84GB disk + ext4 (no `fcopyfile`), so low risk; preventive consistency only.
+- [x] **D1: Apply same cp-retry pattern to Linux `with-csharp` step** in `release.yml` — the "Package with-csharp (Linux)" step now retries the binary `cp` up to 3x with `df -h` diagnostics on failure and a hard `test -f` check, mirroring the macOS step's C3 pattern. Preventive consistency only (Linux runner has 84GB disk + ext4, no `fcopyfile` EIO failure mode) — no observed Linux failure, just aligning both platforms' failure behavior.
 
 ### Historical context (for C1/C2 above)
 

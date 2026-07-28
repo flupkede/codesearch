@@ -4210,6 +4210,32 @@ impl CodesearchService {
     /// peers (`<peer>/<alias>`, opt-in `remote_mounts`), then RRF-interleaves the
     /// disjoint ranked lists. One unreachable project becomes a `warning`, never
     /// a hard failure.
+    /// Build the JSON body shipped to a remote peer for a federated search
+    /// (group fan-out or single-project fan-out). Both call sites forward the
+    /// same fields — `mode` and `limit_value` are passed explicitly because
+    /// each caller computes them slightly differently (single lowercased
+    /// `mode` string shared across a whole request; a per-call `limit_value`
+    /// that may be over-fetched to compensate for client-side `filter_path`
+    /// filtering). Extracted so the two bodies can't drift out of sync.
+    fn build_remote_search_body(
+        request: &SearchRequest,
+        mode: &str,
+        limit_value: Option<usize>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "query": request.query,
+            "mode": mode,
+            "compact": request.compact,
+            "semantic_mode": request.semantic_mode,
+            "regex": request.regex,
+            "phrase": request.phrase,
+            "file_glob": request.file_glob,
+            "language": request.language,
+            "format": request.format,
+            "limit": limit_value,
+        })
+    }
+
     async fn federated_search(
         &self,
         request: &SearchRequest,
@@ -4282,18 +4308,7 @@ impl CodesearchService {
         // 2) Build the request body shipped to each remote (group forced to the
         //    peer's own scope + project stripped by the federation client).
         //    `filter_path` intentionally omitted — applied client-side below.
-        let body = serde_json::json!({
-            "query": request.query,
-            "mode": mode,
-            "compact": request.compact,
-            "semantic_mode": request.semantic_mode,
-            "regex": request.regex,
-            "phrase": request.phrase,
-            "file_glob": request.file_glob,
-            "language": request.language,
-            "format": request.format,
-            "limit": fetch_limit,
-        });
+        let body = Self::build_remote_search_body(request, &mode, fetch_limit);
 
         let client = match FederationClient::new() {
             Ok(c) => c,
@@ -4385,18 +4400,7 @@ impl CodesearchService {
         // Same shape as the group fan-out body; the federation client forces
         // `project=<remote_alias>` and strips `group`. `filter_path` is
         // intentionally omitted — applied client-side below.
-        let body = serde_json::json!({
-            "query": request.query,
-            "mode": mode,
-            "compact": request.compact,
-            "semantic_mode": request.semantic_mode,
-            "regex": request.regex,
-            "phrase": request.phrase,
-            "file_glob": request.file_glob,
-            "language": request.language,
-            "format": request.format,
-            "limit": peer_limit,
-        });
+        let body = Self::build_remote_search_body(request, &mode, peer_limit);
 
         let client = match FederationClient::new() {
             Ok(c) => c,
@@ -4608,7 +4612,7 @@ impl CodesearchService {
 
     /// Unified symbol navigation — dispatches based on `kind`.
     #[tool(
-        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
+        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol (lexical/text-based; for IDE-precise call-graphs prefer `find_impact`)\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     async fn find(
         &self,
@@ -6227,15 +6231,16 @@ impl CodesearchService {
 
     /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
     ///
-    /// Uses language-specific semantic analysis (SCIP) to find all references to a symbol,
-    /// enabling agents to plan refactors with IDE-class accuracy instead of text-matching
-    /// grep heuristics. C# is supported today (via the bundled `scip-csharp` helper);
-    /// TypeScript is also supported (via `scip-typescript`, resolved through `npx` or
-    /// `CODESEARCH_SCIP_TYPESCRIPT`). The architecture is language-agnostic and more
-    /// languages will follow. For languages not yet supported, use `find` with
-    /// `kind="usages"` as a text-based fallback.
+    /// The recommended tool for "who calls X?" / "what breaks if I rename X?". Uses
+    /// language-specific semantic analysis (SCIP) to find all references, enabling agents
+    /// to plan refactors with IDE-class accuracy instead of text-matching grep heuristics.
+    /// Precision backends ship per language: C# (bundled `scip-csharp` helper,
+    /// `-with-csharp` releases) and TypeScript (`scip-typescript`, resolved via `npx`
+    /// or `CODESEARCH_SCIP_TYPESCRIPT`). If no backend is installed for the target
+    /// language, the response reports it — fall back to `find` with `kind="usages"`
+    /// (lexical) only then.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nReturns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands the language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nLanguages: C# (requires the `scip-csharp` helper, bundled in `-with-csharp` releases) and TypeScript (requires `scip-typescript`, resolved via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`). For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -7933,7 +7938,7 @@ SERVICE-MODE NOTES (codesearch serve, esp. on another host):
 
 PICK THE RIGHT TOOL FOR THE TASK:
   "who calls X?" / "what breaks if I rename X?"
-    → find_impact (C# via SCIP; other languages: use find kind="usages")
+    → find_impact (precise SCIP call-graph; if no backend for the language, it says so → then use find kind="usages")
   "find code about X" / "how does X work" / "show me X"
     → search(mode="semantic") — concepts + synonyms + identifiers
   exact syntax like Vec<T> / foo = null / a::b
@@ -7947,7 +7952,7 @@ PICK THE RIGHT TOOL FOR THE TASK:
 
 RULES:
   - search(semantic) is the DEFAULT for code lookup. Don't skip it.
-  - find_impact for C# refactors; find(kind="usages") for other languages.
+  - For "who calls X" / impact analysis, try find_impact first; fall back to find(kind="usages") only if find_impact reports no backend.
   - NEVER use literal as first search unless you need exact syntax.
   - project or group is REQUIRED in multi-repo mode.
 

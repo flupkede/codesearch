@@ -222,8 +222,8 @@ wait_healthz() {
   done
 }
 
-# Make sure a repo's index is built/refreshed; wait_until_indexed() then blocks for
-# completion. Two cases:
+# Make sure a repo's index is built/refreshed; wait_active_build_done() then blocks
+# for completion. Two cases:
 #
 #   - ALREADY REGISTERED (index restored from a prior snapshot): do NOT issue any
 #     reindex here. serve's Phase-1 STARTUP WARMUP already opens the repo in write
@@ -234,8 +234,8 @@ wait_healthz() {
 #     process" (observed). So we let the warmup own the refresh and simply wait for
 #     the repo to reach a ready ("warm") state. During warmup /status reports the
 #     repo as "closed"; it flips to "warm" only after the refresh completes, which is
-#     exactly the signal wait_until_indexed() blocks on. /reindex?force=true is also
-#     unused (returns 500 in this deployment).
+#     exactly the signal wait_active_build_done() blocks on. /reindex?force=true is
+#     also unused (returns 500 in this deployment).
 #
 #   - NOT YET REGISTERED (first-ever cold build, no snapshot existed): POST /repos
 #     {path} to build the index from scratch (202; background; shows "indexing").
@@ -274,60 +274,15 @@ verify_index_ready() {
   log "verify: repo '${name}' OK — ${chunks} chunks indexed"
 }
 
-# Block until the requested rebuild has STARTED and then FINISHED (or timeout).
-# /reindex (and /repos) return 202 immediately and run in the background, so two
-# phases close the start-up race:
-#   1. After the 202 there's a short window before the background task flips the
-#      repo to "indexing". Phase 1 waits for a real build to be observable (status
-#      "indexing", or an already-ready "open"/"warm" when an incremental reindex
-#      finds no deltas and completes instantly) so we never mistake the gap for
-#      "done".
-#   2. Phase 2 then waits for "indexing" to clear.
-# The /status repo objects carry a "status" field per alias.
-wait_until_indexed() {
-  local base="http://127.0.0.1:${PORT}" waited=0 step=10 body started=0
-  # Phase 1: confirm a build is observable (bounded — a huge corpus enters
-  # "indexing" within seconds; a fully cache-hit rebuild may go straight to ready).
-  local start_wait=0
-  while [ "${start_wait}" -lt 120 ]; do
-    body="$(api "${base}/status" 2>/dev/null || true)"
-    if printf '%s' "${body}" | grep -q '"status":"indexing"'; then
-      started=1; break
-    fi
-    if printf '%s' "${body}" | grep -qE '"status":"(open|warm|readonly)"'; then
-      log "repo already ready (cache-instant rebuild) after ~${start_wait}s"; return 0
-    fi
-    sleep 3; start_wait=$((start_wait + 3))
-  done
-  [ "${started}" -eq 1 ] && log "build started; waiting for completion" \
-    || log "WARN: no 'indexing' observed within ${start_wait}s — proceeding cautiously"
-  # Phase 2: wait for indexing to clear, requiring the repo to be present + ready.
-  while [ "${waited}" -lt "${INDEX_JOB_MAX_WAIT_SECS}" ]; do
-    body="$(api "${base}/status" 2>/dev/null || true)"
-    if [ -n "${body}" ] \
-        && ! printf '%s' "${body}" | grep -q '"status":"indexing"' \
-        && printf '%s' "${body}" | grep -qE '"status":"(open|warm|readonly)"'; then
-      log "indexing complete after ~${waited}s"
-      return 0
-    fi
-    sleep "${step}"
-    waited=$((waited + step))
-    [ $((waited % 60)) -eq 0 ] && log "still indexing... (~${waited}s)"
-  done
-  log "WARN: indexing did not finish within ${INDEX_JOB_MAX_WAIT_SECS}s — snapshotting anyway"
-  return 0
-}
-
 # =============================================================================
 # index-job mode: build/refresh the index on a big replica, snapshot, exit.
 # =============================================================================
 # Sequential-safe build wait: block until the single in-flight build finishes.
 # The index-job builds ONE vendor at a time, so a "indexing" status anywhere in
-# /status can only be that one build — no per-alias parsing needed. (This is why
-# we don't reuse wait_until_indexed here: its start-detection short-circuits as
-# "already ready" the moment ANY earlier vendor is open, which would let the next
-# build be submitted before the current one finishes — reintroducing the parallel
-# builds that OOM-killed serve.)
+# /status can only be that one build — no per-alias parsing needed. Deliberately
+# does NOT short-circuit as "already ready" just because an earlier vendor is
+# open — that would let the next build be submitted before the current one
+# finishes, reintroducing the parallel builds that OOM-killed serve.
 wait_active_build_done() {
   local base="http://127.0.0.1:${PORT}" waited=0 body
   sleep 5   # let the 202 flip the repo into "indexing" before we start checking
