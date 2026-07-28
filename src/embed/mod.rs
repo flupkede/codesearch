@@ -231,6 +231,7 @@ impl EmbeddingService {
     }
 
     /// Get model information
+    #[allow(dead_code)] // Public info accessor; mirrors model_short_name()
     pub fn model_name(&self) -> &str {
         self.model_type.name()
     }

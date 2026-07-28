@@ -159,6 +159,30 @@ impl ModelType {
         }
     }
 
+    /// Stamp this model's identity into a metadata JSON object.
+    ///
+    /// Single source of truth for the three metadata keys (`model_short_name`,
+    /// `model_name`, `dimensions`). Every index-creation path — CLI
+    /// (`index_with_options`), serve/git-hook force-reindex, incremental
+    /// refresh, and `--model` override — writes the model through here so the
+    /// keys and value derivation cannot drift, and so `read_model_metadata`
+    /// never has to fall back to the `unknown` sentinel (which disables the
+    /// empty-index self-heal). Overwrites any existing values for these keys.
+    pub fn write_metadata_fields(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
+        obj.insert(
+            "model_short_name".to_string(),
+            serde_json::Value::String(self.short_name().to_string()),
+        );
+        obj.insert(
+            "model_name".to_string(),
+            serde_json::Value::String(self.name().to_string()),
+        );
+        obj.insert(
+            "dimensions".to_string(),
+            serde_json::Value::Number(self.dimensions().into()),
+        );
+    }
+
     /// List all available models
     pub fn all() -> &'static [ModelType] {
         &[

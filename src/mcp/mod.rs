@@ -8691,23 +8691,14 @@ pub async fn run_mcp_server(
         // Get model info
         let model_type = ModelType::default();
         let model_short_name = model_type.short_name().to_string();
-        let model_name = format!("{:?}", model_type);
         let dimensions = model_type.dimensions();
 
-        // Create minimal metadata.json (atomic read-modify-write, matching format used by build_index)
+        // Create minimal metadata.json (atomic read-modify-write, matching format
+        // used by build_index). Routes through the single-source-of-truth stamp so
+        // model_name matches the other index paths (previously wrote the Debug
+        // variant name here, e.g. "AllMiniLML6V2Q", instead of the model name).
         crate::vectordb::merge_metadata_atomic(&db_path, |obj| {
-            obj.insert(
-                "model_short_name".to_string(),
-                serde_json::Value::String(model_short_name.clone()),
-            );
-            obj.insert(
-                "model_name".to_string(),
-                serde_json::Value::String(model_name),
-            );
-            obj.insert(
-                "dimensions".to_string(),
-                serde_json::Value::Number(dimensions.into()),
-            );
+            model_type.write_metadata_fields(obj);
             obj.insert(
                 "indexed_at".to_string(),
                 serde_json::Value::String(chrono::Utc::now().to_rfc3339()),

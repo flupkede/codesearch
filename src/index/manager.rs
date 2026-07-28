@@ -853,8 +853,24 @@ impl IndexManager {
             elapsed.as_secs_f64()
         );
 
-        // Persist chunk/file counts in metadata.json for status(projects)
+        // Persist the resolved model AND the chunk/file counts in metadata.json.
+        //
+        // Writing the model here (mirroring the CLI `index_with_options` path,
+        // which stamps it unconditionally) unifies the two index-creation paths:
+        // an index built via the serve/git-hook path — which may have started
+        // from a model-less metadata.json pre-created by `ensure_schema_version`
+        // — now always ends up with a resolvable `model_short_name`. This is the
+        // structural half of the "model: unknown" fix: it guarantees the model
+        // is recorded regardless of who created the file, so it can never regress
+        // to `unknown` (which also disables the empty-index fallback). Best-effort
+        // — a failed write only affects display/status, not searchability.
         {
+            if let Err(e) = crate::vectordb::merge_metadata_atomic(db_path, |obj| {
+                embed_model.write_metadata_fields(obj);
+            }) {
+                warn!("metadata.json model write warning: {}", e);
+            }
+
             let vs = stores.vector_store.read().await;
             if let Ok(stats) = vs.stats() {
                 super::update_metadata_stats(db_path, stats.total_chunks, stats.total_files);
@@ -907,14 +923,36 @@ impl IndexManager {
 
         // Apply model override if provided (e.g. from `index add --model`)
         if let Some(ref mt) = model_override {
-            preserved_metadata["model_short_name"] =
-                serde_json::Value::String(mt.short_name().to_string());
-            preserved_metadata["model_name"] = serde_json::Value::String(mt.name().to_string());
-            preserved_metadata["dimensions"] = serde_json::Value::Number(mt.dimensions().into());
+            if let Some(obj) = preserved_metadata.as_object_mut() {
+                mt.write_metadata_fields(obj);
+            }
             info!(
                 "📝 Model override applied: {} ({} dims)",
                 mt.short_name(),
                 mt.dimensions()
+            );
+        }
+
+        // If the metadata.json that already exists lacks model fields, stamp the
+        // default model. This is the fix for the "model: unknown" worktree bug:
+        // when a repo is registered via `POST /repos` (the git-hook path), the
+        // store is opened first and `ensure_schema_version` pre-creates a
+        // metadata.json containing only `schema_version`. That defeats the
+        // `else` branch above (which only stamps a default when the whole file is
+        // absent), so without this guard the index is left with no
+        // `model_short_name` — every reader then shows `model: unknown` AND the
+        // live-chunk-count fallback (`live_chunk_count`) bails on that string,
+        // making a perfectly-good index look empty. Only runs when no explicit
+        // override was given (the override block above already populated these).
+        if preserved_metadata.get("model_short_name").is_none() {
+            let default_model = ModelType::default();
+            if let Some(obj) = preserved_metadata.as_object_mut() {
+                default_model.write_metadata_fields(obj);
+            }
+            info!(
+                "📝 metadata.json had no model_short_name (pre-created by schema-version bootstrap) — stamping default model {} ({} dims)",
+                default_model.short_name(),
+                default_model.dimensions()
             );
         }
         let model_name = preserved_metadata
@@ -2239,6 +2277,59 @@ mod tests {
         assert!(
             result.is_ok(),
             "Should return Ok when no metadata.json exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_reindex_stamps_model_when_metadata_has_only_schema_version() {
+        // Regression for the "model: unknown" worktree bug.
+        //
+        // When a repo is registered via `POST /repos` (the git-hook path), the
+        // store is opened FIRST and `ensure_schema_version` pre-creates a
+        // metadata.json containing ONLY `schema_version` — no model fields.
+        // Before the fix, force_reindex's Step 0 saw the file already exists and
+        // skipped the default-model stamp, so the index was left with no
+        // `model_short_name`: every reader then showed `model: unknown` AND the
+        // live-chunk-count fallback bailed on that string, making the index look
+        // empty (agent falls back to grep). This test reproduces that exact
+        // bootstrap state and asserts force_reindex now stamps the default model.
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        // create_test_stores → VectorStore::new → ensure_schema_version, which
+        // writes the real "schema_version only" metadata.json — the exact bug state.
+        let dims = ModelType::default().dimensions();
+        let stores = create_test_stores(&db_path, dims).await;
+
+        // Precondition: the bootstrap wrote NO model field.
+        let before = std::fs::read_to_string(db_path.join("metadata.json")).unwrap();
+        let before_json: serde_json::Value = serde_json::from_str(&before).unwrap();
+        assert!(
+            before_json.get("model_short_name").is_none(),
+            "precondition: schema-version bootstrap must not write a model, got: {before}"
+        );
+
+        // Empty codebase → perform_incremental_refresh returns before any
+        // embedding, so this exercises Fix A (the Step-0 stamp) without loading
+        // an ONNX model.
+        IndexManager::force_reindex_with_stores(&codebase_path, &db_path, &stores, None)
+            .await
+            .expect("force reindex on empty codebase should succeed");
+
+        let after = std::fs::read_to_string(db_path.join("metadata.json")).unwrap();
+        let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after_json.get("model_short_name").and_then(|v| v.as_str()),
+            Some(ModelType::default().short_name()),
+            "metadata.json must have the default model_short_name stamped, got: {after}"
+        );
+        assert_eq!(
+            after_json.get("dimensions").and_then(|v| v.as_u64()),
+            Some(dims as u64),
+            "metadata.json must record the default model's dimensions, got: {after}"
         );
     }
 

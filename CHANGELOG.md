@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`model: unknown` on indexes created via the serve / git-hook path (git worktrees especially).** When a repo was registered through `POST /repos` (the git-hook flow), the vector store was opened first and `ensure_schema_version` pre-created a `metadata.json` containing only `schema_version` — no model fields. The force-reindex path then saw the file already existed and skipped stamping the default model, so the index was left with no `model_short_name`. Every reader reported `model: unknown`, and that sentinel disabled the empty-index live-chunk-count self-heal, making a perfectly good worktree index look empty so agents fell back to grep. The serve/git-hook and incremental-refresh paths now always stamp the resolved model. As part of the fix, the model→metadata stamp (`model_short_name`/`model_name`/`dimensions`) is consolidated into a single `ModelType::write_metadata_fields` source of truth across all five index-creation sites — which also corrects a pre-existing drift where the auto-create-DB path wrote the Debug variant name (e.g. `AllMiniLML6V2Q`) as `model_name` instead of the real model name. Existing worktree indexes need one reindex to pick up the stamped model.
+
 ## [1.1.31] - 2026-07-23
 
 **Security hardening sweep (Aikido) + community bug/dependency fixes.**
