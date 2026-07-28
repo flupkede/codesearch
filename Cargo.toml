@@ -98,6 +98,10 @@ async-trait = "0.1"
 arroy = "0.5"
 heed = "0.20"
 bincode = "1.3"
+# SCIP symbol indexing — parses standard SCIP protobuf (.scip) emitted by
+# Sourcegraph indexers (e.g. scip-typescript) for the TypeScript symbol adapter.
+scip = "0.9"
+protobuf = "3.7"
 rand = "0.8"
 # Bumped floor from 1.5.0 to 1.8.0 for CVE patches (Aikido group: rmcp priority 82, 3 CVEs).
 # v2.x is available but is a breaking major bump — deferred.
@@ -137,3 +141,4 @@ default = []
 cuda = ["ort/cuda"]        # Enable CUDA GPU acceleration (requires cuDNN)
 tensorrt = ["ort/tensorrt"] # Enable TensorRT acceleration (NVIDIA only)
 csharp_helper_integration = []  # Enable integration tests that require the scip-csharp helper binary
+typescript_helper_integration = []  # Enable integration tests that require scip-typescript (npx or CODESEARCH_SCIP_TYPESCRIPT)

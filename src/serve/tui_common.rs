@@ -58,6 +58,8 @@ pub struct RepoRow {
     pub csharp_index: String,
     /// Optional C# error message
     pub csharp_error: Option<String>,
+    /// TypeScript index status: same vocabulary as `csharp_index`.
+    pub typescript_index: String,
     /// Pending file changes detected by file watcher
     pub changes: u64,
     /// Total MCP tool calls since serve start
@@ -322,10 +324,14 @@ pub fn render_table(
     let max_alias_w = repos
         .iter()
         .map(|r| {
-            let extra = match r.csharp_index.as_str() {
-                "ready" | "error" | "indexing" => 4,
-                _ => 0,
-            };
+            // Each indicator (" C#·" / " TS·") is 4 display cols; account for both.
+            let mut extra = 0usize;
+            if matches!(r.csharp_index.as_str(), "ready" | "error" | "indexing") {
+                extra += 4;
+            }
+            if matches!(r.typescript_index.as_str(), "ready" | "error" | "indexing") {
+                extra += 4;
+            }
             r.alias.len() + extra
         })
         .max()
@@ -353,7 +359,7 @@ pub fn render_table(
             let lock_cell = lock_cell(&repo.lock_mode);
 
             // Alias text with optional C# indicator suffix, plus its base style.
-            let (alias_text, mut alias_style) = match repo.csharp_index.as_str() {
+            let (mut alias_text, mut alias_style) = match repo.csharp_index.as_str() {
                 "ready" => (
                     format!("{} C#·", repo.alias),
                     Style::default().fg(Color::White),
@@ -374,6 +380,19 @@ pub fn render_table(
                 }
                 _ => (repo.alias.clone(), Style::default().fg(Color::White)),
             };
+
+            // Append the TypeScript indicator alongside the C# one when a TS
+            // index exists. The alias column is the canonical multi-language
+            // symbol-index indicator (the status cell only carries C#).
+            match repo.typescript_index.as_str() {
+                "ready" => alias_text.push_str(" TS·"),
+                "error" => {
+                    alias_text.push_str(" TS!");
+                    alias_style = alias_style.fg(Color::Red);
+                }
+                "indexing" => alias_text.push_str(" TS…"),
+                _ => {}
+            }
 
             // Red bold alias if the repo is in an error state.
             if repo.status == "error" {
@@ -645,6 +664,7 @@ pub fn render_footer(
     active: u64,
     cpu: &str,
     csharp_helper: bool,
+    ts_helper: bool,
     flash: Option<&str>,
 ) {
     let selected = table_state.selected().unwrap_or(0);
@@ -657,7 +677,7 @@ pub fn render_footer(
     let sessions_str = format!("Sessions: {}", active);
     let cpu_str = format!("CPU: {}", cpu);
 
-    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len();
+    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len() + "TS │ ".len();
 
     let footer_inner = area.inner(Margin {
         vertical: 0,
@@ -711,8 +731,15 @@ pub fn render_footer(
         Span::styled("C# │ ", Style::default().fg(Color::DarkGray))
     };
 
+    let ts_indicator = if ts_helper {
+        Span::styled("TS │ ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("TS │ ", Style::default().fg(Color::DarkGray))
+    };
+
     let right_line = Line::from(vec![
         csharp_indicator,
+        ts_indicator,
         Span::styled(cpu_str, Style::default().fg(Color::Green)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(sessions_str, Style::default().fg(Color::Cyan)),

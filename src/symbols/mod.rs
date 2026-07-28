@@ -9,6 +9,8 @@
 
 pub mod csharp;
 pub mod scip_parse;
+pub mod scip_proto;
+pub mod typescript;
 
 use std::path::{Path, PathBuf};
 
@@ -178,7 +180,10 @@ impl SymbolIndexerRegistry {
     /// Create a registry with default (MVP) indexers.
     pub fn new() -> Self {
         Self {
-            indexers: vec![Box::new(csharp::CSharpSymbolIndexer::new())],
+            indexers: vec![
+                Box::new(csharp::CSharpSymbolIndexer::new()),
+                Box::new(typescript::TypeScriptSymbolIndexer::new()),
+            ],
         }
     }
 

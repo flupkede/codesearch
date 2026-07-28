@@ -6234,11 +6234,13 @@ impl CodesearchService {
     /// The recommended tool for "who calls X?" / "what breaks if I rename X?". Uses
     /// language-specific semantic analysis (SCIP) to find all references, enabling agents
     /// to plan refactors with IDE-class accuracy instead of text-matching grep heuristics.
-    /// Precision backends ship per language; C# is available today (bundled `scip-csharp`
-    /// helper, `-with-csharp` releases). If no backend is installed for the target language,
-    /// the response reports it — fall back to `find` with `kind="usages"` (lexical) only then.
+    /// Precision backends ship per language: C# (bundled `scip-csharp` helper,
+    /// `-with-csharp` releases) and TypeScript (`scip-typescript`, resolved via `npx`
+    /// or `CODESEARCH_SCIP_TYPESCRIPT`). If no backend is installed for the target
+    /// language, the response reports it — fall back to `find` with `kind="usages"`
+    /// (lexical) only then.
     #[tool(
-        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nPrecision backends (SCIP) ship per language; C# is available today (bundled `scip-csharp` helper, `-with-csharp` releases). If no backend is installed for the target language, the response says so — fall back to `find kind=\"usages\"` (lexical) only then.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants:\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     async fn find_impact(
         &self,
@@ -6299,6 +6301,9 @@ impl CodesearchService {
                 let ext = Path::new(f).extension()?.to_str()?.to_lowercase();
                 match ext.as_str() {
                     "cs" => Some(crate::constants::LANG_CSHARP.to_string()),
+                    "ts" | "tsx" | "mts" | "cts" => {
+                        Some(crate::constants::LANG_TYPESCRIPT.to_string())
+                    }
                     _ => None,
                 }
             })
@@ -6320,10 +6325,10 @@ impl CodesearchService {
                 let installed = registry.installed_languages();
                 if installed.is_empty() {
                     return Ok(CallToolResult::success(vec![Content::text(
-                        "No symbol indexers installed. Install the `scip-csharp` helper for C# support.".to_string(),
+                        "No symbol indexers installed. Install the `scip-csharp` helper for C# support, or `scip-typescript` (via npx) for TypeScript support.".to_string(),
                     )]));
                 }
-                // Use the first installed language (MVP: only C#)
+                // Use the first installed language (MVP: C# or TypeScript)
                 match registry.get(&installed[0]) {
                     Some(i) => i,
                     None => {

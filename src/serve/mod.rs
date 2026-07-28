@@ -38,10 +38,10 @@ use crate::constants::{
     ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV,
     CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
     DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_PATH,
-    HEALTHZ_PATH, HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV,
-    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH,
-    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
-    STATUS_PATH,
+    HEALTHZ_PATH, HEALTH_PATH, LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS,
+    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
+    REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV,
+    SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
@@ -103,6 +103,7 @@ pub(crate) struct RepoStatusInfo {
     pub(crate) tool_call_count: u64,
     pub(crate) csharp_index: CSharpIndexStatus,
     pub(crate) csharp_error: Option<String>,
+    pub(crate) typescript_index: CSharpIndexStatus,
 }
 
 impl RepoStateLabel {
@@ -2226,6 +2227,24 @@ impl ServeState {
                 None
             };
 
+            // TypeScript index status. Unlike C#, there is no live status cache
+            // populated during rebuilds yet (stage 7 work), so we always probe:
+            // helper available (npx/scip-typescript resolvable) + index dir
+            // exists → Ready; otherwise None. The TUI icon reflects "an index
+            // exists", which is exactly what matters for discoverability.
+            let registry = &self.symbol_registry;
+            let typescript_index = {
+                let has_ts_helper = registry
+                    .get(LANG_TYPESCRIPT)
+                    .map(|i| i.is_available())
+                    .unwrap_or(false);
+                if has_ts_helper && registry.has_index_for(LANG_TYPESCRIPT, &db_path) {
+                    CSharpIndexStatus::Ready
+                } else {
+                    CSharpIndexStatus::None
+                }
+            };
+
             result.push((
                 alias.clone(),
                 RepoStatusInfo {
@@ -2235,6 +2254,7 @@ impl ServeState {
                     tool_call_count,
                     csharp_index,
                     csharp_error,
+                    typescript_index,
                 },
             ));
         }
@@ -2519,6 +2539,12 @@ async fn status_handler(
                 CSharpIndexStatus::Error => "error",
                 CSharpIndexStatus::Indexing => "indexing",
             };
+            let ts_str = match info.typescript_index {
+                CSharpIndexStatus::None => "none",
+                CSharpIndexStatus::Ready => "ready",
+                CSharpIndexStatus::Error => "error",
+                CSharpIndexStatus::Indexing => "indexing",
+            };
             json!({
                 "alias": alias,
                 "status": status_str,
@@ -2528,6 +2554,7 @@ async fn status_handler(
                 "tool_call_count": info.tool_call_count,
                 "csharp_index": csharp_str,
                 "csharp_error": info.csharp_error,
+                "typescript_index": ts_str,
             })
         })
         .collect();
@@ -2578,12 +2605,19 @@ async fn status_handler(
         .map(|i| i.is_available())
         .unwrap_or(false);
 
+    let ts_helper = state
+        .symbol_registry
+        .get(LANG_TYPESCRIPT)
+        .map(|i| i.is_available())
+        .unwrap_or(false);
+
     AxumJson(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "repos": repo_json,
         "active_sessions": active_sessions,
         "cpu_percent": cpu,
         "csharp_helper": csharp_helper,
+        "ts_helper": ts_helper,
         "uptime_secs": uptime_secs,
     }))
 }
