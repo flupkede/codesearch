@@ -1,10 +1,10 @@
 # AGENTS.md — codesearch (features/remote-mount-selection)
 
-_Last updated: 2026-07-27_
+_Last updated: 2026-07-29_
 
 ## Current state
 
-- **Version:** see `Cargo.toml` (pre-commit hook auto-bumps patch per commit on feature branches).
+- **Version:** `Major.Minor.Patch` (semver). Patch auto-bumps +1 on every PR merged to `develop` (CI via `.github/workflows/bump-develop.yml`); minor bumps manually at release (`scripts/bump-version.sh --type minor`, resets patch→0). Per-commit uniqueness comes from `build.rs`'s `+<commit_count>` suffix. See `RELEASING.md`.
 - **Validation:** `cargo check` for iteration, `cargo clippy -D warnings` for lint, `cargo test --lib --bins` before a branch is considered done. No `--release` builds during the fix loop — build only at the very end.
 - **Deploy:** cloud peer runs the per-vendor federation split (akeneo/vendor-a/bynder/digizuite/inriver/keyshot + custom KB), image built locally via BuildKit `docker buildx --push`, all vendors reindexed and federation validated end-to-end (`project=cloud/<vendor>`).
 
