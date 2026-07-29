@@ -1,0 +1,103 @@
+name: Bump develop version
+
+# Auto patch-bump — the "Incr" component of the Major.Minor.Incr scheme:
+#   - Incr (patch) += 1 here, automatically, on EVERY PR merge to develop.
+#   - Minor bumps deliberately at release time: run
+#     `scripts/bump-version.sh --type minor` on the release branch BEFORE
+#     tagging (the tag commit must carry the new Cargo.toml version, so minor
+#     can't be a tag-push-triggered automation). Patch resets to 0 on minor.
+#   - Major on breaking changes (manual `--type major`).
+#
+# The bot pushes the bump commit back to develop. A push made with GITHUB_TOKEN
+# does NOT re-trigger workflows (prevents loops), so this also will not kick off
+# ci.yml's `on: push: branches: [develop]` for the bump commit — the merged PR's
+# own CI already validated the code.
+#
+# ⚠️ ONE-TIME SETUP REQUIRED — the "block develop" ruleset (id 15793147) enforces
+# a pull_request rule (1 review + code-owner review) on refs/heads/develop, and
+# the default GITHUB_TOKEN is NOT in its bypass list (only RepositoryRole id 5).
+# So a GITHUB_TOKEN push to develop is REJECTED. The push step below therefore
+# authenticates with a PAT whose actor CAN bypass (you, the repo owner/admin):
+#   1. Create a fine-grained PAT: scope = this repo only, permission
+#      Contents = Read and write. Owner = you (admin → bypasses the rule).
+#   2. Add it as a repository Actions secret named CI_PAT.
+#   3. (Alternative to a PAT) install a GitHub App with Contents:write, add the
+#      App to the ruleset bypass list, and mint its token via
+#      actions/create-github-app-token instead of the secret below.
+# Until CI_PAT exists, every run fails fast at checkout (empty token).
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [develop]
+
+permissions:
+  contents: write
+
+# Serialize concurrent merges so each one gets its own bump. cancel-in-progress:
+# false → a queued run waits, then re-reads a fresh develop (already carrying the
+# previous bump) before bumping again. So N rapid merges → N patch bumps.
+concurrency:
+  group: bump-develop
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Only when the PR was actually merged (closed-without-merge is a no-op).
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout develop
+        # pin@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: develop
+          # CI_PAT (not GITHUB_TOKEN): only a token whose actor can bypass
+          # the "block develop" ruleset may push to develop. See SETUP note above.
+          # Passing `token:` also persists those creds so `git push` below works.
+          token: ${{ secrets.CI_PAT }}
+
+      - name: Compute next patch version
+        id: ver
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "::notice::Bump $CURRENT -> $NEW"
+
+      - name: Bump version in Cargo.toml + Cargo.lock
+        env:
+          CURRENT: ${{ steps.ver.outputs.current }}
+          NEW: ${{ steps.ver.outputs.new }}
+        run: |
+          set -euo pipefail
+          # Cargo.toml — the package version line (mirrors scripts/bump-version.sh).
+          sed -i "0,/^version = \"$CURRENT\"/s//version = \"$NEW\"/" Cargo.toml
+          # Cargo.lock — sync ONLY the codesearch package's version line, via a
+          # targeted range (its `name =` -> next `version =`). Never touches
+          # dependency versions (unlike `cargo update --workspace`, which would
+          # opportunistically bump transitive deps as a side effect).
+          sed -i "/^name = \"codesearch\"/,/^version = /{ s/^version = \"$CURRENT\"/version = \"$NEW\"/ }" Cargo.lock
+          # Hard-verify both files now carry the new version before committing.
+          grep -m1 "^version = \"$NEW\"" Cargo.toml >/dev/null
+          grep -A1 '^name = "codesearch"$' Cargo.lock | grep -m1 "^version = \"$NEW\"" >/dev/null
+
+      - name: Commit & push bump
+        env:
+          NEW: ${{ steps.ver.outputs.new }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          # No-op guard (e.g. a re-merge that already left develop at NEW).
+          if git diff --cached --quiet; then
+            echo "No version change to commit (already at $NEW)."
+            exit 0
+          fi
+          git commit -m "chore: bump version to $NEW (auto, PR #$PR merged to develop)"
+          git push
