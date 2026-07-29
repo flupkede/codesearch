@@ -36,6 +36,7 @@ pub enum Language {
     Css,
     Xml,
     Jupyter,
+    Protobuf,
     Unknown,
 }
 
@@ -108,6 +109,7 @@ impl Language {
             "css" => Self::Css,
             "xml" => Self::Xml,
             "jupyter" => Self::Jupyter,
+            "protobuf" | "proto" => Self::Protobuf,
             _ => return None,
         };
         Some(lang)
@@ -153,6 +155,7 @@ impl Language {
             "css" | "scss" | "sass" | "less" => Self::Css,
             "xml" | "csproj" | "props" | "targets" | "resx" | "config" => Self::Xml,
             "ipynb" => Self::Jupyter,
+            "proto" => Self::Protobuf,
             _ => Self::Unknown,
         }
     }
@@ -179,6 +182,7 @@ impl Language {
                 | Self::Yaml
                 | Self::Json
                 | Self::Markdown
+                | Self::Protobuf
         )
     }
 
@@ -214,6 +218,7 @@ impl Language {
             Self::Css => "CSS",
             Self::Xml => "XML",
             Self::Jupyter => "Jupyter",
+            Self::Protobuf => "Protobuf",
             Self::Unknown => "Unknown",
         }
     }
@@ -328,6 +333,12 @@ mod tests {
     }
 
     #[test]
+    fn test_protobuf_detection() {
+        assert_eq!(Language::from_extension("proto"), Language::Protobuf);
+        assert_eq!(detect("schema.proto"), Language::Protobuf);
+    }
+
+    #[test]
     fn test_php_detection() {
         assert_eq!(Language::from_extension("php"), Language::Php);
         // `.inc` is deliberately NOT a built-in mapping: it is language-agnostic
@@ -345,6 +356,8 @@ mod tests {
         assert_eq!(Language::from_name("c++"), Some(Language::Cpp));
         assert_eq!(Language::from_name("c#"), Some(Language::CSharp));
         assert_eq!(Language::from_name("golang"), Some(Language::Go));
+        assert_eq!(Language::from_name("protobuf"), Some(Language::Protobuf));
+        assert_eq!(Language::from_name("proto"), Some(Language::Protobuf));
         assert_eq!(Language::from_name("nonsense"), None);
         // "Unknown" is never a valid override target.
         assert_eq!(Language::from_name("unknown"), None);
@@ -405,6 +418,7 @@ mod tests {
         assert!(Language::TypeScript.supports_tree_sitter());
         assert!(Language::Json.supports_tree_sitter());
         assert!(Language::Markdown.supports_tree_sitter());
+        assert!(Language::Protobuf.supports_tree_sitter());
         // Toml has no tree-sitter grammar yet.
         assert!(!Language::Toml.supports_tree_sitter());
     }
