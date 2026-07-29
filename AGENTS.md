@@ -32,10 +32,10 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 - [ ] **T4: 0-chunk status bug** — `index_status_impl` (`src/mcp/mod.rs:7519-7619`) reports `status: "building"` whenever `stats.total_chunks == 0`, for both the single-store and multi-store (group) paths. Traced the surrounding call graph looking for a staleness/race defect: `VectorStore::stats()` (`src/vectordb/store.rs:755-778`) opens a fresh LMDB read-txn per call (no cached/stale count); `with_vector_store_read_for` (`src/mcp/mod.rs:4003-4053`) resolves the store fresh via `store_override`/`shared_stores` per call, no cross-request caching; `force_reindex_with_stores` (`src/index/manager.rs:954-963`) takes `&SharedStores` and rewrites the *existing* store in place rather than swapping the `Arc`, so no stale-handle-after-reindex scenario either. **No concrete defect confirmed via static tracing** — the reported symptom needs a live repro (cold-start race or concurrent reload) to pin down before attempting a fix; do not blind-fix based on the title alone. (TODO card `6a26cce1…`)
 - [x] ~~TUI `i`/`d`/`f` diagnostics~~ — investigated, this was a stale reference in the TODO title, not a code bug. Actual TUI keybindings (`src/serve/tui_common.rs`: `handle_key` + `render_footer`) are `i` (info), `d` (doctor), `n` (reindex), `r` (remove), `l` (reload), `q` (quit) — footer hints match the handler exactly. No `f` binding exists or ever existed in the codebase; the title's "f" doesn't correspond to anything real.
 
-### Code — 🔒 separate worktrees, do NOT touch here
+### Code — 🔒 separate worktrees (resolved)
 
-- 🔒 **find_impact routing diagnose/fix** — `DIAGNOSE_FIND_IMPACT_ROUTING.md` (repo root). Diagnose complete (root cause: self-discouraging tool-description at `src/mcp/mod.rs:6236` + asymmetric framing vs `find` at `4611` + `INSTRUCTIONS_TEMPLATE` at `7915-7953` routing non-C# away). Fix-opties A (text-layer rewrite) / B (transparent SCIP delegation in `find kind=usages`) / C (merge tools) / D (nudges) ready to pick. **Lives in its own worktree.**
-- 🔒 **TypeScript SCIP indexing** — `PLAN_TYPESCRIPT_SCIP.md` (repo root). 8-stage plan to mirror the C# pipeline with `scip-typescript` (Sourcegraph npm CLI); MVP = stages 1-6. **Lives in its own worktree.**
+- [x] ~~🔒 **find_impact routing diagnose/fix**~~ — **resolved via PR #163** (merged 2026-07-27, Option D = nudges/reframe: recommend find_impact first; stop deflecting to `find kind=usages`; align rustdoc; auto-detect TS SCIP extensions). Diagnosis doc kept in repo root as `DIAGNOSE_FIND_IMPACT_ROUTING.md`.
+- [x] ~~🔒 **TypeScript SCIP indexing**~~ — **resolved via PR #167** (merge `98a1979`, 2026-07-28). SCIP protobuf parsing, `TypeScriptSymbolIndexer` + registry wiring, file-watcher TS tracking, tests+fixture+smoke, TUI indicator, Windows `npx` fix. Plan doc kept as `PLAN_TYPESCRIPT_SCIP.md`. Follow-up SCIP-adapter dedup tracked as T5.
 
 ### Cloud / infra — needs decision before pickup
 
@@ -58,7 +58,7 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 ### GitHub issues
 
 - [ ] **#162: include protobuf as a language aware** — feature request (opened 2026-07-27). Scope: should `.proto` files be indexed as a first-class language? Needs scoping discussion.
-- (resolved locally, pending push) **#161: missing macOS binary in v1.1.31** — fixed via C1+C3+C4 on `release.yml` (commit `a68b022`, merged to develop locally in `d0500e3`, not yet pushed).
+- [x] **#161: missing macOS binary in v1.1.31** — fixed: C1/C3/C4 (APFS disk-pressure retry: stage binary out of `target/` + `cargo clean` + tar/cp retry loops with `df -h` diagnostics) merged via #166; PR #173 pinned the `actions/checkout` `ref:` so `workflow_dispatch` builds the tagged commit (related mismatch class). GitHub issue #161 closed 2026-07-29.
 
 ### Defensive / low priority
 
