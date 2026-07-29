@@ -22,7 +22,7 @@ use crate::constants::{
 };
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
-use crate::symbols::{RebuildScope, SymbolIndexerRegistry};
+use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
 use crate::watch::{FileEvent, FileWatcher, GitHeadWatcher};
 use std::collections::HashSet;
@@ -36,15 +36,33 @@ use tracing::{debug, error, info, warn};
 // Import Result from the parent module
 use super::Result;
 
-/// Callback invoked after each watcher-triggered C# symbol rebuild completes.
+/// Signal sent to the serve layer about a watcher-triggered symbol rebuild.
 ///
-/// Arguments: `(success: bool, error_msg: Option<String>)`.
-/// - `(true, None)` on success.
-/// - `(false, Some(msg))` on failure.
+/// Unlike the old two-argument `(success, error)` callback, this carries a
+/// `Started` variant so the serve layer can flip the C# indicator to
+/// `Indexing` for the *duration* of the rebuild — matching what the
+/// serve-side `trigger_symbol_rebuild` already does for the phase-2 /
+/// POST-/reindex paths. Without `Started`, a watcher-triggered rebuild only
+/// ever reported its terminal state, so the C#-specific indicator never showed
+/// "Indexing" while the (35–84s) rebuild was actually running.
+pub enum SymbolRebuildSignal {
+    /// A rebuild is about to run (helper available and project applies).
+    Started,
+    /// Rebuild finished successfully.
+    Succeeded,
+    /// Rebuild failed with the given message.
+    Failed(String),
+}
+
+/// Callback invoked around each watcher-triggered C# symbol rebuild.
+///
+/// Called with [`SymbolRebuildSignal::Started`] just before the rebuild runs,
+/// then exactly once more with [`SymbolRebuildSignal::Succeeded`] or
+/// [`SymbolRebuildSignal::Failed`] when it finishes.
 ///
 /// The serve layer uses this to update `csharp_index_status` / `csharp_index_error`
 /// without coupling `IndexManager` to `ServeState`.
-pub type CSharpRebuildNotifier = Arc<dyn Fn(bool, Option<String>) + Send + Sync>;
+pub type CSharpRebuildNotifier = Arc<dyn Fn(SymbolRebuildSignal) + Send + Sync>;
 
 /// Callback to notify the serve layer that text/vector indexing is active or idle.
 ///
@@ -1024,6 +1042,128 @@ impl IndexManager {
         Ok(())
     }
 
+    /// Trigger a fire-and-forget FULL symbol rebuild for every applicable
+    /// language, used when a branch switch invalidates the symbol index wholesale.
+    ///
+    /// A branch change rewrites arbitrary files in the working tree, so an
+    /// incremental (per-file / per-`.csproj`) scope cannot be computed — the
+    /// buffered `.cs`/`.ts` events were discarded by the branch-change handler.
+    /// A `RebuildScope::Full` is the honest, correct choice here: it re-derives
+    /// the entire symbol index for the new branch. Runs in a detached blocking
+    /// task so the watcher loop is never blocked by the (potentially 35–84s)
+    /// scip-csharp / scip-typescript invocation.
+    ///
+    /// `indexing_cb` (if any) toggles the general TUI "Indexing" label around
+    /// the whole rebuild; `csharp_notifier` (if any) drives the C#-specific
+    /// indicator (`Started`/`Succeeded`/`Failed`). Non-applicable languages
+    /// (no `.sln` / no `tsconfig.json`) or an unavailable helper are skipped
+    /// without touching any status — mirroring the debounce path.
+    fn spawn_branch_change_symbol_rebuild(
+        symbol_registry: Arc<SymbolIndexerRegistry>,
+        repo_path: PathBuf,
+        db_path: PathBuf,
+        repo_label: String,
+        csharp_notifier: Option<CSharpRebuildNotifier>,
+        indexing_cb: Option<IndexingStatusCallback>,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            // Resolve applicable + available indexers up front so we only toggle
+            // the "Indexing" label when there is real work to do.
+            let csharp = symbol_registry
+                .get(LANG_CSHARP)
+                .filter(|i| i.applies_to(&repo_path) && i.is_available());
+            let typescript = symbol_registry
+                .get(LANG_TYPESCRIPT)
+                .filter(|i| i.applies_to(&repo_path) && i.is_available());
+
+            if csharp.is_none() && typescript.is_none() {
+                // Nothing to rebuild — don't flash the TUI or touch status.
+                return;
+            }
+
+            if let Some(ref cb) = indexing_cb {
+                cb(true);
+            }
+
+            if let Some(indexer) = csharp {
+                // C# drives the serve-side status indicator: Started now,
+                // terminal signal inside run_full_rebuild_logged.
+                if let Some(ref n) = csharp_notifier {
+                    n(SymbolRebuildSignal::Started);
+                }
+                Self::run_full_rebuild_logged(
+                    indexer,
+                    &repo_path,
+                    &db_path,
+                    &repo_label,
+                    "C#",
+                    csharp_notifier.as_ref(),
+                );
+            }
+
+            if let Some(indexer) = typescript {
+                // The TypeScript path has no serve-side status notifier yet, so
+                // only the general "Indexing" label reflects it (via indexing_cb).
+                Self::run_full_rebuild_logged(
+                    indexer,
+                    &repo_path,
+                    &db_path,
+                    &repo_label,
+                    "TypeScript",
+                    None,
+                );
+            }
+
+            if let Some(ref cb) = indexing_cb {
+                cb(false);
+            }
+        });
+    }
+
+    /// Run a `RebuildScope::Full` rebuild for one language's indexer, log the
+    /// outcome with the repo + language label, and (when `notifier` is `Some`,
+    /// i.e. C#) emit the terminal [`SymbolRebuildSignal`] (`Succeeded`/`Failed`).
+    ///
+    /// This is the shared body behind every full-scope rebuild in the watcher
+    /// (branch-change C#/TS and the `.cs` debounce full-solution fallback), so
+    /// the log wording and notifier semantics stay in one place. The caller
+    /// owns the *in-progress* signalling (`indexing_cb(true/false)` and the C#
+    /// `Started` signal), because a single caller may batch several rebuilds
+    /// under one "Indexing" window.
+    fn run_full_rebuild_logged(
+        indexer: &dyn SymbolIndexer,
+        repo_path: &Path,
+        db_path: &Path,
+        repo_label: &str,
+        lang_label: &str,
+        notifier: Option<&CSharpRebuildNotifier>,
+    ) {
+        match indexer.rebuild(repo_path, db_path, RebuildScope::Full) {
+            Ok(summary) => {
+                info!(
+                    "✅ [{}] {} symbol rebuild complete: {} symbols, {} refs in {}ms",
+                    repo_label,
+                    lang_label,
+                    summary.symbols_indexed,
+                    summary.references_stored,
+                    summary.duration_ms
+                );
+                if let Some(n) = notifier {
+                    n(SymbolRebuildSignal::Succeeded);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️ [{}] {} symbol rebuild failed: {}",
+                    repo_label, lang_label, e
+                );
+                if let Some(n) = notifier {
+                    n(SymbolRebuildSignal::Failed(e.to_string()));
+                }
+            }
+        }
+    }
+
     /// Start the background file watcher.
     ///
     /// This is the **second method call** - should be called after `new()`.
@@ -1069,7 +1209,19 @@ impl IndexManager {
 
         // Spawn background task
         tokio::spawn(async move {
-            info!("👀 File watcher task started for: {}", path.display());
+            // Short human-readable repo label for log attribution in a
+            // multi-repo hub. In serve mode the alias == directory name, so the
+            // last path component is the alias for the common case; fall back to
+            // the full path when there is no file name (e.g. a root path).
+            let repo_label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            info!(
+                "👀 File watcher task started for '{}': {}",
+                repo_label,
+                path.display()
+            );
 
             // Start the watcher inside the task (if not already started by start_watching)
             {
@@ -1124,7 +1276,10 @@ impl IndexManager {
                 if let Some(watcher) = &git_head_watcher {
                     if let Ok(branch_changed) = watcher.check().await {
                         if branch_changed.is_some() {
-                            info!("🔀 Git branch changed, triggering full incremental refresh...");
+                            info!(
+                                "🔀 [{}] Git branch changed, triggering full incremental refresh...",
+                                repo_label
+                            );
                             // Notify serve layer: indexing active
                             if let Some(ref cb) = indexing_cb {
                                 cb(true);
@@ -1134,7 +1289,7 @@ impl IndexManager {
                             if let Err(e) =
                                 Self::refresh_index_with_stores(&path, &db_path, &stores).await
                             {
-                                error!("❌ Branch change refresh failed: {}", e);
+                                error!("❌ [{}] Branch change refresh failed: {}", repo_label, e);
                             }
                             // Notify serve layer: indexing idle
                             if let Some(ref cb) = indexing_cb {
@@ -1150,6 +1305,22 @@ impl IndexManager {
                             ts_files_modified.clear();
                             ts_files_deleted.clear();
                             ts_last_event_time = None;
+
+                            // A branch switch can change arbitrary source files, so
+                            // the symbol index is now stale — but no incremental
+                            // scope can be computed (the working tree changed wholesale
+                            // and the buffered .cs/.ts events were just discarded above).
+                            // Trigger a fire-and-forget FULL symbol rebuild for every
+                            // language that applies, so `find_impact` reflects the new
+                            // branch instead of silently serving stale references.
+                            Self::spawn_branch_change_symbol_rebuild(
+                                symbol_registry.clone(),
+                                path.clone(),
+                                db_path.clone(),
+                                repo_label.clone(),
+                                csharp_notifier.clone(),
+                                indexing_cb.clone(),
+                            );
                         }
                     }
                 }
@@ -1265,18 +1436,30 @@ impl IndexManager {
                     let to_remove: Vec<PathBuf> = files_to_remove.drain().collect();
 
                     info!(
-                        "📦 Flushing batch: {} to index, {} to remove",
+                        "📦 [{}] Flushing batch: {} to index, {} to remove",
+                        repo_label,
                         to_index.len(),
                         to_remove.len()
                     );
 
+                    // Signal "Indexing" to the TUI for the duration of the text
+                    // batch refresh. Without this, ordinary file edits (the most
+                    // common watcher activity) never surface in the TUI status
+                    // column — only branch changes and symbol rebuilds did.
+                    if let Some(ref cb) = indexing_cb {
+                        cb(true);
+                    }
                     // Process batch using shared stores
                     if let Err(e) = Self::process_batch_with_stores(
                         &path, &db_path, &stores, to_index, to_remove,
                     )
                     .await
                     {
-                        error!("❌ Batch processing failed: {}", e);
+                        error!("❌ [{}] Batch processing failed: {}", repo_label, e);
+                    }
+                    // Clear "Indexing" regardless of outcome.
+                    if let Some(ref cb) = indexing_cb {
+                        cb(false);
                     }
 
                     // Reset timer
@@ -1296,8 +1479,8 @@ impl IndexManager {
                             cs_last_event_time = None;
 
                             info!(
-                                "🔬 {} modified + {} deleted .cs file(s), triggering incremental symbol rebuild (after {}s debounce)",
-                                modified_count, deleted_count,
+                                "🔬 [{}] {} modified + {} deleted .cs file(s), triggering incremental symbol rebuild (after {}s debounce)",
+                                repo_label, modified_count, deleted_count,
                                 cs_debounce.as_secs()
                             );
 
@@ -1312,6 +1495,9 @@ impl IndexManager {
                             let reg = symbol_registry.clone();
                             let rp = path.clone();
                             let dp = db_path.clone();
+                            // Clone the repo label into the blocking task (the outer
+                            // binding is reused by later loop iterations).
+                            let repo_label = repo_label.clone();
                             let notifier = csharp_notifier.clone();
                             // Clone indexing_cb so the SCIP rebuild can signal
                             // active_reindexes (and therefore show "Indexing" in
@@ -1323,19 +1509,29 @@ impl IndexManager {
                                 if let Some(indexer) = reg.get(LANG_CSHARP) {
                                     if !indexer.applies_to(&rp) {
                                         info!(
-                                            "🔬 symbol rebuild skipped: not applicable (no .sln)"
+                                            "🔬 [{}] symbol rebuild skipped: not applicable (no .sln)",
+                                            repo_label
                                         );
                                         return;
                                     }
                                     if !indexer.is_available() {
-                                        info!("🔬 symbol rebuild skipped: helper not available");
+                                        info!(
+                                            "🔬 [{}] symbol rebuild skipped: helper not available",
+                                            repo_label
+                                        );
                                         return;
                                     }
 
                                     // Signal "Indexing" to the TUI now that we know
-                                    // a real SCIP rebuild will actually run.
+                                    // a real SCIP rebuild will actually run. This
+                                    // toggles both the general repo-state label
+                                    // (indexing_cb → active_reindexes) and the
+                                    // C#-specific indicator (notifier → Indexing).
                                     if let Some(ref cb) = indexing_cb_scip {
                                         cb(true);
+                                    }
+                                    if let Some(ref n) = notifier {
+                                        n(SymbolRebuildSignal::Started);
                                     }
 
                                     // Group modified files by their containing .csproj
@@ -1361,28 +1557,18 @@ impl IndexManager {
                                     // files.first() and silently ignored the rest).
                                     if !ungrouped.is_empty() {
                                         info!(
-                                            "🔬 {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                            "🔬 [{}] {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                            repo_label,
                                             ungrouped.len()
                                         );
-                                        match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
-                                            Ok(summary) => {
-                                                info!(
-                                                    "✅ Symbol rebuild complete: {} symbols, {} refs in {}ms",
-                                                    summary.symbols_indexed,
-                                                    summary.references_stored,
-                                                    summary.duration_ms
-                                                );
-                                                if let Some(ref n) = notifier {
-                                                    n(true, None);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!("⚠️ Symbol rebuild failed: {}", e);
-                                                if let Some(ref n) = notifier {
-                                                    n(false, Some(e.to_string()));
-                                                }
-                                            }
-                                        }
+                                        Self::run_full_rebuild_logged(
+                                            indexer,
+                                            &rp,
+                                            &dp,
+                                            &repo_label,
+                                            "C#",
+                                            notifier.as_ref(),
+                                        );
                                         // Clear "Indexing" regardless of outcome
                                         if let Some(ref cb) = indexing_cb_scip {
                                             cb(false);
@@ -1401,7 +1587,8 @@ impl IndexManager {
                                             .map(|n| n.to_string_lossy().into_owned())
                                             .unwrap_or_default();
                                         info!(
-                                            "🔬 incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
+                                            "🔬 [{}] incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
+                                            repo_label,
                                             i + 1,
                                             total_groups,
                                             csproj_name,
@@ -1449,8 +1636,8 @@ impl IndexManager {
                                     // Notify serve layer about overall outcome
                                     if let Some(ref n) = notifier {
                                         match last_error {
-                                            None => n(true, None),
-                                            Some(msg) => n(false, Some(msg)),
+                                            None => n(SymbolRebuildSignal::Succeeded),
+                                            Some(msg) => n(SymbolRebuildSignal::Failed(msg)),
                                         }
                                     }
                                     // Clear "Indexing" now that all groups are done
@@ -1482,8 +1669,8 @@ impl IndexManager {
                             ts_last_event_time = None;
 
                             info!(
-                                "🔬 {} modified + {} deleted .ts/.tsx/.mts/.cts file(s), triggering full symbol rebuild (after {}s debounce)",
-                                modified_count, deleted_count,
+                                "🔬 [{}] {} modified + {} deleted .ts/.tsx/.mts/.cts file(s), triggering full symbol rebuild (after {}s debounce)",
+                                repo_label, modified_count, deleted_count,
                                 ts_debounce.as_secs()
                             );
 
@@ -1491,17 +1678,22 @@ impl IndexManager {
                             let rp = path.clone();
                             let dp = db_path.clone();
                             let indexing_cb_ts = indexing_cb.clone();
+                            // Clone the repo label into the blocking task (the outer
+                            // binding is reused by later loop iterations).
+                            let repo_label = repo_label.clone();
                             tokio::task::spawn_blocking(move || {
                                 if let Some(indexer) = reg.get(LANG_TYPESCRIPT) {
                                     if !indexer.applies_to(&rp) {
                                         info!(
-                                            "🔬 TypeScript symbol rebuild skipped: not applicable (no tsconfig.json)"
+                                            "🔬 [{}] TypeScript symbol rebuild skipped: not applicable (no tsconfig.json)",
+                                            repo_label
                                         );
                                         return;
                                     }
                                     if !indexer.is_available() {
                                         info!(
-                                            "🔬 TypeScript symbol rebuild skipped: scip-typescript not available"
+                                            "🔬 [{}] TypeScript symbol rebuild skipped: scip-typescript not available",
+                                            repo_label
                                         );
                                         return;
                                     }
@@ -1512,19 +1704,17 @@ impl IndexManager {
                                         cb(true);
                                     }
 
-                                    match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
-                                        Ok(summary) => {
-                                            info!(
-                                                "✅ TypeScript symbol rebuild complete: {} symbols, {} refs in {}ms",
-                                                summary.symbols_indexed,
-                                                summary.references_stored,
-                                                summary.duration_ms
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!("⚠️ TypeScript symbol rebuild failed: {}", e);
-                                        }
-                                    }
+                                    // The TypeScript path has no serve-side status
+                                    // notifier yet, so only the general "Indexing"
+                                    // label reflects it (via indexing_cb_ts).
+                                    Self::run_full_rebuild_logged(
+                                        indexer,
+                                        &rp,
+                                        &dp,
+                                        &repo_label,
+                                        "TypeScript",
+                                        None,
+                                    );
 
                                     // Clear "Indexing" regardless of outcome
                                     if let Some(ref cb) = indexing_cb_ts {
