@@ -33,7 +33,8 @@ git commit -m "fix: describe the change"
 git push -u origin fix/my-fix
 ```
 
-Create PR → `develop`. **Squash merge.**
+Create PR → `develop`. **Merge commit** (`--merge`) — feature history stays full of
+`Merge pull request #N`, not squash.
 
 ### 2. Develop → master (when requested)
 
@@ -56,10 +57,14 @@ CI (`release.yml`) builds binaries and creates a GitHub Release with auto-genera
 
 ## Rules
 
-- **Version bumps are manual + deliberate** — edit `version` in `Cargo.toml`
-  when it's meaningful (typically when cutting a release branch), then
-  `cargo update --workspace` to sync `Cargo.lock`. There is no per-commit
-  auto-bump; per-commit uniqueness comes from `build.rs`'s `+<commit_count>`.
+- **Version scheme `Major.Minor.Patch`** (semver):
+  - **Patch** auto-bumps +1 on every PR merged to `develop` — CI does this via
+    `.github/workflows/bump-develop.yml` (edits `Cargo.toml` + syncs `Cargo.lock`,
+    no rebuild). No per-commit bump; per-commit uniqueness still comes from
+    `build.rs`'s `+<commit_count>` suffix.
+  - **Minor** bumps manually at release via `scripts/bump-version.sh --type minor`
+    (resets patch→0). **Major** on breaking changes.
 - **No manual CHANGELOG.md edits** — GitHub Releases auto-generate release notes
-- **Squash merge** all PRs to keep history linear
+- **Merge style:** feature→`develop` = **merge commit** (`--merge`); `develop`→`master`
+  release PR = **squash** (one commit per release on master)
 - **Tag format**: `v1.0.X` on master HEAD

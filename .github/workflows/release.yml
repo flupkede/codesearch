@@ -40,6 +40,10 @@ jobs:
       # pin@v4
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          # Pin ref so workflow_dispatch builds the tagged commit (inputs.version),
+          # not the default branch (master-tip) — otherwise binaries get labeled
+          # with a version they weren't built from (#161-class mismatch).
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.version) || github.ref }}
           persist-credentials: false
 
       - name: Install Rust
@@ -141,6 +145,10 @@ jobs:
       # pin@v4
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          # Pin ref so workflow_dispatch builds the tagged commit (inputs.version),
+          # not the default branch (master-tip) — otherwise binaries get labeled
+          # with a version they weren't built from (#161-class mismatch).
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.version) || github.ref }}
           persist-credentials: false
 
       - name: Install Rust
