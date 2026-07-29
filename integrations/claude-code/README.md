@@ -29,13 +29,16 @@ parent's `AGENTS.md` or the MCP `initialize` instructions at all.
 Two [Claude Code hooks](https://docs.claude.com/en/docs/claude-code/hooks)
 that make the preference *structural* instead of advisory:
 
-- **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks the first `Grep`
-  call against an internal repo path when codesearch looks available, with a
-  message telling the model exactly how to load and call codesearch instead.
-  If the *same* query is retried within 5 minutes, it's let through
-  unblocked — that's the legitimate "codesearch found nothing, falling back"
-  path. Grep against paths outside the current repo is never blocked;
-  codesearch doesn't cover arbitrary external paths well, grep is right there.
+- **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks every `Grep`
+  call against an internal repo path *for as long as the codesearch serve hub
+  is reachable*, with a message telling the model exactly how to load and call
+  codesearch instead. Grep is auto-allowed **only** when codesearch is
+  genuinely down: the hook probes the unauthenticated `/healthz` liveness
+  endpoint and lets Grep through only when that probe fails. A low-confidence
+  or empty codesearch *result* is a successful call ("reformulate"), not a dead
+  server, so it does **not** unblock Grep. Grep against paths outside the
+  current repo is never blocked; codesearch doesn't cover arbitrary external
+  paths well, grep is right there.
 
 - **`subagent-preamble`** — a `PreToolUse` hook on `Agent` (the subagent-spawn
   tool). Prepends a short preamble to every subagent prompt explaining that
@@ -127,7 +130,11 @@ points at `hooks/codesearch/`) from `settings.json`, and delete
 - Both hooks are per-machine, not per-repo: install once at user scope and
   every project benefits, including ones without a local `.codesearch.db`
   (the guard simply won't block Grep there, since step 2 fails open).
-- The 5-minute retry-unblock window is a heuristic, not a guarantee the model
-  actually called codesearch in between. It's deliberately permissive —
-  the goal is nudging the *first* attempt, not adversarially trapping the
-  model into an unusable state.
+- `grep-guard` decides "is codesearch down?" by probing the serve hub's
+  unauthenticated `/healthz` endpoint (base URL from `CODESEARCH_SERVER`, else
+  `http://127.0.0.1:$CODESEARCH_SERVE_PORT`, else the compiled default
+  `http://127.0.0.1:39725`). Any HTTP response counts as up and keeps Grep
+  blocked; only a connection-level failure (refused / timeout) counts as down
+  and lets Grep through. The probe has a 2-second timeout, so a wedged server
+  eventually fails open rather than stalling every Grep. The PowerShell hook
+  needs no extra tools; the bash hook additionally requires `curl`.
