@@ -44,10 +44,14 @@
 #   DATA_DIR                  Working root (default /data).
 #   CODESEARCH_SERVE_PORT     Serve port (default 39725).
 #   INDEX_JOB_REPO_READY_SECS index-job mode: max seconds to wait for ONE repo to
-#                             become ready before giving up on it and letting
-#                             verify decide (default 600). Per repo, not per job:
+#                             reach warm/open (default 600). Per repo, not per job:
 #                             the batch worst case must stay inside the platform's
-#                             job replicaTimeout.
+#                             job replicaTimeout. Exceeding it ABORTS the job — a
+#                             mid-warmup index must never be tarred over the good
+#                             snapshot. Raise it if a corpus legitimately needs longer.
+#   SERVE_STOP_GRACE_SECS     index-job mode: seconds to wait for the local serve to
+#                             honour SIGTERM before SIGKILL, before the snapshot tar
+#                             (default 30).
 #
 set -euo pipefail
 
@@ -64,6 +68,9 @@ CONFIG_DIR="${HOME}/.codesearch"
 # Per-repo readiness budget for the index-job — see wait_repo_ready for why this
 # is per repo and why it must stay well under the platform job timeout.
 INDEX_JOB_REPO_READY_SECS="${INDEX_JOB_REPO_READY_SECS:-600}"
+# How long the index-job waits for serve to honour SIGTERM before SIGKILL, so a
+# hung serve cannot burn the whole replicaTimeout right before the snapshot.
+SERVE_STOP_GRACE_SECS="${SERVE_STOP_GRACE_SECS:-30}"
 
 log() { echo "[entrypoint] $*"; }
 die() { echo "[entrypoint] FATAL: $*" >&2; exit 1; }
@@ -332,13 +339,34 @@ verify_index_ready() {
     sleep 5
   done
   chunks="$(json_field "${info}" chunks)"
-  if [ -z "${chunks}" ] || [ "${chunks}" -lt 1 ] 2>/dev/null; then
-    log "verify: repo '${name}' reports chunks=${chunks:-<none>} — index looks EMPTY"
+  # Absent is NOT the same as zero, and the difference decides between "delete
+  # this vendor" and "abort the job". info_handler ALWAYS emits `chunks` (it is
+  # initialised to 0 and unconditionally serialised), so a truly empty repo
+  # reports `"chunks": 0` — a present field. Empty output here therefore means
+  # the response was not parseable JSON at all: a 500, a 404, an error body, a
+  # reset connection. Routing that to VERIFY_EMPTY would hand a transient blip
+  # to prune_dead_vendor, which rm -rf's the vendor's source AND index and then
+  # uploads the snapshot without it. Unknown is fatal; only a parsed 0 is empty.
+  # Absent or non-numeric are both UNKNOWN. `[ "$x" -lt 1 ]` on garbage exits 2,
+  # which silently reads as "not less than 1", so the shape is tested up front
+  # rather than relied on.
+  case "${chunks}" in
+    ''|*[!0-9]*)
+      log "verify: repo '${name}' — /info gave no usable 'chunks' value (got '${chunks:-<none>}'),"
+      log "        so the index state is UNKNOWN. Refusing to guess (guessing EMPTY here"
+      log "        would delete a possibly healthy vendor)."
+      return "${VERIFY_NO_GRAPH}" ;;
+  esac
+  if [ "${chunks}" -lt 1 ]; then
+    log "verify: repo '${name}' reports chunks=${chunks} — index looks EMPTY"
     return "${VERIFY_EMPTY}"
   fi
   case "${indexed}" in
     true)
-      log "verify: repo '${name}' OK — ${chunks} chunks indexed, HNSW graph present" ;;
+      log "verify: repo '${name}' OK — ${chunks} chunks indexed, HNSW graph present"
+      # Explicit: without it the function's status is the status of the last
+      # `log`, and an echo onto a closed stdout would read as VERIFY_EMPTY.
+      return 0 ;;
     false)
       log "verify: repo '${name}' has ${chunks} chunks but indexed=false — the HNSW graph is"
       log "        MISSING, so semantic search would return 0 results for this vendor."
@@ -411,13 +439,20 @@ prune_ghost_vendors() {
 # embed → fits 2 GiB). custom-kb is NOT under DOCS_DIR → stays writable.
 # Generic-boundary-safe: the read_only capability lives in the binary; this
 # entrypoint makes the cloud-specific "DOCS is read-only here" decision.
+#
+# FATAL on failure, deliberately. This is step 4 of the clear → warm → wait →
+# mark ordering and it is load-bearing for the defect the whole branch exists to
+# fix: a snapshot in which a DOCS vendor is still writable makes the 1 vCPU /
+# 2 GiB serve replica open it write-mode and run build_index() + an incremental
+# embed at warmup — the measured 1.94 GiB / exit-137 crash-loop. A WARN here
+# would ship exactly that while the job reports success, so every failure path
+# aborts BEFORE upload_snapshot instead.
 mark_docs_readonly() {
-  local repos_json="${CONFIG_DIR}/repos.json" vendor name marked=0
-  [ -f "${repos_json}" ] || { log "mark_docs_readonly: no repos.json yet — nothing to mark"; return 0; }
-  if ! command -v jq >/dev/null 2>&1; then
-    log "  WARN: jq missing — cannot mark DOCS read-only (DOCS would be writable on serve restore)"
-    return 0
-  fi
+  local repos_json="${CONFIG_DIR}/repos.json" vendor name marked=0 failed=0
+  [ -f "${repos_json}" ] \
+    || die "mark_docs_readonly: no repos.json at '${repos_json}' — cannot mark DOCS read-only, and an unmarked snapshot puts serve back in the write-mode warmup OOM"
+  command -v jq >/dev/null 2>&1 \
+    || die "jq is required in index-job mode: without it DOCS cannot be marked read-only and the snapshot would make the 2 GiB serve replica warm up write-mode"
   for vendor in "${DOCS_DIR}"/*/; do
     [ -d "${vendor}" ] || continue
     name="$(basename "${vendor%/}")"
@@ -426,15 +461,26 @@ mark_docs_readonly() {
       if jq --arg a "${name}" '.repo_read_only[$a] = true' "${repos_json}" > "${repos_json}.tmp" \
          && mv -f "${repos_json}.tmp" "${repos_json}"; then
         log "  marked DOCS vendor '${name}' read-only in repos.json"
-        marked=1
+        marked=$((marked + 1))
       else
-        log "  WARN: could not mark DOCS vendor '${name}' read-only (jq write failed)"
+        # Tolerant: this is only cleanup, and under `set -e` a failing rm here
+        # would abort with a bare shell error instead of the diagnostic die below.
+        rm -f "${repos_json}.tmp" 2>/dev/null || true
+        log "  ERROR: could not mark DOCS vendor '${name}' read-only (jq write failed)"
+        failed=$((failed + 1))
       fi
     else
       log "  note: DOCS vendor '${name}' not registered — skipping"
     fi
   done
-  [ "${marked}" -eq 1 ] || log "mark_docs_readonly: no DOCS vendors marked"
+  [ "${failed}" -eq 0 ] \
+    || die "${failed} DOCS vendor(s) could not be marked read-only — refusing to upload a snapshot serve would warm up write-mode"
+  # The vendor loop already died if NO vendor was healthy, so by the time we get
+  # here at least one registered DOCS vendor must exist. Zero marked means the
+  # repos.json we are writing is not the one the build used.
+  [ "${marked}" -gt 0 ] \
+    || die "mark_docs_readonly marked 0 DOCS vendors although the build verified at least one — '${repos_json}' does not describe the index being snapshotted"
+  log "marked ${marked} DOCS vendor(s) read-only for the snapshot"
 }
 
 # Remove the repo_read_only map from repos.json. This is STEP 1 of the
@@ -669,8 +715,23 @@ run_index_job() {
   # ("file changed as we read it"). Killing serve first quiesces the filesystem
   # so tar reads a stable snapshot. upload_snapshot is pure local tar+azcopy —
   # it does NOT need the serve API.
+  # Bounded: `kill` only sends SIGTERM, and an unbounded `wait` on a serve that
+  # is slow to handle it (or ignores it) blocks the job here with no escalation
+  # until the platform replicaTimeout kills the whole run — losing the snapshot
+  # that is already built. Escalate to SIGKILL instead; the tar just needs the
+  # process gone, and LMDB is crash-safe.
   log "stopping local serve before snapshot"
   kill "${serve_pid}" 2>/dev/null || true
+  serve_stop_waited=0
+  while kill -0 "${serve_pid}" 2>/dev/null; do
+    [ "${serve_stop_waited}" -ge "${SERVE_STOP_GRACE_SECS}" ] && {
+      log "  serve did not exit within ${SERVE_STOP_GRACE_SECS}s — sending SIGKILL"
+      kill -9 "${serve_pid}" 2>/dev/null || true
+      break
+    }
+    sleep 1
+    serve_stop_waited=$((serve_stop_waited + 1))
+  done
   wait "${serve_pid}" 2>/dev/null || true
 
   # Mark DOCS read-only LAST — after warmup built the graphs, after serve is

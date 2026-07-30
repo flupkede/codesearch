@@ -1766,18 +1766,22 @@ impl ServeState {
             let alias_owned = alias.to_string();
             match tokio::task::spawn_blocking(move || {
                 let mut vstore = vector_store.blocking_write();
-                match vstore.stats() {
-                    Ok(s) if s.total_chunks > 0 && !s.indexed => {
+                // `index_health()`, not `stats()` — the predicate needs exactly
+                // `(total_chunks, indexed)`, while `stats()` deserializes every
+                // ChunkMetadata in the store just to count unique file paths.
+                // Same two values from the same source, on a memory-sensitive path.
+                match vstore.index_health() {
+                    Ok((total_chunks, false)) if total_chunks > 0 => {
                         info!(
                             "Building vector index for '{}' ({} existing chunks)",
-                            alias_owned, s.total_chunks
+                            alias_owned, total_chunks
                         );
                         if let Err(e) = vstore.build_index() {
                             warn!("Failed to build vector index for '{}': {}", alias_owned, e);
                         }
                     }
                     Ok(_) => {} // already indexed or no chunks
-                    Err(e) => warn!("Could not read stats for '{}': {}", alias_owned, e),
+                    Err(e) => warn!("Could not read index health for '{}': {}", alias_owned, e),
                 }
             })
             .await
