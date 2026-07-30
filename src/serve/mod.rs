@@ -1546,20 +1546,22 @@ impl ServeState {
             }
         }
 
-        let path = {
+        let (path, force_readonly) = {
             let config = self
                 .config
                 .read()
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            config
+            let p = config
                 .resolve(alias)
-                .ok_or_else(|| format!("Unknown alias '{}'", alias))?
+                .ok_or_else(|| format!("Unknown alias '{}'", alias))?;
+            let ro = config.repo_read_only.get(alias) == Some(&true);
+            (p, ro)
         };
 
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false)? {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
             OpenedStores::Readonly(_) => {
                 // Already registered as Readonly by try_open_stores.
                 // Touch so the idle reaper can evict this handle.
@@ -1700,20 +1702,22 @@ impl ServeState {
         }
 
         // Slow path: need to open
-        let path = {
+        let (path, force_readonly) = {
             let config = self
                 .config
                 .read()
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            config
+            let p = config
                 .resolve(alias)
-                .ok_or_else(|| format!("Unknown alias '{}'", alias))?
+                .ok_or_else(|| format!("Unknown alias '{}'", alias))?;
+            let ro = config.repo_read_only.get(alias) == Some(&true);
+            (p, ro)
         };
 
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false)? {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
             OpenedStores::Readonly(s) => {
                 // Already registered as Readonly; touch and return.
                 self.touch_access(alias);
@@ -1943,6 +1947,7 @@ impl ServeState {
         alias: &str,
         db_path: &Path,
         allow_create: bool,
+        force_readonly: bool,
     ) -> std::result::Result<OpenedStores, String> {
         if !db_path.exists() && !allow_create {
             let parent = db_path
@@ -1959,6 +1964,31 @@ impl ServeState {
         }
 
         let dims = self.get_dimensions_for_path(db_path);
+
+        // Read-only requested via the per-repo `repo_read_only` config flag:
+        // open readonly directly and never attempt a write open. This makes
+        // warmup return early (no incremental-refresh embedding), which is the
+        // point for large static corpora on a memory-constrained replica.
+        if force_readonly {
+            return match SharedStores::new_readonly(db_path, dims) {
+                Ok(s) => {
+                    info!("Opened repo in readonly mode (forced by config): {}", alias);
+                    let stores_arc = Arc::new(s);
+                    self.repos.insert(
+                        alias.to_string(),
+                        RepoState::Readonly {
+                            stores: stores_arc.clone(),
+                        },
+                    );
+                    Ok(OpenedStores::Readonly(stores_arc))
+                }
+                Err(e) => {
+                    warn!("Failed to open repo {}: {}", alias, e);
+                    self.repos.insert(alias.to_string(), RepoState::Conflicted);
+                    Err(Self::conflicted_msg(alias))
+                }
+            };
+        }
 
         match SharedStores::new(db_path, dims) {
             Ok(s) => {
@@ -3052,7 +3082,7 @@ async fn reindex_handler(
                 // FSW not running -- open existing or create fresh DB.
                 // allow_create=true so a force-reindex can recover a deleted DB.
                 let cancel = CancellationToken::new();
-                match state.try_open_stores(&alias, &db_path, true) {
+                match state.try_open_stores(&alias, &db_path, true, false) {
                     Ok(OpenedStores::Write(s)) => {
                         // Register as Write to block double-open races while we reindex.
                         state.repos.insert(
@@ -3291,10 +3321,12 @@ async fn add_repo_handler(
     //  path opened its own LMDB handle, conflicting with
     //  calls from the serve's request handlers.
     let db_path = canonical_path.join(DB_DIR_NAME);
-    let stores = match state.try_open_stores(&alias, &db_path, true) {
+    let stores = match state.try_open_stores(&alias, &db_path, true, false) {
         Ok(OpenedStores::Write(s)) => s,
         Ok(OpenedStores::Readonly(_)) => {
-            unreachable!("try_open_stores(allow_create=true) never returns Readonly")
+            unreachable!(
+                "try_open_stores(allow_create=true, force_readonly=false) never returns Readonly"
+            )
         }
         Err(e) => {
             // Clean up the config entry we just added
@@ -4615,7 +4647,7 @@ mod tests {
 
         let state = state_with_config(ReposConfig::default());
 
-        match state.try_open_stores("brandnew", &db_path, true) {
+        match state.try_open_stores("brandnew", &db_path, true, false) {
             Ok(OpenedStores::Write(_)) => {}
             Ok(OpenedStores::Readonly(_)) => {
                 panic!("brand-new repo opened Readonly; expected Write")

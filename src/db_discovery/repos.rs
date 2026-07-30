@@ -81,6 +81,14 @@ pub struct ReposConfig {
     pub groups: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub repos_meta: HashMap<String, RepoMeta>,
+    /// Per-repo read-only flag. Aliases mapped to `true` are opened **read-only**
+    /// by `codesearch serve`: the index is queried but never re-embedded/warmed
+    /// (no write open, no incremental refresh). Intended for large static corpora
+    /// on a memory-constrained replica where a separate job owns the heavy rebuild
+    /// (e.g. the cloud DOCS corpus on the 2 GiB serve replica). Writes/reindexes
+    /// against a read-only repo are rejected. Default: every repo is writable.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub repo_read_only: HashMap<String, bool>,
     /// Remote `codesearch serve` peers reachable for federation. Group members
     /// reference these via the `"@<peer_name>"` convention.
     #[serde(default)]
@@ -1680,6 +1688,30 @@ mod tests {
         let meta = loaded.meta("repo-a");
         assert_eq!(meta.last_changed_unix, Some(100));
         assert_eq!(meta.last_scip_indexed_unix, Some(120));
+    }
+
+    #[test]
+    fn test_save_then_load_roundtrip_with_repo_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("repos.json");
+
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        cfg.repo_read_only.insert("repo-a".to_string(), true);
+        cfg.save_to(&path).unwrap();
+
+        let loaded = ReposConfig::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.repo_read_only.get("repo-a"),
+            Some(&true),
+            "repo_read_only flag should round-trip through repos.json"
+        );
+        // default: a config written without the flag must still load (backward compat)
+        assert!(
+            !loaded.repo_read_only.contains_key("repo-b"),
+            "unset repos must not appear read-only"
+        );
     }
 
     #[test]

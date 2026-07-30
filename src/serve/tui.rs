@@ -951,7 +951,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
         None => {
             // Try to open stores (allow_create=true for recovery)
             let cancel = CancellationToken::new();
-            match state.try_open_stores(&alias, &db_path, true) {
+            match state.try_open_stores(&alias, &db_path, true, false) {
                 Ok(super::OpenedStores::Write(s)) => {
                     state.repos.insert(
                         alias.clone(),
