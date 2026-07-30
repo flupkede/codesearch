@@ -753,6 +753,21 @@ impl VectorStore {
         })
     }
 
+    /// Cheap health probe: `(total_chunks, indexed)` without the full-table scan
+    /// [`Self::stats`] performs.
+    ///
+    /// `stats()` deserializes every `ChunkMetadata` in the store to count unique
+    /// file paths — tens of thousands of records on a large corpus. Callers that
+    /// only need to know "are there chunks, and is the HNSW graph present?" must
+    /// use this instead: `chunks.len()` is an O(1) LMDB stat and `indexed` is a
+    /// plain field. This matters on the memory/CPU-constrained serve replica,
+    /// where the read-only warmup path exists precisely to do almost no work.
+    pub fn index_health(&self) -> Result<(usize, bool)> {
+        let rtxn = self.env.read_txn()?;
+        let total_chunks = self.chunks.len(&rtxn)? as usize;
+        Ok((total_chunks, self.indexed))
+    }
+
     pub fn stats(&self) -> Result<StoreStats> {
         let rtxn = self.env.read_txn()?;
 

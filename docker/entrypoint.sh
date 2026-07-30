@@ -43,20 +43,27 @@
 #                             (default 900).
 #   DATA_DIR                  Working root (default /data).
 #   CODESEARCH_SERVE_PORT     Serve port (default 39725).
-#   INDEX_JOB_MAX_WAIT_SECS   Max seconds the job waits for indexing to finish
-#                             (default 3600).
+#   INDEX_JOB_REPO_READY_SECS index-job mode: max seconds to wait for ONE repo to
+#                             become ready before giving up on it and letting
+#                             verify decide (default 600). Per repo, not per job:
+#                             the batch worst case must stay inside the platform's
+#                             job replicaTimeout.
 #
 set -euo pipefail
 
 MODE="${CODESEARCH_RUN_MODE:-serve}"
 DATA_DIR="${DATA_DIR:-/data}"
 PORT="${CODESEARCH_SERVE_PORT:-39725}"
+# Single source of truth for the loopback management API the index-job drives.
+API_BASE="http://127.0.0.1:${PORT}"
 DOCS_DIR="${DATA_DIR}/docs"
 KB_DIR="${DATA_DIR}/custom-kb"
 SNAPSHOT_NAME="codesearch-snapshot.tgz"
 SNAPSHOT_LOCAL="/tmp/${SNAPSHOT_NAME}"
 CONFIG_DIR="${HOME}/.codesearch"
-INDEX_JOB_MAX_WAIT_SECS="${INDEX_JOB_MAX_WAIT_SECS:-3600}"
+# Per-repo readiness budget for the index-job — see wait_repo_ready for why this
+# is per repo and why it must stay well under the platform job timeout.
+INDEX_JOB_REPO_READY_SECS="${INDEX_JOB_REPO_READY_SECS:-600}"
 
 log() { echo "[entrypoint] $*"; }
 die() { echo "[entrypoint] FATAL: $*" >&2; exit 1; }
@@ -144,7 +151,7 @@ sync_kb() {
 # and retries next cycle). A 409 means a reindex is already running (e.g. a lazy
 # FSW pickup of the same pull) — expected and harmless.
 reindex_kb() {
-  local name base="http://127.0.0.1:${PORT}" resp code
+  local name base="${API_BASE}" resp code
   name="$(basename "${KB_DIR}")"
   resp="$(api_code -X POST "${base}/repos/${name}/reindex" || true)"
   code="${resp##*$'\n'}"          # last line = HTTP status
@@ -229,7 +236,7 @@ api_code() {
 }
 
 wait_healthz() {
-  local base="http://127.0.0.1:${PORT}"
+  local base="${API_BASE}"
   local tries="${1:-60}"
   until curl -fsS "${base}/healthz" >/dev/null 2>&1; do
     tries=$((tries - 1))
@@ -259,7 +266,7 @@ wait_healthz() {
 #     A hard failure to kick this off ABORTS the job (die) so we never go on to
 #     upload a broken/empty snapshot over a good one.
 rebuild_repo() {
-  local path="$1" name base="http://127.0.0.1:${PORT}" resp code
+  local path="$1" name base="${API_BASE}" resp code
   name="$(basename "$path")"
   if api "${base}/status" 2>/dev/null | grep -q "\"alias\":\"${name}\""; then
     log "repo '${name}' already registered — serve startup warmup is incrementally \
@@ -277,18 +284,50 @@ refreshing it; waiting for warmup to finish (no competing reindex)"
   esac
 }
 
-# Hard pre-upload guard: confirm the repo actually has a populated index before we
-# snapshot it. GET /repos/<alias>/info reports {"chunks":N,...}. chunks < 1 means the
-# index is empty/broken — refuse to upload so we never clobber a known-good snapshot.
+# Hard pre-upload guard: confirm the repo has a populated AND SEARCHABLE index
+# before we snapshot it. GET /repos/<alias>/info reports {"chunks":N,"indexed":B}.
+#
+# Both properties must be checked, and they mean different things:
+#   chunks < 1            → the index is empty. Usually a vendor whose source
+#                           vanished. Recoverable at batch level: the caller
+#                           prunes just this vendor and keeps going.
+#   chunks >= 1, !indexed → chunks exist but the HNSW graph was never committed.
+#                           This index LOOKS healthy in every count-based check
+#                           yet `VectorStore::search` refuses to run on it, so
+#                           the vendor answers 0 results — and a read-only serve
+#                           replica can never repair it (build_index needs a
+#                           write txn MDB_RDONLY rejects). Publishing this over
+#                           a good snapshot is strictly destructive, so it is
+#                           NOT prunable: the caller must abort the whole job.
+#
+# Exit codes: 0 = ready, 1 = empty (prunable), 2 = chunks but no graph (fatal).
+VERIFY_EMPTY=1
+VERIFY_NO_GRAPH=2
 verify_index_ready() {
-  local name="$1" base="http://127.0.0.1:${PORT}" info chunks
+  local name="$1" base="${API_BASE}" info chunks indexed
   info="$(api "${base}/repos/${name}/info" 2>/dev/null || true)"
   chunks="$(printf '%s' "${info}" | sed -n 's/.*"chunks":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
   if [ -z "${chunks}" ] || [ "${chunks}" -lt 1 ] 2>/dev/null; then
     log "verify: repo '${name}' reports chunks=${chunks:-<none>} — index looks EMPTY"
-    return 1
+    return "${VERIFY_EMPTY}"
   fi
-  log "verify: repo '${name}' OK — ${chunks} chunks indexed"
+  indexed="$(json_field "${info}" indexed)"
+  case "${indexed}" in
+    true)
+      log "verify: repo '${name}' OK — ${chunks} chunks indexed, HNSW graph present" ;;
+    false)
+      log "verify: repo '${name}' has ${chunks} chunks but indexed=false — the HNSW graph is"
+      log "        MISSING, so semantic search would return 0 results for this vendor."
+      return "${VERIFY_NO_GRAPH}" ;;
+    *)
+      # Field absent or null. Either an older serve build that does not report
+      # `indexed`, or the repo is not currently open so there is no live store
+      # to ask. Neither is evidence of a BAD index, so do not abort a whole run
+      # over it — but say plainly that the graph went unverified, because that
+      # is the one property this guard exists to check.
+      log "verify: repo '${name}' — ${chunks} chunks, but /info reported no 'indexed' field;"
+      log "        HNSW graph presence could NOT be verified (accepting on chunk count alone)." ;;
+  esac
 }
 
 # A vendor whose index came up EMPTY after warmup (0 chunks / 0 files) is dead
@@ -302,7 +341,7 @@ verify_index_ready() {
 # here only logs a WARN and returns so the job keeps going. The batch-level guard
 # (found==0 -> die) still aborts if NO vendor is healthy.
 prune_dead_vendor() {
-  local name="$1" vendor="${DOCS_DIR}/${1}" base="http://127.0.0.1:${PORT}"
+  local name="$1" vendor="${DOCS_DIR}/${1}" base="${API_BASE}"
   log "vendor '${name}' is empty/broken after warmup — best-effort prune (will NOT abort the batch)"
   if api -X DELETE "${base}/repos/${name}" >/dev/null 2>&1; then
     log "  unregistered '${name}' from repos.json"
@@ -323,7 +362,7 @@ prune_dead_vendor() {
 # it via the API (closes the store + drops the repos.json entry) and delete the
 # orphan index dir. Conservative: a folder holding even one non-index entry is kept.
 prune_ghost_vendors() {
-  local base="http://127.0.0.1:${PORT}" vendor vname first_non_index
+  local base="${API_BASE}" vendor vname first_non_index
   local pruned=0
   for vendor in "${DOCS_DIR}"/*/; do
     [ -d "${vendor}" ] || continue     # empty ${DOCS_DIR} -> glob stays literal
@@ -376,23 +415,30 @@ mark_docs_readonly() {
   [ "${marked}" -eq 1 ] || log "mark_docs_readonly: no DOCS vendors marked"
 }
 
-# Remove the repo_read_only map from repos.json so serve opens every repo in
-# WRITE mode on snapshot restore. See the index-job tail for why the read-only
-# DOCS feature is currently disabled (read-only search returns 0 results).
-# Idempotent + best-effort: a missing field, missing jq, or a write failure only
-# logs a WARN and continues (the job must not abort over a stale flag cleanup).
+# Remove the repo_read_only map from repos.json. This is STEP 1 of the
+# clear → warm → wait → mark ordering documented at the index-job tail (see
+# mark_docs_readonly there); it is not a standalone cleanup and the read-only
+# DOCS feature is NOT disabled.
+#
+# Running here, before the job's serve starts, makes serve open DOCS in WRITE
+# mode so warmup builds and commits every HNSW graph. Step 4 re-marks DOCS
+# read-only after serve is stopped, so the snapshot carries both the graphs and
+# the flag. Do not delete this call to "simplify" — without it the job's serve
+# opens DOCS read-only, never builds a graph, and ships an unsearchable snapshot.
+#
+# Idempotent. jq is REQUIRED: without it the flags survive into the job's serve
+# and the whole ordering silently collapses, so a missing jq is fatal rather
+# than a WARN. A jq write failure is likewise fatal for the same reason.
 clear_docs_readonly() {
   local repos_json="${CONFIG_DIR}/repos.json"
   [ -f "${repos_json}" ] || { log "clear_docs_readonly: no repos.json — nothing to clear"; return 0; }
-  if ! command -v jq >/dev/null 2>&1; then
-    log "  WARN: jq missing — cannot strip repo_read_only (serve may still open DOCS read-only)"
-    return 0
-  fi
+  command -v jq >/dev/null 2>&1 \
+    || die "jq is required in index-job mode: without it repo_read_only cannot be stripped, the job's serve opens DOCS read-only, and the uploaded snapshot would carry no HNSW graphs"
   if jq -e 'has("repo_read_only")' "${repos_json}" >/dev/null 2>&1; then
     if jq 'del(.repo_read_only)' "${repos_json}" > "${repos_json}.tmp" && mv -f "${repos_json}.tmp" "${repos_json}"; then
-      log "stripped repo_read_only flags from repos.json (DOCS will be served write-mode)"
+      log "stripped repo_read_only flags from repos.json (DOCS opened write-mode for the build)"
     else
-      log "  WARN: could not strip repo_read_only from repos.json (jq write failed)"
+      die "could not strip repo_read_only from repos.json (jq write failed) — the build would produce an unsearchable snapshot"
     fi
   else
     log "clear_docs_readonly: no repo_read_only map present — already clean"
@@ -402,19 +448,40 @@ clear_docs_readonly() {
 # =============================================================================
 # index-job mode: build/refresh the index on a big replica, snapshot, exit.
 # =============================================================================
-# Extract one repo's "status" value out of a GET /status body. jq when present,
-# otherwise a sed fallback that isolates the object carrying "alias":"<name>"
-# (the objects are emitted as a flat array, so splitting on '{' gives one record
-# per line and we keep the one naming this alias).
+# Extract a top-level scalar field out of a JSON object body (e.g. the
+# /repos/<alias>/info response). Empty output ONLY when the field is absent or
+# JSON null; a literal `false` prints "false".
+#
+# Deliberately NOT `.[$f] // empty`: jq's `//` treats `false` as an empty value,
+# so a boolean field that is genuinely `false` would print nothing and become
+# indistinguishable from "field missing". For `indexed` those two mean opposite
+# things — "no HNSW graph, abort the job" vs "this serve build cannot tell me,
+# don't abort" — so they must not collapse.
+#
+# Explicit `return 0`: callers assign this inside an `if` body where `set -e` is
+# live, and a SIGPIPE from jq into `head -n1` must not abort the job. Absence is
+# signalled by empty OUTPUT, never by exit status.
+json_field() {
+  local body="$1" field="$2"
+  printf '%s' "${body}" | jq -r --arg f "${field}" \
+    'if has($f) and (.[$f] != null) then (.[$f] | tostring) else empty end' \
+    2>/dev/null | head -n1
+  return 0
+}
+
+# Extract one repo's "status" value out of a GET /status body.
+#
+# jq-only, by design. The previous sed fallback had to splice the alias into a
+# regex, and vendor names are blob-synced folder names: one containing '.', '*'
+# or '[' matched the WRONG record and could report a false "warm" — which in
+# this job means "graph is built, go ahead and publish". A silently wrong ready
+# signal is far worse than a hard failure, and jq is a hard image dependency
+# (see the Dockerfile), so require_jq at job start makes this unreachable.
 repo_status() {
   local body="$1" name="$2"
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "${body}" | jq -r --arg a "${name}" \
-      '.repos[]? | select(.alias == $a) | .status' 2>/dev/null | head -n1
-    return 0
-  fi
-  printf '%s' "${body}" | tr '{' '\n' \
-    | sed -n "s/.*\"alias\":\"${name}\".*\"status\":\"\([a-z_]*\)\".*/\1/p" | head -n1
+  printf '%s' "${body}" | jq -r --arg a "${name}" \
+    '.repos[]? | select(.alias == $a) | .status' 2>/dev/null | head -n1
+  return 0
 }
 
 # Sequential-safe build wait: block until this vendor is BOTH (a) not part of an
@@ -444,17 +511,35 @@ repo_status() {
 #      write-mode serve rebuilds every vendor's graph at once on cold start and
 #      is OOM-killed on the 2 GiB replica. Both were observed in production.
 #
-# So we now wait for the named repo to reach warm/open/readonly as well.
+# So we now wait for the named repo to reach warm/open as well.
+#
+# "readonly" is deliberately NOT accepted as ready. clear_docs_readonly ran
+# before serve started, so no repo is CONFIGURED read-only in job mode — a
+# "readonly" here can only mean the write open FAILED and try_open_stores fell
+# back. That path returns from warmup without ever calling build_index(), i.e.
+# exactly the "chunks present, no HNSW graph" state this whole change exists to
+# prevent. Accepting it would report the failure as ready and publish a dead
+# index. We keep polling instead and let the per-repo budget expire, after which
+# verify_index_ready sees indexed=false and aborts the job.
+#
+# The budget (INDEX_JOB_REPO_READY_SECS, top of file) is PER REPO, and small on
+# purpose. The previous global 3600s would, with six vendors, let a single stuck
+# repo run the job past the Container Apps replicaTimeout (5400s) and lose the
+# whole run — including every healthy vendor's freshly baked deltas. 600s x 6
+# vendors + custom-kb stays inside it with room for restore, tar and upload.
 wait_repo_ready() {
-  local name="$1" base="http://127.0.0.1:${PORT}" waited=0 body st=""
+  local name="$1" base="${API_BASE}" waited=0 body st=""
   sleep 5   # let the 202 flip the repo into "indexing" before we start checking
-  while [ "${waited}" -lt "${INDEX_JOB_MAX_WAIT_SECS}" ]; do
+  while [ "${waited}" -lt "${INDEX_JOB_REPO_READY_SECS}" ]; do
     body="$(api "${base}/status" 2>/dev/null || true)"
     if ! printf '%s' "${body}" | grep -q '"status":"indexing"'; then
       st="$(repo_status "${body}" "${name}")"
       case "${st}" in
-        warm|open|readonly)
+        warm|open)
           log "repo '${name}' ready (status=${st}) after ~$((waited + 5))s"; return 0 ;;
+        readonly)
+          log "WARN: repo '${name}' opened READ-ONLY in the index job — the write open failed,"
+          log "      so its HNSW graph is not being built. Verify will catch this." ;;
       esac
     fi
     sleep 10; waited=$((waited + 10))
@@ -465,6 +550,11 @@ wait_repo_ready() {
 
 run_index_job() {
   log "MODE=index-job — heavy build + snapshot, then exit"
+  # jq underpins the whole clear → warm → wait → mark contract (flag rewrites,
+  # per-repo status, graph verification). Fail here rather than degrade into
+  # publishing an unsearchable snapshot.
+  command -v jq >/dev/null 2>&1 \
+    || die "jq is required in index-job mode (repos.json flag rewrites, /status parsing, index verification)"
   restore_snapshot   # incremental: re-embed only deltas when a prior snapshot exists
   # Strip any repo_read_only flags RESTORED from a prior snapshot BEFORE serve
   # starts. Critical: if the flags are present, the job's serve opens DOCS
@@ -502,27 +592,38 @@ run_index_job() {
   # the job memory limit. Sequential build caps peak memory to a single index.
   # verify_index_ready runs inline (empty/broken vendor aborts before upload, so
   # one bad build can never clobber the good snapshot).
-  local vendor found=0 vname
+  local vendor found=0 vname vrc
   for vendor in "${DOCS_DIR}"/*/; do
     [ -d "${vendor}" ] || continue     # empty ${DOCS_DIR} → glob stays literal
     vname="$(basename "${vendor%/}")"
     rebuild_repo "${vendor%/}"         # strip trailing slash so basename is clean
     wait_repo_ready "${vname}"         # block until this vendor is genuinely ready
-    # An empty/broken vendor is best-effort pruned (see prune_dead_vendor) and
-    # skipped — it must NOT abort the whole batch. Only die if NONE are healthy.
-    if verify_index_ready "${vname}"; then
-      found=1
-    else
-      prune_dead_vendor "${vname}"
-    fi
+    # Three outcomes, deliberately NOT collapsed into pass/fail:
+    #   ready     → count it and move on.
+    #   empty     → best-effort prune (see prune_dead_vendor) and skip; a single
+    #               dead vendor must not veto the batch, which also carries every
+    #               healthy vendor's fresh deltas. Only die if NONE are healthy.
+    #   no graph  → FATAL. The index has content but is unsearchable, and unlike
+    #               "empty" this is not the vendor's fault — pruning it would
+    #               silently delete a healthy corpus to work around a build
+    #               failure, and uploading it would publish a dead index over a
+    #               good snapshot. Abort and keep the previous snapshot.
+    vrc=0; verify_index_ready "${vname}" || vrc=$?
+    case "${vrc}" in
+      0) found=1 ;;
+      "${VERIFY_EMPTY}") prune_dead_vendor "${vname}" ;;
+      *) die "vendor '${vname}' has chunks but no HNSW graph — refusing to upload an unsearchable index over the good snapshot" ;;
+    esac
   done
   [ "${found}" -eq 1 ] \
     || die "no healthy vendor subfolders under ${DOCS_DIR} — nothing to index (expected ${DOCS_DIR}/<vendor>/…)"
   if [ -d "${KB_DIR}/.git" ]; then
     rebuild_repo "${KB_DIR}"
     wait_repo_ready "$(basename "${KB_DIR}")"
+    # custom-kb is not prunable — it is the curated corpus, so ANY verify failure
+    # (empty or missing graph) aborts rather than publishing over a good snapshot.
     verify_index_ready "$(basename "${KB_DIR}")" \
-      || die "index verification failed for custom-kb (empty/broken) — refusing to upload over the good snapshot"
+      || die "index verification failed for custom-kb (empty or no HNSW graph) — refusing to upload over the good snapshot"
   fi
   # Stop the local serve BEFORE snapshotting. upload_snapshot tar's the index
   # dir; a live serve can touch LMDB/tantivy files mid-archive → tar exits 1

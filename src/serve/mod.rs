@@ -1573,17 +1573,20 @@ impl ServeState {
                 // `/status` (the repo reports "readonly", chunk counts look
                 // healthy) and previously cost a multi-round debugging spiral —
                 // so state it loudly, once, at warmup.
-                match stores.vector_store.read().await.stats() {
-                    Ok(s) if s.total_chunks > 0 && !s.indexed => warn!(
+                // `index_health()` (not `stats()`) on purpose: this arm is the
+                // cheap path that keeps the 2 GiB replica alive, and `stats()`
+                // would deserialize every chunk just to count unique paths.
+                match stores.vector_store.read().await.index_health() {
+                    Ok((total_chunks, false)) if total_chunks > 0 => warn!(
                         "Warmup '{}': opened READ-ONLY but its vector index has no HNSW graph \
                          ({} chunks present). Semantic search will return 0 results for this \
                          repo. The graph must be built by a WRITE-mode run before the snapshot \
                          is taken; a read-only store cannot build one.",
-                        alias, s.total_chunks
+                        alias, total_chunks
                     ),
                     Ok(_) => {}
                     Err(e) => warn!(
-                        "Warmup '{}': opened READ-ONLY but could not read stats: {}",
+                        "Warmup '{}': opened READ-ONLY but could not read index health: {}",
                         alias, e
                     ),
                 }
@@ -2793,6 +2796,11 @@ async fn info_handler(
         }
     }
 
+    // Whether the HNSW graph is actually present. `None` when the repo is not
+    // open (nothing live to ask), so a consumer can tell "no graph" apart from
+    // "unknown" instead of reading a defaulted `false` as a hard failure.
+    let mut indexed: Option<bool> = None;
+
     // If stores are open, live stats override metadata.
     if let Some(stores) = state.get_opened_stores(&alias) {
         if let Ok(vs) = stores.vector_store.try_read() {
@@ -2800,6 +2808,7 @@ async fn info_handler(
                 chunks = live_stats.total_chunks;
                 files = live_stats.total_files;
                 max_chunk_id = live_stats.max_chunk_id;
+                indexed = Some(live_stats.indexed);
                 if dims == 0 {
                     dims = live_stats.dimensions;
                 }
@@ -2823,6 +2832,13 @@ async fn info_handler(
         "dims": dims,
         "lock": lock,
         "index_age": index_age,
+        // Is the HNSW graph built and committed? A non-zero `chunks` with
+        // `indexed: false` is a searchable-looking but silently dead index:
+        // `VectorStore::search` refuses to run without the graph. The cloud
+        // index-job asserts this before publishing a snapshot, because a
+        // read-only serve replica can never build the graph itself.
+        // `null` = repo not currently open, so the graph state is unknown.
+        "indexed": indexed,
     }))
     .into_response()
 }
