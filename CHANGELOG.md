@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Protobuf (`.proto`) as a first-class indexed language — Niveau 1 (#162).** `.proto` files are now parsed with [`tree-sitter-proto`](https://crates.io/crates/tree-sitter-proto) and chunked along `message` / `enum` / `service` / `rpc` boundaries instead of falling back to naive line-windowing. Definition chunks classify as Struct (`message`), Enum (`enum`), Interface (`service`), Method (`rpc`), and preceding `//` / `/* */` comments are captured as docstrings. This is text-aware indexing only — symbol-level precision (`find_impact` / call-graph for protobuf, "Niveau 2") is deferred until a motivating gRPC/Kafka-schema corpus exists, since there is no `scip-protobuf` emitter today.
+
 ### Fixed
 
 - **Watcher-triggered reindexes were invisible in the serve TUI, and branch switches never rebuilt symbols.** Three related gaps in the `codesearch serve` file watcher: (1) the ordinary text-batch reindex (the most common watcher activity) never signalled the TUI, so editing a file showed nothing in the status column even though the index updated — despite the callback's own doc claiming it fired on "batch flushes"; (2) a C# symbol rebuild toggled only the general repo-state label, never the C#-specific indicator, so that column never showed "Indexing" during the (30–90s) rebuild; (3) a git **branch switch** refreshed only the text index and discarded the buffered `.cs`/`.ts` events without rebuilding symbols, leaving `find_impact` serving references from the previous branch until the next incidental `.cs` edit or a serve restart. Now: the text-batch flush toggles the TUI "Indexing" label; the C# notifier is a 3-state signal (`Started`/`Succeeded`/`Failed`) so the C# indicator shows "Indexing" for the rebuild duration; and a branch switch triggers a full C#/TypeScript symbol rebuild. Watcher symbol-rebuild log lines now carry the repo label for multi-repo attribution.

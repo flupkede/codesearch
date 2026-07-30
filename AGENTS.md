@@ -17,6 +17,7 @@ _Last updated: 2026-07-29_
 - **Remote index management (`--remote`)** — `--remote <peer>` flag on `index list/add/rm` + `index reindex` verb drives a peer's management API via `FederationClient` (`ManagementOutcome`: `Ok` / `HttpError{status,reason}` / `Unreachable`). Endpoints: `GET /status`, `POST /repos {path}`, `DELETE /repos/:alias`, `POST /repos/:alias/reindex[?force=]`. `--json` on List/Reindex (requires `--remote`). Without `--remote`, every `index` verb is unchanged (local).
 - **Local `index rm <alias>`** — resolves the argument as a registered alias before falling back to path interpretation.
 - **CLI aliases** — `ls` is a visible alias for `list` (`index`/`groups`/`remote`); `rm` for `remove` (pre-existing).
+- **Protobuf (`.proto`) language support — Niveau 1** (#162, PR #175) — `.proto` files parsed with `tree-sitter-proto` and chunked along `message`/`enum`/`service`/`rpc` boundaries (Struct/Enum/Interface/Method) with preceding `//`/`/* */` comments as docstrings, instead of naive line-windowing. Symbol-level `find_impact` (Niveau 2) deferred — no `scip-protobuf` emitter exists today.
 
 > ℹ️ **Remote write verbs** (`add`, `reindex --force`) require a read-write peer; the cloud peer rejects them (`--force` → HTTP 500 "could only be opened read-only; cannot force-reindex"). An **incremental** `reindex` (no `--force`) of an already-registered repo *does* succeed on the cloud peer — that is the custom-kb auto-refresh path. `list` is always safe. `rm` is not durable — the next cold start re-registers from the restored snapshot.
 
@@ -57,7 +58,7 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 
 ### GitHub issues
 
-- [ ] **#162: include protobuf as a language aware** — feature request (opened 2026-07-27). Scope: should `.proto` files be indexed as a first-class language? Needs scoping discussion.
+- [~] **#162: include protobuf as a language aware** — Niveau 1 (text-aware `tree-sitter-proto` chunking on `message`/`enum`/`service`/`rpc` boundaries) shipped in PR #175. Niveau 2 (SCIP symbols → `find_impact`/call-graph) deferred pending a `.proto`-heavy repo — no `scip-protobuf` emitter exists today.
 - [x] **#161: missing macOS binary in v1.1.31** — fixed: C1/C3/C4 (APFS disk-pressure retry: stage binary out of `target/` + `cargo clean` + tar/cp retry loops with `df -h` diagnostics) merged via #166; PR #173 pinned the `actions/checkout` `ref:` so `workflow_dispatch` builds the tagged commit (related mismatch class). GitHub issue #161 closed 2026-07-29.
 
 ### Defensive / low priority

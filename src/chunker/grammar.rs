@@ -78,6 +78,7 @@ impl GrammarManager {
             // plain `Parser` like every other language here.
             Language::Markdown => Ok(tree_sitter_md::LANGUAGE.into()),
             Language::Dart => Ok(tree_sitter_dart::LANGUAGE.into()),
+            Language::Protobuf => Ok(tree_sitter_proto::LANGUAGE.into()),
             _ => Err(anyhow!(
                 "Language {} does not support tree-sitter",
                 language.name()
@@ -104,6 +105,7 @@ impl GrammarManager {
             Language::Json,
             Language::Markdown,
             Language::Dart,
+            Language::Protobuf,
         ]
     }
 
@@ -162,6 +164,14 @@ mod tests {
     fn test_load_java_grammar() {
         let manager = GrammarManager::new();
         let grammar = manager.get_grammar(Language::Java);
+
+        assert!(grammar.is_some());
+    }
+
+    #[test]
+    fn test_load_proto_grammar() {
+        let manager = GrammarManager::new();
+        let grammar = manager.get_grammar(Language::Protobuf);
 
         assert!(grammar.is_some());
     }
@@ -322,6 +332,7 @@ mod tests {
         assert!(manager.is_supported(Language::Yaml));
         assert!(manager.is_supported(Language::Json));
         assert!(manager.is_supported(Language::Markdown));
+        assert!(manager.is_supported(Language::Protobuf));
         assert!(!manager.is_supported(Language::Toml));
     }
 }
