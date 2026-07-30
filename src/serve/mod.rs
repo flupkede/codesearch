@@ -1562,8 +1562,31 @@ impl ServeState {
 
         // Open stores: existence check + write/readonly/conflicted logic.
         let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
-            OpenedStores::Readonly(_) => {
+            OpenedStores::Readonly(stores) => {
                 // Already registered as Readonly by try_open_stores.
+                //
+                // A read-only store can never repair itself: `build_index()`
+                // needs a write txn that MDB_RDONLY rejects, so if the snapshot
+                // this repo was restored from was taken before its HNSW graph
+                // was committed, `search()` fails with "Index not built" and the
+                // repo silently answers 0 results forever. That is invisible in
+                // `/status` (the repo reports "readonly", chunk counts look
+                // healthy) and previously cost a multi-round debugging spiral —
+                // so state it loudly, once, at warmup.
+                match stores.vector_store.read().await.stats() {
+                    Ok(s) if s.total_chunks > 0 && !s.indexed => warn!(
+                        "Warmup '{}': opened READ-ONLY but its vector index has no HNSW graph \
+                         ({} chunks present). Semantic search will return 0 results for this \
+                         repo. The graph must be built by a WRITE-mode run before the snapshot \
+                         is taken; a read-only store cannot build one.",
+                        alias, s.total_chunks
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        "Warmup '{}': opened READ-ONLY but could not read stats: {}",
+                        alias, e
+                    ),
+                }
                 // Touch so the idle reaper can evict this handle.
                 self.touch_access(alias);
                 return Ok(());

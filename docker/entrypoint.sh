@@ -238,7 +238,7 @@ wait_healthz() {
   done
 }
 
-# Make sure a repo's index is built/refreshed; wait_active_build_done() then blocks
+# Make sure a repo's index is built/refreshed; wait_repo_ready() then blocks
 # for completion. Two cases:
 #
 #   - ALREADY REGISTERED (index restored from a prior snapshot): do NOT issue any
@@ -250,8 +250,9 @@ wait_healthz() {
 #     process" (observed). So we let the warmup own the refresh and simply wait for
 #     the repo to reach a ready ("warm") state. During warmup /status reports the
 #     repo as "closed"; it flips to "warm" only after the refresh completes, which is
-#     exactly the signal wait_active_build_done() blocks on. /reindex?force=true is
-#     also unused (returns 500 in this deployment).
+#     exactly the signal wait_repo_ready() blocks on — note that warmup never reports
+#     "indexing", so the alias-specific status check is the ONLY signal here.
+#     /reindex?force=true is also unused (returns 500 in this deployment).
 #
 #   - NOT YET REGISTERED (first-ever cold build, no snapshot existed): POST /repos
 #     {path} to build the index from scratch (202; background; shows "indexing").
@@ -401,23 +402,64 @@ clear_docs_readonly() {
 # =============================================================================
 # index-job mode: build/refresh the index on a big replica, snapshot, exit.
 # =============================================================================
-# Sequential-safe build wait: block until the single in-flight build finishes.
-# The index-job builds ONE vendor at a time, so a "indexing" status anywhere in
-# /status can only be that one build — no per-alias parsing needed. Deliberately
-# does NOT short-circuit as "already ready" just because an earlier vendor is
-# open — that would let the next build be submitted before the current one
-# finishes, reintroducing the parallel builds that OOM-killed serve.
-wait_active_build_done() {
-  local base="http://127.0.0.1:${PORT}" waited=0 body
+# Extract one repo's "status" value out of a GET /status body. jq when present,
+# otherwise a sed fallback that isolates the object carrying "alias":"<name>"
+# (the objects are emitted as a flat array, so splitting on '{' gives one record
+# per line and we keep the one naming this alias).
+repo_status() {
+  local body="$1" name="$2"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "${body}" | jq -r --arg a "${name}" \
+      '.repos[]? | select(.alias == $a) | .status' 2>/dev/null | head -n1
+    return 0
+  fi
+  printf '%s' "${body}" | tr '{' '\n' \
+    | sed -n "s/.*\"alias\":\"${name}\".*\"status\":\"\([a-z_]*\)\".*/\1/p" | head -n1
+}
+
+# Sequential-safe build wait: block until this vendor is BOTH (a) not part of an
+# in-flight submitted build and (b) actually in a ready state.
+#
+# Two different signals are involved and conflating them was a real bug:
+#
+#   1. `"status":"indexing"` is set ONLY for an explicitly submitted
+#      `POST /repos` / `POST /repos/<alias>/reindex` build — the first-ever cold
+#      build path. The index-job builds ONE vendor at a time, so an "indexing"
+#      anywhere in /status can only be that one build; no per-alias parsing is
+#      needed for this half, and we must not short-circuit just because an
+#      earlier vendor is already open (that would resubmit before the current
+#      build finished, reintroducing the parallel builds that OOM-killed serve).
+#
+#   2. Phase-1 STARTUP WARMUP — the path that actually runs for every vendor
+#      restored from a snapshot ("already registered") — never sets "indexing".
+#      A warming repo is simply absent from the state map and reports "closed",
+#      flipping to "warm" only once the warmup has built AND committed its HNSW
+#      graph. Waiting on signal 1 alone therefore returned after the initial 5s
+#      sleep for every already-registered vendor ("build settled after ~5s" for
+#      all six, job wall-clock 67s), so the job could kill serve and tar the
+#      index dir while warmup was still writing it. The uploaded snapshot then
+#      carries a missing/half-built vector graph, and neither consumer can
+#      recover: a read-only serve cannot build a graph at all (build_index needs
+#      a write txn MDB_RDONLY rejects) so it answers 0 results, while a
+#      write-mode serve rebuilds every vendor's graph at once on cold start and
+#      is OOM-killed on the 2 GiB replica. Both were observed in production.
+#
+# So we now wait for the named repo to reach warm/open/readonly as well.
+wait_repo_ready() {
+  local name="$1" base="http://127.0.0.1:${PORT}" waited=0 body st=""
   sleep 5   # let the 202 flip the repo into "indexing" before we start checking
   while [ "${waited}" -lt "${INDEX_JOB_MAX_WAIT_SECS}" ]; do
     body="$(api "${base}/status" 2>/dev/null || true)"
     if ! printf '%s' "${body}" | grep -q '"status":"indexing"'; then
-      log "build settled after ~$((waited + 5))s"; return 0
+      st="$(repo_status "${body}" "${name}")"
+      case "${st}" in
+        warm|open|readonly)
+          log "repo '${name}' ready (status=${st}) after ~$((waited + 5))s"; return 0 ;;
+      esac
     fi
     sleep 10; waited=$((waited + 10))
   done
-  log "WARN: build still 'indexing' after ${waited}s — proceeding to verify"
+  log "WARN: repo '${name}' still '${st:-<unknown>}' after ${waited}s — proceeding to verify"
   return 0
 }
 
@@ -465,7 +507,7 @@ run_index_job() {
     [ -d "${vendor}" ] || continue     # empty ${DOCS_DIR} → glob stays literal
     vname="$(basename "${vendor%/}")"
     rebuild_repo "${vendor%/}"         # strip trailing slash so basename is clean
-    wait_active_build_done             # block until this single build completes
+    wait_repo_ready "${vname}"         # block until this vendor is genuinely ready
     # An empty/broken vendor is best-effort pruned (see prune_dead_vendor) and
     # skipped — it must NOT abort the whole batch. Only die if NONE are healthy.
     if verify_index_ready "${vname}"; then
@@ -478,7 +520,7 @@ run_index_job() {
     || die "no healthy vendor subfolders under ${DOCS_DIR} — nothing to index (expected ${DOCS_DIR}/<vendor>/…)"
   if [ -d "${KB_DIR}/.git" ]; then
     rebuild_repo "${KB_DIR}"
-    wait_active_build_done
+    wait_repo_ready "$(basename "${KB_DIR}")"
     verify_index_ready "$(basename "${KB_DIR}")" \
       || die "index verification failed for custom-kb (empty/broken) — refusing to upload over the good snapshot"
   fi
@@ -491,13 +533,30 @@ run_index_job() {
   kill "${serve_pid}" 2>/dev/null || true
   wait "${serve_pid}" 2>/dev/null || true
 
-  # NOTE: the read-only DOCS feature is DISABLED (read-only search returns 0
-  # results — VectorStore::search needs the HNSW graph from build_index(), which
-  # requires a WRITE txn that MDB_RDONLY rejects; a read-only open only works if
-  # a prior write-mode build persisted the graph). DOCS is served write-mode.
-  # repo_read_only flags are already cleared above (before warmup) so the job
-  # builds+persists the graphs; this keeps that clean state in the snapshot.
-  # mark_docs_readonly
+  # Mark DOCS read-only LAST — after warmup built the graphs, after serve is
+  # stopped, immediately before the tar.
+  #
+  # The ordering is the whole trick and it is not interchangeable:
+  #   clear_docs_readonly (top of the job, BEFORE serve starts)
+  #     → the job's serve opens DOCS in WRITE mode → warmup runs build_index()
+  #       and commits the HNSW graph into LMDB.
+  #   wait_repo_ready per vendor
+  #     → guarantees that commit actually finished before we tar (without this
+  #       the snapshot can carry a half-built graph — see wait_repo_ready).
+  #   mark_docs_readonly (here, serve already dead)
+  #     → only flips the repos.json flag, touching no index data, so the
+  #       snapshot ships ready-to-search graphs PLUS the read-only flag.
+  #
+  # Why serve needs the flag: with DOCS writable, serve's Phase-1 warmup opens
+  # all five vendors write-mode and runs build_index() + an incremental refresh
+  # (embedding) on each, holding every one Warm at once. Measured 1.94 GiB on
+  # the 1 vCPU / 2 GiB replica → SIGKILL (exit 137) ~30s after startup, in a
+  # crash-loop. Read-only warmup returns early: no embed, no build, no refresh.
+  # That is only safe BECAUSE the graph is already in the snapshot — a read-only
+  # store cannot build one (build_index needs a write txn MDB_RDONLY rejects),
+  # which is why an earlier attempt to mark read-only WITHOUT the clear+wait
+  # above made search return 0 results and had to be reverted.
+  mark_docs_readonly
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"
 
   log "index-job done"
