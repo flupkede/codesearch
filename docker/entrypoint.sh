@@ -449,22 +449,30 @@ run_index_job() {
     verify_index_ready "$(basename "${KB_DIR}")" \
       || die "index verification failed for custom-kb (empty/broken) — refusing to upload over the good snapshot"
   fi
-  # Stop the local serve BEFORE marking + snapshotting. Two reasons:
-  #  (1) upload_snapshot tar's the index dir; a live serve can touch LMDB/tantivy
-  #      files mid-archive → tar exits 1 ("file changed as we read it"). Killing
-  #      serve first quiesces the filesystem so tar reads a stable snapshot.
-  #  (2) The jq repo_read_only write below must be the LAST word on repos.json;
-  #      if serve were still alive it could rewrite repos.json on shutdown and
-  #      drop the flags. upload_snapshot is pure local tar+azcopy — it does NOT
-  #      need the serve API.
+  # Stop the local serve BEFORE snapshotting. upload_snapshot tar's the index
+  # dir; a live serve can touch LMDB/tantivy files mid-archive → tar exits 1
+  # ("file changed as we read it"). Killing serve first quiesces the filesystem
+  # so tar reads a stable snapshot. upload_snapshot is pure local tar+azcopy —
+  # it does NOT need the serve API.
   log "stopping local serve before snapshot"
   kill "${serve_pid}" 2>/dev/null || true
   wait "${serve_pid}" 2>/dev/null || true
 
-  # Mark every DOCS vendor read-only in repos.json so serve, on snapshot
-  # restore, opens DOCS read-only and skips warmup embedding (→ fits 2 GiB).
-  # custom-kb stays writable (it is not under DOCS_DIR).
-  mark_docs_readonly
+  # NOTE: mark_docs_readonly is intentionally DISABLED. The per-repo read_only
+  # flag makes serve open DOCS via SharedStores::new_readonly, whose search path
+  # is BROKEN: VectorStore::search needs the HNSW graph, which is only built by
+  # build_index() — and build_index() requires a WRITE txn (env.write_txn()),
+  # which fails under MDB_RDONLY. A read-only open therefore only finds the
+  # graph if it was persisted by a prior write-mode build, and that is NOT
+  # reliably the case (incremental refresh skips build_index when there are 0
+  # changed files). Net effect: every read-only DOCS vendor returned 0 search
+  # results (both semantic and literal) while /info still reported the chunk
+  # count. Fix is left to a follow-up (serve-side: rebuild+persist the graph in
+  # the index job, or make read-only search not depend on a persisted graph).
+  # Until then DOCS is served write-mode (warmup rebuilds the in-memory index,
+  # exactly as v2.10 did). With zero source changes there is no embedding, so
+  # the 2 GiB replica still fits comfortably.
+  # mark_docs_readonly
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"
 
   log "index-job done"
