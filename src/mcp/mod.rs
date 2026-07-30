@@ -2411,6 +2411,46 @@ mod tests {
     }
 
     #[test]
+    fn respond_with_items_carries_warnings_on_every_path() {
+        use rmcp::model::RawContent;
+        let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
+            match &r.unwrap().content[0].raw {
+                RawContent::Text(t) => t.text.clone(),
+                other => panic!("expected text content, got {other:?}"),
+            }
+        };
+        let warned = vec!["repo 'inriver' outline scan failed: os error 22".to_string()];
+
+        // Empty + failure: the message must contradict its own diagnosis.
+        let out = text(super::respond_with_items(&[0u32; 0], &warned, || {
+            "No indexed chunks found for path.".to_string()
+        }));
+        assert!(out.contains("WARNING"), "got: {out}");
+        assert!(out.contains("inriver"), "got: {out}");
+
+        // NON-empty + failure: this is the path five handlers used to drop. A
+        // short-but-plausible list from a partially-dead group must say so.
+        let out = text(super::respond_with_items(&[1u32, 2], &warned, || {
+            "unused".to_string()
+        }));
+        assert!(out.contains("warnings"), "got: {out}");
+        assert!(out.contains("os error 22"), "got: {out}");
+        assert!(out.contains("results"), "got: {out}");
+
+        // Healthy: byte-identical to the pre-existing bare array.
+        let out = text(super::respond_with_items(&[1u32, 2], &[], || {
+            "unused".to_string()
+        }));
+        assert_eq!(out, "[1,2]", "a healthy response must not change shape");
+
+        // Empty and healthy: plain message, no warning noise.
+        let out = text(super::respond_with_items(&[0u32; 0], &[], || {
+            "No indexed chunks found for path.".to_string()
+        }));
+        assert_eq!(out, "No indexed chunks found for path.");
+    }
+
+    #[test]
     fn retry_hint_is_dropped_only_when_a_store_failed() {
         let hint = || Some("literal_search".to_string());
 
@@ -3808,6 +3848,38 @@ fn push_store_warning(warnings: &mut Vec<String>, msg: &str) {
         tracing::error!("MCP: {}", msg);
         warnings.push(msg.to_string());
     }
+}
+
+/// The single exit for a handler that returns a list of items plus a warnings
+/// channel.
+///
+/// Five handlers previously read their channel ONLY on the empty path, so a
+/// partially-failed group returned a plausible-looking short list with no
+/// signal at all - the same false negative as an empty result, just harder to
+/// notice. Routing every exit through here means the channel is carried
+/// whether the list is empty or not, and there is no per-handler discipline
+/// left to forget.
+///
+/// A healthy call is byte-identical to the previous behaviour (a bare JSON
+/// array), so this is backward compatible.
+fn respond_with_items<T: serde::Serialize>(
+    items: &[T],
+    warnings: &[String],
+    empty_message: impl FnOnce() -> String,
+) -> Result<CallToolResult, McpError> {
+    if items.is_empty() {
+        return Ok(CallToolResult::success(vec![Content::text(
+            qualify_empty_result(empty_message(), warnings),
+        )]));
+    }
+    if !warnings.is_empty() {
+        let payload = serde_json::json!({ "results": items, "warnings": warnings });
+        return Ok(CallToolResult::success(vec![Content::text(
+            payload.to_string(),
+        )]));
+    }
+    let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string());
+    Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
 /// Decide whether to keep the "try another tool" hint.
@@ -6233,15 +6305,13 @@ impl CodesearchService {
             item.path = ctx.prefix_result_path(&item.path);
         }
 
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No definition found for '{}'. Try find_usages() to find references, or broaden your search.",
+        respond_with_items(&items, &find_warnings, || {
+            format!(
+                "No definition found for '{}'. Try find_usages() to find references, \
+                 or broaden your search.",
                 request.symbol
-            ))]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+            )
+        })
     }
 
     // === find_usages tool ===
@@ -6392,15 +6462,12 @@ impl CodesearchService {
             item.path = ctx.prefix_result_path(&item.path);
         }
 
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No usages found for '{}' (only definitions were found). Try find_definition() to locate the declaration.",
-                symbol
-            ))]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        respond_with_items(&items, &find_warnings, || {
+            format!(
+                "No usages found for '{symbol}' (only definitions were found). Try \
+                 find_definition() to locate the declaration."
+            )
+        })
     }
 
     /// Fetch outline items for an already-normalised absolute path.
@@ -6563,19 +6630,11 @@ impl CodesearchService {
             }
         }
 
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                qualify_empty_result(
-                    "No indexed chunks found for path. Verify the file is within the \
-                     project root and the index is up to date."
-                        .to_string(),
-                    &outline_warnings,
-                ),
-            )]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        respond_with_items(&items, &outline_warnings, || {
+            "No indexed chunks found for path. Verify the file is within the \
+             project root and the index is up to date."
+                .to_string()
+        })
     }
 
     #[tool(
@@ -7256,19 +7315,11 @@ impl CodesearchService {
         }
 
         items.sort_by_key(|i| i.line);
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                qualify_empty_result(
-                    "No import chunks found. The index may not include import statements \
-                     for this language, or the file has no imports."
-                        .to_string(),
-                    &import_warnings,
-                ),
-            )]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        respond_with_items(&items, &import_warnings, || {
+            "No import chunks found. The index may not include import statements \
+             for this language, or the file has no imports."
+                .to_string()
+        })
     }
 
     async fn find_dependents(
@@ -7512,17 +7563,9 @@ impl CodesearchService {
         }
 
         items.sort_by(|a, b| a.path.cmp(&b.path));
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                qualify_empty_result(
-                    format!("No dependent files found for '{}'.", request.symbol_or_path),
-                    &dep_warnings,
-                ),
-            )]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        respond_with_items(&items, &dep_warnings, || {
+            format!("No dependent files found for '{}'.", request.symbol_or_path)
+        })
     }
 
     /// Internal: find similar chunks, used by `explore(kind="similar")`.
@@ -7695,33 +7738,12 @@ impl CodesearchService {
             item.path = ctx.prefix_result_path(&item.path);
         }
 
-        // The embedding-lookup read of `similar_warnings` above sits in an early
-        // return, so every failure recorded AFTER it — the whole neighbour
-        // fan-out — reached no caller. A channel needs a read reachable from
-        // every write, not just one read.
-        if results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                qualify_empty_result(
-                    format!("No similar chunks found for chunk_id {}.", request.chunk_id),
-                    &similar_warnings,
-                ),
-            )]));
-        }
-        if !similar_warnings.is_empty() {
-            // Non-empty but incomplete is the likelier loss here: neighbours
-            // from a broken repo are simply absent from a plausible-looking
-            // list. Say so rather than let the list speak for the whole group.
-            let payload = serde_json::json!({
-                "results": results,
-                "warnings": similar_warnings,
-            });
-            return Ok(CallToolResult::success(vec![Content::text(
-                payload.to_string(),
-            )]));
-        }
-
-        let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        // Every exit carries the channel: the earlier read sat in an
+        // early-return arm, so once an embedding was found, every failure
+        // recorded afterwards (the whole neighbour fan-out) was discarded.
+        respond_with_items(&results, &similar_warnings, || {
+            format!("No similar chunks found for chunk_id {}.", request.chunk_id)
+        })
     }
 
     async fn literal_search(
