@@ -3600,6 +3600,27 @@ struct MultiReadOutcome<R> {
     failures: Vec<(String, String)>,
 }
 
+// Hand-written rather than derived: `derive(Default)` would demand `R: Default`,
+// which the result types do not implement and do not need to.
+impl<R> Default for MultiReadOutcome<R> {
+    fn default() -> Self {
+        Self {
+            results: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
+impl<R> MultiReadOutcome<R> {
+    /// Render failures as caller-facing warning lines.
+    fn warnings(&self, what: &str) -> Vec<String> {
+        self.failures
+            .iter()
+            .map(|(alias, err)| format!("repo '{alias}' {what} failed: {err}"))
+            .collect()
+    }
+}
+
 struct MultiStoreContext {
     /// Single-store override (set when exactly 1 repo resolved, or None).
     /// Pass to `with_*_store_read_for()` methods.
@@ -4169,16 +4190,22 @@ impl CodesearchService {
     ///
     /// Runs `action` against each store and merges all results into a single vec,
     /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
+    ///
+    /// Like the vector fan-out, a per-store failure does not abort the query but
+    /// IS reported in [`MultiReadOutcome::failures`]. The literal path is not
+    /// hypothetical here: during the cloud read-only incident every affected
+    /// vendor returned 0 results for literal search too, and it looked clean.
     async fn with_fts_store_read_multi<R, F>(
         &self,
         mut action: F,
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
-    ) -> Result<Vec<R>>
+    ) -> Result<MultiReadOutcome<R>>
     where
         F: FnMut(&FtsStore) -> Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
+        let mut failures: Vec<(String, String)> = Vec::new();
         let mut all_results: Vec<R> = Vec::new();
         let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
             std::collections::HashMap::new();
@@ -4201,7 +4228,14 @@ impl CodesearchService {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("FTS store read failed for multi-store fan-out: {:?}", e);
+                    tracing::warn!(
+                        "FTS store read failed for multi-store fan-out (alias {}): {:?}",
+                        alias,
+                        e
+                    );
+                    // Same contract as the vector fan-out: a swallowed failure
+                    // must not reach the caller as an ordinary empty result.
+                    failures.push((alias.to_string(), format!("{e:#}")));
                 }
             }
         }
@@ -4213,7 +4247,10 @@ impl CodesearchService {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        Ok(all_results)
+        Ok(MultiReadOutcome {
+            results: all_results,
+            failures,
+        })
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -4925,6 +4962,7 @@ impl CodesearchService {
                 has_identifiers,
                 ctx.project_alias.as_deref(),
                 &ctx.alias_roots,
+                &[],
             );
         }
 
@@ -5104,6 +5142,7 @@ impl CodesearchService {
             has_identifiers,
             ctx.project_alias.as_deref(),
             &ctx.alias_roots,
+            &[],
         )
     }
 
@@ -5127,7 +5166,11 @@ impl CodesearchService {
 
         // === Lexical mode: FTS only across all stores ===
         if mode == "lexical" {
-            let fts_results = self
+            // Lexical has no second backend, so a failed store here is invisible
+            // unless it is reported: the query simply looks like it found nothing.
+            let mut lexical_warnings: Vec<String> = Vec::new();
+
+            let outcome = self
                 .with_fts_store_read_multi(
                     |fts_store| fts_store.search(&request.query, limit * 5, structural_intent),
                     stores.clone(),
@@ -5135,11 +5178,21 @@ impl CodesearchService {
                 )
                 .await
                 .unwrap_or_default();
+            if !outcome.failures.is_empty() {
+                tracing::error!(
+                    "MCP: lexical fan-out degraded — {} of {} repo(s) failed: {:?}",
+                    outcome.failures.len(),
+                    stores.len(),
+                    outcome.failures
+                );
+                lexical_warnings.extend(outcome.warnings("literal search"));
+            }
+            let fts_results = outcome.results;
 
             // Also do exact search if identifiers detected
             let mut all_fts = fts_results;
             for ident in identifiers {
-                let exact = self
+                let exact_outcome = self
                     .with_fts_store_read_multi(
                         |fts_store| fts_store.search_exact(ident, limit * 3, structural_intent),
                         stores.clone(),
@@ -5147,7 +5200,8 @@ impl CodesearchService {
                     )
                     .await
                     .unwrap_or_default();
-                merge_exact_into_fts(&mut all_fts, exact);
+                lexical_warnings.extend(exact_outcome.warnings("exact-identifier search"));
+                merge_exact_into_fts(&mut all_fts, exact_outcome.results);
             }
 
             all_fts.sort_by(|a, b| {
@@ -5171,6 +5225,7 @@ impl CodesearchService {
                     !identifiers.is_empty(),
                     None,
                     alias_roots,
+                    &lexical_warnings,
                 );
             }
 
@@ -5181,6 +5236,7 @@ impl CodesearchService {
                 !identifiers.is_empty(),
                 None,
                 alias_roots,
+                &lexical_warnings,
             );
         }
 
@@ -5220,43 +5276,52 @@ impl CodesearchService {
             )
             .await;
 
-        let vector_results = match outcome {
-            Ok(o) => {
-                // Every store failed: report it. Falling through with an empty
-                // vec here would render as a successful "no results found",
-                // hiding a total outage behind a plausible-looking answer.
-                if o.results.is_empty() && !o.failures.is_empty() {
-                    let detail = o
-                        .failures
-                        .iter()
-                        .map(|(alias, err)| format!("  - {alias}: {err}"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+        // Warnings raised by the fan-out, carried into the response so the
+        // calling agent can tell "not in the corpus" from "that repo is down".
+        let mut search_warnings: Vec<String> = Vec::new();
+
+        let vector_results =
+            match outcome {
+                Ok(o) => {
+                    if !o.failures.is_empty() {
+                        tracing::error!(
+                            "MCP: vector fan-out degraded — {} of {} repo(s) failed: {:?}",
+                            o.failures.len(),
+                            stores.len(),
+                            o.failures
+                        );
+                        // Only "semantic" has no second backend to fall back on. In
+                        // hybrid/auto/lexical the FTS half can still answer, so
+                        // hard-failing here would throw away good results — the same
+                        // reason one broken repo does not abort the whole fan-out.
+                        if mode == "semantic" && o.results.is_empty() {
+                            let detail = o
+                                .failures
+                                .iter()
+                                .map(|(alias, err)| format!("  - {alias}: {err}"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            return Ok(CallToolResult::success(vec![Content::text(format!(
+                                "Error searching vector store: {} of {} repo(s) in scope failed \
+                             and none returned results:\n{}",
+                                o.failures.len(),
+                                stores.len(),
+                                detail
+                            ))]));
+                        }
+                        search_warnings.extend(o.failures.iter().map(|(alias, err)| {
+                            format!("repo '{alias}' vector search failed: {err}")
+                        }));
+                    }
+                    o.results
+                }
+                Err(e) => {
+                    tracing::error!("MCP: vector fan-out failed: {:?}", e);
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error searching vector store: all {} repo(s) in scope failed:\n{}",
-                        o.failures.len(),
-                        detail
+                        "Error searching vector store: {e:#}"
                     ))]));
                 }
-                if !o.failures.is_empty() {
-                    // Partial outage: the healthy repos still answer, but the
-                    // result set is incomplete and must not look authoritative.
-                    tracing::error!(
-                        "MCP: group search degraded — {} of {} repo(s) failed: {:?}",
-                        o.failures.len(),
-                        stores.len(),
-                        o.failures
-                    );
-                }
-                o.results
-            }
-            Err(e) => {
-                tracing::error!("MCP: group search failed: {:?}", e);
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error searching vector store: {e:#}"
-                ))]));
-            }
-        };
+            };
 
         // === Mode: "semantic" — vector only ===
         if mode == "semantic" {
@@ -5279,14 +5344,17 @@ impl CodesearchService {
                 !identifiers.is_empty(),
                 None,
                 alias_roots,
+                &search_warnings,
             );
         }
 
         // === Modes: "hybrid" | "auto" — full hybrid search ===
         let (vector_k, fts_k) = adapt_rrf_k(&request.query);
 
-        // FTS search across all stores
-        let fts_results = self
+        // FTS search across all stores. Its failures matter as much as the
+        // vector half's: during the cloud read-only incident literal search
+        // also returned 0 results for every affected vendor, and looked clean.
+        let fts_outcome = self
             .with_fts_store_read_multi(
                 |fts_store| fts_store.search(&request.query, limit * 5, structural_intent),
                 stores.clone(),
@@ -5294,12 +5362,22 @@ impl CodesearchService {
             )
             .await
             .unwrap_or_default();
+        if !fts_outcome.failures.is_empty() {
+            tracing::error!(
+                "MCP: FTS fan-out degraded — {} of {} repo(s) failed: {:?}",
+                fts_outcome.failures.len(),
+                stores.len(),
+                fts_outcome.failures
+            );
+            search_warnings.extend(fts_outcome.warnings("literal search"));
+        }
+        let fts_results = fts_outcome.results;
 
         // Exact identifier search across all stores
         let all_exact = if !identifiers.is_empty() {
             let mut exact_results: Vec<crate::fts::FtsResult> = Vec::new();
             for ident in identifiers {
-                let exact = self
+                let exact_outcome = self
                     .with_fts_store_read_multi(
                         |fts_store| fts_store.search_exact(ident, limit * 3, structural_intent),
                         stores.clone(),
@@ -5307,7 +5385,8 @@ impl CodesearchService {
                     )
                     .await
                     .unwrap_or_default();
-                for r in exact {
+                search_warnings.extend(exact_outcome.warnings("exact-identifier search"));
+                for r in exact_outcome.results {
                     if !exact_results.iter().any(|e| e.chunk_id == r.chunk_id) {
                         exact_results.push(r);
                     }
@@ -5365,6 +5444,7 @@ impl CodesearchService {
             !identifiers.is_empty(),
             None,
             alias_roots,
+            &search_warnings,
         )
     }
 
@@ -5494,10 +5574,17 @@ impl CodesearchService {
             !identifiers.is_empty(),
             project_alias,
             alias_roots,
+            &[],
         )
     }
 
     /// Build the final SemanticSearchResponse with low-confidence signaling.
+    // Eight parameters, one over clippy's threshold. Bundling them into a
+    // `ResponseContext` struct is the right end state and is recorded as a
+    // follow-up; doing it in an incident fix would touch all seven call sites
+    // for no behavioural gain. The alternative — dropping `warnings` — is not
+    // acceptable: without it a failed repo is silently reported as "no match".
+    #[allow(clippy::too_many_arguments)]
     fn build_semantic_response(
         &self,
         results: Vec<crate::vectordb::SearchResult>,
@@ -5506,13 +5593,24 @@ impl CodesearchService {
         has_identifiers: bool,
         project_alias: Option<&str>,
         alias_roots: &std::collections::HashMap<String, String>,
+        // Repos that failed during a fan-out. MUST reach the caller: the
+        // consumer of this tool is a remote agent that never sees the server
+        // log, so a silently omitted repo reads as "no match there" — a false
+        // negative. The federated path already does this (`warnings` on the
+        // remote-project fan-out); the local path never could.
+        warnings: &[String],
     ) -> Result<CallToolResult, McpError> {
+        let warnings = if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.to_vec())
+        };
         if results.is_empty() {
             let response = SemanticSearchResponse {
                 results: vec![],
                 low_confidence: Some(true),
                 suggested_tool: Some("literal_search".to_string()),
-                warnings: None,
+                warnings,
             };
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
             return Ok(CallToolResult::success(vec![Content::text(json)]));
@@ -5583,7 +5681,7 @@ impl CodesearchService {
             results: items,
             low_confidence,
             suggested_tool,
-            warnings: None,
+            warnings,
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -5669,6 +5767,7 @@ impl CodesearchService {
             )
             .await
             .unwrap_or_default()
+            .results
         } else {
             match self
                 .with_fts_store_read_for(
@@ -5837,6 +5936,7 @@ impl CodesearchService {
             )
             .await
             .unwrap_or_default()
+            .results
         } else {
             match self
                 .with_fts_store_read_for(
@@ -6606,7 +6706,8 @@ impl CodesearchService {
                             ctx.store_aliases.as_ref().unwrap(),
                         )
                         .await
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .results;
                     for h in hits {
                         if seen_fts_ids.insert(h.chunk_id) {
                             all_hits.push((h.chunk_id, h.score));
@@ -6741,7 +6842,8 @@ impl CodesearchService {
                     sa,
                 )
                 .await
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .results;
 
             if exact_hits.is_empty() {
                 self.with_fts_store_read_multi(
@@ -6751,6 +6853,7 @@ impl CodesearchService {
                 )
                 .await
                 .unwrap_or_default()
+                .results
             } else {
                 exact_hits
             }
@@ -7269,6 +7372,7 @@ impl CodesearchService {
                 )
                 .await
                 .unwrap_or_default()
+                .results
             } else {
                 match self
                     .with_fts_store_read_for(
