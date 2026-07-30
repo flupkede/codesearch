@@ -274,6 +274,27 @@ verify_index_ready() {
   log "verify: repo '${name}' OK — ${chunks} chunks indexed"
 }
 
+# A vendor whose index came up EMPTY after warmup (0 chunks / 0 files) is dead
+# weight: a ghost whose source vanished (but whose folder still holds stray
+# non-index files prune_ghost_vendors conservatively keeps), or a stale/corrupt
+# index the incremental warmup could not repair. Either way a SINGLE dead vendor
+# must NOT veto the whole snapshot, which also carries every healthy vendor's
+# freshly baked deltas. Best-effort: unregister it (closes the store + drops the
+# repos.json entry) and remove the orphan folder so it is neither re-baked into
+# the snapshot nor served as an empty project. Every step is tolerant — a failure
+# here only logs a WARN and returns so the job keeps going. The batch-level guard
+# (found==0 -> die) still aborts if NO vendor is healthy.
+prune_dead_vendor() {
+  local name="$1" vendor="${DOCS_DIR}/${1}" base="http://127.0.0.1:${PORT}"
+  log "vendor '${name}' is empty/broken after warmup — best-effort prune (will NOT abort the batch)"
+  if api -X DELETE "${base}/repos/${name}" >/dev/null 2>&1; then
+    log "  unregistered '${name}' from repos.json"
+  else
+    log "  WARN: unregister '${name}' failed (continuing — folder removal still attempted)"
+  fi
+  rm -rf "${vendor}" || log "  WARN: could not remove orphan dir for '${name}'"
+}
+
 # Prune GHOST vendor folders before they are re-baked into the snapshot. A ghost
 # is an indexed vendor whose source .md disappeared from the blob: azcopy sync
 # --delete-destination removed the .md, but docs_index_exclusions() PROTECTED its
@@ -396,12 +417,16 @@ run_index_job() {
     vname="$(basename "${vendor%/}")"
     rebuild_repo "${vendor%/}"         # strip trailing slash so basename is clean
     wait_active_build_done             # block until this single build completes
-    verify_index_ready "${vname}" \
-      || die "index verification failed for '${vname}' (empty/broken) — refusing to upload over the good snapshot"
-    found=1
+    # An empty/broken vendor is best-effort pruned (see prune_dead_vendor) and
+    # skipped — it must NOT abort the whole batch. Only die if NONE are healthy.
+    if verify_index_ready "${vname}"; then
+      found=1
+    else
+      prune_dead_vendor "${vname}"
+    fi
   done
   [ "${found}" -eq 1 ] \
-    || die "no vendor subfolders under ${DOCS_DIR} — nothing to index (expected ${DOCS_DIR}/<vendor>/…)"
+    || die "no healthy vendor subfolders under ${DOCS_DIR} — nothing to index (expected ${DOCS_DIR}/<vendor>/…)"
   if [ -d "${KB_DIR}/.git" ]; then
     rebuild_repo "${KB_DIR}"
     wait_active_build_done
