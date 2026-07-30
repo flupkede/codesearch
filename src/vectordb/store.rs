@@ -384,6 +384,9 @@ impl VectorStore {
         // TrackedEnv additionally prevents double-open within the same process.
         let mut opts = EnvOpenOptions::new();
         opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
+        // SAFETY: see `BASE_ENV_FLAGS` — `NO_TLS` only changes how LMDB tracks
+        // reader slots, never the on-disk format.
+        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
         let env = unsafe {
             TrackedEnv::open(
                 &opts,
@@ -473,8 +476,10 @@ impl VectorStore {
         // TrackedEnv additionally prevents double-open within the same process.
         let mut opts = EnvOpenOptions::new();
         opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
-        // SAFETY: READ_ONLY flag is safe for concurrent read access.
-        unsafe { opts.flags(EnvFlags::READ_ONLY) };
+        // SAFETY: READ_ONLY is safe for concurrent read access; `NO_TLS` is
+        // required for it to be *usable* — without it a second live read txn on
+        // the same thread fails with MDB_BAD_RSLOT. See `BASE_ENV_FLAGS`.
+        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS | EnvFlags::READ_ONLY) };
         let env = unsafe {
             TrackedEnv::open(
                 &opts,
@@ -507,7 +512,20 @@ impl VectorStore {
             false
         };
 
-        drop(rtxn);
+        // MUST commit, not drop. LMDB keeps a database handle opened inside a
+        // transaction private to that transaction "until the transaction is
+        // successfully committed"; if the transaction is *aborted* instead, the
+        // handle is closed automatically. Dropping an `RoTxn` aborts it, which
+        // silently invalidated `vectors` / `chunks` above — every later use then
+        // failed with a bare EINVAL (os error 22).
+        //
+        // That is why this only ever broke in read-only mode: `new()` opens its
+        // databases in a WRITE txn that is committed, so its handles stay valid.
+        // In production it surfaced as read-only vendors reporting
+        // `indexed: null` / `max_chunk_id: 0` while every search against them
+        // failed, even though the HNSW graph was present (`indexed` is cached
+        // here, before the invalidation, so it still read `true`).
+        rtxn.commit()?;
 
         tracing::debug!(
             "✅ Database opened read-only (next_id: {}, indexed: {})",

@@ -369,6 +369,8 @@ impl PersistentEmbeddingCache {
         // TrackedEnv additionally prevents double-open within the same process.
         let mut opts = EnvOpenOptions::new();
         opts.map_size(512 * 1024 * 1024).max_dbs(1); // 512MB — plenty for cache
+                                                     // SAFETY: `NO_TLS` only changes reader-slot tracking. See `BASE_ENV_FLAGS`.
+        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
         let env = unsafe {
             TrackedEnv::open(
                 &opts,

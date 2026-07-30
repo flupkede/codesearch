@@ -4856,8 +4856,12 @@ impl CodesearchService {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("MCP: Search failed: {:?}", e);
+                // `{:#}` renders the whole anyhow chain. With plain `{}` the
+                // caller only ever saw the outermost `.context(...)` wrapper
+                // ("Error reading from project-routed vector store"), which
+                // hides the actual fault and makes remote diagnosis guesswork.
                 return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error searching vector store: {}",
+                    "Error searching vector store: {:#}",
                     e
                 ))]));
             }
