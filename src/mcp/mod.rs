@@ -2307,6 +2307,161 @@ mod tests {
         assert!(json.contains("\"note\""));
     }
 
+    // === Store-failure reporting =========================================
+    //
+    // These exist because this exact contract has been silently re-broken three
+    // times in three review rounds, in three different handlers. The behaviour
+    // is verified in production, but nothing in CI would have caught a fourth
+    // regression. These tests make the contract cheap to keep.
+
+    #[test]
+    fn store_warning_is_formatted_in_one_place() {
+        assert_eq!(
+            super::store_warning("inriver", "chunk lookup", "os error 22"),
+            "repo 'inriver' chunk lookup failed: os error 22"
+        );
+    }
+
+    #[test]
+    fn note_store_failure_records_once_per_store() {
+        let aliases = vec!["inriver".to_string(), "akeneo".to_string()];
+        let mut warnings = Vec::new();
+        let err = anyhow::anyhow!("os error 22");
+
+        // A resolution loop runs per hit; the caller wants to know THAT the
+        // repo is down, not how many times we noticed.
+        super::note_store_failure(&mut warnings, &aliases, 0, "chunk lookup", &err);
+        super::note_store_failure(&mut warnings, &aliases, 0, "chunk lookup", &err);
+        super::note_store_failure(&mut warnings, &aliases, 1, "chunk lookup", &err);
+
+        assert_eq!(
+            warnings.len(),
+            2,
+            "duplicates must be collapsed: {warnings:?}"
+        );
+        assert!(warnings[0].contains("inriver"));
+        assert!(warnings[1].contains("akeneo"));
+    }
+
+    #[test]
+    fn note_store_failure_renders_the_whole_error_chain() {
+        // Plain `{}` shows only the outermost context, which is what turned a
+        // real EINVAL into an unactionable "Error reading from vector store".
+        let err = anyhow::anyhow!("os error 22").context("Error searching vector store");
+        let mut warnings = Vec::new();
+        super::note_store_failure(&mut warnings, &["inriver".to_string()], 0, "search", &err);
+
+        assert!(warnings[0].contains("os error 22"), "got: {}", warnings[0]);
+        assert!(warnings[0].contains("Error searching vector store"));
+    }
+
+    #[test]
+    fn note_store_failure_survives_a_short_alias_list() {
+        // Fan-out and alias vectors are parallel by convention, not by type. A
+        // mismatch must not panic in a search handler.
+        let mut warnings = Vec::new();
+        super::note_store_failure(&mut warnings, &[], 3, "search", &anyhow::anyhow!("boom"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("unknown"));
+    }
+
+    #[test]
+    fn into_results_routes_failures_into_warnings() {
+        let outcome = super::MultiReadOutcome {
+            results: vec![1u32, 2],
+            failures: vec![("inriver".to_string(), "os error 22".to_string())],
+        };
+        let mut warnings = Vec::new();
+        let results = outcome.into_results(&mut warnings, "chunk lookup");
+
+        assert_eq!(results, vec![1, 2]);
+        assert_eq!(
+            warnings,
+            vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()],
+            "taking the results must never drop the failures"
+        );
+    }
+
+    #[test]
+    fn qualify_empty_result_is_transparent_when_nothing_failed() {
+        let msg = "No definition found for 'Foo'.".to_string();
+        assert_eq!(super::qualify_empty_result(msg.clone(), &[]), msg);
+    }
+
+    #[test]
+    fn qualify_empty_result_contradicts_a_not_found_diagnosis() {
+        // "may not be indexed" is a DIAGNOSIS, and it is flatly wrong when the
+        // store never answered. An agent acts on it by giving up or by
+        // re-indexing something that was never broken.
+        let out = super::qualify_empty_result(
+            "No definition found for 'Foo'. The symbol may not be indexed.".to_string(),
+            &["repo 'inriver' definition search failed: os error 22".to_string()],
+        );
+        assert!(out.contains("WARNING"));
+        assert!(out.contains("not trustworthy"));
+        assert!(out.contains("inriver"));
+        assert!(out.contains("os error 22"));
+    }
+
+    #[test]
+    fn semantic_response_emits_warnings_and_drops_the_retry_hint() {
+        let response = super::SemanticSearchResponse {
+            results: vec![],
+            low_confidence: Some(true),
+            suggested_tool: None,
+            warnings: Some(vec!["repo 'inriver' search failed: os error 22".to_string()]),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"warnings\""), "got: {json}");
+        assert!(json.contains("os error 22"));
+        assert!(
+            !json.contains("suggested_tool"),
+            "retrying with another tool just hits the same broken store: {json}"
+        );
+    }
+
+    #[test]
+    fn semantic_response_omits_warnings_when_healthy() {
+        // Backward compatibility: a healthy response must be byte-identical to
+        // what callers saw before the field existed.
+        let response = super::SemanticSearchResponse {
+            results: vec![],
+            low_confidence: None,
+            suggested_tool: None,
+            warnings: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("warnings"), "got: {json}");
+    }
+
+    #[test]
+    fn literal_response_emits_warnings_and_omits_them_when_healthy() {
+        let failed = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+            warnings: Some(vec![
+                "repo 'inriver' chunk lookup failed: os error 22".to_string()
+            ]),
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains("\"warnings\""), "got: {json}");
+        assert!(json.contains("os error 22"));
+
+        let healthy = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+            warnings: None,
+        };
+        let json = serde_json::to_string(&healthy).unwrap();
+        assert!(!json.contains("warnings"), "got: {json}");
+    }
+
     #[test]
     fn test_literal_search_response_omits_fields_when_not_promoted() {
         let response = super::LiteralSearchResponse {
@@ -3599,6 +3754,7 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
 /// is the most misleading signal this system can emit — it reads as "the corpus
 /// does not contain that", and it is what sent an earlier round of this
 /// investigation chasing an indexing problem that did not exist.
+#[must_use]
 struct MultiReadOutcome<R> {
     /// Merged, deduplicated, score-sorted results from the stores that worked.
     results: Vec<R>,
@@ -3620,11 +3776,44 @@ fn note_store_failure(
     err: &anyhow::Error,
 ) {
     let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-    let msg = format!("repo '{alias}' {what} failed: {err:#}");
-    if !warnings.contains(&msg) {
+    push_store_warning(warnings, &store_warning(alias, what, &format!("{err:#}")));
+}
+
+/// The one place a per-store warning line is formatted. Two copies used to
+/// exist and could drift; a caller matching on this text would then silently
+/// stop matching half of them.
+fn store_warning(alias: &str, what: &str, err: &str) -> String {
+    format!("repo '{alias}' {what} failed: {err}")
+}
+
+/// Append a warning unless it is already present, logging it once.
+fn push_store_warning(warnings: &mut Vec<String>, msg: &str) {
+    if !warnings.iter().any(|w| w == msg) {
         tracing::error!("MCP: {}", msg);
-        warnings.push(msg);
+        warnings.push(msg.to_string());
     }
+}
+
+/// Qualify a "nothing found" message when a store in scope actually failed.
+///
+/// This is the defect that keeps coming back in a new handler: "No definition
+/// found — the symbol may not be indexed" is a *diagnosis*, and it is flatly
+/// wrong when the store never answered. An agent acts on it by giving up or by
+/// re-indexing something that was never broken.
+fn qualify_empty_result(message: String, warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return message;
+    }
+    format!(
+        "{}
+
+WARNING: this result is not trustworthy — {} store(s) in scope          failed, so \"not found\" may mean \"not searched\":
+{}",
+        message,
+        warnings.len(),
+        warnings.join("
+")
+    )
 }
 
 // Hand-written rather than derived: `derive(Default)` would demand `R: Default`,
@@ -3643,8 +3832,20 @@ impl<R> MultiReadOutcome<R> {
     fn warnings(&self, what: &str) -> Vec<String> {
         self.failures
             .iter()
-            .map(|(alias, err)| format!("repo '{alias}' {what} failed: {err}"))
+            .map(|(alias, err)| store_warning(alias, what, err))
             .collect()
+    }
+
+    /// Take the results, routing any failures into `warnings` on the way out.
+    ///
+    /// Deliberately the only ergonomic way to get at `results`: reaching for
+    /// the field directly and dropping `failures` is `unwrap_or_default()`
+    /// under a new name, and that is the bug this whole type exists to stop.
+    fn into_results(self, warnings: &mut Vec<String>, what: &str) -> Vec<R> {
+        for (alias, err) in &self.failures {
+            push_store_warning(warnings, &store_warning(alias, what, err));
+        }
+        self.results
     }
 }
 
@@ -4918,8 +5119,7 @@ impl CodesearchService {
                 Err(e) => {
                     tracing::error!("MCP: Failed to get embedding service: {:?}", e);
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error initializing embedding service: {}",
-                        e
+                        "Error initializing embedding service: {e:#}"
                     ))]));
                 }
             };
@@ -4931,12 +5131,17 @@ impl CodesearchService {
                 Err(e) => {
                     tracing::error!("MCP: Failed to embed query: {:?}", e);
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error embedding query: {}",
-                        e
+                        "Error embedding query: {e:#}"
                     ))]));
                 }
             }
         };
+
+        // Failures on this single-store path. The group fan-out has carried a
+        // warnings channel since the read-only incident; without the same thing
+        // here, `project=<alias>` — the form an agent uses most — still reports
+        // a broken store as an ordinary empty result.
+        let mut single_warnings: Vec<String> = Vec::new();
 
         // Search vector store
         let vector_results = match self
@@ -4953,14 +5158,23 @@ impl CodesearchService {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("MCP: Search failed: {:?}", e);
+                // Only "semantic" has no second backend to fall back on. In
+                // hybrid/auto the FTS half can still answer, so hard-failing
+                // here would throw away good results — the same mistake this
+                // branch already fixed once in the group fan-out.
+                //
                 // `{:#}` renders the whole anyhow chain. With plain `{}` the
                 // caller only ever saw the outermost `.context(...)` wrapper
                 // ("Error reading from project-routed vector store"), which
                 // hides the actual fault and makes remote diagnosis guesswork.
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error searching vector store: {:#}",
-                    e
-                ))]));
+                if mode == "semantic" {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error searching vector store: {:#}",
+                        e
+                    ))]));
+                }
+                single_warnings.push(format!("vector search failed: {e:#}"));
+                Vec::new()
             }
         };
 
@@ -4989,7 +5203,7 @@ impl CodesearchService {
                 has_identifiers,
                 ctx.project_alias.as_deref(),
                 &ctx.alias_roots,
-                &[],
+                &single_warnings,
             );
         }
 
@@ -5011,7 +5225,7 @@ impl CodesearchService {
                 |fts_store| {
                     let fts_results = fts_store
                         .search(&request.query, limit * 5, structural_intent)
-                        .unwrap_or_default();
+                        .context("Error searching FTS store")?;
 
                     let fused = if identifiers.is_empty() {
                         rrf_fusion(&vector_results, &fts_results, vector_k as f32)
@@ -5070,6 +5284,10 @@ impl CodesearchService {
             }
             Err(e) => {
                 tracing::warn!("MCP: FTS store unavailable, using vector-only: {:?}", e);
+                // Degrading to vector-only is correct, but it must be VISIBLE:
+                // a caller that gets half a hybrid search with no signal cannot
+                // tell it from a complete one.
+                single_warnings.push(format!("lexical (FTS) search failed: {e:#}"));
                 vector_results.into_iter().take(limit).collect()
             }
         };
@@ -5169,7 +5387,7 @@ impl CodesearchService {
             has_identifiers,
             ctx.project_alias.as_deref(),
             &ctx.alias_roots,
-            &[],
+            &single_warnings,
         )
     }
 
@@ -5279,8 +5497,7 @@ impl CodesearchService {
                 Ok(g) => g,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error initializing embedding service: {}",
-                        e
+                        "Error initializing embedding service: {e:#}"
                     ))]));
                 }
             };
@@ -5289,8 +5506,7 @@ impl CodesearchService {
                 Ok(e) => e,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error embedding query: {}",
-                        e
+                        "Error embedding query: {e:#}"
                     ))]));
                 }
             }
@@ -5683,7 +5899,13 @@ impl CodesearchService {
             let response = SemanticSearchResponse {
                 results: vec![],
                 low_confidence: Some(true),
-                suggested_tool: Some("literal_search".to_string()),
+                // No result because a store is DOWN is not a reason to retry
+                // with `literal_search` — that goes back at the same store.
+                suggested_tool: if warnings.is_some() {
+                    None
+                } else {
+                    Some("literal_search".to_string())
+                },
                 warnings,
             };
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -5749,7 +5971,15 @@ impl CodesearchService {
 
         // Check low-confidence: top result's RRF score below threshold
         let top_score = items.first().map(|r| r.score);
-        let (low_confidence, suggested_tool) = compute_low_confidence(top_score, has_identifiers);
+        let (low_confidence, mut suggested_tool) =
+            compute_low_confidence(top_score, has_identifiers);
+
+        // A weak result set caused by a DOWN store is not a reason to retry with
+        // another tool — that just sends the agent back at the same broken
+        // store. Suppress the suggestion and let the warning speak.
+        if warnings.is_some() {
+            suggested_tool = None;
+        }
 
         let response = SemanticSearchResponse {
             results: items,
@@ -5849,6 +6079,11 @@ impl CodesearchService {
             }
         }
 
+        // Stores that failed during this lookup. Without this, "the symbol may
+        // not be indexed" below is emitted as a confident diagnosis even when
+        // no store ever answered.
+        let mut find_warnings: Vec<String> = Vec::new();
+
         // FTS search — multi-store or single
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
             let sa = ctx.store_aliases.as_ref().unwrap();
@@ -5859,7 +6094,7 @@ impl CodesearchService {
             )
             .await
             .unwrap_or_default()
-            .results
+            .into_results(&mut find_warnings, "definition search")
         } else {
             match self
                 .with_fts_store_read_for(
@@ -5871,18 +6106,22 @@ impl CodesearchService {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error searching: {}",
-                        e
+                        "Error searching: {e:#}"
                     ))]));
                 }
             }
         };
 
         if fts_results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No definition found for '{}'. The symbol may not be indexed.",
-                request.symbol
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                qualify_empty_result(
+                    format!(
+                        "No definition found for '{}'. The symbol may not be indexed.",
+                        request.symbol
+                    ),
+                    &find_warnings,
+                ),
+            )]));
         }
 
         // Resolve chunk metadata and filter by definition kinds
@@ -5958,8 +6197,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error opening database: {}",
-                        e
+                        "Error opening database: {e:#}"
                     ))]));
                 }
             }
@@ -6018,6 +6256,10 @@ impl CodesearchService {
             }
         }
 
+        // See `find_definition`: an empty result and a dead store must not
+        // produce the same sentence.
+        let mut find_warnings: Vec<String> = Vec::new();
+
         // FTS search — multi-store or single
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
             let sa = ctx.store_aliases.as_ref().unwrap();
@@ -6028,7 +6270,7 @@ impl CodesearchService {
             )
             .await
             .unwrap_or_default()
-            .results
+            .into_results(&mut find_warnings, "usage search")
         } else {
             match self
                 .with_fts_store_read_for(
@@ -6040,18 +6282,19 @@ impl CodesearchService {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error searching: {}",
-                        e
+                        "Error searching: {e:#}"
                     ))]));
                 }
             }
         };
 
         if fts_results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No usages found for '{}'. The symbol may not be indexed.",
-                symbol
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                qualify_empty_result(
+                    format!("No usages found for '{symbol}'. The symbol may not be indexed."),
+                    &find_warnings,
+                ),
+            )]));
         }
 
         // Resolve chunks and exclude definition chunks
@@ -6113,8 +6356,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error opening database: {}",
-                        e
+                        "Error opening database: {e:#}"
                     ))]));
                 }
             }
@@ -6245,8 +6487,7 @@ impl CodesearchService {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error reading outline: {}",
-                    e
+                    "Error reading outline: {e:#}"
                 ))]));
             }
         };
@@ -6350,6 +6591,12 @@ impl CodesearchService {
             clamped = true;
         }
 
+        // Stores that failed while looking up this chunk. get_chunk previously
+        // collapsed every `Err` into "not found", so during the read-only
+        // incident it would have reported every chunk in every vendor repo as
+        // missing — a confident, wrong answer.
+        let mut chunk_warnings: Vec<String> = Vec::new();
+
         // Look up chunk — multi-store: smart candidate detection for chunk_id collision.
         // chunk_ids are local per database, not globally unique. When no project is specified
         // and multiple stores are active, scan all stores to find which ones have this chunk_id.
@@ -6367,15 +6614,23 @@ impl CodesearchService {
                             }
                         }
                         Ok(None) => continue,
-                        Err(_) => continue,
+                        Err(ref e) => {
+                            note_store_failure(&mut chunk_warnings, aliases, i, "chunk lookup", e);
+                            continue;
+                        }
                     }
                 }
                 match candidates.len() {
                     0 => {
-                        return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "Chunk {} not found in any repository. Verify the chunk_id and index state.",
-                            request.chunk_id
-                        ))]));
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            qualify_empty_result(
+                                format!(
+                                    "Chunk {} not found in any repository. Verify the                                      chunk_id and index state.",
+                                    request.chunk_id
+                                ),
+                                &chunk_warnings,
+                            ),
+                        )]));
                     }
                     1 => {
                         // Exactly one store has this chunk_id — auto-route
@@ -6386,7 +6641,16 @@ impl CodesearchService {
                             serve_state.touch_access(alias);
                         }
                         let store = store_arc.vector_store.read().await;
-                        store.get_chunk(request.chunk_id).unwrap_or_default()
+                        match store.get_chunk(request.chunk_id) {
+                            Ok(c) => c,
+                            Err(ref e) => {
+                                push_store_warning(
+                                    &mut chunk_warnings,
+                                    &store_warning(alias, "chunk lookup", &format!("{e:#}")),
+                                );
+                                None
+                            }
+                        }
                     }
                     _ => {
                         // Multiple stores have this chunk_id — ambiguous
@@ -6405,8 +6669,10 @@ impl CodesearchService {
                 }
             } else {
                 // Single store or project specified — direct lookup
+                let empty_aliases: Vec<String> = Vec::new();
+                let aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
                 let mut found = None;
-                for store_arc in sv {
+                for (i, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(c)) => {
@@ -6414,27 +6680,52 @@ impl CodesearchService {
                             break;
                         }
                         Ok(None) => continue,
-                        Err(_) => break,
+                        // Do NOT abandon the remaining stores: one broken store
+                        // says nothing about the others, and the chunk may well
+                        // live in a healthy one.
+                        Err(ref e) => {
+                            note_store_failure(&mut chunk_warnings, aliases, i, "chunk lookup", e);
+                            continue;
+                        }
                     }
                 }
                 found
             }
         } else {
-            self.with_vector_store_read_for(
-                |store| store.get_chunk(request.chunk_id),
-                ctx.stores.clone(),
-            )
-            .await
-            .unwrap_or_default()
+            match self
+                .with_vector_store_read_for(
+                    |store| store.get_chunk(request.chunk_id),
+                    ctx.stores.clone(),
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    push_store_warning(
+                        &mut chunk_warnings,
+                        &store_warning(
+                            ctx.project_alias.as_deref().unwrap_or("unknown"),
+                            "chunk lookup",
+                            &format!("{e:#}"),
+                        ),
+                    );
+                    None
+                }
+            }
         };
 
         let mut chunk = match chunk {
             Some(c) => c,
             None => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Chunk {} not found. Verify the chunk_id and index state.",
-                    request.chunk_id
-                ))]));
+                return Ok(CallToolResult::success(vec![Content::text(
+                    qualify_empty_result(
+                        format!(
+                            "Chunk {} not found. Verify the chunk_id and index state.",
+                            request.chunk_id
+                        ),
+                        &chunk_warnings,
+                    ),
+                )]));
             }
         };
 
@@ -6674,8 +6965,7 @@ impl CodesearchService {
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
             Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Symbol lookup failed: {}",
-                e
+                "Symbol lookup failed: {e:#}"
             ))])),
         }
     }
@@ -6721,6 +7011,10 @@ impl CodesearchService {
         // Strip project-alias prefix from target path if present.
         let stripped_path = strip_alias_prefix(&request.path, ctx.project_alias.as_ref());
         let normalized = normalize_tool_path(&stripped_path, &project_root);
+
+        // Stores that failed during this lookup, so "no imports found" is never
+        // reported as fact when a store never answered.
+        let mut import_warnings: Vec<String> = Vec::new();
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store group fan-out: collect import items from all stores
@@ -6772,8 +7066,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error reading imports: {}",
-                        e
+                        "Error reading imports: {e:#}"
                     ))]));
                 }
             }
@@ -6799,7 +7092,7 @@ impl CodesearchService {
                         )
                         .await
                         .unwrap_or_default()
-                        .results;
+                        .into_results(&mut import_warnings, "imports search");
                     for h in hits {
                         if seen_fts_ids.insert(h.chunk_id) {
                             all_hits.push((h.chunk_id, h.score));
@@ -6895,6 +7188,10 @@ impl CodesearchService {
         let limit = request.limit.unwrap_or(20).min(200);
         let high_limit = (limit * 10).max(200); // generous budget for filtering
 
+        // Stores that failed during this lookup, so "no dependents" is never
+        // reported as fact when a store never answered.
+        let mut dep_warnings: Vec<String> = Vec::new();
+
         // Extract a meaningful search term from path-like inputs.
         // Import chunks contain module references like `use crate::constants::X`
         // but the tool receives file paths like `src/constants.rs`.
@@ -6935,7 +7232,7 @@ impl CodesearchService {
                 )
                 .await
                 .unwrap_or_default()
-                .results;
+                .into_results(&mut dep_warnings, "dependents search");
 
             if exact_hits.is_empty() {
                 self.with_fts_store_read_multi(
@@ -6945,27 +7242,37 @@ impl CodesearchService {
                 )
                 .await
                 .unwrap_or_default()
-                .results
+                .into_results(&mut dep_warnings, "dependents search")
             } else {
                 exact_hits
             }
         } else {
             // Single-store FTS search
-            let exact_hits = self
+            let alias = ctx.project_alias.as_deref().unwrap_or("unknown");
+            let mut run = |r: anyhow::Result<Vec<crate::fts::FtsResult>>| match r {
+                Ok(hits) => hits,
+                Err(e) => {
+                    push_store_warning(
+                        &mut dep_warnings,
+                        &store_warning(alias, "dependents search", &format!("{e:#}")),
+                    );
+                    Vec::new()
+                }
+            };
+            let exact_hits = run(self
                 .with_fts_store_read_for(
                     |fts_store| fts_store.search_exact(&search_term, high_limit, import_kind),
                     ctx.stores.clone(),
                 )
-                .await
-                .unwrap_or_default();
+                .await);
 
             if exact_hits.is_empty() {
-                self.with_fts_store_read_for(
-                    |fts_store| fts_store.search(&search_term, high_limit, import_kind),
-                    ctx.stores.clone(),
-                )
-                .await
-                .unwrap_or_default()
+                run(self
+                    .with_fts_store_read_for(
+                        |fts_store| fts_store.search(&search_term, high_limit, import_kind),
+                        ctx.stores.clone(),
+                    )
+                    .await)
             } else {
                 exact_hits
             }
@@ -7121,25 +7428,50 @@ impl CodesearchService {
 
         let limit = request.limit.unwrap_or(5).min(20);
 
+        // Stores that failed while resolving the source embedding. `if let
+        // Ok(Some(..))` used to discard the error, so a dead store produced
+        // "embedding not found" — a wrong diagnosis, not a missing chunk.
+        let mut similar_warnings: Vec<String> = Vec::new();
+
         let mut results = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store: find the embedding in whichever store has it,
             // then search across all stores for similar chunks.
+            let empty_aliases: Vec<String> = Vec::new();
+            let aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
             let mut embedding: Option<Vec<f32>> = None;
-            for store_arc in sv {
+            for (i, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
-                if let Ok(Some(emb)) = store.get_embedding(request.chunk_id) {
-                    embedding = Some(emb);
-                    break;
+                match store.get_embedding(request.chunk_id) {
+                    Ok(Some(emb)) => {
+                        embedding = Some(emb);
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(ref e) => {
+                        note_store_failure(
+                            &mut similar_warnings,
+                            aliases,
+                            i,
+                            "embedding lookup",
+                            e,
+                        );
+                        continue;
+                    }
                 }
             }
 
             let embedding = match embedding {
                 Some(e) => e,
                 None => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Embedding not found for chunk_id {} in any store.",
-                        request.chunk_id
-                    ))]));
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        qualify_empty_result(
+                            format!(
+                                "Embedding not found for chunk_id {} in any store.",
+                                request.chunk_id
+                            ),
+                            &similar_warnings,
+                        ),
+                    )]));
                 }
             };
 
