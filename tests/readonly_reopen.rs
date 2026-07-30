@@ -56,8 +56,12 @@ fn sample_chunks() -> Vec<EmbeddedChunk> {
 #[test]
 #[ignore]
 fn build_db_child() {
-    let path = std::env::var(BUILD_DB_ENV)
-        .unwrap_or_else(|_| panic!("{BUILD_DB_ENV} must be set for the child helper"));
+    // Not an error when run directly (`cargo test -- --ignored`): this test is
+    // only meaningful when the parent invokes it with a target path.
+    let Ok(path) = std::env::var(BUILD_DB_ENV) else {
+        eprintln!("skip: {BUILD_DB_ENV} not set — this helper is driven by the parent test");
+        return;
+    };
     let mut store = VectorStore::new(std::path::Path::new(&path), 4).expect("create store");
     store.insert_chunks(sample_chunks()).expect("insert chunks");
     store.build_index().expect("build index");

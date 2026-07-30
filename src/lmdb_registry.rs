@@ -29,16 +29,19 @@ use crate::cache::safe_canonicalize;
 /// transaction on the same thread fails with
 /// `MDB_BAD_RSLOT: Invalid reuse of reader locktable slot`.
 ///
-/// That is reachable in normal operation, not a corner case: `serve` answers
-/// requests from a tokio worker pool, and a single handler routinely holds one
-/// read txn open while opening another (e.g. `stats()` for `/info` while a
-/// search txn is live, or a group query walking several repos). It surfaced in
-/// production as read-only DOCS vendors reporting `indexed: null` /
-/// `max_chunk_id: 0` on `/repos/<alias>/info` while every semantic query
-/// against them failed — even though the HNSW graph was present and verified.
+/// This is defensive hardening, not a fix for a known live call path. Every
+/// current reader (`VectorStore::stats`, `::search`, …) opens and drops its own
+/// `RoTxn` inside one function body, so no two are live at once today, and
+/// `MDB_BAD_RSLOT` is per-environment so a group query across repos cannot
+/// trigger it either. The flag is here because the failure is real, silent and
+/// easy to reintroduce: it was reproduced against the production `inriver`
+/// database simply by holding two read transactions at once, and nothing in the
+/// type system stops a future refactor (e.g. reading stats while a search txn
+/// is open) from doing exactly that.
 ///
 /// Because heed refuses to reopen the same path with different options, this
-/// must be applied at EVERY env-open site, not only the read-only one.
+/// must be applied at EVERY env-open site, not only the read-only one — a
+/// partial rollout would turn a working reopen into an intermittent failure.
 pub const BASE_ENV_FLAGS: heed::EnvFlags = heed::EnvFlags::NO_TLS;
 
 // ── Global registry ─────────────────────────────────────────────

@@ -3585,6 +3585,21 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
 /// Created by `CodesearchService::resolve_routing()`, this struct encapsulates
 /// all the decisions a handler needs: which store to use, whether to fan out,
 /// and whether to call `ensure_database_exists()`.
+/// Outcome of a fan-out read across several repos.
+///
+/// Exists so an empty `results` is never ambiguous. A group query that hits a
+/// broken store used to come back as a successful search with zero hits, which
+/// is the most misleading signal this system can emit — it reads as "the corpus
+/// does not contain that", and it is what sent an earlier round of this
+/// investigation chasing an indexing problem that did not exist.
+struct MultiReadOutcome<R> {
+    /// Merged, deduplicated, score-sorted results from the stores that worked.
+    results: Vec<R>,
+    /// `(alias, full error chain)` for every store that failed. Empty on a
+    /// clean run.
+    failures: Vec<(String, String)>,
+}
+
 struct MultiStoreContext {
     /// Single-store override (set when exactly 1 repo resolved, or None).
     /// Pass to `with_*_store_read_for()` methods.
@@ -4084,16 +4099,22 @@ impl CodesearchService {
     ///
     /// Runs `action` against each store and merges all results into a single vec,
     /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
+    ///
+    /// A per-store failure does NOT abort the fan-out — one broken repo should
+    /// not blind a group query to the healthy ones — but it is reported back in
+    /// [`MultiReadOutcome::failures`] so the caller can tell an genuinely empty
+    /// result apart from a total failure.
     async fn with_vector_store_read_multi<R, F>(
         &self,
         mut action: F,
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
-    ) -> Result<Vec<R>>
+    ) -> Result<MultiReadOutcome<R>>
     where
         F: FnMut(&VectorStore) -> anyhow::Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
+        let mut failures: Vec<(String, String)> = Vec::new();
         let mut all_results: Vec<R> = Vec::new();
         let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
             std::collections::HashMap::new();
@@ -4117,7 +4138,16 @@ impl CodesearchService {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Vector store read failed for multi-store fan-out: {:?}", e);
+                    tracing::warn!(
+                        "Vector store read failed for multi-store fan-out (alias {}): {:?}",
+                        alias,
+                        e
+                    );
+                    // Remembered, not just logged: a caller that only sees an
+                    // empty Vec cannot tell "nothing matched" from "every store
+                    // failed", and the second one must never be reported as a
+                    // successful empty search.
+                    failures.push((alias.to_string(), format!("{e:#}")));
                 }
             }
         }
@@ -4129,7 +4159,10 @@ impl CodesearchService {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        Ok(all_results)
+        Ok(MultiReadOutcome {
+            results: all_results,
+            failures,
+        })
     }
 
     /// Fan-out FTS store read across multiple stores, merging results.
@@ -5175,7 +5208,7 @@ impl CodesearchService {
         };
 
         // Search vector stores across all repos
-        let vector_results = self
+        let outcome = self
             .with_vector_store_read_multi(
                 |store| {
                     store
@@ -5185,8 +5218,45 @@ impl CodesearchService {
                 stores.clone(),
                 aliases,
             )
-            .await
-            .unwrap_or_default();
+            .await;
+
+        let vector_results = match outcome {
+            Ok(o) => {
+                // Every store failed: report it. Falling through with an empty
+                // vec here would render as a successful "no results found",
+                // hiding a total outage behind a plausible-looking answer.
+                if o.results.is_empty() && !o.failures.is_empty() {
+                    let detail = o
+                        .failures
+                        .iter()
+                        .map(|(alias, err)| format!("  - {alias}: {err}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error searching vector store: all {} repo(s) in scope failed:\n{}",
+                        o.failures.len(),
+                        detail
+                    ))]));
+                }
+                if !o.failures.is_empty() {
+                    // Partial outage: the healthy repos still answer, but the
+                    // result set is incomplete and must not look authoritative.
+                    tracing::error!(
+                        "MCP: group search degraded — {} of {} repo(s) failed: {:?}",
+                        o.failures.len(),
+                        stores.len(),
+                        o.failures
+                    );
+                }
+                o.results
+            }
+            Err(e) => {
+                tracing::error!("MCP: group search failed: {:?}", e);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error searching vector store: {e:#}"
+                ))]));
+            }
+        };
 
         // === Mode: "semantic" — vector only ===
         if mode == "semantic" {
