@@ -424,6 +424,16 @@ wait_active_build_done() {
 run_index_job() {
   log "MODE=index-job — heavy build + snapshot, then exit"
   restore_snapshot   # incremental: re-embed only deltas when a prior snapshot exists
+  # Strip any repo_read_only flags RESTORED from a prior snapshot BEFORE serve
+  # starts. Critical: if the flags are present, the job's serve opens DOCS
+  # read-only → warmup skips build_index() → the HNSW graphs are NOT built/persisted
+  # into the uploaded snapshot. The serve replica would then have to build all
+  # DOCS graphs at once on cold start (OOM/crash-loop), and a read-only serve
+  # would return 0 search results (read-only search needs a persisted graph it
+  # cannot build itself). Clearing here makes the job open DOCS WRITE mode so
+  # warmup builds+commits every graph — the snapshot then carries ready-to-search
+  # indexes and serve warmup is light (graphs already present).
+  clear_docs_readonly
   sync_blob
   sync_kb
 
@@ -481,19 +491,13 @@ run_index_job() {
   kill "${serve_pid}" 2>/dev/null || true
   wait "${serve_pid}" 2>/dev/null || true
 
-  # NOTE: the read-only DOCS feature is DISABLED (see clear_docs_readonly below).
-  # mark_docs_readonly is intentionally NOT called.
+  # NOTE: the read-only DOCS feature is DISABLED (read-only search returns 0
+  # results — VectorStore::search needs the HNSW graph from build_index(), which
+  # requires a WRITE txn that MDB_RDONLY rejects; a read-only open only works if
+  # a prior write-mode build persisted the graph). DOCS is served write-mode.
+  # repo_read_only flags are already cleared above (before warmup) so the job
+  # builds+persists the graphs; this keeps that clean state in the snapshot.
   # mark_docs_readonly
-  # STRIP any repo_read_only flags so serve opens DOCS in WRITE mode on restore.
-  # Why this is needed even though mark_docs_readonly is no longer called: a
-  # PRIOR job run (v2.13) baked repo_read_only[<alias>]=true into repos.json and
-  # uploaded it. Every subsequent job RESTORES that repos.json and re-uploads it
-  # unchanged, so the flags persist forward indefinitely. We must actively delete
-  # the map so the snapshot serves DOCS write-mode (the read-only search path is
-  # broken — VectorStore::search needs the HNSW graph from build_index(), which
-  # needs a WRITE txn that MDB_RDONLY rejects; read-only vendors returned 0
-  # search results for both semantic and literal while /info still showed chunks).
-  clear_docs_readonly
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"
 
   log "index-job done"
