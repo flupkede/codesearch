@@ -190,10 +190,26 @@ upload_snapshot() {
   log "creating index snapshot (excluding model weights)"
   # Exclude model weights (baked into the image) and lock files (never valid to
   # carry across containers — see restore_snapshot for why).
+  #
+  # tar exits 1 ("Some files differ" / "file changed as we read it") when ANY
+  # tracked file is touched mid-archive — common when snapshotting an index the
+  # live serve process is still writing to, and BENIGN for a point-in-time
+  # restore snapshot (LMDB readers are MVCC; a momentarily-shifted data.mdb
+  # still restores). Only a FATAL tar error (exit >= 2, e.g. disk-full/ENOSPC)
+  # should abort the upload. Capture stderr to a side file so a real failure is
+  # diagnosable instead of silently swallowed by /dev/null.
+  local tar_err=0
   tar czf "${SNAPSHOT_LOCAL}" -C / \
     --exclude='*.onnx' --exclude='*.onnx_data' \
     --exclude='*.lock' --exclude='lock.mdb' \
-    "${DATA_DIR#/}" "${CONFIG_DIR#/}" 2>/dev/null || { log "WARN: snapshot tar failed"; return 1; }
+    "${DATA_DIR#/}" "${CONFIG_DIR#/}" 2>"${SNAPSHOT_LOCAL}.tarerr" || tar_err=$?
+  if [ "${tar_err}" -ge 2 ]; then
+    log "WARN: snapshot tar failed (exit ${tar_err}): $(tr '\n' ' ' < "${SNAPSHOT_LOCAL}.tarerr" 2>/dev/null)"
+    rm -f "${SNAPSHOT_LOCAL}" "${SNAPSHOT_LOCAL}.tarerr"
+    return 1
+  fi
+  [ "${tar_err}" -eq 1 ] && log "note: tar reported file-changed (exit 1) — benign for a live snapshot, proceeding"
+  rm -f "${SNAPSHOT_LOCAL}.tarerr"
   azcopy copy "${SNAPSHOT_LOCAL}" "$(snapshot_blob_url)" --overwrite=true 2>&1 | sed 's/^/[azcopy] /' || {
     log "WARN: snapshot upload failed"; rm -f "${SNAPSHOT_LOCAL}"; return 1;
   }
@@ -433,15 +449,25 @@ run_index_job() {
     verify_index_ready "$(basename "${KB_DIR}")" \
       || die "index verification failed for custom-kb (empty/broken) — refusing to upload over the good snapshot"
   fi
+  # Stop the local serve BEFORE marking + snapshotting. Two reasons:
+  #  (1) upload_snapshot tar's the index dir; a live serve can touch LMDB/tantivy
+  #      files mid-archive → tar exits 1 ("file changed as we read it"). Killing
+  #      serve first quiesces the filesystem so tar reads a stable snapshot.
+  #  (2) The jq repo_read_only write below must be the LAST word on repos.json;
+  #      if serve were still alive it could rewrite repos.json on shutdown and
+  #      drop the flags. upload_snapshot is pure local tar+azcopy — it does NOT
+  #      need the serve API.
+  log "stopping local serve before snapshot"
+  kill "${serve_pid}" 2>/dev/null || true
+  wait "${serve_pid}" 2>/dev/null || true
+
   # Mark every DOCS vendor read-only in repos.json so serve, on snapshot
   # restore, opens DOCS read-only and skips warmup embedding (→ fits 2 GiB).
   # custom-kb stays writable (it is not under DOCS_DIR).
   mark_docs_readonly
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"
 
-  log "index-job done — shutting down local serve"
-  kill "${serve_pid}" 2>/dev/null || true
-  wait "${serve_pid}" 2>/dev/null || true
+  log "index-job done"
   exit 0
 }
 
