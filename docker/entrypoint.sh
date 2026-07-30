@@ -307,6 +307,37 @@ prune_ghost_vendors() {
   [ "${pruned}" -eq 1 ] || log "no ghost vendors to prune"
 }
 
+# Mark every DOCS vendor read-only in the local serve's repos.json, so the
+# uploaded snapshot makes serve open DOCS read-only on restore (no warmup
+# embed → fits 2 GiB). custom-kb is NOT under DOCS_DIR → stays writable.
+# Generic-boundary-safe: the read_only capability lives in the binary; this
+# entrypoint makes the cloud-specific "DOCS is read-only here" decision.
+mark_docs_readonly() {
+  local repos_json="${CONFIG_DIR}/repos.json" vendor name marked=0
+  [ -f "${repos_json}" ] || { log "mark_docs_readonly: no repos.json yet — nothing to mark"; return 0; }
+  if ! command -v jq >/dev/null 2>&1; then
+    log "  WARN: jq missing — cannot mark DOCS read-only (DOCS would be writable on serve restore)"
+    return 0
+  fi
+  for vendor in "${DOCS_DIR}"/*/; do
+    [ -d "${vendor}" ] || continue
+    name="$(basename "${vendor%/}")"
+    # only mark aliases actually registered in repos.json
+    if jq -e --arg a "${name}" 'has("repos") and (.repos | has($a))' "${repos_json}" >/dev/null 2>&1; then
+      if jq --arg a "${name}" '.repo_read_only[$a] = true' "${repos_json}" > "${repos_json}.tmp" \
+         && mv -f "${repos_json}.tmp" "${repos_json}"; then
+        log "  marked DOCS vendor '${name}' read-only in repos.json"
+        marked=1
+      else
+        log "  WARN: could not mark DOCS vendor '${name}' read-only (jq write failed)"
+      fi
+    else
+      log "  note: DOCS vendor '${name}' not registered — skipping"
+    fi
+  done
+  [ "${marked}" -eq 1 ] || log "mark_docs_readonly: no DOCS vendors marked"
+}
+
 # =============================================================================
 # index-job mode: build/refresh the index on a big replica, snapshot, exit.
 # =============================================================================
@@ -377,6 +408,10 @@ run_index_job() {
     verify_index_ready "$(basename "${KB_DIR}")" \
       || die "index verification failed for custom-kb (empty/broken) — refusing to upload over the good snapshot"
   fi
+  # Mark every DOCS vendor read-only in repos.json so serve, on snapshot
+  # restore, opens DOCS read-only and skips warmup embedding (→ fits 2 GiB).
+  # custom-kb stays writable (it is not under DOCS_DIR).
+  mark_docs_readonly
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"
 
   log "index-job done — shutting down local serve"
