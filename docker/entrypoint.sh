@@ -72,6 +72,18 @@ INDEX_JOB_REPO_READY_SECS="${INDEX_JOB_REPO_READY_SECS:-600}"
 # hung serve cannot burn the whole replicaTimeout right before the snapshot.
 SERVE_STOP_GRACE_SECS="${SERVE_STOP_GRACE_SECS:-30}"
 
+# Both knobs are fed to `[ ... -lt/-ge ... ]`, where a non-numeric value makes
+# `test` exit 2 — which reads as "condition false" and silently restores the
+# unbounded-wait behaviour these budgets exist to remove. Validate the shape
+# instead of discovering it at 3 a.m.
+for _knob in INDEX_JOB_REPO_READY_SECS SERVE_STOP_GRACE_SECS; do
+  eval "_v=\${${_knob}}"
+  case "${_v}" in
+    ''|*[!0-9]*) echo "[entrypoint] FATAL: ${_knob} must be a non-negative integer (got '${_v}')" >&2; exit 1 ;;
+  esac
+done
+unset _knob _v
+
 log() { echo "[entrypoint] $*"; }
 die() { echo "[entrypoint] FATAL: $*" >&2; exit 1; }
 
@@ -447,40 +459,69 @@ prune_ghost_vendors() {
 # embed at warmup — the measured 1.94 GiB / exit-137 crash-loop. A WARN here
 # would ship exactly that while the job reports success, so every failure path
 # aborts BEFORE upload_snapshot instead.
+# The target set is derived from repos.json, NOT from a DOCS_DIR glob, and the
+# result is read back before the job continues.
+#
+# Driving the loop off the filesystem was fail-open in exactly the case that
+# matters: an alias can be registered in repos.json while its folder is gone.
+# prune_dead_vendor and prune_ghost_vendors both do a BEST-EFFORT
+# `DELETE /repos/<alias>` followed by an unconditional `rm -rf`, so a failed
+# unregister plus a successful remove leaves precisely that state. A glob-driven
+# loop never visits it, never counts it as a failure, and the "at least one
+# marked" post-check passes on some other vendor — shipping a snapshot with a
+# registered, WRITABLE DOCS alias, which is the crash-loop we are fixing.
+#
+# The set is "every registered alias except custom-kb" rather than "every alias
+# whose path starts with DOCS_DIR": serve canonicalizes paths on register
+# (safe_canonicalize), so a path-prefix test would be a guess about symlink
+# resolution, and guessing wrong here would abort every run. Alias identity is
+# exact. This container only ever registers DOCS vendors plus custom-kb.
 mark_docs_readonly() {
-  local repos_json="${CONFIG_DIR}/repos.json" vendor name marked=0 failed=0
+  local repos_json="${CONFIG_DIR}/repos.json" kb_alias expected unmarked kb_flag
   [ -f "${repos_json}" ] \
     || die "mark_docs_readonly: no repos.json at '${repos_json}' — cannot mark DOCS read-only, and an unmarked snapshot puts serve back in the write-mode warmup OOM"
   command -v jq >/dev/null 2>&1 \
     || die "jq is required in index-job mode: without it DOCS cannot be marked read-only and the snapshot would make the 2 GiB serve replica warm up write-mode"
-  for vendor in "${DOCS_DIR}"/*/; do
-    [ -d "${vendor}" ] || continue
-    name="$(basename "${vendor%/}")"
-    # only mark aliases actually registered in repos.json
-    if jq -e --arg a "${name}" 'has("repos") and (.repos | has($a))' "${repos_json}" >/dev/null 2>&1; then
-      if jq --arg a "${name}" '.repo_read_only[$a] = true' "${repos_json}" > "${repos_json}.tmp" \
-         && mv -f "${repos_json}.tmp" "${repos_json}"; then
-        log "  marked DOCS vendor '${name}' read-only in repos.json"
-        marked=$((marked + 1))
-      else
-        # Tolerant: this is only cleanup, and under `set -e` a failing rm here
-        # would abort with a bare shell error instead of the diagnostic die below.
-        rm -f "${repos_json}.tmp" 2>/dev/null || true
-        log "  ERROR: could not mark DOCS vendor '${name}' read-only (jq write failed)"
-        failed=$((failed + 1))
-      fi
-    else
-      log "  note: DOCS vendor '${name}' not registered — skipping"
-    fi
-  done
-  [ "${failed}" -eq 0 ] \
-    || die "${failed} DOCS vendor(s) could not be marked read-only — refusing to upload a snapshot serve would warm up write-mode"
-  # The vendor loop already died if NO vendor was healthy, so by the time we get
-  # here at least one registered DOCS vendor must exist. Zero marked means the
-  # repos.json we are writing is not the one the build used.
-  [ "${marked}" -gt 0 ] \
-    || die "mark_docs_readonly marked 0 DOCS vendors although the build verified at least one — '${repos_json}' does not describe the index being snapshotted"
-  log "marked ${marked} DOCS vendor(s) read-only for the snapshot"
+  kb_alias="$(basename "${KB_DIR}")"
+
+  expected="$(jq -r --arg kb "${kb_alias}" \
+    '[(.repos // {}) | keys[] | select(. != $kb)] | length' "${repos_json}" 2>/dev/null || true)"
+  case "${expected}" in
+    ''|*[!0-9]*)
+      die "mark_docs_readonly: could not read the alias list out of '${repos_json}' (got '${expected:-<none>}') — refusing to upload a snapshot whose read-only state is unknown" ;;
+  esac
+  [ "${expected}" -gt 0 ] \
+    || die "mark_docs_readonly: repos.json registers no DOCS alias although the build verified at least one — '${repos_json}' does not describe the index being snapshotted"
+
+  # One atomic rewrite for the whole set: a per-vendor loop could leave the file
+  # half-marked if it failed midway.
+  if ! { jq --arg kb "${kb_alias}" \
+          'reduce ((.repos // {}) | keys[] | select(. != $kb)) as $a (.; .repo_read_only[$a] = true)' \
+          "${repos_json}" > "${repos_json}.tmp" && mv -f "${repos_json}.tmp" "${repos_json}"; }; then
+    # Tolerant: cleanup only. Under `set -e` a failing rm would abort with a bare
+    # shell error instead of the diagnostic die below.
+    rm -f "${repos_json}.tmp" 2>/dev/null || true
+    die "mark_docs_readonly: jq write to '${repos_json}' failed — refusing to upload a snapshot serve would warm up write-mode"
+  fi
+
+  # Read back the artifact rather than trusting the write. Anything still not
+  # true is named, so the operator does not have to diff repos.json by hand.
+  unmarked="$(jq -r --arg kb "${kb_alias}" \
+    '. as $root
+     | [(.repos // {}) | keys[]
+        | select(. != $kb)
+        | select(($root.repo_read_only[.] // false) != true)]
+     | join(", ")' "${repos_json}" 2>/dev/null || echo "<readback-failed>")"
+  [ -z "${unmarked}" ] \
+    || die "mark_docs_readonly: still writable after the rewrite: ${unmarked} — refusing to upload a snapshot serve would warm up write-mode"
+
+  # custom-kb must stay WRITABLE: it is the one repo serve legitimately updates
+  # at runtime, and marking it read-only would silently freeze it.
+  kb_flag="$(jq -r --arg kb "${kb_alias}" '.repo_read_only[$kb] // false' "${repos_json}" 2>/dev/null || echo "true")"
+  [ "${kb_flag}" = "false" ] \
+    || die "mark_docs_readonly: '${kb_alias}' was marked read-only (${kb_flag}) — it must stay writable"
+
+  log "marked ${expected} DOCS alias(es) read-only for the snapshot; '${kb_alias}' left writable"
 }
 
 # Remove the repo_read_only map from repos.json. This is STEP 1 of the
@@ -649,6 +690,23 @@ run_index_job() {
   sync_blob
   sync_kb
 
+  # Keep serve's stale-indexing-marker eviction OUTSIDE our readiness budget.
+  #
+  # /status reports "indexing" only while an alias has a live marker in
+  # active_reindexes, and `is_indexing` LAZILY EVICTS markers older than
+  # CODESEARCH_MAX_INDEXING_SECS (default 1800). The eviction is a self-healing
+  # guard against leaked markers, but wait_repo_ready leans on that label: the
+  # POST /repos cold-build path registers RepoState::Write (which maps to "open")
+  # BEFORE the background build finishes, and only the "indexing" precedence in
+  # repo_statuses_lightweight keeps that from reading as ready. So if a build
+  # legitimately outlives the eviction threshold, the label flips to "open"
+  # mid-build and the job would tar a half-built index over the good snapshot.
+  # At the 600s default that is unreachable — but the timeout message invites
+  # raising the budget, so pin the threshold above it rather than leave a knob
+  # that turns a documented workaround into silent corruption.
+  export CODESEARCH_MAX_INDEXING_SECS="$((INDEX_JOB_REPO_READY_SECS + 300))"
+  log "pinned CODESEARCH_MAX_INDEXING_SECS=${CODESEARCH_MAX_INDEXING_SECS} (readiness budget ${INDEX_JOB_REPO_READY_SECS}s + 300s margin)"
+
   # Run serve locally (no ingress needed) just to drive the indexing API.
   codesearch serve --host 127.0.0.1 --port "${PORT}" --no-tui --quiet=false &
   local serve_pid=$!
@@ -722,7 +780,7 @@ run_index_job() {
   # process gone, and LMDB is crash-safe.
   log "stopping local serve before snapshot"
   kill "${serve_pid}" 2>/dev/null || true
-  serve_stop_waited=0
+  local serve_stop_waited=0
   while kill -0 "${serve_pid}" 2>/dev/null; do
     [ "${serve_stop_waited}" -ge "${SERVE_STOP_GRACE_SECS}" ] && {
       log "  serve did not exit within ${SERVE_STOP_GRACE_SECS}s — sending SIGKILL"
