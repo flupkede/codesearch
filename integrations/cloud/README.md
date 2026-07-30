@@ -211,6 +211,8 @@ codesearch index reindex <alias> [--force] --remote cloud     # POST /repos/:ali
   snapshot, so the published snapshot is never at risk. The only write it performs is the
   incremental custom-KB reindex, which touches only that replica's own local LMDB copy (rebuilt
   from git on each replica) — so you can still run multiple replicas or restart freely.
+- **DOCS served read-only (`repo_read_only` flag)** — the index job marks every DOCS vendor `read_only: true` in the published snapshot's `repos.json` (`mark_docs_readonly()` in `docker/entrypoint.sh`). On restore, serve's warmup opens those repos read-only and returns early — it does **not** run the embedding warmup on DOCS — so the 1 vCPU / 2 GiB replica never embeds the heavy corpus (it only incrementally reindexes the small `custom-kb`, which stays writable). This is what lets the serve replica stay small.
+- **Ghost-vendor pruning** — when a vendor's source is removed from the blob, `sync_blob --delete-destination` strips its `.md` files but the index dir (`.codesearch.db`) is protected from deletion, leaving an empty ghost folder that the restored `repos.json` still registers. Before publishing a snapshot, the index job detects such ghost vendors (a DOCS folder whose only child is `.codesearch.db`), unregisters them (`DELETE /repos/<alias>`) and removes the orphaned index dir — so vanished vendors don't linger and get re-baked forever.
 
 ## See also
 
