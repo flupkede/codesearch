@@ -375,6 +375,29 @@ mark_docs_readonly() {
   [ "${marked}" -eq 1 ] || log "mark_docs_readonly: no DOCS vendors marked"
 }
 
+# Remove the repo_read_only map from repos.json so serve opens every repo in
+# WRITE mode on snapshot restore. See the index-job tail for why the read-only
+# DOCS feature is currently disabled (read-only search returns 0 results).
+# Idempotent + best-effort: a missing field, missing jq, or a write failure only
+# logs a WARN and continues (the job must not abort over a stale flag cleanup).
+clear_docs_readonly() {
+  local repos_json="${CONFIG_DIR}/repos.json"
+  [ -f "${repos_json}" ] || { log "clear_docs_readonly: no repos.json — nothing to clear"; return 0; }
+  if ! command -v jq >/dev/null 2>&1; then
+    log "  WARN: jq missing — cannot strip repo_read_only (serve may still open DOCS read-only)"
+    return 0
+  fi
+  if jq -e 'has("repo_read_only")' "${repos_json}" >/dev/null 2>&1; then
+    if jq 'del(.repo_read_only)' "${repos_json}" > "${repos_json}.tmp" && mv -f "${repos_json}.tmp" "${repos_json}"; then
+      log "stripped repo_read_only flags from repos.json (DOCS will be served write-mode)"
+    else
+      log "  WARN: could not strip repo_read_only from repos.json (jq write failed)"
+    fi
+  else
+    log "clear_docs_readonly: no repo_read_only map present — already clean"
+  fi
+}
+
 # =============================================================================
 # index-job mode: build/refresh the index on a big replica, snapshot, exit.
 # =============================================================================
@@ -458,21 +481,19 @@ run_index_job() {
   kill "${serve_pid}" 2>/dev/null || true
   wait "${serve_pid}" 2>/dev/null || true
 
-  # NOTE: mark_docs_readonly is intentionally DISABLED. The per-repo read_only
-  # flag makes serve open DOCS via SharedStores::new_readonly, whose search path
-  # is BROKEN: VectorStore::search needs the HNSW graph, which is only built by
-  # build_index() — and build_index() requires a WRITE txn (env.write_txn()),
-  # which fails under MDB_RDONLY. A read-only open therefore only finds the
-  # graph if it was persisted by a prior write-mode build, and that is NOT
-  # reliably the case (incremental refresh skips build_index when there are 0
-  # changed files). Net effect: every read-only DOCS vendor returned 0 search
-  # results (both semantic and literal) while /info still reported the chunk
-  # count. Fix is left to a follow-up (serve-side: rebuild+persist the graph in
-  # the index job, or make read-only search not depend on a persisted graph).
-  # Until then DOCS is served write-mode (warmup rebuilds the in-memory index,
-  # exactly as v2.10 did). With zero source changes there is no embedding, so
-  # the 2 GiB replica still fits comfortably.
+  # NOTE: the read-only DOCS feature is DISABLED (see clear_docs_readonly below).
+  # mark_docs_readonly is intentionally NOT called.
   # mark_docs_readonly
+  # STRIP any repo_read_only flags so serve opens DOCS in WRITE mode on restore.
+  # Why this is needed even though mark_docs_readonly is no longer called: a
+  # PRIOR job run (v2.13) baked repo_read_only[<alias>]=true into repos.json and
+  # uploaded it. Every subsequent job RESTORES that repos.json and re-uploads it
+  # unchanged, so the flags persist forward indefinitely. We must actively delete
+  # the map so the snapshot serves DOCS write-mode (the read-only search path is
+  # broken — VectorStore::search needs the HNSW graph from build_index(), which
+  # needs a WRITE txn that MDB_RDONLY rejects; read-only vendors returned 0
+  # search results for both semantic and literal while /info still showed chunks).
+  clear_docs_readonly
   upload_snapshot || die "snapshot upload failed — job is the source of truth, aborting"
 
   log "index-job done"
