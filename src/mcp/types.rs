@@ -379,6 +379,13 @@ pub struct LiteralSearchResponse {
     /// Suggested next tool when low_confidence is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_tool: Option<String>,
+
+    /// Repos that failed during this search. Without this a broken store is
+    /// indistinguishable from a repo that simply holds no match — a false
+    /// negative for the calling agent, which never sees the server log.
+    /// Omitted entirely when empty, so healthy responses are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
 }
 
 /// Semantic search response wrapper with low-confidence signaling

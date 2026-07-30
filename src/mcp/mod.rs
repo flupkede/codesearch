@@ -2121,6 +2121,7 @@ mod tests {
             note: None,
             low_confidence: Some(true),
             suggested_tool: Some("search with mode='semantic'".to_string()),
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains(r#""low_confidence":true"#));
@@ -2135,6 +2136,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("low_confidence"));
@@ -2282,6 +2284,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.starts_with('{'));
@@ -2297,6 +2300,7 @@ mod tests {
             note: Some("auto-promoted".to_string()),
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains(r#""auto_promoted_to_regex":true"#));
@@ -2311,6 +2315,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("auto_promoted_to_regex"));
@@ -2333,6 +2338,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let mut lines: Vec<String> = Vec::new();
         if response.auto_promoted_to_regex == Some(true) {
@@ -2366,6 +2372,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let mut lines: Vec<String> = Vec::new();
         if response.auto_promoted_to_regex == Some(true) {
@@ -3598,6 +3605,26 @@ struct MultiReadOutcome<R> {
     /// `(alias, full error chain)` for every store that failed. Empty on a
     /// clean run.
     failures: Vec<(String, String)>,
+}
+
+/// Record a per-store failure as a caller-facing warning, once per store.
+///
+/// Resolution loops run per hit, so a single broken store would otherwise emit
+/// one identical warning per result; the caller wants to know *that* the repo
+/// is down, not how many times it noticed.
+fn note_store_failure(
+    warnings: &mut Vec<String>,
+    aliases: &[String],
+    idx: usize,
+    what: &str,
+    err: &anyhow::Error,
+) {
+    let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
+    let msg = format!("repo '{alias}' {what} failed: {err:#}");
+    if !warnings.contains(&msg) {
+        tracing::error!("MCP: {}", msg);
+        warnings.push(msg);
+    }
 }
 
 // Hand-written rather than derived: `derive(Default)` would demand `R: Default`,
@@ -5211,7 +5238,13 @@ impl CodesearchService {
             });
 
             let results = self
-                .resolve_fts_to_search_results_multi(&all_fts, limit, &stores)
+                .resolve_fts_to_search_results_multi(
+                    &all_fts,
+                    limit,
+                    &stores,
+                    aliases,
+                    &mut lexical_warnings,
+                )
                 .await;
 
             if let Some(target_kind) = structural_intent {
@@ -5424,7 +5457,13 @@ impl CodesearchService {
             } else {
                 // Chunk from FTS but not in vector results — resolve from stores
                 if let Some(resolved) = self
-                    .resolve_chunk_from_stores(f.chunk_id, f.rrf_score, &stores)
+                    .resolve_chunk_from_stores(
+                        f.chunk_id,
+                        f.rrf_score,
+                        &stores,
+                        aliases,
+                        &mut search_warnings,
+                    )
                     .await
                 {
                     mapped.push(resolved);
@@ -5454,10 +5493,16 @@ impl CodesearchService {
         chunk_id: u32,
         score: f32,
         stores: &[Arc<SharedStores>],
+        aliases: &[String],
+        warnings: &mut Vec<String>,
     ) -> Option<crate::vectordb::SearchResult> {
-        for store_arc in stores {
+        for (idx, store_arc) in stores.iter().enumerate() {
             let store = store_arc.vector_store.read().await;
-            if let Ok(Some(chunk)) = store.get_chunk(chunk_id) {
+            let looked_up = store.get_chunk(chunk_id);
+            if let Err(ref e) = looked_up {
+                note_store_failure(warnings, aliases, idx, "chunk lookup", e);
+            }
+            if let Ok(Some(chunk)) = looked_up {
                 return Some(crate::vectordb::SearchResult {
                     id: chunk_id,
                     content: chunk.content,
@@ -5485,12 +5530,23 @@ impl CodesearchService {
         fts_results: &[crate::fts::FtsResult],
         limit: usize,
         stores: &[Arc<SharedStores>],
+        aliases: &[String],
+        warnings: &mut Vec<String>,
     ) -> Vec<crate::vectordb::SearchResult> {
         let mut results = Vec::new();
         for fts in fts_results.iter().take(limit) {
-            for store_arc in stores {
+            for (idx, store_arc) in stores.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
-                if let Ok(Some(chunk)) = store.get_chunk(fts.chunk_id) {
+                let looked_up = store.get_chunk(fts.chunk_id);
+                if let Err(ref e) = looked_up {
+                    // `Ok(None)` means "this store does not hold that chunk" and
+                    // is normal during fan-out; `Err` means the store is broken.
+                    // Collapsing the two is how a dead vector store renders as
+                    // an empty literal search — the exact shape of the step-8
+                    // incident, which tantivy-side checks cannot detect.
+                    note_store_failure(warnings, aliases, idx, "chunk lookup", e);
+                }
+                if let Ok(Some(chunk)) = looked_up {
                     results.push(crate::vectordb::SearchResult {
                         id: fts.chunk_id,
                         content: chunk.content,
@@ -5528,13 +5584,26 @@ impl CodesearchService {
     ) -> Result<CallToolResult, McpError> {
         let structural_intent = detect_structural_intent(&request.query);
 
-        let mut fts_results = self
+        // `project=`-scoped queries route here, not through the fan-out
+        // (`is_multi` requires >1 store), so this path needs the same failure
+        // reporting — it is at least as common as a group query.
+        let mut lexical_warnings: Vec<String> = Vec::new();
+
+        let mut fts_results = match self
             .with_fts_store_read_for(
                 |fts_store| fts_store.search(&request.query, limit * 5, structural_intent),
                 stores.clone(),
             )
             .await
-            .unwrap_or_default();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("literal search failed: {e:#}");
+                tracing::error!("MCP: {}", msg);
+                lexical_warnings.push(msg);
+                Vec::new()
+            }
+        };
 
         // Also do exact search if identifiers detected
         for ident in identifiers {
@@ -5546,7 +5615,12 @@ impl CodesearchService {
                 .await
             {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    let msg = format!("exact-identifier search for '{ident}' failed: {e:#}");
+                    tracing::error!("MCP: {}", msg);
+                    lexical_warnings.push(msg);
+                    continue;
+                }
             };
             merge_exact_into_fts(&mut fts_results, exact);
         }
@@ -5559,7 +5633,7 @@ impl CodesearchService {
 
         // Resolve FTS results to chunk metadata
         let mut results = self
-            .resolve_fts_to_search_results(&fts_results, limit, stores)
+            .resolve_fts_to_search_results(&fts_results, limit, stores, &mut lexical_warnings)
             .await;
 
         // Apply kind boost
@@ -5574,7 +5648,7 @@ impl CodesearchService {
             !identifiers.is_empty(),
             project_alias,
             alias_roots,
-            &[],
+            &lexical_warnings,
         )
     }
 
@@ -5694,36 +5768,54 @@ impl CodesearchService {
         fts_results: &[crate::fts::FtsResult],
         limit: usize,
         stores: Option<Arc<SharedStores>>,
+        warnings: &mut Vec<String>,
     ) -> Vec<crate::vectordb::SearchResult> {
-        self.with_vector_store_read_for(
-            |store| {
-                let mut results = Vec::new();
-                for fts in fts_results.iter().take(limit) {
-                    if let Ok(Some(chunk)) = store.get_chunk(fts.chunk_id) {
-                        results.push(crate::vectordb::SearchResult {
-                            id: fts.chunk_id,
-                            content: chunk.content,
-                            path: chunk.path,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            kind: chunk.kind,
-                            signature: chunk.signature,
-                            docstring: chunk.docstring,
-                            context: chunk.context,
-                            hash: chunk.hash,
-                            distance: 0.0,
-                            score: fts.score,
-                            context_prev: chunk.context_prev,
-                            context_next: chunk.context_next,
-                        });
+        let outcome = self
+            .with_vector_store_read_for(
+                |store| {
+                    let mut results = Vec::new();
+                    for fts in fts_results.iter().take(limit) {
+                        // A failed lookup is not an absent chunk. Propagating the
+                        // error keeps a broken vector store from rendering as an
+                        // ordinary empty literal search.
+                        let chunk = store
+                            .get_chunk(fts.chunk_id)
+                            .context("Error resolving FTS hit to chunk metadata")?;
+                        if let Some(chunk) = chunk {
+                            results.push(crate::vectordb::SearchResult {
+                                id: fts.chunk_id,
+                                content: chunk.content,
+                                path: chunk.path,
+                                start_line: chunk.start_line,
+                                end_line: chunk.end_line,
+                                kind: chunk.kind,
+                                signature: chunk.signature,
+                                docstring: chunk.docstring,
+                                context: chunk.context,
+                                hash: chunk.hash,
+                                distance: 0.0,
+                                score: fts.score,
+                                context_prev: chunk.context_prev,
+                                context_next: chunk.context_next,
+                            });
+                        }
                     }
+                    Ok(results)
+                },
+                stores,
+            )
+            .await;
+        match outcome {
+            Ok(results) => results,
+            Err(e) => {
+                let msg = format!("literal search could not read the index: {e:#}");
+                tracing::error!("MCP: {}", msg);
+                if !warnings.contains(&msg) {
+                    warnings.push(msg);
                 }
-                Ok(results)
-            },
-            stores,
-        )
-        .await
-        .unwrap_or_default()
+                Vec::new()
+            }
+        }
     }
 
     // === find_definition internal ===
@@ -7165,6 +7257,11 @@ impl CodesearchService {
         let limit = request.limit.unwrap_or(20);
         let output_format = request.format.as_deref().unwrap_or("json");
 
+        // Repos that failed during this search. Reported to the caller: an
+        // agent that never sees the server log cannot otherwise distinguish a
+        // broken store from a repo that holds no match.
+        let mut literal_warnings: Vec<String> = Vec::new();
+
         // Auto-regex promotion: detect code patterns that BM25 would destroy
         let user_set_regex = request.regex.unwrap_or(false);
         let user_set_phrase = request.phrase.unwrap_or(false);
@@ -7359,20 +7456,26 @@ impl CodesearchService {
             };
             let fts_results = if let Some(ref sv) = ctx.stores_vec {
                 let sa = ctx.store_aliases.as_ref().unwrap();
-                self.with_fts_store_read_multi(
-                    |fts_store| {
-                        if request.phrase.unwrap_or(false) {
-                            fts_store.search_phrase(&bm25_query, limit * 3)
-                        } else {
-                            fts_store.search(&bm25_query, limit * 3, None)
-                        }
-                    },
-                    sv.clone(),
-                    sa,
-                )
-                .await
-                .unwrap_or_default()
-                .results
+                let outcome = self
+                    .with_fts_store_read_multi(
+                        |fts_store| {
+                            if request.phrase.unwrap_or(false) {
+                                fts_store.search_phrase(&bm25_query, limit * 3)
+                            } else {
+                                fts_store.search(&bm25_query, limit * 3, None)
+                            }
+                        },
+                        sv.clone(),
+                        sa,
+                    )
+                    .await
+                    .unwrap_or_default();
+                for (alias, err) in &outcome.failures {
+                    let msg = format!("repo '{alias}' literal search failed: {err}");
+                    tracing::error!("MCP: {}", msg);
+                    literal_warnings.push(msg);
+                }
+                outcome.results
             } else {
                 match self
                     .with_fts_store_read_for(
@@ -7402,9 +7505,14 @@ impl CodesearchService {
                 // Multi-store: resolve chunks from all stores
                 let mut items: Vec<LiteralSearchResultItem> = Vec::new();
                 'outer: for fts_result in &fts_results {
-                    for store_arc in sv {
+                    let sa = ctx.store_aliases.as_ref().unwrap();
+                    for (idx, store_arc) in sv.iter().enumerate() {
                         let store = store_arc.vector_store.read().await;
-                        if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                        let looked_up = store.get_chunk(fts_result.chunk_id);
+                        if let Err(ref e) = looked_up {
+                            note_store_failure(&mut literal_warnings, sa, idx, "chunk lookup", e);
+                        }
+                        if let Some(chunk) = looked_up.ok().flatten() {
                             if let Some(ref lang) = lang_filter {
                                 let file_lang =
                                     Language::from_path(std::path::Path::new(&chunk.path));
@@ -7568,6 +7676,11 @@ impl CodesearchService {
                 suggested_tool
             } else {
                 None
+            },
+            warnings: if literal_warnings.is_empty() {
+                None
+            } else {
+                Some(literal_warnings)
             },
         };
 
