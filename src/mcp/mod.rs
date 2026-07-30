@@ -3899,6 +3899,16 @@ struct MultiStoreContext {
 }
 
 impl MultiStoreContext {
+    /// Aliases parallel to `stores_vec`, or an empty slice when absent.
+    ///
+    /// Every fan-out that reports a per-store failure needs this, and hand-rolling
+    /// `let empty = Vec::new(); ...unwrap_or(&empty)` at each site produced four
+    /// copies of the same two lines — and one handler where the binding was out
+    /// of scope, which is how a silent store read survived a round of review.
+    fn aliases(&self) -> &[String] {
+        self.store_aliases.as_deref().unwrap_or(&[])
+    }
+
     /// Prefix a result path with its owning alias for multi-repo identification.
     ///
     /// Three dispatch modes:
@@ -6410,8 +6420,7 @@ impl CodesearchService {
         warnings: &mut Vec<String>,
     ) -> anyhow::Result<Vec<FileOutlineItem>> {
         if let Some(ref sv) = ctx.stores_vec {
-            let empty_aliases: Vec<String> = Vec::new();
-            let aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
+            let aliases = ctx.aliases();
             let mut all_items: Vec<FileOutlineItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
@@ -6557,7 +6566,8 @@ impl CodesearchService {
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 qualify_empty_result(
-                    "No indexed chunks found for path. Verify the file is within the                      project root and the index is up to date."
+                    "No indexed chunks found for path. Verify the file is within the \
+                     project root and the index is up to date."
                         .to_string(),
                     &outline_warnings,
                 ),
@@ -6706,8 +6716,7 @@ impl CodesearchService {
                 }
             } else {
                 // Single store or project specified — direct lookup
-                let empty_aliases: Vec<String> = Vec::new();
-                let aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
+                let aliases = ctx.aliases();
                 let mut found = None;
                 for (i, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
@@ -7055,8 +7064,7 @@ impl CodesearchService {
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store group fan-out: collect import items from all stores
-            let empty_aliases: Vec<String> = Vec::new();
-            let import_aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
+            let import_aliases = ctx.aliases();
             let mut all_items: Vec<ImportItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
@@ -7068,11 +7076,19 @@ impl CodesearchService {
                                 continue;
                             }
                             if seen_ids.insert(meta.id) {
-                                if let Ok(Some(chunk)) = store.get_chunk(meta.id) {
-                                    all_items.extend(parse_import_lines(
+                                match store.get_chunk(meta.id) {
+                                    Ok(Some(chunk)) => all_items.extend(parse_import_lines(
                                         &chunk.content,
                                         chunk.start_line,
-                                    ));
+                                    )),
+                                    Ok(None) => {}
+                                    Err(ref e) => note_store_failure(
+                                        &mut import_warnings,
+                                        import_aliases,
+                                        store_idx,
+                                        "chunk lookup",
+                                        e,
+                                    ),
                                 }
                             }
                         }
@@ -7127,6 +7143,7 @@ impl CodesearchService {
             let mut seen_fts_ids: HashSet<u32> = HashSet::new();
 
             if let Some(ref sv) = ctx.stores_vec {
+                let import_aliases = ctx.aliases();
                 // Multi-store FTS fallback
                 for keyword in IMPORT_FTS_KEYWORDS {
                     let hits = self
@@ -7148,14 +7165,29 @@ impl CodesearchService {
                 // Resolve FTS hits via vector stores
                 let mut resolved: Vec<ImportItem> = Vec::new();
                 for (chunk_id, _) in &all_hits {
-                    for store_arc in sv {
+                    for (store_idx, store_arc) in sv.iter().enumerate() {
                         let store = store_arc.vector_store.read().await;
-                        if let Ok(Some(chunk)) = store.get_chunk(*chunk_id) {
-                            if crate::cache::normalize_path_str(&chunk.path) == normalized {
-                                resolved
-                                    .extend(parse_import_lines(&chunk.content, chunk.start_line));
+                        match store.get_chunk(*chunk_id) {
+                            Ok(Some(chunk)) => {
+                                if crate::cache::normalize_path_str(&chunk.path) == normalized {
+                                    resolved.extend(parse_import_lines(
+                                        &chunk.content,
+                                        chunk.start_line,
+                                    ));
+                                }
+                                break;
                             }
-                            break;
+                            Ok(None) => continue,
+                            Err(ref e) => {
+                                note_store_failure(
+                                    &mut import_warnings,
+                                    import_aliases,
+                                    store_idx,
+                                    "chunk lookup",
+                                    e,
+                                );
+                                continue;
+                            }
                         }
                     }
                 }
@@ -7209,7 +7241,17 @@ impl CodesearchService {
                         ctx.stores.clone(),
                     )
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or_else(|e| {
+                        push_store_warning(
+                            &mut import_warnings,
+                            &store_warning(
+                                ctx.project_alias.as_deref().unwrap_or("unknown"),
+                                "chunk lookup",
+                                &format!("{e:#}"),
+                            ),
+                        );
+                        Vec::new()
+                    });
             }
         }
 
@@ -7217,7 +7259,8 @@ impl CodesearchService {
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 qualify_empty_result(
-                    "No import chunks found. The index may not include import statements                      for this language, or the file has no imports."
+                    "No import chunks found. The index may not include import statements \
+                     for this language, or the file has no imports."
                         .to_string(),
                     &import_warnings,
                 ),
@@ -7342,8 +7385,7 @@ impl CodesearchService {
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store: resolve chunks across all stores
-            let empty_aliases: Vec<String> = Vec::new();
-            let dep_aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
+            let dep_aliases = ctx.aliases();
             let mut seen_paths = HashSet::new();
             let mut out = Vec::new();
             for f in &fts_results {
@@ -7513,8 +7555,7 @@ impl CodesearchService {
         let mut results = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store: find the embedding in whichever store has it,
             // then search across all stores for similar chunks.
-            let empty_aliases: Vec<String> = Vec::new();
-            let aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
+            let aliases = ctx.aliases();
             let mut embedding: Option<Vec<f32>> = None;
             for (i, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
@@ -7652,6 +7693,31 @@ impl CodesearchService {
         // Prefix paths with alias for multi-repo identification
         for item in &mut results {
             item.path = ctx.prefix_result_path(&item.path);
+        }
+
+        // The embedding-lookup read of `similar_warnings` above sits in an early
+        // return, so every failure recorded AFTER it — the whole neighbour
+        // fan-out — reached no caller. A channel needs a read reachable from
+        // every write, not just one read.
+        if results.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                qualify_empty_result(
+                    format!("No similar chunks found for chunk_id {}.", request.chunk_id),
+                    &similar_warnings,
+                ),
+            )]));
+        }
+        if !similar_warnings.is_empty() {
+            // Non-empty but incomplete is the likelier loss here: neighbours
+            // from a broken repo are simply absent from a plausible-looking
+            // list. Say so rather than let the list speak for the whole group.
+            let payload = serde_json::json!({
+                "results": results,
+                "warnings": similar_warnings,
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                payload.to_string(),
+            )]));
         }
 
         let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
