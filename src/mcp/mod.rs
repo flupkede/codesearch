@@ -2398,13 +2398,33 @@ mod tests {
             &["repo 'inriver' definition search failed: os error 22".to_string()],
         );
         assert!(out.contains("WARNING"));
-        assert!(out.contains("not trustworthy"));
         assert!(out.contains("inriver"));
         assert!(out.contains("os error 22"));
+        // The message is a caller-facing sentence. A mangled line
+        // continuation collapses it into a run of spaces and nobody
+        // notices, because every `contains` assertion above still passes.
+        assert!(
+            out.contains("this result is not trustworthy — 1 store(s) in scope failed"),
+            "message must read as a sentence, got: {out}"
+        );
+        assert!(!out.contains("  "), "no run-on spacing in: {out}");
     }
 
     #[test]
-    fn semantic_response_emits_warnings_and_drops_the_retry_hint() {
+    fn retry_hint_is_dropped_only_when_a_store_failed() {
+        let hint = || Some("literal_search".to_string());
+
+        // The ordinary low-confidence hint is legitimate and must survive.
+        assert_eq!(super::retry_hint(hint(), &None), hint());
+        assert_eq!(super::retry_hint(hint(), &Some(vec![])), hint());
+
+        // But retrying against a store we KNOW is down is bad advice.
+        let warned = Some(vec!["repo 'inriver' search failed: os error 22".to_string()]);
+        assert_eq!(super::retry_hint(hint(), &warned), None);
+    }
+
+    #[test]
+    fn semantic_response_emits_warnings_to_the_caller() {
         let response = super::SemanticSearchResponse {
             results: vec![],
             low_confidence: Some(true),
@@ -2414,10 +2434,6 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"warnings\""), "got: {json}");
         assert!(json.contains("os error 22"));
-        assert!(
-            !json.contains("suggested_tool"),
-            "retrying with another tool just hits the same broken store: {json}"
-        );
     }
 
     #[test]
@@ -3794,6 +3810,22 @@ fn push_store_warning(warnings: &mut Vec<String>, msg: &str) {
     }
 }
 
+/// Decide whether to keep the "try another tool" hint.
+///
+/// A weak or empty result caused by a store that is DOWN is not a reason to
+/// retry with a different tool — that just sends the agent back at the same
+/// broken store. Extracted from `build_semantic_response` so the decision is
+/// testable without standing up a service.
+fn retry_hint(suggested: Option<String>, warnings: &Option<Vec<String>>) -> Option<String> {
+    // `is_some()` alone is wrong: an empty `Some(vec![])` means nothing failed,
+    // and suppressing a legitimate hint on it would be a silent regression the
+    // moment a caller constructs the warnings vec eagerly.
+    if warnings.as_ref().is_some_and(|w| !w.is_empty()) {
+        return None;
+    }
+    suggested
+}
+
 /// Qualify a "nothing found" message when a store in scope actually failed.
 ///
 /// This is the defect that keeps coming back in a new handler: "No definition
@@ -3805,14 +3837,10 @@ fn qualify_empty_result(message: String, warnings: &[String]) -> String {
         return message;
     }
     format!(
-        "{}
-
-WARNING: this result is not trustworthy — {} store(s) in scope          failed, so \"not found\" may mean \"not searched\":
-{}",
-        message,
-        warnings.len(),
-        warnings.join("
-")
+        "{message}\n\nWARNING: this result is not trustworthy — {count} store(s) in \
+         scope failed, so \"not found\" may mean \"not searched\":\n{detail}",
+        count = warnings.len(),
+        detail = warnings.join("\n")
     )
 }
 
@@ -5899,13 +5927,7 @@ impl CodesearchService {
             let response = SemanticSearchResponse {
                 results: vec![],
                 low_confidence: Some(true),
-                // No result because a store is DOWN is not a reason to retry
-                // with `literal_search` — that goes back at the same store.
-                suggested_tool: if warnings.is_some() {
-                    None
-                } else {
-                    Some("literal_search".to_string())
-                },
+                suggested_tool: retry_hint(Some("literal_search".to_string()), &warnings),
                 warnings,
             };
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -5971,15 +5993,8 @@ impl CodesearchService {
 
         // Check low-confidence: top result's RRF score below threshold
         let top_score = items.first().map(|r| r.score);
-        let (low_confidence, mut suggested_tool) =
-            compute_low_confidence(top_score, has_identifiers);
-
-        // A weak result set caused by a DOWN store is not a reason to retry with
-        // another tool — that just sends the agent back at the same broken
-        // store. Suppress the suggestion and let the warning speak.
-        if warnings.is_some() {
-            suggested_tool = None;
-        }
+        let (low_confidence, suggested_tool) = compute_low_confidence(top_score, has_identifiers);
+        let suggested_tool = retry_hint(suggested_tool, &warnings);
 
         let response = SemanticSearchResponse {
             results: items,
@@ -6381,17 +6396,25 @@ impl CodesearchService {
     /// Fetch outline items for an already-normalised absolute path.
     ///
     /// Returns `Ok(vec![])` when no chunks match.
-    /// In multi-store mode, per-store I/O failures are logged and skipped (never `Err`).
+    /// In multi-store mode, per-store I/O failures are recorded in `warnings` and
+    /// skipped (never `Err`) so one broken repo cannot blank the whole outline.
     /// In single-store mode, I/O failures are returned as `Err`.
+    ///
+    /// `warnings` is not optional: without it a failed store is indistinguishable
+    /// from a file with no indexed chunks, and the caller is told the file is not
+    /// indexed — a diagnosis, and a wrong one.
     async fn outline_items_for_normalized(
         &self,
         normalized: &str,
         ctx: &MultiStoreContext,
+        warnings: &mut Vec<String>,
     ) -> anyhow::Result<Vec<FileOutlineItem>> {
         if let Some(ref sv) = ctx.stores_vec {
+            let empty_aliases: Vec<String> = Vec::new();
+            let aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
             let mut all_items: Vec<FileOutlineItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for store_arc in sv {
+            for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
                 match store.chunks_for_file(normalized) {
                     Ok(metas) => {
@@ -6407,11 +6430,8 @@ impl CodesearchService {
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Vector store read failed in outline_items_for_normalized fan-out: {:?}",
-                            e
-                        );
+                    Err(ref e) => {
+                        note_store_failure(warnings, aliases, store_idx, "outline scan", e);
                     }
                 }
             }
@@ -6483,7 +6503,11 @@ impl CodesearchService {
         let stripped_path = strip_alias_prefix(&request.path, ctx.project_alias.as_ref());
         let normalized = normalize_tool_path(&stripped_path, &project_root);
 
-        let mut items = match self.outline_items_for_normalized(&normalized, &ctx).await {
+        let mut outline_warnings: Vec<String> = Vec::new();
+        let mut items = match self
+            .outline_items_for_normalized(&normalized, &ctx, &mut outline_warnings)
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -6506,7 +6530,7 @@ impl CodesearchService {
                     normalized_orig
                 );
                 items = match self
-                    .outline_items_for_normalized(&normalized_orig, &ctx)
+                    .outline_items_for_normalized(&normalized_orig, &ctx, &mut outline_warnings)
                     .await
                 {
                     Ok(v) => v,
@@ -6516,6 +6540,14 @@ impl CodesearchService {
                             normalized_orig,
                             e
                         );
+                        push_store_warning(
+                            &mut outline_warnings,
+                            &store_warning(
+                                ctx.project_alias.as_deref().unwrap_or("unknown"),
+                                "outline scan",
+                                &format!("{e:#}"),
+                            ),
+                        );
                         Vec::new()
                     }
                 };
@@ -6524,7 +6556,11 @@ impl CodesearchService {
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
-                "No indexed chunks found for path. Verify the file is within the project root and the index is up to date.".to_string(),
+                qualify_empty_result(
+                    "No indexed chunks found for path. Verify the file is within the                      project root and the index is up to date."
+                        .to_string(),
+                    &outline_warnings,
+                ),
             )]));
         }
 
@@ -6625,7 +6661,8 @@ impl CodesearchService {
                         return Ok(CallToolResult::success(vec![Content::text(
                             qualify_empty_result(
                                 format!(
-                                    "Chunk {} not found in any repository. Verify the                                      chunk_id and index state.",
+                                    "Chunk {} not found in any repository. Verify the \
+                                     chunk_id and index state.",
                                     request.chunk_id
                                 ),
                                 &chunk_warnings,
@@ -7018,9 +7055,11 @@ impl CodesearchService {
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store group fan-out: collect import items from all stores
+            let empty_aliases: Vec<String> = Vec::new();
+            let import_aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
             let mut all_items: Vec<ImportItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for store_arc in sv {
+            for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
                 match store.chunks_for_file(&normalized) {
                     Ok(metas) => {
@@ -7038,8 +7077,14 @@ impl CodesearchService {
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Vector store read failed in find_imports fan-out: {:?}", e);
+                    Err(ref e) => {
+                        note_store_failure(
+                            &mut import_warnings,
+                            import_aliases,
+                            store_idx,
+                            "imports scan",
+                            e,
+                        );
                     }
                 }
             }
@@ -7118,13 +7163,26 @@ impl CodesearchService {
             } else {
                 // Single-store FTS fallback
                 for keyword in IMPORT_FTS_KEYWORDS {
-                    let hits = self
+                    let hits = match self
                         .with_fts_store_read_for(
                             |fts_store| fts_store.search_exact(keyword, fallback_limit, None),
                             ctx.stores.clone(),
                         )
                         .await
-                        .unwrap_or_default();
+                    {
+                        Ok(h) => h,
+                        Err(e) => {
+                            push_store_warning(
+                                &mut import_warnings,
+                                &store_warning(
+                                    ctx.project_alias.as_deref().unwrap_or("unknown"),
+                                    "imports search",
+                                    &format!("{e:#}"),
+                                ),
+                            );
+                            Vec::new()
+                        }
+                    };
                     for h in hits {
                         if seen_fts_ids.insert(h.chunk_id) {
                             all_hits.push((h.chunk_id, h.score));
@@ -7158,7 +7216,11 @@ impl CodesearchService {
         items.sort_by_key(|i| i.line);
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
-                "No import chunks found. The index may not include import statements for this language, or the file has no imports.".to_string(),
+                qualify_empty_result(
+                    "No import chunks found. The index may not include import statements                      for this language, or the file has no imports."
+                        .to_string(),
+                    &import_warnings,
+                ),
             )]));
         }
 
@@ -7280,10 +7342,12 @@ impl CodesearchService {
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store: resolve chunks across all stores
+            let empty_aliases: Vec<String> = Vec::new();
+            let dep_aliases = ctx.store_aliases.as_deref().unwrap_or(&empty_aliases);
             let mut seen_paths = HashSet::new();
             let mut out = Vec::new();
             for f in &fts_results {
-                for store_arc in sv {
+                for (store_idx, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
                     match store.get_chunk(f.chunk_id) {
                         Ok(Some(chunk)) => {
@@ -7320,7 +7384,19 @@ impl CodesearchService {
                             break; // found in this store, move to next FTS result
                         }
                         Ok(None) => {} // try next store
-                        Err(_) => break,
+                        // One broken store says nothing about the others; a
+                        // `break` here silently drops a chunk that lives in a
+                        // healthy store later in the list.
+                        Err(ref e) => {
+                            note_store_failure(
+                                &mut dep_warnings,
+                                dep_aliases,
+                                store_idx,
+                                "chunk lookup",
+                                e,
+                            );
+                            continue;
+                        }
                     }
                 }
                 if out.len() >= limit {
@@ -7382,8 +7458,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error resolving dependents: {}",
-                        e
+                        "Error resolving dependents: {e:#}"
                     ))]));
                 }
             }
@@ -7396,10 +7471,12 @@ impl CodesearchService {
 
         items.sort_by(|a, b| a.path.cmp(&b.path));
         if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No dependent files found for '{}'.",
-                request.symbol_or_path
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                qualify_empty_result(
+                    format!("No dependent files found for '{}'.", request.symbol_or_path),
+                    &dep_warnings,
+                ),
+            )]));
         }
 
         let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
@@ -7478,7 +7555,7 @@ impl CodesearchService {
             // Search across all stores with the found embedding
             let mut all_results: Vec<SearchResultItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for store_arc in sv {
+            for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
                 match store.search(&embedding, limit + 1) {
                     Ok(mut neighbors) => {
@@ -7502,8 +7579,17 @@ impl CodesearchService {
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Similarity search failed in fan-out: {:?}", e);
+                    Err(ref e) => {
+                        // The embedding was found, so the handler returns results
+                        // either way; without this, a group query silently omits
+                        // every neighbour from the broken repo.
+                        note_store_failure(
+                            &mut similar_warnings,
+                            aliases,
+                            store_idx,
+                            "similarity search",
+                            e,
+                        );
                     }
                 }
             }
@@ -7557,8 +7643,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error finding similar chunks: {}",
-                        e
+                        "Error finding similar chunks: {e:#}"
                     ))]));
                 }
             }
@@ -7762,8 +7847,7 @@ impl CodesearchService {
                     Ok(items) => items,
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "Error scanning chunks: {}",
-                            e
+                            "Error scanning chunks: {e:#}"
                         ))]));
                     }
                 }
@@ -7825,8 +7909,7 @@ impl CodesearchService {
                     Ok(r) => r,
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "Error searching: {}",
-                            e
+                            "Error searching: {e:#}"
                         ))]));
                     }
                 }
@@ -7963,8 +8046,7 @@ impl CodesearchService {
                     Ok(items) => items,
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "Error resolving search results: {}",
-                            e
+                            "Error resolving search results: {e:#}"
                         ))]));
                     }
                 }
