@@ -274,6 +274,39 @@ verify_index_ready() {
   log "verify: repo '${name}' OK — ${chunks} chunks indexed"
 }
 
+# Prune GHOST vendor folders before they are re-baked into the snapshot. A ghost
+# is an indexed vendor whose source .md disappeared from the blob: azcopy sync
+# --delete-destination removed the .md, but docs_index_exclusions() PROTECTED its
+# .codesearch.db, so the folder survives holding ONLY the index dir. The restored
+# repos.json still registers the alias, and the build loop below would no-op on it
+# (already registered) while verify_index_ready passes on the stale chunks, so the
+# ghost would silently persist in every subsequent snapshot. We detect a ghost as a
+# DOCS_DIR/<vendor> folder whose ONLY immediate child is .codesearch.db, unregister
+# it via the API (closes the store + drops the repos.json entry) and delete the
+# orphan index dir. Conservative: a folder holding even one non-index entry is kept.
+prune_ghost_vendors() {
+  local base="http://127.0.0.1:${PORT}" vendor vname first_non_index
+  local pruned=0
+  for vendor in "${DOCS_DIR}"/*/; do
+    [ -d "${vendor}" ] || continue     # empty ${DOCS_DIR} -> glob stays literal
+    vname="$(basename "${vendor%/}")"
+    # Find the FIRST immediate child that is NOT the index dir. -print -quit stops
+    # after one match (we only care whether ANY non-index entry exists).
+    first_non_index="$(find "${vendor%/}" -mindepth 1 -maxdepth 1 ! -name '.codesearch.db' -print -quit 2>/dev/null)"
+    if [ -z "${first_non_index}" ]; then
+      log "ghost vendor '${vname}': source gone (only .codesearch.db remains) -- pruning"
+      if api -X DELETE "${base}/repos/${vname}" >/dev/null 2>&1; then
+        log "  unregistered '${vname}' from repos.json"
+      else
+        log "  WARN: unregister '${vname}' failed (continuing -- folder will still be removed)"
+      fi
+      rm -rf "${vendor%/}" || log "  WARN: could not remove orphan index dir for '${vname}'"
+      pruned=1
+    fi
+  done
+  [ "${pruned}" -eq 1 ] || log "no ghost vendors to prune"
+}
+
 # =============================================================================
 # index-job mode: build/refresh the index on a big replica, snapshot, exit.
 # =============================================================================
@@ -309,6 +342,10 @@ run_index_job() {
   trap 'kill "${serve_pid}" 2>/dev/null || true' EXIT
 
   wait_healthz 90 || { log "serve never came up"; exit 1; }
+
+  # Drop ghost vendors (indexed but source vanished from blob) BEFORE the build
+  # loop so they are neither rebuilt nor re-baked into the snapshot.
+  prune_ghost_vendors
 
   # PER-VENDOR SPLIT: build/refresh one index per immediate subfolder of
   # ${DOCS_DIR} (akeneo, bynder, …) instead of a single monolithic "docs" repo.
