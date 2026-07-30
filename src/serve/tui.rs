@@ -941,6 +941,19 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
             return ReindexLaunch::Failed;
         }
     };
+    // Same guard as the HTTP reindex route: a force reindex opens the repo
+    // write-mode and rebuilds its index, which for a read-only repo means both a
+    // memory blow-up on a constrained replica and divergence from the index its
+    // owning job publishes.
+    if config.repo_read_only.get(&alias) == Some(&true) {
+        tracing::warn!(
+            "Refusing force reindex of '{}': marked read-only (repo_read_only) — its index is \
+             owned by another writer",
+            alias
+        );
+        state.end_indexing(&alias);
+        return ReindexLaunch::Failed;
+    }
     drop(config); // release read lock
 
     let db_path = project_path.join(DB_DIR_NAME);

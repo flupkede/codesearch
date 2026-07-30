@@ -214,6 +214,21 @@ impl ReposConfig {
             self.repos_meta.remove(&alias);
         }
 
+        // 2b. Same for orphan read-only flags. `skip_serializing_if` only omits the
+        //     map when it is entirely empty, so a stale `repo_read_only["gone"]`
+        //     survives every round-trip — and an alias that is removed and later
+        //     re-added under the same name would silently inherit read-only.
+        let orphan_read_only: Vec<String> = self
+            .repo_read_only
+            .keys()
+            .filter(|alias| !self.repos.contains_key(*alias))
+            .cloned()
+            .collect();
+        for alias in orphan_read_only {
+            tracing::warn!("repos.json: dropping orphan read-only flag for '{}'", alias);
+            self.repo_read_only.remove(&alias);
+        }
+
         // 3. Prune group members referencing unknown aliases OR unknown remote
         //    peers; drop now-empty groups. A member starting with `@` is a
         //    federation reference to a remote peer (`@cloud`), all others are
@@ -1711,6 +1726,33 @@ mod tests {
         assert!(
             !loaded.repo_read_only.contains_key("repo-b"),
             "unset repos must not appear read-only"
+        );
+    }
+
+    /// A read-only flag for an alias that is no longer registered must not survive
+    /// `reconcile()`. `skip_serializing_if` only omits the map when it is entirely
+    /// empty, so without an explicit prune the stale entry round-trips forever and
+    /// an alias removed and later re-added under the same name would silently come
+    /// back read-only — invisible, and on the serve replica it means that repo is
+    /// never refreshed again.
+    #[test]
+    fn test_reconcile_drops_orphan_repo_read_only() {
+        let mut cfg = ReposConfig::default();
+        cfg.repos
+            .insert("live".to_string(), PathBuf::from("/tmp/live"));
+        cfg.repo_read_only.insert("live".to_string(), true);
+        cfg.repo_read_only.insert("gone".to_string(), true);
+
+        cfg.reconcile();
+
+        assert_eq!(
+            cfg.repo_read_only.get("live"),
+            Some(&true),
+            "a registered alias must keep its read-only flag"
+        );
+        assert!(
+            !cfg.repo_read_only.contains_key("gone"),
+            "read-only flag for an unregistered alias must be dropped"
         );
     }
 

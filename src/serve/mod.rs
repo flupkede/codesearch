@@ -1756,9 +1756,13 @@ impl ServeState {
         };
 
         // Ensure the HNSW vector index is built from existing data.
-        // When opening an existing DB, VectorStore starts with indexed=false.
-        // Without this, search fails with "Index not built" until the background
-        // refresh completes (which may take minutes for large repos).
+        // `indexed` is NOT "false until we build": VectorStore::new probes the
+        // persisted arroy graph at open time (`Reader::open(...).is_ok()`), so it is
+        // already true for a store whose graph was committed by a previous run — which
+        // is exactly how a read-only replica can serve a snapshot it cannot build.
+        // It is false when the graph is absent OR when items were inserted after the
+        // last build (arroy reports NeedBuild); without this, search fails with
+        // "Index not built" until the background refresh completes.
         // build_index() is CPU-heavy — offload to the blocking pool so the async
         // runtime is not stalled while building the HNSW index for large repos.
         {
@@ -3068,7 +3072,7 @@ async fn reindex_handler(
         .unwrap_or(false);
 
     // Resolve the project path for this alias
-    let project_path = {
+    let (project_path, read_only) = {
         let config = match state.config.read() {
             Ok(c) => c,
             Err(e) => {
@@ -3081,8 +3085,9 @@ async fn reindex_handler(
                 );
             }
         };
+        let ro = config.repo_read_only.get(&alias) == Some(&true);
         match config.resolve(&alias) {
-            Some(p) => p,
+            Some(p) => (p, ro),
             None => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -3094,6 +3099,29 @@ async fn reindex_handler(
             }
         }
     };
+
+    // Honour `repo_read_only` HERE, not just on the open paths. Without this the
+    // flag is advisory on the one route that can undo it: a reindex opens the
+    // repo WRITE-mode (`try_open_stores(..., force_readonly = false)` below),
+    // runs a full incremental refresh plus `build_index()`, and starts an FSW —
+    // on a memory-constrained replica that is exactly the warmup blow-up the flag
+    // exists to prevent, and the rebuilt index would also diverge from the one the
+    // owning job publishes. 409 rather than 403: the repo is not permanently
+    // forbidden, it is owned by another writer right now.
+    if read_only {
+        return (
+            StatusCode::CONFLICT,
+            axum::response::Json(json!({
+                "error": format!(
+                    "Repo '{}' is marked read-only (repo_read_only) — its index is owned by \
+                     another writer (e.g. a separate indexing job). Reindex it there, or clear \
+                     the flag in repos.json.",
+                    alias
+                ),
+                "status": "read_only"
+            })),
+        );
+    }
 
     let db_path = project_path.join(DB_DIR_NAME);
     let alias_bg = alias.clone();

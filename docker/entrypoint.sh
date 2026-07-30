@@ -71,6 +71,9 @@ INDEX_JOB_REPO_READY_SECS="${INDEX_JOB_REPO_READY_SECS:-600}"
 # How long the index-job waits for serve to honour SIGTERM before SIGKILL, so a
 # hung serve cannot burn the whole replicaTimeout right before the snapshot.
 SERVE_STOP_GRACE_SECS="${SERVE_STOP_GRACE_SECS:-30}"
+# Set by sync_blob. Ghost-vendor pruning reads the LOCAL tree as evidence about
+# the BLOB, so it is only valid after a clean sync. Starts pessimistic.
+BLOB_SYNC_OK=0
 
 # Both knobs are fed to `[ ... -lt/-ge ... ]`, where a non-numeric value makes
 # `test` exit 2 — which reads as "condition false" and silently restores the
@@ -119,11 +122,20 @@ snapshot_blob_url() {
 # DB_DIR_NAME constant (src/constants.rs). If that constant is ever renamed and
 # this is not, the exclusion stops matching and --delete-destination wipes every
 # index. Keep the two in lockstep.
+#
+# INPUT-SHAPE COUPLING: the list separator is ';', and the entries are blob-derived
+# folder names. A name containing ';' would split into two bogus entries and
+# silently drop protection for everything after it — --delete-destination would
+# then wipe those indexes. Such a name cannot be handled, only refused.
 docs_index_exclusions() {
-  local excl=".codesearch.db" d
+  local excl=".codesearch.db" d name
   for d in "${DOCS_DIR}"/*/; do
     [ -d "${d}" ] || continue                       # no subdirs → glob stays literal
-    excl="${excl};$(basename "${d%/}")/.codesearch.db"
+    name="$(basename "${d%/}")"
+    case "${name}" in
+      *';'*) die "vendor folder name contains ';' (${name}) — it would corrupt the azcopy --exclude-path list and expose every later index dir to --delete-destination" ;;
+    esac
+    excl="${excl};${name}/.codesearch.db"
   done
   printf '%s' "${excl}"
 }
@@ -140,10 +152,26 @@ sync_blob() {
   # codesearch index dir under ${DOCS_DIR} from being deleted — the index is
   # owned by the snapshot/indexer and must never be clobbered by the corpus sync
   # (this also protects the serve app's restored indexes on cold start).
-  azcopy sync "${BLOB_SAS_URL}" "${DOCS_DIR}" \
-    --delete-destination=true \
-    --exclude-path="${exclusions}" 2>&1 | sed 's/^/[azcopy] /' || \
+  #
+  # BLOB_SYNC_OK gates ghost-vendor pruning. A degraded sync (throttling, a SAS
+  # hiccup, a transient 5xx mid-listing) can delete a LIVE vendor's .md files and
+  # still let the run continue past the WARN below. docs_index_exclusions then
+  # faithfully protects that vendor's .codesearch.db — leaving a folder whose only
+  # child is the index dir, which is byte-for-byte the ghost signature. The vendor
+  # would be unregistered and rm -rf'd on evidence manufactured by the failure
+  # itself. A real ghost surviving one extra cycle costs nothing; deleting a live
+  # vendor is unrecoverable from inside the job.
+  if azcopy sync "${BLOB_SAS_URL}" "${DOCS_DIR}" \
+      --delete-destination=true \
+      --exclude-path="${exclusions}" 2>&1 | sed 's/^/[azcopy] /'; then
+    BLOB_SYNC_OK=1
+  else
+    BLOB_SYNC_OK=0
     log "WARN: azcopy sync failed (continuing with existing local copy)"
+    log "      ghost-vendor pruning is DISABLED for this run — the local tree may"
+    log "      no longer reflect the blob, and a half-synced vendor is indistinguishable"
+    log "      from a ghost."
+  fi
 }
 
 sync_kb() {
@@ -405,12 +433,16 @@ verify_index_ready() {
 prune_dead_vendor() {
   local name="$1" vendor="${DOCS_DIR}/${1}" base="${API_BASE}"
   log "vendor '${name}' is empty/broken after warmup — best-effort prune (will NOT abort the batch)"
+  # Unregister FIRST; only remove the folder if that succeeded. See the same
+  # reasoning in prune_ghost_vendors: a removed folder under a still-registered
+  # alias is a dangling entry no later run repairs.
   if api -X DELETE "${base}/repos/${name}" >/dev/null 2>&1; then
     log "  unregistered '${name}' from repos.json"
+    rm -rf "${vendor}" || log "  WARN: could not remove orphan dir for '${name}'"
   else
-    log "  WARN: unregister '${name}' failed (continuing — folder removal still attempted)"
+    log "  WARN: unregister '${name}' failed — KEEPING the folder so alias and disk stay"
+    log "        consistent; the prune will be retried on the next run"
   fi
-  rm -rf "${vendor}" || log "  WARN: could not remove orphan dir for '${name}'"
 }
 
 # Prune GHOST vendor folders before they are re-baked into the snapshot. A ghost
@@ -423,9 +455,18 @@ prune_dead_vendor() {
 # DOCS_DIR/<vendor> folder whose ONLY immediate child is .codesearch.db, unregister
 # it via the API (closes the store + drops the repos.json entry) and delete the
 # orphan index dir. Conservative: a folder holding even one non-index entry is kept.
+#
+# Gated on BLOB_SYNC_OK: the whole predicate is "the blob no longer has this
+# vendor's source", inferred from the LOCAL tree. That inference is only valid if
+# the sync that produced the local tree actually succeeded — see sync_blob.
 prune_ghost_vendors() {
   local base="${API_BASE}" vendor vname first_non_index
-  local pruned=0
+  local pruned=0 deferred=0
+  if [ "${BLOB_SYNC_OK}" -ne 1 ]; then
+    log "skipping ghost-vendor prune: the blob sync did not complete cleanly, so an"
+    log "  empty vendor folder is not evidence that its source was removed upstream"
+    return 0
+  fi
   for vendor in "${DOCS_DIR}"/*/; do
     [ -d "${vendor}" ] || continue     # empty ${DOCS_DIR} -> glob stays literal
     vname="$(basename "${vendor%/}")"
@@ -434,16 +475,28 @@ prune_ghost_vendors() {
     first_non_index="$(find "${vendor%/}" -mindepth 1 -maxdepth 1 ! -name '.codesearch.db' -print -quit 2>/dev/null)"
     if [ -z "${first_non_index}" ]; then
       log "ghost vendor '${vname}': source gone (only .codesearch.db remains) -- pruning"
+      # Unregister FIRST and only remove the folder if it succeeded. Removing an
+      # alias's folder while it stays registered creates a dangling entry that no
+      # later run self-heals: the build loop skips it (already registered) and
+      # mark_docs_readonly keeps re-marking it, so the snapshot ships an alias
+      # whose path does not exist and which fails to open on restore. Leaving both
+      # in place instead is self-correcting — the next run retries the prune.
       if api -X DELETE "${base}/repos/${vname}" >/dev/null 2>&1; then
         log "  unregistered '${vname}' from repos.json"
+        rm -rf "${vendor%/}" || log "  WARN: could not remove orphan index dir for '${vname}'"
+        pruned=1
       else
-        log "  WARN: unregister '${vname}' failed (continuing -- folder will still be removed)"
+        log "  WARN: unregister '${vname}' failed — KEEPING the folder so alias and disk stay"
+        log "        consistent; the prune will be retried on the next run"
+        deferred=$((deferred + 1))
       fi
-      rm -rf "${vendor%/}" || log "  WARN: could not remove orphan index dir for '${vname}'"
-      pruned=1
     fi
   done
-  [ "${pruned}" -eq 1 ] || log "no ghost vendors to prune"
+  if [ "${deferred}" -gt 0 ]; then
+    log "${deferred} ghost vendor(s) detected but NOT pruned (unregister failed) — retried next run"
+  elif [ "${pruned}" -ne 1 ]; then
+    log "no ghost vendors to prune"
+  fi
 }
 
 # Mark every DOCS vendor read-only in the local serve's repos.json, so the
@@ -477,12 +530,23 @@ prune_ghost_vendors() {
 # resolution, and guessing wrong here would abort every run. Alias identity is
 # exact. This container only ever registers DOCS vendors plus custom-kb.
 mark_docs_readonly() {
-  local repos_json="${CONFIG_DIR}/repos.json" kb_alias expected unmarked kb_flag
+  local repos_json="${CONFIG_DIR}/repos.json" kb_alias expected unmarked kb_flag dangling
   [ -f "${repos_json}" ] \
     || die "mark_docs_readonly: no repos.json at '${repos_json}' — cannot mark DOCS read-only, and an unmarked snapshot puts serve back in the write-mode warmup OOM"
   command -v jq >/dev/null 2>&1 \
     || die "jq is required in index-job mode: without it DOCS cannot be marked read-only and the snapshot would make the 2 GiB serve replica warm up write-mode"
   kb_alias="$(basename "${KB_DIR}")"
+
+  # A registered alias whose path is gone would be marked and shipped, and then
+  # fail to open on restore. The prune helpers no longer create that state (they
+  # keep the folder when the unregister fails), so reaching it means repos.json
+  # does not describe the tree we are about to tar — the same condition already
+  # rejected below, caught earlier and named.
+  dangling="$(jq -r --arg kb "${kb_alias}" \
+    '(.repos // {}) | to_entries[] | select(.key != $kb) | .value' "${repos_json}" 2>/dev/null \
+    | while IFS= read -r p; do [ -n "${p}" ] && [ ! -d "${p}" ] && printf '%s ' "${p}"; done || true)"
+  [ -z "${dangling}" ] \
+    || die "mark_docs_readonly: registered alias(es) with a missing path: ${dangling}— repos.json does not describe the index being snapshotted"
 
   expected="$(jq -r --arg kb "${kb_alias}" \
     '[(.repos // {}) | keys[] | select(. != $kb)] | length' "${repos_json}" 2>/dev/null || true)"
