@@ -300,18 +300,42 @@ refreshing it; waiting for warmup to finish (no competing reindex)"
 #                           a good snapshot is strictly destructive, so it is
 #                           NOT prunable: the caller must abort the whole job.
 #
-# Exit codes: 0 = ready, 1 = empty (prunable), 2 = chunks but no graph (fatal).
+#   chunks >= 1, indexed
+#   absent/null           → the graph state is UNKNOWN, and this is treated as
+#                           FAILURE, not as "probably fine". See below — unknown
+#                           and failure are not disjoint states here.
+#
+# Why unknown must be fail-closed. `indexed` is populated only when the repo has
+# a live open store (info_handler asks `get_opened_stores`). A repo that is still
+# WARMING is absent from the state map — the write path registers `Warm` only
+# after the incremental refresh completes — so it reports `indexed: null` while
+# `chunks` falls back to metadata.json FROM THE RESTORED SNAPSHOT and is
+# therefore reassuringly non-zero. That is exactly the mid-warmup repo we must
+# not tar. "Older serve build that lacks the field" is NOT a real cause here:
+# the binary and this script ship in the same image.
+#
+# Exit codes: 0 = ready, 1 = empty (prunable), 2 = graph missing or unverifiable
+# (fatal).
 VERIFY_EMPTY=1
 VERIFY_NO_GRAPH=2
+# How many times to re-ask /info when `indexed` comes back unknown, to absorb a
+# transient `try_read()` contention against a warmup still holding the lock.
+VERIFY_INFO_RETRIES=3
 verify_index_ready() {
-  local name="$1" base="${API_BASE}" info chunks indexed
-  info="$(api "${base}/repos/${name}/info" 2>/dev/null || true)"
-  chunks="$(printf '%s' "${info}" | sed -n 's/.*"chunks":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+  local name="$1" base="${API_BASE}" info chunks indexed tries="${VERIFY_INFO_RETRIES}"
+  while : ; do
+    info="$(api "${base}/repos/${name}/info" 2>/dev/null || true)"
+    indexed="$(json_field "${info}" indexed)"
+    [ -n "${indexed}" ] && break
+    tries=$((tries - 1))
+    [ "${tries}" -le 0 ] && break
+    sleep 5
+  done
+  chunks="$(json_field "${info}" chunks)"
   if [ -z "${chunks}" ] || [ "${chunks}" -lt 1 ] 2>/dev/null; then
     log "verify: repo '${name}' reports chunks=${chunks:-<none>} — index looks EMPTY"
     return "${VERIFY_EMPTY}"
   fi
-  indexed="$(json_field "${info}" indexed)"
   case "${indexed}" in
     true)
       log "verify: repo '${name}' OK — ${chunks} chunks indexed, HNSW graph present" ;;
@@ -320,13 +344,11 @@ verify_index_ready() {
       log "        MISSING, so semantic search would return 0 results for this vendor."
       return "${VERIFY_NO_GRAPH}" ;;
     *)
-      # Field absent or null. Either an older serve build that does not report
-      # `indexed`, or the repo is not currently open so there is no live store
-      # to ask. Neither is evidence of a BAD index, so do not abort a whole run
-      # over it — but say plainly that the graph went unverified, because that
-      # is the one property this guard exists to check.
-      log "verify: repo '${name}' — ${chunks} chunks, but /info reported no 'indexed' field;"
-      log "        HNSW graph presence could NOT be verified (accepting on chunk count alone)." ;;
+      log "verify: repo '${name}' — ${chunks} chunks, but /info reported indexed=<unknown> after"
+      log "        ${VERIFY_INFO_RETRIES} tries. The repo has no live store, which means it is most"
+      log "        likely STILL WARMING — and its chunk count came from the previously"
+      log "        restored snapshot, not from a finished build. Refusing to guess."
+      return "${VERIFY_NO_GRAPH}" ;;
   esac
 }
 
@@ -519,16 +541,24 @@ repo_status() {
 # back. That path returns from warmup without ever calling build_index(), i.e.
 # exactly the "chunks present, no HNSW graph" state this whole change exists to
 # prevent. Accepting it would report the failure as ready and publish a dead
-# index. We keep polling instead and let the per-repo budget expire, after which
-# verify_index_ready sees indexed=false and aborts the job.
+# index, so we keep polling and let the budget expire instead.
+#
+# RETURNS NON-ZERO ON TIMEOUT, and the caller must treat that as fatal. This
+# used to return 0 ("proceeding to verify"), which quietly handed a repo that
+# was still WARMING to verify_index_ready — where it reports indexed=null (no
+# live store yet) while its chunk count falls back to the previously restored
+# snapshot's metadata. That combination is indistinguishable from a healthy
+# repo on counts alone, so a timeout has to be a hard stop here rather than a
+# soft handoff.
 #
 # The budget (INDEX_JOB_REPO_READY_SECS, top of file) is PER REPO, and small on
-# purpose. The previous global 3600s would, with six vendors, let a single stuck
-# repo run the job past the Container Apps replicaTimeout (5400s) and lose the
-# whole run — including every healthy vendor's freshly baked deltas. 600s x 6
-# vendors + custom-kb stays inside it with room for restore, tar and upload.
+# purpose. The previous global 3600s would, across the whole vendor set, let a
+# single stuck repo run the job past the Container Apps replicaTimeout (5400s)
+# and lose the whole run — including every healthy vendor's freshly baked
+# deltas. 600s x (5 vendors + custom-kb) leaves ample room for restore, tar and
+# upload inside that ceiling.
 wait_repo_ready() {
-  local name="$1" base="${API_BASE}" waited=0 body st=""
+  local name="$1" base="${API_BASE}" waited=0 body st="" warned_readonly=0
   sleep 5   # let the 202 flip the repo into "indexing" before we start checking
   while [ "${waited}" -lt "${INDEX_JOB_REPO_READY_SECS}" ]; do
     body="$(api "${base}/status" 2>/dev/null || true)"
@@ -538,14 +568,18 @@ wait_repo_ready() {
         warm|open)
           log "repo '${name}' ready (status=${st}) after ~$((waited + 5))s"; return 0 ;;
         readonly)
-          log "WARN: repo '${name}' opened READ-ONLY in the index job — the write open failed,"
-          log "      so its HNSW graph is not being built. Verify will catch this." ;;
+          # Log once, not every 10s for the whole budget.
+          if [ "${warned_readonly}" -eq 0 ]; then
+            warned_readonly=1
+            log "WARN: repo '${name}' opened READ-ONLY in the index job — the write open failed,"
+            log "      so its HNSW graph is not being built. Still polling; this will time out."
+          fi ;;
       esac
     fi
     sleep 10; waited=$((waited + 10))
   done
-  log "WARN: repo '${name}' still '${st:-<unknown>}' after ${waited}s — proceeding to verify"
-  return 0
+  log "WARN: repo '${name}' still '${st:-<unknown>}' after ${waited}s — never reached warm/open"
+  return 1
 }
 
 run_index_job() {
@@ -597,7 +631,11 @@ run_index_job() {
     [ -d "${vendor}" ] || continue     # empty ${DOCS_DIR} → glob stays literal
     vname="$(basename "${vendor%/}")"
     rebuild_repo "${vendor%/}"         # strip trailing slash so basename is clean
-    wait_repo_ready "${vname}"         # block until this vendor is genuinely ready
+    # Fail-closed: a vendor that never reached warm/open may still be building
+    # its graph. Tarring now would publish a mid-warmup index over the good
+    # snapshot, and the chunk count would not reveal it (see verify_index_ready).
+    wait_repo_ready "${vname}" \
+      || die "vendor '${vname}' never became ready within ${INDEX_JOB_REPO_READY_SECS}s — refusing to snapshot a possibly mid-warmup index over the good one (raise INDEX_JOB_REPO_READY_SECS if this corpus legitimately needs longer)"
     # Three outcomes, deliberately NOT collapsed into pass/fail:
     #   ready     → count it and move on.
     #   empty     → best-effort prune (see prune_dead_vendor) and skip; a single
@@ -619,7 +657,8 @@ run_index_job() {
     || die "no healthy vendor subfolders under ${DOCS_DIR} — nothing to index (expected ${DOCS_DIR}/<vendor>/…)"
   if [ -d "${KB_DIR}/.git" ]; then
     rebuild_repo "${KB_DIR}"
-    wait_repo_ready "$(basename "${KB_DIR}")"
+    wait_repo_ready "$(basename "${KB_DIR}")" \
+      || die "custom-kb never became ready within ${INDEX_JOB_REPO_READY_SECS}s — refusing to snapshot a possibly mid-warmup index over the good one"
     # custom-kb is not prunable — it is the curated corpus, so ANY verify failure
     # (empty or missing graph) aborts rather than publishing over a good snapshot.
     verify_index_ready "$(basename "${KB_DIR}")" \

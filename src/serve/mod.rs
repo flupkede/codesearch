@@ -1602,15 +1602,18 @@ impl ServeState {
         // `build_index()` is a synchronous, CPU-heavy operation (HNSW graph
         // construction). Running it directly on a tokio worker thread starves
         // the async executor and makes `/health` time out during warmup, so it
-        // is offloaded to `spawn_blocking`. Stats are read first under a short
-        // `.read()` lock to decide whether a build is even needed.
+        // is offloaded to `spawn_blocking`. Index health is read first under a
+        // short `.read()` lock to decide whether a build is even needed —
+        // `index_health()` rather than `stats()`, since the predicate needs
+        // exactly `(total_chunks, indexed)` and `stats()` would deserialize
+        // every chunk in the store just to count unique file paths.
         let needs_build = {
             let vstore = stores.vector_store.read().await;
-            match vstore.stats() {
-                Ok(s) if s.total_chunks > 0 && !s.indexed => Some(s.total_chunks),
+            match vstore.index_health() {
+                Ok((total_chunks, false)) if total_chunks > 0 => Some(total_chunks),
                 Ok(_) => None,
                 Err(e) => {
-                    warn!("Warmup '{}': could not read stats: {}", alias, e);
+                    warn!("Warmup '{}': could not read index health: {}", alias, e);
                     None
                 }
             }
