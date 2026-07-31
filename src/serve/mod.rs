@@ -198,6 +198,22 @@ pub(crate) struct ServeState {
     /// `stop_fsw`) so the LMDB `Environment` drops and releases the file
     /// handles BEFORE the DB directory is deleted. See `await_fsw_shutdown`.
     fsw_tasks: DashMap<String, tokio::task::JoinHandle<()>>,
+    /// Repo alias → `(JoinHandle, CancellationToken)` of its background
+    /// *indexing* task (the heavy `add_repo`/`reindex` embed pass), separate
+    /// from `fsw_tasks` because `restart_fsw` reuses the `fsw_tasks` slot for
+    /// the continuous watcher loop.
+    ///
+    /// This exists to fix the index-cancellation no-op (BUG1): `add_repo` and
+    /// `reindex` used to spawn detached, untracked `tokio::spawn` tasks that
+    /// neither observed the cancel token nor could be awaited, so `remove_repo`
+    /// reported success while a full-corpus embed pass kept running (and
+    /// writing) on the removed alias — 6 GB / 52% CPU runaway. Registering the
+    /// handle here lets `await_index_task` (called from `remove_repo`) cancel
+    /// the token AND await the task before the DB directory is deleted, so the
+    /// task's `Arc<SharedStores>` (and the LMDB mmap handles it keeps alive)
+    /// drop first. The token is stored alongside the handle so `remove_repo`
+    /// can cancel regardless of the repo's `RepoState` variant.
+    index_tasks: DashMap<String, (tokio::task::JoinHandle<()>, CancellationToken)>,
     /// Loaded repos config (alias → path).
     config: std::sync::RwLock<ReposConfig>,
     /// Last observed mtime of the repos config file.
@@ -302,6 +318,7 @@ impl ServeState {
             repos: DashMap::new(),
             last_access: DashMap::new(),
             fsw_tasks: DashMap::new(),
+            index_tasks: DashMap::new(),
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
@@ -1287,6 +1304,16 @@ impl ServeState {
         self.await_fsw_shutdown(alias).await;
         tracing::info!("Evicted repo '{}' from memory", alias);
 
+        // 2b. Await the background *indexing* task (add_repo/reindex embed pass)
+        // too. Before this, a freshly-added repo's full-corpus reindex ran in a
+        // detached, untracked task that ignore its cancel token — so the lines
+        // above cancelled a token nobody listened to, this await found nothing
+        // to wait on, and the embed pass kept running (writing chunks, holding
+        // the LMDB mmap open) long after remove_repo reported success.
+        // await_index_task cancels the task's OWN token and awaits its exit, so
+        // its Arc<SharedStores> drops before the DB delete below.
+        self.await_index_task(alias).await;
+
         // 3. Unregister from repos.json
         {
             let mut config = self
@@ -1429,6 +1456,59 @@ impl ServeState {
         }
     }
 
+    /// Cancel and await the background *indexing* task for `alias`
+    /// (`add_repo`/`reindex` embed pass), if one is registered in
+    /// [`Self::index_tasks`].
+    ///
+    /// Cancels the task's token first (so an in-flight embed pass aborts at the
+    /// next batch/phase boundary), then awaits its `JoinHandle` with a 5s
+    /// timeout. The await is what guarantees the task's `Arc<SharedStores>` —
+    /// and the LMDB mmap handles it keeps alive on Windows — have actually
+    /// dropped before `remove_repo` deletes the DB directory. Without this,
+    /// `remove_repo` would delete `repos.json` while the detached task kept
+    /// writing chunks into a soon-to-be-orphaned `.codesearch.db`.
+    async fn await_index_task(&self, alias: &str) {
+        if let Some((_, (handle, token))) = self.index_tasks.remove(alias) {
+            token.cancel();
+            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => {
+                    tracing::debug!("Index task for '{}' exited cleanly", alias);
+                }
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        "Index task for '{}' panicked during shutdown: {}",
+                        alias,
+                        join_err
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Index task for '{}' did not exit within 5s; LMDB handles may stay locked",
+                        alias
+                    );
+                }
+            }
+        }
+    }
+
+    /// True iff `alias` is still registered in the config AND its indexing
+    /// `CancellationToken` has not been cancelled.
+    ///
+    /// Used by the `add_repo` background task to decide whether to proceed past
+    /// `force_reindex_with_stores` into `build_index` / `restart_fsw`. If the
+    /// repo was removed mid-index (`remove_repo` unregistered it and cancelled
+    /// the token), the detached task must stop instead of resurrecting the
+    /// alias — writing a fresh HNSW graph / starting a new FSW for a repo the
+    /// user just deleted.
+    fn is_alias_live(&self, alias: &str, token: &CancellationToken) -> bool {
+        !token.is_cancelled()
+            && self
+                .config
+                .read()
+                .map(|c| c.resolve(alias).is_some())
+                .unwrap_or(false)
+    }
+
     /// Spawn the FSW background task for a repo after it has been stopped.
     ///
     /// Creates a fresh IndexManager, performs an initial incremental refresh,
@@ -1485,6 +1565,7 @@ impl ServeState {
                         &project_path,
                         &db_path_bg,
                         &stores_bg,
+                        &token_for_task,
                     )
                     .await
                     {
@@ -1612,9 +1693,17 @@ impl ServeState {
 
         let stores_arc = stores;
 
-        if let Err(e) =
-            IndexManager::perform_incremental_refresh_with_stores(&path, &db_path, &stores_arc)
-                .await
+        // Warmup runs at startup (pre-warm), never in response to a user action,
+        // so it is given a fresh token that is never cancelled — the refresh runs
+        // to completion. A real user-initiated cancel routes through the
+        // RepoState::Write token owned by the live task instead.
+        if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
+            &path,
+            &db_path,
+            &stores_arc,
+            &CancellationToken::new(),
+        )
+        .await
         {
             tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
         }
@@ -1797,6 +1886,7 @@ impl ServeState {
                             &project_path,
                             &db_path_clone,
                             &stores_for_task,
+                            &token_for_task,
                         )
                         .await
                         {
@@ -3094,27 +3184,64 @@ async fn reindex_handler(
             }
         };
 
+        // Fresh cancellation token for this reindex task, registered alongside
+        // its handle in `index_tasks` so `remove_repo` can cancel + await it
+        // (BUG1: this was a detached, uncancellable tokio::spawn — a remove
+        // during a force reindex left the embed pass running on a dead alias).
+        let reindex_token = CancellationToken::new();
+        let reindex_token_task = reindex_token.clone();
+
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tracing::info!(
                 "Force reindex for '{}': clearing stores and reindexing",
                 alias_bg
             );
 
             // 2. Clear data and reindex
-            match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores, None)
-                .await
+            match IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                None,
+                &reindex_token_task,
+            )
+            .await
             {
                 Ok(()) => {
                     tracing::info!("Force reindex complete for '{}'", alias_bg);
                 }
                 Err(e) => {
+                    if reindex_token_task.is_cancelled() {
+                        // Cancellation (e.g. remove_repo ran mid-reindex): the
+                        // repo is already being torn down by remove_repo — do
+                        // NOT restart the FSW or rebuild symbols, both of which
+                        // would resurrect the removed alias with a fresh,
+                        // uncancellable task.
+                        tracing::info!("Reindex cancelled for '{}': {}", alias_bg, e);
+                        g_state.end_indexing(&g_alias);
+                        return;
+                    }
                     tracing::error!("Force reindex failed for '{}': {}", alias_bg, e);
                 }
             }
 
-            // 3. Restart FSW with fresh IndexManager
+            // Guard: even if force_reindex returned Ok, the repo may have been
+            // removed (or the task cancelled) during the embed pass. Do NOT
+            // restart the FSW or rebuild symbols — that would resurrect the
+            // removed alias. restart_fsw's own config check is insufficient here
+            // because remove_repo unregisters config AFTER awaiting this task.
+            if !g_state.is_alias_live(&g_alias, &reindex_token_task) {
+                tracing::info!(
+                    "Skipping restart_fsw for '{}': repo removed or cancelled mid-reindex",
+                    g_alias
+                );
+                g_state.end_indexing(&g_alias);
+                return;
+            }
+
+            // 3. Restart FSW with fresh IndexManager.
             g_state.restart_fsw(&g_alias, stores).await;
 
             // 4. Optional symbol index rebuild
@@ -3124,6 +3251,9 @@ async fn reindex_handler(
 
             g_state.end_indexing(&g_alias);
         });
+        state
+            .index_tasks
+            .insert(alias.to_string(), (handle, reindex_token));
     } else {
         // Incremental refresh: ensure the repo is opened, then refresh
         let stores = match state.get_or_open_stores(&alias, true).await {
@@ -3140,9 +3270,14 @@ async fn reindex_handler(
             }
         };
 
+        // Fresh cancellation token for this incremental reindex task, registered
+        // in `index_tasks` so `remove_repo` can cancel + await it (BUG1).
+        let reindex_token = CancellationToken::new();
+        let reindex_token_task = reindex_token.clone();
+
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tracing::info!(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
                 alias_bg
@@ -3151,6 +3286,7 @@ async fn reindex_handler(
                 &project_path,
                 &db_path,
                 &stores,
+                &reindex_token_task,
             )
             .await
             {
@@ -3169,6 +3305,9 @@ async fn reindex_handler(
 
             g_state.end_indexing(&g_alias);
         });
+        state
+            .index_tasks
+            .insert(alias.to_string(), (handle, reindex_token));
     }
 
     (
@@ -3381,8 +3520,14 @@ async fn add_repo_handler(
     let alias_bg = alias.clone();
     let state_bg = state.clone();
     let project_path = canonical_path.clone();
+    // Clone the cancel token INTO the task so force_reindex_with_stores can
+    // observe a remove_repo cancellation mid-embed. BUG1: previously the token
+    // was created and stored in RepoState::Write but never threaded into the
+    // indexing task, so cancelling it (stop_fsw) did nothing and the task ran
+    // the full embed pass to completion on a removed alias.
+    let token_for_task = cancel_token.clone();
 
-    tokio::spawn(async move {
+    let index_handle = tokio::spawn(async move {
         tracing::info!(
             "Indexing newly added repo '{}' ({}) in background",
             alias_bg,
@@ -3394,6 +3539,7 @@ async fn add_repo_handler(
             &db_path,
             &stores,
             model_override,
+            &token_for_task,
         )
         .await
         {
@@ -3405,6 +3551,15 @@ async fn add_repo_handler(
                 );
             }
             Err(e) => {
+                if token_for_task.is_cancelled() {
+                    // Cancellation (e.g. remove_repo ran mid-index): the repo is
+                    // already being torn down by remove_repo — do NOT repeat the
+                    // destructive cleanup (repos.remove/unregister) here, just
+                    // release the indexing guard and let remove_repo finish.
+                    tracing::info!("Indexing cancelled for '{}': {}", alias_bg, e);
+                    state_bg.end_indexing(&alias_bg);
+                    return;
+                }
                 tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
                 // Clean up: remove from repos and config
                 state_bg.repos.remove(&alias_bg);
@@ -3421,6 +3576,19 @@ async fn add_repo_handler(
                 }
                 return;
             }
+        }
+
+        // Guard: if the repo was removed (or the task cancelled) during the
+        // embed pass — even though force_reindex returned Ok (the cancellation
+        // check raced past the last batch) — do NOT build the vector index or
+        // restart the FSW. That would resurrect a removed alias.
+        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
+            tracing::info!(
+                "Skipping build_index for '{}': repo removed or cancelled mid-index",
+                alias_bg
+            );
+            state_bg.end_indexing(&alias_bg);
+            return;
         }
 
         // Build vector index from freshly indexed data.
@@ -3442,12 +3610,30 @@ async fn add_repo_handler(
             }
         }
 
+        // Re-check before restart_fsw: build_index (spawn_blocking) may have
+        // taken long enough for a remove_repo to land in between.
+        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
+            tracing::info!(
+                "Skipping restart_fsw for '{}': repo removed or cancelled during build_index",
+                alias_bg
+            );
+            state_bg.end_indexing(&alias_bg);
+            return;
+        }
+
         // Start FSW and transition to proper Write state with IndexManager
         state_bg.restart_fsw(&alias_bg, stores).await;
 
         state_bg.end_indexing(&alias_bg);
         tracing::info!("Repo '{}' fully indexed and ready", alias_bg);
     });
+
+    // Register the indexing task so remove_repo can cancel + await it (BUG1).
+    // Storing the token alongside the handle means remove_repo can cancel
+    // regardless of the repo's RepoState variant.
+    state
+        .index_tasks
+        .insert(alias.clone(), (index_handle, cancel_token));
 
     (
         StatusCode::ACCEPTED,
