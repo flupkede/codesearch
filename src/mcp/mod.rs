@@ -2451,6 +2451,66 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_chunk_payload_declares_an_incomplete_candidate_list() {
+        // `candidate_projects` reads as exhaustive. When a store failed to
+        // answer, the repo the caller wants may be the one missing from it, so
+        // the message itself must stop claiming completeness.
+        let warned = vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()];
+        let p = super::ambiguous_chunk_payload(123, &["akeneo", "custom-kb"], &warned);
+
+        assert_eq!(p["warnings"][0], warned[0].as_str());
+        let msg = p["message"].as_str().unwrap();
+        assert!(msg.contains("incomplete"), "got: {msg}");
+    }
+
+    #[test]
+    fn ambiguous_chunk_payload_is_unchanged_when_every_store_answered() {
+        let p = super::ambiguous_chunk_payload(123, &["akeneo", "custom-kb"], &[]);
+
+        // Absent, not `null`: `json!` renders `None` as an explicit null, which
+        // would be a shape change on the healthy path.
+        assert!(
+            p.get("warnings").is_none(),
+            "healthy payload must not gain a key: {p}"
+        );
+        assert_eq!(
+            p["message"],
+            "chunk_id 123 exists in multiple repositories. Specify which one."
+        );
+    }
+
+    #[test]
+    fn get_chunk_response_carries_warnings_on_the_success_path() {
+        // The dangerous exit: a chunk returned from a partially-dead group is
+        // indistinguishable from one returned by a healthy group unless the
+        // failure travels with it.
+        let mk = |w: Option<Vec<String>>| super::GetChunkResponse {
+            chunk_id: 1,
+            path: "src/x.rs".to_string(),
+            start_line: 1,
+            end_line: 2,
+            kind: "function".to_string(),
+            signature: None,
+            content: "fn x() {}".to_string(),
+            context_before: None,
+            context_after: None,
+            context_lines_clamped: None,
+            note: None,
+            warnings: w,
+        };
+
+        let warned = vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()];
+        let json = serde_json::to_string(&mk(Some(warned))).unwrap();
+        assert!(json.contains("os error 22"), "got: {json}");
+
+        let json = serde_json::to_string(&mk(None)).unwrap();
+        assert!(
+            !json.contains("warnings"),
+            "a healthy chunk must not gain a key: {json}"
+        );
+    }
+
+    #[test]
     fn retry_hint_is_dropped_only_when_a_store_failed() {
         let hint = || Some("literal_search".to_string());
 
@@ -3880,6 +3940,40 @@ fn respond_with_items<T: serde::Serialize>(
     }
     let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string());
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// Build the `ambiguous_chunk_id` payload for `get_chunk`.
+///
+/// `candidate_projects` reads as the complete set of repos holding this
+/// chunk_id, so a store that failed to answer must be declared: the repo the
+/// caller actually wants may be the one missing from the list. Extracted so the
+/// "is this list complete?" decision is testable without standing up stores.
+///
+/// `warnings` is *inserted* rather than emitted as `null`, so the healthy-path
+/// shape is byte-identical to before — matching `skip_serializing_if` on every
+/// other warnings-carrying response.
+fn ambiguous_chunk_payload(
+    chunk_id: u32,
+    candidate_projects: &[&str],
+    warnings: &[String],
+) -> serde_json::Value {
+    let mut message =
+        format!("chunk_id {chunk_id} exists in multiple repositories. Specify which one.");
+    if !warnings.is_empty() {
+        message.push_str(" The candidate list is incomplete — see `warnings`.");
+    }
+    let mut payload = serde_json::json!({
+        "error_code": "ambiguous_chunk_id",
+        "message": message,
+        "candidate_projects": candidate_projects,
+        "hint_for_agent": "The chunk_id collision is a known limitation of multi-repo mode. Re-run get_chunk with one of the candidate_projects, or use search to identify the correct repository first."
+    });
+    if !warnings.is_empty() {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("warnings".to_string(), serde_json::json!(warnings));
+        }
+    }
+    payload
 }
 
 /// Decide whether to keep the "try another tool" hint.
@@ -6708,15 +6802,18 @@ impl CodesearchService {
         let chunk = if let Some(ref sv) = ctx.stores_vec {
             if sv.len() > 1 && request.project.is_none() {
                 // Smart candidate detection: find which stores actually contain this chunk_id
-                let mut candidates: Vec<(&Arc<SharedStores>, &String)> = Vec::new();
-                let aliases = ctx.store_aliases.as_deref().unwrap();
+                let mut candidates: Vec<(&Arc<SharedStores>, &str)> = Vec::new();
+                let aliases = ctx.aliases();
                 for (i, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(_)) => {
-                            if let Some(alias) = aliases.get(i) {
-                                candidates.push((store_arc, alias));
-                            }
+                            // A store that HAS the chunk is a candidate even if its
+                            // alias is missing. Gating the push on `aliases.get(i)`
+                            // dropped it silently, which is how a 2-candidate
+                            // collision could render as an unambiguous auto-route.
+                            let alias = aliases.get(i).map(|s| s.as_str()).unwrap_or("unknown");
+                            candidates.push((store_arc, alias));
                         }
                         Ok(None) => continue,
                         Err(ref e) => {
@@ -6759,15 +6856,18 @@ impl CodesearchService {
                         }
                     }
                     _ => {
-                        // Multiple stores have this chunk_id — ambiguous
+                        // Multiple stores have this chunk_id — ambiguous.
+                        //
+                        // `candidate_projects` reads as the complete list, so a
+                        // store that failed to answer has to be declared: the
+                        // right repo may be the one missing from it.
                         let candidate_names: Vec<&str> =
-                            candidates.iter().map(|(_, a)| a.as_str()).collect();
-                        let payload = serde_json::json!({
-                            "error_code": "ambiguous_chunk_id",
-                            "message": format!("chunk_id {} exists in multiple repositories. Specify which one.", request.chunk_id),
-                            "candidate_projects": candidate_names,
-                            "hint_for_agent": "The chunk_id collision is a known limitation of multi-repo mode. Re-run get_chunk with one of the candidate_projects, or use search to identify the correct repository first."
-                        });
+                            candidates.iter().map(|(_, a)| *a).collect();
+                        let payload = ambiguous_chunk_payload(
+                            request.chunk_id,
+                            &candidate_names,
+                            &chunk_warnings,
+                        );
                         return Ok(CallToolResult::success(vec![Content::text(
                             payload.to_string(),
                         )]));
@@ -6885,6 +6985,15 @@ impl CodesearchService {
             context_after,
             context_lines_clamped: if clamped { Some(true) } else { None },
             note,
+            // The success path is the one that used to drop this, and it is the
+            // dangerous one: a confidently-returned chunk from a group where a
+            // store failed to answer looks exactly like a chunk from a healthy
+            // group. Same false negative as an empty result, harder to notice.
+            warnings: if chunk_warnings.is_empty() {
+                None
+            } else {
+                Some(chunk_warnings)
+            },
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
