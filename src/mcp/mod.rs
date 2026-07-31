@@ -2365,6 +2365,94 @@ mod tests {
         assert!(warnings[0].contains("unknown"));
     }
 
+    // === status(kind="index") multi-store summary ==========================
+    //
+    // Follow-up 16: a store failing mid-fan-out used to render identically to
+    // "not yet indexed" (both are 0 chunks, `all_indexed = false`). These pin
+    // the three-way decision the fix depends on — building / degraded-ready /
+    // clean-ready are distinct messages, not just a boolean.
+
+    #[test]
+    fn index_status_summary_reports_building_before_anything_failed() {
+        let (status, message) = super::index_status_summary(3, 0, 0);
+        assert_eq!(status, "building");
+        assert!(!message.contains("failed"), "got: {message}");
+    }
+
+    #[test]
+    fn index_status_summary_reports_clean_ready_with_no_failures() {
+        let (status, message) = super::index_status_summary(3, 0, 500);
+        assert_eq!(status, "ready");
+        assert!(!message.contains("failed"), "got: {message}");
+        assert!(message.contains("3 repo(s)"), "got: {message}");
+    }
+
+    #[test]
+    fn index_status_summary_surfaces_a_degraded_group_as_ready_with_a_count() {
+        // This is the exact case that used to be indistinguishable from
+        // "index still warming": some data is in, one store didn't answer.
+        let (status, message) = super::index_status_summary(3, 1, 500);
+        assert_eq!(
+            status, "ready",
+            "the two healthy stores must not be masked by the one that failed"
+        );
+        assert!(
+            message.contains("2 of 3 repo(s)") && message.contains("1 store(s) failed"),
+            "message must name both the healthy count and the failure count, got: {message}"
+        );
+        assert!(message.contains("warnings"), "got: {message}");
+    }
+
+    #[test]
+    fn index_status_summary_reports_error_when_every_store_failed() {
+        // The correlated-failure case: all stores went down together (e.g. a
+        // shared read-only-snapshot or disk-full condition), so `total_chunks`
+        // is 0 for the same reason it would be on a never-indexed group. Before
+        // this fix, `total_chunks == 0` was checked first and this rendered as
+        // "building" — byte-identical to "not indexed yet" — even though every
+        // store actively failed. `failed_count >= total_repos` must win.
+        let (status, message) = super::index_status_summary(3, 3, 0);
+        assert_eq!(
+            status, "error",
+            "a group where every store failed must not read as merely 'still building'"
+        );
+        assert!(message.contains("3"), "got: {message}");
+        assert!(message.contains("warnings"), "got: {message}");
+    }
+
+    #[test]
+    fn repo_stats_from_result_carries_counts_and_no_error_on_success() {
+        let stats = crate::vectordb::StoreStats {
+            total_chunks: 42,
+            total_files: 7,
+            indexed: true,
+            dimensions: 384,
+            max_chunk_id: 42,
+        };
+        let (total_chunks, total_files, error) = super::repo_stats_from_result(Ok(stats));
+        assert_eq!((total_chunks, total_files), (42, 7));
+        assert!(error.is_none(), "got: {error:?}");
+    }
+
+    #[test]
+    fn repo_stats_from_result_zeroes_counts_and_names_the_error_on_failure() {
+        // This is the exact case requirement 2 of follow-up 16 closes: a
+        // stats() failure used to be indistinguishable from a healthy, simply
+        // empty repo (both render as 0/0 with no error). Reintroducing the old
+        // behaviour (returning `None` unconditionally here, as the fix
+        // originally had it before this helper existed) makes this assertion
+        // fail — confirmed by hand before restoring the real branch.
+        let err = anyhow::anyhow!("LMDB env unreadable: os error 30");
+        let (total_chunks, total_files, error) =
+            super::repo_stats_from_result(Err::<crate::vectordb::StoreStats, _>(err));
+        assert_eq!((total_chunks, total_files), (0, 0));
+        let error = error.expect("a stats() failure must surface an error, not render as healthy");
+        assert!(
+            error.contains("stats unavailable") && error.contains("os error 30"),
+            "got: {error}"
+        );
+    }
+
     #[test]
     fn into_results_routes_failures_into_warnings() {
         let outcome = super::MultiReadOutcome {
@@ -4105,6 +4193,75 @@ struct MultiReadOutcome<R> {
     /// `(alias, full error chain)` for every store that failed. Empty on a
     /// clean run.
     failures: Vec<(String, String)>,
+}
+
+/// Decide the `status`/`status_message` pair for a multi-store
+/// `status(kind="index"|"projects")` response.
+///
+/// Pulled out of the handler so the four-way call — every store down, still
+/// building, ready but one or more stores failed to report their stats, or
+/// fully ready — is testable without opening a single store. `failed_count`
+/// is checked before declaring "building" or "ready" precisely so a store
+/// that came back `Err` cannot render identically to one that returned
+/// healthy zero-valued stats. The all-failed case is checked first: a
+/// correlated failure (e.g. every store hits the same read-only-snapshot or
+/// disk-full condition at once) also has `total_chunks == 0`, and without
+/// this ordering it fell through to "building" — byte-identical to a group
+/// that simply has not been indexed yet, which is the exact indistinguishable
+/// case this fix exists to close. See AGENTS.md's fan-out warnings-channel
+/// rule.
+fn index_status_summary(
+    total_repos: usize,
+    failed_count: usize,
+    total_chunks: usize,
+) -> (String, String) {
+    if total_repos > 0 && failed_count >= total_repos {
+        (
+            "error".to_string(),
+            format!(
+                "All {total_repos} repo(s) failed to report status — every store errored, see `warnings`."
+            ),
+        )
+    } else if total_chunks == 0 {
+        (
+            "building".to_string(),
+            format!(
+                "Index is being built across {total_repos} repo(s). Searches may fail until indexing completes."
+            ),
+        )
+    } else if failed_count > 0 {
+        (
+            "ready".to_string(),
+            format!(
+                "Index is ready for searching across {} of {total_repos} repo(s) — {failed_count} store(s) failed to report status, see `warnings`.",
+                total_repos.saturating_sub(failed_count),
+            ),
+        )
+    } else {
+        (
+            "ready".to_string(),
+            format!("Index is ready for searching across {total_repos} repo(s)."),
+        )
+    }
+}
+
+/// Turn a store's `stats()` result into the `(total_chunks, total_files,
+/// error)` triple `list_projects` reports per repo.
+///
+/// Pulled out of the handler, mirroring `index_status_summary` just above, so
+/// the fix's actual claim — a `stats()` failure surfaces as `error: Some(..)`
+/// with zero-valued counts, instead of silently rendering as a healthy-looking
+/// empty repo — is unit-testable without opening a real `VectorStore` or
+/// `ServeState`. The two calls to `serve_state.repo_lock_status()` in
+/// `list_projects` don't vary by outcome, so they stay in the handler; this
+/// covers only the part that does.
+fn repo_stats_from_result(
+    stats: anyhow::Result<crate::vectordb::StoreStats>,
+) -> (usize, usize, Option<String>) {
+    match stats {
+        Ok(s) => (s.total_chunks, s.total_files, None),
+        Err(ref e) => (0, 0, Some(format!("stats unavailable: {e:#}"))),
+    }
 }
 
 /// Record a per-store failure as a caller-facing warning, once per store.
@@ -8702,8 +8859,11 @@ impl CodesearchService {
             let mut max_chunk_id = 0u32;
             let mut dimensions = 0usize;
             let mut all_indexed = true;
+            let aliases = ctx.aliases();
+            let mut stats_warnings: Vec<String> = Vec::new();
+            let mut failed_count = 0usize;
 
-            for store_arc in sv {
+            for (i, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
                 match store.stats() {
                     Ok(stats) => {
@@ -8719,23 +8879,21 @@ impl CodesearchService {
                             all_indexed = false;
                         }
                     }
-                    Err(_) => {
+                    // `all_indexed = false` alone renders identically to "still
+                    // warming" — the caller has no way to tell "wait" from "this
+                    // store is down". This is the tool whose job is reporting index
+                    // health, so it must not stay silent on the one signal that
+                    // matters here: bind the error, carry it, never `Err(_)`.
+                    Err(ref e) => {
                         all_indexed = false;
+                        failed_count += 1;
+                        note_store_failure(&mut stats_warnings, aliases, i, "stats", e);
                     }
                 }
             }
 
-            let (status, status_message) = if total_chunks == 0 {
-                (
-                    "building".to_string(),
-                    format!("Index is being built across {} repo(s). Searches may fail until indexing completes.", sv.len()),
-                )
-            } else {
-                (
-                    "ready".to_string(),
-                    format!("Index is ready for searching across {} repo(s).", sv.len()),
-                )
-            };
+            let (status, status_message) =
+                index_status_summary(sv.len(), failed_count, total_chunks);
 
             let response = IndexStatusResponse {
                 indexed: all_indexed,
@@ -8752,8 +8910,7 @@ impl CodesearchService {
                 mode: self.mcp_mode(),
             };
 
-            let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            return respond_with_object(&response, &stats_warnings);
         }
 
         // Single-store path
@@ -8860,34 +9017,37 @@ impl CodesearchService {
             for (alias, path) in &config.repos {
                 let db_path = path.join(crate::constants::DB_DIR_NAME);
 
-                let (total_chunks, total_files, model, lock_status) = if db_path.exists() {
+                let (total_chunks, total_files, model, lock_status, error) = if db_path.exists() {
                     let (model_name, _dims) = read_model_metadata(&db_path);
 
                     // For repos already opened in DashMap, use the live SharedStores for stats
                     // WITHOUT opening a new VectorStore connection.
                     // For unopened repos, just report metadata — do NOT open the DB.
                     if let Some(stores) = serve_state.get_opened_stores(alias) {
-                        let vs = stores.vector_store.read().await;
-                        match vs.stats() {
-                            Ok(stats) => (
-                                stats.total_chunks,
-                                stats.total_files,
-                                model_name,
-                                serve_state
-                                    .repo_lock_status(alias)
-                                    .unwrap_or("unknown")
-                                    .to_string(),
-                            ),
-                            Err(_) => (
-                                0,
-                                0,
-                                model_name,
-                                serve_state
-                                    .repo_lock_status(alias)
-                                    .unwrap_or("unknown")
-                                    .to_string(),
-                            ),
-                        }
+                        let stats_result = {
+                            let vs = stores.vector_store.read().await;
+                            vs.stats()
+                        };
+                        // `0 chunks` alone reads exactly like "not indexed yet" — the
+                        // repo may in fact be full and simply failing to answer (the
+                        // read-only-incident shape this branch exists for). Attribute
+                        // the failure to THIS repo rather than a top-level channel:
+                        // list_projects returns one entry per repo, so per-item is the
+                        // shape that actually matches the fan-out.
+                        // `repo_stats_from_result` carries only the part of this
+                        // decision that varies by Ok/Err — see its doc comment.
+                        let (total_chunks, total_files, error) =
+                            repo_stats_from_result(stats_result);
+                        (
+                            total_chunks,
+                            total_files,
+                            model_name,
+                            serve_state
+                                .repo_lock_status(alias)
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            error,
+                        )
                     } else {
                         // Repo NOT opened — read persisted stats from metadata.json
                         let (md_chunks, md_files) = read_metadata_stats(&db_path);
@@ -8896,10 +9056,10 @@ impl CodesearchService {
                         } else {
                             "available".to_string()
                         };
-                        (md_chunks, md_files, model_name, lock_status)
+                        (md_chunks, md_files, model_name, lock_status, None)
                     }
                 } else {
-                    (0, 0, "not indexed".to_string(), "unknown".to_string())
+                    (0, 0, "not indexed".to_string(), "unknown".to_string(), None)
                 };
 
                 repos_info.push(RepoInfo {
@@ -8911,6 +9071,7 @@ impl CodesearchService {
                     model,
                     lock_status,
                     groups: project_groups.get(alias).cloned().unwrap_or_default(),
+                    error,
                 });
             }
 
@@ -8962,6 +9123,10 @@ impl CodesearchService {
                 (0, 0, "not indexed".to_string(), "unknown".to_string())
             };
 
+            // Stdio mode is single-repo-at-a-time CLI usage, not the live multi-repo
+            // federation this fan-out fix targets — a stats() failure here is out of
+            // scope for this fix (VectorStore::new/stats failing locally is a different
+            // shape than a store going down mid-request in a shared serve process).
             repos_info.push(RepoInfo {
                 alias: alias.clone(),
                 project_path: path.display().to_string(),
@@ -8971,6 +9136,7 @@ impl CodesearchService {
                 model,
                 lock_status,
                 groups: project_groups.get(alias).cloned().unwrap_or_default(),
+                error: None,
             });
         }
 
