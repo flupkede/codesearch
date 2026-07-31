@@ -516,6 +516,11 @@ pub enum Commands {
         /// - auto:   Connect to serve if running, otherwise use local DB
         /// - client: Always connect to serve; fail if not running
         /// - local:  Always use local DB (classic stdio behavior)
+        ///
+        /// In auto/client mode the connection to serve is closed after 60s
+        /// without traffic (so a scale-to-zero remote can suspend) and reopened
+        /// on the next request. Tune with
+        /// CODESEARCH_MCP_PROXY_IDLE_DISCONNECT_SECS; 0 keeps it always open.
         #[arg(short, long, env = crate::constants::MCP_MODE_ENV, default_value = "auto")]
         mode: crate::mcp::McpMode,
     },
