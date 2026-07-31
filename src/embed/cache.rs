@@ -352,7 +352,17 @@ impl PersistentEmbeddingCache {
     /// mixing incompatible embeddings.
     pub fn open(model_name: &str) -> Result<Self> {
         let cache_dir = Self::cache_dir_for(model_name)?;
+        Self::open_with_cache_dir(model_name, cache_dir)
+    }
 
+    /// Open a persistent cache rooted at an explicit `cache_dir` (test seam).
+    ///
+    /// Production callers resolve the directory under
+    /// `~/.codesearch/embedding_cache/<model>` via [`Self::open`] / the
+    /// [`Self::cache_dir_for`] helper and must never call this directly. Tests
+    /// pass a `tempfile::TempDir` path so they never touch the real user cache,
+    /// and the directory is removed automatically on drop — even on panic.
+    pub(crate) fn open_with_cache_dir(model_name: &str, cache_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create embedding cache directory {}: {}",
@@ -935,8 +945,7 @@ mod tests {
     #[test]
     fn test_live_stats_registry_lifecycle() {
         // Use a unique model name so this test never collides with a real cache
-        // or with parallel test runs. The cache dir lives under the user's global
-        // ~/.codesearch/embedding_cache/ — clean it up at the end.
+        // or with parallel test runs.
         let model_name = format!(
             "__test_live_stats_tmp_{}_{}",
             std::process::id(),
@@ -952,10 +961,15 @@ mod tests {
             "live_stats should be None before any cache is opened"
         );
 
-        let cache_dir = PersistentEmbeddingCache::cache_dir_for(&model_name).unwrap();
+        // Redirect the cache into a tempdir so this test NEVER writes into the
+        // real user cache (~/.codesearch/embedding_cache/). The TempDir removes
+        // itself on drop — including on panic — so there is no manual cleanup
+        // that can leak (BUG3).
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let cache_dir = temp_dir.path().join(&model_name);
 
         // Open populates the registry via refresh_live_stats().
-        let cache = PersistentEmbeddingCache::open(&model_name).unwrap();
+        let cache = PersistentEmbeddingCache::open_with_cache_dir(&model_name, cache_dir).unwrap();
         let live = PersistentEmbeddingCache::live_stats(&model_name)
             .expect("live_stats should be Some immediately after open");
         assert_eq!(
@@ -978,14 +992,16 @@ mod tests {
         let live = PersistentEmbeddingCache::live_stats(&model_name).unwrap();
         assert_eq!(live.entries, 0, "live_stats should be 0 after clear");
 
-        // Dropping the cache removes the registry entry (Drop impl).
+        // Dropping the cache removes the registry entry (Drop impl) and closes
+        // the LMDB env, releasing the mmap so temp_dir can remove the files.
         drop(cache);
         assert!(
             PersistentEmbeddingCache::live_stats(&model_name).is_none(),
             "live_stats should be None after the cache is dropped"
         );
 
-        // Clean up the test cache directory.
-        let _ = std::fs::remove_dir_all(&cache_dir);
+        // temp_dir removes the cache dir on drop (even on panic). No manual
+        // `remove_dir_all` that could leak on an early-return/panic path.
+        drop(temp_dir);
     }
 }
