@@ -277,6 +277,8 @@ impl TypeScriptSymbolIndexer {
             .unwrap_or(SCIP_LMDB_DEFAULT_MAP_SIZE_MB);
         let mut opts = EnvOpenOptions::new();
         opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
+        // SAFETY: `NO_TLS` only changes reader-slot tracking. See `BASE_ENV_FLAGS`.
+        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
         let env =
             unsafe { TrackedEnv::open(&opts, &scip_dir, &format!("SCIP({})", db_path.display()))? };
 

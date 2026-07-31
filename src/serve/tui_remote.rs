@@ -337,6 +337,7 @@ async fn run_remote_tui_loop(
                                         match resp.json::<InfoResponse>().await {
                                             Ok(info) => OverlayState::Info {
                                                 alias,
+                                                path: info.path,
                                                 chunks: info.chunks,
                                                 files: info.files,
                                                 max_chunk_id: info.max_chunk_id,
@@ -477,6 +478,11 @@ async fn run_remote_tui_loop(
 
 #[derive(Debug, Deserialize)]
 struct InfoResponse {
+    /// On-disk path of this repo's index database on the peer. `#[serde(default)]`
+    /// so a client talking to an older serve that doesn't send this key yet still
+    /// deserializes instead of failing with "missing field" — it just renders empty.
+    #[serde(default)]
+    path: String,
     chunks: usize,
     files: usize,
     max_chunk_id: u32,

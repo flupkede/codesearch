@@ -368,6 +368,37 @@ pub const DEFAULT_IDLE_SUSPEND_SECS: u64 = 2 * 60 * 60;
 /// How often the keep-warm task pings its own ingress while active.
 pub const KEEP_WARM_INTERVAL_SECS: u64 = 2 * 60; // 2 minutes
 
+// --- MCP proxy idle-disconnect (client side of scale-to-zero) -----------------
+
+/// Environment variable to override how long the local `codesearch mcp` proxy
+/// keeps its HTTP MCP session to the remote `codesearch serve` open while no
+/// tool calls are flowing.
+///
+/// This is the client-side counterpart of `IDLE_SUSPEND_SECS_ENV`: a single
+/// long-lived Streamable-HTTP session registers as a permanently open request at
+/// the remote's ingress, so a scale-to-zero host (e.g. Azure Container Apps with
+/// a KEDA HTTP scaler) never observes 0 concurrent requests and never suspends
+/// the replica. Closing the session while idle lets it scale down; the next tool
+/// call reconnects on demand.
+pub const MCP_PROXY_IDLE_DISCONNECT_SECS_ENV: &str = "CODESEARCH_MCP_PROXY_IDLE_DISCONNECT_SECS";
+
+/// Default idle window before the local MCP proxy closes its connection to the
+/// remote serve hub (1 minute).
+///
+/// Deliberately short: it has to elapse *before* the host's own scale-in
+/// cooldown can start, otherwise the replica never gets the chance to suspend
+/// after real use stops. Still long enough that closely-spaced tool calls (an
+/// agent issuing `search` → `get_chunk` → `find` in sequence) reuse one session
+/// instead of thrashing connect/teardown.
+///
+/// `0` disables idle-disconnect entirely, restoring the previous behaviour of
+/// one connection held open for the whole lifetime of the proxy process.
+pub const DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS: u64 = 60;
+
+/// How often the MCP proxy's idle-checker task ticks. Bounds how long past the
+/// configured window a connection may linger before being closed.
+pub const MCP_PROXY_IDLE_CHECK_INTERVAL_SECS: u64 = 10;
+
 /// Default per-peer federation request timeout (seconds) when a remote peer
 /// does not specify its own `timeout_secs`. Shared by the federation client
 /// and the `remote` CLI command so both report/apply the same default.

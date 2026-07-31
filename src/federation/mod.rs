@@ -146,6 +146,10 @@ pub struct RemoteRepoStatus {
 /// field is optional/defaulted so an older/newer remote still parses.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteRepoInfo {
+    /// The peer's on-disk index path (its `.codesearch.db` directory) — NOT
+    /// the same shape as `RemoteRepoAdded.path` below, which is a repo root.
+    #[serde(default)]
+    pub path: String,
     #[serde(default)]
     pub chunks: usize,
     #[serde(default)]

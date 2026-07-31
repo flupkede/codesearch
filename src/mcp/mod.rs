@@ -2121,6 +2121,7 @@ mod tests {
             note: None,
             low_confidence: Some(true),
             suggested_tool: Some("search with mode='semantic'".to_string()),
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains(r#""low_confidence":true"#));
@@ -2135,6 +2136,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("low_confidence"));
@@ -2282,6 +2284,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.starts_with('{'));
@@ -2297,10 +2300,444 @@ mod tests {
             note: Some("auto-promoted".to_string()),
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains(r#""auto_promoted_to_regex":true"#));
         assert!(json.contains("\"note\""));
+    }
+
+    // === Store-failure reporting =========================================
+    //
+    // These exist because this exact contract has been silently re-broken three
+    // times in three review rounds, in three different handlers. The behaviour
+    // is verified in production, but nothing in CI would have caught a fourth
+    // regression. These tests make the contract cheap to keep.
+
+    #[test]
+    fn store_warning_is_formatted_in_one_place() {
+        assert_eq!(
+            super::store_warning("inriver", "chunk lookup", "os error 22"),
+            "repo 'inriver' chunk lookup failed: os error 22"
+        );
+    }
+
+    #[test]
+    fn note_store_failure_records_once_per_store() {
+        let aliases = vec!["inriver".to_string(), "akeneo".to_string()];
+        let mut warnings = Vec::new();
+        let err = anyhow::anyhow!("os error 22");
+
+        // A resolution loop runs per hit; the caller wants to know THAT the
+        // repo is down, not how many times we noticed.
+        super::note_store_failure(&mut warnings, &aliases, 0, "chunk lookup", &err);
+        super::note_store_failure(&mut warnings, &aliases, 0, "chunk lookup", &err);
+        super::note_store_failure(&mut warnings, &aliases, 1, "chunk lookup", &err);
+
+        assert_eq!(
+            warnings.len(),
+            2,
+            "duplicates must be collapsed: {warnings:?}"
+        );
+        assert!(warnings[0].contains("inriver"));
+        assert!(warnings[1].contains("akeneo"));
+    }
+
+    #[test]
+    fn note_store_failure_renders_the_whole_error_chain() {
+        // Plain `{}` shows only the outermost context, which is what turned a
+        // real EINVAL into an unactionable "Error reading from vector store".
+        let err = anyhow::anyhow!("os error 22").context("Error searching vector store");
+        let mut warnings = Vec::new();
+        super::note_store_failure(&mut warnings, &["inriver".to_string()], 0, "search", &err);
+
+        assert!(warnings[0].contains("os error 22"), "got: {}", warnings[0]);
+        assert!(warnings[0].contains("Error searching vector store"));
+    }
+
+    #[test]
+    fn note_store_failure_survives_a_short_alias_list() {
+        // Fan-out and alias vectors are parallel by convention, not by type. A
+        // mismatch must not panic in a search handler.
+        let mut warnings = Vec::new();
+        super::note_store_failure(&mut warnings, &[], 3, "search", &anyhow::anyhow!("boom"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("unknown"));
+    }
+
+    // === status(kind="index") multi-store summary ==========================
+    //
+    // Follow-up 16: a store failing mid-fan-out used to render identically to
+    // "not yet indexed" (both are 0 chunks, `all_indexed = false`). These pin
+    // the three-way decision the fix depends on — building / degraded-ready /
+    // clean-ready are distinct messages, not just a boolean.
+
+    #[test]
+    fn index_status_summary_reports_building_before_anything_failed() {
+        let (status, message) = super::index_status_summary(3, 0, 0);
+        assert_eq!(status, "building");
+        assert!(!message.contains("failed"), "got: {message}");
+    }
+
+    #[test]
+    fn index_status_summary_reports_clean_ready_with_no_failures() {
+        let (status, message) = super::index_status_summary(3, 0, 500);
+        assert_eq!(status, "ready");
+        assert!(!message.contains("failed"), "got: {message}");
+        assert!(message.contains("3 repo(s)"), "got: {message}");
+    }
+
+    #[test]
+    fn index_status_summary_surfaces_a_degraded_group_as_ready_with_a_count() {
+        // This is the exact case that used to be indistinguishable from
+        // "index still warming": some data is in, one store didn't answer.
+        let (status, message) = super::index_status_summary(3, 1, 500);
+        assert_eq!(
+            status, "ready",
+            "the two healthy stores must not be masked by the one that failed"
+        );
+        assert!(
+            message.contains("2 of 3 repo(s)") && message.contains("1 store(s) failed"),
+            "message must name both the healthy count and the failure count, got: {message}"
+        );
+        assert!(message.contains("warnings"), "got: {message}");
+    }
+
+    #[test]
+    fn index_status_summary_reports_error_when_every_store_failed() {
+        // The correlated-failure case: all stores went down together (e.g. a
+        // shared read-only-snapshot or disk-full condition), so `total_chunks`
+        // is 0 for the same reason it would be on a never-indexed group. Before
+        // this fix, `total_chunks == 0` was checked first and this rendered as
+        // "building" — byte-identical to "not indexed yet" — even though every
+        // store actively failed. `failed_count >= total_repos` must win.
+        let (status, message) = super::index_status_summary(3, 3, 0);
+        assert_eq!(
+            status, "error",
+            "a group where every store failed must not read as merely 'still building'"
+        );
+        assert!(message.contains("3"), "got: {message}");
+        assert!(message.contains("warnings"), "got: {message}");
+    }
+
+    #[test]
+    fn repo_stats_from_result_carries_counts_and_no_error_on_success() {
+        let stats = crate::vectordb::StoreStats {
+            total_chunks: 42,
+            total_files: 7,
+            indexed: true,
+            dimensions: 384,
+            max_chunk_id: 42,
+        };
+        let (total_chunks, total_files, error) = super::repo_stats_from_result(Ok(stats));
+        assert_eq!((total_chunks, total_files), (42, 7));
+        assert!(error.is_none(), "got: {error:?}");
+    }
+
+    #[test]
+    fn repo_stats_from_result_zeroes_counts_and_names_the_error_on_failure() {
+        // This is the exact case requirement 2 of follow-up 16 closes: a
+        // stats() failure used to be indistinguishable from a healthy, simply
+        // empty repo (both render as 0/0 with no error). Reintroducing the old
+        // behaviour (returning `None` unconditionally here, as the fix
+        // originally had it before this helper existed) makes this assertion
+        // fail — confirmed by hand before restoring the real branch.
+        let err = anyhow::anyhow!("LMDB env unreadable: os error 30");
+        let (total_chunks, total_files, error) =
+            super::repo_stats_from_result(Err::<crate::vectordb::StoreStats, _>(err));
+        assert_eq!((total_chunks, total_files), (0, 0));
+        let error = error.expect("a stats() failure must surface an error, not render as healthy");
+        assert!(
+            error.contains("stats unavailable") && error.contains("os error 30"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn record_stats_or_warn_pushes_nothing_on_success() {
+        let stats = crate::vectordb::StoreStats {
+            total_chunks: 5,
+            total_files: 2,
+            indexed: true,
+            dimensions: 384,
+            max_chunk_id: 5,
+        };
+        let mut warnings = Vec::new();
+        let (total_chunks, total_files, error) =
+            super::record_stats_or_warn(Ok(stats), "inriver", &mut warnings);
+        assert_eq!((total_chunks, total_files), (5, 2));
+        assert!(error.is_none(), "got: {error:?}");
+        assert!(
+            warnings.is_empty(),
+            "a healthy store must not add a warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn record_stats_or_warn_names_the_repo_and_surfaces_the_error_on_failure() {
+        // This is the exact call site `list_projects` uses — pinning it here
+        // means a future edit cannot silently stop reporting a broken store
+        // without also breaking `total_chunks`/`total_files`, which this
+        // asserts too. Reintroducing the old bug (discarding `error` after
+        // this call, or calling `repo_stats_from_result` directly and
+        // skipping the push) makes the `warnings` assertion below fail —
+        // confirmed by hand before restoring the real call site.
+        let err = anyhow::anyhow!("LMDB env unreadable: os error 30");
+        let mut warnings = Vec::new();
+        let (total_chunks, total_files, error) = super::record_stats_or_warn(
+            Err::<crate::vectordb::StoreStats, _>(err),
+            "inriver",
+            &mut warnings,
+        );
+        assert_eq!((total_chunks, total_files), (0, 0));
+        assert!(error.is_some(), "got: {error:?}");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(
+            warnings[0].contains("repo 'inriver' stats failed")
+                && warnings[0].contains("os error 30"),
+            "got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn record_stats_or_warn_does_not_duplicate_the_same_warning() {
+        // `push_store_warning` dedups by exact match; this pins that
+        // `record_stats_or_warn` still benefits from it when called twice
+        // with the same failure (e.g. a repo appearing twice in a fan-out).
+        let mut warnings = Vec::new();
+        for _ in 0..2 {
+            let err = anyhow::anyhow!("LMDB env unreadable: os error 30");
+            super::record_stats_or_warn(
+                Err::<crate::vectordb::StoreStats, _>(err),
+                "inriver",
+                &mut warnings,
+            );
+        }
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the same repo/failure must not be reported twice, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn into_results_routes_failures_into_warnings() {
+        let outcome = super::MultiReadOutcome {
+            results: vec![1u32, 2],
+            failures: vec![("inriver".to_string(), "os error 22".to_string())],
+        };
+        let mut warnings = Vec::new();
+        let results = outcome.into_results(&mut warnings, "chunk lookup");
+
+        assert_eq!(results, vec![1, 2]);
+        assert_eq!(
+            warnings,
+            vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()],
+            "taking the results must never drop the failures"
+        );
+    }
+
+    #[test]
+    fn qualify_empty_result_is_transparent_when_nothing_failed() {
+        let msg = "No definition found for 'Foo'.".to_string();
+        assert_eq!(super::qualify_empty_result(msg.clone(), &[]), msg);
+    }
+
+    #[test]
+    fn qualify_empty_result_contradicts_a_not_found_diagnosis() {
+        // "may not be indexed" is a DIAGNOSIS, and it is flatly wrong when the
+        // store never answered. An agent acts on it by giving up or by
+        // re-indexing something that was never broken.
+        let out = super::qualify_empty_result(
+            "No definition found for 'Foo'. The symbol may not be indexed.".to_string(),
+            &["repo 'inriver' definition search failed: os error 22".to_string()],
+        );
+        assert!(out.contains("WARNING"));
+        assert!(out.contains("inriver"));
+        assert!(out.contains("os error 22"));
+        // The message is a caller-facing sentence. A mangled line
+        // continuation collapses it into a run of spaces and nobody
+        // notices, because every `contains` assertion above still passes.
+        assert!(
+            out.contains("this result is not trustworthy — 1 store(s) in scope failed"),
+            "message must read as a sentence, got: {out}"
+        );
+        assert!(!out.contains("  "), "no run-on spacing in: {out}");
+    }
+
+    #[test]
+    fn respond_with_items_carries_warnings_on_every_path() {
+        use rmcp::model::RawContent;
+        let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
+            match &r.unwrap().content[0].raw {
+                RawContent::Text(t) => t.text.clone(),
+                other => panic!("expected text content, got {other:?}"),
+            }
+        };
+        let warned = vec!["repo 'inriver' outline scan failed: os error 22".to_string()];
+
+        // Empty + failure: the message must contradict its own diagnosis.
+        let out = text(super::respond_with_items(&[0u32; 0], &warned, || {
+            "No indexed chunks found for path.".to_string()
+        }));
+        assert!(out.contains("WARNING"), "got: {out}");
+        assert!(out.contains("inriver"), "got: {out}");
+
+        // NON-empty + failure: this is the path five handlers used to drop. A
+        // short-but-plausible list from a partially-dead group must say so.
+        let out = text(super::respond_with_items(&[1u32, 2], &warned, || {
+            "unused".to_string()
+        }));
+        assert!(out.contains("warnings"), "got: {out}");
+        assert!(out.contains("os error 22"), "got: {out}");
+        assert!(out.contains("results"), "got: {out}");
+
+        // Healthy: byte-identical to the pre-existing bare array.
+        let out = text(super::respond_with_items(&[1u32, 2], &[], || {
+            "unused".to_string()
+        }));
+        assert_eq!(out, "[1,2]", "a healthy response must not change shape");
+
+        // Empty and healthy: plain message, no warning noise.
+        let out = text(super::respond_with_items(&[0u32; 0], &[], || {
+            "No indexed chunks found for path.".to_string()
+        }));
+        assert_eq!(out, "No indexed chunks found for path.");
+    }
+
+    #[test]
+    fn ambiguous_chunk_payload_declares_an_incomplete_candidate_list() {
+        // `candidate_projects` reads as exhaustive. When a store failed to
+        // answer, the repo the caller wants may be the one missing from it, so
+        // the message itself must stop claiming completeness.
+        let warned = vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()];
+        let p = super::ambiguous_chunk_payload(123, &["akeneo", "custom-kb"], &warned);
+
+        assert_eq!(p["warnings"][0], warned[0].as_str());
+        let msg = p["message"].as_str().unwrap();
+        assert!(msg.contains("incomplete"), "got: {msg}");
+    }
+
+    #[test]
+    fn ambiguous_chunk_payload_is_unchanged_when_every_store_answered() {
+        let p = super::ambiguous_chunk_payload(123, &["akeneo", "custom-kb"], &[]);
+
+        // Absent, not `null`: `json!` renders `None` as an explicit null, which
+        // would be a shape change on the healthy path.
+        assert!(
+            p.get("warnings").is_none(),
+            "healthy payload must not gain a key: {p}"
+        );
+        assert_eq!(
+            p["message"],
+            "chunk_id 123 exists in multiple repositories. Specify which one."
+        );
+    }
+
+    #[test]
+    fn respond_with_object_carries_warnings_without_disturbing_the_healthy_shape() {
+        use rmcp::model::RawContent;
+        let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
+            match &r.unwrap().content[0].raw {
+                RawContent::Text(t) => t.text.clone(),
+                other => panic!("expected text content, got {other:?}"),
+            }
+        };
+        // Declaration order is deliberately NOT alphabetical: a round-trip
+        // through `serde_json::to_value` would re-sort these (the Map is a
+        // BTreeMap without `preserve_order`), so this pins that the healthy path
+        // does not round-trip.
+        #[derive(serde::Serialize)]
+        struct Chunkish {
+            path: String,
+            content: String,
+        }
+        let obj = Chunkish {
+            path: "src/x.rs".to_string(),
+            content: "fn x() {}".to_string(),
+        };
+
+        let out = text(super::respond_with_object(&obj, &[]));
+        assert_eq!(
+            out, r#"{"path":"src/x.rs","content":"fn x() {}"}"#,
+            "a healthy object must keep its bytes AND its key order"
+        );
+
+        let warned = vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()];
+        let out = text(super::respond_with_object(&obj, &warned));
+        assert!(out.contains("os error 22"), "got: {out}");
+        assert!(
+            out.contains("src/x.rs"),
+            "the object itself survives: {out}"
+        );
+    }
+
+    #[test]
+    fn retry_hint_is_dropped_only_when_a_store_failed() {
+        let hint = || Some("literal_search".to_string());
+
+        // The ordinary low-confidence hint is legitimate and must survive.
+        assert_eq!(super::retry_hint(hint(), &None), hint());
+        assert_eq!(super::retry_hint(hint(), &Some(vec![])), hint());
+
+        // But retrying against a store we KNOW is down is bad advice.
+        let warned = Some(vec!["repo 'inriver' search failed: os error 22".to_string()]);
+        assert_eq!(super::retry_hint(hint(), &warned), None);
+    }
+
+    #[test]
+    fn semantic_response_emits_warnings_to_the_caller() {
+        let response = super::SemanticSearchResponse {
+            results: vec![],
+            low_confidence: Some(true),
+            suggested_tool: None,
+            warnings: Some(vec!["repo 'inriver' search failed: os error 22".to_string()]),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"warnings\""), "got: {json}");
+        assert!(json.contains("os error 22"));
+    }
+
+    #[test]
+    fn semantic_response_omits_warnings_when_healthy() {
+        // Backward compatibility: a healthy response must be byte-identical to
+        // what callers saw before the field existed.
+        let response = super::SemanticSearchResponse {
+            results: vec![],
+            low_confidence: None,
+            suggested_tool: None,
+            warnings: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("warnings"), "got: {json}");
+    }
+
+    #[test]
+    fn literal_response_emits_warnings_and_omits_them_when_healthy() {
+        let failed = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+            warnings: Some(vec![
+                "repo 'inriver' chunk lookup failed: os error 22".to_string()
+            ]),
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains("\"warnings\""), "got: {json}");
+        assert!(json.contains("os error 22"));
+
+        let healthy = super::LiteralSearchResponse {
+            results: vec![],
+            auto_promoted_to_regex: None,
+            note: None,
+            low_confidence: None,
+            suggested_tool: None,
+            warnings: None,
+        };
+        let json = serde_json::to_string(&healthy).unwrap();
+        assert!(!json.contains("warnings"), "got: {json}");
     }
 
     #[test]
@@ -2311,6 +2748,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(!json.contains("auto_promoted_to_regex"));
@@ -2333,6 +2771,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let mut lines: Vec<String> = Vec::new();
         if response.auto_promoted_to_regex == Some(true) {
@@ -2366,6 +2805,7 @@ mod tests {
             note: None,
             low_confidence: None,
             suggested_tool: None,
+            warnings: None,
         };
         let mut lines: Vec<String> = Vec::new();
         if response.auto_promoted_to_regex == Some(true) {
@@ -2449,6 +2889,22 @@ pub use types::*;
 /// The peer is wrapped in `Arc<RwLock<Option<Peer>>>` so it can be hot-swapped when the
 /// serve connection drops and reconnects. During reconnection, tool calls return a
 /// descriptive "reconnecting" error so Claude Desktop can retry.
+///
+/// ## Idle disconnect / connect on demand
+///
+/// The peer is also `None` while the proxy is *deliberately* disconnected: after
+/// `CODESEARCH_MCP_PROXY_IDLE_DISCONNECT_SECS` (default
+/// `DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS`, `0` disables) without a successful
+/// forwarded request, the idle-checker in `run_mcp_client` closes the HTTP MCP
+/// session so a scale-to-zero remote can suspend its replica. Every successful
+/// `list_tools` / `call_tool` stamps `last_activity`, which resets that window.
+///
+/// Because a closed session is indistinguishable from a dead one at the peer
+/// slot, `call_tool` / `list_tools` signal `connect_request_tx` on their first
+/// attempt whenever the slot is `None`, asking the main loop to connect *now*
+/// instead of waiting for the failure-path reconnect cadence. The existing
+/// bounded retry-with-backoff remains the fallback if that connect does not land
+/// within the retry budget.
 struct McpProxyService {
     /// Shared peer handle — hot-swapped on reconnect.
     /// `None` means we're reconnecting to serve; tool calls return a retry-able error.
@@ -2459,18 +2915,171 @@ struct McpProxyService {
     /// from server restarts and TCP keep-alive failures without bubbling the error
     /// up to Claude Desktop.
     disconnect_tx: tokio::sync::mpsc::Sender<()>,
+    /// Ask the main loop to run `connect_to_serve` immediately (capacity-1
+    /// channel — duplicate requests coalesce, "connect now" is idempotent).
+    /// Sent when a request arrives while the peer slot is empty.
+    connect_request_tx: tokio::sync::mpsc::Sender<()>,
+    /// When the last request was successfully forwarded to serve. Shared with the
+    /// idle-checker in `run_mcp_client`, which closes the connection once this is
+    /// older than the configured idle-disconnect window.
+    last_activity: Arc<Mutex<std::time::Instant>>,
+    /// Number of requests currently being forwarded. `last_activity` only advances
+    /// on completion, so without this a request that runs longer than the idle
+    /// window (a big search, a cold symbol rebuild) would have its own transport
+    /// closed underneath it. The idle-checker never disconnects while this is > 0.
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Notified by the main loop's `connect_request_rx` arm whenever an on-demand
+    /// `connect_to_serve` attempt returns `Err` — i.e. serve refused the
+    /// connection outright, as opposed to still being slow to accept one. Lets
+    /// `await_peer` stop waiting immediately on a definitive failure instead of
+    /// polling out the rest of `PROXY_CONNECT_WAIT_MS` (previously ~20s per call
+    /// even when serve was known to be down within the first few milliseconds).
+    /// A slow-but-eventually-successful wake never touches this: it resolves by
+    /// the peer slot filling in, which `await_peer`'s own poll already catches.
+    connect_failed: Arc<tokio::sync::Notify>,
+}
+
+/// Keeps `McpProxyService::in_flight` incremented for its lifetime. A guard rather
+/// than paired add/sub calls because the forwarding loop has several early returns.
+struct InFlightGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl InFlightGuard {
+    fn new(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl McpProxyService {
     #[allow(dead_code)]
     fn new(peer: rmcp::service::Peer<RoleClient>) -> Self {
         // Direct constructor used by tests / single-shot scenarios.
-        // No reconnect plumbing — the dummy channel is never read.
+        // No reconnect plumbing — the dummy channels are never read.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (connect_tx, _connect_rx) = tokio::sync::mpsc::channel(1);
         Self {
             peer: std::sync::Arc::new(tokio::sync::RwLock::new(Some(peer))),
             disconnect_tx: tx,
+            connect_request_tx: connect_tx,
+            last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            connect_failed: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Stamp "real traffic just flowed", resetting the idle-disconnect window.
+    fn mark_activity(&self) {
+        mark_proxy_activity(&self.last_activity);
+    }
+
+    /// Best-effort nudge to the main loop: connect to serve now. A full channel
+    /// already means "a connect is pending", a closed one means the loop is gone;
+    /// both are fine to ignore — the caller's own retry/backoff covers it.
+    fn request_connect(&self) {
+        let _ = self.connect_request_tx.try_send(());
+    }
+
+    /// Wait — bounded by `PROXY_CONNECT_WAIT_MS` — for the peer slot to be filled
+    /// after `request_connect`. Returns true as soon as a peer is available.
+    ///
+    /// Without this, a request arriving after an idle-close would burn its whole
+    /// retry budget (~1s) while the on-demand connect is still waking a
+    /// scaled-to-zero remote, and fail with "reconnecting" every single time.
+    async fn await_peer(&self) -> bool {
+        self.await_peer_bounded(PROXY_CONNECT_WAIT_MS).await
+    }
+
+    /// Core of `await_peer`, parameterized on the wait budget so it is unit
+    /// testable without actually waiting out `PROXY_CONNECT_WAIT_MS` (~20s).
+    /// Uses the production refusal-grace window; see
+    /// `await_peer_bounded_with_grace` for what that means and why it is its
+    /// own parameter.
+    async fn await_peer_bounded(&self, wait_ms: u64) -> bool {
+        self.await_peer_bounded_with_grace(wait_ms, CONNECT_REFUSAL_GRACE)
+            .await
+    }
+
+    /// Core of `await_peer_bounded`, additionally parameterized on the
+    /// refusal-grace window so *that* is unit testable without waiting out
+    /// `reconnect::INTERVAL_SECS` (~3s) for real.
+    ///
+    /// Polls the peer slot on `PROXY_RETRY_BACKOFF_MS` cadence, but also races
+    /// each poll against `connect_failed` so a definitive on-demand connect
+    /// failure (serve refused the connection, not merely slow to accept one)
+    /// clamps the remaining wait down to `refusal_grace` instead of polling
+    /// out the rest of `wait_ms`. A slow-but-still-in-progress wake never
+    /// fires `connect_failed` — it is only notified from an `Err` return of
+    /// `connect_to_serve` — so this does not shorten the legitimate
+    /// scale-to-zero wake path, only the case where serve is already known to
+    /// have refused this attempt.
+    ///
+    /// The clamp is deliberately *not* an immediate return: a refusal only
+    /// means this one on-demand attempt was refused, not that serve won't
+    /// recover — `run_mcp_client`'s own disconnect/reconnect cycle
+    /// (`reconnect::INTERVAL_SECS` later) can still land within the original
+    /// budget, e.g. when serve is mid-restart rather than genuinely down.
+    /// Returning immediately turned that case — previously transparent to the
+    /// caller, since the pre-fix full-budget poll caught the reconnect — into
+    /// a visible "reconnecting" error on the very first request after a
+    /// restart. Clamping to `refusal_grace` keeps most of the original fix's
+    /// win (a hard-down serve is still bounded well under the full `wait_ms`)
+    /// while still giving that recovery cycle room to land.
+    async fn await_peer_bounded_with_grace(
+        &self,
+        wait_ms: u64,
+        refusal_grace: std::time::Duration,
+    ) -> bool {
+        let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        loop {
+            // Register for the next failure notification BEFORE checking the
+            // peer slot, so a failure landing between this check and the
+            // `select!` below cannot be missed (the standard tokio::sync::Notify
+            // idiom: create the `Notified` future first, await it second).
+            let failed = self.connect_failed.notified();
+            if self.peer.read().await.is_some() {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let backoff = std::time::Duration::from_millis(PROXY_RETRY_BACKOFF_MS)
+                .min(deadline.saturating_duration_since(now));
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = failed => {
+                    // A concurrent successful connect could still have landed in
+                    // the instant before this notification; one last check keeps
+                    // that case correct instead of reporting a false failure.
+                    if self.peer.read().await.is_some() {
+                        return true;
+                    }
+                    deadline = deadline.min(now + refusal_grace);
+                }
+            }
+        }
+    }
+
+    /// On an empty peer slot (a deliberate idle-close or a real outage), ask the
+    /// main loop to connect *now* instead of waiting for the failure-path
+    /// reconnect cadence to notice, then give that connect a bounded window to
+    /// land. Returns true if a peer became available and the caller should
+    /// retry its forwarded call immediately.
+    ///
+    /// Only meaningful on the caller's first attempt (`attempt == 0`) — a
+    /// second empty slot means the on-demand connect already ran and fell
+    /// through to the ordinary retry/backoff path. Pulled out of `list_tools`/
+    /// `call_tool` because the two copies had already started to drift (see
+    /// review remarks on the commit that added this).
+    async fn try_on_demand_connect(&self) -> bool {
+        self.request_connect();
+        self.await_peer().await
     }
 
     /// Force a reconnect: clear the shared peer and signal the main loop in
@@ -2494,6 +3103,55 @@ const PROXY_MAX_RETRY_ATTEMPTS: u32 = 3;
 /// Backoff between proxy retries, also used as the post-reconnect settle delay.
 const PROXY_RETRY_BACKOFF_MS: u64 = 500;
 
+/// How long a request may wait for an on-demand connect (after an idle-close, or
+/// while serve is still starting) before falling back to the retry/backoff path.
+///
+/// Sized for a scale-to-zero host: the remote's ingress *holds* the request while
+/// it activates a suspended replica, so the connect itself can legitimately take
+/// several seconds. Waiting here is strictly better than returning "reconnecting"
+/// on the first call after every idle period.
+const PROXY_CONNECT_WAIT_MS: u64 = 20_000;
+
+/// How long `await_peer_bounded` still waits after a definitive on-demand
+/// connect refusal, instead of returning immediately or polling out the rest
+/// of `PROXY_CONNECT_WAIT_MS`.
+///
+/// Sized to cover `run_mcp_client`'s own disconnect/reconnect cycle
+/// (`reconnect::INTERVAL_SECS`, ~3s) plus margin for the ~100ms synthetic-
+/// disconnect delay and `connect_to_serve`'s own latency — so a serve that is
+/// merely mid-restart still recovers transparently within this window,
+/// exactly as it did before the refusal short-circuit existed, while a
+/// genuinely-down serve is still bounded well under the full ~20s budget.
+const CONNECT_REFUSAL_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(reconnect::INTERVAL_SECS * 1_000 + 1_000);
+
+/// Record a definitive on-demand connect refusal: wake any `await_peer_bounded`
+/// callers immediately (via `connect_failed`) instead of leaving them to poll
+/// out their full budget for a refusal that is already known, then seed a
+/// synthetic disconnect so `run_mcp_client`'s own disconnect/reconnect cycle
+/// picks it up. A genuinely slow wake never reaches this function — it
+/// resolves via the `Ok` branch in the caller once the peer slot fills in —
+/// so this does not shorten a legitimate scale-to-zero wake, only a refusal.
+///
+/// Pulled out of `run_mcp_client`'s `connect_request_rx` arm so the one line
+/// that makes `await_peer_bounded`'s refusal short-circuit real in production
+/// is covered by a test that calls this function directly, not only by tests
+/// that call `connect_failed.notify_waiters()` themselves in isolation —
+/// those pin how `await_peer_bounded` *reacts* to a notification, but nothing
+/// previously pinned that this call site still *fires* one: deleting this
+/// function's body left the full suite green.
+fn note_connect_failure(
+    connect_failed: &tokio::sync::Notify,
+    disconnect_tx: &tokio::sync::mpsc::Sender<()>,
+) {
+    connect_failed.notify_waiters();
+    let tx = disconnect_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = tx.send(()).await;
+    });
+}
+
 /// Heuristic: does this error message describe a transport-level failure
 /// (broken TCP, server gone, stale keep-alive, stale session) that warrants
 /// a forced reconnect + retry, as opposed to a real tool-level error that
@@ -2516,6 +3174,239 @@ mod reconnect {
     pub const MAX_DURATION_SECS: u64 = 300; // 5 minutes
 }
 
+/// Record the current instant as the proxy's most recent activity.
+fn mark_proxy_activity(last_activity: &Arc<Mutex<std::time::Instant>>) {
+    if let Ok(mut slot) = last_activity.lock() {
+        *slot = std::time::Instant::now();
+    }
+}
+
+/// Resolve the MCP proxy idle-disconnect window: explicit value → env var →
+/// `DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS`. Mirrors how `run_serve` resolves its
+/// own `idle_suspend_secs`. `0` means "never idle-disconnect".
+fn resolve_proxy_idle_disconnect_secs(explicit: Option<u64>) -> u64 {
+    explicit
+        .or_else(|| {
+            std::env::var(crate::constants::MCP_PROXY_IDLE_DISCONNECT_SECS_ENV)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        })
+        .unwrap_or(crate::constants::DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS)
+}
+
+/// Has the proxy been idle long enough to close its connection to serve?
+///
+/// `threshold_secs == 0` disables idle-disconnect, so this always returns false.
+/// `now` is a parameter (rather than read from the clock) purely so this is unit
+/// testable without sleeping.
+fn is_idle(
+    last_activity: std::time::Instant,
+    threshold_secs: u64,
+    now: std::time::Instant,
+) -> bool {
+    if threshold_secs == 0 {
+        return false;
+    }
+    now.saturating_duration_since(last_activity).as_secs() >= threshold_secs
+}
+
+#[cfg(test)]
+mod proxy_idle_tests {
+    use super::{is_idle, resolve_proxy_idle_disconnect_secs};
+    use crate::constants::DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn not_idle_before_the_threshold_elapses() {
+        let last = Instant::now();
+        let now = last + Duration::from_secs(59);
+        assert!(!is_idle(last, 60, now));
+    }
+
+    #[test]
+    fn idle_once_the_threshold_is_reached() {
+        let last = Instant::now();
+        assert!(is_idle(last, 60, last + Duration::from_secs(60)));
+        assert!(is_idle(last, 60, last + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn zero_threshold_disables_idle_disconnect() {
+        let last = Instant::now();
+        // Even an absurdly long idle period must not trigger a close.
+        assert!(!is_idle(last, 0, last + Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn clock_going_backwards_is_not_idle() {
+        // saturating_duration_since floors at zero instead of panicking.
+        let last = Instant::now() + Duration::from_secs(10);
+        assert!(!is_idle(last, 60, Instant::now()));
+    }
+
+    #[test]
+    fn explicit_value_wins_over_env_and_default() {
+        // Explicit takes precedence without consulting the environment, so this
+        // stays correct regardless of what other tests set.
+        assert_eq!(resolve_proxy_idle_disconnect_secs(Some(5)), 5);
+        assert_eq!(resolve_proxy_idle_disconnect_secs(Some(0)), 0);
+    }
+
+    #[test]
+    fn falls_back_to_the_documented_default() {
+        // No explicit value and (in the normal test environment) no env override.
+        if std::env::var(crate::constants::MCP_PROXY_IDLE_DISCONNECT_SECS_ENV).is_err() {
+            assert_eq!(
+                resolve_proxy_idle_disconnect_secs(None),
+                DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS
+            );
+        }
+    }
+}
+
+/// Unit tests for `await_peer_bounded`'s refusal clamp and the
+/// `note_connect_failure` call site that fires it in production, isolated
+/// from the full `run_mcp_client` loop by parameterizing the wait budget (and,
+/// for the clamp itself, the refusal-grace window) so these run in
+/// milliseconds instead of the real `PROXY_CONNECT_WAIT_MS` (~20s) or
+/// `reconnect::INTERVAL_SECS` (~3s).
+#[cfg(test)]
+mod await_peer_tests {
+    use super::McpProxyService;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A `McpProxyService` whose peer slot never fills on its own — no reconnect
+    /// plumbing behind it, matching the "single-shot" spirit of the existing
+    /// `McpProxyService::new` test constructor but with an *empty* peer slot,
+    /// which is the case `await_peer_bounded` actually has to wait through.
+    fn empty_peer_service() -> McpProxyService {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (connect_tx, _connect_rx) = tokio::sync::mpsc::channel(1);
+        McpProxyService {
+            peer: Arc::new(tokio::sync::RwLock::new(None)),
+            disconnect_tx: tx,
+            connect_request_tx: connect_tx,
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            connect_failed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn times_out_when_the_peer_slot_never_fills_and_nothing_is_notified() {
+        let svc = empty_peer_service();
+        let start = Instant::now();
+        let ok = svc.await_peer_bounded(150).await;
+        assert!(!ok);
+        // Baseline: with no signal at all this genuinely waits out the budget,
+        // rather than returning early for some unrelated reason — which is what
+        // makes the next test's early return meaningful.
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "expected the full wait budget to elapse, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_failure_notification_clamps_the_wait_to_the_refusal_grace() {
+        // Uses `await_peer_bounded_with_grace` directly (not the production
+        // `await_peer_bounded`, which hardcodes `CONNECT_REFUSAL_GRACE` at
+        // ~4s) so the clamp itself is exercised with a millisecond-scale
+        // grace instead of actually waiting out `reconnect::INTERVAL_SECS`.
+        let svc = empty_peer_service();
+        let connect_failed = svc.connect_failed.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            connect_failed.notify_waiters();
+        });
+
+        let start = Instant::now();
+        // Budget is 5s, grace is 100ms — if the clamp did not fire, this call
+        // would take the full 5s instead of ~20ms (notification) + ~100ms
+        // (grace) for the peer slot to (not) fill in.
+        let ok = svc
+            .await_peer_bounded_with_grace(5_000, Duration::from_millis(100))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            !ok,
+            "peer slot stayed empty — this was a refusal, not a success"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "expected the failure notification to clamp the 5s wait down near the \
+             grace window, took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "expected the clamp to still honor the refusal-grace window rather than \
+             returning immediately, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn note_connect_failure_wakes_a_parked_waiter_and_schedules_a_disconnect() {
+        // Pins the exact production call site (`run_mcp_client`'s
+        // `connect_request_rx` Err arm) rather than re-testing
+        // `await_peer_bounded`'s reaction to a hand-fired notification: this
+        // is the one line that makes that short-circuit real, and nothing
+        // previously covered it — deleting `note_connect_failure`'s body left
+        // the whole suite green.
+        let connect_failed = Arc::new(tokio::sync::Notify::new());
+        let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let waiter_failed = connect_failed.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_failed.notified().await;
+        });
+        // Give the spawned task a moment to actually park in `.notified()`
+        // before firing, so this proves a live waiter is woken — not merely
+        // that a notification lands somewhere.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        super::note_connect_failure(&connect_failed, &disconnect_tx);
+
+        tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("note_connect_failure did not wake the parked waiter in time")
+            .expect("waiter task panicked");
+
+        let got = tokio::time::timeout(Duration::from_millis(500), disconnect_rx.recv())
+            .await
+            .expect("note_connect_failure did not schedule the synthetic disconnect in time");
+        assert!(
+            got.is_some(),
+            "expected the disconnect channel to receive a message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_notification_before_anyone_is_waiting_does_not_leak_forward() {
+        // Notify::notify_waiters() only wakes tasks already parked in
+        // .notified() — it stores no permit for a future waiter (unlike
+        // notify_one()). Pinned explicitly because `await_peer_bounded`'s
+        // correctness depends on this: a failure from an unrelated, already-
+        // finished wait must not falsely short-circuit the next one.
+        let svc = empty_peer_service();
+        svc.connect_failed.notify_waiters(); // no one is waiting yet
+
+        let start = Instant::now();
+        let ok = svc.await_peer_bounded(150).await;
+        assert!(!ok);
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "a pre-existing notification must not shorten a later, unrelated wait, took {:?}",
+            start.elapsed()
+        );
+    }
+}
+
 impl ServerHandler for McpProxyService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -2533,12 +3424,16 @@ impl ServerHandler for McpProxyService {
         request: Option<PaginatedRequestParams>,
         _cx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let _in_flight = InFlightGuard::new(&self.in_flight);
         let mut last_err: Option<String> = None;
         for attempt in 0..PROXY_MAX_RETRY_ATTEMPTS {
             let peer = self.peer.read().await.clone();
             match peer {
                 Some(p) => match p.list_tools(request.clone()).await {
-                    Ok(r) => return Ok(r),
+                    Ok(r) => {
+                        self.mark_activity();
+                        return Ok(r);
+                    }
                     Err(e) => {
                         let msg = e.to_string();
                         if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
@@ -2556,6 +3451,14 @@ impl ServerHandler for McpProxyService {
                     }
                 },
                 None => {
+                    // Empty peer slot: either a deliberate idle-close or a real
+                    // outage. `try_on_demand_connect` asks the main loop to
+                    // connect *now* rather than waiting for the failure-path
+                    // reconnect cadence to notice, bounded so we still fall back
+                    // to the ordinary retry/backoff below if it doesn't land.
+                    if attempt == 0 && self.try_on_demand_connect().await {
+                        continue;
+                    }
                     if attempt < PROXY_MAX_RETRY_ATTEMPTS - 1 {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             PROXY_RETRY_BACKOFF_MS,
@@ -2581,12 +3484,16 @@ impl ServerHandler for McpProxyService {
         request: CallToolRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let _in_flight = InFlightGuard::new(&self.in_flight);
         let mut last_err: Option<String> = None;
         for attempt in 0..PROXY_MAX_RETRY_ATTEMPTS {
             let peer = self.peer.read().await.clone();
             match peer {
                 Some(p) => match p.call_tool(request.clone()).await {
-                    Ok(r) => return Ok(r),
+                    Ok(r) => {
+                        self.mark_activity();
+                        return Ok(r);
+                    }
                     Err(e) => {
                         let msg = e.to_string();
                         if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
@@ -2605,6 +3512,14 @@ impl ServerHandler for McpProxyService {
                     }
                 },
                 None => {
+                    // Empty peer slot: either a deliberate idle-close or a real
+                    // outage. `try_on_demand_connect` asks the main loop to
+                    // connect *now* rather than waiting for the failure-path
+                    // reconnect cadence to notice, bounded so we still fall back
+                    // to the ordinary retry/backoff below if it doesn't land.
+                    if attempt == 0 && self.try_on_demand_connect().await {
+                        continue;
+                    }
                     if attempt < PROXY_MAX_RETRY_ATTEMPTS - 1 {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             PROXY_RETRY_BACKOFF_MS,
@@ -3585,6 +4500,319 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
 /// Created by `CodesearchService::resolve_routing()`, this struct encapsulates
 /// all the decisions a handler needs: which store to use, whether to fan out,
 /// and whether to call `ensure_database_exists()`.
+/// Outcome of a fan-out read across several repos.
+///
+/// Exists so an empty `results` is never ambiguous. A group query that hits a
+/// broken store used to come back as a successful search with zero hits, which
+/// is the most misleading signal this system can emit — it reads as "the corpus
+/// does not contain that", and it is what sent an earlier round of this
+/// investigation chasing an indexing problem that did not exist.
+#[must_use]
+struct MultiReadOutcome<R> {
+    /// Merged, deduplicated, score-sorted results from the stores that worked.
+    results: Vec<R>,
+    /// `(alias, full error chain)` for every store that failed. Empty on a
+    /// clean run.
+    failures: Vec<(String, String)>,
+}
+
+/// Decide the `status`/`status_message` pair for a multi-store
+/// `status(kind="index"|"projects")` response.
+///
+/// Pulled out of the handler so the four-way call — every store down, still
+/// building, ready but one or more stores failed to report their stats, or
+/// fully ready — is testable without opening a single store. `failed_count`
+/// is checked before declaring "building" or "ready" precisely so a store
+/// that came back `Err` cannot render identically to one that returned
+/// healthy zero-valued stats. The all-failed case is checked first: a
+/// correlated failure (e.g. every store hits the same read-only-snapshot or
+/// disk-full condition at once) also has `total_chunks == 0`, and without
+/// this ordering it fell through to "building" — byte-identical to a group
+/// that simply has not been indexed yet, which is the exact indistinguishable
+/// case this fix exists to close. See AGENTS.md's fan-out warnings-channel
+/// rule.
+fn index_status_summary(
+    total_repos: usize,
+    failed_count: usize,
+    total_chunks: usize,
+) -> (String, String) {
+    if total_repos > 0 && failed_count >= total_repos {
+        (
+            "error".to_string(),
+            format!(
+                "All {total_repos} repo(s) failed to report status — every store errored, see `warnings`."
+            ),
+        )
+    } else if total_chunks == 0 {
+        (
+            "building".to_string(),
+            format!(
+                "Index is being built across {total_repos} repo(s). Searches may fail until indexing completes."
+            ),
+        )
+    } else if failed_count > 0 {
+        (
+            "ready".to_string(),
+            format!(
+                "Index is ready for searching across {} of {total_repos} repo(s) — {failed_count} store(s) failed to report status, see `warnings`.",
+                total_repos.saturating_sub(failed_count),
+            ),
+        )
+    } else {
+        (
+            "ready".to_string(),
+            format!("Index is ready for searching across {total_repos} repo(s)."),
+        )
+    }
+}
+
+/// Turn a store's `stats()` result into the `(total_chunks, total_files,
+/// error)` triple `list_projects` reports per repo.
+///
+/// Pulled out of the handler, mirroring `index_status_summary` just above, so
+/// the fix's actual claim — a `stats()` failure surfaces as `error: Some(..)`
+/// with zero-valued counts, instead of silently rendering as a healthy-looking
+/// empty repo — is unit-testable without opening a real `VectorStore` or
+/// `ServeState`. The two calls to `serve_state.repo_lock_status()` in
+/// `list_projects` don't vary by outcome, so they stay in the handler; this
+/// covers only the part that does.
+fn repo_stats_from_result(
+    stats: anyhow::Result<crate::vectordb::StoreStats>,
+) -> (usize, usize, Option<String>) {
+    match stats {
+        Ok(s) => (s.total_chunks, s.total_files, None),
+        Err(ref e) => (0, 0, Some(format!("stats unavailable: {e:#}"))),
+    }
+}
+
+/// `repo_stats_from_result` plus recording the failure as a caller-facing
+/// warning, in one call.
+///
+/// `list_projects` used to inline `repo_stats_from_result` and then decide
+/// separately whether to push a warning — two steps a future edit could
+/// silently pull apart (drop the second one, keep the first) without
+/// affecting `total_chunks`/`total_files` at all, so nothing would look
+/// wrong at the call site. Folding both into one call means a regression
+/// that drops the warning has to delete this call entirely, which also
+/// deletes the counts — no longer a silent edit. This is also the seam a
+/// test can drive without opening a real `VectorStore`/`ServeState`: it
+/// exercises the exact composition `list_projects` calls, not a
+/// re-implementation of it.
+fn record_stats_or_warn(
+    stats: anyhow::Result<crate::vectordb::StoreStats>,
+    alias: &str,
+    warnings: &mut Vec<String>,
+) -> (usize, usize, Option<String>) {
+    let (total_chunks, total_files, error) = repo_stats_from_result(stats);
+    if let Some(ref msg) = error {
+        push_store_warning(warnings, &store_warning(alias, "stats", msg));
+    }
+    (total_chunks, total_files, error)
+}
+
+/// Record a per-store failure as a caller-facing warning, once per store.
+///
+/// Resolution loops run per hit, so a single broken store would otherwise emit
+/// one identical warning per result; the caller wants to know *that* the repo
+/// is down, not how many times it noticed.
+fn note_store_failure(
+    warnings: &mut Vec<String>,
+    aliases: &[String],
+    idx: usize,
+    what: &str,
+    err: &anyhow::Error,
+) {
+    let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
+    push_store_warning(warnings, &store_warning(alias, what, &format!("{err:#}")));
+}
+
+/// The one place a per-store warning line is formatted. Two copies used to
+/// exist and could drift; a caller matching on this text would then silently
+/// stop matching half of them.
+fn store_warning(alias: &str, what: &str, err: &str) -> String {
+    format!("repo '{alias}' {what} failed: {err}")
+}
+
+/// Append a warning unless it is already present, logging it once.
+fn push_store_warning(warnings: &mut Vec<String>, msg: &str) {
+    if !warnings.iter().any(|w| w == msg) {
+        tracing::error!("MCP: {}", msg);
+        warnings.push(msg.to_string());
+    }
+}
+
+/// The single exit for a handler that returns a list of items plus a warnings
+/// channel.
+///
+/// Five handlers previously read their channel ONLY on the empty path, so a
+/// partially-failed group returned a plausible-looking short list with no
+/// signal at all - the same false negative as an empty result, just harder to
+/// notice. Routing every exit through here means the channel is carried
+/// whether the list is empty or not, and there is no per-handler discipline
+/// left to forget.
+///
+/// A healthy call is byte-identical to the previous behaviour (a bare JSON
+/// array), so this is backward compatible.
+fn respond_with_items<T: serde::Serialize>(
+    items: &[T],
+    warnings: &[String],
+    empty_message: impl FnOnce() -> String,
+) -> Result<CallToolResult, McpError> {
+    if items.is_empty() {
+        return Ok(CallToolResult::success(vec![Content::text(
+            qualify_empty_result(empty_message(), warnings),
+        )]));
+    }
+    if !warnings.is_empty() {
+        let payload = serde_json::json!({ "results": items, "warnings": warnings });
+        return Ok(CallToolResult::success(vec![Content::text(
+            payload.to_string(),
+        )]));
+    }
+    let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string());
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// The object-shaped sibling of `respond_with_items`: one exit for handlers that
+/// return a single struct rather than a list.
+///
+/// A `warnings` *field* on the response struct was the obvious fix and is the
+/// weaker one — the handler is still free to populate it with `None`, and a test
+/// that builds the struct itself cannot see that happen. Review round 8 proved
+/// it: the round-7 defect was reintroduced at the `get_chunk` success path and
+/// all 630 tests still passed.
+///
+/// **This is an improvement, not a guarantee.** Round 9 measured the difference:
+/// passing `&[]` here is exactly as writable as `warnings: None` was, the suite
+/// still cannot see it, and no lint fires (the channel stays "used" by the
+/// ambiguous path). What it actually buys is narrower and real — no optional
+/// field whose absence is invisible, no future construction site that can zero
+/// it, and an audit that collapses from "check every response struct" to "check
+/// the call sites of two functions", which is grep-answerable. The channel can
+/// no longer be *forgotten*, only actively discarded.
+///
+/// Healthy path serializes the struct directly, so its key order and bytes are
+/// unchanged. `serde_json::Map` is a `BTreeMap` here (no `preserve_order`
+/// feature), so round-tripping through `to_value` would silently re-sort the
+/// keys — which is only acceptable on the warning path, where the shape is new
+/// anyway.
+fn respond_with_object<T: serde::Serialize>(
+    value: &T,
+    warnings: &[String],
+) -> Result<CallToolResult, McpError> {
+    if !warnings.is_empty() {
+        if let Ok(mut v) = serde_json::to_value(value) {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("warnings".to_string(), serde_json::json!(warnings));
+                return Ok(CallToolResult::success(vec![Content::text(v.to_string())]));
+            }
+        }
+    }
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// Build the `ambiguous_chunk_id` payload for `get_chunk`.
+///
+/// `candidate_projects` reads as the complete set of repos holding this
+/// chunk_id, so a store that failed to answer must be declared: the repo the
+/// caller actually wants may be the one missing from the list. Extracted so the
+/// "is this list complete?" decision is testable without standing up stores.
+///
+/// `warnings` is *inserted* rather than emitted as `null`, so the healthy-path
+/// shape is byte-identical to before — matching `skip_serializing_if` on every
+/// other warnings-carrying response.
+fn ambiguous_chunk_payload(
+    chunk_id: u32,
+    candidate_projects: &[&str],
+    warnings: &[String],
+) -> serde_json::Value {
+    let mut message =
+        format!("chunk_id {chunk_id} exists in multiple repositories. Specify which one.");
+    if !warnings.is_empty() {
+        message.push_str(" The candidate list is incomplete — see `warnings`.");
+    }
+    let mut payload = serde_json::json!({
+        "error_code": "ambiguous_chunk_id",
+        "message": message,
+        "candidate_projects": candidate_projects,
+        "hint_for_agent": "The chunk_id collision is a known limitation of multi-repo mode. Re-run get_chunk with one of the candidate_projects, or use search to identify the correct repository first."
+    });
+    if !warnings.is_empty() {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("warnings".to_string(), serde_json::json!(warnings));
+        }
+    }
+    payload
+}
+
+/// Decide whether to keep the "try another tool" hint.
+///
+/// A weak or empty result caused by a store that is DOWN is not a reason to
+/// retry with a different tool — that just sends the agent back at the same
+/// broken store. Extracted from `build_semantic_response` so the decision is
+/// testable without standing up a service.
+fn retry_hint(suggested: Option<String>, warnings: &Option<Vec<String>>) -> Option<String> {
+    // `is_some()` alone is wrong: an empty `Some(vec![])` means nothing failed,
+    // and suppressing a legitimate hint on it would be a silent regression the
+    // moment a caller constructs the warnings vec eagerly.
+    if warnings.as_ref().is_some_and(|w| !w.is_empty()) {
+        return None;
+    }
+    suggested
+}
+
+/// Qualify a "nothing found" message when a store in scope actually failed.
+///
+/// This is the defect that keeps coming back in a new handler: "No definition
+/// found — the symbol may not be indexed" is a *diagnosis*, and it is flatly
+/// wrong when the store never answered. An agent acts on it by giving up or by
+/// re-indexing something that was never broken.
+fn qualify_empty_result(message: String, warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return message;
+    }
+    format!(
+        "{message}\n\nWARNING: this result is not trustworthy — {count} store(s) in \
+         scope failed, so \"not found\" may mean \"not searched\":\n{detail}",
+        count = warnings.len(),
+        detail = warnings.join("\n")
+    )
+}
+
+// Hand-written rather than derived: `derive(Default)` would demand `R: Default`,
+// which the result types do not implement and do not need to.
+impl<R> Default for MultiReadOutcome<R> {
+    fn default() -> Self {
+        Self {
+            results: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
+impl<R> MultiReadOutcome<R> {
+    /// Render failures as caller-facing warning lines.
+    fn warnings(&self, what: &str) -> Vec<String> {
+        self.failures
+            .iter()
+            .map(|(alias, err)| store_warning(alias, what, err))
+            .collect()
+    }
+
+    /// Take the results, routing any failures into `warnings` on the way out.
+    ///
+    /// Deliberately the only ergonomic way to get at `results`: reaching for
+    /// the field directly and dropping `failures` is `unwrap_or_default()`
+    /// under a new name, and that is the bug this whole type exists to stop.
+    fn into_results(self, warnings: &mut Vec<String>, what: &str) -> Vec<R> {
+        for (alias, err) in &self.failures {
+            push_store_warning(warnings, &store_warning(alias, what, err));
+        }
+        self.results
+    }
+}
+
 struct MultiStoreContext {
     /// Single-store override (set when exactly 1 repo resolved, or None).
     /// Pass to `with_*_store_read_for()` methods.
@@ -3607,6 +4835,16 @@ struct MultiStoreContext {
 }
 
 impl MultiStoreContext {
+    /// Aliases parallel to `stores_vec`, or an empty slice when absent.
+    ///
+    /// Every fan-out that reports a per-store failure needs this, and hand-rolling
+    /// `let empty = Vec::new(); ...unwrap_or(&empty)` at each site produced four
+    /// copies of the same two lines — and one handler where the binding was out
+    /// of scope, which is how a silent store read survived a round of review.
+    fn aliases(&self) -> &[String] {
+        self.store_aliases.as_deref().unwrap_or(&[])
+    }
+
     /// Prefix a result path with its owning alias for multi-repo identification.
     ///
     /// Three dispatch modes:
@@ -4084,16 +5322,22 @@ impl CodesearchService {
     ///
     /// Runs `action` against each store and merges all results into a single vec,
     /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
+    ///
+    /// A per-store failure does NOT abort the fan-out — one broken repo should
+    /// not blind a group query to the healthy ones — but it is reported back in
+    /// [`MultiReadOutcome::failures`] so the caller can tell an genuinely empty
+    /// result apart from a total failure.
     async fn with_vector_store_read_multi<R, F>(
         &self,
         mut action: F,
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
-    ) -> Result<Vec<R>>
+    ) -> Result<MultiReadOutcome<R>>
     where
         F: FnMut(&VectorStore) -> anyhow::Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
+        let mut failures: Vec<(String, String)> = Vec::new();
         let mut all_results: Vec<R> = Vec::new();
         let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
             std::collections::HashMap::new();
@@ -4117,7 +5361,16 @@ impl CodesearchService {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Vector store read failed for multi-store fan-out: {:?}", e);
+                    tracing::warn!(
+                        "Vector store read failed for multi-store fan-out (alias {}): {:?}",
+                        alias,
+                        e
+                    );
+                    // Remembered, not just logged: a caller that only sees an
+                    // empty Vec cannot tell "nothing matched" from "every store
+                    // failed", and the second one must never be reported as a
+                    // successful empty search.
+                    failures.push((alias.to_string(), format!("{e:#}")));
                 }
             }
         }
@@ -4129,23 +5382,32 @@ impl CodesearchService {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        Ok(all_results)
+        Ok(MultiReadOutcome {
+            results: all_results,
+            failures,
+        })
     }
 
     /// Fan-out FTS store read across multiple stores, merging results.
     ///
     /// Runs `action` against each store and merges all results into a single vec,
     /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
+    ///
+    /// Like the vector fan-out, a per-store failure does not abort the query but
+    /// IS reported in [`MultiReadOutcome::failures`]. The literal path is not
+    /// hypothetical here: during the cloud read-only incident every affected
+    /// vendor returned 0 results for literal search too, and it looked clean.
     async fn with_fts_store_read_multi<R, F>(
         &self,
         mut action: F,
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
-    ) -> Result<Vec<R>>
+    ) -> Result<MultiReadOutcome<R>>
     where
         F: FnMut(&FtsStore) -> Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
+        let mut failures: Vec<(String, String)> = Vec::new();
         let mut all_results: Vec<R> = Vec::new();
         let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
             std::collections::HashMap::new();
@@ -4168,7 +5430,14 @@ impl CodesearchService {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("FTS store read failed for multi-store fan-out: {:?}", e);
+                    tracing::warn!(
+                        "FTS store read failed for multi-store fan-out (alias {}): {:?}",
+                        alias,
+                        e
+                    );
+                    // Same contract as the vector fan-out: a swallowed failure
+                    // must not reach the caller as an ordinary empty result.
+                    failures.push((alias.to_string(), format!("{e:#}")));
                 }
             }
         }
@@ -4180,7 +5449,10 @@ impl CodesearchService {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        Ok(all_results)
+        Ok(MultiReadOutcome {
+            results: all_results,
+            failures,
+        })
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -4821,8 +6093,7 @@ impl CodesearchService {
                 Err(e) => {
                     tracing::error!("MCP: Failed to get embedding service: {:?}", e);
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error initializing embedding service: {}",
-                        e
+                        "Error initializing embedding service: {e:#}"
                     ))]));
                 }
             };
@@ -4834,12 +6105,17 @@ impl CodesearchService {
                 Err(e) => {
                     tracing::error!("MCP: Failed to embed query: {:?}", e);
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error embedding query: {}",
-                        e
+                        "Error embedding query: {e:#}"
                     ))]));
                 }
             }
         };
+
+        // Failures on this single-store path. The group fan-out has carried a
+        // warnings channel since the read-only incident; without the same thing
+        // here, `project=<alias>` — the form an agent uses most — still reports
+        // a broken store as an ordinary empty result.
+        let mut single_warnings: Vec<String> = Vec::new();
 
         // Search vector store
         let vector_results = match self
@@ -4856,10 +6132,23 @@ impl CodesearchService {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("MCP: Search failed: {:?}", e);
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error searching vector store: {}",
-                    e
-                ))]));
+                // Only "semantic" has no second backend to fall back on. In
+                // hybrid/auto the FTS half can still answer, so hard-failing
+                // here would throw away good results — the same mistake this
+                // branch already fixed once in the group fan-out.
+                //
+                // `{:#}` renders the whole anyhow chain. With plain `{}` the
+                // caller only ever saw the outermost `.context(...)` wrapper
+                // ("Error reading from project-routed vector store"), which
+                // hides the actual fault and makes remote diagnosis guesswork.
+                if mode == "semantic" {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error searching vector store: {:#}",
+                        e
+                    ))]));
+                }
+                single_warnings.push(format!("vector search failed: {e:#}"));
+                Vec::new()
             }
         };
 
@@ -4888,6 +6177,7 @@ impl CodesearchService {
                 has_identifiers,
                 ctx.project_alias.as_deref(),
                 &ctx.alias_roots,
+                &single_warnings,
             );
         }
 
@@ -4909,7 +6199,7 @@ impl CodesearchService {
                 |fts_store| {
                     let fts_results = fts_store
                         .search(&request.query, limit * 5, structural_intent)
-                        .unwrap_or_default();
+                        .context("Error searching FTS store")?;
 
                     let fused = if identifiers.is_empty() {
                         rrf_fusion(&vector_results, &fts_results, vector_k as f32)
@@ -4968,6 +6258,10 @@ impl CodesearchService {
             }
             Err(e) => {
                 tracing::warn!("MCP: FTS store unavailable, using vector-only: {:?}", e);
+                // Degrading to vector-only is correct, but it must be VISIBLE:
+                // a caller that gets half a hybrid search with no signal cannot
+                // tell it from a complete one.
+                single_warnings.push(format!("lexical (FTS) search failed: {e:#}"));
                 vector_results.into_iter().take(limit).collect()
             }
         };
@@ -5067,6 +6361,7 @@ impl CodesearchService {
             has_identifiers,
             ctx.project_alias.as_deref(),
             &ctx.alias_roots,
+            &single_warnings,
         )
     }
 
@@ -5090,7 +6385,11 @@ impl CodesearchService {
 
         // === Lexical mode: FTS only across all stores ===
         if mode == "lexical" {
-            let fts_results = self
+            // Lexical has no second backend, so a failed store here is invisible
+            // unless it is reported: the query simply looks like it found nothing.
+            let mut lexical_warnings: Vec<String> = Vec::new();
+
+            let outcome = self
                 .with_fts_store_read_multi(
                     |fts_store| fts_store.search(&request.query, limit * 5, structural_intent),
                     stores.clone(),
@@ -5098,11 +6397,21 @@ impl CodesearchService {
                 )
                 .await
                 .unwrap_or_default();
+            if !outcome.failures.is_empty() {
+                tracing::error!(
+                    "MCP: lexical fan-out degraded — {} of {} repo(s) failed: {:?}",
+                    outcome.failures.len(),
+                    stores.len(),
+                    outcome.failures
+                );
+                lexical_warnings.extend(outcome.warnings("literal search"));
+            }
+            let fts_results = outcome.results;
 
             // Also do exact search if identifiers detected
             let mut all_fts = fts_results;
             for ident in identifiers {
-                let exact = self
+                let exact_outcome = self
                     .with_fts_store_read_multi(
                         |fts_store| fts_store.search_exact(ident, limit * 3, structural_intent),
                         stores.clone(),
@@ -5110,7 +6419,8 @@ impl CodesearchService {
                     )
                     .await
                     .unwrap_or_default();
-                merge_exact_into_fts(&mut all_fts, exact);
+                lexical_warnings.extend(exact_outcome.warnings("exact-identifier search"));
+                merge_exact_into_fts(&mut all_fts, exact_outcome.results);
             }
 
             all_fts.sort_by(|a, b| {
@@ -5120,7 +6430,13 @@ impl CodesearchService {
             });
 
             let results = self
-                .resolve_fts_to_search_results_multi(&all_fts, limit, &stores)
+                .resolve_fts_to_search_results_multi(
+                    &all_fts,
+                    limit,
+                    &stores,
+                    aliases,
+                    &mut lexical_warnings,
+                )
                 .await;
 
             if let Some(target_kind) = structural_intent {
@@ -5134,6 +6450,7 @@ impl CodesearchService {
                     !identifiers.is_empty(),
                     None,
                     alias_roots,
+                    &lexical_warnings,
                 );
             }
 
@@ -5144,6 +6461,7 @@ impl CodesearchService {
                 !identifiers.is_empty(),
                 None,
                 alias_roots,
+                &lexical_warnings,
             );
         }
 
@@ -5153,8 +6471,7 @@ impl CodesearchService {
                 Ok(g) => g,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error initializing embedding service: {}",
-                        e
+                        "Error initializing embedding service: {e:#}"
                     ))]));
                 }
             };
@@ -5163,15 +6480,14 @@ impl CodesearchService {
                 Ok(e) => e,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error embedding query: {}",
-                        e
+                        "Error embedding query: {e:#}"
                     ))]));
                 }
             }
         };
 
         // Search vector stores across all repos
-        let vector_results = self
+        let outcome = self
             .with_vector_store_read_multi(
                 |store| {
                     store
@@ -5181,8 +6497,54 @@ impl CodesearchService {
                 stores.clone(),
                 aliases,
             )
-            .await
-            .unwrap_or_default();
+            .await;
+
+        // Warnings raised by the fan-out, carried into the response so the
+        // calling agent can tell "not in the corpus" from "that repo is down".
+        let mut search_warnings: Vec<String> = Vec::new();
+
+        let vector_results =
+            match outcome {
+                Ok(o) => {
+                    if !o.failures.is_empty() {
+                        tracing::error!(
+                            "MCP: vector fan-out degraded — {} of {} repo(s) failed: {:?}",
+                            o.failures.len(),
+                            stores.len(),
+                            o.failures
+                        );
+                        // Only "semantic" has no second backend to fall back on. In
+                        // hybrid/auto/lexical the FTS half can still answer, so
+                        // hard-failing here would throw away good results — the same
+                        // reason one broken repo does not abort the whole fan-out.
+                        if mode == "semantic" && o.results.is_empty() {
+                            let detail = o
+                                .failures
+                                .iter()
+                                .map(|(alias, err)| format!("  - {alias}: {err}"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            return Ok(CallToolResult::success(vec![Content::text(format!(
+                                "Error searching vector store: {} of {} repo(s) in scope failed \
+                             and none returned results:\n{}",
+                                o.failures.len(),
+                                stores.len(),
+                                detail
+                            ))]));
+                        }
+                        search_warnings.extend(o.failures.iter().map(|(alias, err)| {
+                            format!("repo '{alias}' vector search failed: {err}")
+                        }));
+                    }
+                    o.results
+                }
+                Err(e) => {
+                    tracing::error!("MCP: vector fan-out failed: {:?}", e);
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Error searching vector store: {e:#}"
+                    ))]));
+                }
+            };
 
         // === Mode: "semantic" — vector only ===
         if mode == "semantic" {
@@ -5205,14 +6567,17 @@ impl CodesearchService {
                 !identifiers.is_empty(),
                 None,
                 alias_roots,
+                &search_warnings,
             );
         }
 
         // === Modes: "hybrid" | "auto" — full hybrid search ===
         let (vector_k, fts_k) = adapt_rrf_k(&request.query);
 
-        // FTS search across all stores
-        let fts_results = self
+        // FTS search across all stores. Its failures matter as much as the
+        // vector half's: during the cloud read-only incident literal search
+        // also returned 0 results for every affected vendor, and looked clean.
+        let fts_outcome = self
             .with_fts_store_read_multi(
                 |fts_store| fts_store.search(&request.query, limit * 5, structural_intent),
                 stores.clone(),
@@ -5220,12 +6585,22 @@ impl CodesearchService {
             )
             .await
             .unwrap_or_default();
+        if !fts_outcome.failures.is_empty() {
+            tracing::error!(
+                "MCP: FTS fan-out degraded — {} of {} repo(s) failed: {:?}",
+                fts_outcome.failures.len(),
+                stores.len(),
+                fts_outcome.failures
+            );
+            search_warnings.extend(fts_outcome.warnings("literal search"));
+        }
+        let fts_results = fts_outcome.results;
 
         // Exact identifier search across all stores
         let all_exact = if !identifiers.is_empty() {
             let mut exact_results: Vec<crate::fts::FtsResult> = Vec::new();
             for ident in identifiers {
-                let exact = self
+                let exact_outcome = self
                     .with_fts_store_read_multi(
                         |fts_store| fts_store.search_exact(ident, limit * 3, structural_intent),
                         stores.clone(),
@@ -5233,7 +6608,8 @@ impl CodesearchService {
                     )
                     .await
                     .unwrap_or_default();
-                for r in exact {
+                search_warnings.extend(exact_outcome.warnings("exact-identifier search"));
+                for r in exact_outcome.results {
                     if !exact_results.iter().any(|e| e.chunk_id == r.chunk_id) {
                         exact_results.push(r);
                     }
@@ -5271,7 +6647,13 @@ impl CodesearchService {
             } else {
                 // Chunk from FTS but not in vector results — resolve from stores
                 if let Some(resolved) = self
-                    .resolve_chunk_from_stores(f.chunk_id, f.rrf_score, &stores)
+                    .resolve_chunk_from_stores(
+                        f.chunk_id,
+                        f.rrf_score,
+                        &stores,
+                        aliases,
+                        &mut search_warnings,
+                    )
                     .await
                 {
                     mapped.push(resolved);
@@ -5291,6 +6673,7 @@ impl CodesearchService {
             !identifiers.is_empty(),
             None,
             alias_roots,
+            &search_warnings,
         )
     }
 
@@ -5300,10 +6683,16 @@ impl CodesearchService {
         chunk_id: u32,
         score: f32,
         stores: &[Arc<SharedStores>],
+        aliases: &[String],
+        warnings: &mut Vec<String>,
     ) -> Option<crate::vectordb::SearchResult> {
-        for store_arc in stores {
+        for (idx, store_arc) in stores.iter().enumerate() {
             let store = store_arc.vector_store.read().await;
-            if let Ok(Some(chunk)) = store.get_chunk(chunk_id) {
+            let looked_up = store.get_chunk(chunk_id);
+            if let Err(ref e) = looked_up {
+                note_store_failure(warnings, aliases, idx, "chunk lookup", e);
+            }
+            if let Ok(Some(chunk)) = looked_up {
                 return Some(crate::vectordb::SearchResult {
                     id: chunk_id,
                     content: chunk.content,
@@ -5331,12 +6720,23 @@ impl CodesearchService {
         fts_results: &[crate::fts::FtsResult],
         limit: usize,
         stores: &[Arc<SharedStores>],
+        aliases: &[String],
+        warnings: &mut Vec<String>,
     ) -> Vec<crate::vectordb::SearchResult> {
         let mut results = Vec::new();
         for fts in fts_results.iter().take(limit) {
-            for store_arc in stores {
+            for (idx, store_arc) in stores.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
-                if let Ok(Some(chunk)) = store.get_chunk(fts.chunk_id) {
+                let looked_up = store.get_chunk(fts.chunk_id);
+                if let Err(ref e) = looked_up {
+                    // `Ok(None)` means "this store does not hold that chunk" and
+                    // is normal during fan-out; `Err` means the store is broken.
+                    // Collapsing the two is how a dead vector store renders as
+                    // an empty literal search — the exact shape of the step-8
+                    // incident, which tantivy-side checks cannot detect.
+                    note_store_failure(warnings, aliases, idx, "chunk lookup", e);
+                }
+                if let Ok(Some(chunk)) = looked_up {
                     results.push(crate::vectordb::SearchResult {
                         id: fts.chunk_id,
                         content: chunk.content,
@@ -5374,13 +6774,26 @@ impl CodesearchService {
     ) -> Result<CallToolResult, McpError> {
         let structural_intent = detect_structural_intent(&request.query);
 
-        let mut fts_results = self
+        // `project=`-scoped queries route here, not through the fan-out
+        // (`is_multi` requires >1 store), so this path needs the same failure
+        // reporting — it is at least as common as a group query.
+        let mut lexical_warnings: Vec<String> = Vec::new();
+
+        let mut fts_results = match self
             .with_fts_store_read_for(
                 |fts_store| fts_store.search(&request.query, limit * 5, structural_intent),
                 stores.clone(),
             )
             .await
-            .unwrap_or_default();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = format!("literal search failed: {e:#}");
+                tracing::error!("MCP: {}", msg);
+                lexical_warnings.push(msg);
+                Vec::new()
+            }
+        };
 
         // Also do exact search if identifiers detected
         for ident in identifiers {
@@ -5392,7 +6805,12 @@ impl CodesearchService {
                 .await
             {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    let msg = format!("exact-identifier search for '{ident}' failed: {e:#}");
+                    tracing::error!("MCP: {}", msg);
+                    lexical_warnings.push(msg);
+                    continue;
+                }
             };
             merge_exact_into_fts(&mut fts_results, exact);
         }
@@ -5405,7 +6823,7 @@ impl CodesearchService {
 
         // Resolve FTS results to chunk metadata
         let mut results = self
-            .resolve_fts_to_search_results(&fts_results, limit, stores)
+            .resolve_fts_to_search_results(&fts_results, limit, stores, &mut lexical_warnings)
             .await;
 
         // Apply kind boost
@@ -5420,10 +6838,17 @@ impl CodesearchService {
             !identifiers.is_empty(),
             project_alias,
             alias_roots,
+            &lexical_warnings,
         )
     }
 
     /// Build the final SemanticSearchResponse with low-confidence signaling.
+    // Eight parameters, one over clippy's threshold. Bundling them into a
+    // `ResponseContext` struct is the right end state and is recorded as a
+    // follow-up; doing it in an incident fix would touch all seven call sites
+    // for no behavioural gain. The alternative — dropping `warnings` — is not
+    // acceptable: without it a failed repo is silently reported as "no match".
+    #[allow(clippy::too_many_arguments)]
     fn build_semantic_response(
         &self,
         results: Vec<crate::vectordb::SearchResult>,
@@ -5432,13 +6857,24 @@ impl CodesearchService {
         has_identifiers: bool,
         project_alias: Option<&str>,
         alias_roots: &std::collections::HashMap<String, String>,
+        // Repos that failed during a fan-out. MUST reach the caller: the
+        // consumer of this tool is a remote agent that never sees the server
+        // log, so a silently omitted repo reads as "no match there" — a false
+        // negative. The federated path already does this (`warnings` on the
+        // remote-project fan-out); the local path never could.
+        warnings: &[String],
     ) -> Result<CallToolResult, McpError> {
+        let warnings = if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.to_vec())
+        };
         if results.is_empty() {
             let response = SemanticSearchResponse {
                 results: vec![],
                 low_confidence: Some(true),
-                suggested_tool: Some("literal_search".to_string()),
-                warnings: None,
+                suggested_tool: retry_hint(Some("literal_search".to_string()), &warnings),
+                warnings,
             };
             let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
             return Ok(CallToolResult::success(vec![Content::text(json)]));
@@ -5504,12 +6940,13 @@ impl CodesearchService {
         // Check low-confidence: top result's RRF score below threshold
         let top_score = items.first().map(|r| r.score);
         let (low_confidence, suggested_tool) = compute_low_confidence(top_score, has_identifiers);
+        let suggested_tool = retry_hint(suggested_tool, &warnings);
 
         let response = SemanticSearchResponse {
             results: items,
             low_confidence,
             suggested_tool,
-            warnings: None,
+            warnings,
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
@@ -5522,36 +6959,54 @@ impl CodesearchService {
         fts_results: &[crate::fts::FtsResult],
         limit: usize,
         stores: Option<Arc<SharedStores>>,
+        warnings: &mut Vec<String>,
     ) -> Vec<crate::vectordb::SearchResult> {
-        self.with_vector_store_read_for(
-            |store| {
-                let mut results = Vec::new();
-                for fts in fts_results.iter().take(limit) {
-                    if let Ok(Some(chunk)) = store.get_chunk(fts.chunk_id) {
-                        results.push(crate::vectordb::SearchResult {
-                            id: fts.chunk_id,
-                            content: chunk.content,
-                            path: chunk.path,
-                            start_line: chunk.start_line,
-                            end_line: chunk.end_line,
-                            kind: chunk.kind,
-                            signature: chunk.signature,
-                            docstring: chunk.docstring,
-                            context: chunk.context,
-                            hash: chunk.hash,
-                            distance: 0.0,
-                            score: fts.score,
-                            context_prev: chunk.context_prev,
-                            context_next: chunk.context_next,
-                        });
+        let outcome = self
+            .with_vector_store_read_for(
+                |store| {
+                    let mut results = Vec::new();
+                    for fts in fts_results.iter().take(limit) {
+                        // A failed lookup is not an absent chunk. Propagating the
+                        // error keeps a broken vector store from rendering as an
+                        // ordinary empty literal search.
+                        let chunk = store
+                            .get_chunk(fts.chunk_id)
+                            .context("Error resolving FTS hit to chunk metadata")?;
+                        if let Some(chunk) = chunk {
+                            results.push(crate::vectordb::SearchResult {
+                                id: fts.chunk_id,
+                                content: chunk.content,
+                                path: chunk.path,
+                                start_line: chunk.start_line,
+                                end_line: chunk.end_line,
+                                kind: chunk.kind,
+                                signature: chunk.signature,
+                                docstring: chunk.docstring,
+                                context: chunk.context,
+                                hash: chunk.hash,
+                                distance: 0.0,
+                                score: fts.score,
+                                context_prev: chunk.context_prev,
+                                context_next: chunk.context_next,
+                            });
+                        }
                     }
+                    Ok(results)
+                },
+                stores,
+            )
+            .await;
+        match outcome {
+            Ok(results) => results,
+            Err(e) => {
+                let msg = format!("literal search could not read the index: {e:#}");
+                tracing::error!("MCP: {}", msg);
+                if !warnings.contains(&msg) {
+                    warnings.push(msg);
                 }
-                Ok(results)
-            },
-            stores,
-        )
-        .await
-        .unwrap_or_default()
+                Vec::new()
+            }
+        }
     }
 
     // === find_definition internal ===
@@ -5585,6 +7040,11 @@ impl CodesearchService {
             }
         }
 
+        // Stores that failed during this lookup. Without this, "the symbol may
+        // not be indexed" below is emitted as a confident diagnosis even when
+        // no store ever answered.
+        let mut find_warnings: Vec<String> = Vec::new();
+
         // FTS search — multi-store or single
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
             let sa = ctx.store_aliases.as_ref().unwrap();
@@ -5595,6 +7055,7 @@ impl CodesearchService {
             )
             .await
             .unwrap_or_default()
+            .into_results(&mut find_warnings, "definition search")
         } else {
             match self
                 .with_fts_store_read_for(
@@ -5606,18 +7067,22 @@ impl CodesearchService {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error searching: {}",
-                        e
+                        "Error searching: {e:#}"
                     ))]));
                 }
             }
         };
 
         if fts_results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No definition found for '{}'. The symbol may not be indexed.",
-                request.symbol
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                qualify_empty_result(
+                    format!(
+                        "No definition found for '{}'. The symbol may not be indexed.",
+                        request.symbol
+                    ),
+                    &find_warnings,
+                ),
+            )]));
         }
 
         // Resolve chunk metadata and filter by definition kinds
@@ -5693,8 +7158,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error opening database: {}",
-                        e
+                        "Error opening database: {e:#}"
                     ))]));
                 }
             }
@@ -5705,15 +7169,13 @@ impl CodesearchService {
             item.path = ctx.prefix_result_path(&item.path);
         }
 
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No definition found for '{}'. Try find_usages() to find references, or broaden your search.",
+        respond_with_items(&items, &find_warnings, || {
+            format!(
+                "No definition found for '{}'. Try find_usages() to find references, \
+                 or broaden your search.",
                 request.symbol
-            ))]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+            )
+        })
     }
 
     // === find_usages tool ===
@@ -5753,6 +7215,10 @@ impl CodesearchService {
             }
         }
 
+        // See `find_definition`: an empty result and a dead store must not
+        // produce the same sentence.
+        let mut find_warnings: Vec<String> = Vec::new();
+
         // FTS search — multi-store or single
         let fts_results = if let Some(ref sv) = ctx.stores_vec {
             let sa = ctx.store_aliases.as_ref().unwrap();
@@ -5763,6 +7229,7 @@ impl CodesearchService {
             )
             .await
             .unwrap_or_default()
+            .into_results(&mut find_warnings, "usage search")
         } else {
             match self
                 .with_fts_store_read_for(
@@ -5774,18 +7241,19 @@ impl CodesearchService {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error searching: {}",
-                        e
+                        "Error searching: {e:#}"
                     ))]));
                 }
             }
         };
 
         if fts_results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No usages found for '{}'. The symbol may not be indexed.",
-                symbol
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                qualify_empty_result(
+                    format!("No usages found for '{symbol}'. The symbol may not be indexed."),
+                    &find_warnings,
+                ),
+            )]));
         }
 
         // Resolve chunks and exclude definition chunks
@@ -5847,8 +7315,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error opening database: {}",
-                        e
+                        "Error opening database: {e:#}"
                     ))]));
                 }
             }
@@ -5859,31 +7326,35 @@ impl CodesearchService {
             item.path = ctx.prefix_result_path(&item.path);
         }
 
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No usages found for '{}' (only definitions were found). Try find_definition() to locate the declaration.",
-                symbol
-            ))]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        respond_with_items(&items, &find_warnings, || {
+            format!(
+                "No usages found for '{symbol}' (only definitions were found). Try \
+                 find_definition() to locate the declaration."
+            )
+        })
     }
 
     /// Fetch outline items for an already-normalised absolute path.
     ///
     /// Returns `Ok(vec![])` when no chunks match.
-    /// In multi-store mode, per-store I/O failures are logged and skipped (never `Err`).
+    /// In multi-store mode, per-store I/O failures are recorded in `warnings` and
+    /// skipped (never `Err`) so one broken repo cannot blank the whole outline.
     /// In single-store mode, I/O failures are returned as `Err`.
+    ///
+    /// `warnings` is not optional: without it a failed store is indistinguishable
+    /// from a file with no indexed chunks, and the caller is told the file is not
+    /// indexed — a diagnosis, and a wrong one.
     async fn outline_items_for_normalized(
         &self,
         normalized: &str,
         ctx: &MultiStoreContext,
+        warnings: &mut Vec<String>,
     ) -> anyhow::Result<Vec<FileOutlineItem>> {
         if let Some(ref sv) = ctx.stores_vec {
+            let aliases = ctx.aliases();
             let mut all_items: Vec<FileOutlineItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for store_arc in sv {
+            for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
                 match store.chunks_for_file(normalized) {
                     Ok(metas) => {
@@ -5899,11 +7370,8 @@ impl CodesearchService {
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Vector store read failed in outline_items_for_normalized fan-out: {:?}",
-                            e
-                        );
+                    Err(ref e) => {
+                        note_store_failure(warnings, aliases, store_idx, "outline scan", e);
                     }
                 }
             }
@@ -5975,12 +7443,15 @@ impl CodesearchService {
         let stripped_path = strip_alias_prefix(&request.path, ctx.project_alias.as_ref());
         let normalized = normalize_tool_path(&stripped_path, &project_root);
 
-        let mut items = match self.outline_items_for_normalized(&normalized, &ctx).await {
+        let mut outline_warnings: Vec<String> = Vec::new();
+        let mut items = match self
+            .outline_items_for_normalized(&normalized, &ctx, &mut outline_warnings)
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Error reading outline: {}",
-                    e
+                    "Error reading outline: {e:#}"
                 ))]));
             }
         };
@@ -5999,7 +7470,7 @@ impl CodesearchService {
                     normalized_orig
                 );
                 items = match self
-                    .outline_items_for_normalized(&normalized_orig, &ctx)
+                    .outline_items_for_normalized(&normalized_orig, &ctx, &mut outline_warnings)
                     .await
                 {
                     Ok(v) => v,
@@ -6009,20 +7480,25 @@ impl CodesearchService {
                             normalized_orig,
                             e
                         );
+                        push_store_warning(
+                            &mut outline_warnings,
+                            &store_warning(
+                                ctx.project_alias.as_deref().unwrap_or("unknown"),
+                                "outline scan",
+                                &format!("{e:#}"),
+                            ),
+                        );
                         Vec::new()
                     }
                 };
             }
         }
 
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No indexed chunks found for path. Verify the file is within the project root and the index is up to date.".to_string(),
-            )]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        respond_with_items(&items, &outline_warnings, || {
+            "No indexed chunks found for path. Verify the file is within the \
+             project root and the index is up to date."
+                .to_string()
+        })
     }
 
     #[tool(
@@ -6084,54 +7560,92 @@ impl CodesearchService {
             clamped = true;
         }
 
+        // Stores that failed while looking up this chunk. get_chunk previously
+        // collapsed every `Err` into "not found", so during the read-only
+        // incident it would have reported every chunk in every vendor repo as
+        // missing — a confident, wrong answer.
+        let mut chunk_warnings: Vec<String> = Vec::new();
+
         // Look up chunk — multi-store: smart candidate detection for chunk_id collision.
         // chunk_ids are local per database, not globally unique. When no project is specified
         // and multiple stores are active, scan all stores to find which ones have this chunk_id.
         let chunk = if let Some(ref sv) = ctx.stores_vec {
             if sv.len() > 1 && request.project.is_none() {
                 // Smart candidate detection: find which stores actually contain this chunk_id
-                let mut candidates: Vec<(&Arc<SharedStores>, &String)> = Vec::new();
-                let aliases = ctx.store_aliases.as_deref().unwrap();
+                let mut candidates: Vec<(&Arc<SharedStores>, String)> = Vec::new();
+                let aliases = ctx.aliases();
                 for (i, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(_)) => {
-                            if let Some(alias) = aliases.get(i) {
-                                candidates.push((store_arc, alias));
-                            }
+                            // A store that HAS the chunk stays a candidate even if
+                            // its alias is missing. `resolve_repo_stores_multi`
+                            // keeps stores and aliases the same length, so this is
+                            // unreachable today — but gating the push on
+                            // `aliases.get(i)` meant a future break of that
+                            // invariant would degrade to a silent auto-route rather
+                            // than a loud one. The placeholder is per-index so two
+                            // aliasless candidates stay distinguishable in
+                            // `candidate_projects`.
+                            let alias = aliases
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| format!("<unnamed store #{i}>"));
+                            candidates.push((store_arc, alias));
                         }
                         Ok(None) => continue,
-                        Err(_) => continue,
+                        Err(ref e) => {
+                            note_store_failure(&mut chunk_warnings, aliases, i, "chunk lookup", e);
+                            continue;
+                        }
                     }
                 }
                 match candidates.len() {
                     0 => {
-                        return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "Chunk {} not found in any repository. Verify the chunk_id and index state.",
-                            request.chunk_id
-                        ))]));
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            qualify_empty_result(
+                                format!(
+                                    "Chunk {} not found in any repository. Verify the \
+                                     chunk_id and index state.",
+                                    request.chunk_id
+                                ),
+                                &chunk_warnings,
+                            ),
+                        )]));
                     }
                     1 => {
                         // Exactly one store has this chunk_id — auto-route
-                        let (store_arc, alias) = candidates[0];
+                        let (store_arc, ref alias) = candidates[0];
                         // Record tool call for the specific repo that served this chunk
                         if let Some(ref serve_state) = self.serve_state {
                             serve_state.record_tool_call(alias, "get_chunk");
                             serve_state.touch_access(alias);
                         }
                         let store = store_arc.vector_store.read().await;
-                        store.get_chunk(request.chunk_id).unwrap_or_default()
+                        match store.get_chunk(request.chunk_id) {
+                            Ok(c) => c,
+                            Err(ref e) => {
+                                push_store_warning(
+                                    &mut chunk_warnings,
+                                    &store_warning(alias, "chunk lookup", &format!("{e:#}")),
+                                );
+                                None
+                            }
+                        }
                     }
                     _ => {
-                        // Multiple stores have this chunk_id — ambiguous
+                        // Multiple stores have this chunk_id — ambiguous.
+                        //
+                        // `candidate_projects` reads as the complete list, so a
+                        // store that failed to answer has to be declared: the
+                        // right repo may be the one missing from it.
                         let candidate_names: Vec<&str> =
                             candidates.iter().map(|(_, a)| a.as_str()).collect();
-                        let payload = serde_json::json!({
-                            "error_code": "ambiguous_chunk_id",
-                            "message": format!("chunk_id {} exists in multiple repositories. Specify which one.", request.chunk_id),
-                            "candidate_projects": candidate_names,
-                            "hint_for_agent": "The chunk_id collision is a known limitation of multi-repo mode. Re-run get_chunk with one of the candidate_projects, or use search to identify the correct repository first."
-                        });
+                        let payload = ambiguous_chunk_payload(
+                            request.chunk_id,
+                            &candidate_names,
+                            &chunk_warnings,
+                        );
                         return Ok(CallToolResult::success(vec![Content::text(
                             payload.to_string(),
                         )]));
@@ -6139,8 +7653,9 @@ impl CodesearchService {
                 }
             } else {
                 // Single store or project specified — direct lookup
+                let aliases = ctx.aliases();
                 let mut found = None;
-                for store_arc in sv {
+                for (i, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(c)) => {
@@ -6148,27 +7663,52 @@ impl CodesearchService {
                             break;
                         }
                         Ok(None) => continue,
-                        Err(_) => break,
+                        // Do NOT abandon the remaining stores: one broken store
+                        // says nothing about the others, and the chunk may well
+                        // live in a healthy one.
+                        Err(ref e) => {
+                            note_store_failure(&mut chunk_warnings, aliases, i, "chunk lookup", e);
+                            continue;
+                        }
                     }
                 }
                 found
             }
         } else {
-            self.with_vector_store_read_for(
-                |store| store.get_chunk(request.chunk_id),
-                ctx.stores.clone(),
-            )
-            .await
-            .unwrap_or_default()
+            match self
+                .with_vector_store_read_for(
+                    |store| store.get_chunk(request.chunk_id),
+                    ctx.stores.clone(),
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    push_store_warning(
+                        &mut chunk_warnings,
+                        &store_warning(
+                            ctx.project_alias.as_deref().unwrap_or("unknown"),
+                            "chunk lookup",
+                            &format!("{e:#}"),
+                        ),
+                    );
+                    None
+                }
+            }
         };
 
         let mut chunk = match chunk {
             Some(c) => c,
             None => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Chunk {} not found. Verify the chunk_id and index state.",
-                    request.chunk_id
-                ))]));
+                return Ok(CallToolResult::success(vec![Content::text(
+                    qualify_empty_result(
+                        format!(
+                            "Chunk {} not found. Verify the chunk_id and index state.",
+                            request.chunk_id
+                        ),
+                        &chunk_warnings,
+                    ),
+                )]));
             }
         };
 
@@ -6225,8 +7765,11 @@ impl CodesearchService {
             note,
         };
 
-        let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        // The success path is the one that used to drop this, and it is the
+        // dangerous one: a confidently-returned chunk from a group where a store
+        // failed to answer looks exactly like a chunk from a healthy group. Same
+        // false negative as an empty result, harder to notice.
+        respond_with_object(&response, &chunk_warnings)
     }
 
     /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
@@ -6408,8 +7951,7 @@ impl CodesearchService {
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
             Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Symbol lookup failed: {}",
-                e
+                "Symbol lookup failed: {e:#}"
             ))])),
         }
     }
@@ -6456,11 +7998,16 @@ impl CodesearchService {
         let stripped_path = strip_alias_prefix(&request.path, ctx.project_alias.as_ref());
         let normalized = normalize_tool_path(&stripped_path, &project_root);
 
+        // Stores that failed during this lookup, so "no imports found" is never
+        // reported as fact when a store never answered.
+        let mut import_warnings: Vec<String> = Vec::new();
+
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store group fan-out: collect import items from all stores
+            let import_aliases = ctx.aliases();
             let mut all_items: Vec<ImportItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for store_arc in sv {
+            for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
                 match store.chunks_for_file(&normalized) {
                     Ok(metas) => {
@@ -6469,17 +8016,31 @@ impl CodesearchService {
                                 continue;
                             }
                             if seen_ids.insert(meta.id) {
-                                if let Ok(Some(chunk)) = store.get_chunk(meta.id) {
-                                    all_items.extend(parse_import_lines(
+                                match store.get_chunk(meta.id) {
+                                    Ok(Some(chunk)) => all_items.extend(parse_import_lines(
                                         &chunk.content,
                                         chunk.start_line,
-                                    ));
+                                    )),
+                                    Ok(None) => {}
+                                    Err(ref e) => note_store_failure(
+                                        &mut import_warnings,
+                                        import_aliases,
+                                        store_idx,
+                                        "chunk lookup",
+                                        e,
+                                    ),
                                 }
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Vector store read failed in find_imports fan-out: {:?}", e);
+                    Err(ref e) => {
+                        note_store_failure(
+                            &mut import_warnings,
+                            import_aliases,
+                            store_idx,
+                            "imports scan",
+                            e,
+                        );
                     }
                 }
             }
@@ -6506,8 +8067,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error reading imports: {}",
-                        e
+                        "Error reading imports: {e:#}"
                     ))]));
                 }
             }
@@ -6523,6 +8083,7 @@ impl CodesearchService {
             let mut seen_fts_ids: HashSet<u32> = HashSet::new();
 
             if let Some(ref sv) = ctx.stores_vec {
+                let import_aliases = ctx.aliases();
                 // Multi-store FTS fallback
                 for keyword in IMPORT_FTS_KEYWORDS {
                     let hits = self
@@ -6532,7 +8093,8 @@ impl CodesearchService {
                             ctx.store_aliases.as_ref().unwrap(),
                         )
                         .await
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .into_results(&mut import_warnings, "imports search");
                     for h in hits {
                         if seen_fts_ids.insert(h.chunk_id) {
                             all_hits.push((h.chunk_id, h.score));
@@ -6543,14 +8105,29 @@ impl CodesearchService {
                 // Resolve FTS hits via vector stores
                 let mut resolved: Vec<ImportItem> = Vec::new();
                 for (chunk_id, _) in &all_hits {
-                    for store_arc in sv {
+                    for (store_idx, store_arc) in sv.iter().enumerate() {
                         let store = store_arc.vector_store.read().await;
-                        if let Ok(Some(chunk)) = store.get_chunk(*chunk_id) {
-                            if crate::cache::normalize_path_str(&chunk.path) == normalized {
-                                resolved
-                                    .extend(parse_import_lines(&chunk.content, chunk.start_line));
+                        match store.get_chunk(*chunk_id) {
+                            Ok(Some(chunk)) => {
+                                if crate::cache::normalize_path_str(&chunk.path) == normalized {
+                                    resolved.extend(parse_import_lines(
+                                        &chunk.content,
+                                        chunk.start_line,
+                                    ));
+                                }
+                                break;
                             }
-                            break;
+                            Ok(None) => continue,
+                            Err(ref e) => {
+                                note_store_failure(
+                                    &mut import_warnings,
+                                    import_aliases,
+                                    store_idx,
+                                    "chunk lookup",
+                                    e,
+                                );
+                                continue;
+                            }
                         }
                     }
                 }
@@ -6558,13 +8135,26 @@ impl CodesearchService {
             } else {
                 // Single-store FTS fallback
                 for keyword in IMPORT_FTS_KEYWORDS {
-                    let hits = self
+                    let hits = match self
                         .with_fts_store_read_for(
                             |fts_store| fts_store.search_exact(keyword, fallback_limit, None),
                             ctx.stores.clone(),
                         )
                         .await
-                        .unwrap_or_default();
+                    {
+                        Ok(h) => h,
+                        Err(e) => {
+                            push_store_warning(
+                                &mut import_warnings,
+                                &store_warning(
+                                    ctx.project_alias.as_deref().unwrap_or("unknown"),
+                                    "imports search",
+                                    &format!("{e:#}"),
+                                ),
+                            );
+                            Vec::new()
+                        }
+                    };
                     for h in hits {
                         if seen_fts_ids.insert(h.chunk_id) {
                             all_hits.push((h.chunk_id, h.score));
@@ -6591,19 +8181,26 @@ impl CodesearchService {
                         ctx.stores.clone(),
                     )
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or_else(|e| {
+                        push_store_warning(
+                            &mut import_warnings,
+                            &store_warning(
+                                ctx.project_alias.as_deref().unwrap_or("unknown"),
+                                "chunk lookup",
+                                &format!("{e:#}"),
+                            ),
+                        );
+                        Vec::new()
+                    });
             }
         }
 
         items.sort_by_key(|i| i.line);
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No import chunks found. The index may not include import statements for this language, or the file has no imports.".to_string(),
-            )]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        respond_with_items(&items, &import_warnings, || {
+            "No import chunks found. The index may not include import statements \
+             for this language, or the file has no imports."
+                .to_string()
+        })
     }
 
     async fn find_dependents(
@@ -6627,6 +8224,10 @@ impl CodesearchService {
 
         let limit = request.limit.unwrap_or(20).min(200);
         let high_limit = (limit * 10).max(200); // generous budget for filtering
+
+        // Stores that failed during this lookup, so "no dependents" is never
+        // reported as fact when a store never answered.
+        let mut dep_warnings: Vec<String> = Vec::new();
 
         // Extract a meaningful search term from path-like inputs.
         // Import chunks contain module references like `use crate::constants::X`
@@ -6667,7 +8268,8 @@ impl CodesearchService {
                     sa,
                 )
                 .await
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_results(&mut dep_warnings, "dependents search");
 
             if exact_hits.is_empty() {
                 self.with_fts_store_read_multi(
@@ -6677,26 +8279,37 @@ impl CodesearchService {
                 )
                 .await
                 .unwrap_or_default()
+                .into_results(&mut dep_warnings, "dependents search")
             } else {
                 exact_hits
             }
         } else {
             // Single-store FTS search
-            let exact_hits = self
+            let alias = ctx.project_alias.as_deref().unwrap_or("unknown");
+            let mut run = |r: anyhow::Result<Vec<crate::fts::FtsResult>>| match r {
+                Ok(hits) => hits,
+                Err(e) => {
+                    push_store_warning(
+                        &mut dep_warnings,
+                        &store_warning(alias, "dependents search", &format!("{e:#}")),
+                    );
+                    Vec::new()
+                }
+            };
+            let exact_hits = run(self
                 .with_fts_store_read_for(
                     |fts_store| fts_store.search_exact(&search_term, high_limit, import_kind),
                     ctx.stores.clone(),
                 )
-                .await
-                .unwrap_or_default();
+                .await);
 
             if exact_hits.is_empty() {
-                self.with_fts_store_read_for(
-                    |fts_store| fts_store.search(&search_term, high_limit, import_kind),
-                    ctx.stores.clone(),
-                )
-                .await
-                .unwrap_or_default()
+                run(self
+                    .with_fts_store_read_for(
+                        |fts_store| fts_store.search(&search_term, high_limit, import_kind),
+                        ctx.stores.clone(),
+                    )
+                    .await)
             } else {
                 exact_hits
             }
@@ -6704,10 +8317,11 @@ impl CodesearchService {
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store: resolve chunks across all stores
+            let dep_aliases = ctx.aliases();
             let mut seen_paths = HashSet::new();
             let mut out = Vec::new();
             for f in &fts_results {
-                for store_arc in sv {
+                for (store_idx, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
                     match store.get_chunk(f.chunk_id) {
                         Ok(Some(chunk)) => {
@@ -6744,7 +8358,19 @@ impl CodesearchService {
                             break; // found in this store, move to next FTS result
                         }
                         Ok(None) => {} // try next store
-                        Err(_) => break,
+                        // One broken store says nothing about the others; a
+                        // `break` here silently drops a chunk that lives in a
+                        // healthy store later in the list.
+                        Err(ref e) => {
+                            note_store_failure(
+                                &mut dep_warnings,
+                                dep_aliases,
+                                store_idx,
+                                "chunk lookup",
+                                e,
+                            );
+                            continue;
+                        }
                     }
                 }
                 if out.len() >= limit {
@@ -6806,8 +8432,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error resolving dependents: {}",
-                        e
+                        "Error resolving dependents: {e:#}"
                     ))]));
                 }
             }
@@ -6819,15 +8444,9 @@ impl CodesearchService {
         }
 
         items.sort_by(|a, b| a.path.cmp(&b.path));
-        if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No dependent files found for '{}'.",
-                request.symbol_or_path
-            ))]));
-        }
-
-        let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        respond_with_items(&items, &dep_warnings, || {
+            format!("No dependent files found for '{}'.", request.symbol_or_path)
+        })
     }
 
     /// Internal: find similar chunks, used by `explore(kind="similar")`.
@@ -6852,32 +8471,56 @@ impl CodesearchService {
 
         let limit = request.limit.unwrap_or(5).min(20);
 
+        // Stores that failed while resolving the source embedding. `if let
+        // Ok(Some(..))` used to discard the error, so a dead store produced
+        // "embedding not found" — a wrong diagnosis, not a missing chunk.
+        let mut similar_warnings: Vec<String> = Vec::new();
+
         let mut results = if let Some(ref sv) = ctx.stores_vec {
             // Multi-store: find the embedding in whichever store has it,
             // then search across all stores for similar chunks.
+            let aliases = ctx.aliases();
             let mut embedding: Option<Vec<f32>> = None;
-            for store_arc in sv {
+            for (i, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
-                if let Ok(Some(emb)) = store.get_embedding(request.chunk_id) {
-                    embedding = Some(emb);
-                    break;
+                match store.get_embedding(request.chunk_id) {
+                    Ok(Some(emb)) => {
+                        embedding = Some(emb);
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(ref e) => {
+                        note_store_failure(
+                            &mut similar_warnings,
+                            aliases,
+                            i,
+                            "embedding lookup",
+                            e,
+                        );
+                        continue;
+                    }
                 }
             }
 
             let embedding = match embedding {
                 Some(e) => e,
                 None => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Embedding not found for chunk_id {} in any store.",
-                        request.chunk_id
-                    ))]));
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        qualify_empty_result(
+                            format!(
+                                "Embedding not found for chunk_id {} in any store.",
+                                request.chunk_id
+                            ),
+                            &similar_warnings,
+                        ),
+                    )]));
                 }
             };
 
             // Search across all stores with the found embedding
             let mut all_results: Vec<SearchResultItem> = Vec::new();
             let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for store_arc in sv {
+            for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
                 match store.search(&embedding, limit + 1) {
                     Ok(mut neighbors) => {
@@ -6901,8 +8544,17 @@ impl CodesearchService {
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Similarity search failed in fan-out: {:?}", e);
+                    Err(ref e) => {
+                        // The embedding was found, so the handler returns results
+                        // either way; without this, a group query silently omits
+                        // every neighbour from the broken repo.
+                        note_store_failure(
+                            &mut similar_warnings,
+                            aliases,
+                            store_idx,
+                            "similarity search",
+                            e,
+                        );
                     }
                 }
             }
@@ -6956,8 +8608,7 @@ impl CodesearchService {
                 Ok(items) => items,
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Error finding similar chunks: {}",
-                        e
+                        "Error finding similar chunks: {e:#}"
                     ))]));
                 }
             }
@@ -6968,8 +8619,12 @@ impl CodesearchService {
             item.path = ctx.prefix_result_path(&item.path);
         }
 
-        let json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        // Every exit carries the channel: the earlier read sat in an
+        // early-return arm, so once an embedding was found, every failure
+        // recorded afterwards (the whole neighbour fan-out) was discarded.
+        respond_with_items(&results, &similar_warnings, || {
+            format!("No similar chunks found for chunk_id {}.", request.chunk_id)
+        })
     }
 
     async fn literal_search(
@@ -6987,6 +8642,11 @@ impl CodesearchService {
 
         let limit = request.limit.unwrap_or(20);
         let output_format = request.format.as_deref().unwrap_or("json");
+
+        // Repos that failed during this search. Reported to the caller: an
+        // agent that never sees the server log cannot otherwise distinguish a
+        // broken store from a repo that holds no match.
+        let mut literal_warnings: Vec<String> = Vec::new();
 
         // Auto-regex promotion: detect code patterns that BM25 would destroy
         let user_set_regex = request.regex.unwrap_or(false);
@@ -7156,8 +8816,7 @@ impl CodesearchService {
                     Ok(items) => items,
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "Error scanning chunks: {}",
-                            e
+                            "Error scanning chunks: {e:#}"
                         ))]));
                     }
                 }
@@ -7182,19 +8841,26 @@ impl CodesearchService {
             };
             let fts_results = if let Some(ref sv) = ctx.stores_vec {
                 let sa = ctx.store_aliases.as_ref().unwrap();
-                self.with_fts_store_read_multi(
-                    |fts_store| {
-                        if request.phrase.unwrap_or(false) {
-                            fts_store.search_phrase(&bm25_query, limit * 3)
-                        } else {
-                            fts_store.search(&bm25_query, limit * 3, None)
-                        }
-                    },
-                    sv.clone(),
-                    sa,
-                )
-                .await
-                .unwrap_or_default()
+                let outcome = self
+                    .with_fts_store_read_multi(
+                        |fts_store| {
+                            if request.phrase.unwrap_or(false) {
+                                fts_store.search_phrase(&bm25_query, limit * 3)
+                            } else {
+                                fts_store.search(&bm25_query, limit * 3, None)
+                            }
+                        },
+                        sv.clone(),
+                        sa,
+                    )
+                    .await
+                    .unwrap_or_default();
+                for (alias, err) in &outcome.failures {
+                    let msg = format!("repo '{alias}' literal search failed: {err}");
+                    tracing::error!("MCP: {}", msg);
+                    literal_warnings.push(msg);
+                }
+                outcome.results
             } else {
                 match self
                     .with_fts_store_read_for(
@@ -7212,8 +8878,7 @@ impl CodesearchService {
                     Ok(r) => r,
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "Error searching: {}",
-                            e
+                            "Error searching: {e:#}"
                         ))]));
                     }
                 }
@@ -7224,9 +8889,14 @@ impl CodesearchService {
                 // Multi-store: resolve chunks from all stores
                 let mut items: Vec<LiteralSearchResultItem> = Vec::new();
                 'outer: for fts_result in &fts_results {
-                    for store_arc in sv {
+                    let sa = ctx.store_aliases.as_ref().unwrap();
+                    for (idx, store_arc) in sv.iter().enumerate() {
                         let store = store_arc.vector_store.read().await;
-                        if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                        let looked_up = store.get_chunk(fts_result.chunk_id);
+                        if let Err(ref e) = looked_up {
+                            note_store_failure(&mut literal_warnings, sa, idx, "chunk lookup", e);
+                        }
+                        if let Some(chunk) = looked_up.ok().flatten() {
                             if let Some(ref lang) = lang_filter {
                                 let file_lang =
                                     Language::from_path(std::path::Path::new(&chunk.path));
@@ -7345,8 +9015,7 @@ impl CodesearchService {
                     Ok(items) => items,
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "Error resolving search results: {}",
-                            e
+                            "Error resolving search results: {e:#}"
                         ))]));
                     }
                 }
@@ -7390,6 +9059,11 @@ impl CodesearchService {
                 suggested_tool
             } else {
                 None
+            },
+            warnings: if literal_warnings.is_empty() {
+                None
+            } else {
+                Some(literal_warnings)
             },
         };
 
@@ -7531,8 +9205,11 @@ impl CodesearchService {
             let mut max_chunk_id = 0u32;
             let mut dimensions = 0usize;
             let mut all_indexed = true;
+            let aliases = ctx.aliases();
+            let mut stats_warnings: Vec<String> = Vec::new();
+            let mut failed_count = 0usize;
 
-            for store_arc in sv {
+            for (i, store_arc) in sv.iter().enumerate() {
                 let store = store_arc.vector_store.read().await;
                 match store.stats() {
                     Ok(stats) => {
@@ -7548,23 +9225,21 @@ impl CodesearchService {
                             all_indexed = false;
                         }
                     }
-                    Err(_) => {
+                    // `all_indexed = false` alone renders identically to "still
+                    // warming" — the caller has no way to tell "wait" from "this
+                    // store is down". This is the tool whose job is reporting index
+                    // health, so it must not stay silent on the one signal that
+                    // matters here: bind the error, carry it, never `Err(_)`.
+                    Err(ref e) => {
                         all_indexed = false;
+                        failed_count += 1;
+                        note_store_failure(&mut stats_warnings, aliases, i, "stats", e);
                     }
                 }
             }
 
-            let (status, status_message) = if total_chunks == 0 {
-                (
-                    "building".to_string(),
-                    format!("Index is being built across {} repo(s). Searches may fail until indexing completes.", sv.len()),
-                )
-            } else {
-                (
-                    "ready".to_string(),
-                    format!("Index is ready for searching across {} repo(s).", sv.len()),
-                )
-            };
+            let (status, status_message) =
+                index_status_summary(sv.len(), failed_count, total_chunks);
 
             let response = IndexStatusResponse {
                 indexed: all_indexed,
@@ -7581,8 +9256,7 @@ impl CodesearchService {
                 mode: self.mcp_mode(),
             };
 
-            let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            return respond_with_object(&response, &stats_warnings);
         }
 
         // Single-store path
@@ -7685,38 +9359,45 @@ impl CodesearchService {
             let config = serve_state.config_snapshot();
             let project_groups = config.project_groups();
             let mut repos_info = Vec::new();
+            let mut list_warnings: Vec<String> = Vec::new();
 
             for (alias, path) in &config.repos {
                 let db_path = path.join(crate::constants::DB_DIR_NAME);
 
-                let (total_chunks, total_files, model, lock_status) = if db_path.exists() {
+                let (total_chunks, total_files, model, lock_status, error) = if db_path.exists() {
                     let (model_name, _dims) = read_model_metadata(&db_path);
 
                     // For repos already opened in DashMap, use the live SharedStores for stats
                     // WITHOUT opening a new VectorStore connection.
                     // For unopened repos, just report metadata — do NOT open the DB.
                     if let Some(stores) = serve_state.get_opened_stores(alias) {
-                        let vs = stores.vector_store.read().await;
-                        match vs.stats() {
-                            Ok(stats) => (
-                                stats.total_chunks,
-                                stats.total_files,
-                                model_name,
-                                serve_state
-                                    .repo_lock_status(alias)
-                                    .unwrap_or("unknown")
-                                    .to_string(),
-                            ),
-                            Err(_) => (
-                                0,
-                                0,
-                                model_name,
-                                serve_state
-                                    .repo_lock_status(alias)
-                                    .unwrap_or("unknown")
-                                    .to_string(),
-                            ),
-                        }
+                        let stats_result = {
+                            let vs = stores.vector_store.read().await;
+                            vs.stats()
+                        };
+                        // `0 chunks` alone reads exactly like "not indexed yet" — the
+                        // repo may in fact be full and simply failing to answer (the
+                        // read-only-incident shape this branch exists for). Attribute
+                        // the failure to THIS repo rather than a top-level channel:
+                        // list_projects returns one entry per repo, so per-item is the
+                        // shape that actually matches the fan-out.
+                        // `repo_stats_from_result` carries only the part of this
+                        // decision that varies by Ok/Err — see its doc comment.
+                        // `record_stats_or_warn` wraps it so this call site cannot
+                        // silently drop the warning half without also breaking the
+                        // counts it returns — see its own doc comment.
+                        let (total_chunks, total_files, error) =
+                            record_stats_or_warn(stats_result, alias, &mut list_warnings);
+                        (
+                            total_chunks,
+                            total_files,
+                            model_name,
+                            serve_state
+                                .repo_lock_status(alias)
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            error,
+                        )
                     } else {
                         // Repo NOT opened — read persisted stats from metadata.json
                         let (md_chunks, md_files) = read_metadata_stats(&db_path);
@@ -7725,10 +9406,10 @@ impl CodesearchService {
                         } else {
                             "available".to_string()
                         };
-                        (md_chunks, md_files, model_name, lock_status)
+                        (md_chunks, md_files, model_name, lock_status, None)
                     }
                 } else {
-                    (0, 0, "not indexed".to_string(), "unknown".to_string())
+                    (0, 0, "not indexed".to_string(), "unknown".to_string(), None)
                 };
 
                 repos_info.push(RepoInfo {
@@ -7740,6 +9421,7 @@ impl CodesearchService {
                     model,
                     lock_status,
                     groups: project_groups.get(alias).cloned().unwrap_or_default(),
+                    error,
                 });
             }
 
@@ -7752,8 +9434,7 @@ impl CodesearchService {
                 current_directory: current_dir.display().to_string(),
             };
 
-            let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            return respond_with_object(&response, &list_warnings);
         }
 
         // Stdio mode: fall back to disk-based lock detection
@@ -7791,6 +9472,10 @@ impl CodesearchService {
                 (0, 0, "not indexed".to_string(), "unknown".to_string())
             };
 
+            // Stdio mode is single-repo-at-a-time CLI usage, not the live multi-repo
+            // federation this fan-out fix targets — a stats() failure here is out of
+            // scope for this fix (VectorStore::new/stats failing locally is a different
+            // shape than a store going down mid-request in a shared serve process).
             repos_info.push(RepoInfo {
                 alias: alias.clone(),
                 project_path: path.display().to_string(),
@@ -7800,6 +9485,7 @@ impl CodesearchService {
                 model,
                 lock_status,
                 groups: project_groups.get(alias).cloned().unwrap_or_default(),
+                error: None,
             });
         }
 
@@ -8403,8 +10089,30 @@ async fn probe_serve_health(serve_url: &str) -> bool {
 /// 3. Retries the HTTP connection every 3 seconds for up to 5 minutes
 /// 4. On success, hot-swaps the peer — tool calls resume immediately
 /// 5. After 5 minutes of failure, exits cleanly (Claude Desktop detects the disconnect)
+///
+/// ## Idle disconnect behaviour
+///
+/// One HTTP MCP session held open for the lifetime of the proxy keeps a request
+/// permanently registered at the remote's ingress, so a scale-to-zero host never
+/// sees 0 concurrent requests and never suspends the replica. To avoid that, the
+/// connection is only held while it is actually being used:
+///
+/// - An idle-checker ticks every `MCP_PROXY_IDLE_CHECK_INTERVAL_SECS`. Once no
+///   request has been forwarded for `CODESEARCH_MCP_PROXY_IDLE_DISCONNECT_SECS`
+///   (default `DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS`; `0` disables and restores
+///   the always-connected behaviour), it clears the peer and cancels the
+///   `RunningService`, closing the transport.
+/// - That is a *planned* close, not an outage: it does not open a failure window
+///   and does not count against `reconnect::MAX_DURATION_SECS`. The monitor task's
+///   resulting `disconnect_tx` signal is recognised (via `voluntary_disconnect`)
+///   and does not trigger an eager reconnect — reconnecting immediately would
+///   defeat the purpose.
+/// - The next `list_tools` / `call_tool` finds an empty peer slot and signals
+///   `connect_request_tx`, which reconnects on demand. Failure-path reconnects
+///   are unaffected and still run on their own cadence.
 async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let mcp_url = format!("{}{}", serve_url, crate::constants::MCP_ENDPOINT_PATH);
     tracing::info!("🔗 Connecting to codesearch serve at {}", mcp_url);
@@ -8412,10 +10120,40 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
     // Channels: spawned monitor tasks notify us when their connection drops.
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (stdio_close_tx, mut stdio_close_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Capacity 1: coalescing duplicate "connect now" requests is correct.
+    let (connect_request_tx, mut connect_request_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // Shared peer state — hot-swapped on reconnect.
     let peer_state: std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>> =
         std::sync::Arc::new(tokio::sync::RwLock::new(None));
+
+    // Idle-disconnect state, shared with the proxy service.
+    let last_activity: Arc<Mutex<std::time::Instant>> =
+        Arc::new(Mutex::new(std::time::Instant::now()));
+    let in_flight: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    // Notified whenever an on-demand `connect_to_serve` attempt (below, in the
+    // `connect_request_rx` arm) comes back `Err` — lets `await_peer` stop waiting
+    // on a definitive refusal instead of polling out the rest of its window.
+    let connect_failed: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+    // Cancellation handle for the *current* connection. `RunningServiceCancellationToken`
+    // is not Clone and its `cancel()` consumes self, so it lives in an Option slot
+    // that the idle-checker `take()`s.
+    let conn_cancel: Arc<
+        tokio::sync::Mutex<Option<rmcp::service::RunningServiceCancellationToken>>,
+    > = Arc::new(tokio::sync::Mutex::new(None));
+    // Set just before we cancel a connection ourselves, so the disconnect signal it
+    // produces is not mistaken for an outage.
+    let voluntary_disconnect = Arc::new(AtomicBool::new(false));
+    let idle_disconnect_secs = resolve_proxy_idle_disconnect_secs(None);
+    if idle_disconnect_secs == 0 {
+        tracing::info!("idle-disconnect disabled — holding the serve connection open");
+    } else {
+        tracing::info!(
+            "💤 idle-disconnect enabled: closing the serve connection after {}s without traffic (checked every {}s)",
+            idle_disconnect_secs,
+            crate::constants::MCP_PROXY_IDLE_CHECK_INTERVAL_SECS
+        );
+    }
 
     // Step 1: Start stdio proxy for Claude Desktop.
     // This must happen first so Claude Desktop has something to talk to,
@@ -8423,6 +10161,10 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
     let proxy = McpProxyService {
         peer: peer_state.clone(),
         disconnect_tx: disconnect_tx.clone(),
+        connect_request_tx: connect_request_tx.clone(),
+        last_activity: last_activity.clone(),
+        in_flight: in_flight.clone(),
+        connect_failed: connect_failed.clone(),
     };
     let server = proxy
         .serve(stdio())
@@ -8437,7 +10179,15 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
 
     // Step 2: Initial connection to serve (tolerant — may not be running yet).
     let mut serve_down_since: Option<std::time::Instant> = None;
-    match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone()).await {
+    match connect_to_serve(
+        &mcp_url,
+        &peer_state,
+        disconnect_tx.clone(),
+        &conn_cancel,
+        &last_activity,
+    )
+    .await
+    {
         Ok(()) => {
             tracing::info!("🚀 MCP proxy ready — forwarding Claude Desktop ↔ codesearch serve");
         }
@@ -8457,7 +10207,15 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
         }
     }
 
-    // Step 3: Main loop — wait for stdio close, serve disconnect, or cancel.
+    // Step 3: Main loop — wait for stdio close, serve disconnect, an on-demand
+    // connect request, an idle timeout, or cancel.
+
+    let mut idle_ticker = tokio::time::interval(std::time::Duration::from_secs(
+        crate::constants::MCP_PROXY_IDLE_CHECK_INTERVAL_SECS,
+    ));
+    // The first tick of a tokio interval completes immediately; skip it so a
+    // freshly started proxy is not evaluated for idleness before it can be used.
+    idle_ticker.tick().await;
 
     loop {
         tokio::select! {
@@ -8475,12 +10233,44 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
                 return Ok(());
             }
 
+            // A request arrived while the peer slot was empty — connect now rather
+            // than waiting for the failure-path cadence. Ordered before the
+            // disconnect branch so a pending 3s backoff cannot starve it.
+            _ = connect_request_rx.recv() => {
+                if peer_state.read().await.is_some() {
+                    continue; // Someone else already reconnected.
+                }
+                match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone(), &conn_cancel, &last_activity).await {
+                    Ok(()) => {
+                        tracing::info!("🔗 Reconnected to codesearch serve on demand");
+                        serve_down_since = None;
+                    }
+                    Err(e) => {
+                        // Serve is genuinely unreachable (or still waking). Hand over
+                        // to the existing failure loop, which retries on its own
+                        // cadence and eventually gives up.
+                        tracing::debug!("On-demand connect failed: {}", e);
+                        note_connect_failure(&connect_failed, &disconnect_tx);
+                    }
+                }
+            }
+
             // Serve disconnected — enter reconnect loop.
             _ = disconnect_rx.recv() => {
                 // Clear peer so tool calls get "reconnecting" error.
                 {
                     let mut p = peer_state.write().await;
                     *p = None;
+                }
+
+                // A disconnect we caused on purpose (idle-close) is not an outage:
+                // no failure window, no eager reconnect — the next request will ask
+                // for one via connect_request_tx.
+                if voluntary_disconnect.swap(false, Ordering::SeqCst) {
+                    tracing::debug!(
+                        "serve connection closed after idle — will reconnect on the next request"
+                    );
+                    continue;
                 }
 
                 if serve_down_since.is_none() {
@@ -8504,7 +10294,7 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
                 // Wait before retrying.
                 tokio::time::sleep(std::time::Duration::from_secs(reconnect::INTERVAL_SECS)).await;
 
-                match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone()).await {
+                match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone(), &conn_cancel, &last_activity).await {
                     Ok(()) => {
                         tracing::info!(
                             "✅ Reconnected to codesearch serve (was down for {:.0}s)",
@@ -8525,6 +10315,61 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
                     }
                 }
             }
+
+            // Idle check — close the connection so a scale-to-zero remote can suspend.
+            _ = idle_ticker.tick() => {
+                if idle_disconnect_secs == 0 {
+                    continue; // Idle-disconnect disabled.
+                }
+                let last = match last_activity.lock() {
+                    Ok(guard) => *guard,
+                    Err(_) => continue, // Poisoned: never tear down on a bookkeeping error.
+                };
+                if !is_idle(last, idle_disconnect_secs, std::time::Instant::now()) {
+                    continue;
+                }
+
+                // Take the peer slot's write lock *before* checking `in_flight`, and
+                // hold it through the clear below, instead of checking `in_flight`
+                // first and taking the write lock afterwards.
+                //
+                // Every forwarding call does `InFlightGuard::new` (increments
+                // `in_flight`) BEFORE `self.peer.read().await` (list_tools/call_tool
+                // above) — so a call that has already obtained `Some(peer)` to
+                // forward through has necessarily already incremented the counter,
+                // and a call that hasn't reached the read yet will block on it once
+                // we hold the write lock. Reading `in_flight` first (the previous
+                // version) left a gap between that read and taking the write lock in
+                // which such a call could still slip past, get `Some(peer)`, and have
+                // its transport cancelled out from under it mid-request — the
+                // in-flight count and the peer-slot teardown were two separate
+                // operations pretending to be one guard. See AGENTS.md
+                // "counter-then-teardown races".
+                let mut p = peer_state.write().await;
+                if p.is_none() {
+                    continue; // Already disconnected.
+                }
+                if in_flight.load(Ordering::SeqCst) > 0 {
+                    continue; // A request is still being forwarded over this transport.
+                }
+
+                tracing::info!(
+                    "💤 Idle for {}s — closing MCP proxy connection to codesearch serve (will reconnect on next request)",
+                    idle_disconnect_secs
+                );
+                // Flag first, so the disconnect signal from the dying monitor task is
+                // recognised as planned no matter how fast it arrives.
+                voluntary_disconnect.store(true, Ordering::SeqCst);
+                *p = None;
+                drop(p);
+                if let Some(token) = conn_cancel.lock().await.take() {
+                    token.cancel();
+                } else {
+                    // Nothing to cancel — don't leave the flag set for a later,
+                    // genuine disconnect to misread.
+                    voluntary_disconnect.store(false, Ordering::SeqCst);
+                }
+            }
         }
     }
 }
@@ -8533,10 +10378,16 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
 ///
 /// On success, updates `peer_state` with the new peer and spawns a background task
 /// that monitors the connection and sends a message on `disconnect_tx` when it drops.
+///
+/// Also parks the connection's cancellation handle in `conn_cancel` (so the
+/// idle-checker can close it) and stamps `last_activity`, so a connection opened
+/// just before an idle tick is not immediately judged idle.
 async fn connect_to_serve(
     mcp_url: &str,
     peer_state: &std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>>,
     disconnect_tx: tokio::sync::mpsc::Sender<()>,
+    conn_cancel: &Arc<tokio::sync::Mutex<Option<rmcp::service::RunningServiceCancellationToken>>>,
+    last_activity: &Arc<Mutex<std::time::Instant>>,
 ) -> Result<()> {
     use rmcp::ServiceExt;
 
@@ -8560,12 +10411,25 @@ async fn connect_to_serve(
             )
         })?;
 
+    // Grab the cancellation handle before the RunningService is moved into the
+    // monitor task below — that's the only way to close this transport later
+    // (idle-disconnect). Cancelling it makes the monitor's `waiting()` resolve, so
+    // the normal disconnect path still runs; nothing needs special-casing.
+    {
+        let mut slot = conn_cancel.lock().await;
+        *slot = Some(http_client.cancellation_token());
+    }
+
     // Update the shared peer.
     let peer = http_client.peer().clone();
     {
         let mut p = peer_state.write().await;
         *p = Some(peer);
     }
+
+    // A fresh connection counts as activity: without this, an idle tick firing
+    // right after a reconnect would immediately close it again.
+    mark_proxy_activity(last_activity);
 
     // Spawn a monitor task that detects when the connection drops.
     tokio::spawn(async move {

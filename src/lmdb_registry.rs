@@ -19,6 +19,31 @@ use std::time::Instant;
 
 use crate::cache::safe_canonicalize;
 
+// ── Baseline env flags ──────────────────────────────────────────
+
+/// Flags every codesearch LMDB environment MUST be opened with.
+///
+/// `NO_TLS` is LMDB's `MDB_NOTLS`: it detaches read transactions from
+/// thread-local storage. Without it LMDB hands out exactly ONE reader
+/// lock-table slot per OS thread, so a second *concurrently live* read
+/// transaction on the same thread fails with
+/// `MDB_BAD_RSLOT: Invalid reuse of reader locktable slot`.
+///
+/// This is defensive hardening, not a fix for a known live call path. Every
+/// current reader (`VectorStore::stats`, `::search`, …) opens and drops its own
+/// `RoTxn` inside one function body, so no two are live at once today, and
+/// `MDB_BAD_RSLOT` is per-environment so a group query across repos cannot
+/// trigger it either. The flag is here because the failure is real, silent and
+/// easy to reintroduce: it was reproduced against the production `inriver`
+/// database simply by holding two read transactions at once, and nothing in the
+/// type system stops a future refactor (e.g. reading stats while a search txn
+/// is open) from doing exactly that.
+///
+/// Because heed refuses to reopen the same path with different options, this
+/// must be applied at EVERY env-open site, not only the read-only one — a
+/// partial rollout would turn a working reopen into an intermittent failure.
+pub const BASE_ENV_FLAGS: heed::EnvFlags = heed::EnvFlags::NO_TLS;
+
 // ── Global registry ─────────────────────────────────────────────
 
 static LMDB_REGISTRY: OnceLock<DashMap<PathBuf, LmdbEntry>> = OnceLock::new();
@@ -189,6 +214,28 @@ mod tests {
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(map_size).max_dbs(1);
         opts
+    }
+
+    /// Two read transactions must be able to be live at the same time on ONE
+    /// thread. Without `NO_TLS` in [`BASE_ENV_FLAGS`] LMDB gives each thread a
+    /// single reader lock-table slot and the second begin fails with
+    /// `MDB_BAD_RSLOT: Invalid reuse of reader locktable slot` — reachable in
+    /// `serve` whenever one handler holds a read txn open while starting
+    /// another (e.g. `/info` stats while a search txn is live).
+    #[test]
+    fn base_flags_allow_concurrent_read_txns_on_one_thread() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = make_opts();
+        unsafe { opts.flags(BASE_ENV_FLAGS) };
+        let env = unsafe { TrackedEnv::open(&opts, dir.path(), "concurrent-read-txn-test") }
+            .expect("open env");
+
+        let first = env.read_txn().expect("first read txn");
+        let second = env
+            .read_txn()
+            .expect("second concurrent read txn on the same thread (needs MDB_NOTLS)");
+        drop(first);
+        drop(second);
     }
 
     #[test]

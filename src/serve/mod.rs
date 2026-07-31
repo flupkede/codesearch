@@ -1546,22 +1546,50 @@ impl ServeState {
             }
         }
 
-        let path = {
+        let (path, force_readonly) = {
             let config = self
                 .config
                 .read()
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            config
+            let p = config
                 .resolve(alias)
-                .ok_or_else(|| format!("Unknown alias '{}'", alias))?
+                .ok_or_else(|| format!("Unknown alias '{}'", alias))?;
+            let ro = config.repo_read_only.get(alias) == Some(&true);
+            (p, ro)
         };
 
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false)? {
-            OpenedStores::Readonly(_) => {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
+            OpenedStores::Readonly(stores) => {
                 // Already registered as Readonly by try_open_stores.
+                //
+                // A read-only store can never repair itself: `build_index()`
+                // needs a write txn that MDB_RDONLY rejects, so if the snapshot
+                // this repo was restored from was taken before its HNSW graph
+                // was committed, `search()` fails with "Index not built" and the
+                // repo silently answers 0 results forever. That is invisible in
+                // `/status` (the repo reports "readonly", chunk counts look
+                // healthy) and previously cost a multi-round debugging spiral —
+                // so state it loudly, once, at warmup.
+                // `index_health()` (not `stats()`) on purpose: this arm is the
+                // cheap path that keeps the 2 GiB replica alive, and `stats()`
+                // would deserialize every chunk just to count unique paths.
+                match stores.vector_store.read().await.index_health() {
+                    Ok((total_chunks, false)) if total_chunks > 0 => warn!(
+                        "Warmup '{}': opened READ-ONLY but its vector index has no HNSW graph \
+                         ({} chunks present). Semantic search will return 0 results for this \
+                         repo. The graph must be built by a WRITE-mode run before the snapshot \
+                         is taken; a read-only store cannot build one.",
+                        alias, total_chunks
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        "Warmup '{}': opened READ-ONLY but could not read index health: {}",
+                        alias, e
+                    ),
+                }
                 // Touch so the idle reaper can evict this handle.
                 self.touch_access(alias);
                 return Ok(());
@@ -1574,15 +1602,18 @@ impl ServeState {
         // `build_index()` is a synchronous, CPU-heavy operation (HNSW graph
         // construction). Running it directly on a tokio worker thread starves
         // the async executor and makes `/health` time out during warmup, so it
-        // is offloaded to `spawn_blocking`. Stats are read first under a short
-        // `.read()` lock to decide whether a build is even needed.
+        // is offloaded to `spawn_blocking`. Index health is read first under a
+        // short `.read()` lock to decide whether a build is even needed —
+        // `index_health()` rather than `stats()`, since the predicate needs
+        // exactly `(total_chunks, indexed)` and `stats()` would deserialize
+        // every chunk in the store just to count unique file paths.
         let needs_build = {
             let vstore = stores.vector_store.read().await;
-            match vstore.stats() {
-                Ok(s) if s.total_chunks > 0 && !s.indexed => Some(s.total_chunks),
+            match vstore.index_health() {
+                Ok((total_chunks, false)) if total_chunks > 0 => Some(total_chunks),
                 Ok(_) => None,
                 Err(e) => {
-                    warn!("Warmup '{}': could not read stats: {}", alias, e);
+                    warn!("Warmup '{}': could not read index health: {}", alias, e);
                     None
                 }
             }
@@ -1700,20 +1731,22 @@ impl ServeState {
         }
 
         // Slow path: need to open
-        let path = {
+        let (path, force_readonly) = {
             let config = self
                 .config
                 .read()
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            config
+            let p = config
                 .resolve(alias)
-                .ok_or_else(|| format!("Unknown alias '{}'", alias))?
+                .ok_or_else(|| format!("Unknown alias '{}'", alias))?;
+            let ro = config.repo_read_only.get(alias) == Some(&true);
+            (p, ro)
         };
 
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false)? {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
             OpenedStores::Readonly(s) => {
                 // Already registered as Readonly; touch and return.
                 self.touch_access(alias);
@@ -1723,9 +1756,13 @@ impl ServeState {
         };
 
         // Ensure the HNSW vector index is built from existing data.
-        // When opening an existing DB, VectorStore starts with indexed=false.
-        // Without this, search fails with "Index not built" until the background
-        // refresh completes (which may take minutes for large repos).
+        // `indexed` is NOT "false until we build": VectorStore::new probes the
+        // persisted arroy graph at open time (`Reader::open(...).is_ok()`), so it is
+        // already true for a store whose graph was committed by a previous run — which
+        // is exactly how a read-only replica can serve a snapshot it cannot build.
+        // It is false when the graph is absent OR when items were inserted after the
+        // last build (arroy reports NeedBuild); without this, search fails with
+        // "Index not built" until the background refresh completes.
         // build_index() is CPU-heavy — offload to the blocking pool so the async
         // runtime is not stalled while building the HNSW index for large repos.
         {
@@ -1733,18 +1770,22 @@ impl ServeState {
             let alias_owned = alias.to_string();
             match tokio::task::spawn_blocking(move || {
                 let mut vstore = vector_store.blocking_write();
-                match vstore.stats() {
-                    Ok(s) if s.total_chunks > 0 && !s.indexed => {
+                // `index_health()`, not `stats()` — the predicate needs exactly
+                // `(total_chunks, indexed)`, while `stats()` deserializes every
+                // ChunkMetadata in the store just to count unique file paths.
+                // Same two values from the same source, on a memory-sensitive path.
+                match vstore.index_health() {
+                    Ok((total_chunks, false)) if total_chunks > 0 => {
                         info!(
                             "Building vector index for '{}' ({} existing chunks)",
-                            alias_owned, s.total_chunks
+                            alias_owned, total_chunks
                         );
                         if let Err(e) = vstore.build_index() {
                             warn!("Failed to build vector index for '{}': {}", alias_owned, e);
                         }
                     }
                     Ok(_) => {} // already indexed or no chunks
-                    Err(e) => warn!("Could not read stats for '{}': {}", alias_owned, e),
+                    Err(e) => warn!("Could not read index health for '{}': {}", alias_owned, e),
                 }
             })
             .await
@@ -1943,6 +1984,7 @@ impl ServeState {
         alias: &str,
         db_path: &Path,
         allow_create: bool,
+        force_readonly: bool,
     ) -> std::result::Result<OpenedStores, String> {
         if !db_path.exists() && !allow_create {
             let parent = db_path
@@ -1959,6 +2001,31 @@ impl ServeState {
         }
 
         let dims = self.get_dimensions_for_path(db_path);
+
+        // Read-only requested via the per-repo `repo_read_only` config flag:
+        // open readonly directly and never attempt a write open. This makes
+        // warmup return early (no incremental-refresh embedding), which is the
+        // point for large static corpora on a memory-constrained replica.
+        if force_readonly {
+            return match SharedStores::new_readonly(db_path, dims) {
+                Ok(s) => {
+                    info!("Opened repo in readonly mode (forced by config): {}", alias);
+                    let stores_arc = Arc::new(s);
+                    self.repos.insert(
+                        alias.to_string(),
+                        RepoState::Readonly {
+                            stores: stores_arc.clone(),
+                        },
+                    );
+                    Ok(OpenedStores::Readonly(stores_arc))
+                }
+                Err(e) => {
+                    warn!("Failed to open repo {}: {}", alias, e);
+                    self.repos.insert(alias.to_string(), RepoState::Conflicted);
+                    Err(Self::conflicted_msg(alias))
+                }
+            };
+        }
 
         match SharedStores::new(db_path, dims) {
             Ok(s) => {
@@ -2740,6 +2807,11 @@ async fn info_handler(
         }
     }
 
+    // Whether the HNSW graph is actually present. `None` when the repo is not
+    // open (nothing live to ask), so a consumer can tell "no graph" apart from
+    // "unknown" instead of reading a defaulted `false` as a hard failure.
+    let mut indexed: Option<bool> = None;
+
     // If stores are open, live stats override metadata.
     if let Some(stores) = state.get_opened_stores(&alias) {
         if let Ok(vs) = stores.vector_store.try_read() {
@@ -2747,6 +2819,7 @@ async fn info_handler(
                 chunks = live_stats.total_chunks;
                 files = live_stats.total_files;
                 max_chunk_id = live_stats.max_chunk_id;
+                indexed = Some(live_stats.indexed);
                 if dims == 0 {
                     dims = live_stats.dimensions;
                 }
@@ -2762,6 +2835,7 @@ async fn info_handler(
     let db_size_human = tui::dir_size_human(&db_path);
 
     AxumJson(json!({
+        "path": db_path.display().to_string(),
         "chunks": chunks,
         "files": files,
         "max_chunk_id": max_chunk_id,
@@ -2770,6 +2844,13 @@ async fn info_handler(
         "dims": dims,
         "lock": lock,
         "index_age": index_age,
+        // Is the HNSW graph built and committed? A non-zero `chunks` with
+        // `indexed: false` is a searchable-looking but silently dead index:
+        // `VectorStore::search` refuses to run without the graph. The cloud
+        // index-job asserts this before publishing a snapshot, because a
+        // read-only serve replica can never build the graph itself.
+        // `null` = repo not currently open, so the graph state is unknown.
+        "indexed": indexed,
     }))
     .into_response()
 }
@@ -2992,7 +3073,7 @@ async fn reindex_handler(
         .unwrap_or(false);
 
     // Resolve the project path for this alias
-    let project_path = {
+    let (project_path, read_only) = {
         let config = match state.config.read() {
             Ok(c) => c,
             Err(e) => {
@@ -3005,8 +3086,9 @@ async fn reindex_handler(
                 );
             }
         };
+        let ro = config.repo_read_only.get(&alias) == Some(&true);
         match config.resolve(&alias) {
-            Some(p) => p,
+            Some(p) => (p, ro),
             None => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -3018,6 +3100,29 @@ async fn reindex_handler(
             }
         }
     };
+
+    // Honour `repo_read_only` HERE, not just on the open paths. Without this the
+    // flag is advisory on the one route that can undo it: a reindex opens the
+    // repo WRITE-mode (`try_open_stores(..., force_readonly = false)` below),
+    // runs a full incremental refresh plus `build_index()`, and starts an FSW —
+    // on a memory-constrained replica that is exactly the warmup blow-up the flag
+    // exists to prevent, and the rebuilt index would also diverge from the one the
+    // owning job publishes. 409 rather than 403: the repo is not permanently
+    // forbidden, it is owned by another writer right now.
+    if read_only {
+        return (
+            StatusCode::CONFLICT,
+            axum::response::Json(json!({
+                "error": format!(
+                    "Repo '{}' is marked read-only (repo_read_only) — its index is owned by \
+                     another writer (e.g. a separate indexing job). Reindex it there, or clear \
+                     the flag in repos.json.",
+                    alias
+                ),
+                "status": "read_only"
+            })),
+        );
+    }
 
     let db_path = project_path.join(DB_DIR_NAME);
     let alias_bg = alias.clone();
@@ -3052,7 +3157,7 @@ async fn reindex_handler(
                 // FSW not running -- open existing or create fresh DB.
                 // allow_create=true so a force-reindex can recover a deleted DB.
                 let cancel = CancellationToken::new();
-                match state.try_open_stores(&alias, &db_path, true) {
+                match state.try_open_stores(&alias, &db_path, true, false) {
                     Ok(OpenedStores::Write(s)) => {
                         // Register as Write to block double-open races while we reindex.
                         state.repos.insert(
@@ -3291,10 +3396,12 @@ async fn add_repo_handler(
     //  path opened its own LMDB handle, conflicting with
     //  calls from the serve's request handlers.
     let db_path = canonical_path.join(DB_DIR_NAME);
-    let stores = match state.try_open_stores(&alias, &db_path, true) {
+    let stores = match state.try_open_stores(&alias, &db_path, true, false) {
         Ok(OpenedStores::Write(s)) => s,
         Ok(OpenedStores::Readonly(_)) => {
-            unreachable!("try_open_stores(allow_create=true) never returns Readonly")
+            unreachable!(
+                "try_open_stores(allow_create=true, force_readonly=false) never returns Readonly"
+            )
         }
         Err(e) => {
             // Clean up the config entry we just added
@@ -4615,7 +4722,7 @@ mod tests {
 
         let state = state_with_config(ReposConfig::default());
 
-        match state.try_open_stores("brandnew", &db_path, true) {
+        match state.try_open_stores("brandnew", &db_path, true, false) {
             Ok(OpenedStores::Write(_)) => {}
             Ok(OpenedStores::Readonly(_)) => {
                 panic!("brand-new repo opened Readonly; expected Write")
@@ -5027,6 +5134,35 @@ mod tests {
             body.get("error").is_some(),
             "expected JSON error body from info handler, got: {}",
             body
+        );
+
+        // GET a registered alias's info → 200, and the body must carry "path"
+        // (the peer's on-disk index directory) so a TUI client's
+        // `#[serde(default)] path: String` field has something to deserialize
+        // rather than silently falling back to an empty string forever.
+        let resp = client
+            .get(format!("http://{}/repos/testalias/info", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "expected 200 from info handler for a registered alias"
+        );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("info handler should return JSON body for a registered alias");
+        let path = body
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("info handler response must carry a \"path\" key");
+        assert!(
+            path.ends_with(crate::constants::DB_DIR_NAME),
+            "expected path to end with {}, got: {}",
+            crate::constants::DB_DIR_NAME,
+            path
         );
 
         // POST unknown alias doctor → 404 from our handler (not axum's built-in 404)

@@ -656,6 +656,7 @@ fn build_info_overlay(
 
     Some(OverlayState::Info {
         alias: alias.clone(),
+        path: db_path.display().to_string(),
         chunks,
         files,
         max_chunk_id,
@@ -852,6 +853,7 @@ fn spawn_remote_info(
         let stats = match FederationClient::new() {
             Ok(client) => match client.repo_info(&peer, &remote_alias).await {
                 ManagementOutcome::Ok(info) => RemoteStatsState::Ready(RemoteIndexStats {
+                    path: info.path,
                     chunks: info.chunks,
                     files: info.files,
                     db_size_human: info.db_size_human,
@@ -941,6 +943,19 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
             return ReindexLaunch::Failed;
         }
     };
+    // Same guard as the HTTP reindex route: a force reindex opens the repo
+    // write-mode and rebuilds its index, which for a read-only repo means both a
+    // memory blow-up on a constrained replica and divergence from the index its
+    // owning job publishes.
+    if config.repo_read_only.get(&alias) == Some(&true) {
+        tracing::warn!(
+            "Refusing force reindex of '{}': marked read-only (repo_read_only) — its index is \
+             owned by another writer",
+            alias
+        );
+        state.end_indexing(&alias);
+        return ReindexLaunch::Failed;
+    }
     drop(config); // release read lock
 
     let db_path = project_path.join(DB_DIR_NAME);
@@ -951,7 +966,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
         None => {
             // Try to open stores (allow_create=true for recovery)
             let cancel = CancellationToken::new();
-            match state.try_open_stores(&alias, &db_path, true) {
+            match state.try_open_stores(&alias, &db_path, true, false) {
                 Ok(super::OpenedStores::Write(s)) => {
                     state.repos.insert(
                         alias.clone(),
