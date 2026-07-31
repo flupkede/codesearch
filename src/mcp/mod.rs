@@ -3956,8 +3956,16 @@ fn respond_with_items<T: serde::Serialize>(
 /// weaker one — the handler is still free to populate it with `None`, and a test
 /// that builds the struct itself cannot see that happen. Review round 8 proved
 /// it: the round-7 defect was reintroduced at the `get_chunk` success path and
-/// all 630 tests still passed. Taking the channel as a required *parameter* is
-/// what `respond_with_items` does, and it is why that family stayed closed.
+/// all 630 tests still passed.
+///
+/// **This is an improvement, not a guarantee.** Round 9 measured the difference:
+/// passing `&[]` here is exactly as writable as `warnings: None` was, the suite
+/// still cannot see it, and no lint fires (the channel stays "used" by the
+/// ambiguous path). What it actually buys is narrower and real — no optional
+/// field whose absence is invisible, no future construction site that can zero
+/// it, and an audit that collapses from "check every response struct" to "check
+/// the call sites of two functions", which is grep-answerable. The channel can
+/// no longer be *forgotten*, only actively discarded.
 ///
 /// Healthy path serializes the struct directly, so its key order and bytes are
 /// unchanged. `serde_json::Map` is a `BTreeMap` here (no `preserve_order`
