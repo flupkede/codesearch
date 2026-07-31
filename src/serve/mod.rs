@@ -1276,7 +1276,7 @@ impl ServeState {
     ///
     /// This is the shared logic used by both the HTTP `DELETE /repos/:alias` handler
     /// and the TUI confirmation flow.
-    pub(crate) async fn remove_repo(&self, alias: &str) -> Result<()> {
+    pub(crate) async fn remove_repo(&self, alias: &str) -> Result<RepoRemovalOutcome> {
         // 1. Resolve project path from config
         let project_path = {
             let config = self
@@ -1342,6 +1342,15 @@ impl ServeState {
         // for that race; if it still fails (warned, non-fatal) the DB dir
         // stays on disk and is cleaned up on the next serve restart. The repo
         // is already unregistered from config, so this is cosmetic.
+        //
+        // BUG2: this step used to swallow every `remove_dir_all` failure and
+        // return `Ok(())`, so the HTTP handler always reported "DB deleted"
+        // even when the directory was still on disk (e.g. ~118 MB locked by a
+        // transient search holding the LMDB mmap). We now track the real
+        // outcome and surface it via `RepoRemovalOutcome` so the caller can
+        // report honestly.
+        let mut db_deleted = !db_path.exists();
+        let mut db_delete_error: Option<String> = None;
         if db_path.exists() {
             for attempt in 0..5 {
                 if attempt > 0 {
@@ -1350,6 +1359,8 @@ impl ServeState {
                 match std::fs::remove_dir_all(&db_path) {
                     Ok(()) => {
                         tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
+                        db_deleted = true;
+                        db_delete_error = None;
                         break;
                     }
                     Err(e) if attempt < 4 => {
@@ -1359,19 +1370,27 @@ impl ServeState {
                             alias,
                             e
                         );
+                        db_delete_error = Some(e.to_string());
                     }
                     Err(e) => {
+                        let msg = e.to_string();
                         tracing::warn!(
                             "Failed to delete database for '{}' after 5 attempts (may be locked): {}",
                             alias,
-                            e
+                            msg
                         );
+                        db_delete_error = Some(msg);
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(RepoRemovalOutcome {
+            project_path,
+            db_path,
+            db_deleted,
+            db_delete_error,
+        })
     }
 
     /// Stop the file system watcher for a repo by cancelling its token.
@@ -3646,10 +3665,34 @@ async fn add_repo_handler(
     )
 }
 
+/// Outcome of [`ServeState::remove_repo`]. Reports per-step success so the
+/// HTTP/CLI layer can give an honest message instead of always claiming the DB
+/// was deleted (BUG2: `remove_repo` used to swallow every `remove_dir_all`
+/// failure and return `Ok(())`, and `remove_repo_handler` always printed
+/// "DB deleted" — even when ~118 MB was still locked on disk).
+#[derive(Debug, Clone)]
+pub(crate) struct RepoRemovalOutcome {
+    /// Canonical project path, resolved from config *before* the alias was
+    /// unregistered. Carried here so the caller can report `path` without a
+    /// (now-stale) post-removal config lookup that would always resolve to
+    /// `None`.
+    pub project_path: PathBuf,
+    /// The `.codesearch.db` directory that was the deletion target.
+    pub db_path: PathBuf,
+    /// `true` iff the DB directory is gone after this call — either it never
+    /// existed or `remove_dir_all` succeeded within the retry budget.
+    pub db_deleted: bool,
+    /// The last error from `remove_dir_all`. `Some` exactly when
+    /// `db_deleted == false`; `None` once a delete succeeds.
+    pub db_delete_error: Option<String>,
+}
+
 /// Remove-repo handler: DELETE /repos/:alias
 ///
 /// Stops the FSW, evicts the repo from memory, unregisters from repos.json,
-/// and deletes the database directory. Returns 200 on success.
+/// and deletes the database directory. Returns 200 on success (status is
+/// `"removed"` when the DB was deleted, `"removed_db_locked"` when the LMDB
+/// dir is still locked on disk — see BUG2).
 async fn remove_repo_handler(
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
@@ -3660,15 +3703,41 @@ async fn remove_repo_handler(
     use axum::http::StatusCode;
 
     match state.remove_repo(&alias).await {
-        Ok(()) => {
-            let project_path = state.config.read().ok().and_then(|c| c.resolve(&alias));
+        Ok(outcome) => {
+            // BUG2: report the real DB-delete outcome instead of always
+            // claiming "DB deleted". When the LMDB dir is still locked on disk
+            // (transient search holder, 5-retry budget exhausted) the repo is
+            // still functionally removed (config unregistered, evicted from
+            // memory) but we say so honestly with a distinct status + reason.
+            let (status, message) = if outcome.db_deleted {
+                (
+                    "removed",
+                    "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+                        .to_string(),
+                )
+            } else {
+                (
+                    "removed_db_locked",
+                    format!(
+                        "Repo removed: FSW stopped, evicted from memory, unregistered; \
+                         DB delete failed (still on disk at {}): {}",
+                        outcome.db_path.display(),
+                        outcome
+                            .db_delete_error
+                            .as_deref()
+                            .unwrap_or("unknown error")
+                    ),
+                )
+            };
             (
                 StatusCode::OK,
                 axum::response::Json(json!({
-                    "status": "removed",
+                    "status": status,
                     "alias": alias,
-                    "path": project_path,
-                    "message": "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+                    "path": outcome.project_path,
+                    "db_deleted": outcome.db_deleted,
+                    "db_delete_error": outcome.db_delete_error,
+                    "message": message,
                 })),
             )
         }
