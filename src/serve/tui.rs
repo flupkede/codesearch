@@ -998,28 +998,63 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
 
     let alias_bg = alias.clone();
     let state_bg = state.clone();
-    tokio::spawn(async move {
+    // Fresh cancellation token for this reindex task, registered in
+    // `index_tasks` so `remove_repo` can cancel + await it (BUG1).
+    let reindex_token = CancellationToken::new();
+    let reindex_token_task = reindex_token.clone();
+    let handle = tokio::spawn(async move {
         tracing::info!(
             "TUI: Force reindex for '{}': clearing stores and reindexing",
             alias_bg
         );
 
-        match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores, None).await
+        match IndexManager::force_reindex_with_stores(
+            &project_path,
+            &db_path,
+            &stores,
+            None,
+            &reindex_token_task,
+        )
+        .await
         {
             Ok(()) => {
                 tracing::info!("TUI: Force reindex complete for '{}'", alias_bg);
             }
             Err(e) => {
+                if reindex_token_task.is_cancelled() {
+                    // Cancellation (e.g. remove_repo ran mid-reindex): the repo
+                    // is already being torn down by remove_repo — do NOT restart
+                    // the FSW, which would resurrect the removed alias with a
+                    // fresh, uncancellable task.
+                    tracing::info!("TUI: Reindex cancelled for '{}': {}", alias_bg, e);
+                    state_bg.end_indexing(&alias_bg);
+                    return;
+                }
                 tracing::error!("TUI: Force reindex failed for '{}': {}", alias_bg, e);
             }
         }
 
-        // Restart FSW with fresh IndexManager
+        // Guard: even if force_reindex returned Ok, the repo may have been
+        // removed (or the task cancelled) during the embed pass. Do NOT restart
+        // the FSW — that would resurrect the removed alias. restart_fsw's own
+        // config check is insufficient here because remove_repo unregisters
+        // config AFTER awaiting this task.
+        if !state_bg.is_alias_live(&alias_bg, &reindex_token_task) {
+            tracing::info!(
+                "TUI: Skipping restart_fsw for '{}': repo removed or cancelled mid-reindex",
+                alias_bg
+            );
+            state_bg.end_indexing(&alias_bg);
+            return;
+        }
+
+        // Restart FSW with fresh IndexManager.
         state_bg.restart_fsw(&alias_bg, stores).await;
 
         // Remove guard
         state_bg.end_indexing(&alias_bg);
     });
+    state.index_tasks.insert(alias, (handle, reindex_token));
 
     ReindexLaunch::Started
 }

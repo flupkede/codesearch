@@ -766,18 +766,14 @@ mod tests {
 
     #[test]
     fn test_find_tsconfig_requires_root_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "ts-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(TypeScriptSymbolIndexer::find_tsconfig(&dir).is_none());
+        // Use tempfile::TempDir so cleanup runs on panic too. The previous
+        // manual std::env::temp_dir().join(unique) + bare last-line
+        // remove_dir_all leaked the dir on any mid-test assertion failure.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        assert!(TypeScriptSymbolIndexer::find_tsconfig(dir).is_none());
         std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
-        assert!(TypeScriptSymbolIndexer::find_tsconfig(&dir).is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(TypeScriptSymbolIndexer::find_tsconfig(dir).is_some());
+        // `tmp` dropped at end of scope → dir removed even on panic.
     }
 }

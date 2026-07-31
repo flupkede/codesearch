@@ -198,6 +198,22 @@ pub(crate) struct ServeState {
     /// `stop_fsw`) so the LMDB `Environment` drops and releases the file
     /// handles BEFORE the DB directory is deleted. See `await_fsw_shutdown`.
     fsw_tasks: DashMap<String, tokio::task::JoinHandle<()>>,
+    /// Repo alias → `(JoinHandle, CancellationToken)` of its background
+    /// *indexing* task (the heavy `add_repo`/`reindex` embed pass), separate
+    /// from `fsw_tasks` because `restart_fsw` reuses the `fsw_tasks` slot for
+    /// the continuous watcher loop.
+    ///
+    /// This exists to fix the index-cancellation no-op (BUG1): `add_repo` and
+    /// `reindex` used to spawn detached, untracked `tokio::spawn` tasks that
+    /// neither observed the cancel token nor could be awaited, so `remove_repo`
+    /// reported success while a full-corpus embed pass kept running (and
+    /// writing) on the removed alias — 6 GB / 52% CPU runaway. Registering the
+    /// handle here lets `await_index_task` (called from `remove_repo`) cancel
+    /// the token AND await the task before the DB directory is deleted, so the
+    /// task's `Arc<SharedStores>` (and the LMDB mmap handles it keeps alive)
+    /// drop first. The token is stored alongside the handle so `remove_repo`
+    /// can cancel regardless of the repo's `RepoState` variant.
+    index_tasks: DashMap<String, (tokio::task::JoinHandle<()>, CancellationToken)>,
     /// Loaded repos config (alias → path).
     config: std::sync::RwLock<ReposConfig>,
     /// Last observed mtime of the repos config file.
@@ -302,6 +318,7 @@ impl ServeState {
             repos: DashMap::new(),
             last_access: DashMap::new(),
             fsw_tasks: DashMap::new(),
+            index_tasks: DashMap::new(),
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
@@ -1259,7 +1276,7 @@ impl ServeState {
     ///
     /// This is the shared logic used by both the HTTP `DELETE /repos/:alias` handler
     /// and the TUI confirmation flow.
-    pub(crate) async fn remove_repo(&self, alias: &str) -> Result<()> {
+    pub(crate) async fn remove_repo(&self, alias: &str) -> Result<RepoRemovalOutcome> {
         // 1. Resolve project path from config
         let project_path = {
             let config = self
@@ -1286,6 +1303,16 @@ impl ServeState {
         // already cancelled the task; this waits for it to actually finish.
         self.await_fsw_shutdown(alias).await;
         tracing::info!("Evicted repo '{}' from memory", alias);
+
+        // 2b. Await the background *indexing* task (add_repo/reindex embed pass)
+        // too. Before this, a freshly-added repo's full-corpus reindex ran in a
+        // detached, untracked task that ignore its cancel token — so the lines
+        // above cancelled a token nobody listened to, this await found nothing
+        // to wait on, and the embed pass kept running (writing chunks, holding
+        // the LMDB mmap open) long after remove_repo reported success.
+        // await_index_task cancels the task's OWN token and awaits its exit, so
+        // its Arc<SharedStores> drops before the DB delete below.
+        self.await_index_task(alias).await;
 
         // 3. Unregister from repos.json
         {
@@ -1315,6 +1342,15 @@ impl ServeState {
         // for that race; if it still fails (warned, non-fatal) the DB dir
         // stays on disk and is cleaned up on the next serve restart. The repo
         // is already unregistered from config, so this is cosmetic.
+        //
+        // BUG2: this step used to swallow every `remove_dir_all` failure and
+        // return `Ok(())`, so the HTTP handler always reported "DB deleted"
+        // even when the directory was still on disk (e.g. ~118 MB locked by a
+        // transient search holding the LMDB mmap). We now track the real
+        // outcome and surface it via `RepoRemovalOutcome` so the caller can
+        // report honestly.
+        let mut db_deleted = !db_path.exists();
+        let mut db_delete_error: Option<String> = None;
         if db_path.exists() {
             for attempt in 0..5 {
                 if attempt > 0 {
@@ -1323,6 +1359,8 @@ impl ServeState {
                 match std::fs::remove_dir_all(&db_path) {
                     Ok(()) => {
                         tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
+                        db_deleted = true;
+                        db_delete_error = None;
                         break;
                     }
                     Err(e) if attempt < 4 => {
@@ -1332,19 +1370,27 @@ impl ServeState {
                             alias,
                             e
                         );
+                        db_delete_error = Some(e.to_string());
                     }
                     Err(e) => {
+                        let msg = e.to_string();
                         tracing::warn!(
                             "Failed to delete database for '{}' after 5 attempts (may be locked): {}",
                             alias,
-                            e
+                            msg
                         );
+                        db_delete_error = Some(msg);
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(RepoRemovalOutcome {
+            project_path,
+            db_path,
+            db_deleted,
+            db_delete_error,
+        })
     }
 
     /// Stop the file system watcher for a repo by cancelling its token.
@@ -1429,6 +1475,59 @@ impl ServeState {
         }
     }
 
+    /// Cancel and await the background *indexing* task for `alias`
+    /// (`add_repo`/`reindex` embed pass), if one is registered in
+    /// [`Self::index_tasks`].
+    ///
+    /// Cancels the task's token first (so an in-flight embed pass aborts at the
+    /// next batch/phase boundary), then awaits its `JoinHandle` with a 5s
+    /// timeout. The await is what guarantees the task's `Arc<SharedStores>` —
+    /// and the LMDB mmap handles it keeps alive on Windows — have actually
+    /// dropped before `remove_repo` deletes the DB directory. Without this,
+    /// `remove_repo` would delete `repos.json` while the detached task kept
+    /// writing chunks into a soon-to-be-orphaned `.codesearch.db`.
+    async fn await_index_task(&self, alias: &str) {
+        if let Some((_, (handle, token))) = self.index_tasks.remove(alias) {
+            token.cancel();
+            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => {
+                    tracing::debug!("Index task for '{}' exited cleanly", alias);
+                }
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        "Index task for '{}' panicked during shutdown: {}",
+                        alias,
+                        join_err
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Index task for '{}' did not exit within 5s; LMDB handles may stay locked",
+                        alias
+                    );
+                }
+            }
+        }
+    }
+
+    /// True iff `alias` is still registered in the config AND its indexing
+    /// `CancellationToken` has not been cancelled.
+    ///
+    /// Used by the `add_repo` background task to decide whether to proceed past
+    /// `force_reindex_with_stores` into `build_index` / `restart_fsw`. If the
+    /// repo was removed mid-index (`remove_repo` unregistered it and cancelled
+    /// the token), the detached task must stop instead of resurrecting the
+    /// alias — writing a fresh HNSW graph / starting a new FSW for a repo the
+    /// user just deleted.
+    fn is_alias_live(&self, alias: &str, token: &CancellationToken) -> bool {
+        !token.is_cancelled()
+            && self
+                .config
+                .read()
+                .map(|c| c.resolve(alias).is_some())
+                .unwrap_or(false)
+    }
+
     /// Spawn the FSW background task for a repo after it has been stopped.
     ///
     /// Creates a fresh IndexManager, performs an initial incremental refresh,
@@ -1485,6 +1584,7 @@ impl ServeState {
                         &project_path,
                         &db_path_bg,
                         &stores_bg,
+                        &token_for_task,
                     )
                     .await
                     {
@@ -1643,9 +1743,17 @@ impl ServeState {
 
         let stores_arc = stores;
 
-        if let Err(e) =
-            IndexManager::perform_incremental_refresh_with_stores(&path, &db_path, &stores_arc)
-                .await
+        // Warmup runs at startup (pre-warm), never in response to a user action,
+        // so it is given a fresh token that is never cancelled — the refresh runs
+        // to completion. A real user-initiated cancel routes through the
+        // RepoState::Write token owned by the live task instead.
+        if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
+            &path,
+            &db_path,
+            &stores_arc,
+            &CancellationToken::new(),
+        )
+        .await
         {
             tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
         }
@@ -1838,6 +1946,7 @@ impl ServeState {
                             &project_path,
                             &db_path_clone,
                             &stores_for_task,
+                            &token_for_task,
                         )
                         .await
                         {
@@ -3199,27 +3308,64 @@ async fn reindex_handler(
             }
         };
 
+        // Fresh cancellation token for this reindex task, registered alongside
+        // its handle in `index_tasks` so `remove_repo` can cancel + await it
+        // (BUG1: this was a detached, uncancellable tokio::spawn — a remove
+        // during a force reindex left the embed pass running on a dead alias).
+        let reindex_token = CancellationToken::new();
+        let reindex_token_task = reindex_token.clone();
+
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tracing::info!(
                 "Force reindex for '{}': clearing stores and reindexing",
                 alias_bg
             );
 
             // 2. Clear data and reindex
-            match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores, None)
-                .await
+            match IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                None,
+                &reindex_token_task,
+            )
+            .await
             {
                 Ok(()) => {
                     tracing::info!("Force reindex complete for '{}'", alias_bg);
                 }
                 Err(e) => {
+                    if reindex_token_task.is_cancelled() {
+                        // Cancellation (e.g. remove_repo ran mid-reindex): the
+                        // repo is already being torn down by remove_repo — do
+                        // NOT restart the FSW or rebuild symbols, both of which
+                        // would resurrect the removed alias with a fresh,
+                        // uncancellable task.
+                        tracing::info!("Reindex cancelled for '{}': {}", alias_bg, e);
+                        g_state.end_indexing(&g_alias);
+                        return;
+                    }
                     tracing::error!("Force reindex failed for '{}': {}", alias_bg, e);
                 }
             }
 
-            // 3. Restart FSW with fresh IndexManager
+            // Guard: even if force_reindex returned Ok, the repo may have been
+            // removed (or the task cancelled) during the embed pass. Do NOT
+            // restart the FSW or rebuild symbols — that would resurrect the
+            // removed alias. restart_fsw's own config check is insufficient here
+            // because remove_repo unregisters config AFTER awaiting this task.
+            if !g_state.is_alias_live(&g_alias, &reindex_token_task) {
+                tracing::info!(
+                    "Skipping restart_fsw for '{}': repo removed or cancelled mid-reindex",
+                    g_alias
+                );
+                g_state.end_indexing(&g_alias);
+                return;
+            }
+
+            // 3. Restart FSW with fresh IndexManager.
             g_state.restart_fsw(&g_alias, stores).await;
 
             // 4. Optional symbol index rebuild
@@ -3229,6 +3375,9 @@ async fn reindex_handler(
 
             g_state.end_indexing(&g_alias);
         });
+        state
+            .index_tasks
+            .insert(alias.to_string(), (handle, reindex_token));
     } else {
         // Incremental refresh: ensure the repo is opened, then refresh
         let stores = match state.get_or_open_stores(&alias, true).await {
@@ -3245,9 +3394,14 @@ async fn reindex_handler(
             }
         };
 
+        // Fresh cancellation token for this incremental reindex task, registered
+        // in `index_tasks` so `remove_repo` can cancel + await it (BUG1).
+        let reindex_token = CancellationToken::new();
+        let reindex_token_task = reindex_token.clone();
+
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tracing::info!(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
                 alias_bg
@@ -3256,6 +3410,7 @@ async fn reindex_handler(
                 &project_path,
                 &db_path,
                 &stores,
+                &reindex_token_task,
             )
             .await
             {
@@ -3274,6 +3429,9 @@ async fn reindex_handler(
 
             g_state.end_indexing(&g_alias);
         });
+        state
+            .index_tasks
+            .insert(alias.to_string(), (handle, reindex_token));
     }
 
     (
@@ -3488,8 +3646,14 @@ async fn add_repo_handler(
     let alias_bg = alias.clone();
     let state_bg = state.clone();
     let project_path = canonical_path.clone();
+    // Clone the cancel token INTO the task so force_reindex_with_stores can
+    // observe a remove_repo cancellation mid-embed. BUG1: previously the token
+    // was created and stored in RepoState::Write but never threaded into the
+    // indexing task, so cancelling it (stop_fsw) did nothing and the task ran
+    // the full embed pass to completion on a removed alias.
+    let token_for_task = cancel_token.clone();
 
-    tokio::spawn(async move {
+    let index_handle = tokio::spawn(async move {
         tracing::info!(
             "Indexing newly added repo '{}' ({}) in background",
             alias_bg,
@@ -3501,6 +3665,7 @@ async fn add_repo_handler(
             &db_path,
             &stores,
             model_override,
+            &token_for_task,
         )
         .await
         {
@@ -3512,6 +3677,15 @@ async fn add_repo_handler(
                 );
             }
             Err(e) => {
+                if token_for_task.is_cancelled() {
+                    // Cancellation (e.g. remove_repo ran mid-index): the repo is
+                    // already being torn down by remove_repo — do NOT repeat the
+                    // destructive cleanup (repos.remove/unregister) here, just
+                    // release the indexing guard and let remove_repo finish.
+                    tracing::info!("Indexing cancelled for '{}': {}", alias_bg, e);
+                    state_bg.end_indexing(&alias_bg);
+                    return;
+                }
                 tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
                 // Clean up: remove from repos and config
                 state_bg.repos.remove(&alias_bg);
@@ -3528,6 +3702,19 @@ async fn add_repo_handler(
                 }
                 return;
             }
+        }
+
+        // Guard: if the repo was removed (or the task cancelled) during the
+        // embed pass — even though force_reindex returned Ok (the cancellation
+        // check raced past the last batch) — do NOT build the vector index or
+        // restart the FSW. That would resurrect a removed alias.
+        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
+            tracing::info!(
+                "Skipping build_index for '{}': repo removed or cancelled mid-index",
+                alias_bg
+            );
+            state_bg.end_indexing(&alias_bg);
+            return;
         }
 
         // Build vector index from freshly indexed data.
@@ -3549,12 +3736,30 @@ async fn add_repo_handler(
             }
         }
 
+        // Re-check before restart_fsw: build_index (spawn_blocking) may have
+        // taken long enough for a remove_repo to land in between.
+        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
+            tracing::info!(
+                "Skipping restart_fsw for '{}': repo removed or cancelled during build_index",
+                alias_bg
+            );
+            state_bg.end_indexing(&alias_bg);
+            return;
+        }
+
         // Start FSW and transition to proper Write state with IndexManager
         state_bg.restart_fsw(&alias_bg, stores).await;
 
         state_bg.end_indexing(&alias_bg);
         tracing::info!("Repo '{}' fully indexed and ready", alias_bg);
     });
+
+    // Register the indexing task so remove_repo can cancel + await it (BUG1).
+    // Storing the token alongside the handle means remove_repo can cancel
+    // regardless of the repo's RepoState variant.
+    state
+        .index_tasks
+        .insert(alias.clone(), (index_handle, cancel_token));
 
     (
         StatusCode::ACCEPTED,
@@ -3567,10 +3772,34 @@ async fn add_repo_handler(
     )
 }
 
+/// Outcome of [`ServeState::remove_repo`]. Reports per-step success so the
+/// HTTP/CLI layer can give an honest message instead of always claiming the DB
+/// was deleted (BUG2: `remove_repo` used to swallow every `remove_dir_all`
+/// failure and return `Ok(())`, and `remove_repo_handler` always printed
+/// "DB deleted" — even when ~118 MB was still locked on disk).
+#[derive(Debug, Clone)]
+pub(crate) struct RepoRemovalOutcome {
+    /// Canonical project path, resolved from config *before* the alias was
+    /// unregistered. Carried here so the caller can report `path` without a
+    /// (now-stale) post-removal config lookup that would always resolve to
+    /// `None`.
+    pub project_path: PathBuf,
+    /// The `.codesearch.db` directory that was the deletion target.
+    pub db_path: PathBuf,
+    /// `true` iff the DB directory is gone after this call — either it never
+    /// existed or `remove_dir_all` succeeded within the retry budget.
+    pub db_deleted: bool,
+    /// The last error from `remove_dir_all`. `Some` exactly when
+    /// `db_deleted == false`; `None` once a delete succeeds.
+    pub db_delete_error: Option<String>,
+}
+
 /// Remove-repo handler: DELETE /repos/:alias
 ///
 /// Stops the FSW, evicts the repo from memory, unregisters from repos.json,
-/// and deletes the database directory. Returns 200 on success.
+/// and deletes the database directory. Returns 200 on success (status is
+/// `"removed"` when the DB was deleted, `"removed_db_locked"` when the LMDB
+/// dir is still locked on disk — see BUG2).
 async fn remove_repo_handler(
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
@@ -3581,15 +3810,41 @@ async fn remove_repo_handler(
     use axum::http::StatusCode;
 
     match state.remove_repo(&alias).await {
-        Ok(()) => {
-            let project_path = state.config.read().ok().and_then(|c| c.resolve(&alias));
+        Ok(outcome) => {
+            // BUG2: report the real DB-delete outcome instead of always
+            // claiming "DB deleted". When the LMDB dir is still locked on disk
+            // (transient search holder, 5-retry budget exhausted) the repo is
+            // still functionally removed (config unregistered, evicted from
+            // memory) but we say so honestly with a distinct status + reason.
+            let (status, message) = if outcome.db_deleted {
+                (
+                    "removed",
+                    "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+                        .to_string(),
+                )
+            } else {
+                (
+                    "removed_db_locked",
+                    format!(
+                        "Repo removed: FSW stopped, evicted from memory, unregistered; \
+                         DB delete failed (still on disk at {}): {}",
+                        outcome.db_path.display(),
+                        outcome
+                            .db_delete_error
+                            .as_deref()
+                            .unwrap_or("unknown error")
+                    ),
+                )
+            };
             (
                 StatusCode::OK,
                 axum::response::Json(json!({
-                    "status": "removed",
+                    "status": status,
                     "alias": alias,
-                    "path": project_path,
-                    "message": "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+                    "path": outcome.project_path,
+                    "db_deleted": outcome.db_deleted,
+                    "db_delete_error": outcome.db_delete_error,
+                    "message": message,
                 })),
             )
         }
@@ -4525,6 +4780,155 @@ mod tests {
         let state = ServeState::new(ReposConfig::default(), None);
         state.await_fsw_shutdown("never-spawned").await;
         assert!(state.fsw_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn await_index_task_cancels_and_joins_indexing_task() {
+        // FINDINGS #1: `remove_repo` stops an in-flight indexing pass via
+        // `await_index_task`, which must (a) remove the alias from `index_tasks`,
+        // (b) cancel the task's OWN token, and (c) actually await (join) the task
+        // to completion — so the task's `Arc<SharedStores>` clone drops and the
+        // LMDB mmap closes BEFORE the DB directory delete. Before BUG1, a
+        // freshly-added repo's embed pass ran in a detached, untracked task that
+        // ignored its token; this locks the tracking + cancellation + join.
+        let state = ServeState::new(ReposConfig::default(), None);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_clone = done.clone();
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move {
+            // Spin until cancelled — proving `await_index_task`'s `token.cancel()`
+            // actually propagates to the task, not just that the task happened to
+            // finish on its own.
+            while !token_clone.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        state
+            .index_tasks
+            .insert("repo-x".to_string(), (handle, token));
+        state.await_index_task("repo-x").await;
+        assert!(
+            !state.index_tasks.contains_key("repo-x"),
+            "index_tasks entry not removed"
+        );
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "indexing task was not cancelled + joined to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_repo_reports_db_deleted_when_delete_succeeds() {
+        // FINDINGS #2: `remove_repo` must report the REAL DB-delete outcome, not
+        // always "DB deleted". On the success path `RepoRemovalOutcome.db_deleted`
+        // must be `true` and the directory gone from disk. Uses a config-path
+        // override so the real `~/.codesearch/repos.json` is never touched.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("repos.json");
+        let repo_path = tmp.path().join("somerepo");
+        std::fs::create_dir(&repo_path).unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        // Put a file in the DB dir so delete has real work.
+        std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("somerepo".to_string()))
+            .unwrap();
+        config.save_to(&config_file).unwrap();
+        let state = ServeState::new(config, Some(config_file));
+
+        let outcome = state
+            .remove_repo("somerepo")
+            .await
+            .expect("remove_repo should succeed on the happy path");
+
+        assert!(outcome.db_deleted, "db_deleted must be true on success");
+        assert!(
+            outcome.db_delete_error.is_none(),
+            "no delete error on success, got: {:?}",
+            outcome.db_delete_error
+        );
+        assert!(!db_path.exists(), "DB directory must be removed from disk");
+    }
+
+    #[tokio::test]
+    async fn remove_repo_reports_db_locked_when_delete_fails() {
+        // FINDINGS #2: when the DB path CANNOT be removed, `RepoRemovalOutcome`
+        // must honestly report `db_deleted == false` plus a reason — NOT claim
+        // success (the BUG2 "always Ok" swallow). We force a deterministic,
+        // cross-platform delete failure by making `db_path` a regular file
+        // (`remove_dir_all` errors on a non-directory), exercising the retry
+        // loop's failure branch without depending on OS file-locking quirks.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("repos.json");
+        let repo_path = tmp.path().join("somerepo");
+        std::fs::create_dir(&repo_path).unwrap();
+        // db_path is a FILE, not a directory -> remove_dir_all fails every retry.
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::write(&db_path, "not a directory").unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("somerepo".to_string()))
+            .unwrap();
+        config.save_to(&config_file).unwrap();
+        let state = ServeState::new(config, Some(config_file));
+
+        let outcome = state
+            .remove_repo("somerepo")
+            .await
+            .expect("remove_repo returns Ok(outcome); delete failure is non-fatal");
+
+        assert!(
+            !outcome.db_deleted,
+            "db_deleted must be false when the delete fails"
+        );
+        assert!(
+            outcome.db_delete_error.is_some(),
+            "a delete error reason must be present on failure"
+        );
+    }
+
+    #[test]
+    fn is_alias_live_reflects_config_and_cancellation() {
+        // FINDINGS #4: the resurrection guard. A detached indexing task must
+        // NOT restart the FSW / rebuild the index for an alias that has been
+        // removed. `is_alias_live` is the conjunction of "not cancelled" and
+        // "alias still resolves in config"; the indexing tasks gate
+        // build_index/restart_fsw on it. Here we lock all three states.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("repo".to_string()))
+            .unwrap();
+        let state = ServeState::new(config, None);
+
+        let live = CancellationToken::new();
+        let dead = CancellationToken::new();
+        dead.cancel();
+
+        // (a) registered + live token -> live
+        assert!(
+            state.is_alias_live("repo", &live),
+            "registered alias with a live token must be live"
+        );
+        // (b) registered but token cancelled -> NOT live (cancellation wins)
+        assert!(
+            !state.is_alias_live("repo", &dead),
+            "a cancelled token must make the alias not-live (resurrection guard)"
+        );
+        // (c) not registered + live token -> NOT live
+        assert!(
+            !state.is_alias_live("ghost", &live),
+            "an unregistered alias must never be live"
+        );
     }
 
     /// Regression guard: `GET /remotes` must NEVER expose a peer's `api_key`.

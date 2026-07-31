@@ -312,6 +312,26 @@ fn is_ts_extension(path: &Path) -> bool {
 }
 
 impl IndexManager {
+    /// Cancellation guard shared by every cancellable indexing function.
+    ///
+    /// Indexing passes (`force_reindex_with_stores`,
+    /// `perform_incremental_refresh_with_stores`, `refresh_index_with_stores`,
+    /// `process_batch_with_stores`) receive a `CancellationToken` and call this
+    /// at every safe boundary (loop tops, between phases) so a `remove_repo`
+    /// mid-flight aborts promptly instead of running the full embed pass to
+    /// completion on an alias that is already gone.
+    ///
+    /// Returns a distinct [`anyhow`] error so the caller can tell a clean
+    /// cancellation apart from a genuine failure — the add-repo task checks
+    /// `cancel_token.is_cancelled()` in its error branch (see
+    /// `add_repo_handler`), and the FSW loop simply logs and continues.
+    fn ensure_indexing_active(cancel_token: &CancellationToken) -> Result<()> {
+        if cancel_token.is_cancelled() {
+            return Err(anyhow::anyhow!("indexing cancelled"));
+        }
+        Ok(())
+    }
+
     /// Create a new index manager with shared stores.
     ///
     /// This is the **first method call** - should be called at server startup.
@@ -532,6 +552,7 @@ impl IndexManager {
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
+        cancel_token: &CancellationToken,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::SemanticChunker;
@@ -540,6 +561,10 @@ impl IndexManager {
 
         info!("🔄 Performing incremental refresh with shared stores...");
         let start = std::time::Instant::now();
+
+        // Bail out before reading/deriving anything if a cancellation already
+        // arrived (e.g. remove_repo ran while this task was scheduled).
+        Self::ensure_indexing_active(cancel_token)?;
 
         // Read model name + dims (lenient) for the FileMetaStore. The strict,
         // fail-fast embedding-model resolution happens lazily below, only when
@@ -630,6 +655,11 @@ impl IndexManager {
             info!("✅ Index is up to date!");
             return Ok(());
         }
+
+        // A cancellation that arrived during the file walk must abort BEFORE any
+        // destructive store mutation below (stale-chunk deletion), so a
+        // half-cleaned index is never left behind by a removed repo.
+        Self::ensure_indexing_active(cancel_token)?;
 
         // There is work to do. Resolve the embedding model NOW — before any
         // destructive store mutation below — so that a corrupt index (unknown
@@ -722,6 +752,9 @@ impl IndexManager {
             let mut total_indexed = 0usize;
 
             for (batch_idx, file_batch) in changed_files.chunks(batch_size).enumerate() {
+                // Abort between batches if the repo was removed mid-index.
+                Self::ensure_indexing_active(cancel_token)?;
+
                 // Read + chunk + embed is synchronous, CPU/I/O-heavy work
                 // (file reads, tree-sitter parsing, fastembed/ONNX inference that
                 // saturates all cores). Offload the whole block to `spawn_blocking`
@@ -730,12 +763,22 @@ impl IndexManager {
                 // are not needed on the async side and may not be `Send`.
                 let files_for_embed = file_batch.to_vec();
                 let cache_dir_for_batch = cache_dir.clone();
+                // Clone the token into the blocking closure so a cancel arriving
+                // DURING the (long, core-saturating) embed pass is observed
+                // per-file, not only once the whole batch returns.
+                let batch_cancel = cancel_token.clone();
                 let embedded_chunks = tokio::task::spawn_blocking(
                     move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
                         let mut chunker = SemanticChunker::new(100, 2000, 10);
                         let mut all_chunks = Vec::new();
 
                         for file in &files_for_embed {
+                            // Mid-embed cancellation point: abort inside the
+                            // spawn_blocking task so we stop reading/chunking/
+                            // embedding further files in this batch promptly.
+                            if batch_cancel.is_cancelled() {
+                                return Err(anyhow::anyhow!("indexing cancelled"));
+                            }
                             let content = match std::fs::read_to_string(&file.path) {
                                 Ok(c) => c,
                                 Err(_) => continue,
@@ -753,6 +796,12 @@ impl IndexManager {
                             embed_model,
                             Some(cache_dir_for_batch.as_path()),
                         )?;
+                        // NOTE: embed_chunks runs a single ONNX inference over
+                        // the whole batch atomically, so it is not interruptible
+                        // mid-call. Worst-case cancel latency is bounded to one
+                        // batch's embed (INCREMENTAL_REFRESH_BATCH_SIZE=200
+                        // files); the per-file check above bounds the read/chunk
+                        // phase that precedes it.
                         embedding_service.embed_chunks(all_chunks)
                     },
                 )
@@ -765,6 +814,11 @@ impl IndexManager {
                         e
                     )
                 })??;
+
+                // A cancel arriving after embed completed but before we commit
+                // the batch to the stores must skip the insert + the final
+                // build_index, so a removed repo never receives fresh data.
+                Self::ensure_indexing_active(cancel_token)?;
 
                 if !embedded_chunks.is_empty() {
                     info!(
@@ -839,6 +893,8 @@ impl IndexManager {
 
             // Build the HNSW index once, after every batch has been inserted.
             if total_indexed > 0 {
+                // Don't rebuild the graph for a repo that was removed mid-index.
+                Self::ensure_indexing_active(cancel_token)?;
                 let vector_store = Arc::clone(&stores.vector_store);
                 tokio::task::spawn_blocking(move || {
                     let mut store = vector_store.blocking_write();
@@ -911,11 +967,15 @@ impl IndexManager {
         db_path: &Path,
         stores: &SharedStores,
         model_override: Option<ModelType>,
+        cancel_token: &CancellationToken,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use anyhow::Context;
 
         info!("🔄 Force reindex: clearing all store data in-place...");
+
+        // Bail before clearing any store data if the repo was already removed.
+        Self::ensure_indexing_active(cancel_token)?;
 
         // ── Step 0: Read and preserve metadata BEFORE clearing anything ──
         // This is defensive: the DB may be incomplete (no metadata.json at all),
@@ -1025,7 +1085,8 @@ impl IndexManager {
         info!("✅ Stores cleared, metadata preserved. Starting full reindex...");
 
         // ── Step 5: Reindex — all files treated as "changed" since metadata is empty ──
-        Self::perform_incremental_refresh_with_stores(codebase_path, db_path, stores).await
+        Self::perform_incremental_refresh_with_stores(codebase_path, db_path, stores, cancel_token)
+            .await
     }
 
     /// Start the file system watcher (begin collecting events) without starting the processing loop.
@@ -1065,6 +1126,7 @@ impl IndexManager {
         repo_label: String,
         csharp_notifier: Option<CSharpRebuildNotifier>,
         indexing_cb: Option<IndexingStatusCallback>,
+        cancel_token: CancellationToken,
     ) {
         tokio::task::spawn_blocking(move || {
             // Resolve applicable + available indexers up front so we only toggle
@@ -1085,33 +1147,51 @@ impl IndexManager {
                 cb(true);
             }
 
+            // Check-before-start bounds each language's rebuild: a single
+            // `indexer.rebuild()` call can't be interrupted mid-run (the 35–84s
+            // scip-csharp invocation), but we skip languages whose rebuild hadn't
+            // begun yet once cancellation lands.
             if let Some(indexer) = csharp {
-                // C# drives the serve-side status indicator: Started now,
-                // terminal signal inside run_full_rebuild_logged.
-                if let Some(ref n) = csharp_notifier {
-                    n(SymbolRebuildSignal::Started);
+                if cancel_token.is_cancelled() {
+                    info!(
+                        "🛑 [{}] symbol rebuild cancelled before C# rebuild",
+                        repo_label
+                    );
+                } else {
+                    // C# drives the serve-side status indicator: Started now,
+                    // terminal signal inside run_full_rebuild_logged.
+                    if let Some(ref n) = csharp_notifier {
+                        n(SymbolRebuildSignal::Started);
+                    }
+                    Self::run_full_rebuild_logged(
+                        indexer,
+                        &repo_path,
+                        &db_path,
+                        &repo_label,
+                        "C#",
+                        csharp_notifier.as_ref(),
+                    );
                 }
-                Self::run_full_rebuild_logged(
-                    indexer,
-                    &repo_path,
-                    &db_path,
-                    &repo_label,
-                    "C#",
-                    csharp_notifier.as_ref(),
-                );
             }
 
             if let Some(indexer) = typescript {
-                // The TypeScript path has no serve-side status notifier yet, so
-                // only the general "Indexing" label reflects it (via indexing_cb).
-                Self::run_full_rebuild_logged(
-                    indexer,
-                    &repo_path,
-                    &db_path,
-                    &repo_label,
-                    "TypeScript",
-                    None,
-                );
+                if cancel_token.is_cancelled() {
+                    info!(
+                        "🛑 [{}] symbol rebuild cancelled before TypeScript rebuild",
+                        repo_label
+                    );
+                } else {
+                    // The TypeScript path has no serve-side status notifier yet, so
+                    // only the general "Indexing" label reflects it (via indexing_cb).
+                    Self::run_full_rebuild_logged(
+                        indexer,
+                        &repo_path,
+                        &db_path,
+                        &repo_label,
+                        "TypeScript",
+                        None,
+                    );
+                }
             }
 
             if let Some(ref cb) = indexing_cb {
@@ -1286,8 +1366,13 @@ impl IndexManager {
                             }
                             // Perform a real incremental refresh: walk filesystem,
                             // detect changed/deleted files, clean stale chunks, re-index
-                            if let Err(e) =
-                                Self::refresh_index_with_stores(&path, &db_path, &stores).await
+                            if let Err(e) = Self::refresh_index_with_stores(
+                                &path,
+                                &db_path,
+                                &stores,
+                                &cancel_token,
+                            )
+                            .await
                             {
                                 error!("❌ [{}] Branch change refresh failed: {}", repo_label, e);
                             }
@@ -1320,6 +1405,7 @@ impl IndexManager {
                                 repo_label.clone(),
                                 csharp_notifier.clone(),
                                 indexing_cb.clone(),
+                                cancel_token.clone(),
                             );
                         }
                     }
@@ -1451,7 +1537,12 @@ impl IndexManager {
                     }
                     // Process batch using shared stores
                     if let Err(e) = Self::process_batch_with_stores(
-                        &path, &db_path, &stores, to_index, to_remove,
+                        &path,
+                        &db_path,
+                        &stores,
+                        to_index,
+                        to_remove,
+                        &cancel_token,
                     )
                     .await
                     {
@@ -1752,10 +1843,14 @@ impl IndexManager {
         stores: &SharedStores,
         files_to_index: Vec<PathBuf>,
         files_to_remove: Vec<PathBuf>,
+        cancel_token: &CancellationToken,
     ) -> Result<()> {
         use crate::output::set_quiet;
 
         let start = std::time::Instant::now();
+
+        // Bail before touching any store if the repo was removed.
+        Self::ensure_indexing_active(cancel_token)?;
 
         // Enable quiet mode during FSW batch processing to suppress verbose embedding output
         set_quiet(true);
@@ -1847,6 +1942,9 @@ impl IndexManager {
         }
 
         // Then, index modified/new files
+        // Abort before the per-file index loop if cancellation landed during the
+        // removal phase above.
+        Self::ensure_indexing_active(cancel_token)?;
         for file_path in &files_to_index {
             debug!("📄 Indexing: {}", file_path.display());
             if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
@@ -1900,6 +1998,7 @@ impl IndexManager {
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
+        cancel_token: &CancellationToken,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::file::FileWalker;
@@ -1907,6 +2006,9 @@ impl IndexManager {
 
         let start = std::time::Instant::now();
         set_quiet(true);
+
+        // Abort before the filesystem walk if the repo was already removed.
+        Self::ensure_indexing_active(cancel_token)?;
 
         let result: Result<()> = async {
             // Phase 1: Discover current files on disk.
@@ -2068,6 +2170,9 @@ impl IndexManager {
             }
 
             // Phase 4: Re-index changed/new files
+            // Abort before the per-file re-index loop if cancellation arrived
+            // during the deletion/orphan-cleanup phases above.
+            Self::ensure_indexing_active(cancel_token)?;
             let reindex_count = files_to_reindex.len();
             for file_path in &files_to_reindex {
                 if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
@@ -2461,12 +2566,137 @@ mod tests {
         // Don't create metadata.json
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
             "Should return Ok when no metadata.json exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_incremental_refresh_before_embedding() {
+        // FINDINGS #3: an indexing pass must observe its cancellation token, not
+        // run to completion on an alias that `remove_repo` is tearing down.
+        //
+        // A pre-cancelled token makes `perform_incremental_refresh_with_stores`
+        // bail at its entry checkpoint — BEFORE the file walk, embedding-model
+        // load, or any store mutation — even though the codebase HAS a changed
+        // file that would otherwise trigger a full embed pass. This locks the
+        // contract the in-flight cancel path (`remove_repo` -> `await_index_task`)
+        // depends on.
+        //
+        // Finer mid-pass checkpoints (per-file inside the `spawn_blocking` embed
+        // loop, between batches, before `build_index`) also exist, but reaching
+        // them requires loading the ONNX embedding model, so a true mid-embed
+        // interrupt is an `#[ignore]` integration test, omitted here.
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+        // A real source file so the change-detector WOULD find work to do.
+        std::fs::write(codebase_path.join("a.txt"), "hello world").unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let token = CancellationToken::new();
+        token.cancel(); // already cancelled -> must abort immediately
+
+        let result = IndexManager::perform_incremental_refresh_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &token,
+        )
+        .await;
+
+        let err = result.expect_err("pre-cancelled token must abort indexing");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "loads the ONNX embedding model (~90MB download on first run); \
+                run with `cargo test -- --ignored mid_pass_cancellation`"]
+    async fn mid_pass_cancellation_aborts_a_running_embed() {
+        // FINDINGS #3 (mid-pass, not just entry): the entry-level test above only
+        // proves a pre-cancelled token bails before work begins. This test lets a
+        // REAL embed pass START (past the entry checkpoint, into ONNX inference),
+        // confirms it is still running, and THEN cancels — proving the per-batch /
+        // per-file / pre-build_index checkpoints abort a RUNNING long pass, not
+        // merely one that never began. Uses `force_reindex_with_stores` so the
+        // default model metadata is stamped correctly (a hand-written "test-model"
+        // short name would fail model resolution before reaching the embed loop).
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        let dims = ModelType::default().dimensions();
+        let stores = create_test_stores(&db_path, dims).await;
+
+        // A large corpus so the full pass spans multiple embed batches and takes
+        // long enough to reliably still be running when we cancel. If this flakes
+        // because the pass finishes first, bump the file count.
+        for i in 0..600 {
+            std::fs::write(
+                codebase_path.join(format!("file_{i:03}.txt")),
+                format!("document body number {i} with enough prose to be chunked\n"),
+            )
+            .unwrap();
+        }
+
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let handle = tokio::spawn(async move {
+            IndexManager::force_reindex_with_stores(
+                &codebase_path,
+                &db_path,
+                &stores,
+                None,
+                &task_token,
+            )
+            .await
+        });
+
+        // Give the pass a head start so it is past the entry checkpoint and into
+        // model load / embedding. 200ms is comfortably past the (microsecond)
+        // entry check while leaving the bulk of a 600-file pass ahead.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !handle.is_finished(),
+            "corpus too small: the pass completed before we could cancel — \
+             increase the file count so the embed run outlasts the head start"
+        );
+
+        let cancel_start = std::time::Instant::now();
+        token.cancel();
+
+        let result = handle.await.expect("indexing task panicked");
+        let cancel_latency = cancel_start.elapsed();
+
+        // The pass must abort to a cancellation error, NOT complete Ok — this is
+        // the assertion that fails if the post-entry checkpoints were missing.
+        let err = result.expect_err("a running embed pass must abort to a cancellation error");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {err}"
+        );
+        // The checkpoint fires at the next batch/phase boundary, well before a
+        // full uncancelled pass over 600 files would finish.
+        assert!(
+            cancel_latency < std::time::Duration::from_secs(30),
+            "cancellation took too long to take effect: {cancel_latency:?}"
         );
     }
 
@@ -2505,9 +2735,15 @@ mod tests {
         // Empty codebase → perform_incremental_refresh returns before any
         // embedding, so this exercises Fix A (the Step-0 stamp) without loading
         // an ONNX model.
-        IndexManager::force_reindex_with_stores(&codebase_path, &db_path, &stores, None)
-            .await
-            .expect("force reindex on empty codebase should succeed");
+        IndexManager::force_reindex_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("force reindex on empty codebase should succeed");
 
         let after = std::fs::read_to_string(db_path.join("metadata.json")).unwrap();
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
@@ -2564,8 +2800,13 @@ mod tests {
         let stores = create_test_stores(&db_path, 4).await;
 
         // Run the refresh
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2620,8 +2861,13 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2657,8 +2903,13 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2699,8 +2950,13 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2749,8 +3005,13 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2792,6 +3053,7 @@ mod tests {
             &codebase_path,
             &db_path,
             &stores,
+            &CancellationToken::new(),
         )
         .await;
 

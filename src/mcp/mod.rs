@@ -10676,6 +10676,7 @@ pub async fn run_mcp_server(
                 &project_path_clone,
                 &db_path_clone,
                 &shared_stores_clone,
+                &bg_cancel_token,
             )
             .await
             {
