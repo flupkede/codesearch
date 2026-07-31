@@ -2454,6 +2454,73 @@ mod tests {
     }
 
     #[test]
+    fn record_stats_or_warn_pushes_nothing_on_success() {
+        let stats = crate::vectordb::StoreStats {
+            total_chunks: 5,
+            total_files: 2,
+            indexed: true,
+            dimensions: 384,
+            max_chunk_id: 5,
+        };
+        let mut warnings = Vec::new();
+        let (total_chunks, total_files, error) =
+            super::record_stats_or_warn(Ok(stats), "inriver", &mut warnings);
+        assert_eq!((total_chunks, total_files), (5, 2));
+        assert!(error.is_none(), "got: {error:?}");
+        assert!(
+            warnings.is_empty(),
+            "a healthy store must not add a warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn record_stats_or_warn_names_the_repo_and_surfaces_the_error_on_failure() {
+        // This is the exact call site `list_projects` uses — pinning it here
+        // means a future edit cannot silently stop reporting a broken store
+        // without also breaking `total_chunks`/`total_files`, which this
+        // asserts too. Reintroducing the old bug (discarding `error` after
+        // this call, or calling `repo_stats_from_result` directly and
+        // skipping the push) makes the `warnings` assertion below fail —
+        // confirmed by hand before restoring the real call site.
+        let err = anyhow::anyhow!("LMDB env unreadable: os error 30");
+        let mut warnings = Vec::new();
+        let (total_chunks, total_files, error) = super::record_stats_or_warn(
+            Err::<crate::vectordb::StoreStats, _>(err),
+            "inriver",
+            &mut warnings,
+        );
+        assert_eq!((total_chunks, total_files), (0, 0));
+        assert!(error.is_some(), "got: {error:?}");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(
+            warnings[0].contains("repo 'inriver' stats failed")
+                && warnings[0].contains("os error 30"),
+            "got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn record_stats_or_warn_does_not_duplicate_the_same_warning() {
+        // `push_store_warning` dedups by exact match; this pins that
+        // `record_stats_or_warn` still benefits from it when called twice
+        // with the same failure (e.g. a repo appearing twice in a fan-out).
+        let mut warnings = Vec::new();
+        for _ in 0..2 {
+            let err = anyhow::anyhow!("LMDB env unreadable: os error 30");
+            super::record_stats_or_warn(
+                Err::<crate::vectordb::StoreStats, _>(err),
+                "inriver",
+                &mut warnings,
+            );
+        }
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the same repo/failure must not be reported twice, got: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn into_results_routes_failures_into_warnings() {
         let outcome = super::MultiReadOutcome {
             results: vec![1u32, 2],
@@ -2861,6 +2928,15 @@ struct McpProxyService {
     /// window (a big search, a cold symbol rebuild) would have its own transport
     /// closed underneath it. The idle-checker never disconnects while this is > 0.
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Notified by the main loop's `connect_request_rx` arm whenever an on-demand
+    /// `connect_to_serve` attempt returns `Err` — i.e. serve refused the
+    /// connection outright, as opposed to still being slow to accept one. Lets
+    /// `await_peer` stop waiting immediately on a definitive failure instead of
+    /// polling out the rest of `PROXY_CONNECT_WAIT_MS` (previously ~20s per call
+    /// even when serve was known to be down within the first few milliseconds).
+    /// A slow-but-eventually-successful wake never touches this: it resolves by
+    /// the peer slot filling in, which `await_peer`'s own poll already catches.
+    connect_failed: Arc<tokio::sync::Notify>,
 }
 
 /// Keeps `McpProxyService::in_flight` incremented for its lifetime. A guard rather
@@ -2893,6 +2969,7 @@ impl McpProxyService {
             connect_request_tx: connect_tx,
             last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
             in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            connect_failed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -2915,16 +2992,77 @@ impl McpProxyService {
     /// retry budget (~1s) while the on-demand connect is still waking a
     /// scaled-to-zero remote, and fail with "reconnecting" every single time.
     async fn await_peer(&self) -> bool {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(PROXY_CONNECT_WAIT_MS);
+        self.await_peer_bounded(PROXY_CONNECT_WAIT_MS).await
+    }
+
+    /// Core of `await_peer`, parameterized on the wait budget so it is unit
+    /// testable without actually waiting out `PROXY_CONNECT_WAIT_MS` (~20s).
+    /// Uses the production refusal-grace window; see
+    /// `await_peer_bounded_with_grace` for what that means and why it is its
+    /// own parameter.
+    async fn await_peer_bounded(&self, wait_ms: u64) -> bool {
+        self.await_peer_bounded_with_grace(wait_ms, CONNECT_REFUSAL_GRACE)
+            .await
+    }
+
+    /// Core of `await_peer_bounded`, additionally parameterized on the
+    /// refusal-grace window so *that* is unit testable without waiting out
+    /// `reconnect::INTERVAL_SECS` (~3s) for real.
+    ///
+    /// Polls the peer slot on `PROXY_RETRY_BACKOFF_MS` cadence, but also races
+    /// each poll against `connect_failed` so a definitive on-demand connect
+    /// failure (serve refused the connection, not merely slow to accept one)
+    /// clamps the remaining wait down to `refusal_grace` instead of polling
+    /// out the rest of `wait_ms`. A slow-but-still-in-progress wake never
+    /// fires `connect_failed` — it is only notified from an `Err` return of
+    /// `connect_to_serve` — so this does not shorten the legitimate
+    /// scale-to-zero wake path, only the case where serve is already known to
+    /// have refused this attempt.
+    ///
+    /// The clamp is deliberately *not* an immediate return: a refusal only
+    /// means this one on-demand attempt was refused, not that serve won't
+    /// recover — `run_mcp_client`'s own disconnect/reconnect cycle
+    /// (`reconnect::INTERVAL_SECS` later) can still land within the original
+    /// budget, e.g. when serve is mid-restart rather than genuinely down.
+    /// Returning immediately turned that case — previously transparent to the
+    /// caller, since the pre-fix full-budget poll caught the reconnect — into
+    /// a visible "reconnecting" error on the very first request after a
+    /// restart. Clamping to `refusal_grace` keeps most of the original fix's
+    /// win (a hard-down serve is still bounded well under the full `wait_ms`)
+    /// while still giving that recovery cycle room to land.
+    async fn await_peer_bounded_with_grace(
+        &self,
+        wait_ms: u64,
+        refusal_grace: std::time::Duration,
+    ) -> bool {
+        let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
         loop {
+            // Register for the next failure notification BEFORE checking the
+            // peer slot, so a failure landing between this check and the
+            // `select!` below cannot be missed (the standard tokio::sync::Notify
+            // idiom: create the `Notified` future first, await it second).
+            let failed = self.connect_failed.notified();
             if self.peer.read().await.is_some() {
                 return true;
             }
-            if std::time::Instant::now() >= deadline {
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(PROXY_RETRY_BACKOFF_MS)).await;
+            let backoff = std::time::Duration::from_millis(PROXY_RETRY_BACKOFF_MS)
+                .min(deadline.saturating_duration_since(now));
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = failed => {
+                    // A concurrent successful connect could still have landed in
+                    // the instant before this notification; one last check keeps
+                    // that case correct instead of reporting a false failure.
+                    if self.peer.read().await.is_some() {
+                        return true;
+                    }
+                    deadline = deadline.min(now + refusal_grace);
+                }
+            }
         }
     }
 
@@ -2973,6 +3111,46 @@ const PROXY_RETRY_BACKOFF_MS: u64 = 500;
 /// several seconds. Waiting here is strictly better than returning "reconnecting"
 /// on the first call after every idle period.
 const PROXY_CONNECT_WAIT_MS: u64 = 20_000;
+
+/// How long `await_peer_bounded` still waits after a definitive on-demand
+/// connect refusal, instead of returning immediately or polling out the rest
+/// of `PROXY_CONNECT_WAIT_MS`.
+///
+/// Sized to cover `run_mcp_client`'s own disconnect/reconnect cycle
+/// (`reconnect::INTERVAL_SECS`, ~3s) plus margin for the ~100ms synthetic-
+/// disconnect delay and `connect_to_serve`'s own latency — so a serve that is
+/// merely mid-restart still recovers transparently within this window,
+/// exactly as it did before the refusal short-circuit existed, while a
+/// genuinely-down serve is still bounded well under the full ~20s budget.
+const CONNECT_REFUSAL_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(reconnect::INTERVAL_SECS * 1_000 + 1_000);
+
+/// Record a definitive on-demand connect refusal: wake any `await_peer_bounded`
+/// callers immediately (via `connect_failed`) instead of leaving them to poll
+/// out their full budget for a refusal that is already known, then seed a
+/// synthetic disconnect so `run_mcp_client`'s own disconnect/reconnect cycle
+/// picks it up. A genuinely slow wake never reaches this function — it
+/// resolves via the `Ok` branch in the caller once the peer slot fills in —
+/// so this does not shorten a legitimate scale-to-zero wake, only a refusal.
+///
+/// Pulled out of `run_mcp_client`'s `connect_request_rx` arm so the one line
+/// that makes `await_peer_bounded`'s refusal short-circuit real in production
+/// is covered by a test that calls this function directly, not only by tests
+/// that call `connect_failed.notify_waiters()` themselves in isolation —
+/// those pin how `await_peer_bounded` *reacts* to a notification, but nothing
+/// previously pinned that this call site still *fires* one: deleting this
+/// function's body left the full suite green.
+fn note_connect_failure(
+    connect_failed: &tokio::sync::Notify,
+    disconnect_tx: &tokio::sync::mpsc::Sender<()>,
+) {
+    connect_failed.notify_waiters();
+    let tx = disconnect_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = tx.send(()).await;
+    });
+}
 
 /// Heuristic: does this error message describe a transport-level failure
 /// (broken TCP, server gone, stale keep-alive, stale session) that warrants
@@ -3083,6 +3261,149 @@ mod proxy_idle_tests {
                 DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS
             );
         }
+    }
+}
+
+/// Unit tests for `await_peer_bounded`'s refusal clamp and the
+/// `note_connect_failure` call site that fires it in production, isolated
+/// from the full `run_mcp_client` loop by parameterizing the wait budget (and,
+/// for the clamp itself, the refusal-grace window) so these run in
+/// milliseconds instead of the real `PROXY_CONNECT_WAIT_MS` (~20s) or
+/// `reconnect::INTERVAL_SECS` (~3s).
+#[cfg(test)]
+mod await_peer_tests {
+    use super::McpProxyService;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A `McpProxyService` whose peer slot never fills on its own — no reconnect
+    /// plumbing behind it, matching the "single-shot" spirit of the existing
+    /// `McpProxyService::new` test constructor but with an *empty* peer slot,
+    /// which is the case `await_peer_bounded` actually has to wait through.
+    fn empty_peer_service() -> McpProxyService {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (connect_tx, _connect_rx) = tokio::sync::mpsc::channel(1);
+        McpProxyService {
+            peer: Arc::new(tokio::sync::RwLock::new(None)),
+            disconnect_tx: tx,
+            connect_request_tx: connect_tx,
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            connect_failed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn times_out_when_the_peer_slot_never_fills_and_nothing_is_notified() {
+        let svc = empty_peer_service();
+        let start = Instant::now();
+        let ok = svc.await_peer_bounded(150).await;
+        assert!(!ok);
+        // Baseline: with no signal at all this genuinely waits out the budget,
+        // rather than returning early for some unrelated reason — which is what
+        // makes the next test's early return meaningful.
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "expected the full wait budget to elapse, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_failure_notification_clamps_the_wait_to_the_refusal_grace() {
+        // Uses `await_peer_bounded_with_grace` directly (not the production
+        // `await_peer_bounded`, which hardcodes `CONNECT_REFUSAL_GRACE` at
+        // ~4s) so the clamp itself is exercised with a millisecond-scale
+        // grace instead of actually waiting out `reconnect::INTERVAL_SECS`.
+        let svc = empty_peer_service();
+        let connect_failed = svc.connect_failed.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            connect_failed.notify_waiters();
+        });
+
+        let start = Instant::now();
+        // Budget is 5s, grace is 100ms — if the clamp did not fire, this call
+        // would take the full 5s instead of ~20ms (notification) + ~100ms
+        // (grace) for the peer slot to (not) fill in.
+        let ok = svc
+            .await_peer_bounded_with_grace(5_000, Duration::from_millis(100))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            !ok,
+            "peer slot stayed empty — this was a refusal, not a success"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "expected the failure notification to clamp the 5s wait down near the \
+             grace window, took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "expected the clamp to still honor the refusal-grace window rather than \
+             returning immediately, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn note_connect_failure_wakes_a_parked_waiter_and_schedules_a_disconnect() {
+        // Pins the exact production call site (`run_mcp_client`'s
+        // `connect_request_rx` Err arm) rather than re-testing
+        // `await_peer_bounded`'s reaction to a hand-fired notification: this
+        // is the one line that makes that short-circuit real, and nothing
+        // previously covered it — deleting `note_connect_failure`'s body left
+        // the whole suite green.
+        let connect_failed = Arc::new(tokio::sync::Notify::new());
+        let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let waiter_failed = connect_failed.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_failed.notified().await;
+        });
+        // Give the spawned task a moment to actually park in `.notified()`
+        // before firing, so this proves a live waiter is woken — not merely
+        // that a notification lands somewhere.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        super::note_connect_failure(&connect_failed, &disconnect_tx);
+
+        tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("note_connect_failure did not wake the parked waiter in time")
+            .expect("waiter task panicked");
+
+        let got = tokio::time::timeout(Duration::from_millis(500), disconnect_rx.recv())
+            .await
+            .expect("note_connect_failure did not schedule the synthetic disconnect in time");
+        assert!(
+            got.is_some(),
+            "expected the disconnect channel to receive a message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_notification_before_anyone_is_waiting_does_not_leak_forward() {
+        // Notify::notify_waiters() only wakes tasks already parked in
+        // .notified() — it stores no permit for a future waiter (unlike
+        // notify_one()). Pinned explicitly because `await_peer_bounded`'s
+        // correctness depends on this: a failure from an unrelated, already-
+        // finished wait must not falsely short-circuit the next one.
+        let svc = empty_peer_service();
+        svc.connect_failed.notify_waiters(); // no one is waiting yet
+
+        let start = Instant::now();
+        let ok = svc.await_peer_bounded(150).await;
+        assert!(!ok);
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "a pre-existing notification must not shorten a later, unrelated wait, took {:?}",
+            start.elapsed()
+        );
     }
 }
 
@@ -4262,6 +4583,31 @@ fn repo_stats_from_result(
         Ok(s) => (s.total_chunks, s.total_files, None),
         Err(ref e) => (0, 0, Some(format!("stats unavailable: {e:#}"))),
     }
+}
+
+/// `repo_stats_from_result` plus recording the failure as a caller-facing
+/// warning, in one call.
+///
+/// `list_projects` used to inline `repo_stats_from_result` and then decide
+/// separately whether to push a warning — two steps a future edit could
+/// silently pull apart (drop the second one, keep the first) without
+/// affecting `total_chunks`/`total_files` at all, so nothing would look
+/// wrong at the call site. Folding both into one call means a regression
+/// that drops the warning has to delete this call entirely, which also
+/// deletes the counts — no longer a silent edit. This is also the seam a
+/// test can drive without opening a real `VectorStore`/`ServeState`: it
+/// exercises the exact composition `list_projects` calls, not a
+/// re-implementation of it.
+fn record_stats_or_warn(
+    stats: anyhow::Result<crate::vectordb::StoreStats>,
+    alias: &str,
+    warnings: &mut Vec<String>,
+) -> (usize, usize, Option<String>) {
+    let (total_chunks, total_files, error) = repo_stats_from_result(stats);
+    if let Some(ref msg) = error {
+        push_store_warning(warnings, &store_warning(alias, "stats", msg));
+    }
+    (total_chunks, total_files, error)
 }
 
 /// Record a per-store failure as a caller-facing warning, once per store.
@@ -9013,6 +9359,7 @@ impl CodesearchService {
             let config = serve_state.config_snapshot();
             let project_groups = config.project_groups();
             let mut repos_info = Vec::new();
+            let mut list_warnings: Vec<String> = Vec::new();
 
             for (alias, path) in &config.repos {
                 let db_path = path.join(crate::constants::DB_DIR_NAME);
@@ -9036,8 +9383,11 @@ impl CodesearchService {
                         // shape that actually matches the fan-out.
                         // `repo_stats_from_result` carries only the part of this
                         // decision that varies by Ok/Err — see its doc comment.
+                        // `record_stats_or_warn` wraps it so this call site cannot
+                        // silently drop the warning half without also breaking the
+                        // counts it returns — see its own doc comment.
                         let (total_chunks, total_files, error) =
-                            repo_stats_from_result(stats_result);
+                            record_stats_or_warn(stats_result, alias, &mut list_warnings);
                         (
                             total_chunks,
                             total_files,
@@ -9084,8 +9434,7 @@ impl CodesearchService {
                 current_directory: current_dir.display().to_string(),
             };
 
-            let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            return respond_with_object(&response, &list_warnings);
         }
 
         // Stdio mode: fall back to disk-based lock detection
@@ -9782,6 +10131,10 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
     let last_activity: Arc<Mutex<std::time::Instant>> =
         Arc::new(Mutex::new(std::time::Instant::now()));
     let in_flight: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    // Notified whenever an on-demand `connect_to_serve` attempt (below, in the
+    // `connect_request_rx` arm) comes back `Err` — lets `await_peer` stop waiting
+    // on a definitive refusal instead of polling out the rest of its window.
+    let connect_failed: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
     // Cancellation handle for the *current* connection. `RunningServiceCancellationToken`
     // is not Clone and its `cancel()` consumes self, so it lives in an Option slot
     // that the idle-checker `take()`s.
@@ -9811,6 +10164,7 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
         connect_request_tx: connect_request_tx.clone(),
         last_activity: last_activity.clone(),
         in_flight: in_flight.clone(),
+        connect_failed: connect_failed.clone(),
     };
     let server = proxy
         .serve(stdio())
@@ -9896,11 +10250,7 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
                         // to the existing failure loop, which retries on its own
                         // cadence and eventually gives up.
                         tracing::debug!("On-demand connect failed: {}", e);
-                        let tx = disconnect_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            let _ = tx.send(()).await;
-                        });
+                        note_connect_failure(&connect_failed, &disconnect_tx);
                     }
                 }
             }
