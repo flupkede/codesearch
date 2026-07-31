@@ -5032,6 +5032,79 @@ mod tests {
     }
 
     #[test]
+    fn remove_orphaned_db_dir_deletes_a_present_directory() {
+        // Regression guard for the self-cleanup backstop: when a background
+        // indexing task finishes an uninterruptible `build_index` for an alias
+        // that was removed mid-build, its post-build guard drops its stores
+        // handle and calls `remove_orphaned_db_dir` to delete the now-orphaned
+        // `.codesearch.db` directory. Without this mechanism the dir would stay
+        // locked (and on disk) until a serve restart.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+        let state = ServeState::new(ReposConfig::default(), None);
+        state.remove_orphaned_db_dir("orphan", &db_path);
+
+        assert!(
+            !db_path.exists(),
+            "self-cleanup must delete the orphaned DB directory"
+        );
+    }
+
+    #[test]
+    fn remove_orphaned_db_dir_handles_already_gone() {
+        // The self-cleanup runs concurrently with `remove_repo`'s own delete
+        // loop; the loop may win the race and delete the dir first, so by the
+        // time the detached task's guard calls `remove_orphaned_db_dir` the
+        // path is already gone. That must not panic or surface a spurious
+        // error — it is a no-op debug-log path.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join(DB_DIR_NAME).join("never-existed");
+        assert!(!db_path.exists());
+
+        let state = ServeState::new(ReposConfig::default(), None);
+        // Must not panic; the already-gone path stays gone.
+        state.remove_orphaned_db_dir("orphan", &db_path);
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    #[allow(clippy::io_other_error)] // synthetic errors with literal messages
+    fn is_db_locked_error_classifies_lock_and_non_lock_errors() {
+        // `remove_repo`'s deadline-bounded delete retry only retries lock-class
+        // errors (Windows sharing/lock violation / access-denied, or a message
+        // hinting the dir is in use). A permanent failure — e.g. a NotFound, or
+        // the dir actually being a regular file — must NOT be retried, so it
+        // surfaces immediately instead of burning the retry budget.
+        use std::io;
+
+        // Permanent: NotFound (dir already gone) -> not a lock.
+        assert!(!ServeState::is_db_locked_error(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        // Lock-class: Windows ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION
+        // (33) raw codes -> retried (raw_os_error is platform-independent here).
+        assert!(ServeState::is_db_locked_error(
+            &io::Error::from_raw_os_error(32)
+        ));
+        assert!(ServeState::is_db_locked_error(
+            &io::Error::from_raw_os_error(33)
+        ));
+        // Lock-class by message hint (cross-platform fallback).
+        assert!(ServeState::is_db_locked_error(&io::Error::new(
+            io::ErrorKind::Other,
+            "The process cannot access the file because it is being used by another process"
+        )));
+        // Permanent: a non-lock message -> not retried.
+        assert!(!ServeState::is_db_locked_error(&io::Error::new(
+            io::ErrorKind::Other,
+            "not a directory"
+        )));
+    }
+
+    #[test]
     fn is_alias_live_reflects_config_and_cancellation() {
         // FINDINGS #4: the resurrection guard. A detached indexing task must
         // NOT restart the FSW / rebuild the index for an alias that has been
