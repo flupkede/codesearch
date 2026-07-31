@@ -100,6 +100,9 @@ pub enum KeyAction {
 /// mount, so these live on the peer).
 #[derive(Debug, Clone)]
 pub struct RemoteIndexStats {
+    /// On-disk path of the index database on the PEER (not the local
+    /// machine) — the peer's `.codesearch.db` directory for this repo.
+    pub path: String,
     pub chunks: usize,
     pub files: usize,
     pub db_size_human: String,
@@ -123,6 +126,10 @@ pub enum OverlayState {
     /// Info modal: repo name, chunks, files, db size, model, dims, etc.
     Info {
         alias: String,
+        /// On-disk path of this repo's index database (the `.codesearch.db`
+        /// directory), so a user staring at the info panel can find it on
+        /// disk without cross-referencing `repos.json`.
+        path: String,
         chunks: usize,
         files: usize,
         max_chunk_id: u32,
@@ -762,6 +769,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
     match overlay {
         OverlayState::Info {
             alias,
+            path,
             chunks,
             files,
             max_chunk_id,
@@ -773,6 +781,10 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
         } => {
             let title = format!(" {} — Index Info ", alias);
             let lines = vec![
+                Line::from(vec![
+                    Span::styled("  Path:        ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(path.clone(), Style::default().fg(Color::White)),
+                ]),
                 Line::from(vec![
                     Span::styled("  Chunks:      ", Style::default().fg(Color::DarkGray)),
                     Span::styled(format!("{}", chunks), Style::default().fg(Color::White)),
@@ -840,6 +852,10 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             // db-size/model detail a local repo shows in its Info overlay.
             let stat_lines: Vec<Line> = match stats {
                 RemoteStatsState::Ready(s) => vec![
+                    Line::from(vec![
+                        Span::styled("  Path (peer): ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(s.path.clone(), Style::default().fg(Color::White)),
+                    ]),
                     Line::from(vec![
                         Span::styled("  Chunks:      ", Style::default().fg(Color::DarkGray)),
                         Span::styled(format!("{}", s.chunks), Style::default().fg(Color::White)),

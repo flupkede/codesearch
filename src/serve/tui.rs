@@ -656,6 +656,7 @@ fn build_info_overlay(
 
     Some(OverlayState::Info {
         alias: alias.clone(),
+        path: db_path.display().to_string(),
         chunks,
         files,
         max_chunk_id,
@@ -852,6 +853,7 @@ fn spawn_remote_info(
         let stats = match FederationClient::new() {
             Ok(client) => match client.repo_info(&peer, &remote_alias).await {
                 ManagementOutcome::Ok(info) => RemoteStatsState::Ready(RemoteIndexStats {
+                    path: info.path,
                     chunks: info.chunks,
                     files: info.files,
                     db_size_human: info.db_size_human,

@@ -2835,6 +2835,7 @@ async fn info_handler(
     let db_size_human = tui::dir_size_human(&db_path);
 
     AxumJson(json!({
+        "path": db_path.display().to_string(),
         "chunks": chunks,
         "files": files,
         "max_chunk_id": max_chunk_id,
@@ -5133,6 +5134,35 @@ mod tests {
             body.get("error").is_some(),
             "expected JSON error body from info handler, got: {}",
             body
+        );
+
+        // GET a registered alias's info → 200, and the body must carry "path"
+        // (the peer's on-disk index directory) so a TUI client's
+        // `#[serde(default)] path: String` field has something to deserialize
+        // rather than silently falling back to an empty string forever.
+        let resp = client
+            .get(format!("http://{}/repos/testalias/info", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "expected 200 from info handler for a registered alias"
+        );
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .expect("info handler should return JSON body for a registered alias");
+        let path = body
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("info handler response must carry a \"path\" key");
+        assert!(
+            path.ends_with(crate::constants::DB_DIR_NAME),
+            "expected path to end with {}, got: {}",
+            crate::constants::DB_DIR_NAME,
+            path
         );
 
         // POST unknown alias doctor → 404 from our handler (not axum's built-in 404)
