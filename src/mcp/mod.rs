@@ -2734,6 +2734,22 @@ pub use types::*;
 /// The peer is wrapped in `Arc<RwLock<Option<Peer>>>` so it can be hot-swapped when the
 /// serve connection drops and reconnects. During reconnection, tool calls return a
 /// descriptive "reconnecting" error so Claude Desktop can retry.
+///
+/// ## Idle disconnect / connect on demand
+///
+/// The peer is also `None` while the proxy is *deliberately* disconnected: after
+/// `CODESEARCH_MCP_PROXY_IDLE_DISCONNECT_SECS` (default
+/// `DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS`, `0` disables) without a successful
+/// forwarded request, the idle-checker in `run_mcp_client` closes the HTTP MCP
+/// session so a scale-to-zero remote can suspend its replica. Every successful
+/// `list_tools` / `call_tool` stamps `last_activity`, which resets that window.
+///
+/// Because a closed session is indistinguishable from a dead one at the peer
+/// slot, `call_tool` / `list_tools` signal `connect_request_tx` on their first
+/// attempt whenever the slot is `None`, asking the main loop to connect *now*
+/// instead of waiting for the failure-path reconnect cadence. The existing
+/// bounded retry-with-backoff remains the fallback if that connect does not land
+/// within the retry budget.
 struct McpProxyService {
     /// Shared peer handle — hot-swapped on reconnect.
     /// `None` means we're reconnecting to serve; tool calls return a retry-able error.
@@ -2744,18 +2760,100 @@ struct McpProxyService {
     /// from server restarts and TCP keep-alive failures without bubbling the error
     /// up to Claude Desktop.
     disconnect_tx: tokio::sync::mpsc::Sender<()>,
+    /// Ask the main loop to run `connect_to_serve` immediately (capacity-1
+    /// channel — duplicate requests coalesce, "connect now" is idempotent).
+    /// Sent when a request arrives while the peer slot is empty.
+    connect_request_tx: tokio::sync::mpsc::Sender<()>,
+    /// When the last request was successfully forwarded to serve. Shared with the
+    /// idle-checker in `run_mcp_client`, which closes the connection once this is
+    /// older than the configured idle-disconnect window.
+    last_activity: Arc<Mutex<std::time::Instant>>,
+    /// Number of requests currently being forwarded. `last_activity` only advances
+    /// on completion, so without this a request that runs longer than the idle
+    /// window (a big search, a cold symbol rebuild) would have its own transport
+    /// closed underneath it. The idle-checker never disconnects while this is > 0.
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Keeps `McpProxyService::in_flight` incremented for its lifetime. A guard rather
+/// than paired add/sub calls because the forwarding loop has several early returns.
+struct InFlightGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl InFlightGuard {
+    fn new(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl McpProxyService {
     #[allow(dead_code)]
     fn new(peer: rmcp::service::Peer<RoleClient>) -> Self {
         // Direct constructor used by tests / single-shot scenarios.
-        // No reconnect plumbing — the dummy channel is never read.
+        // No reconnect plumbing — the dummy channels are never read.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (connect_tx, _connect_rx) = tokio::sync::mpsc::channel(1);
         Self {
             peer: std::sync::Arc::new(tokio::sync::RwLock::new(Some(peer))),
             disconnect_tx: tx,
+            connect_request_tx: connect_tx,
+            last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Stamp "real traffic just flowed", resetting the idle-disconnect window.
+    fn mark_activity(&self) {
+        mark_proxy_activity(&self.last_activity);
+    }
+
+    /// Best-effort nudge to the main loop: connect to serve now. A full channel
+    /// already means "a connect is pending", a closed one means the loop is gone;
+    /// both are fine to ignore — the caller's own retry/backoff covers it.
+    fn request_connect(&self) {
+        let _ = self.connect_request_tx.try_send(());
+    }
+
+    /// Wait — bounded by `PROXY_CONNECT_WAIT_MS` — for the peer slot to be filled
+    /// after `request_connect`. Returns true as soon as a peer is available.
+    ///
+    /// Without this, a request arriving after an idle-close would burn its whole
+    /// retry budget (~1s) while the on-demand connect is still waking a
+    /// scaled-to-zero remote, and fail with "reconnecting" every single time.
+    async fn await_peer(&self) -> bool {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(PROXY_CONNECT_WAIT_MS);
+        loop {
+            if self.peer.read().await.is_some() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(PROXY_RETRY_BACKOFF_MS)).await;
+        }
+    }
+
+    /// On an empty peer slot (a deliberate idle-close or a real outage), ask the
+    /// main loop to connect *now* instead of waiting for the failure-path
+    /// reconnect cadence to notice, then give that connect a bounded window to
+    /// land. Returns true if a peer became available and the caller should
+    /// retry its forwarded call immediately.
+    ///
+    /// Only meaningful on the caller's first attempt (`attempt == 0`) — a
+    /// second empty slot means the on-demand connect already ran and fell
+    /// through to the ordinary retry/backoff path. Pulled out of `list_tools`/
+    /// `call_tool` because the two copies had already started to drift (see
+    /// review remarks on the commit that added this).
+    async fn try_on_demand_connect(&self) -> bool {
+        self.request_connect();
+        self.await_peer().await
     }
 
     /// Force a reconnect: clear the shared peer and signal the main loop in
@@ -2779,6 +2877,15 @@ const PROXY_MAX_RETRY_ATTEMPTS: u32 = 3;
 /// Backoff between proxy retries, also used as the post-reconnect settle delay.
 const PROXY_RETRY_BACKOFF_MS: u64 = 500;
 
+/// How long a request may wait for an on-demand connect (after an idle-close, or
+/// while serve is still starting) before falling back to the retry/backoff path.
+///
+/// Sized for a scale-to-zero host: the remote's ingress *holds* the request while
+/// it activates a suspended replica, so the connect itself can legitimately take
+/// several seconds. Waiting here is strictly better than returning "reconnecting"
+/// on the first call after every idle period.
+const PROXY_CONNECT_WAIT_MS: u64 = 20_000;
+
 /// Heuristic: does this error message describe a transport-level failure
 /// (broken TCP, server gone, stale keep-alive, stale session) that warrants
 /// a forced reconnect + retry, as opposed to a real tool-level error that
@@ -2801,6 +2908,96 @@ mod reconnect {
     pub const MAX_DURATION_SECS: u64 = 300; // 5 minutes
 }
 
+/// Record the current instant as the proxy's most recent activity.
+fn mark_proxy_activity(last_activity: &Arc<Mutex<std::time::Instant>>) {
+    if let Ok(mut slot) = last_activity.lock() {
+        *slot = std::time::Instant::now();
+    }
+}
+
+/// Resolve the MCP proxy idle-disconnect window: explicit value → env var →
+/// `DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS`. Mirrors how `run_serve` resolves its
+/// own `idle_suspend_secs`. `0` means "never idle-disconnect".
+fn resolve_proxy_idle_disconnect_secs(explicit: Option<u64>) -> u64 {
+    explicit
+        .or_else(|| {
+            std::env::var(crate::constants::MCP_PROXY_IDLE_DISCONNECT_SECS_ENV)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+        })
+        .unwrap_or(crate::constants::DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS)
+}
+
+/// Has the proxy been idle long enough to close its connection to serve?
+///
+/// `threshold_secs == 0` disables idle-disconnect, so this always returns false.
+/// `now` is a parameter (rather than read from the clock) purely so this is unit
+/// testable without sleeping.
+fn is_idle(
+    last_activity: std::time::Instant,
+    threshold_secs: u64,
+    now: std::time::Instant,
+) -> bool {
+    if threshold_secs == 0 {
+        return false;
+    }
+    now.saturating_duration_since(last_activity).as_secs() >= threshold_secs
+}
+
+#[cfg(test)]
+mod proxy_idle_tests {
+    use super::{is_idle, resolve_proxy_idle_disconnect_secs};
+    use crate::constants::DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn not_idle_before_the_threshold_elapses() {
+        let last = Instant::now();
+        let now = last + Duration::from_secs(59);
+        assert!(!is_idle(last, 60, now));
+    }
+
+    #[test]
+    fn idle_once_the_threshold_is_reached() {
+        let last = Instant::now();
+        assert!(is_idle(last, 60, last + Duration::from_secs(60)));
+        assert!(is_idle(last, 60, last + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn zero_threshold_disables_idle_disconnect() {
+        let last = Instant::now();
+        // Even an absurdly long idle period must not trigger a close.
+        assert!(!is_idle(last, 0, last + Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn clock_going_backwards_is_not_idle() {
+        // saturating_duration_since floors at zero instead of panicking.
+        let last = Instant::now() + Duration::from_secs(10);
+        assert!(!is_idle(last, 60, Instant::now()));
+    }
+
+    #[test]
+    fn explicit_value_wins_over_env_and_default() {
+        // Explicit takes precedence without consulting the environment, so this
+        // stays correct regardless of what other tests set.
+        assert_eq!(resolve_proxy_idle_disconnect_secs(Some(5)), 5);
+        assert_eq!(resolve_proxy_idle_disconnect_secs(Some(0)), 0);
+    }
+
+    #[test]
+    fn falls_back_to_the_documented_default() {
+        // No explicit value and (in the normal test environment) no env override.
+        if std::env::var(crate::constants::MCP_PROXY_IDLE_DISCONNECT_SECS_ENV).is_err() {
+            assert_eq!(
+                resolve_proxy_idle_disconnect_secs(None),
+                DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS
+            );
+        }
+    }
+}
+
 impl ServerHandler for McpProxyService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -2818,12 +3015,16 @@ impl ServerHandler for McpProxyService {
         request: Option<PaginatedRequestParams>,
         _cx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let _in_flight = InFlightGuard::new(&self.in_flight);
         let mut last_err: Option<String> = None;
         for attempt in 0..PROXY_MAX_RETRY_ATTEMPTS {
             let peer = self.peer.read().await.clone();
             match peer {
                 Some(p) => match p.list_tools(request.clone()).await {
-                    Ok(r) => return Ok(r),
+                    Ok(r) => {
+                        self.mark_activity();
+                        return Ok(r);
+                    }
                     Err(e) => {
                         let msg = e.to_string();
                         if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
@@ -2841,6 +3042,14 @@ impl ServerHandler for McpProxyService {
                     }
                 },
                 None => {
+                    // Empty peer slot: either a deliberate idle-close or a real
+                    // outage. `try_on_demand_connect` asks the main loop to
+                    // connect *now* rather than waiting for the failure-path
+                    // reconnect cadence to notice, bounded so we still fall back
+                    // to the ordinary retry/backoff below if it doesn't land.
+                    if attempt == 0 && self.try_on_demand_connect().await {
+                        continue;
+                    }
                     if attempt < PROXY_MAX_RETRY_ATTEMPTS - 1 {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             PROXY_RETRY_BACKOFF_MS,
@@ -2866,12 +3075,16 @@ impl ServerHandler for McpProxyService {
         request: CallToolRequestParams,
         _cx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let _in_flight = InFlightGuard::new(&self.in_flight);
         let mut last_err: Option<String> = None;
         for attempt in 0..PROXY_MAX_RETRY_ATTEMPTS {
             let peer = self.peer.read().await.clone();
             match peer {
                 Some(p) => match p.call_tool(request.clone()).await {
-                    Ok(r) => return Ok(r),
+                    Ok(r) => {
+                        self.mark_activity();
+                        return Ok(r);
+                    }
                     Err(e) => {
                         let msg = e.to_string();
                         if !is_transport_error_msg(&msg) || attempt >= PROXY_MAX_RETRY_ATTEMPTS - 1
@@ -2890,6 +3103,14 @@ impl ServerHandler for McpProxyService {
                     }
                 },
                 None => {
+                    // Empty peer slot: either a deliberate idle-close or a real
+                    // outage. `try_on_demand_connect` asks the main loop to
+                    // connect *now* rather than waiting for the failure-path
+                    // reconnect cadence to notice, bounded so we still fall back
+                    // to the ordinary retry/backoff below if it doesn't land.
+                    if attempt == 0 && self.try_on_demand_connect().await {
+                        continue;
+                    }
                     if attempt < PROXY_MAX_RETRY_ATTEMPTS - 1 {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             PROXY_RETRY_BACKOFF_MS,
@@ -9353,8 +9574,30 @@ async fn probe_serve_health(serve_url: &str) -> bool {
 /// 3. Retries the HTTP connection every 3 seconds for up to 5 minutes
 /// 4. On success, hot-swaps the peer — tool calls resume immediately
 /// 5. After 5 minutes of failure, exits cleanly (Claude Desktop detects the disconnect)
+///
+/// ## Idle disconnect behaviour
+///
+/// One HTTP MCP session held open for the lifetime of the proxy keeps a request
+/// permanently registered at the remote's ingress, so a scale-to-zero host never
+/// sees 0 concurrent requests and never suspends the replica. To avoid that, the
+/// connection is only held while it is actually being used:
+///
+/// - An idle-checker ticks every `MCP_PROXY_IDLE_CHECK_INTERVAL_SECS`. Once no
+///   request has been forwarded for `CODESEARCH_MCP_PROXY_IDLE_DISCONNECT_SECS`
+///   (default `DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS`; `0` disables and restores
+///   the always-connected behaviour), it clears the peer and cancels the
+///   `RunningService`, closing the transport.
+/// - That is a *planned* close, not an outage: it does not open a failure window
+///   and does not count against `reconnect::MAX_DURATION_SECS`. The monitor task's
+///   resulting `disconnect_tx` signal is recognised (via `voluntary_disconnect`)
+///   and does not trigger an eager reconnect — reconnecting immediately would
+///   defeat the purpose.
+/// - The next `list_tools` / `call_tool` finds an empty peer slot and signals
+///   `connect_request_tx`, which reconnects on demand. Failure-path reconnects
+///   are unaffected and still run on their own cadence.
 async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let mcp_url = format!("{}{}", serve_url, crate::constants::MCP_ENDPOINT_PATH);
     tracing::info!("🔗 Connecting to codesearch serve at {}", mcp_url);
@@ -9362,10 +9605,36 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
     // Channels: spawned monitor tasks notify us when their connection drops.
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (stdio_close_tx, mut stdio_close_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Capacity 1: coalescing duplicate "connect now" requests is correct.
+    let (connect_request_tx, mut connect_request_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // Shared peer state — hot-swapped on reconnect.
     let peer_state: std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>> =
         std::sync::Arc::new(tokio::sync::RwLock::new(None));
+
+    // Idle-disconnect state, shared with the proxy service.
+    let last_activity: Arc<Mutex<std::time::Instant>> =
+        Arc::new(Mutex::new(std::time::Instant::now()));
+    let in_flight: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    // Cancellation handle for the *current* connection. `RunningServiceCancellationToken`
+    // is not Clone and its `cancel()` consumes self, so it lives in an Option slot
+    // that the idle-checker `take()`s.
+    let conn_cancel: Arc<
+        tokio::sync::Mutex<Option<rmcp::service::RunningServiceCancellationToken>>,
+    > = Arc::new(tokio::sync::Mutex::new(None));
+    // Set just before we cancel a connection ourselves, so the disconnect signal it
+    // produces is not mistaken for an outage.
+    let voluntary_disconnect = Arc::new(AtomicBool::new(false));
+    let idle_disconnect_secs = resolve_proxy_idle_disconnect_secs(None);
+    if idle_disconnect_secs == 0 {
+        tracing::info!("idle-disconnect disabled — holding the serve connection open");
+    } else {
+        tracing::info!(
+            "💤 idle-disconnect enabled: closing the serve connection after {}s without traffic (checked every {}s)",
+            idle_disconnect_secs,
+            crate::constants::MCP_PROXY_IDLE_CHECK_INTERVAL_SECS
+        );
+    }
 
     // Step 1: Start stdio proxy for Claude Desktop.
     // This must happen first so Claude Desktop has something to talk to,
@@ -9373,6 +9642,9 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
     let proxy = McpProxyService {
         peer: peer_state.clone(),
         disconnect_tx: disconnect_tx.clone(),
+        connect_request_tx: connect_request_tx.clone(),
+        last_activity: last_activity.clone(),
+        in_flight: in_flight.clone(),
     };
     let server = proxy
         .serve(stdio())
@@ -9387,7 +9659,15 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
 
     // Step 2: Initial connection to serve (tolerant — may not be running yet).
     let mut serve_down_since: Option<std::time::Instant> = None;
-    match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone()).await {
+    match connect_to_serve(
+        &mcp_url,
+        &peer_state,
+        disconnect_tx.clone(),
+        &conn_cancel,
+        &last_activity,
+    )
+    .await
+    {
         Ok(()) => {
             tracing::info!("🚀 MCP proxy ready — forwarding Claude Desktop ↔ codesearch serve");
         }
@@ -9407,7 +9687,15 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
         }
     }
 
-    // Step 3: Main loop — wait for stdio close, serve disconnect, or cancel.
+    // Step 3: Main loop — wait for stdio close, serve disconnect, an on-demand
+    // connect request, an idle timeout, or cancel.
+
+    let mut idle_ticker = tokio::time::interval(std::time::Duration::from_secs(
+        crate::constants::MCP_PROXY_IDLE_CHECK_INTERVAL_SECS,
+    ));
+    // The first tick of a tokio interval completes immediately; skip it so a
+    // freshly started proxy is not evaluated for idleness before it can be used.
+    idle_ticker.tick().await;
 
     loop {
         tokio::select! {
@@ -9425,12 +9713,48 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
                 return Ok(());
             }
 
+            // A request arrived while the peer slot was empty — connect now rather
+            // than waiting for the failure-path cadence. Ordered before the
+            // disconnect branch so a pending 3s backoff cannot starve it.
+            _ = connect_request_rx.recv() => {
+                if peer_state.read().await.is_some() {
+                    continue; // Someone else already reconnected.
+                }
+                match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone(), &conn_cancel, &last_activity).await {
+                    Ok(()) => {
+                        tracing::info!("🔗 Reconnected to codesearch serve on demand");
+                        serve_down_since = None;
+                    }
+                    Err(e) => {
+                        // Serve is genuinely unreachable (or still waking). Hand over
+                        // to the existing failure loop, which retries on its own
+                        // cadence and eventually gives up.
+                        tracing::debug!("On-demand connect failed: {}", e);
+                        let tx = disconnect_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            let _ = tx.send(()).await;
+                        });
+                    }
+                }
+            }
+
             // Serve disconnected — enter reconnect loop.
             _ = disconnect_rx.recv() => {
                 // Clear peer so tool calls get "reconnecting" error.
                 {
                     let mut p = peer_state.write().await;
                     *p = None;
+                }
+
+                // A disconnect we caused on purpose (idle-close) is not an outage:
+                // no failure window, no eager reconnect — the next request will ask
+                // for one via connect_request_tx.
+                if voluntary_disconnect.swap(false, Ordering::SeqCst) {
+                    tracing::debug!(
+                        "serve connection closed after idle — will reconnect on the next request"
+                    );
+                    continue;
                 }
 
                 if serve_down_since.is_none() {
@@ -9454,7 +9778,7 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
                 // Wait before retrying.
                 tokio::time::sleep(std::time::Duration::from_secs(reconnect::INTERVAL_SECS)).await;
 
-                match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone()).await {
+                match connect_to_serve(&mcp_url, &peer_state, disconnect_tx.clone(), &conn_cancel, &last_activity).await {
                     Ok(()) => {
                         tracing::info!(
                             "✅ Reconnected to codesearch serve (was down for {:.0}s)",
@@ -9475,6 +9799,61 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
                     }
                 }
             }
+
+            // Idle check — close the connection so a scale-to-zero remote can suspend.
+            _ = idle_ticker.tick() => {
+                if idle_disconnect_secs == 0 {
+                    continue; // Idle-disconnect disabled.
+                }
+                let last = match last_activity.lock() {
+                    Ok(guard) => *guard,
+                    Err(_) => continue, // Poisoned: never tear down on a bookkeeping error.
+                };
+                if !is_idle(last, idle_disconnect_secs, std::time::Instant::now()) {
+                    continue;
+                }
+
+                // Take the peer slot's write lock *before* checking `in_flight`, and
+                // hold it through the clear below, instead of checking `in_flight`
+                // first and taking the write lock afterwards.
+                //
+                // Every forwarding call does `InFlightGuard::new` (increments
+                // `in_flight`) BEFORE `self.peer.read().await` (list_tools/call_tool
+                // above) — so a call that has already obtained `Some(peer)` to
+                // forward through has necessarily already incremented the counter,
+                // and a call that hasn't reached the read yet will block on it once
+                // we hold the write lock. Reading `in_flight` first (the previous
+                // version) left a gap between that read and taking the write lock in
+                // which such a call could still slip past, get `Some(peer)`, and have
+                // its transport cancelled out from under it mid-request — the
+                // in-flight count and the peer-slot teardown were two separate
+                // operations pretending to be one guard. See AGENTS.md
+                // "counter-then-teardown races".
+                let mut p = peer_state.write().await;
+                if p.is_none() {
+                    continue; // Already disconnected.
+                }
+                if in_flight.load(Ordering::SeqCst) > 0 {
+                    continue; // A request is still being forwarded over this transport.
+                }
+
+                tracing::info!(
+                    "💤 Idle for {}s — closing MCP proxy connection to codesearch serve (will reconnect on next request)",
+                    idle_disconnect_secs
+                );
+                // Flag first, so the disconnect signal from the dying monitor task is
+                // recognised as planned no matter how fast it arrives.
+                voluntary_disconnect.store(true, Ordering::SeqCst);
+                *p = None;
+                drop(p);
+                if let Some(token) = conn_cancel.lock().await.take() {
+                    token.cancel();
+                } else {
+                    // Nothing to cancel — don't leave the flag set for a later,
+                    // genuine disconnect to misread.
+                    voluntary_disconnect.store(false, Ordering::SeqCst);
+                }
+            }
         }
     }
 }
@@ -9483,10 +9862,16 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
 ///
 /// On success, updates `peer_state` with the new peer and spawns a background task
 /// that monitors the connection and sends a message on `disconnect_tx` when it drops.
+///
+/// Also parks the connection's cancellation handle in `conn_cancel` (so the
+/// idle-checker can close it) and stamps `last_activity`, so a connection opened
+/// just before an idle tick is not immediately judged idle.
 async fn connect_to_serve(
     mcp_url: &str,
     peer_state: &std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>>,
     disconnect_tx: tokio::sync::mpsc::Sender<()>,
+    conn_cancel: &Arc<tokio::sync::Mutex<Option<rmcp::service::RunningServiceCancellationToken>>>,
+    last_activity: &Arc<Mutex<std::time::Instant>>,
 ) -> Result<()> {
     use rmcp::ServiceExt;
 
@@ -9510,12 +9895,25 @@ async fn connect_to_serve(
             )
         })?;
 
+    // Grab the cancellation handle before the RunningService is moved into the
+    // monitor task below — that's the only way to close this transport later
+    // (idle-disconnect). Cancelling it makes the monitor's `waiting()` resolve, so
+    // the normal disconnect path still runs; nothing needs special-casing.
+    {
+        let mut slot = conn_cancel.lock().await;
+        *slot = Some(http_client.cancellation_token());
+    }
+
     // Update the shared peer.
     let peer = http_client.peer().clone();
     {
         let mut p = peer_state.write().await;
         *p = Some(peer);
     }
+
+    // A fresh connection counts as activity: without this, an idle tick firing
+    // right after a reconnect would immediately close it again.
+    mark_proxy_activity(last_activity);
 
     // Spawn a monitor task that detects when the connection drops.
     tokio::spawn(async move {
