@@ -2480,33 +2480,40 @@ mod tests {
     }
 
     #[test]
-    fn get_chunk_response_carries_warnings_on_the_success_path() {
-        // The dangerous exit: a chunk returned from a partially-dead group is
-        // indistinguishable from one returned by a healthy group unless the
-        // failure travels with it.
-        let mk = |w: Option<Vec<String>>| super::GetChunkResponse {
-            chunk_id: 1,
+    fn respond_with_object_carries_warnings_without_disturbing_the_healthy_shape() {
+        use rmcp::model::RawContent;
+        let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
+            match &r.unwrap().content[0].raw {
+                RawContent::Text(t) => t.text.clone(),
+                other => panic!("expected text content, got {other:?}"),
+            }
+        };
+        // Declaration order is deliberately NOT alphabetical: a round-trip
+        // through `serde_json::to_value` would re-sort these (the Map is a
+        // BTreeMap without `preserve_order`), so this pins that the healthy path
+        // does not round-trip.
+        #[derive(serde::Serialize)]
+        struct Chunkish {
+            path: String,
+            content: String,
+        }
+        let obj = Chunkish {
             path: "src/x.rs".to_string(),
-            start_line: 1,
-            end_line: 2,
-            kind: "function".to_string(),
-            signature: None,
             content: "fn x() {}".to_string(),
-            context_before: None,
-            context_after: None,
-            context_lines_clamped: None,
-            note: None,
-            warnings: w,
         };
 
-        let warned = vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()];
-        let json = serde_json::to_string(&mk(Some(warned))).unwrap();
-        assert!(json.contains("os error 22"), "got: {json}");
+        let out = text(super::respond_with_object(&obj, &[]));
+        assert_eq!(
+            out, r#"{"path":"src/x.rs","content":"fn x() {}"}"#,
+            "a healthy object must keep its bytes AND its key order"
+        );
 
-        let json = serde_json::to_string(&mk(None)).unwrap();
+        let warned = vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()];
+        let out = text(super::respond_with_object(&obj, &warned));
+        assert!(out.contains("os error 22"), "got: {out}");
         assert!(
-            !json.contains("warnings"),
-            "a healthy chunk must not gain a key: {json}"
+            out.contains("src/x.rs"),
+            "the object itself survives: {out}"
         );
     }
 
@@ -3939,6 +3946,37 @@ fn respond_with_items<T: serde::Serialize>(
         )]));
     }
     let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string());
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// The object-shaped sibling of `respond_with_items`: one exit for handlers that
+/// return a single struct rather than a list.
+///
+/// A `warnings` *field* on the response struct was the obvious fix and is the
+/// weaker one — the handler is still free to populate it with `None`, and a test
+/// that builds the struct itself cannot see that happen. Review round 8 proved
+/// it: the round-7 defect was reintroduced at the `get_chunk` success path and
+/// all 630 tests still passed. Taking the channel as a required *parameter* is
+/// what `respond_with_items` does, and it is why that family stayed closed.
+///
+/// Healthy path serializes the struct directly, so its key order and bytes are
+/// unchanged. `serde_json::Map` is a `BTreeMap` here (no `preserve_order`
+/// feature), so round-tripping through `to_value` would silently re-sort the
+/// keys — which is only acceptable on the warning path, where the shape is new
+/// anyway.
+fn respond_with_object<T: serde::Serialize>(
+    value: &T,
+    warnings: &[String],
+) -> Result<CallToolResult, McpError> {
+    if !warnings.is_empty() {
+        if let Ok(mut v) = serde_json::to_value(value) {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("warnings".to_string(), serde_json::json!(warnings));
+                return Ok(CallToolResult::success(vec![Content::text(v.to_string())]));
+            }
+        }
+    }
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
@@ -6802,17 +6840,25 @@ impl CodesearchService {
         let chunk = if let Some(ref sv) = ctx.stores_vec {
             if sv.len() > 1 && request.project.is_none() {
                 // Smart candidate detection: find which stores actually contain this chunk_id
-                let mut candidates: Vec<(&Arc<SharedStores>, &str)> = Vec::new();
+                let mut candidates: Vec<(&Arc<SharedStores>, String)> = Vec::new();
                 let aliases = ctx.aliases();
                 for (i, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(_)) => {
-                            // A store that HAS the chunk is a candidate even if its
-                            // alias is missing. Gating the push on `aliases.get(i)`
-                            // dropped it silently, which is how a 2-candidate
-                            // collision could render as an unambiguous auto-route.
-                            let alias = aliases.get(i).map(|s| s.as_str()).unwrap_or("unknown");
+                            // A store that HAS the chunk stays a candidate even if
+                            // its alias is missing. `resolve_repo_stores_multi`
+                            // keeps stores and aliases the same length, so this is
+                            // unreachable today — but gating the push on
+                            // `aliases.get(i)` meant a future break of that
+                            // invariant would degrade to a silent auto-route rather
+                            // than a loud one. The placeholder is per-index so two
+                            // aliasless candidates stay distinguishable in
+                            // `candidate_projects`.
+                            let alias = aliases
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| format!("<unnamed store #{i}>"));
                             candidates.push((store_arc, alias));
                         }
                         Ok(None) => continue,
@@ -6837,7 +6883,7 @@ impl CodesearchService {
                     }
                     1 => {
                         // Exactly one store has this chunk_id — auto-route
-                        let (store_arc, alias) = candidates[0];
+                        let (store_arc, ref alias) = candidates[0];
                         // Record tool call for the specific repo that served this chunk
                         if let Some(ref serve_state) = self.serve_state {
                             serve_state.record_tool_call(alias, "get_chunk");
@@ -6862,7 +6908,7 @@ impl CodesearchService {
                         // store that failed to answer has to be declared: the
                         // right repo may be the one missing from it.
                         let candidate_names: Vec<&str> =
-                            candidates.iter().map(|(_, a)| *a).collect();
+                            candidates.iter().map(|(_, a)| a.as_str()).collect();
                         let payload = ambiguous_chunk_payload(
                             request.chunk_id,
                             &candidate_names,
@@ -6985,19 +7031,13 @@ impl CodesearchService {
             context_after,
             context_lines_clamped: if clamped { Some(true) } else { None },
             note,
-            // The success path is the one that used to drop this, and it is the
-            // dangerous one: a confidently-returned chunk from a group where a
-            // store failed to answer looks exactly like a chunk from a healthy
-            // group. Same false negative as an empty result, harder to notice.
-            warnings: if chunk_warnings.is_empty() {
-                None
-            } else {
-                Some(chunk_warnings)
-            },
         };
 
-        let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        // The success path is the one that used to drop this, and it is the
+        // dangerous one: a confidently-returned chunk from a group where a store
+        // failed to answer looks exactly like a chunk from a healthy group. Same
+        // false negative as an empty result, harder to notice.
+        respond_with_object(&response, &chunk_warnings)
     }
 
     /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.

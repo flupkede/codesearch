@@ -453,14 +453,6 @@ pub struct GetChunkResponse {
     pub context_lines_clamped: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// Stores that failed while this chunk was being looked up.
-    ///
-    /// A chunk returned from a partially-dead group is not necessarily the right
-    /// chunk: chunk_ids are local per database, so a store that failed to answer
-    /// might have been a second candidate and made this an `ambiguous_chunk_id`.
-    /// Absent when every store in scope answered.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warnings: Option<Vec<String>>,
 }
 
 /// Import/dependency item found in a file
