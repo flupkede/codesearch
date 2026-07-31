@@ -4675,6 +4675,155 @@ mod tests {
         assert!(state.fsw_tasks.is_empty());
     }
 
+    #[tokio::test]
+    async fn await_index_task_cancels_and_joins_indexing_task() {
+        // FINDINGS #1: `remove_repo` stops an in-flight indexing pass via
+        // `await_index_task`, which must (a) remove the alias from `index_tasks`,
+        // (b) cancel the task's OWN token, and (c) actually await (join) the task
+        // to completion — so the task's `Arc<SharedStores>` clone drops and the
+        // LMDB mmap closes BEFORE the DB directory delete. Before BUG1, a
+        // freshly-added repo's embed pass ran in a detached, untracked task that
+        // ignored its token; this locks the tracking + cancellation + join.
+        let state = ServeState::new(ReposConfig::default(), None);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_clone = done.clone();
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move {
+            // Spin until cancelled — proving `await_index_task`'s `token.cancel()`
+            // actually propagates to the task, not just that the task happened to
+            // finish on its own.
+            while !token_clone.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        state
+            .index_tasks
+            .insert("repo-x".to_string(), (handle, token));
+        state.await_index_task("repo-x").await;
+        assert!(
+            !state.index_tasks.contains_key("repo-x"),
+            "index_tasks entry not removed"
+        );
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "indexing task was not cancelled + joined to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_repo_reports_db_deleted_when_delete_succeeds() {
+        // FINDINGS #2: `remove_repo` must report the REAL DB-delete outcome, not
+        // always "DB deleted". On the success path `RepoRemovalOutcome.db_deleted`
+        // must be `true` and the directory gone from disk. Uses a config-path
+        // override so the real `~/.codesearch/repos.json` is never touched.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("repos.json");
+        let repo_path = tmp.path().join("somerepo");
+        std::fs::create_dir(&repo_path).unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        // Put a file in the DB dir so delete has real work.
+        std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("somerepo".to_string()))
+            .unwrap();
+        config.save_to(&config_file).unwrap();
+        let state = ServeState::new(config, Some(config_file));
+
+        let outcome = state
+            .remove_repo("somerepo")
+            .await
+            .expect("remove_repo should succeed on the happy path");
+
+        assert!(outcome.db_deleted, "db_deleted must be true on success");
+        assert!(
+            outcome.db_delete_error.is_none(),
+            "no delete error on success, got: {:?}",
+            outcome.db_delete_error
+        );
+        assert!(!db_path.exists(), "DB directory must be removed from disk");
+    }
+
+    #[tokio::test]
+    async fn remove_repo_reports_db_locked_when_delete_fails() {
+        // FINDINGS #2: when the DB path CANNOT be removed, `RepoRemovalOutcome`
+        // must honestly report `db_deleted == false` plus a reason — NOT claim
+        // success (the BUG2 "always Ok" swallow). We force a deterministic,
+        // cross-platform delete failure by making `db_path` a regular file
+        // (`remove_dir_all` errors on a non-directory), exercising the retry
+        // loop's failure branch without depending on OS file-locking quirks.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("repos.json");
+        let repo_path = tmp.path().join("somerepo");
+        std::fs::create_dir(&repo_path).unwrap();
+        // db_path is a FILE, not a directory -> remove_dir_all fails every retry.
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::write(&db_path, "not a directory").unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("somerepo".to_string()))
+            .unwrap();
+        config.save_to(&config_file).unwrap();
+        let state = ServeState::new(config, Some(config_file));
+
+        let outcome = state
+            .remove_repo("somerepo")
+            .await
+            .expect("remove_repo returns Ok(outcome); delete failure is non-fatal");
+
+        assert!(
+            !outcome.db_deleted,
+            "db_deleted must be false when the delete fails"
+        );
+        assert!(
+            outcome.db_delete_error.is_some(),
+            "a delete error reason must be present on failure"
+        );
+    }
+
+    #[test]
+    fn is_alias_live_reflects_config_and_cancellation() {
+        // FINDINGS #4: the resurrection guard. A detached indexing task must
+        // NOT restart the FSW / rebuild the index for an alias that has been
+        // removed. `is_alias_live` is the conjunction of "not cancelled" and
+        // "alias still resolves in config"; the indexing tasks gate
+        // build_index/restart_fsw on it. Here we lock all three states.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir(&repo_path).unwrap();
+
+        let mut config = ReposConfig::default();
+        config
+            .register_with_alias(repo_path.clone(), Some("repo".to_string()))
+            .unwrap();
+        let state = ServeState::new(config, None);
+
+        let live = CancellationToken::new();
+        let dead = CancellationToken::new();
+        dead.cancel();
+
+        // (a) registered + live token -> live
+        assert!(
+            state.is_alias_live("repo", &live),
+            "registered alias with a live token must be live"
+        );
+        // (b) registered but token cancelled -> NOT live (cancellation wins)
+        assert!(
+            !state.is_alias_live("repo", &dead),
+            "a cancelled token must make the alias not-live (resurrection guard)"
+        );
+        // (c) not registered + live token -> NOT live
+        assert!(
+            !state.is_alias_live("ghost", &live),
+            "an unregistered alias must never be live"
+        );
+    }
+
     /// Regression guard: `GET /remotes` must NEVER expose a peer's `api_key`.
     ///
     /// `RemotePeerInfo` is a dedicated projection struct with no `api_key`

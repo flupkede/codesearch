@@ -1004,4 +1004,86 @@ mod tests {
         // `remove_dir_all` that could leak on an early-return/panic path.
         drop(temp_dir);
     }
+
+    #[test]
+    fn test_cache_dir_absent_after_panic_via_tempdir() {
+        // FINDINGS #5 (BUG3 regression): a panic during use of the injectable
+        // cache dir must clean up via TempDir's Drop during unwind, leaving the
+        // PRODUCTION cache path (`cache_dir_for`) untouched. Before BUG3 a test
+        // pointed at the real `~/.codesearch/embedding_cache/<name>` with a bare
+        // last-line `remove_dir_all`, which leaked on panic (247 leaked dirs).
+        use std::panic;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("panic-test-{}-{}", std::process::id(), now.as_nanos());
+
+        // Compute the production path once; clean up any residue from a
+        // previous leaked run so the assertion below is meaningful.
+        let prod_path = PersistentEmbeddingCache::cache_dir_for(&model).ok();
+        if let Some(ref p) = prod_path {
+            let _ = std::fs::remove_dir_all(p);
+        }
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let cache_dir = temp_dir.path().join(&model);
+            // Open into the redirected dir (the BUG3 seam), then panic mid-use.
+            let _cache = PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir).unwrap();
+            panic!("simulated mid-test failure");
+            // `_cache` then `temp_dir` drop during unwind (reverse order), so the
+            // LMDB env closes before the tempdir removes the files.
+        }));
+        assert!(result.is_err(), "inner closure should have panicked");
+
+        // The production path must NOT exist — TempDir unwound and the prod
+        // path was never opened.
+        if let Some(ref p) = prod_path {
+            assert!(
+                !p.exists(),
+                "production cache dir leaked despite the panic: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn injectable_cache_dir_leaves_production_path_untouched() {
+        // FINDINGS #6 (BUG3 isolation guard): opening via the injectable seam
+        // into a TempDir must leave the PRODUCTION cache path empty and clean up
+        // the TempDir on normal drop. Production code routes through `open`
+        // (real home); tests route through `open_with_cache_dir` (tempdir) — the
+        // two never meet. (A true repo-wide CI guard would snapshot
+        // `~/.codesearch` before/after the whole suite; this focused test locks
+        // the seam's isolation invariant.)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("guard-test-{}-{}", std::process::id(), now.as_nanos());
+
+        let prod_path = PersistentEmbeddingCache::cache_dir_for(&model).ok();
+
+        {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let cache_dir = temp_dir.path().join(&model);
+            let cache = PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir).unwrap();
+            // Drop the LMDB cache first (closes the env / releases the mmap).
+            drop(cache);
+            // `temp_dir` drops at scope end. On Windows the LMDB mmap handle can
+            // briefly delay the tempdir's removal, so we do NOT assert tempdir
+            // cleanup here (the existing `test_live_stats_registry_lifecycle`
+            // trusts Drop the same way) — only the PRODUCTION-path invariant.
+        }
+
+        // The production path must NOT exist — the tempdir-backed open never
+        // touched the real home cache dir.
+        if let Some(ref p) = prod_path {
+            assert!(
+                !p.exists(),
+                "production cache dir was touched by the tempdir-backed open: {}",
+                p.display()
+            );
+        }
+    }
 }

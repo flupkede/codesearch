@@ -2581,6 +2581,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_aborts_incremental_refresh_before_embedding() {
+        // FINDINGS #3: an indexing pass must observe its cancellation token, not
+        // run to completion on an alias that `remove_repo` is tearing down.
+        //
+        // A pre-cancelled token makes `perform_incremental_refresh_with_stores`
+        // bail at its entry checkpoint — BEFORE the file walk, embedding-model
+        // load, or any store mutation — even though the codebase HAS a changed
+        // file that would otherwise trigger a full embed pass. This locks the
+        // contract the in-flight cancel path (`remove_repo` -> `await_index_task`)
+        // depends on.
+        //
+        // Finer mid-pass checkpoints (per-file inside the `spawn_blocking` embed
+        // loop, between batches, before `build_index`) also exist, but reaching
+        // them requires loading the ONNX embedding model, so a true mid-embed
+        // interrupt is an `#[ignore]` integration test, omitted here.
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+        // A real source file so the change-detector WOULD find work to do.
+        std::fs::write(codebase_path.join("a.txt"), "hello world").unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let token = CancellationToken::new();
+        token.cancel(); // already cancelled -> must abort immediately
+
+        let result = IndexManager::perform_incremental_refresh_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &token,
+        )
+        .await;
+
+        let err = result.expect_err("pre-cancelled token must abort indexing");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "loads the ONNX embedding model (~90MB download on first run); \
+                run with `cargo test -- --ignored mid_pass_cancellation`"]
+    async fn mid_pass_cancellation_aborts_a_running_embed() {
+        // FINDINGS #3 (mid-pass, not just entry): the entry-level test above only
+        // proves a pre-cancelled token bails before work begins. This test lets a
+        // REAL embed pass START (past the entry checkpoint, into ONNX inference),
+        // confirms it is still running, and THEN cancels — proving the per-batch /
+        // per-file / pre-build_index checkpoints abort a RUNNING long pass, not
+        // merely one that never began. Uses `force_reindex_with_stores` so the
+        // default model metadata is stamped correctly (a hand-written "test-model"
+        // short name would fail model resolution before reaching the embed loop).
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        let dims = ModelType::default().dimensions();
+        let stores = create_test_stores(&db_path, dims).await;
+
+        // A large corpus so the full pass spans multiple embed batches and takes
+        // long enough to reliably still be running when we cancel. If this flakes
+        // because the pass finishes first, bump the file count.
+        for i in 0..600 {
+            std::fs::write(
+                codebase_path.join(format!("file_{i:03}.txt")),
+                format!("document body number {i} with enough prose to be chunked\n"),
+            )
+            .unwrap();
+        }
+
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let handle = tokio::spawn(async move {
+            IndexManager::force_reindex_with_stores(
+                &codebase_path,
+                &db_path,
+                &stores,
+                None,
+                &task_token,
+            )
+            .await
+        });
+
+        // Give the pass a head start so it is past the entry checkpoint and into
+        // model load / embedding. 200ms is comfortably past the (microsecond)
+        // entry check while leaving the bulk of a 600-file pass ahead.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !handle.is_finished(),
+            "corpus too small: the pass completed before we could cancel — \
+             increase the file count so the embed run outlasts the head start"
+        );
+
+        let cancel_start = std::time::Instant::now();
+        token.cancel();
+
+        let result = handle.await.expect("indexing task panicked");
+        let cancel_latency = cancel_start.elapsed();
+
+        // The pass must abort to a cancellation error, NOT complete Ok — this is
+        // the assertion that fails if the post-entry checkpoints were missing.
+        let err = result.expect_err("a running embed pass must abort to a cancellation error");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {err}"
+        );
+        // The checkpoint fires at the next batch/phase boundary, well before a
+        // full uncancelled pass over 600 files would finish.
+        assert!(
+            cancel_latency < std::time::Duration::from_secs(30),
+            "cancellation took too long to take effect: {cancel_latency:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn force_reindex_stamps_model_when_metadata_has_only_schema_version() {
         // Regression for the "model: unknown" worktree bug.
         //
