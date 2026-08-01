@@ -1612,7 +1612,7 @@ impl ServeState {
     /// actually held the handle is the one best placed to delete the dir
     /// right after releasing it. Failures are non-fatal — the repo is already
     /// unregistered, and a serve restart reaps any leftover.
-    fn remove_orphaned_db_dir(&self, alias: &str, db_path: &std::path::Path) {
+    fn remove_orphaned_db_dir(alias: &str, db_path: &std::path::Path) {
         match std::fs::remove_dir_all(db_path) {
             Ok(()) => tracing::info!(
                 "Self-cleanup deleted orphaned DB dir for '{}': {}",
@@ -1713,6 +1713,17 @@ impl ServeState {
                     }
 
                     if token_for_task.is_cancelled() {
+                        // The repo was removed (or cancelled) during the
+                        // just-finished uninterruptible build phase of the
+                        // refresh. `await_fsw_shutdown` detached this task on
+                        // purpose; drop our handles — `im_for_task` holds a
+                        // SharedStores ref via IndexManager and `stores_bg` is
+                        // the direct clone — so the LMDB env closes, then
+                        // self-clean the orphaned DB dir instead of leaving it
+                        // on disk until a serve restart.
+                        drop(im_for_task);
+                        drop(stores_bg);
+                        ServeState::remove_orphaned_db_dir(&alias_bg, &db_path_bg);
                         return;
                     }
 
@@ -2075,6 +2086,18 @@ impl ServeState {
                         }
 
                         if token_for_task.is_cancelled() {
+                            // The incremental refresh above may have finished a
+                            // build that `remove_repo` could not interrupt; this
+                            // detached task is now the last holder of the LMDB
+                            // handles (remove_repo already dropped the repos entry
+                            // and gave up awaiting this task). Release both Arcs to
+                            // close the env synchronously, then self-clean the
+                            // orphaned DB dir — matching the add_repo/reindex
+                            // post-build guards so the detach-on-timeout promise
+                            // in `await_fsw_shutdown` actually holds.
+                            drop(im_for_task);
+                            drop(stores_for_task);
+                            ServeState::remove_orphaned_db_dir(&alias_clone, &db_path_clone);
                             return;
                         }
 
@@ -3487,7 +3510,7 @@ async fn reindex_handler(
                     g_alias
                 );
                 drop(stores);
-                g_state.remove_orphaned_db_dir(&g_alias, &db_path);
+                ServeState::remove_orphaned_db_dir(&g_alias, &db_path);
                 g_state.end_indexing(&g_alias);
                 return;
             }
@@ -3547,6 +3570,23 @@ async fn reindex_handler(
                 Err(e) => {
                     tracing::error!("❌ Reindex failed for '{}': {}", alias_bg, e);
                 }
+            }
+
+            // Guard: the incremental refresh above may have finished a build that
+            // `remove_repo` could not interrupt (build_index is uninterruptible).
+            // If the alias was removed (or cancelled) during it, this detached
+            // task is the last holder of the stores handle — drop it to close the
+            // LMDB env, then self-clean the orphaned DB dir (matching the
+            // add_repo/reindex post-build guards).
+            if !g_state.is_alias_live(&g_alias, &reindex_token_task) {
+                tracing::info!(
+                    "Repo '{}' removed during incremental reindex; dropping stores and self-cleaning DB dir",
+                    g_alias
+                );
+                drop(stores);
+                ServeState::remove_orphaned_db_dir(&g_alias, &db_path);
+                g_state.end_indexing(&g_alias);
+                return;
             }
 
             // Optional symbol index rebuild
@@ -3880,7 +3920,7 @@ async fn add_repo_handler(
                 alias_bg
             );
             drop(stores);
-            state_bg.remove_orphaned_db_dir(&alias_bg, &db_path);
+            ServeState::remove_orphaned_db_dir(&alias_bg, &db_path);
             state_bg.end_indexing(&alias_bg);
             return;
         }
@@ -5044,8 +5084,7 @@ mod tests {
         std::fs::create_dir_all(&db_path).unwrap();
         std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
 
-        let state = ServeState::new(ReposConfig::default(), None);
-        state.remove_orphaned_db_dir("orphan", &db_path);
+        ServeState::remove_orphaned_db_dir("orphan", &db_path);
 
         assert!(
             !db_path.exists(),
@@ -5064,9 +5103,8 @@ mod tests {
         let db_path = tmp.path().join(DB_DIR_NAME).join("never-existed");
         assert!(!db_path.exists());
 
-        let state = ServeState::new(ReposConfig::default(), None);
         // Must not panic; the already-gone path stays gone.
-        state.remove_orphaned_db_dir("orphan", &db_path);
+        ServeState::remove_orphaned_db_dir("orphan", &db_path);
         assert!(!db_path.exists());
     }
 

@@ -1049,7 +1049,7 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
                 alias_bg
             );
             drop(stores);
-            state_bg.remove_orphaned_db_dir(&alias_bg, &db_path);
+            ServeState::remove_orphaned_db_dir(&alias_bg, &db_path);
             state_bg.end_indexing(&alias_bg);
             return;
         }
