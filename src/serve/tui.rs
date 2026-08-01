@@ -1040,10 +1040,16 @@ fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch 
         // config check is insufficient here because remove_repo unregisters
         // config AFTER awaiting this task.
         if !state_bg.is_alias_live(&alias_bg, &reindex_token_task) {
+            // Alias removed during force_reindex (whose final build_index is
+            // uninterruptible). `remove_repo` gave up awaiting this task and
+            // reported its own outcome; drop our stores handle (closes the
+            // LMDB env) and self-clean the orphaned DB dir.
             tracing::info!(
-                "TUI: Skipping restart_fsw for '{}': repo removed or cancelled mid-reindex",
+                "TUI: Repo '{}' removed mid-reindex; dropping stores and self-cleaning DB dir",
                 alias_bg
             );
+            drop(stores);
+            ServeState::remove_orphaned_db_dir(&alias_bg, &db_path);
             state_bg.end_indexing(&alias_bg);
             return;
         }

@@ -435,6 +435,30 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
 
+/// Cooperative join window (seconds) for `await_index_task` and
+/// `await_fsw_shutdown`: how long a background indexing / file-watcher task
+/// is given to observe its `CancellationToken` and exit on its own before it
+/// is force-aborted. Kept short so a stuck task cannot wedge `remove_repo`;
+/// the follow-on DB-delete retry budget (`DB_DELETE_RETRY_BUDGET_SECS`) is
+/// the outer bound for the whole shutdown.
+pub const BG_TASK_COOPERATIVE_TIMEOUT_SECS: u64 = 5;
+
+/// Total wall-clock budget (seconds) `remove_repo` spends retrying a locked
+/// `.codesearch.db` delete after the background task is aborted. An indexing
+/// task that ignores its token is force-aborted, but its `Arc<SharedStores>`
+/// / LMDB handles are only released once the runtime finishes dropping the
+/// aborted future; this budget covers that release window plus any OS
+/// handle-close lag on Windows.
+pub const DB_DELETE_RETRY_BUDGET_SECS: u64 = 60;
+
+/// Initial backoff (milliseconds) for the locked-DB delete retry loop in
+/// `remove_repo`; doubled each attempt up to `DB_DELETE_RETRY_BACKOFF_CAP_MS`.
+pub const DB_DELETE_RETRY_INITIAL_MS: u64 = 200;
+
+/// Upper bound (milliseconds) for the exponential backoff between locked-DB
+/// delete retries in `remove_repo`.
+pub const DB_DELETE_RETRY_BACKOFF_CAP_MS: u64 = 2000;
+
 /// Default embedding dimensions used when metadata is missing or unreadable.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
 

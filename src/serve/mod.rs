@@ -1352,10 +1352,21 @@ impl ServeState {
         let mut db_deleted = !db_path.exists();
         let mut db_delete_error: Option<String> = None;
         if db_path.exists() {
-            for attempt in 0..5 {
-                if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
+            // Deadline-bounded exponential-backoff retry. We ONLY retry on
+            // lock-class errors (sharing/lock violation or access-denied on
+            // Windows, or a message hinting the dir is in use) — a genuine
+            // non-lock failure (e.g. a non-directory path, or a permission
+            // refusal that won't resolve) must surface immediately instead of
+            // burning the whole budget. The budget covers the window in which
+            // a just-aborted indexing task is still dropping its
+            // `Arc<SharedStores>` and the OS is closing the LMDB mmap handles
+            // on Windows; once those release, the retry succeeds.
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(crate::constants::DB_DELETE_RETRY_BUDGET_SECS);
+            let mut backoff_ms = crate::constants::DB_DELETE_RETRY_INITIAL_MS;
+            let mut attempt = 0usize;
+            loop {
+                attempt += 1;
                 match std::fs::remove_dir_all(&db_path) {
                     Ok(()) => {
                         tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
@@ -1363,23 +1374,46 @@ impl ServeState {
                         db_delete_error = None;
                         break;
                     }
-                    Err(e) if attempt < 4 => {
-                        tracing::debug!(
-                            "DB delete attempt {} for '{}' failed (will retry): {}",
-                            attempt + 1,
-                            alias,
-                            e
-                        );
-                        db_delete_error = Some(e.to_string());
-                    }
                     Err(e) => {
+                        // If the dir is already gone, treat that as success:
+                        // a concurrent deleter won the race. This happens in
+                        // exactly the in-build scenario this fix targets — the
+                        // detached indexing task's post-build guard ran
+                        // `drop(stores)` + `remove_orphaned_db_dir` and removed
+                        // the dir before our retry saw it. The goal (dir not on
+                        // disk) is achieved, so report honestly that it is gone
+                        // rather than misreporting a "not found" as a failure.
+                        if e.kind() == std::io::ErrorKind::NotFound || !db_path.exists() {
+                            tracing::info!(
+                                "Database dir for '{}' already gone (concurrent cleanup?): {}",
+                                alias,
+                                db_path.display()
+                            );
+                            db_deleted = true;
+                            db_delete_error = None;
+                            break;
+                        }
                         let msg = e.to_string();
-                        tracing::warn!(
-                            "Failed to delete database for '{}' after 5 attempts (may be locked): {}",
+                        db_delete_error = Some(msg.clone());
+                        if !Self::is_db_locked_error(&e) || std::time::Instant::now() >= deadline {
+                            tracing::warn!(
+                                "Failed to delete database for '{}' after {} attempt(s) \
+                                 (may be locked): {}",
+                                alias,
+                                attempt,
+                                msg
+                            );
+                            break;
+                        }
+                        tracing::debug!(
+                            "DB delete attempt {} for '{}' failed (locked, will retry): {}",
+                            attempt,
                             alias,
                             msg
                         );
-                        db_delete_error = Some(msg);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        backoff_ms =
+                            (backoff_ms * 2).min(crate::constants::DB_DELETE_RETRY_BACKOFF_CAP_MS);
                     }
                 }
             }
@@ -1454,7 +1488,17 @@ impl ServeState {
     /// fallback for that edge case.
     async fn await_fsw_shutdown(&self, alias: &str) {
         if let Some((_, handle)) = self.fsw_tasks.remove(alias) {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            // Bounded cooperative join, same rationale as `await_index_task`:
+            // we do NOT abort on timeout. An FSW refresh can also be parked
+            // inside an uninterruptible `build_index` on a `spawn_blocking`
+            // thread; aborting would detach that task and drop its post-build
+            // self-cleanup. Detaching lets the guard run and clean up.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
+                handle,
+            )
+            .await
+            {
                 Ok(Ok(())) => {
                     tracing::debug!("FSW task for '{}' exited cleanly", alias);
                 }
@@ -1467,8 +1511,10 @@ impl ServeState {
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "FSW task for '{}' did not exit within 5s; LMDB handles may stay locked",
-                        alias
+                        "FSW task for '{}' did not exit within {}s cooperative window; \
+                         detaching — its post-build guard will self-clean the DB dir",
+                        alias,
+                        crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS,
                     );
                 }
             }
@@ -1489,7 +1535,26 @@ impl ServeState {
     async fn await_index_task(&self, alias: &str) {
         if let Some((_, (handle, token))) = self.index_tasks.remove(alias) {
             token.cancel();
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            // Bounded cooperative join. We deliberately do NOT abort the task
+            // on timeout. An indexing task can be parked inside `build_index`'s
+            // synchronous arroy HNSW build, which runs on a `spawn_blocking`
+            // thread and has no cancellation point Tokio can interrupt.
+            // Aborting the OUTER `JoinHandle` would only detach that blocking
+            // task (it keeps its own `Arc<RwLock<VectorStore>>` clone, so the
+            // LMDB mmap stays open regardless) AND drop the post-build
+            // continuation — including the self-cleanup that deletes the
+            // orphaned `.codesearch.db` dir once the build finishes. So on
+            // timeout we detach the outer task ON PURPOSE: its post-build guard
+            // (`remove_orphaned_db_dir`) releases the handles and self-cleans
+            // the directory. The deadline-bounded delete retry in `remove_repo`
+            // covers builds that finish within its budget; a serve restart reaps
+            // anything left over.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
+                handle,
+            )
+            .await
+            {
                 Ok(Ok(())) => {
                     tracing::debug!("Index task for '{}' exited cleanly", alias);
                 }
@@ -1502,11 +1567,67 @@ impl ServeState {
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "Index task for '{}' did not exit within 5s; LMDB handles may stay locked",
-                        alias
+                        "Index task for '{}' still in an uninterruptible build_index after {}s; \
+                         detaching — its post-build guard will self-clean the DB dir",
+                        alias,
+                        crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS,
                     );
                 }
             }
+        }
+    }
+
+    /// Classify an `io::Error` from `remove_dir_all` as a transient "DB is
+    /// locked / in use" failure worth retrying (sharing/lock violation or
+    /// access-denied on Windows, or a message hinting the dir is in use),
+    /// versus a permanent failure (e.g. a non-directory path) that must
+    /// surface immediately. Used by [`Self::remove_repo`]'s deadline-bounded
+    /// delete retry so a genuine non-lock error doesn't burn the whole budget.
+    fn is_db_locked_error(e: &std::io::Error) -> bool {
+        // Windows sharing/lock violations surface as raw OS error codes:
+        // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32),
+        // ERROR_LOCK_VIOLATION (33).
+        if let Some(raw) = e.raw_os_error() {
+            if matches!(raw, 5 | 32 | 33) {
+                return true;
+            }
+        }
+        // Cross-platform fallback: the error message hints the dir is in use.
+        let msg = e.to_string();
+        msg.contains("being used")
+            || msg.contains("is in use")
+            || msg.contains("locked")
+            || msg.contains("busy")
+    }
+
+    /// Best-effort delete of an orphaned `.codesearch.db` directory, called
+    /// from a background indexing task's post-build guard when its alias was
+    /// removed (or cancelled) mid-build. The caller MUST drop its own
+    /// `Arc<SharedStores>` clone BEFORE calling this — that closes the LMDB
+    /// env synchronously (the `spawn_blocking` build already released its
+    /// `Arc<RwLock<VectorStore>>` clone on return), so the directory is no
+    /// longer locked on Windows and the remove can succeed. This is the
+    /// guaranteed backstop for the in-build case: `remove_repo`'s own
+    /// delete retry gives up once the alias is torn down, but the task that
+    /// actually held the handle is the one best placed to delete the dir
+    /// right after releasing it. Failures are non-fatal — the repo is already
+    /// unregistered, and a serve restart reaps any leftover.
+    fn remove_orphaned_db_dir(alias: &str, db_path: &std::path::Path) {
+        match std::fs::remove_dir_all(db_path) {
+            Ok(()) => tracing::info!(
+                "Self-cleanup deleted orphaned DB dir for '{}': {}",
+                alias,
+                db_path.display()
+            ),
+            Err(_) if !db_path.exists() => {
+                tracing::debug!("Self-cleanup: DB dir for '{}' already gone", alias)
+            }
+            Err(e) => tracing::warn!(
+                "Self-cleanup could not delete orphaned DB dir for '{}' \
+                 (it will be reaped on next serve restart): {}",
+                alias,
+                e
+            ),
         }
     }
 
@@ -1592,6 +1713,17 @@ impl ServeState {
                     }
 
                     if token_for_task.is_cancelled() {
+                        // The repo was removed (or cancelled) during the
+                        // just-finished uninterruptible build phase of the
+                        // refresh. `await_fsw_shutdown` detached this task on
+                        // purpose; drop our handles — `im_for_task` holds a
+                        // SharedStores ref via IndexManager and `stores_bg` is
+                        // the direct clone — so the LMDB env closes, then
+                        // self-clean the orphaned DB dir instead of leaving it
+                        // on disk until a serve restart.
+                        drop(im_for_task);
+                        drop(stores_bg);
+                        ServeState::remove_orphaned_db_dir(&alias_bg, &db_path_bg);
                         return;
                     }
 
@@ -1954,6 +2086,18 @@ impl ServeState {
                         }
 
                         if token_for_task.is_cancelled() {
+                            // The incremental refresh above may have finished a
+                            // build that `remove_repo` could not interrupt; this
+                            // detached task is now the last holder of the LMDB
+                            // handles (remove_repo already dropped the repos entry
+                            // and gave up awaiting this task). Release both Arcs to
+                            // close the env synchronously, then self-clean the
+                            // orphaned DB dir — matching the add_repo/reindex
+                            // post-build guards so the detach-on-timeout promise
+                            // in `await_fsw_shutdown` actually holds.
+                            drop(im_for_task);
+                            drop(stores_for_task);
+                            ServeState::remove_orphaned_db_dir(&alias_clone, &db_path_clone);
                             return;
                         }
 
@@ -3357,10 +3501,16 @@ async fn reindex_handler(
             // removed alias. restart_fsw's own config check is insufficient here
             // because remove_repo unregisters config AFTER awaiting this task.
             if !g_state.is_alias_live(&g_alias, &reindex_token_task) {
+                // Alias removed during force_reindex (whose final build_index is
+                // uninterruptible). `remove_repo` gave up awaiting this task and
+                // reported its own outcome; drop our stores handle (closes the
+                // LMDB env) and self-clean the orphaned DB dir.
                 tracing::info!(
-                    "Skipping restart_fsw for '{}': repo removed or cancelled mid-reindex",
+                    "Repo '{}' removed mid-reindex; dropping stores and self-cleaning DB dir",
                     g_alias
                 );
+                drop(stores);
+                ServeState::remove_orphaned_db_dir(&g_alias, &db_path);
                 g_state.end_indexing(&g_alias);
                 return;
             }
@@ -3420,6 +3570,23 @@ async fn reindex_handler(
                 Err(e) => {
                     tracing::error!("❌ Reindex failed for '{}': {}", alias_bg, e);
                 }
+            }
+
+            // Guard: the incremental refresh above may have finished a build that
+            // `remove_repo` could not interrupt (build_index is uninterruptible).
+            // If the alias was removed (or cancelled) during it, this detached
+            // task is the last holder of the stores handle — drop it to close the
+            // LMDB env, then self-clean the orphaned DB dir (matching the
+            // add_repo/reindex post-build guards).
+            if !g_state.is_alias_live(&g_alias, &reindex_token_task) {
+                tracing::info!(
+                    "Repo '{}' removed during incremental reindex; dropping stores and self-cleaning DB dir",
+                    g_alias
+                );
+                drop(stores);
+                ServeState::remove_orphaned_db_dir(&g_alias, &db_path);
+                g_state.end_indexing(&g_alias);
+                return;
             }
 
             // Optional symbol index rebuild
@@ -3739,10 +3906,21 @@ async fn add_repo_handler(
         // Re-check before restart_fsw: build_index (spawn_blocking) may have
         // taken long enough for a remove_repo to land in between.
         if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
+            // The alias was removed (or cancelled) during the just-finished
+            // build_index. `remove_repo` already gave up awaiting this task
+            // (build_index is uninterruptible) and reported its own delete
+            // outcome, but the DB dir may still be locked by OUR stores
+            // handle. Drop it — the spawn_blocking build already released its
+            // Arc clone, so dropping this last Arc<SharedStores> closes the
+            // LMDB env synchronously — then self-clean the directory. The task
+            // that held the handle is the one best placed to delete it right
+            // after releasing it.
             tracing::info!(
-                "Skipping restart_fsw for '{}': repo removed or cancelled during build_index",
+                "Repo '{}' removed during build_index; dropping stores and self-cleaning DB dir",
                 alias_bg
             );
+            drop(stores);
+            ServeState::remove_orphaned_db_dir(&alias_bg, &db_path);
             state_bg.end_indexing(&alias_bg);
             return;
         }
@@ -4891,6 +5069,77 @@ mod tests {
             outcome.db_delete_error.is_some(),
             "a delete error reason must be present on failure"
         );
+    }
+
+    #[test]
+    fn remove_orphaned_db_dir_deletes_a_present_directory() {
+        // Regression guard for the self-cleanup backstop: when a background
+        // indexing task finishes an uninterruptible `build_index` for an alias
+        // that was removed mid-build, its post-build guard drops its stores
+        // handle and calls `remove_orphaned_db_dir` to delete the now-orphaned
+        // `.codesearch.db` directory. Without this mechanism the dir would stay
+        // locked (and on disk) until a serve restart.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+        ServeState::remove_orphaned_db_dir("orphan", &db_path);
+
+        assert!(
+            !db_path.exists(),
+            "self-cleanup must delete the orphaned DB directory"
+        );
+    }
+
+    #[test]
+    fn remove_orphaned_db_dir_handles_already_gone() {
+        // The self-cleanup runs concurrently with `remove_repo`'s own delete
+        // loop; the loop may win the race and delete the dir first, so by the
+        // time the detached task's guard calls `remove_orphaned_db_dir` the
+        // path is already gone. That must not panic or surface a spurious
+        // error — it is a no-op debug-log path.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join(DB_DIR_NAME).join("never-existed");
+        assert!(!db_path.exists());
+
+        // Must not panic; the already-gone path stays gone.
+        ServeState::remove_orphaned_db_dir("orphan", &db_path);
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    #[allow(clippy::io_other_error)] // synthetic errors with literal messages
+    fn is_db_locked_error_classifies_lock_and_non_lock_errors() {
+        // `remove_repo`'s deadline-bounded delete retry only retries lock-class
+        // errors (Windows sharing/lock violation / access-denied, or a message
+        // hinting the dir is in use). A permanent failure — e.g. a NotFound, or
+        // the dir actually being a regular file — must NOT be retried, so it
+        // surfaces immediately instead of burning the retry budget.
+        use std::io;
+
+        // Permanent: NotFound (dir already gone) -> not a lock.
+        assert!(!ServeState::is_db_locked_error(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        // Lock-class: Windows ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION
+        // (33) raw codes -> retried (raw_os_error is platform-independent here).
+        assert!(ServeState::is_db_locked_error(
+            &io::Error::from_raw_os_error(32)
+        ));
+        assert!(ServeState::is_db_locked_error(
+            &io::Error::from_raw_os_error(33)
+        ));
+        // Lock-class by message hint (cross-platform fallback).
+        assert!(ServeState::is_db_locked_error(&io::Error::new(
+            io::ErrorKind::Other,
+            "The process cannot access the file because it is being used by another process"
+        )));
+        // Permanent: a non-lock message -> not retried.
+        assert!(!ServeState::is_db_locked_error(&io::Error::new(
+            io::ErrorKind::Other,
+            "not a directory"
+        )));
     }
 
     #[test]
