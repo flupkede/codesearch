@@ -211,6 +211,63 @@ fn remove_orphaned_db_dir_handles_already_gone() {
     assert!(!db_path.exists());
 }
 
+/// End-to-end regression for PR #179: when `remove_repo` lands while a
+/// `build_index` is still inside its uninterruptible `spawn_blocking` phase,
+/// the orphaned `.codesearch.db` dir must still end up deleted — by the build
+/// task's post-build self-cleanup guard (`remove_orphaned_db_dir`), which runs
+/// after the blocking work returns. Unlike
+/// `await_index_task_cancels_and_joins_indexing_task` (which plants a
+/// cooperatively-cancellable async yield-loop) and unlike the
+/// `remove_orphaned_db_dir_*` unit tests (which call the guard directly), this
+/// plants a `spawn_blocking`-based task and drives the full `remove_repo` path
+/// while that blocking work is still in flight.
+#[tokio::test]
+async fn remove_repo_during_active_build_self_cleans_db_dir() {
+    let (_tmp, repo_path, state) = state_with_repo("buildrepo");
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    // Seed a file so the dir is non-empty and delete is real work.
+    std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+    // Plant an indexing task that mimics a real build_index: an uninterruptible
+    // `spawn_blocking` phase (tokio cannot cancel it mid-sleep via the token),
+    // followed by the PR #179 post-build self-cleanup guard.
+    let token = CancellationToken::new();
+    let db_path_for_cleanup = db_path.clone();
+    let handle = tokio::spawn(async move {
+        // build_index's synchronous arroy HNSW build runs on the blocking pool
+        // and has no cancellation point tokio can interrupt.
+        let _ = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        })
+        .await;
+        // Post-build guard: the alias was removed mid-build, so the dir is
+        // orphaned — self-clean it now that the build's handles are released.
+        ServeState::remove_orphaned_db_dir("buildrepo", &db_path_for_cleanup);
+    });
+    state
+        .index_tasks
+        .insert("buildrepo".to_string(), (handle, token));
+
+    // remove_repo lands WHILE the spawn_blocking build is still sleeping.
+    let outcome = state
+        .remove_repo("buildrepo")
+        .await
+        .expect("remove_repo should succeed");
+    // Safety margin in case await_index_task's bounded join detached the task.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert!(
+        outcome.db_deleted,
+        "remove_repo must report db_deleted=true; got error: {:?}",
+        outcome.db_delete_error
+    );
+    assert!(
+        !db_path.exists(),
+        "orphaned .codesearch.db dir must be self-cleaned after a mid-build remove"
+    );
+}
+
 #[test]
 #[allow(clippy::io_other_error)] // synthetic errors with literal messages
 fn is_db_locked_error_classifies_lock_and_non_lock_errors() {
@@ -795,6 +852,65 @@ async fn reindex_route_is_registered() {
         body.get("status").is_some(),
         "expected JSON with 'status' field, got: {}",
         body
+    );
+}
+
+/// `repo_read_only=true` must refuse a reindex on the one route that can undo
+/// it — even with `?force=true`. This is the cloud-peer OOM-avoidance
+/// invariant: the lightweight serve replica must never rebuild the heavy DOCS
+/// corpus index it only holds read-only. The handler returns 409 CONFLICT with
+/// `status: "read_only"` (see the read-only guard in `reindex_handler`,
+/// src/serve/mod.rs).
+#[tokio::test]
+async fn reindex_refused_for_read_only_repo_even_with_force() {
+    let (_tmp, _repo_path, state) = state_with_repo("readonlyrepo");
+    // Mark the repo read-only in the live config (how a snapshot-restore sets it).
+    state
+        .config
+        .write()
+        .unwrap()
+        .repo_read_only
+        .insert("readonlyrepo".to_string(), true);
+
+    let state = Arc::new(state);
+    let app = axum::Router::new()
+        .route(
+            crate::constants::HEALTH_PATH,
+            axum::routing::get(health_handler),
+        )
+        .route(
+            "/repos/:alias/reindex",
+            axum::routing::post(reindex_handler),
+        )
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    // Even force=true must be refused for a read-only repo.
+    let resp = client
+        .post(format!(
+            "http://{}/repos/readonlyrepo/reindex?force=true",
+            addr
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "force-reindex on a read-only repo must be refused with 409"
+    );
+    let body: serde_json::Value = resp.json().await.expect("handler returns JSON");
+    assert_eq!(
+        body.get("status").and_then(|v| v.as_str()),
+        Some("read_only"),
+        "expected status=read_only, got: {body}"
     );
 }
 

@@ -622,6 +622,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_slow_peer_returns_unreachable_within_deadline() {
+        // A peer that ACCEPTS the connection but responds slower than the
+        // configured `timeout_secs` must surface as `Outcome::Unreachable`
+        // (driven by reqwest's per-request timeout) — NOT hang for the full
+        // server delay. This is the deadline guarantee federation relies on to
+        // avoid a single slow peer stalling a fan-out.
+        let app = axum::Router::new().route(
+            crate::constants::SEARCH_PATH,
+            axum::routing::post(|| async {
+                // Sleep far longer than the peer timeout below.
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                axum::Json(serde_json::json!({"results": []}))
+            }),
+        );
+        let addr = spawn_test_server(app).await;
+
+        let slow_peer = RemotePeer {
+            url: format!("http://{addr}"),
+            api_key: String::new(),
+            group: None,
+            timeout_secs: Some(1),
+        };
+
+        let client = FederationClient::new().unwrap();
+        let start = std::time::Instant::now();
+        let outcome = client
+            .search_project(&slow_peer, serde_json::json!({"query": "x"}), "kb")
+            .await;
+        let elapsed = start.elapsed();
+
+        // Must return well before the 3s server delay — i.e. the deadline fired.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "expected the peer timeout (~1s) to fire, not a hang for the full \
+             server delay; took {elapsed:?}"
+        );
+        match outcome {
+            Outcome::Unreachable(_) => {}
+            other => panic!("expected Unreachable (deadline), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn search_returns_results_from_a_live_peer() {
         let app = axum::Router::new().route(
             crate::constants::SEARCH_PATH,
