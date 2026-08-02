@@ -126,21 +126,11 @@ async fn remove_repo_reports_db_deleted_when_delete_succeeds() {
     // always "DB deleted". On the success path `RepoRemovalOutcome.db_deleted`
     // must be `true` and the directory gone from disk. Uses a config-path
     // override so the real `~/.codesearch/repos.json` is never touched.
-    let tmp = tempfile::tempdir().unwrap();
-    let config_file = tmp.path().join("repos.json");
-    let repo_path = tmp.path().join("somerepo");
-    std::fs::create_dir(&repo_path).unwrap();
+    let (_tmp, repo_path, state) = state_with_repo("somerepo");
     let db_path = repo_path.join(DB_DIR_NAME);
     std::fs::create_dir_all(&db_path).unwrap();
     // Put a file in the DB dir so delete has real work.
     std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
-
-    let mut config = ReposConfig::default();
-    config
-        .register_with_alias(repo_path.clone(), Some("somerepo".to_string()))
-        .unwrap();
-    config.save_to(&config_file).unwrap();
-    let state = ServeState::new(config, Some(config_file));
 
     let outcome = state
         .remove_repo("somerepo")
@@ -164,20 +154,10 @@ async fn remove_repo_reports_db_locked_when_delete_fails() {
     // cross-platform delete failure by making `db_path` a regular file
     // (`remove_dir_all` errors on a non-directory), exercising the retry
     // loop's failure branch without depending on OS file-locking quirks.
-    let tmp = tempfile::tempdir().unwrap();
-    let config_file = tmp.path().join("repos.json");
-    let repo_path = tmp.path().join("somerepo");
-    std::fs::create_dir(&repo_path).unwrap();
+    let (_tmp, repo_path, state) = state_with_repo("somerepo");
     // db_path is a FILE, not a directory -> remove_dir_all fails every retry.
     let db_path = repo_path.join(DB_DIR_NAME);
     std::fs::write(&db_path, "not a directory").unwrap();
-
-    let mut config = ReposConfig::default();
-    config
-        .register_with_alias(repo_path.clone(), Some("somerepo".to_string()))
-        .unwrap();
-    config.save_to(&config_file).unwrap();
-    let state = ServeState::new(config, Some(config_file));
 
     let outcome = state
         .remove_repo("somerepo")
@@ -358,6 +338,28 @@ fn state_with_config(config: ReposConfig) -> ServeState {
     let config_file = tmp.path().join("repos.json");
     config.save_to(&config_file).unwrap();
     ServeState::new(config, Some(config_file))
+}
+
+/// Common single-repo test scaffolding: a temp dir (kept alive for the test
+/// lifetime — unlike `state_with_config`, which drops its `TempDir` on return),
+/// a `repos.json` inside it, an empty repo dir at `<tmp>/<alias>`, a
+/// `ReposConfig` with that repo registered under `alias`, and a `ServeState`
+/// wired to the config file. Returns `(tmp, repo_path, state)`.
+///
+/// Callers that need to seed a `.codesearch.db` inside the repo do so from the
+/// returned `repo_path` after this call.
+fn state_with_repo(alias: &str) -> (tempfile::TempDir, std::path::PathBuf, ServeState) {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let repo_path = tmp.path().join(alias);
+    std::fs::create_dir(&repo_path).unwrap();
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some(alias.to_string()))
+        .unwrap();
+    config.save_to(&config_file).unwrap();
+    let state = ServeState::new(config, Some(config_file));
+    (tmp, repo_path, state)
 }
 
 #[tokio::test]
