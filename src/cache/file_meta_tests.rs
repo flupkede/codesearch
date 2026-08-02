@@ -61,22 +61,40 @@ fn safe_canonicalize_on_nonexistent_path_returns_error() {
 
 #[cfg(windows)]
 #[test]
-fn test_normalize_path_strips_unc_prefix() {
-    let path = Path::new(r"\\?\C:\WorkArea\AI\codesearch\src\main.rs");
-    assert_eq!(
-        normalize_path(path),
-        "C:/WorkArea/AI/codesearch/src/main.rs"
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn test_normalize_path_converts_backslashes() {
-    let path = Path::new(r"C:\WorkArea\AI\codesearch\src\main.rs");
-    assert_eq!(
-        normalize_path(path),
-        "C:/WorkArea/AI/codesearch/src/main.rs"
-    );
+fn test_normalize_path_windows_forms() {
+    // Previously 5 separate #[cfg(windows)] #[test]s (strips_unc_prefix,
+    // converts_backslashes, mixed_separators, deeply_nested,
+    // consecutive_backslashes); consolidated into one table-driven test over
+    // normalize_path equality cases.
+    let cases: &[(&str, &str)] = &[
+        (
+            r"\\?\C:\WorkArea\AI\codesearch\src\main.rs",
+            "C:/WorkArea/AI/codesearch/src/main.rs",
+        ),
+        (
+            r"C:\WorkArea\AI\codesearch\src\main.rs",
+            "C:/WorkArea/AI/codesearch/src/main.rs",
+        ),
+        (
+            r"C:\Users\project/src/lib.rs",
+            "C:/Users/project/src/lib.rs",
+        ),
+        (
+            r"\\?\C:\Very\Deep\Nested\Path\To\Some\File.rs",
+            "C:/Very/Deep/Nested/Path/To/Some/File.rs",
+        ),
+        (
+            r"C:\\Double\\Backslashes\\file.rs",
+            "C://Double//Backslashes//file.rs",
+        ),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(
+            normalize_path(Path::new(input)),
+            *expected,
+            "normalize_path({input:?}) expected {expected:?}"
+        );
+    }
 }
 
 #[test]
@@ -91,8 +109,23 @@ fn test_normalize_path_forward_slashes_unchanged() {
 
 #[cfg(windows)]
 #[test]
-fn test_normalize_path_str_strips_unc() {
-    assert_eq!(normalize_path_str(r"\\?\C:\foo\bar.rs"), "C:/foo/bar.rs");
+fn test_normalize_path_str_windows_forms() {
+    // Previously 2 separate #[cfg(windows)] #[test]s (strips_unc,
+    // mixed_separators); consolidated into one table-driven test.
+    let cases: &[(&str, &str)] = &[
+        (r"\\?\C:\foo\bar.rs", "C:/foo/bar.rs"),
+        (
+            r"C:\Users\project/src/lib.rs",
+            "C:/Users/project/src/lib.rs",
+        ),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(
+            normalize_path_str(input),
+            *expected,
+            "normalize_path_str({input:?}) expected {expected:?}"
+        );
+    }
 }
 
 #[test]
@@ -120,23 +153,6 @@ fn test_normalize_path_preserves_unix_backslash_filenames() {
     assert_eq!(literal, "foo\\bar.rs");
 }
 
-#[cfg(windows)]
-#[test]
-fn test_normalize_path_mixed_separators() {
-    // Mixed separators should be normalized to forward slashes
-    let path = Path::new(r"C:\Users\project/src/lib.rs");
-    assert_eq!(normalize_path(path), "C:/Users/project/src/lib.rs");
-}
-
-#[cfg(windows)]
-#[test]
-fn test_normalize_path_str_mixed_separators() {
-    assert_eq!(
-        normalize_path_str(r"C:\Users\project/src/lib.rs"),
-        "C:/Users/project/src/lib.rs"
-    );
-}
-
 #[test]
 fn test_normalize_path_already_normalized() {
     // Already normalized paths should remain unchanged
@@ -145,25 +161,6 @@ fn test_normalize_path_already_normalized() {
         normalize_path(path),
         "C:/WorkArea/AI/codesearch/src/main.rs"
     );
-}
-
-#[cfg(windows)]
-#[test]
-fn test_normalize_path_deeply_nested() {
-    // Deeply nested paths
-    let path = Path::new(r"\\?\C:\Very\Deep\Nested\Path\To\Some\File.rs");
-    assert_eq!(
-        normalize_path(path),
-        "C:/Very/Deep/Nested/Path/To/Some/File.rs"
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn test_normalize_path_consecutive_backslashes() {
-    // Consecutive backslashes (edge case from file systems)
-    let path = Path::new(r"C:\\Double\\Backslashes\\file.rs");
-    assert_eq!(normalize_path(path), "C://Double//Backslashes//file.rs");
 }
 
 #[cfg(windows)]
@@ -246,40 +243,37 @@ fn test_file_meta_store() {
 
 #[cfg(windows)]
 #[test]
-fn test_path_comparison_unc_vs_normal() {
-    // UNC prefix (from Windows canonicalize) must match normal path
-    let unc = normalize_path(Path::new(r"\\?\C:\WorkArea\src\main.rs"));
-    let normal = normalize_path(Path::new(r"C:\WorkArea\src\main.rs"));
-    assert_eq!(unc, normal);
-}
+fn test_path_comparison_normalizes_equivalently() {
+    // Previously 4 separate #[test]s (path_comparison_unc_vs_normal,
+    // path_comparison_backslash_vs_forward, path_str_comparison_unc_vs_normal,
+    // path_comparison_stored_vs_walker); consolidated into one table-driven
+    // test asserting that pathologically different spellings of the same path
+    // normalize to an identical key (the production bug class for path matching).
+    let path_pairs: &[(&str, &str)] = &[
+        // UNC-prefixed vs backslash form
+        (r"\\?\C:\WorkArea\src\main.rs", r"C:\WorkArea\src\main.rs"),
+        // backslash vs forward-slash form
+        (r"C:\WorkArea\src\main.rs", "C:/WorkArea/src/main.rs"),
+        // stored (forward) vs walked (UNC) form
+        (
+            "C:/WorkArea/AI/codesearch/src/main.rs",
+            r"\\?\C:\WorkArea\AI\codesearch\src\main.rs",
+        ),
+    ];
+    for (a, b) in path_pairs {
+        let na = normalize_path(Path::new(a));
+        let nb = normalize_path(Path::new(b));
+        assert_eq!(
+            na, nb,
+            "normalize_path({a:?}) vs normalize_path({b:?}) diverged"
+        );
+    }
 
-#[cfg(windows)]
-#[test]
-fn test_path_comparison_backslash_vs_forward() {
-    let backslash = normalize_path(Path::new(r"C:\WorkArea\src\main.rs"));
-    let forward = normalize_path(Path::new("C:/WorkArea/src/main.rs"));
-    assert_eq!(backslash, forward);
-}
-
-#[cfg(windows)]
-#[test]
-fn test_path_str_comparison_unc_vs_normal() {
-    let unc = normalize_path_str(r"\\?\C:\WorkArea\src\main.rs");
-    let normal = normalize_path_str(r"C:\WorkArea\src\main.rs");
-    assert_eq!(unc, normal);
-}
-
-#[cfg(windows)]
-#[test]
-fn test_path_comparison_stored_vs_walker() {
-    // Simulates: FileMetaStore stored path vs FileWalker discovered path
-    // FileMetaStore stores via normalize_path(&file.path)
-    // FileWalker returns paths via canonicalize() which adds UNC on Windows
-    let stored = normalize_path(Path::new("C:/WorkArea/AI/codesearch/src/main.rs"));
-    let walked = normalize_path(Path::new(r"\\?\C:\WorkArea\AI\codesearch\src\main.rs"));
+    // normalize_path_str UNC vs normal
     assert_eq!(
-        stored, walked,
-        "Stored path must match walked path after normalization"
+        normalize_path_str(r"\\?\C:\WorkArea\src\main.rs"),
+        normalize_path_str(r"C:\WorkArea\src\main.rs"),
+        "normalize_path_str UNC vs normal diverged"
     );
 }
 

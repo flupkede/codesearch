@@ -225,109 +225,94 @@ fn retain_by_filter_path_no_match_yields_empty() {
 // === is_definition_chunk tests ===
 
 #[test]
-fn test_is_definition_chunk_rust_function() {
-    assert!(super::is_definition_chunk(
-        "Function",
-        &Some("fn authenticate(".to_string()),
-        "authenticate"
-    ));
-    assert!(super::is_definition_chunk(
-        "Function",
-        &Some("pub fn CodesearchService".to_string()),
-        "CodesearchService"
-    ));
-    assert!(super::is_definition_chunk(
-        "Function",
-        &Some("pub async fn handle_request".to_string()),
-        "handle_request"
-    ));
-}
+fn test_is_definition_chunk() {
+    // Previously 18 separate #[test]s (plus an inline mini-table inside one of
+    // them); consolidated into a single table-driven test exercising every
+    // (kind, signature, symbol) triple and the expected boolean returned by
+    // is_definition_chunk.
+    let cases: &[(&str, Option<&str>, &str, bool)] = &[
+        // rust function / struct / trait / enum
+        ("Function", Some("fn authenticate("), "authenticate", true),
+        (
+            "Function",
+            Some("pub fn CodesearchService"),
+            "CodesearchService",
+            true,
+        ),
+        (
+            "Function",
+            Some("pub async fn handle_request"),
+            "handle_request",
+            true,
+        ),
+        (
+            "Struct",
+            Some("pub struct CodesearchService"),
+            "CodesearchService",
+            true,
+        ),
+        ("Struct", Some("struct SearchResult"), "SearchResult", true),
+        ("Trait", Some("pub trait Searchable"), "Searchable", true),
+        ("Enum", Some("pub enum ModelType"), "ModelType", true),
+        // python def / class
+        ("Function", Some("def authenticate("), "authenticate", true),
+        ("Class", Some("class UserService"), "UserService", true),
+        // impl / const / static / type alias / interface
+        (
+            "Struct",
+            Some("impl CodesearchService"),
+            "CodesearchService",
+            true,
+        ),
+        ("Function", Some("const MAX_SIZE"), "MAX_SIZE", true),
+        ("Function", Some("static INSTANCE"), "INSTANCE", true),
+        ("TypeAlias", Some("type Result"), "Result", true),
+        ("TypeAlias", Some("pub type Error"), "Error", true),
+        (
+            "Interface",
+            Some("interface Searchable"),
+            "Searchable",
+            true,
+        ),
+        // generics / colon-bound trait
+        ("Function", Some("fn parse<T>"), "parse", true),
+        ("Struct", Some("struct HashMap<K, V>"), "HashMap", true),
+        ("Trait", Some("trait AsRef<T>:"), "AsRef", true),
+        // method
+        ("Method", Some("fn search"), "search", true),
+        ("Method", Some("pub async fn handle"), "handle", true),
+        // every DEFINITION_KIND recognized (former all_kinds mini-table)
+        ("Function", Some("fn foo("), "foo", true),
+        ("Class", Some("class Bar"), "Bar", true),
+        ("Method", Some("fn baz("), "baz", true),
+        ("Struct", Some("struct Qux"), "Qux", true),
+        ("Trait", Some("trait Quux"), "Quux", true),
+        ("Enum", Some("enum Corge"), "Corge", true),
+        ("TypeAlias", Some("type Grault"), "Grault", true),
+        ("Interface", Some("interface Garply"), "Garply", true),
+        // negatives
+        ("Comment", Some("fn authenticate("), "authenticate", false),
+        ("Import", Some("use authenticate"), "authenticate", false),
+        ("Function", Some("fn handle_request"), "authenticate", false),
+        ("Function", None, "authenticate", false),
+        ("Function", Some(""), "authenticate", false),
+        ("Function", Some("fn authenticate"), "authorize", false),
+        (
+            "Function",
+            Some("fn authenticate_user"),
+            "authenticate",
+            false,
+        ),
+    ];
 
-#[test]
-fn test_is_definition_chunk_rust_struct() {
-    assert!(super::is_definition_chunk(
-        "Struct",
-        &Some("pub struct CodesearchService".to_string()),
-        "CodesearchService"
-    ));
-    assert!(super::is_definition_chunk(
-        "Struct",
-        &Some("struct SearchResult".to_string()),
-        "SearchResult"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_rust_trait() {
-    assert!(super::is_definition_chunk(
-        "Trait",
-        &Some("pub trait Searchable".to_string()),
-        "Searchable"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_rust_enum() {
-    assert!(super::is_definition_chunk(
-        "Enum",
-        &Some("pub enum ModelType".to_string()),
-        "ModelType"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_non_definition_kind() {
-    // A Comment or Import kind should never be treated as a definition
-    assert!(!super::is_definition_chunk(
-        "Comment",
-        &Some("fn authenticate(".to_string()),
-        "authenticate"
-    ));
-    assert!(!super::is_definition_chunk(
-        "Import",
-        &Some("use authenticate".to_string()),
-        "authenticate"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_usage_not_definition() {
-    // A function chunk where the signature mentions the symbol but isn't its definition
-    // should NOT be filtered out
-    assert!(!super::is_definition_chunk(
-        "Function",
-        &Some("fn handle_request".to_string()),
-        "authenticate"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_no_signature() {
-    // No signature = can't determine if it's a definition
-    assert!(!super::is_definition_chunk(
-        "Function",
-        &None,
-        "authenticate"
-    ));
-    assert!(!super::is_definition_chunk(
-        "Function",
-        &Some(String::new()),
-        "authenticate"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_python() {
-    assert!(super::is_definition_chunk(
-        "Function",
-        &Some("def authenticate(".to_string()),
-        "authenticate"
-    ));
-    assert!(super::is_definition_chunk(
-        "Class",
-        &Some("class UserService".to_string()),
-        "UserService"
-    ));
+    for (kind, sig, symbol, expected) in cases {
+        let sig = sig.map(|s| s.to_string());
+        let got = super::is_definition_chunk(kind, &sig, symbol);
+        assert_eq!(
+            got, *expected,
+            "is_definition_chunk({kind:?}, {sig:?}, {symbol:?}) expected {expected}"
+        );
+    }
 }
 
 // === SemanticSearchResponse low-confidence tests ===
@@ -531,49 +516,70 @@ fn test_dedup_key_includes_alias() {
 // === simple_glob_match tests ===
 
 #[test]
-fn test_simple_glob_match_exact() {
-    assert!(super::simple_glob_match("src/main.rs", "src/main.rs"));
-    assert!(!super::simple_glob_match("src/main.rs", "src/other.rs"));
-}
+fn test_simple_glob_match() {
+    // Previously 16 separate #[test]s across two "simple_glob" / "glob" sections
+    // that were near-duplicate sets; consolidated into one table-driven test.
+    // Backslash rows use the raw-string originals (e.g. r"src\mcp\mod.rs"),
+    // here written as escaped string literals.
+    let cases: &[(&str, &str, bool)] = &[
+        // exact
+        ("src/main.rs", "src/main.rs", true),
+        ("src/main.rs", "src/other.rs", false),
+        ("src/main.rs", "src/main.rs.bak", false),
+        // ** prefix
+        ("src/mcp/**", "src/mcp/mod.rs", true),
+        ("src/mcp/**", "src/mcp/types.rs", true),
+        ("src/mcp/**", "src/mcp/sub/deep.rs", true),
+        ("src/mcp/**", "src/other/mod.rs", false),
+        ("**/test.rs", "test.rs", true),
+        ("**/test.rs", "src/test.rs", true),
+        ("**/test.rs", "a/b/c/test.rs", true),
+        // ** suffix
+        ("**/*.rs", "src/main.rs", true),
+        ("**/*.rs", "deep/nested/file.rs", true),
+        ("**/*.rs", "src/main.ts", false),
+        ("src/**", "src/", true),
+        ("src/**", "src/foo", true),
+        ("src/**", "src/a/b/c", true),
+        // ** both sides
+        ("src/**/*.rs", "src/main.rs", true),
+        ("src/**/*.rs", "src/mcp/mod.rs", true),
+        ("src/**/*.rs", "src/lib.rs", true),
+        ("src/**/*.rs", "src/a/b/c/d.rs", true),
+        ("src/**/*.rs", "tests/main.rs", false),
+        ("src/**/*.rs", "src/main.ts", false),
+        ("src/**/*.rs", "src/lib.ts", false),
+        ("src/**/*.rs", "test/lib.rs", false),
+        ("**/**", "anything", true),
+        ("**/**", "a/b/c", true),
+        // single * (stays within a path segment)
+        ("*.rs", "main.rs", true),
+        ("*.rs", "main.ts", false),
+        ("*.rs", "src/main.rs", false),
+        ("src/*.rs", "src/main.rs", true),
+        ("src/*.rs", "src/sub/main.rs", false),
+        ("test_*.rs", "test_foo.rs", true),
+        ("test_*.rs", "test_foo.ts", false),
+        // ** in the middle
+        ("src/**/test.rs", "src/test.rs", true),
+        ("src/**/test.rs", "src/a/test.rs", true),
+        ("src/**/test.rs", "src/a/b/c/test.rs", true),
+        ("src/**/test.rs", "src/a/other.rs", false),
+        // empty pattern
+        ("", "", true),
+        ("", "foo.rs", false),
+        // backslash normalization (Windows paths)
+        ("src/mcp/**", "src\\mcp\\mod.rs", true),
+        ("src\\mcp\\**", "src/mcp/mod.rs", true),
+    ];
 
-#[test]
-fn test_simple_glob_match_double_star_prefix() {
-    assert!(super::simple_glob_match("src/mcp/**", "src/mcp/mod.rs"));
-    assert!(super::simple_glob_match("src/mcp/**", "src/mcp/types.rs"));
-    assert!(super::simple_glob_match(
-        "src/mcp/**",
-        "src/mcp/sub/deep.rs"
-    ));
-    assert!(!super::simple_glob_match("src/mcp/**", "src/other/mod.rs"));
-}
-
-#[test]
-fn test_simple_glob_match_double_star_suffix() {
-    assert!(super::simple_glob_match("**/*.rs", "src/main.rs"));
-    assert!(super::simple_glob_match("**/*.rs", "deep/nested/file.rs"));
-    assert!(!super::simple_glob_match("**/*.rs", "src/main.ts"));
-}
-
-#[test]
-fn test_simple_glob_match_double_star_both() {
-    assert!(super::simple_glob_match("src/**/*.rs", "src/main.rs"));
-    assert!(super::simple_glob_match("src/**/*.rs", "src/mcp/mod.rs"));
-    assert!(!super::simple_glob_match("src/**/*.rs", "tests/main.rs"));
-    assert!(!super::simple_glob_match("src/**/*.rs", "src/main.ts"));
-}
-
-#[test]
-fn test_simple_glob_match_single_star() {
-    assert!(super::simple_glob_match("*.rs", "main.rs"));
-    assert!(!super::simple_glob_match("*.rs", "main.ts"));
-    assert!(super::simple_glob_match("src/*.rs", "src/main.rs"));
-    assert!(!super::simple_glob_match("src/*.rs", "src/sub/main.rs"));
-}
-
-#[test]
-fn test_simple_glob_match_backslash_normalization() {
-    assert!(super::simple_glob_match("src/mcp/**", r"src\mcp\mod.rs"));
-    assert!(super::simple_glob_match(r"src\mcp\**", "src/mcp/mod.rs"));
+    for (pattern, path, expected) in cases {
+        let got = super::simple_glob_match(pattern, path);
+        assert_eq!(
+            got, *expected,
+            "simple_glob_match({pattern:?}, {path:?}) expected {expected}"
+        );
+    }
 }
 
 // === merge_exact_into_fts tests ===
@@ -721,217 +727,6 @@ fn test_low_confidence_no_results_with_identifiers() {
     // Even with identifiers, no results → suggest literal_search
     assert_eq!(lc, Some(true));
     assert_eq!(tool.as_deref(), Some("literal_search"));
-}
-
-// === Extended is_definition_chunk tests ===
-
-#[test]
-fn test_is_definition_chunk_impl_block() {
-    // impl blocks should match
-    assert!(super::is_definition_chunk(
-        "Struct",
-        &Some("impl CodesearchService".to_string()),
-        "CodesearchService"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_const() {
-    assert!(super::is_definition_chunk(
-        "Function",
-        &Some("const MAX_SIZE".to_string()),
-        "MAX_SIZE"
-    ));
-    assert!(super::is_definition_chunk(
-        "Function",
-        &Some("static INSTANCE".to_string()),
-        "INSTANCE"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_type_alias() {
-    assert!(super::is_definition_chunk(
-        "TypeAlias",
-        &Some("type Result".to_string()),
-        "Result"
-    ));
-    assert!(super::is_definition_chunk(
-        "TypeAlias",
-        &Some("pub type Error".to_string()),
-        "Error"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_interface() {
-    assert!(super::is_definition_chunk(
-        "Interface",
-        &Some("interface Searchable".to_string()),
-        "Searchable"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_with_generics() {
-    // fn with generics — symbol is just the name before <
-    assert!(super::is_definition_chunk(
-        "Function",
-        &Some("fn parse<T>".to_string()),
-        "parse"
-    ));
-    assert!(super::is_definition_chunk(
-        "Struct",
-        &Some("struct HashMap<K, V>".to_string()),
-        "HashMap"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_with_colon() {
-    // trait with colon (Rust trait bounds)
-    assert!(super::is_definition_chunk(
-        "Trait",
-        &Some("trait AsRef<T>:".to_string()),
-        "AsRef"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_wrong_symbol() {
-    // Correct prefix but symbol name doesn't follow
-    assert!(!super::is_definition_chunk(
-        "Function",
-        &Some("fn authenticate".to_string()),
-        "authorize" // different symbol
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_symbol_as_prefix_of_other() {
-    // Symbol is a prefix of the actual name — should NOT match
-    assert!(!super::is_definition_chunk(
-        "Function",
-        &Some("fn authenticate_user".to_string()),
-        "authenticate" // missing boundary check
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_method() {
-    assert!(super::is_definition_chunk(
-        "Method",
-        &Some("fn search".to_string()),
-        "search"
-    ));
-    assert!(super::is_definition_chunk(
-        "Method",
-        &Some("pub async fn handle".to_string()),
-        "handle"
-    ));
-}
-
-#[test]
-fn test_is_definition_chunk_all_kinds() {
-    // Verify all DEFINITION_KINDS are recognized
-    let test_cases = [
-        ("Function", "fn foo(", "foo"),
-        ("Class", "class Bar", "Bar"),
-        ("Method", "fn baz(", "baz"),
-        ("Struct", "struct Qux", "Qux"),
-        ("Trait", "trait Quux", "Quux"),
-        ("Enum", "enum Corge", "Corge"),
-        ("TypeAlias", "type Grault", "Grault"),
-        ("Interface", "interface Garply", "Garply"),
-    ];
-    for (kind, sig, symbol) in &test_cases {
-        assert!(
-            super::is_definition_chunk(kind, &Some(sig.to_string()), symbol),
-            "is_definition_chunk({kind}, {sig}, {symbol}) should be true"
-        );
-    }
-}
-
-// === Extended simple_glob_match tests ===
-
-#[test]
-fn test_glob_exact_match_no_star() {
-    assert!(super::simple_glob_match("src/main.rs", "src/main.rs"));
-    assert!(!super::simple_glob_match("src/main.rs", "src/other.rs"));
-    assert!(!super::simple_glob_match("src/main.rs", "src/main.rs.bak"));
-}
-
-#[test]
-fn test_glob_double_star_prefix_empty() {
-    // ** at start matches any prefix
-    assert!(super::simple_glob_match("**/test.rs", "test.rs"));
-    assert!(super::simple_glob_match("**/test.rs", "src/test.rs"));
-    assert!(super::simple_glob_match("**/test.rs", "a/b/c/test.rs"));
-}
-
-#[test]
-fn test_glob_double_star_suffix_empty() {
-    // ** at end matches any suffix
-    assert!(super::simple_glob_match("src/**", "src/"));
-    assert!(super::simple_glob_match("src/**", "src/foo"));
-    assert!(super::simple_glob_match("src/**", "src/a/b/c"));
-}
-
-#[test]
-fn test_glob_both_double_stars() {
-    assert!(super::simple_glob_match("**/**", "anything"));
-    assert!(super::simple_glob_match("**/**", "a/b/c"));
-}
-
-#[test]
-fn test_glob_nested_double_star() {
-    // src/**/*.rs — must have src/ prefix and .rs extension
-    assert!(super::simple_glob_match("src/**/*.rs", "src/lib.rs"));
-    assert!(super::simple_glob_match("src/**/*.rs", "src/mcp/mod.rs"));
-    assert!(super::simple_glob_match("src/**/*.rs", "src/a/b/c/d.rs"));
-    assert!(!super::simple_glob_match("src/**/*.rs", "test/lib.rs"));
-    assert!(!super::simple_glob_match("src/**/*.rs", "src/lib.ts"));
-}
-
-#[test]
-fn test_glob_single_star_multiple() {
-    // Multiple single stars in pattern
-    assert!(super::simple_glob_match("test_*.rs", "test_foo.rs"));
-    assert!(!super::simple_glob_match("test_*.rs", "test_foo.ts"));
-}
-
-#[test]
-fn test_glob_single_star_stays_in_segment() {
-    // * should NOT cross /
-    assert!(!super::simple_glob_match("*.rs", "src/main.rs"));
-    assert!(!super::simple_glob_match("src/*.rs", "src/sub/main.rs"));
-}
-
-#[test]
-fn test_glob_empty_pattern() {
-    assert!(super::simple_glob_match("", ""));
-    assert!(!super::simple_glob_match("", "foo.rs"));
-}
-
-#[test]
-fn test_glob_trailing_slash_in_prefix() {
-    // src/mcp/** with trailing slash in path
-    assert!(super::simple_glob_match("src/mcp/**", "src/mcp/mod.rs"));
-}
-
-#[test]
-fn test_glob_double_star_middle() {
-    // Pattern: src/**/test.rs
-    assert!(super::simple_glob_match("src/**/test.rs", "src/test.rs"));
-    assert!(super::simple_glob_match("src/**/test.rs", "src/a/test.rs"));
-    assert!(super::simple_glob_match(
-        "src/**/test.rs",
-        "src/a/b/c/test.rs"
-    ));
-    assert!(!super::simple_glob_match(
-        "src/**/test.rs",
-        "src/a/other.rs"
-    ));
 }
 
 // === Serde roundtrip tests for new types ===
@@ -1696,164 +1491,69 @@ fn test_merge_exact_cross_store_dedup() {
 // ─── regex_has_anchorable_token detector tests ───────────────────────
 
 #[test]
-fn test_regex_has_anchorable_token_plain_identifier() {
-    assert!(super::regex_has_anchorable_token("match_line_for_literal"));
-}
-
-#[test]
-fn test_regex_has_anchorable_token_generic_with_word() {
-    assert!(super::regex_has_anchorable_token("Vec<.*>"));
-    assert!(super::regex_has_anchorable_token("HashMap::new"));
-}
-
-#[test]
-fn test_regex_has_anchorable_token_short_word_below_threshold() {
-    // "fn" alone is only 2 chars — not enough.
-    assert!(!super::regex_has_anchorable_token("fn"));
-    assert!(super::regex_has_anchorable_token("fnx")); // 3 chars triggers
-}
-
-#[test]
-fn test_regex_has_anchorable_token_word_boundary_pattern() {
-    assert!(!super::regex_has_anchorable_token(r"\bfn\s+\w+"));
-    assert!(!super::regex_has_anchorable_token(r"\bimpl\s+"));
-}
-
-#[test]
-fn test_regex_has_anchorable_token_method_call_pattern() {
-    assert!(!super::regex_has_anchorable_token(r"\.\w+\(\)"));
-}
-
-#[test]
-fn test_regex_has_anchorable_token_character_classes_dont_count() {
-    // [A-Z] and [a-z] inside brackets must NOT be counted as runs.
-    assert!(!super::regex_has_anchorable_token(r"[A-Z]+_[A-Z]+"));
-    assert!(!super::regex_has_anchorable_token(r"^[A-Z]\w+"));
-}
-
-#[test]
-fn test_regex_has_anchorable_token_empty() {
-    assert!(!super::regex_has_anchorable_token(""));
-}
-
-#[test]
-fn test_regex_has_anchorable_token_pure_punctuation() {
-    assert!(!super::regex_has_anchorable_token(r"->"));
-    assert!(!super::regex_has_anchorable_token(r"::"));
-}
-
-// ─── Scan-path decision logic tests ──────────────────────────────────
-//
-// Full integration tests for literal_search require a CodesearchService
-// with a working DB/FTS index — no such harness exists yet. These tests
-// validate the critical decision logic: which queries take the BM25 path
-// vs the scan path.
-
-#[test]
-fn test_regex_anchorable_queries_detected_correctly() {
-    // Queries with ≥3 alphanumeric runs → anchorable → BM25 path
-    assert!(super::regex_has_anchorable_token("match_line_for_literal"));
-    assert!(super::regex_has_anchorable_token("HashMap::new"));
-    assert!(super::regex_has_anchorable_token("Vec<.*>"));
-    assert!(super::regex_has_anchorable_token("fnx"));
-}
-
-#[test]
-fn test_regex_tokenless_queries_detected_correctly() {
-    // Tokenless regex patterns → not anchorable → scan path
-    assert!(!super::regex_has_anchorable_token(r"\bfn\s+\w+"));
-    assert!(!super::regex_has_anchorable_token(r"\bimpl\s+"));
-    assert!(!super::regex_has_anchorable_token(r"\.\w+\(\)"));
-    assert!(!super::regex_has_anchorable_token(r"[A-Z]+_[A-Z]+"));
-    assert!(!super::regex_has_anchorable_token(r"^[A-Z]\w+"));
-}
-
-// ─── Trailing-escape detector tests ──────────────────────────────
-
-#[test]
-fn test_regex_has_anchorable_token_trailing_word_boundary() {
-    assert!(!super::regex_has_anchorable_token(r"impl\b"));
-    assert!(!super::regex_has_anchorable_token(r"Result\b"));
-    assert!(!super::regex_has_anchorable_token(r"match\b"));
-}
-
-#[test]
-fn test_regex_has_anchorable_token_trailing_class() {
-    assert!(!super::regex_has_anchorable_token(r"impl[A-Z]"));
-    assert!(!super::regex_has_anchorable_token(r"foo[abc]+"));
-}
-
-#[test]
-fn test_regex_has_anchorable_token_trailing_escape_with_clean_run_after() {
-    // After the merged trailing escape, if there's a clean run later, that
-    // later run can still anchor.
-    assert!(super::regex_has_anchorable_token(r"impl\b\s+function_name"));
-    //                                              ^^^^^^^^^^^^^ anchorable
-}
-
-#[test]
-fn test_regex_has_anchorable_token_trailing_escape_at_end_only() {
-    // Run, then escape, then EOF — not anchorable.
-    assert!(!super::regex_has_anchorable_token(r"impl\s"));
-}
-
-#[test]
-fn test_regex_has_anchorable_token_both_sides_escaped() {
-    // \bimpl\b — leading escape already disqualifies "impl"; trailing
-    // doesn't change the answer.
-    assert!(!super::regex_has_anchorable_token(r"\bimpl\b"));
+fn test_regex_has_anchorable_token() {
+    // Previously 13 separate #[test]s named test_regex_has_anchorable_token_*
+    // (plus two near-duplicate "scan-path decision" tests asserting the same
+    // predicate); consolidated into one table-driven test.
+    let cases: &[(&str, bool)] = &[
+        // anchorable (>=3 alphanumeric run)
+        ("match_line_for_literal", true),
+        ("Vec<.*>", true),
+        ("HashMap::new", true),
+        ("fnx", true),
+        ("impl\\b\\s+function_name", true),
+        // not anchorable
+        ("fn", false),
+        ("\\bfn\\s+\\w+", false),
+        ("\\bimpl\\s+", false),
+        ("\\.\\w+\\(\\)", false),
+        ("[A-Z]+_[A-Z]+", false),
+        ("^[A-Z]\\w+", false),
+        ("", false),
+        ("->", false),
+        ("::", false),
+        ("impl\\b", false),
+        ("Result\\b", false),
+        ("match\\b", false),
+        ("impl[A-Z]", false),
+        ("foo[abc]+", false),
+        ("impl\\s", false),
+        ("\\bimpl\\b", false),
+    ];
+    for (pattern, expected) in cases {
+        let got = super::regex_has_anchorable_token(pattern);
+        assert_eq!(
+            got, *expected,
+            "regex_has_anchorable_token({pattern:?}) expected {expected}"
+        );
+    }
 }
 
 // ── regex_has_disjunctive_or tests ──────────────────────────────
 
 #[test]
-fn test_disjunctive_or_simple_alternation() {
-    assert!(super::regex_has_disjunctive_or("TODO|FIXME|HACK"));
-}
-
-#[test]
-fn test_disjunctive_or_two_alternatives() {
-    assert!(super::regex_has_disjunctive_or("foo|bar"));
-}
-
-#[test]
-fn test_disjunctive_or_pipe_inside_group_not_counted() {
-    // (foo|bar) is inside parens — not top-level
-    assert!(!super::regex_has_disjunctive_or("(foo|bar)"));
-}
-
-#[test]
-fn test_disjunctive_or_pipe_inside_bracket_not_counted() {
-    // [|] is inside character class
-    assert!(!super::regex_has_disjunctive_or("[a|b]"));
-}
-
-#[test]
-fn test_disjunctive_or_escaped_pipe_not_counted() {
-    assert!(!super::regex_has_disjunctive_or(r"foo\|bar"));
-}
-
-#[test]
-fn test_disjunctive_or_no_pipe() {
-    assert!(!super::regex_has_disjunctive_or("TODO"));
-}
-
-#[test]
-fn test_disjunctive_or_mixed_top_level_and_group() {
-    // foo|(bar|baz) — the first | is top-level
-    assert!(super::regex_has_disjunctive_or("foo|(bar|baz)"));
-}
-
-#[test]
-fn test_disjunctive_or_nested_groups() {
-    // ((a|b)) — pipe inside double parens
-    assert!(!super::regex_has_disjunctive_or("((a|b))"));
-}
-
-#[test]
-fn test_disjunctive_or_mixed_top_level_and_bracket() {
-    // [a-z]|foo — pipe after bracket is top-level
-    assert!(super::regex_has_disjunctive_or("[a-z]|foo"));
+fn test_regex_has_disjunctive_or() {
+    // Previously 9 separate #[test]s; consolidated into one table-driven test
+    // over regex_has_disjunctive_or (top-level `|`, ignoring pipes inside
+    // groups, brackets, or escaped).
+    let cases: &[(&str, bool)] = &[
+        ("TODO|FIXME|HACK", true),
+        ("foo|bar", true),
+        ("(foo|bar)", false),
+        ("[a|b]", false),
+        ("foo\\|bar", false),
+        ("TODO", false),
+        ("foo|(bar|baz)", true),
+        ("((a|b))", false),
+        ("[a-z]|foo", true),
+    ];
+    for (pattern, expected) in cases {
+        let got = super::regex_has_disjunctive_or(pattern);
+        assert_eq!(
+            got, *expected,
+            "regex_has_disjunctive_or({pattern:?}) expected {expected}"
+        );
+    }
 }
 
 #[test]
@@ -1884,111 +1584,58 @@ fn test_regex_no_match_match_line_returns_none() {
 // ─── looks_like_code_pattern detector tests ───────────────────────
 
 #[test]
-fn test_looks_like_code_pattern_assignment() {
-    assert!(super::looks_like_code_pattern("foo = null"));
-    assert!(super::looks_like_code_pattern("x = 42"));
-}
-
-#[test]
-fn test_looks_like_code_pattern_arrow() {
-    assert!(super::looks_like_code_pattern("foo->bar"));
-    assert!(super::looks_like_code_pattern("x => y"));
-}
-
-#[test]
-fn test_looks_like_code_pattern_namespace() {
-    assert!(super::looks_like_code_pattern("std::string"));
-    assert!(super::looks_like_code_pattern("a::b::c"));
-}
-
-#[test]
-fn test_looks_like_code_pattern_generics() {
-    assert!(super::looks_like_code_pattern("Vec<T>"));
-    assert!(super::looks_like_code_pattern("HashMap<K, V>"));
-}
-
-#[test]
-fn test_looks_like_code_pattern_statement_end() {
-    assert!(super::looks_like_code_pattern("return x;"));
-    assert!(super::looks_like_code_pattern("if (x) {"));
-}
-
-#[test]
-fn test_looks_like_code_pattern_plain_identifier_false() {
-    assert!(!super::looks_like_code_pattern(
-        "ActivitiesListModelResponse"
-    ));
-    assert!(!super::looks_like_code_pattern("foo_bar"));
-}
-
-#[test]
-fn test_looks_like_code_pattern_dotted_path_false() {
-    assert!(!super::looks_like_code_pattern("foo.bar"));
-    assert!(!super::looks_like_code_pattern("System.Console"));
-}
-
-#[test]
-fn test_looks_like_code_pattern_empty_false() {
-    assert!(!super::looks_like_code_pattern(""));
+fn test_looks_like_code_pattern() {
+    // Previously 8 separate #[test]s; consolidated into one table-driven test.
+    let cases: &[(&str, bool)] = &[
+        // code-like (true)
+        ("foo = null", true),
+        ("x = 42", true),
+        ("foo->bar", true),
+        ("x => y", true),
+        ("std::string", true),
+        ("a::b::c", true),
+        ("Vec<T>", true),
+        ("HashMap<K, V>", true),
+        ("return x;", true),
+        ("if (x) {", true),
+        // not code-like (false)
+        ("ActivitiesListModelResponse", false),
+        ("foo_bar", false),
+        ("foo.bar", false),
+        ("System.Console", false),
+        ("", false),
+    ];
+    for (pattern, expected) in cases {
+        let got = super::looks_like_code_pattern(pattern);
+        assert_eq!(
+            got, *expected,
+            "looks_like_code_pattern({pattern:?}) expected {expected}"
+        );
+    }
 }
 
 // ─── extract_bm25_query_from_regex tests ─────────────────────────
 
 #[test]
-fn test_extract_bm25_query_from_regex_class_word_cache() {
-    // "class \w+Cache\b" → should extract "class Cache"
-    assert_eq!(
-        super::extract_bm25_query_from_regex("class \\w+Cache\\b"),
-        "class Cache"
-    );
-}
-
-#[test]
-fn test_extract_bm25_query_from_regex_interface() {
-    // "interface I\w+" → should extract "interface"
-    assert_eq!(
-        super::extract_bm25_query_from_regex("interface I\\w+"),
-        "interface"
-    );
-}
-
-#[test]
-fn test_extract_bm25_query_from_regex_class_word_store() {
-    // "class \w+Store\b" → should extract "class Store"
-    assert_eq!(
-        super::extract_bm25_query_from_regex("class \\w+Store\\b"),
-        "class Store"
-    );
-}
-
-#[test]
-fn test_extract_bm25_query_from_regex_plain() {
-    // Plain identifier → unchanged
-    assert_eq!(
-        super::extract_bm25_query_from_regex("CleanupController"),
-        "CleanupController"
-    );
-}
-
-#[test]
-fn test_extract_bm25_query_from_regex_all_escapes() {
-    // Pure escape classes → empty
-    assert_eq!(super::extract_bm25_query_from_regex("\\w+"), "");
-}
-
-#[test]
-fn test_extract_bm25_query_from_regex_method_call() {
-    // "\.MethodName\(" → "MethodName"
-    assert_eq!(
-        super::extract_bm25_query_from_regex("\\.MethodName\\("),
-        "MethodName"
-    );
-}
-
-#[test]
-fn test_extract_bm25_query_from_regex_bracket_class() {
-    // "[a-z]+Cache" → "Cache" (bracket class stripped)
-    assert_eq!(super::extract_bm25_query_from_regex("[a-z]+Cache"), "Cache");
+fn test_extract_bm25_query_from_regex() {
+    // Previously 7 separate #[test]s; consolidated into one table-driven test.
+    // Input patterns are regex source strings (backslashes already escaped).
+    let cases: &[(&str, &str)] = &[
+        ("class \\w+Cache\\b", "class Cache"),
+        ("interface I\\w+", "interface"),
+        ("class \\w+Store\\b", "class Store"),
+        ("CleanupController", "CleanupController"),
+        ("\\w+", ""),
+        ("\\.MethodName\\(", "MethodName"),
+        ("[a-z]+Cache", "Cache"),
+    ];
+    for (pattern, expected) in cases {
+        let got = super::extract_bm25_query_from_regex(pattern);
+        assert_eq!(
+            got, *expected,
+            "extract_bm25_query_from_regex({pattern:?}) expected {expected:?}"
+        );
+    }
 }
 
 // ─── compute_literal_low_confidence tests ─────────────────────────

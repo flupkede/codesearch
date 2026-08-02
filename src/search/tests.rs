@@ -5,87 +5,66 @@ use crate::chunker::ChunkKind;
 // ── detect_identifiers ───────────────────────────────────────────────────
 
 #[test]
-fn test_detect_identifiers_pascal_case() {
-    let ids = detect_identifiers("find the VectorStore struct");
-    assert!(ids.contains(&"VectorStore".to_string()));
-}
-
-#[test]
-fn test_detect_identifiers_snake_case() {
-    let ids = detect_identifiers("where is find_git_root defined");
-    assert!(ids.contains(&"find_git_root".to_string()));
-}
-
-#[test]
-fn test_detect_identifiers_camel_case() {
-    let ids = detect_identifiers("show me insertChunksWithIds");
-    assert!(ids.contains(&"insertChunksWithIds".to_string()));
-}
-
-#[test]
-fn test_detect_identifiers_plain_words_ignored() {
-    // Plain lowercase words that are not identifiers
-    let ids = detect_identifiers("what does this function do");
-    assert!(ids.is_empty());
-}
-
-#[test]
-fn test_detect_identifiers_mixed_query() {
-    let ids = detect_identifiers("how does VectorStore handle find_git_root");
-    assert!(ids.contains(&"VectorStore".to_string()));
-    assert!(ids.contains(&"find_git_root".to_string()));
+fn test_detect_identifiers() {
+    // Previously 5 separate #[test]s; consolidated into one table-driven test.
+    // Each row: (query, identifiers that must be present, whether the result
+    // must be empty).
+    let cases: &[(&str, &[&str], bool)] = &[
+        ("find the VectorStore struct", &["VectorStore"], false),
+        ("where is find_git_root defined", &["find_git_root"], false),
+        (
+            "show me insertChunksWithIds",
+            &["insertChunksWithIds"],
+            false,
+        ),
+        ("what does this function do", &[], true),
+        (
+            "how does VectorStore handle find_git_root",
+            &["VectorStore", "find_git_root"],
+            false,
+        ),
+    ];
+    for (query, must_contain, expect_empty) in cases {
+        let ids = detect_identifiers(query);
+        if *expect_empty {
+            assert!(
+                ids.is_empty(),
+                "detect_identifiers({query:?}) should be empty, got {ids:?}"
+            );
+        } else {
+            for expected in *must_contain {
+                assert!(
+                    ids.contains(&expected.to_string()),
+                    "detect_identifiers({query:?}) should contain {expected}, got {ids:?}"
+                );
+            }
+        }
+    }
 }
 
 // ── detect_structural_intent ─────────────────────────────────────────────
 
 #[test]
-fn test_detect_structural_intent_struct_keyword() {
-    let kind = detect_structural_intent("struct VectorStore definition");
-    assert_eq!(kind, Some(ChunkKind::Struct));
-}
-
-#[test]
-fn test_detect_structural_intent_fn_keyword() {
-    let kind = detect_structural_intent("fn find_git_root implementation");
-    assert!(matches!(kind, Some(ChunkKind::Function)));
-}
-
-#[test]
-fn test_detect_structural_intent_class_keyword() {
-    let kind = detect_structural_intent("class IndexManager definition");
-    assert_eq!(kind, Some(ChunkKind::Class));
-}
-
-#[test]
-fn test_detect_structural_intent_enum_keyword() {
-    let kind = detect_structural_intent("enum ChunkKind variants");
-    assert_eq!(kind, Some(ChunkKind::Enum));
-}
-
-#[test]
-fn test_detect_structural_intent_trait_keyword() {
-    let kind = detect_structural_intent("trait Searchable implementation");
-    assert_eq!(kind, Some(ChunkKind::Trait));
-}
-
-#[test]
-fn test_detect_structural_intent_no_identifier_returns_none() {
-    // Structural keyword present but no identifier → None
-    let kind = detect_structural_intent("how does a struct work");
-    assert_eq!(kind, None);
-}
-
-#[test]
-fn test_detect_structural_intent_no_keyword_returns_none() {
-    // Identifier present but no structural keyword → None
-    let kind = detect_structural_intent("show me VectorStore");
-    assert_eq!(kind, None);
-}
-
-#[test]
-fn test_detect_structural_intent_plain_query_returns_none() {
-    let kind = detect_structural_intent("how does error handling work");
-    assert_eq!(kind, None);
+fn test_detect_structural_intent() {
+    // Previously 8 separate #[test]s (keyword + None cases); consolidated into
+    // one table-driven test. The quiet-mode case is kept as its own test below.
+    let cases: &[(&str, Option<ChunkKind>)] = &[
+        ("struct VectorStore definition", Some(ChunkKind::Struct)),
+        ("fn find_git_root implementation", Some(ChunkKind::Function)),
+        ("class IndexManager definition", Some(ChunkKind::Class)),
+        ("enum ChunkKind variants", Some(ChunkKind::Enum)),
+        ("trait Searchable implementation", Some(ChunkKind::Trait)),
+        ("how does a struct work", None),
+        ("show me VectorStore", None),
+        ("how does error handling work", None),
+    ];
+    for (query, expected) in cases {
+        let kind = detect_structural_intent(query);
+        assert_eq!(
+            kind, *expected,
+            "detect_structural_intent({query:?}) expected {expected:?}"
+        );
+    }
 }
 
 #[test]
@@ -272,74 +251,43 @@ fn test_path_filter_matches_relative_dot_slash_input() {
 // ── sanitize_for_terminal ───────────────────────────────────────────────
 
 #[test]
-fn test_sanitize_strips_csi_clear_screen() {
-    // \x1b[2J = clear screen
-    assert_eq!(sanitize_for_terminal("hello\x1b[2Jworld"), "helloworld");
-}
-
-#[test]
-fn test_sanitize_strips_csi_with_params() {
-    // \x1b[38;5;200m = set 256-color foreground
-    assert_eq!(
-        sanitize_for_terminal("\x1b[38;5;200mred\x1b[0m text"),
-        "red text"
-    );
-}
-
-#[test]
-fn test_sanitize_strips_osc_bel_terminator() {
-    // \x1b]0;title\x07 = set window title, BEL terminator
-    assert_eq!(sanitize_for_terminal("a\x1b]0;title\x07b"), "ab");
-}
-
-#[test]
-fn test_sanitize_strips_osc_st_terminator() {
-    // \x1b]0;title\x1b\\ = set window title, ST terminator
-    assert_eq!(sanitize_for_terminal("a\x1b]0;title\x1b\\b"), "ab");
-}
-
-#[test]
-fn test_sanitize_strips_single_char_escape() {
-    // ESC M = Reverse Index (RI), in the 0x40-0x5F documented range
-    assert_eq!(sanitize_for_terminal("a\x1bM b"), "a b");
-}
-
-#[test]
-fn test_sanitize_strips_control_chars_except_newline_tab() {
-    // NUL, BEL, backspace, vertical tab, form feed, CR — all stripped
-    assert_eq!(
-        sanitize_for_terminal("a\x00b\x07c\x08d\x0be\x0cf\rg"),
-        "abcdefg"
-    );
-    // newline and tab preserved
-    assert_eq!(sanitize_for_terminal("a\nb\tc"), "a\nb\tc");
-}
-
-#[test]
-fn test_sanitize_strips_back_to_back_escapes() {
-    // Two consecutive CSI sequences — both stripped
-    assert_eq!(sanitize_for_terminal("\x1b[2J\x1b[2Jcleared"), "cleared");
-}
-
-#[test]
-fn test_sanitize_preserves_unicode() {
-    assert_eq!(sanitize_for_terminal("héllo → 世界 🦀"), "héllo → 世界 🦀");
-}
-
-#[test]
-fn test_sanitize_preserves_empty_and_clean_strings() {
-    assert_eq!(sanitize_for_terminal(""), "");
-    assert_eq!(sanitize_for_terminal("clean string"), "clean string");
-}
-
-#[test]
-fn test_sanitize_truncated_escape_dropped_safely() {
-    // Truncated CSI at end of string — should not panic
-    assert_eq!(sanitize_for_terminal("text\x1b["), "text");
-    // Truncated OSC at end of string
-    assert_eq!(sanitize_for_terminal("text\x1b]0;unterminated"), "text");
-    // Lone ESC at end
-    assert_eq!(sanitize_for_terminal("text\x1b"), "text");
+fn test_sanitize_for_terminal() {
+    // Previously 9 separate #[test]s; consolidated into one table-driven test.
+    // Escape sequences are written as Rust \x1b escapes (the source form).
+    let cases: &[(&str, &str)] = &[
+        // \x1b[2J = clear screen
+        ("hello\x1b[2Jworld", "helloworld"),
+        // \x1b[38;5;200m = 256-color fg, reset with \x1b[0m
+        ("\x1b[38;5;200mred\x1b[0m text", "red text"),
+        // OSC with BEL terminator (\x1b]0;title\x07)
+        ("a\x1b]0;title\x07b", "ab"),
+        // OSC with ST terminator (\x1b]0;title\x1b\\)
+        ("a\x1b]0;title\x1b\\b", "ab"),
+        // ESC M = Reverse Index (single-char escape, 0x40-0x5F range)
+        ("a\x1bM b", "a b"),
+        // control chars (NUL, BEL, BS, VT, FF, CR) stripped
+        ("a\x00b\x07c\x08d\x0be\x0cf\rg", "abcdefg"),
+        // newline and tab preserved
+        ("a\nb\tc", "a\nb\tc"),
+        // two consecutive CSI sequences
+        ("\x1b[2J\x1b[2Jcleared", "cleared"),
+        // unicode preserved
+        ("héllo → 世界 🦀", "héllo → 世界 🦀"),
+        // empty and clean strings
+        ("", ""),
+        ("clean string", "clean string"),
+        // truncated CSI / OSC / lone ESC at end — must not panic
+        ("text\x1b[", "text"),
+        ("text\x1b]0;unterminated", "text"),
+        ("text\x1b", "text"),
+    ];
+    for (input, expected) in cases {
+        let got = sanitize_for_terminal(input);
+        assert_eq!(
+            got, *expected,
+            "sanitize_for_terminal({input:?}) expected {expected:?}"
+        );
+    }
 }
 
 #[test]
