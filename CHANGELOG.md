@@ -5,12 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<!--
+Convention: there is no `[Unreleased]` staging section. New entries are added
+directly under the heading for the current pending version (the one
+`Cargo.toml` on `develop` is presently building toward — patch auto-bumps on
+every PR merge, see RELEASING.md). That section keeps accumulating entries as
+more PRs land; when the release is actually tagged, the same section is
+finalized in place with a date — no renaming/migration step needed.
+-->
 
-## [Unreleased]
+## [1.1.37] (unreleased)
 
 ### Added
 
 - **Protobuf (`.proto`) as a first-class indexed language — Niveau 1 (#162).** `.proto` files are now parsed with [`tree-sitter-proto`](https://crates.io/crates/tree-sitter-proto) and chunked along `message` / `enum` / `service` / `rpc` boundaries instead of falling back to naive line-windowing. Definition chunks classify as Struct (`message`), Enum (`enum`), Interface (`service`), Method (`rpc`), and preceding `//` / `/* */` comments are captured as docstrings. This is text-aware indexing only — symbol-level precision (`find_impact` / call-graph for protobuf, "Niveau 2") is deferred until a motivating gRPC/Kafka-schema corpus exists, since there is no `scip-protobuf` emitter today.
+- **Standalone remote TUI (`codesearch serve tui --url ...`) now works against authenticated remote serves.** Previously it did an unauthenticated `/health` check with no way to pass a key, so it failed with 401 against any auth-required serve (e.g. the cloud peer). It now resolves the API key for the given URL from `repos.json` (`remotes.*.url` match) or a new `--api-key` CLI override, reusing the existing `build_serve_client_with_key` helper — the same `Authorization: Bearer` header the federation client already uses, so no new auth mechanism was invented. The authenticated client is passed through to all TUI actions (status/info/doctor/reindex/remove/reload), with clear, distinct error messages for "no key configured" vs. "key rejected (401)". No behavior change for local (non-authed) serves.
 
 ### Fixed
 
