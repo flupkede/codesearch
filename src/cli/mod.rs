@@ -449,6 +449,12 @@ pub enum Commands {
         /// For `tui` action: serve URL to connect to
         #[arg(long, default_value = DEFAULT_SERVE_URL)]
         url: String,
+
+        /// For `tui` action: API key for an authenticated remote serve. When
+        /// omitted, the key is looked up in `~/.codesearch/repos.json` by
+        /// matching `--url` against a configured remote peer's URL.
+        #[arg(long)]
+        api_key: Option<String>,
     },
 
     /// Show statistics about the vector database
@@ -1183,9 +1189,12 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             keep_warm_url,
             idle_suspend_secs,
             url,
+            api_key,
         } => {
             match action {
-                crate::cli::ServeAction::Tui => crate::serve::run_tui_standalone(url).await,
+                crate::cli::ServeAction::Tui => {
+                    crate::serve::run_tui_standalone(url, api_key).await
+                }
                 crate::cli::ServeAction::Start => {
                     // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
                     // regardless of whether a database exists in the current directory.

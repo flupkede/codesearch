@@ -4334,19 +4334,79 @@ async fn log_mcp_requests(
     response
 }
 
+/// Normalize a serve URL for comparison: trim trailing slashes and lowercase
+/// the scheme+host+port portion so `https://Host:443/` and `https://host:443`
+/// compare equal. Not a full URL parser — good enough for matching a CLI/env
+/// `--url` against a `RemotePeer.url` from `repos.json`.
+fn normalize_serve_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Resolve the API key to use for `serve_url` by matching it against the
+/// configured remote peers in `~/.codesearch/repos.json`. Returns `None` when
+/// no peer matches (e.g. a plain local/no-auth serve) or the matching peer has
+/// no key configured — in both cases the caller falls back to unauthenticated
+/// requests, preserving today's behavior for local serves.
+///
+/// Never logs the resolved key.
+fn resolve_api_key_for_url(serve_url: &str) -> Option<String> {
+    let target = normalize_serve_url(serve_url);
+    let config = ReposConfig::load().ok()?;
+    config
+        .remotes
+        .values()
+        .find(|peer| normalize_serve_url(&peer.url) == target)
+        .map(|peer| peer.api_key.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
 /// Run the standalone TUI that connects to a running serve instance via HTTP.
 ///
 /// This is the entry point for `codesearch serve tui`.
-pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
+///
+/// `api_key_override` (from `--api-key`) takes precedence over any key
+/// resolved from `~/.codesearch/repos.json` by matching `serve_url` against a
+/// configured remote peer. When neither resolves a key, requests are sent
+/// unauthenticated — identical to today's behavior for a local, no-auth
+/// serve.
+pub async fn run_tui_standalone(serve_url: String, api_key_override: Option<String>) -> Result<()> {
     if !tui::is_tty() {
         eprintln!("Error: No TTY detected. The standalone TUI requires an interactive terminal.");
         std::process::exit(1);
     }
 
+    let api_key = api_key_override.or_else(|| resolve_api_key_for_url(&serve_url));
+
+    let client = match crate::index::build_serve_client_with_key(
+        std::time::Duration::from_secs(10),
+        api_key.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to build HTTP client: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Check if serve is reachable
     let health_url = format!("{}{}", serve_url, HEALTH_PATH);
-    match reqwest::get(&health_url).await {
+    match client.get(&health_url).send().await {
         Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+            if api_key.is_some() {
+                eprintln!(
+                    "Error: Serve at {} rejected the configured API key (401 Unauthorized).",
+                    serve_url
+                );
+            } else {
+                eprintln!(
+                    "Error: Serve at {} requires an API key — none configured for this URL. \
+                     Register it with `codesearch remote add` or pass `--api-key`.",
+                    serve_url
+                );
+            }
+            std::process::exit(1);
+        }
         Ok(_) => {
             eprintln!(
                 "Error: Serve at {} returned an error. Is it running?",
@@ -4363,7 +4423,7 @@ pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
         }
     }
 
-    tui_remote::run_remote_tui(serve_url).await
+    tui_remote::run_remote_tui(serve_url, client).await
 }
 
 /// Run the MCP serve mode.
