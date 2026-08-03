@@ -16,6 +16,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.1.37] (unreleased)
 
+### Changed
+
+- **Test-suite reorg (710 → ~604 tests, no coverage lost).** Extracted embedded `#[cfg(test)]` blocks out of bloated `mod.rs` files into sibling `_tests.rs` files (mcp/serve/search/cache/db_discovery); collapsed ~109 near-duplicate predicate tests into table-driven tests; centralized a repeated test helper (`state_with_repo`). Also closed 3 coverage gaps found during the pass: `repo_read_only` force-reindex refusal, a federation slow-peer → `Unreachable` timeout, and a `remove_repo`-during-active-build end-to-end race.
+
 ### Added
 
 - **Protobuf (`.proto`) as a first-class indexed language — Niveau 1 (#162).** `.proto` files are now parsed with [`tree-sitter-proto`](https://crates.io/crates/tree-sitter-proto) and chunked along `message` / `enum` / `service` / `rpc` boundaries instead of falling back to naive line-windowing. Definition chunks classify as Struct (`message`), Enum (`enum`), Interface (`service`), Method (`rpc`), and preceding `//` / `/* */` comments are captured as docstrings. This is text-aware indexing only — symbol-level precision (`find_impact` / call-graph for protobuf, "Niveau 2") is deferred until a motivating gRPC/Kafka-schema corpus exists, since there is no `scip-protobuf` emitter today.
