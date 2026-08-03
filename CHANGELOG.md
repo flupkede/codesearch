@@ -5,8 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<!--
+Convention: there is no `[Unreleased]` staging section. New entries are added
+directly under the heading for the current pending version (the one
+`Cargo.toml` on `develop` is presently building toward — patch auto-bumps on
+every PR merge, see RELEASING.md). That section keeps accumulating entries as
+more PRs land; when the release is actually tagged, the same section is
+finalized in place with a date — no renaming/migration step needed.
+-->
 
-## [Unreleased]
+## [1.1.37] (unreleased)
+
+### Changed
+
+- **Test-suite reorg (710 → ~604 tests, no coverage lost).** Extracted embedded `#[cfg(test)]` blocks out of bloated `mod.rs` files into sibling `_tests.rs` files (mcp/serve/search/cache/db_discovery); collapsed ~109 near-duplicate predicate tests into table-driven tests; centralized a repeated test helper (`state_with_repo`). Also closed 3 coverage gaps found during the pass: `repo_read_only` force-reindex refusal, a federation slow-peer → `Unreachable` timeout, and a `remove_repo`-during-active-build end-to-end race.
 
 ### Added
 
