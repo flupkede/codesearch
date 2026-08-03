@@ -63,7 +63,7 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 
 ### GitHub issues
 
-- [~] **#162: include protobuf as a language aware** — Niveau 1 (text-aware `tree-sitter-proto` chunking on `message`/`enum`/`service`/`rpc` boundaries) shipped in PR #175. Niveau 2 (SCIP symbols → `find_impact`/call-graph) deferred pending a `.proto`-heavy repo — no `scip-protobuf` emitter exists today.
+- [x] **#162: include protobuf as a language aware** — Niveau 1 (text-aware `tree-sitter-proto` chunking on `message`/`enum`/`service`/`rpc` boundaries) shipped in PR #175. Niveau 2 (SCIP symbols → `find_impact`/call-graph) deferred pending a `.proto`-heavy repo — no `scip-protobuf` emitter exists today.
 - [x] **#161: missing macOS binary in v1.1.31** — fixed: C1/C3/C4 (APFS disk-pressure retry: stage binary out of `target/` + `cargo clean` + tar/cp retry loops with `df -h` diagnostics) merged via #166; PR #173 pinned the `actions/checkout` `ref:` so `workflow_dispatch` builds the tagged commit (related mismatch class). GitHub issue #161 closed 2026-07-29.
 
 ### Defensive / low priority
