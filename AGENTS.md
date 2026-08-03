@@ -99,7 +99,7 @@ Common mistake: a subagent runs `/git pr create` with no explicit `--base`, the 
 
 - **Validation:** `cargo check` and `cargo clippy` for iteration. No `--release` builds — always dev/debug until the very end.
 - **Runtime:** `C:\Users\develterf\.local\bin\` — `codesearch.exe` + `helpers/csharp/scip-csharp.exe`
-- **Build:** `target/release/` — outside repo (via `CARGO_TARGET_DIR`)
+- **Build:** `target/release/` — outside repo (via `CARGO_TARGET_DIR`). `build.ps1` self-heals `core.bare=false` before invoking cargo — this checkout is a bare+working-tree hybrid whose `core.bare` intermittently resets to `true` (VS Code's git integration rewrites `.git/config` on ref changes), which makes cargo abort with `did not expect repo to be bare`. No need to flip it manually before building; `build.ps1` does it.
 - **Deploy:** `..\copy-to-common.ps1` — builds + copies both binaries to `~/.local/bin/`. A running `codesearch.exe` is file-locked on Windows; stop serve before deploying.
 - **Canonical paths:** NEVER call `.canonicalize()` directly. Always use `safe_canonicalize()`.
 - **LMDB rule:** No two `EnvOpenOptions::open()` on same dir in same process. All access via `get_or_open_stores()` → `Arc<SharedStores>`.
