@@ -38,13 +38,15 @@ use crate::constants::{
     ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV,
     CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
     DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_PATH,
-    HEALTHZ_PATH, HEALTH_PATH, LANG_CSHARP, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV,
-    MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH,
-    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
-    STATUS_PATH,
+    HEALTHZ_PATH, HEALTH_PATH, LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS,
+    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
+    REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV,
+    SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
-use crate::index::{CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores};
+use crate::index::{
+    CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
+};
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
 
@@ -103,6 +105,7 @@ pub(crate) struct RepoStatusInfo {
     pub(crate) tool_call_count: u64,
     pub(crate) csharp_index: CSharpIndexStatus,
     pub(crate) csharp_error: Option<String>,
+    pub(crate) typescript_index: CSharpIndexStatus,
 }
 
 impl RepoStateLabel {
@@ -195,6 +198,22 @@ pub(crate) struct ServeState {
     /// `stop_fsw`) so the LMDB `Environment` drops and releases the file
     /// handles BEFORE the DB directory is deleted. See `await_fsw_shutdown`.
     fsw_tasks: DashMap<String, tokio::task::JoinHandle<()>>,
+    /// Repo alias → `(JoinHandle, CancellationToken)` of its background
+    /// *indexing* task (the heavy `add_repo`/`reindex` embed pass), separate
+    /// from `fsw_tasks` because `restart_fsw` reuses the `fsw_tasks` slot for
+    /// the continuous watcher loop.
+    ///
+    /// This exists to fix the index-cancellation no-op (BUG1): `add_repo` and
+    /// `reindex` used to spawn detached, untracked `tokio::spawn` tasks that
+    /// neither observed the cancel token nor could be awaited, so `remove_repo`
+    /// reported success while a full-corpus embed pass kept running (and
+    /// writing) on the removed alias — 6 GB / 52% CPU runaway. Registering the
+    /// handle here lets `await_index_task` (called from `remove_repo`) cancel
+    /// the token AND await the task before the DB directory is deleted, so the
+    /// task's `Arc<SharedStores>` (and the LMDB mmap handles it keeps alive)
+    /// drop first. The token is stored alongside the handle so `remove_repo`
+    /// can cancel regardless of the repo's `RepoState` variant.
+    index_tasks: DashMap<String, (tokio::task::JoinHandle<()>, CancellationToken)>,
     /// Loaded repos config (alias → path).
     config: std::sync::RwLock<ReposConfig>,
     /// Last observed mtime of the repos config file.
@@ -216,6 +235,13 @@ pub(crate) struct ServeState {
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
     last_tool_call: DashMap<String, (String, std::time::Instant)>,
+    /// Per-federated-peer last activity time — the last time a real tool call was
+    /// dispatched to that peer (`federated_search` / `federated_project_search` /
+    /// `federated_get_chunk`). Drives the embedded TUI's event-driven refresh:
+    /// when a peer's value advances, the TUI pokes an immediate `/status` poll
+    /// of just that peer instead of waiting for the slow baseline poll. This is
+    /// federation-only and never touches local-repo activity tracking.
+    remote_peer_activity: DashMap<String, std::time::Instant>,
     /// Currently active MCP sessions.
     active_sessions: AtomicU64,
     /// Total MCP sessions since serve started.
@@ -251,6 +277,14 @@ pub(crate) struct ServeState {
     reload_count: std::sync::atomic::AtomicUsize,
     /// Instant when ServeState was created — used to compute uptime for TUI header.
     started_at: std::time::Instant,
+    /// Resolved idle-before-suspend window (seconds) — the same value the
+    /// keep-warm task uses to decide when to let the host scale the replica to
+    /// zero. The embedded TUI reuses it as the federated-peer `/status` baseline
+    /// poll interval, so its background polling can never keep a peer awake past
+    /// the host's own suspend term. Resolved in [`Self::new`] from
+    /// `IDLE_SUSPEND_SECS_ENV` (falling back to `DEFAULT_IDLE_SUSPEND_SECS`) and
+    /// overridden by the `--idle-suspend-secs` flag in `run_serve`.
+    idle_suspend_secs: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -299,12 +333,14 @@ impl ServeState {
             repos: DashMap::new(),
             last_access: DashMap::new(),
             fsw_tasks: DashMap::new(),
+            index_tasks: DashMap::new(),
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
             active_reindexes: Arc::new(DashMap::new()),
             repo_changes: DashMap::new(),
             last_tool_call: DashMap::new(),
+            remote_peer_activity: DashMap::new(),
             active_sessions: AtomicU64::new(0),
             total_sessions: AtomicU64::new(0),
             sysinfo_system: std::sync::Mutex::new(sys),
@@ -318,6 +354,11 @@ impl ServeState {
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
             started_at: std::time::Instant::now(),
+            idle_suspend_secs: std::env::var(crate::constants::IDLE_SUSPEND_SECS_ENV)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|s| *s > 0)
+                .unwrap_or(crate::constants::DEFAULT_IDLE_SUSPEND_SECS),
         }
     }
 
@@ -348,21 +389,27 @@ impl ServeState {
     ///
     /// The notifier captures `Arc` clones of the two status maps so it can be sent
     /// into the file-watcher background task without holding a reference to `&self`.
-    /// When the watcher-triggered rebuild completes it calls the closure, which updates
-    /// `csharp_index_status` and `csharp_index_error` — making the outcome visible in
-    /// the TUI and in `/status` without any extra polling.
+    /// The watcher calls it with [`SymbolRebuildSignal::Started`] just before a
+    /// rebuild runs (→ `Indexing`) and again with `Succeeded`/`Failed` when it
+    /// finishes (→ `Ready`/`Error`), updating `csharp_index_status` /
+    /// `csharp_index_error` — making both the in-progress and terminal states
+    /// visible in the TUI and in `/status` without any extra polling.
     fn make_csharp_notifier(&self, alias: &str) -> CSharpRebuildNotifier {
         let status_map = Arc::clone(&self.csharp_index_status);
         let error_map = Arc::clone(&self.csharp_index_error);
         let alias_key = alias.to_string();
-        Arc::new(move |success: bool, error_msg: Option<String>| {
-            if success {
+        Arc::new(move |signal: SymbolRebuildSignal| match signal {
+            SymbolRebuildSignal::Started => {
+                // Flip the C# indicator to "Indexing" for the duration of the
+                // watcher-triggered rebuild, matching `trigger_symbol_rebuild`.
+                status_map.insert(alias_key.clone(), CSharpIndexStatus::Indexing);
+            }
+            SymbolRebuildSignal::Succeeded => {
                 status_map.insert(alias_key.clone(), CSharpIndexStatus::Ready);
                 error_map.remove(&alias_key);
-            } else {
-                if let Some(msg) = error_msg {
-                    error_map.insert(alias_key.clone(), msg);
-                }
+            }
+            SymbolRebuildSignal::Failed(msg) => {
+                error_map.insert(alias_key.clone(), msg);
                 status_map.insert(alias_key.clone(), CSharpIndexStatus::Error);
             }
         })
@@ -371,9 +418,10 @@ impl ServeState {
     /// Build an `IndexingStatusCallback` for the given repo `alias`.
     ///
     /// The callback captures a clone of `active_reindexes` so it can be sent
-    /// into the file-watcher background task. When the watcher triggers a refresh
-    /// (branch change, significant batch), it calls this closure to insert/remove
-    /// the alias — making "Indexing" visible in the TUI.
+    /// into the file-watcher background task. The watcher calls this closure to
+    /// insert/remove the alias around every reindex — branch-change refresh,
+    /// text-batch flush, and symbol rebuild — making "Indexing" visible in the
+    /// TUI status column.
     fn make_indexing_status_callback(&self, alias: &str) -> IndexingStatusCallback {
         let reindexes = self.active_reindexes.clone();
         let alias_key = alias.to_string();
@@ -1249,7 +1297,7 @@ impl ServeState {
     ///
     /// This is the shared logic used by both the HTTP `DELETE /repos/:alias` handler
     /// and the TUI confirmation flow.
-    pub(crate) async fn remove_repo(&self, alias: &str) -> Result<()> {
+    pub(crate) async fn remove_repo(&self, alias: &str) -> Result<RepoRemovalOutcome> {
         // 1. Resolve project path from config
         let project_path = {
             let config = self
@@ -1276,6 +1324,16 @@ impl ServeState {
         // already cancelled the task; this waits for it to actually finish.
         self.await_fsw_shutdown(alias).await;
         tracing::info!("Evicted repo '{}' from memory", alias);
+
+        // 2b. Await the background *indexing* task (add_repo/reindex embed pass)
+        // too. Before this, a freshly-added repo's full-corpus reindex ran in a
+        // detached, untracked task that ignore its cancel token — so the lines
+        // above cancelled a token nobody listened to, this await found nothing
+        // to wait on, and the embed pass kept running (writing chunks, holding
+        // the LMDB mmap open) long after remove_repo reported success.
+        // await_index_task cancels the task's OWN token and awaits its exit, so
+        // its Arc<SharedStores> drops before the DB delete below.
+        self.await_index_task(alias).await;
 
         // 3. Unregister from repos.json
         {
@@ -1305,36 +1363,89 @@ impl ServeState {
         // for that race; if it still fails (warned, non-fatal) the DB dir
         // stays on disk and is cleaned up on the next serve restart. The repo
         // is already unregistered from config, so this is cosmetic.
+        //
+        // BUG2: this step used to swallow every `remove_dir_all` failure and
+        // return `Ok(())`, so the HTTP handler always reported "DB deleted"
+        // even when the directory was still on disk (e.g. ~118 MB locked by a
+        // transient search holding the LMDB mmap). We now track the real
+        // outcome and surface it via `RepoRemovalOutcome` so the caller can
+        // report honestly.
+        let mut db_deleted = !db_path.exists();
+        let mut db_delete_error: Option<String> = None;
         if db_path.exists() {
-            for attempt in 0..5 {
-                if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
+            // Deadline-bounded exponential-backoff retry. We ONLY retry on
+            // lock-class errors (sharing/lock violation or access-denied on
+            // Windows, or a message hinting the dir is in use) — a genuine
+            // non-lock failure (e.g. a non-directory path, or a permission
+            // refusal that won't resolve) must surface immediately instead of
+            // burning the whole budget. The budget covers the window in which
+            // a just-aborted indexing task is still dropping its
+            // `Arc<SharedStores>` and the OS is closing the LMDB mmap handles
+            // on Windows; once those release, the retry succeeds.
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(crate::constants::DB_DELETE_RETRY_BUDGET_SECS);
+            let mut backoff_ms = crate::constants::DB_DELETE_RETRY_INITIAL_MS;
+            let mut attempt = 0usize;
+            loop {
+                attempt += 1;
                 match std::fs::remove_dir_all(&db_path) {
                     Ok(()) => {
                         tracing::info!("Deleted database for '{}': {}", alias, db_path.display());
+                        db_deleted = true;
+                        db_delete_error = None;
                         break;
                     }
-                    Err(e) if attempt < 4 => {
-                        tracing::debug!(
-                            "DB delete attempt {} for '{}' failed (will retry): {}",
-                            attempt + 1,
-                            alias,
-                            e
-                        );
-                    }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to delete database for '{}' after 5 attempts (may be locked): {}",
+                        // If the dir is already gone, treat that as success:
+                        // a concurrent deleter won the race. This happens in
+                        // exactly the in-build scenario this fix targets — the
+                        // detached indexing task's post-build guard ran
+                        // `drop(stores)` + `remove_orphaned_db_dir` and removed
+                        // the dir before our retry saw it. The goal (dir not on
+                        // disk) is achieved, so report honestly that it is gone
+                        // rather than misreporting a "not found" as a failure.
+                        if e.kind() == std::io::ErrorKind::NotFound || !db_path.exists() {
+                            tracing::info!(
+                                "Database dir for '{}' already gone (concurrent cleanup?): {}",
+                                alias,
+                                db_path.display()
+                            );
+                            db_deleted = true;
+                            db_delete_error = None;
+                            break;
+                        }
+                        let msg = e.to_string();
+                        db_delete_error = Some(msg.clone());
+                        if !Self::is_db_locked_error(&e) || std::time::Instant::now() >= deadline {
+                            tracing::warn!(
+                                "Failed to delete database for '{}' after {} attempt(s) \
+                                 (may be locked): {}",
+                                alias,
+                                attempt,
+                                msg
+                            );
+                            break;
+                        }
+                        tracing::debug!(
+                            "DB delete attempt {} for '{}' failed (locked, will retry): {}",
+                            attempt,
                             alias,
-                            e
+                            msg
                         );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        backoff_ms =
+                            (backoff_ms * 2).min(crate::constants::DB_DELETE_RETRY_BACKOFF_CAP_MS);
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(RepoRemovalOutcome {
+            project_path,
+            db_path,
+            db_deleted,
+            db_delete_error,
+        })
     }
 
     /// Stop the file system watcher for a repo by cancelling its token.
@@ -1398,7 +1509,17 @@ impl ServeState {
     /// fallback for that edge case.
     async fn await_fsw_shutdown(&self, alias: &str) {
         if let Some((_, handle)) = self.fsw_tasks.remove(alias) {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            // Bounded cooperative join, same rationale as `await_index_task`:
+            // we do NOT abort on timeout. An FSW refresh can also be parked
+            // inside an uninterruptible `build_index` on a `spawn_blocking`
+            // thread; aborting would detach that task and drop its post-build
+            // self-cleanup. Detaching lets the guard run and clean up.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
+                handle,
+            )
+            .await
+            {
                 Ok(Ok(())) => {
                     tracing::debug!("FSW task for '{}' exited cleanly", alias);
                 }
@@ -1411,12 +1532,142 @@ impl ServeState {
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "FSW task for '{}' did not exit within 5s; LMDB handles may stay locked",
-                        alias
+                        "FSW task for '{}' did not exit within {}s cooperative window; \
+                         detaching — its post-build guard will self-clean the DB dir",
+                        alias,
+                        crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS,
                     );
                 }
             }
         }
+    }
+
+    /// Cancel and await the background *indexing* task for `alias`
+    /// (`add_repo`/`reindex` embed pass), if one is registered in
+    /// [`Self::index_tasks`].
+    ///
+    /// Cancels the task's token first (so an in-flight embed pass aborts at the
+    /// next batch/phase boundary), then awaits its `JoinHandle` with a 5s
+    /// timeout. The await is what guarantees the task's `Arc<SharedStores>` —
+    /// and the LMDB mmap handles it keeps alive on Windows — have actually
+    /// dropped before `remove_repo` deletes the DB directory. Without this,
+    /// `remove_repo` would delete `repos.json` while the detached task kept
+    /// writing chunks into a soon-to-be-orphaned `.codesearch.db`.
+    async fn await_index_task(&self, alias: &str) {
+        if let Some((_, (handle, token))) = self.index_tasks.remove(alias) {
+            token.cancel();
+            // Bounded cooperative join. We deliberately do NOT abort the task
+            // on timeout. An indexing task can be parked inside `build_index`'s
+            // synchronous arroy HNSW build, which runs on a `spawn_blocking`
+            // thread and has no cancellation point Tokio can interrupt.
+            // Aborting the OUTER `JoinHandle` would only detach that blocking
+            // task (it keeps its own `Arc<RwLock<VectorStore>>` clone, so the
+            // LMDB mmap stays open regardless) AND drop the post-build
+            // continuation — including the self-cleanup that deletes the
+            // orphaned `.codesearch.db` dir once the build finishes. So on
+            // timeout we detach the outer task ON PURPOSE: its post-build guard
+            // (`remove_orphaned_db_dir`) releases the handles and self-cleans
+            // the directory. The deadline-bounded delete retry in `remove_repo`
+            // covers builds that finish within its budget; a serve restart reaps
+            // anything left over.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
+                handle,
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    tracing::debug!("Index task for '{}' exited cleanly", alias);
+                }
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        "Index task for '{}' panicked during shutdown: {}",
+                        alias,
+                        join_err
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Index task for '{}' still in an uninterruptible build_index after {}s; \
+                         detaching — its post-build guard will self-clean the DB dir",
+                        alias,
+                        crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Classify an `io::Error` from `remove_dir_all` as a transient "DB is
+    /// locked / in use" failure worth retrying (sharing/lock violation or
+    /// access-denied on Windows, or a message hinting the dir is in use),
+    /// versus a permanent failure (e.g. a non-directory path) that must
+    /// surface immediately. Used by [`Self::remove_repo`]'s deadline-bounded
+    /// delete retry so a genuine non-lock error doesn't burn the whole budget.
+    fn is_db_locked_error(e: &std::io::Error) -> bool {
+        // Windows sharing/lock violations surface as raw OS error codes:
+        // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32),
+        // ERROR_LOCK_VIOLATION (33).
+        if let Some(raw) = e.raw_os_error() {
+            if matches!(raw, 5 | 32 | 33) {
+                return true;
+            }
+        }
+        // Cross-platform fallback: the error message hints the dir is in use.
+        let msg = e.to_string();
+        msg.contains("being used")
+            || msg.contains("is in use")
+            || msg.contains("locked")
+            || msg.contains("busy")
+    }
+
+    /// Best-effort delete of an orphaned `.codesearch.db` directory, called
+    /// from a background indexing task's post-build guard when its alias was
+    /// removed (or cancelled) mid-build. The caller MUST drop its own
+    /// `Arc<SharedStores>` clone BEFORE calling this — that closes the LMDB
+    /// env synchronously (the `spawn_blocking` build already released its
+    /// `Arc<RwLock<VectorStore>>` clone on return), so the directory is no
+    /// longer locked on Windows and the remove can succeed. This is the
+    /// guaranteed backstop for the in-build case: `remove_repo`'s own
+    /// delete retry gives up once the alias is torn down, but the task that
+    /// actually held the handle is the one best placed to delete the dir
+    /// right after releasing it. Failures are non-fatal — the repo is already
+    /// unregistered, and a serve restart reaps any leftover.
+    fn remove_orphaned_db_dir(alias: &str, db_path: &std::path::Path) {
+        match std::fs::remove_dir_all(db_path) {
+            Ok(()) => tracing::info!(
+                "Self-cleanup deleted orphaned DB dir for '{}': {}",
+                alias,
+                db_path.display()
+            ),
+            Err(_) if !db_path.exists() => {
+                tracing::debug!("Self-cleanup: DB dir for '{}' already gone", alias)
+            }
+            Err(e) => tracing::warn!(
+                "Self-cleanup could not delete orphaned DB dir for '{}' \
+                 (it will be reaped on next serve restart): {}",
+                alias,
+                e
+            ),
+        }
+    }
+
+    /// True iff `alias` is still registered in the config AND its indexing
+    /// `CancellationToken` has not been cancelled.
+    ///
+    /// Used by the `add_repo` background task to decide whether to proceed past
+    /// `force_reindex_with_stores` into `build_index` / `restart_fsw`. If the
+    /// repo was removed mid-index (`remove_repo` unregistered it and cancelled
+    /// the token), the detached task must stop instead of resurrecting the
+    /// alias — writing a fresh HNSW graph / starting a new FSW for a repo the
+    /// user just deleted.
+    fn is_alias_live(&self, alias: &str, token: &CancellationToken) -> bool {
+        !token.is_cancelled()
+            && self
+                .config
+                .read()
+                .map(|c| c.resolve(alias).is_some())
+                .unwrap_or(false)
     }
 
     /// Spawn the FSW background task for a repo after it has been stopped.
@@ -1475,6 +1726,7 @@ impl ServeState {
                         &project_path,
                         &db_path_bg,
                         &stores_bg,
+                        &token_for_task,
                     )
                     .await
                     {
@@ -1482,6 +1734,17 @@ impl ServeState {
                     }
 
                     if token_for_task.is_cancelled() {
+                        // The repo was removed (or cancelled) during the
+                        // just-finished uninterruptible build phase of the
+                        // refresh. `await_fsw_shutdown` detached this task on
+                        // purpose; drop our handles — `im_for_task` holds a
+                        // SharedStores ref via IndexManager and `stores_bg` is
+                        // the direct clone — so the LMDB env closes, then
+                        // self-clean the orphaned DB dir instead of leaving it
+                        // on disk until a serve restart.
+                        drop(im_for_task);
+                        drop(stores_bg);
+                        ServeState::remove_orphaned_db_dir(&alias_bg, &db_path_bg);
                         return;
                     }
 
@@ -1536,22 +1799,50 @@ impl ServeState {
             }
         }
 
-        let path = {
+        let (path, force_readonly) = {
             let config = self
                 .config
                 .read()
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            config
+            let p = config
                 .resolve(alias)
-                .ok_or_else(|| format!("Unknown alias '{}'", alias))?
+                .ok_or_else(|| format!("Unknown alias '{}'", alias))?;
+            let ro = config.repo_read_only.get(alias) == Some(&true);
+            (p, ro)
         };
 
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false)? {
-            OpenedStores::Readonly(_) => {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
+            OpenedStores::Readonly(stores) => {
                 // Already registered as Readonly by try_open_stores.
+                //
+                // A read-only store can never repair itself: `build_index()`
+                // needs a write txn that MDB_RDONLY rejects, so if the snapshot
+                // this repo was restored from was taken before its HNSW graph
+                // was committed, `search()` fails with "Index not built" and the
+                // repo silently answers 0 results forever. That is invisible in
+                // `/status` (the repo reports "readonly", chunk counts look
+                // healthy) and previously cost a multi-round debugging spiral —
+                // so state it loudly, once, at warmup.
+                // `index_health()` (not `stats()`) on purpose: this arm is the
+                // cheap path that keeps the 2 GiB replica alive, and `stats()`
+                // would deserialize every chunk just to count unique paths.
+                match stores.vector_store.read().await.index_health() {
+                    Ok((total_chunks, false)) if total_chunks > 0 => warn!(
+                        "Warmup '{}': opened READ-ONLY but its vector index has no HNSW graph \
+                         ({} chunks present). Semantic search will return 0 results for this \
+                         repo. The graph must be built by a WRITE-mode run before the snapshot \
+                         is taken; a read-only store cannot build one.",
+                        alias, total_chunks
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        "Warmup '{}': opened READ-ONLY but could not read index health: {}",
+                        alias, e
+                    ),
+                }
                 // Touch so the idle reaper can evict this handle.
                 self.touch_access(alias);
                 return Ok(());
@@ -1564,15 +1855,18 @@ impl ServeState {
         // `build_index()` is a synchronous, CPU-heavy operation (HNSW graph
         // construction). Running it directly on a tokio worker thread starves
         // the async executor and makes `/health` time out during warmup, so it
-        // is offloaded to `spawn_blocking`. Stats are read first under a short
-        // `.read()` lock to decide whether a build is even needed.
+        // is offloaded to `spawn_blocking`. Index health is read first under a
+        // short `.read()` lock to decide whether a build is even needed —
+        // `index_health()` rather than `stats()`, since the predicate needs
+        // exactly `(total_chunks, indexed)` and `stats()` would deserialize
+        // every chunk in the store just to count unique file paths.
         let needs_build = {
             let vstore = stores.vector_store.read().await;
-            match vstore.stats() {
-                Ok(s) if s.total_chunks > 0 && !s.indexed => Some(s.total_chunks),
+            match vstore.index_health() {
+                Ok((total_chunks, false)) if total_chunks > 0 => Some(total_chunks),
                 Ok(_) => None,
                 Err(e) => {
-                    warn!("Warmup '{}': could not read stats: {}", alias, e);
+                    warn!("Warmup '{}': could not read index health: {}", alias, e);
                     None
                 }
             }
@@ -1602,9 +1896,17 @@ impl ServeState {
 
         let stores_arc = stores;
 
-        if let Err(e) =
-            IndexManager::perform_incremental_refresh_with_stores(&path, &db_path, &stores_arc)
-                .await
+        // Warmup runs at startup (pre-warm), never in response to a user action,
+        // so it is given a fresh token that is never cancelled — the refresh runs
+        // to completion. A real user-initiated cancel routes through the
+        // RepoState::Write token owned by the live task instead.
+        if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
+            &path,
+            &db_path,
+            &stores_arc,
+            &CancellationToken::new(),
+        )
+        .await
         {
             tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
         }
@@ -1690,20 +1992,22 @@ impl ServeState {
         }
 
         // Slow path: need to open
-        let path = {
+        let (path, force_readonly) = {
             let config = self
                 .config
                 .read()
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            config
+            let p = config
                 .resolve(alias)
-                .ok_or_else(|| format!("Unknown alias '{}'", alias))?
+                .ok_or_else(|| format!("Unknown alias '{}'", alias))?;
+            let ro = config.repo_read_only.get(alias) == Some(&true);
+            (p, ro)
         };
 
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false)? {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
             OpenedStores::Readonly(s) => {
                 // Already registered as Readonly; touch and return.
                 self.touch_access(alias);
@@ -1713,9 +2017,13 @@ impl ServeState {
         };
 
         // Ensure the HNSW vector index is built from existing data.
-        // When opening an existing DB, VectorStore starts with indexed=false.
-        // Without this, search fails with "Index not built" until the background
-        // refresh completes (which may take minutes for large repos).
+        // `indexed` is NOT "false until we build": VectorStore::new probes the
+        // persisted arroy graph at open time (`Reader::open(...).is_ok()`), so it is
+        // already true for a store whose graph was committed by a previous run — which
+        // is exactly how a read-only replica can serve a snapshot it cannot build.
+        // It is false when the graph is absent OR when items were inserted after the
+        // last build (arroy reports NeedBuild); without this, search fails with
+        // "Index not built" until the background refresh completes.
         // build_index() is CPU-heavy — offload to the blocking pool so the async
         // runtime is not stalled while building the HNSW index for large repos.
         {
@@ -1723,18 +2031,22 @@ impl ServeState {
             let alias_owned = alias.to_string();
             match tokio::task::spawn_blocking(move || {
                 let mut vstore = vector_store.blocking_write();
-                match vstore.stats() {
-                    Ok(s) if s.total_chunks > 0 && !s.indexed => {
+                // `index_health()`, not `stats()` — the predicate needs exactly
+                // `(total_chunks, indexed)`, while `stats()` deserializes every
+                // ChunkMetadata in the store just to count unique file paths.
+                // Same two values from the same source, on a memory-sensitive path.
+                match vstore.index_health() {
+                    Ok((total_chunks, false)) if total_chunks > 0 => {
                         info!(
                             "Building vector index for '{}' ({} existing chunks)",
-                            alias_owned, s.total_chunks
+                            alias_owned, total_chunks
                         );
                         if let Err(e) = vstore.build_index() {
                             warn!("Failed to build vector index for '{}': {}", alias_owned, e);
                         }
                     }
                     Ok(_) => {} // already indexed or no chunks
-                    Err(e) => warn!("Could not read stats for '{}': {}", alias_owned, e),
+                    Err(e) => warn!("Could not read index health for '{}': {}", alias_owned, e),
                 }
             })
             .await
@@ -1787,6 +2099,7 @@ impl ServeState {
                             &project_path,
                             &db_path_clone,
                             &stores_for_task,
+                            &token_for_task,
                         )
                         .await
                         {
@@ -1794,6 +2107,18 @@ impl ServeState {
                         }
 
                         if token_for_task.is_cancelled() {
+                            // The incremental refresh above may have finished a
+                            // build that `remove_repo` could not interrupt; this
+                            // detached task is now the last holder of the LMDB
+                            // handles (remove_repo already dropped the repos entry
+                            // and gave up awaiting this task). Release both Arcs to
+                            // close the env synchronously, then self-clean the
+                            // orphaned DB dir — matching the add_repo/reindex
+                            // post-build guards so the detach-on-timeout promise
+                            // in `await_fsw_shutdown` actually holds.
+                            drop(im_for_task);
+                            drop(stores_for_task);
+                            ServeState::remove_orphaned_db_dir(&alias_clone, &db_path_clone);
                             return;
                         }
 
@@ -1933,6 +2258,7 @@ impl ServeState {
         alias: &str,
         db_path: &Path,
         allow_create: bool,
+        force_readonly: bool,
     ) -> std::result::Result<OpenedStores, String> {
         if !db_path.exists() && !allow_create {
             let parent = db_path
@@ -1949,6 +2275,31 @@ impl ServeState {
         }
 
         let dims = self.get_dimensions_for_path(db_path);
+
+        // Read-only requested via the per-repo `repo_read_only` config flag:
+        // open readonly directly and never attempt a write open. This makes
+        // warmup return early (no incremental-refresh embedding), which is the
+        // point for large static corpora on a memory-constrained replica.
+        if force_readonly {
+            return match SharedStores::new_readonly(db_path, dims) {
+                Ok(s) => {
+                    info!("Opened repo in readonly mode (forced by config): {}", alias);
+                    let stores_arc = Arc::new(s);
+                    self.repos.insert(
+                        alias.to_string(),
+                        RepoState::Readonly {
+                            stores: stores_arc.clone(),
+                        },
+                    );
+                    Ok(OpenedStores::Readonly(stores_arc))
+                }
+                Err(e) => {
+                    warn!("Failed to open repo {}: {}", alias, e);
+                    self.repos.insert(alias.to_string(), RepoState::Conflicted);
+                    Err(Self::conflicted_msg(alias))
+                }
+            };
+        }
 
         match SharedStores::new(db_path, dims) {
             Ok(s) => {
@@ -2111,6 +2462,35 @@ impl ServeState {
             .max()
     }
 
+    /// Record that a federated tool call was dispatched to `peer_name`.
+    ///
+    /// Drives the embedded TUI's event-driven `/status` refresh (see
+    /// [`Self::remote_peer_last_activity`]). Federation-only: local-repo tool
+    /// calls go through [`Self::record_tool_call`] and are completely unaffected.
+    pub(crate) fn record_remote_peer_activity(&self, peer_name: &str) {
+        self.remote_peer_activity
+            .insert(peer_name.to_string(), std::time::Instant::now());
+    }
+
+    /// Last time a federated tool call hit `peer_name`, if any.
+    ///
+    /// The embedded TUI polls this every render tick; an advance (a newer
+    /// `Instant` than the value seen on the previous tick) means a real tool call
+    /// just used that peer, so the TUI pokes an immediate per-peer `/status`
+    /// refresh instead of waiting for the slow baseline poll.
+    pub(crate) fn remote_peer_last_activity(&self, peer_name: &str) -> Option<Instant> {
+        self.remote_peer_activity
+            .get(peer_name)
+            .map(|entry| *entry.value())
+    }
+
+    /// The resolved idle-before-suspend window (seconds) — used by the embedded
+    /// TUI as the federated-peer `/status` baseline poll interval so background
+    /// polling can never keep a peer awake past the host's own suspend term.
+    pub(crate) fn idle_suspend_secs(&self) -> u64 {
+        self.idle_suspend_secs
+    }
+
     /// Record that changes were made to a repo (index/reindex).
     #[allow(dead_code)]
     pub(crate) fn record_changes(&self, alias: &str, count: u64) {
@@ -2226,6 +2606,24 @@ impl ServeState {
                 None
             };
 
+            // TypeScript index status. Unlike C#, there is no live status cache
+            // populated during rebuilds yet (stage 7 work), so we always probe:
+            // helper available (npx/scip-typescript resolvable) + index dir
+            // exists → Ready; otherwise None. The TUI icon reflects "an index
+            // exists", which is exactly what matters for discoverability.
+            let registry = &self.symbol_registry;
+            let typescript_index = {
+                let has_ts_helper = registry
+                    .get(LANG_TYPESCRIPT)
+                    .map(|i| i.is_available())
+                    .unwrap_or(false);
+                if has_ts_helper && registry.has_index_for(LANG_TYPESCRIPT, &db_path) {
+                    CSharpIndexStatus::Ready
+                } else {
+                    CSharpIndexStatus::None
+                }
+            };
+
             result.push((
                 alias.clone(),
                 RepoStatusInfo {
@@ -2235,6 +2633,7 @@ impl ServeState {
                     tool_call_count,
                     csharp_index,
                     csharp_error,
+                    typescript_index,
                 },
             ));
         }
@@ -2519,6 +2918,12 @@ async fn status_handler(
                 CSharpIndexStatus::Error => "error",
                 CSharpIndexStatus::Indexing => "indexing",
             };
+            let ts_str = match info.typescript_index {
+                CSharpIndexStatus::None => "none",
+                CSharpIndexStatus::Ready => "ready",
+                CSharpIndexStatus::Error => "error",
+                CSharpIndexStatus::Indexing => "indexing",
+            };
             json!({
                 "alias": alias,
                 "status": status_str,
@@ -2528,6 +2933,7 @@ async fn status_handler(
                 "tool_call_count": info.tool_call_count,
                 "csharp_index": csharp_str,
                 "csharp_error": info.csharp_error,
+                "typescript_index": ts_str,
             })
         })
         .collect();
@@ -2578,12 +2984,19 @@ async fn status_handler(
         .map(|i| i.is_available())
         .unwrap_or(false);
 
+    let ts_helper = state
+        .symbol_registry
+        .get(LANG_TYPESCRIPT)
+        .map(|i| i.is_available())
+        .unwrap_or(false);
+
     AxumJson(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "repos": repo_json,
         "active_sessions": active_sessions,
         "cpu_percent": cpu,
         "csharp_helper": csharp_helper,
+        "ts_helper": ts_helper,
         "uptime_secs": uptime_secs,
     }))
 }
@@ -2697,6 +3110,11 @@ async fn info_handler(
         }
     }
 
+    // Whether the HNSW graph is actually present. `None` when the repo is not
+    // open (nothing live to ask), so a consumer can tell "no graph" apart from
+    // "unknown" instead of reading a defaulted `false` as a hard failure.
+    let mut indexed: Option<bool> = None;
+
     // If stores are open, live stats override metadata.
     if let Some(stores) = state.get_opened_stores(&alias) {
         if let Ok(vs) = stores.vector_store.try_read() {
@@ -2704,6 +3122,7 @@ async fn info_handler(
                 chunks = live_stats.total_chunks;
                 files = live_stats.total_files;
                 max_chunk_id = live_stats.max_chunk_id;
+                indexed = Some(live_stats.indexed);
                 if dims == 0 {
                     dims = live_stats.dimensions;
                 }
@@ -2719,6 +3138,7 @@ async fn info_handler(
     let db_size_human = tui::dir_size_human(&db_path);
 
     AxumJson(json!({
+        "path": db_path.display().to_string(),
         "chunks": chunks,
         "files": files,
         "max_chunk_id": max_chunk_id,
@@ -2727,6 +3147,13 @@ async fn info_handler(
         "dims": dims,
         "lock": lock,
         "index_age": index_age,
+        // Is the HNSW graph built and committed? A non-zero `chunks` with
+        // `indexed: false` is a searchable-looking but silently dead index:
+        // `VectorStore::search` refuses to run without the graph. The cloud
+        // index-job asserts this before publishing a snapshot, because a
+        // read-only serve replica can never build the graph itself.
+        // `null` = repo not currently open, so the graph state is unknown.
+        "indexed": indexed,
     }))
     .into_response()
 }
@@ -2949,7 +3376,7 @@ async fn reindex_handler(
         .unwrap_or(false);
 
     // Resolve the project path for this alias
-    let project_path = {
+    let (project_path, read_only) = {
         let config = match state.config.read() {
             Ok(c) => c,
             Err(e) => {
@@ -2962,8 +3389,9 @@ async fn reindex_handler(
                 );
             }
         };
+        let ro = config.repo_read_only.get(&alias) == Some(&true);
         match config.resolve(&alias) {
-            Some(p) => p,
+            Some(p) => (p, ro),
             None => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -2975,6 +3403,29 @@ async fn reindex_handler(
             }
         }
     };
+
+    // Honour `repo_read_only` HERE, not just on the open paths. Without this the
+    // flag is advisory on the one route that can undo it: a reindex opens the
+    // repo WRITE-mode (`try_open_stores(..., force_readonly = false)` below),
+    // runs a full incremental refresh plus `build_index()`, and starts an FSW —
+    // on a memory-constrained replica that is exactly the warmup blow-up the flag
+    // exists to prevent, and the rebuilt index would also diverge from the one the
+    // owning job publishes. 409 rather than 403: the repo is not permanently
+    // forbidden, it is owned by another writer right now.
+    if read_only {
+        return (
+            StatusCode::CONFLICT,
+            axum::response::Json(json!({
+                "error": format!(
+                    "Repo '{}' is marked read-only (repo_read_only) — its index is owned by \
+                     another writer (e.g. a separate indexing job). Reindex it there, or clear \
+                     the flag in repos.json.",
+                    alias
+                ),
+                "status": "read_only"
+            })),
+        );
+    }
 
     let db_path = project_path.join(DB_DIR_NAME);
     let alias_bg = alias.clone();
@@ -3009,7 +3460,7 @@ async fn reindex_handler(
                 // FSW not running -- open existing or create fresh DB.
                 // allow_create=true so a force-reindex can recover a deleted DB.
                 let cancel = CancellationToken::new();
-                match state.try_open_stores(&alias, &db_path, true) {
+                match state.try_open_stores(&alias, &db_path, true, false) {
                     Ok(OpenedStores::Write(s)) => {
                         // Register as Write to block double-open races while we reindex.
                         state.repos.insert(
@@ -3051,27 +3502,70 @@ async fn reindex_handler(
             }
         };
 
+        // Fresh cancellation token for this reindex task, registered alongside
+        // its handle in `index_tasks` so `remove_repo` can cancel + await it
+        // (BUG1: this was a detached, uncancellable tokio::spawn — a remove
+        // during a force reindex left the embed pass running on a dead alias).
+        let reindex_token = CancellationToken::new();
+        let reindex_token_task = reindex_token.clone();
+
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tracing::info!(
                 "Force reindex for '{}': clearing stores and reindexing",
                 alias_bg
             );
 
             // 2. Clear data and reindex
-            match IndexManager::force_reindex_with_stores(&project_path, &db_path, &stores, None)
-                .await
+            match IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                None,
+                &reindex_token_task,
+            )
+            .await
             {
                 Ok(()) => {
                     tracing::info!("Force reindex complete for '{}'", alias_bg);
                 }
                 Err(e) => {
+                    if reindex_token_task.is_cancelled() {
+                        // Cancellation (e.g. remove_repo ran mid-reindex): the
+                        // repo is already being torn down by remove_repo — do
+                        // NOT restart the FSW or rebuild symbols, both of which
+                        // would resurrect the removed alias with a fresh,
+                        // uncancellable task.
+                        tracing::info!("Reindex cancelled for '{}': {}", alias_bg, e);
+                        g_state.end_indexing(&g_alias);
+                        return;
+                    }
                     tracing::error!("Force reindex failed for '{}': {}", alias_bg, e);
                 }
             }
 
-            // 3. Restart FSW with fresh IndexManager
+            // Guard: even if force_reindex returned Ok, the repo may have been
+            // removed (or the task cancelled) during the embed pass. Do NOT
+            // restart the FSW or rebuild symbols — that would resurrect the
+            // removed alias. restart_fsw's own config check is insufficient here
+            // because remove_repo unregisters config AFTER awaiting this task.
+            if !g_state.is_alias_live(&g_alias, &reindex_token_task) {
+                // Alias removed during force_reindex (whose final build_index is
+                // uninterruptible). `remove_repo` gave up awaiting this task and
+                // reported its own outcome; drop our stores handle (closes the
+                // LMDB env) and self-clean the orphaned DB dir.
+                tracing::info!(
+                    "Repo '{}' removed mid-reindex; dropping stores and self-cleaning DB dir",
+                    g_alias
+                );
+                drop(stores);
+                ServeState::remove_orphaned_db_dir(&g_alias, &db_path);
+                g_state.end_indexing(&g_alias);
+                return;
+            }
+
+            // 3. Restart FSW with fresh IndexManager.
             g_state.restart_fsw(&g_alias, stores).await;
 
             // 4. Optional symbol index rebuild
@@ -3081,6 +3575,9 @@ async fn reindex_handler(
 
             g_state.end_indexing(&g_alias);
         });
+        state
+            .index_tasks
+            .insert(alias.to_string(), (handle, reindex_token));
     } else {
         // Incremental refresh: ensure the repo is opened, then refresh
         let stores = match state.get_or_open_stores(&alias, true).await {
@@ -3097,9 +3594,14 @@ async fn reindex_handler(
             }
         };
 
+        // Fresh cancellation token for this incremental reindex task, registered
+        // in `index_tasks` so `remove_repo` can cancel + await it (BUG1).
+        let reindex_token = CancellationToken::new();
+        let reindex_token_task = reindex_token.clone();
+
         let g_alias = guard_alias.clone();
         let g_state = guard_state.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tracing::info!(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
                 alias_bg
@@ -3108,6 +3610,7 @@ async fn reindex_handler(
                 &project_path,
                 &db_path,
                 &stores,
+                &reindex_token_task,
             )
             .await
             {
@@ -3119,6 +3622,23 @@ async fn reindex_handler(
                 }
             }
 
+            // Guard: the incremental refresh above may have finished a build that
+            // `remove_repo` could not interrupt (build_index is uninterruptible).
+            // If the alias was removed (or cancelled) during it, this detached
+            // task is the last holder of the stores handle — drop it to close the
+            // LMDB env, then self-clean the orphaned DB dir (matching the
+            // add_repo/reindex post-build guards).
+            if !g_state.is_alias_live(&g_alias, &reindex_token_task) {
+                tracing::info!(
+                    "Repo '{}' removed during incremental reindex; dropping stores and self-cleaning DB dir",
+                    g_alias
+                );
+                drop(stores);
+                ServeState::remove_orphaned_db_dir(&g_alias, &db_path);
+                g_state.end_indexing(&g_alias);
+                return;
+            }
+
             // Optional symbol index rebuild
             if do_symbols {
                 trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
@@ -3126,6 +3646,9 @@ async fn reindex_handler(
 
             g_state.end_indexing(&g_alias);
         });
+        state
+            .index_tasks
+            .insert(alias.to_string(), (handle, reindex_token));
     }
 
     (
@@ -3248,10 +3771,12 @@ async fn add_repo_handler(
     //  path opened its own LMDB handle, conflicting with
     //  calls from the serve's request handlers.
     let db_path = canonical_path.join(DB_DIR_NAME);
-    let stores = match state.try_open_stores(&alias, &db_path, true) {
+    let stores = match state.try_open_stores(&alias, &db_path, true, false) {
         Ok(OpenedStores::Write(s)) => s,
         Ok(OpenedStores::Readonly(_)) => {
-            unreachable!("try_open_stores(allow_create=true) never returns Readonly")
+            unreachable!(
+                "try_open_stores(allow_create=true, force_readonly=false) never returns Readonly"
+            )
         }
         Err(e) => {
             // Clean up the config entry we just added
@@ -3338,8 +3863,14 @@ async fn add_repo_handler(
     let alias_bg = alias.clone();
     let state_bg = state.clone();
     let project_path = canonical_path.clone();
+    // Clone the cancel token INTO the task so force_reindex_with_stores can
+    // observe a remove_repo cancellation mid-embed. BUG1: previously the token
+    // was created and stored in RepoState::Write but never threaded into the
+    // indexing task, so cancelling it (stop_fsw) did nothing and the task ran
+    // the full embed pass to completion on a removed alias.
+    let token_for_task = cancel_token.clone();
 
-    tokio::spawn(async move {
+    let index_handle = tokio::spawn(async move {
         tracing::info!(
             "Indexing newly added repo '{}' ({}) in background",
             alias_bg,
@@ -3351,6 +3882,7 @@ async fn add_repo_handler(
             &db_path,
             &stores,
             model_override,
+            &token_for_task,
         )
         .await
         {
@@ -3362,6 +3894,15 @@ async fn add_repo_handler(
                 );
             }
             Err(e) => {
+                if token_for_task.is_cancelled() {
+                    // Cancellation (e.g. remove_repo ran mid-index): the repo is
+                    // already being torn down by remove_repo — do NOT repeat the
+                    // destructive cleanup (repos.remove/unregister) here, just
+                    // release the indexing guard and let remove_repo finish.
+                    tracing::info!("Indexing cancelled for '{}': {}", alias_bg, e);
+                    state_bg.end_indexing(&alias_bg);
+                    return;
+                }
                 tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
                 // Clean up: remove from repos and config
                 state_bg.repos.remove(&alias_bg);
@@ -3378,6 +3919,19 @@ async fn add_repo_handler(
                 }
                 return;
             }
+        }
+
+        // Guard: if the repo was removed (or the task cancelled) during the
+        // embed pass — even though force_reindex returned Ok (the cancellation
+        // check raced past the last batch) — do NOT build the vector index or
+        // restart the FSW. That would resurrect a removed alias.
+        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
+            tracing::info!(
+                "Skipping build_index for '{}': repo removed or cancelled mid-index",
+                alias_bg
+            );
+            state_bg.end_indexing(&alias_bg);
+            return;
         }
 
         // Build vector index from freshly indexed data.
@@ -3399,12 +3953,41 @@ async fn add_repo_handler(
             }
         }
 
+        // Re-check before restart_fsw: build_index (spawn_blocking) may have
+        // taken long enough for a remove_repo to land in between.
+        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
+            // The alias was removed (or cancelled) during the just-finished
+            // build_index. `remove_repo` already gave up awaiting this task
+            // (build_index is uninterruptible) and reported its own delete
+            // outcome, but the DB dir may still be locked by OUR stores
+            // handle. Drop it — the spawn_blocking build already released its
+            // Arc clone, so dropping this last Arc<SharedStores> closes the
+            // LMDB env synchronously — then self-clean the directory. The task
+            // that held the handle is the one best placed to delete it right
+            // after releasing it.
+            tracing::info!(
+                "Repo '{}' removed during build_index; dropping stores and self-cleaning DB dir",
+                alias_bg
+            );
+            drop(stores);
+            ServeState::remove_orphaned_db_dir(&alias_bg, &db_path);
+            state_bg.end_indexing(&alias_bg);
+            return;
+        }
+
         // Start FSW and transition to proper Write state with IndexManager
         state_bg.restart_fsw(&alias_bg, stores).await;
 
         state_bg.end_indexing(&alias_bg);
         tracing::info!("Repo '{}' fully indexed and ready", alias_bg);
     });
+
+    // Register the indexing task so remove_repo can cancel + await it (BUG1).
+    // Storing the token alongside the handle means remove_repo can cancel
+    // regardless of the repo's RepoState variant.
+    state
+        .index_tasks
+        .insert(alias.clone(), (index_handle, cancel_token));
 
     (
         StatusCode::ACCEPTED,
@@ -3417,10 +4000,34 @@ async fn add_repo_handler(
     )
 }
 
+/// Outcome of [`ServeState::remove_repo`]. Reports per-step success so the
+/// HTTP/CLI layer can give an honest message instead of always claiming the DB
+/// was deleted (BUG2: `remove_repo` used to swallow every `remove_dir_all`
+/// failure and return `Ok(())`, and `remove_repo_handler` always printed
+/// "DB deleted" — even when ~118 MB was still locked on disk).
+#[derive(Debug, Clone)]
+pub(crate) struct RepoRemovalOutcome {
+    /// Canonical project path, resolved from config *before* the alias was
+    /// unregistered. Carried here so the caller can report `path` without a
+    /// (now-stale) post-removal config lookup that would always resolve to
+    /// `None`.
+    pub project_path: PathBuf,
+    /// The `.codesearch.db` directory that was the deletion target.
+    pub db_path: PathBuf,
+    /// `true` iff the DB directory is gone after this call — either it never
+    /// existed or `remove_dir_all` succeeded within the retry budget.
+    pub db_deleted: bool,
+    /// The last error from `remove_dir_all`. `Some` exactly when
+    /// `db_deleted == false`; `None` once a delete succeeds.
+    pub db_delete_error: Option<String>,
+}
+
 /// Remove-repo handler: DELETE /repos/:alias
 ///
 /// Stops the FSW, evicts the repo from memory, unregisters from repos.json,
-/// and deletes the database directory. Returns 200 on success.
+/// and deletes the database directory. Returns 200 on success (status is
+/// `"removed"` when the DB was deleted, `"removed_db_locked"` when the LMDB
+/// dir is still locked on disk — see BUG2).
 async fn remove_repo_handler(
     axum::extract::Path(alias): axum::extract::Path<String>,
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
@@ -3431,15 +4038,41 @@ async fn remove_repo_handler(
     use axum::http::StatusCode;
 
     match state.remove_repo(&alias).await {
-        Ok(()) => {
-            let project_path = state.config.read().ok().and_then(|c| c.resolve(&alias));
+        Ok(outcome) => {
+            // BUG2: report the real DB-delete outcome instead of always
+            // claiming "DB deleted". When the LMDB dir is still locked on disk
+            // (transient search holder, 5-retry budget exhausted) the repo is
+            // still functionally removed (config unregistered, evicted from
+            // memory) but we say so honestly with a distinct status + reason.
+            let (status, message) = if outcome.db_deleted {
+                (
+                    "removed",
+                    "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+                        .to_string(),
+                )
+            } else {
+                (
+                    "removed_db_locked",
+                    format!(
+                        "Repo removed: FSW stopped, evicted from memory, unregistered; \
+                         DB delete failed (still on disk at {}): {}",
+                        outcome.db_path.display(),
+                        outcome
+                            .db_delete_error
+                            .as_deref()
+                            .unwrap_or("unknown error")
+                    ),
+                )
+            };
             (
                 StatusCode::OK,
                 axum::response::Json(json!({
-                    "status": "removed",
+                    "status": status,
                     "alias": alias,
-                    "path": project_path,
-                    "message": "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
+                    "path": outcome.project_path,
+                    "db_deleted": outcome.db_deleted,
+                    "db_delete_error": outcome.db_delete_error,
+                    "message": message,
                 })),
             )
         }
@@ -3701,19 +4334,79 @@ async fn log_mcp_requests(
     response
 }
 
+/// Normalize a serve URL for comparison: trim trailing slashes and lowercase
+/// the scheme+host+port portion so `https://Host:443/` and `https://host:443`
+/// compare equal. Not a full URL parser — good enough for matching a CLI/env
+/// `--url` against a `RemotePeer.url` from `repos.json`.
+fn normalize_serve_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// Resolve the API key to use for `serve_url` by matching it against the
+/// configured remote peers in `~/.codesearch/repos.json`. Returns `None` when
+/// no peer matches (e.g. a plain local/no-auth serve) or the matching peer has
+/// no key configured — in both cases the caller falls back to unauthenticated
+/// requests, preserving today's behavior for local serves.
+///
+/// Never logs the resolved key.
+fn resolve_api_key_for_url(serve_url: &str) -> Option<String> {
+    let target = normalize_serve_url(serve_url);
+    let config = ReposConfig::load().ok()?;
+    config
+        .remotes
+        .values()
+        .find(|peer| normalize_serve_url(&peer.url) == target)
+        .map(|peer| peer.api_key.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
 /// Run the standalone TUI that connects to a running serve instance via HTTP.
 ///
 /// This is the entry point for `codesearch serve tui`.
-pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
+///
+/// `api_key_override` (from `--api-key`) takes precedence over any key
+/// resolved from `~/.codesearch/repos.json` by matching `serve_url` against a
+/// configured remote peer. When neither resolves a key, requests are sent
+/// unauthenticated — identical to today's behavior for a local, no-auth
+/// serve.
+pub async fn run_tui_standalone(serve_url: String, api_key_override: Option<String>) -> Result<()> {
     if !tui::is_tty() {
         eprintln!("Error: No TTY detected. The standalone TUI requires an interactive terminal.");
         std::process::exit(1);
     }
 
+    let api_key = api_key_override.or_else(|| resolve_api_key_for_url(&serve_url));
+
+    let client = match crate::index::build_serve_client_with_key(
+        std::time::Duration::from_secs(10),
+        api_key.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to build HTTP client: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Check if serve is reachable
     let health_url = format!("{}{}", serve_url, HEALTH_PATH);
-    match reqwest::get(&health_url).await {
+    match client.get(&health_url).send().await {
         Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+            if api_key.is_some() {
+                eprintln!(
+                    "Error: Serve at {} rejected the configured API key (401 Unauthorized).",
+                    serve_url
+                );
+            } else {
+                eprintln!(
+                    "Error: Serve at {} requires an API key — none configured for this URL. \
+                     Register it with `codesearch remote add` or pass `--api-key`.",
+                    serve_url
+                );
+            }
+            std::process::exit(1);
+        }
         Ok(_) => {
             eprintln!(
                 "Error: Serve at {} returned an error. Is it running?",
@@ -3730,7 +4423,7 @@ pub async fn run_tui_standalone(serve_url: String) -> Result<()> {
         }
     }
 
-    tui_remote::run_remote_tui(serve_url).await
+    tui_remote::run_remote_tui(serve_url, client).await
 }
 
 /// Run the MCP serve mode.
@@ -3976,7 +4669,17 @@ pub async fn run_serve(
     #[cfg(unix)]
     raise_fd_limit(config.repos.len());
 
-    let serve_state = Arc::new(ServeState::new(config, None));
+    let mut serve_state = ServeState::new(config, None);
+    // The `--idle-suspend-secs` flag takes precedence over the env/default the
+    // constructor already resolved; mirror the keep-warm task's resolution so
+    // the embedded TUI's federated-peer poll interval matches exactly. `0`
+    // means "disabled" for keep-warm, so treat it as "leave the default".
+    if let Some(secs) = idle_suspend_secs {
+        if secs > 0 {
+            serve_state.idle_suspend_secs = secs;
+        }
+    }
+    let serve_state = Arc::new(serve_state);
 
     // Construct the bind address from resolved host + port.
     // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.
@@ -4291,1235 +4994,5 @@ pub async fn run_serve(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn test_api_key_matches() {
-        assert!(api_key_matches("secret-key", "secret-key"));
-        assert!(!api_key_matches("secret-key", "secret-keX"));
-        assert!(!api_key_matches("secret", "secret-key")); // different length
-        assert!(!api_key_matches("", "secret-key"));
-        assert!(api_key_matches("", "")); // both empty digests are equal
-                                          // Case-sensitive and exact.
-        assert!(!api_key_matches("Secret-Key", "secret-key"));
-    }
-
-    #[test]
-    fn rest_service_drop_does_not_touch_active_sessions() {
-        // Per-request REST services (built via make_service for /search /find
-        // /explore /chunk, NOT the serve MCP session factory) must never touch
-        // active_sessions: their Drop must NOT decrement the counter, or it
-        // underflows to u64::MAX. Regression guard for the tracks_session fix.
-        let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
-        {
-            let _svc = crate::mcp::CodesearchService::new_for_serve(state.clone()).unwrap();
-        }
-        assert_eq!(
-            state.active_session_count(),
-            0,
-            "REST service drop underflowed active_sessions"
-        );
-    }
-
-    #[test]
-    fn tracked_session_drop_balances_active_sessions() {
-        // A genuine MCP session increments on connect and the serve factory
-        // marks it tracked, so Drop decrements and the counter returns to 0.
-        let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
-        let _id = state.session_connected();
-        {
-            let mut svc = crate::mcp::CodesearchService::new_for_serve(state.clone()).unwrap();
-            svc.mark_session_tracked();
-        }
-        assert_eq!(
-            state.active_session_count(),
-            0,
-            "tracked session did not balance"
-        );
-    }
-
-    #[tokio::test]
-    async fn await_fsw_shutdown_joins_exited_task_and_removes_entry() {
-        // `await_fsw_shutdown` must (a) remove the alias from `fsw_tasks` and
-        // (b) actually await (join) the task to completion — not just drop the
-        // handle. We prove the join happened by observing a side-effect the
-        // task sets on exit. Regression guard for the Windows DB-delete fix:
-        // if someone removes the join, the LMDB env stays open and the task's
-        // Arc<SharedStores> clone keeps the mmap handle locked on Windows.
-        let state = ServeState::new(ReposConfig::default(), None);
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_clone = done.clone();
-        let handle = tokio::spawn(async move {
-            // Yield once so the task isn't already-finished at insert time.
-            tokio::task::yield_now().await;
-            done_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
-        state.fsw_tasks.insert("repo-x".to_string(), handle);
-        state.await_fsw_shutdown("repo-x").await;
-        assert!(
-            !state.fsw_tasks.contains_key("repo-x"),
-            "fsw_tasks entry not removed"
-        );
-        assert!(
-            done.load(std::sync::atomic::Ordering::SeqCst),
-            "FSW task was not joined to completion"
-        );
-    }
-
-    #[tokio::test]
-    async fn await_fsw_shutdown_noop_on_missing_alias() {
-        // A repo that never had an FSW task (Warm/Readonly/Conflicted) must
-        // not panic — the map lookup is the no-op guard.
-        let state = ServeState::new(ReposConfig::default(), None);
-        state.await_fsw_shutdown("never-spawned").await;
-        assert!(state.fsw_tasks.is_empty());
-    }
-
-    /// Regression guard: `GET /remotes` must NEVER expose a peer's `api_key`.
-    ///
-    /// `RemotePeerInfo` is a dedicated projection struct with no `api_key`
-    /// field — serde cannot serialize a field that doesn't exist, so the
-    /// shared secret cannot leak even by accident. This test locks that
-    /// defense-in-depth: if a future change adds an `api_key` field to
-    /// `RemotePeerInfo` (or otherwise lets the key into the response shape),
-    /// this assertion fails.
-    #[test]
-    fn remote_peer_info_never_serializes_api_key() {
-        use crate::db_discovery::repos::RemotePeer;
-
-        // Build a peer carrying a real-looking secret, exactly as it lives in
-        // repos.json, then project it the same way `remotes_handler` does.
-        let peer = RemotePeer {
-            url: "https://codesearch-serve.example.internal".to_string(),
-            api_key: "supersecret-LEAK-MARKER-do-not-serialize".to_string(),
-            group: Some("all".to_string()),
-            timeout_secs: Some(90),
-        };
-        let info = RemotePeerInfo {
-            alias: "cloud".to_string(),
-            url: peer.url.clone(),
-            group: peer.group.clone(),
-            timeout_secs: peer.timeout_secs,
-        };
-
-        let json = serde_json::to_string(&info).expect("RemotePeerInfo must serialize");
-
-        // The four whitelisted fields are present:
-        assert!(json.contains("cloud"), "alias missing: {json}");
-        assert!(
-            json.contains("codesearch-serve.example.internal"),
-            "url missing: {json}"
-        );
-        assert!(json.contains("all"), "group missing: {json}");
-        assert!(json.contains("90"), "timeout_secs missing: {json}");
-
-        // The secret is NOT present — neither the field name nor the value:
-        assert!(
-            !json.contains("api_key"),
-            "api_key FIELD leaked into /remotes response shape: {json}"
-        );
-        assert!(
-            !json.contains("supersecret-LEAK-MARKER"),
-            "api_key VALUE leaked into /remotes response: {json}"
-        );
-    }
-
-    fn state_with_config(config: ReposConfig) -> ServeState {
-        // Use a temp file override so reload_if_changed doesn't see the real repos.json
-        let tmp = tempfile::tempdir().unwrap();
-        let config_file = tmp.path().join("repos.json");
-        config.save_to(&config_file).unwrap();
-        ServeState::new(config, Some(config_file))
-    }
-
-    #[tokio::test]
-    async fn missing_db_not_cached_as_conflicted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
-            .unwrap();
-
-        let state = state_with_config(config);
-
-        // First call: DB missing → error, NOT cached as Conflicted
-        let err = match state.get_or_open_stores("testalias", true).await {
-            Err(e) => e,
-            Ok(_) => panic!("expected error for missing DB"),
-        };
-        assert!(
-            err.contains("Database not found"),
-            "expected 'not found', got: {}",
-            err
-        );
-        assert!(!state.repos.contains_key("testalias"));
-
-        // Recreate the DB directory + metadata so the next call succeeds.
-        // Deliberately do NOT open SharedStores directly here: the reopen below
-        // (get_or_open_stores → try_open_stores) creates the LMDB env itself
-        // (proven by `try_open_stores_creates_db_for_brand_new_repo`). Opening
-        // it directly first would open the same LMDB env twice in one process,
-        // which the AGENTS.md LMDB rule forbids; on Linux the first env is not
-        // always released before the reopen, making this test flaky. One open =
-        // deterministic.
-        let db_path = repo_path.join(DB_DIR_NAME);
-        std::fs::create_dir(&db_path).unwrap();
-        let meta = db_path.join("metadata.json");
-        let mut f = std::fs::File::create(&meta).unwrap();
-        write!(f, "{{\"dimensions\":384}}").unwrap();
-        drop(f);
-
-        // Second call: should succeed without restart
-        let res = state.get_or_open_stores("testalias", true).await;
-        assert!(res.is_ok(), "expected ok after recreating DB, got: Err");
-    }
-
-    #[tokio::test]
-    async fn not_found_error_mentions_fix_commands() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
-            .unwrap();
-
-        let state = state_with_config(config);
-        let err = match state.get_or_open_stores("testalias", true).await {
-            Err(e) => e,
-            Ok(_) => panic!("expected error for missing DB"),
-        };
-        assert!(
-            err.contains("codesearch index add"),
-            "error should mention 'index add': {}",
-            err
-        );
-        assert!(
-            err.contains("codesearch index rm"),
-            "error should mention 'index rm': {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn conflicted_error_mentions_stop_and_retry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-        let db_path = repo_path.join(DB_DIR_NAME);
-        std::fs::create_dir(&db_path).unwrap();
-        let meta = db_path.join("metadata.json");
-        let mut f = std::fs::File::create(&meta).unwrap();
-        write!(f, "{{\"dimensions\":384}}").unwrap();
-        drop(f);
-
-        // Open a write lock externally
-        let _lock = SharedStores::new(&db_path, 384).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
-            .unwrap();
-
-        let state = state_with_config(config);
-        let err = match state.get_or_open_stores("testalias", true).await {
-            Err(e) => e,
-            Ok(_) => panic!("expected conflict error"),
-        };
-        assert!(err.contains("Stop"), "error should mention 'Stop': {}", err);
-        assert!(
-            err.contains("retry"),
-            "error should mention 'retry': {}",
-            err
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Central store-creation / register path — regression guards.
-    //
-    // This is the point that has silently broken multiple times: opening or
-    // creating a repo's database for a BRAND-NEW repo whose `.codesearch.db`
-    // directory does not exist yet. The failure mode was a misleading
-    // "Database is locked by another process" error -> HTTP 500 on POST /repos
-    // -> repos.json registration rolled back -> CLI fell back to a local
-    // duplicate index (control never handed to serve).
-    //
-    // RULE FOR THESE TESTS: never pre-create the `.codesearch.db` directory.
-    // Earlier tests masked this exact bug by creating it first. The create /
-    // register path must be exercised with the directory genuinely absent.
-    // ------------------------------------------------------------------
-
-    /// Core invariant: `try_open_stores(allow_create = true)` on a repo whose
-    /// database directory does not exist yet MUST create it and return a
-    /// writable handle — never a "locked"/open error. This is the single
-    /// assertion that directly catches the regression class.
-    #[tokio::test]
-    async fn try_open_stores_creates_db_for_brand_new_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("brandnew");
-        std::fs::create_dir(&repo_path).unwrap();
-        let db_path = repo_path.join(DB_DIR_NAME);
-        assert!(
-            !db_path.exists(),
-            "test precondition violated: db dir must NOT be pre-created"
-        );
-
-        let state = state_with_config(ReposConfig::default());
-
-        match state.try_open_stores("brandnew", &db_path, true) {
-            Ok(OpenedStores::Write(_)) => {}
-            Ok(OpenedStores::Readonly(_)) => {
-                panic!("brand-new repo opened Readonly; expected Write")
-            }
-            Err(e) => panic!(
-                "opening stores for a brand-new repo (allow_create=true) must succeed, got: {e}"
-            ),
-        }
-
-        assert!(
-            db_path.exists(),
-            "the .codesearch.db directory should have been created"
-        );
-    }
-
-    /// End-to-end guard for the exact symptom pair: `POST /repos` for a repo
-    /// whose database does not exist yet must return 202 Accepted, persist the
-    /// alias to repos.json, and register the repo in WRITE mode — it must NOT
-    /// return 500 and roll back the registration.
-    ///
-    /// Determinism: `#[tokio::test]` uses a current-thread runtime, so the
-    /// background reindex task spawned by the handler cannot preempt this test
-    /// (no `.await` follows the handler call). All assertions observe the
-    /// handler's synchronous pre-spawn state — no embedding model required, no
-    /// race. `persist_config` honors the temp config override, so the real
-    /// `~/.codesearch/repos.json` is never touched.
-    #[tokio::test]
-    async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("brandnew");
-        std::fs::create_dir(&repo_path).unwrap();
-        let db_path = repo_path.join(DB_DIR_NAME);
-        assert!(!db_path.exists(), "precondition: db dir must not exist yet");
-
-        let state = Arc::new(state_with_config(ReposConfig::default()));
-
-        let (status, body) = add_repo_handler(
-            axum::extract::State(state.clone()),
-            axum::extract::Json(AddRepoRequest {
-                path: repo_path.clone(),
-                alias: Some("brandnew".to_string()),
-                model: None,
-            }),
-        )
-        .await;
-
-        assert_eq!(
-            status,
-            axum::http::StatusCode::ACCEPTED,
-            "brand-new repo register must be accepted (not 500), got {}: {}",
-            status,
-            body.0
-        );
-
-        // Registration persisted, NOT rolled back.
-        assert!(
-            state.config_snapshot().repos.contains_key("brandnew"),
-            "alias must remain in repos.json after register (no rollback)"
-        );
-
-        // Registered in memory as Write so the fast-path avoids a second open.
-        assert_eq!(
-            state.repo_lock_status("brandnew"),
-            Some("write"),
-            "repo should be registered as Write immediately after add"
-        );
-
-        assert!(
-            db_path.exists(),
-            "the .codesearch.db directory should have been created"
-        );
-    }
-
-    /// `persist_config` must write to the override path (and therefore be
-    /// observable by `reload_if_changed`/`config_snapshot`) rather than the real
-    /// `~/.codesearch/repos.json`. Guards the wiring that makes the register
-    /// path hermetically testable.
-    #[test]
-    fn persist_config_honors_override_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_file = tmp.path().join("repos.json");
-        let repo_path = tmp.path().join("somerepo");
-        std::fs::create_dir(&repo_path).unwrap();
-
-        ReposConfig::default().save_to(&config_file).unwrap();
-        let state = ServeState::new(ReposConfig::default(), Some(config_file.clone()));
-
-        {
-            let mut cfg = state.config.write().unwrap();
-            cfg.register_with_alias(repo_path.clone(), Some("somerepo".to_string()))
-                .unwrap();
-            state.persist_config(&cfg).unwrap();
-        }
-
-        // The override file on disk must contain the alias.
-        let on_disk = ReposConfig::load_from(&config_file).unwrap();
-        assert!(
-            on_disk.repos.contains_key("somerepo"),
-            "persist_config must write to the override path"
-        );
-    }
-
-    #[test]
-    fn config_reload_picks_up_new_alias() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_file = tmp.path().join("repos.json");
-
-        let repo_a = tmp.path().join("repo-a");
-        std::fs::create_dir(&repo_a).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_a.clone(), Some("a".to_string()))
-            .unwrap();
-        config.save_to(&config_file).unwrap();
-
-        let state = ServeState::new(config, Some(config_file.clone()));
-        assert_eq!(state.aliases(), vec!["a"]);
-
-        // Add a new alias directly to the file
-        let repo_b = tmp.path().join("repo-b");
-        std::fs::create_dir(&repo_b).unwrap();
-        let mut config2 = ReposConfig::load_from(&config_file).unwrap();
-        config2
-            .register_with_alias(repo_b, Some("b".to_string()))
-            .unwrap();
-
-        // Small sleep to ensure mtime changes on Windows
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        config2.save_to(&config_file).unwrap();
-
-        // Next query should pick it up
-        let aliases = state.aliases();
-        assert!(aliases.contains(&"a".to_string()));
-        assert!(aliases.contains(&"b".to_string()));
-    }
-
-    #[tokio::test]
-    async fn config_reload_drops_removed_alias() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_file = tmp.path().join("repos.json");
-
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-        let db_path = repo_path.join(DB_DIR_NAME);
-        std::fs::create_dir(&db_path).unwrap();
-        let meta = db_path.join("metadata.json");
-        let mut f = std::fs::File::create(&meta).unwrap();
-        write!(f, "{{\"dimensions\":384}}").unwrap();
-        drop(f);
-        let _stores = SharedStores::new(&db_path, 384).unwrap();
-        drop(_stores);
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path.clone(), Some("x".to_string()))
-            .unwrap();
-        config.save_to(&config_file).unwrap();
-
-        let state = ServeState::new(config, Some(config_file.clone()));
-        // Open alias x so it lands in DashMap
-        let _ = state.get_or_open_stores("x", true).await.unwrap();
-        assert!(state.repos.contains_key("x"));
-
-        // Rewrite config without x
-        let config2 = ReposConfig::default();
-
-        // Small sleep to ensure mtime changes on Windows
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        config2.save_to(&config_file).unwrap();
-
-        // Next query for x should fail as unknown
-        let err = match state.get_or_open_stores("x", true).await {
-            Err(e) => e,
-            Ok(_) => panic!("expected unknown alias after removal"),
-        };
-        assert!(
-            err.contains("Unknown alias"),
-            "expected unknown alias, got: {}",
-            err
-        );
-        assert!(!state.repos.contains_key("x"));
-    }
-
-    #[test]
-    fn config_reload_no_spurious_reload() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_file = tmp.path().join("repos.json");
-
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path, Some("a".to_string()))
-            .unwrap();
-        config.save_to(&config_file).unwrap();
-
-        let state = ServeState::new(config, Some(config_file.clone()));
-        let initial = state.reload_count.load(std::sync::atomic::Ordering::SeqCst);
-
-        // First call triggers reload (mtime was None)
-        let _ = state.aliases();
-        let after_first = state.reload_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(after_first, initial + 1);
-
-        // Second call without file change should NOT reload
-        let _ = state.aliases();
-        let after_second = state.reload_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(after_second, after_first);
-    }
-
-    /// Verify that the /repos/:alias/reindex route is registered and reachable.
-    /// This test starts a real axum server on a random port and sends a POST request.
-    #[tokio::test]
-    async fn reindex_route_is_registered() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
-            .unwrap();
-
-        let config_file = tmp.path().join("repos.json");
-        config.save_to(&config_file).unwrap();
-
-        let state = Arc::new(ServeState::new(config, Some(config_file)));
-
-        let app = axum::Router::new()
-            .route(
-                crate::constants::HEALTH_PATH,
-                axum::routing::get(health_handler),
-            )
-            .route(
-                "/repos/:alias/reindex",
-                axum::routing::post(reindex_handler),
-            )
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // Give the server a moment to start
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let client = reqwest::Client::new();
-
-        // POST to unknown alias → 404 from our handler (not axum's built-in 404)
-        let resp = client
-            .post(format!("http://{}/repos/unknown/reindex", addr))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "expected 404 from our handler"
-        );
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .expect("handler should return JSON body for 404");
-        assert!(
-            body.get("error").is_some(),
-            "expected JSON error body, got: {}",
-            body
-        );
-
-        // POST to known alias → 202 Accepted or 500 (DB missing), but NOT axum's built-in 404
-        // The key assertion is that the route IS registered (we get our handler's response, not axum's empty 404)
-        let resp = client
-            .post(format!("http://{}/repos/testalias/reindex", addr))
-            .send()
-            .await
-            .unwrap();
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().await.expect("handler should return JSON body");
-        assert!(
-            status == reqwest::StatusCode::ACCEPTED
-                || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "expected 202 or 500 from our handler (not axum's 404), got {}: {}",
-            status,
-            body
-        );
-        assert!(
-            body.get("status").is_some(),
-            "expected JSON with 'status' field, got: {}",
-            body
-        );
-    }
-
-    /// `/healthz` is exempt from `require_auth_for_network`: reachable without a
-    /// key even on a (simulated) network bind, while `/health` stays protected.
-    #[tokio::test]
-    async fn healthz_is_unauthenticated_on_network_bind() {
-        let network_auth = NetworkAuthConfig {
-            is_network_bind: true,
-            api_key: Some("secret-key".to_string()),
-        };
-
-        let app = axum::Router::new()
-            .route(HEALTH_PATH, axum::routing::get(health_handler))
-            .route(HEALTHZ_PATH, axum::routing::get(healthz_handler))
-            .layer(axum::middleware::from_fn(require_auth_for_network))
-            .layer(axum::Extension(network_auth));
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let client = reqwest::Client::new();
-
-        // /healthz reachable WITHOUT a key on a network bind.
-        let resp = client
-            .get(format!("http://{}/healthz", addr))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            reqwest::StatusCode::OK,
-            "/healthz must be public on a network bind"
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(
-            body.get("status").and_then(|v| v.as_str()),
-            Some("ok"),
-            "/healthz body must be {{\"status\":\"ok\"}}"
-        );
-
-        // /health stays protected on a network bind (401 without a key).
-        let resp = client
-            .get(format!("http://{}/health", addr))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            reqwest::StatusCode::UNAUTHORIZED,
-            "/health must still require auth on a network bind"
-        );
-    }
-
-    /// Verify that the /repos/:alias/info and /repos/:alias/doctor routes are
-    /// registered and reachable. Starts a real axum server on a random port and
-    /// asserts that an unknown alias yields our handler's 404 (not axum's 404).
-    #[tokio::test]
-    async fn info_doctor_routes_registered() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
-            .unwrap();
-
-        let config_file = tmp.path().join("repos.json");
-        config.save_to(&config_file).unwrap();
-
-        let state = Arc::new(ServeState::new(config, Some(config_file)));
-
-        let app = axum::Router::new()
-            .route(
-                crate::constants::HEALTH_PATH,
-                axum::routing::get(health_handler),
-            )
-            .route("/repos/:alias/info", axum::routing::get(info_handler))
-            .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        // Give the server a moment to start
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let client = reqwest::Client::new();
-
-        // GET unknown alias info → 404 from our handler (not axum's built-in 404)
-        let resp = client
-            .get(format!("http://{}/repos/unknown/info", addr))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "expected 404 from info handler"
-        );
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .expect("info handler should return JSON body for 404");
-        assert!(
-            body.get("error").is_some(),
-            "expected JSON error body from info handler, got: {}",
-            body
-        );
-
-        // POST unknown alias doctor → 404 from our handler (not axum's built-in 404)
-        let resp = client
-            .post(format!("http://{}/repos/unknown/doctor", addr))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            reqwest::StatusCode::NOT_FOUND,
-            "expected 404 from doctor handler"
-        );
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .expect("doctor handler should return JSON body for 404");
-        assert!(
-            body.get("error").is_some(),
-            "expected JSON error body from doctor handler, got: {}",
-            body
-        );
-    }
-
-    /// Verify that the federation REST endpoints (/search, /find, /explore,
-    /// /chunk/:id) are registered and reachable. Each must dispatch to OUR
-    /// handler (returning a JSON body) rather than axum's built-in empty 404.
-    /// Starts a real axum server on a random port.
-    #[tokio::test]
-    async fn rest_routes_are_registered() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
-            .unwrap();
-
-        let config_file = tmp.path().join("repos.json");
-        config.save_to(&config_file).unwrap();
-
-        let state = Arc::new(ServeState::new(config, Some(config_file)));
-
-        let app = axum::Router::new()
-            .route(
-                crate::constants::HEALTH_PATH,
-                axum::routing::get(health_handler),
-            )
-            .route(
-                crate::constants::SEARCH_PATH,
-                axum::routing::post(crate::mcp::rest_search_handler),
-            )
-            .route(
-                crate::constants::FIND_PATH,
-                axum::routing::post(crate::mcp::rest_find_handler),
-            )
-            .route(
-                crate::constants::EXPLORE_PATH,
-                axum::routing::post(crate::mcp::rest_explore_handler),
-            )
-            .route(
-                crate::constants::CHUNK_PATH,
-                axum::routing::get(crate::mcp::rest_get_chunk_handler),
-            )
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let client = reqwest::Client::new();
-
-        // Helper: a response from OUR handler is either 200 (success) or 500
-        // (McpError mapped), but ALWAYS a parseable JSON body — never axum's
-        // built-in empty 404. The repo has no index, so the tools return
-        // error/scope JSON; we only assert the route + handler are wired.
-        async fn assert_our_handler(client: &reqwest::Client, url: String) -> serde_json::Value {
-            let resp = client.get(&url).send().await.unwrap();
-            // GET endpoints: must reach our handler (JSON body), status 200/500.
-            assert!(
-                resp.status() == reqwest::StatusCode::OK
-                    || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                "GET {} -> unexpected status {} (route not registered?)",
-                url,
-                resp.status()
-            );
-            resp.json().await.unwrap_or_else(|e| {
-                panic!(
-                    "GET {} did not return a JSON body from our handler: {}",
-                    url, e
-                )
-            })
-        }
-
-        // POST /search — dispatches to rest_search_handler.
-        let resp = client
-            .post(format!("http://{}/search", addr))
-            .json(&serde_json::json!({"query": "foo", "project": "testalias"}))
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            resp.status() == reqwest::StatusCode::OK
-                || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "POST /search -> unexpected status {} (route not registered?)",
-            resp.status()
-        );
-        let _body: serde_json::Value = resp
-            .json()
-            .await
-            .expect("POST /search should return JSON from our handler, not axum's 404");
-
-        // POST /find — dispatches to rest_find_handler.
-        let resp = client
-            .post(format!("http://{}/find", addr))
-            .json(
-                &serde_json::json!({"kind": "definition", "symbol": "foo", "project": "testalias"}),
-            )
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            resp.status() == reqwest::StatusCode::OK
-                || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "POST /find -> unexpected status {} (route not registered?)",
-            resp.status()
-        );
-        let _: serde_json::Value = resp
-            .json()
-            .await
-            .expect("POST /find should return JSON from our handler");
-
-        // POST /explore — dispatches to rest_explore_handler.
-        let resp = client
-            .post(format!("http://{}/explore", addr))
-            .json(&serde_json::json!({"kind": "outline", "target": "somefile", "project": "testalias"}))
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            resp.status() == reqwest::StatusCode::OK
-                || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "POST /explore -> unexpected status {} (route not registered?)",
-            resp.status()
-        );
-        let _: serde_json::Value = resp
-            .json()
-            .await
-            .expect("POST /explore should return JSON from our handler");
-
-        // GET /chunk/1 — dispatches to rest_get_chunk_handler.
-        let _ = assert_our_handler(
-            &client,
-            format!("http://{}/chunk/1?project=testalias", addr),
-        )
-        .await;
-    }
-
-    #[test]
-    fn config_reload_tolerates_parse_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_file = tmp.path().join("repos.json");
-
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path.clone(), Some("a".to_string()))
-            .unwrap();
-        config.save_to(&config_file).unwrap();
-
-        let state = ServeState::new(config, Some(config_file.clone()));
-        assert!(state.aliases().contains(&"a".to_string()));
-
-        // Overwrite with garbage
-        std::fs::write(&config_file, "not-json-at-all").unwrap();
-
-        // Should not panic; old config still usable
-        let aliases = state.aliases();
-        assert!(aliases.contains(&"a".to_string()));
-    }
-
-    /// Verify that concurrent reindex requests for the same alias return 409 Conflict.
-    #[tokio::test]
-    async fn concurrent_reindex_returns_conflict() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_path = tmp.path().join("myrepo");
-        std::fs::create_dir(&repo_path).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
-            .unwrap();
-
-        let config_file = tmp.path().join("repos.json");
-        config.save_to(&config_file).unwrap();
-
-        let state = Arc::new(ServeState::new(config, Some(config_file)));
-
-        let app = axum::Router::new()
-            .route(
-                "/repos/:alias/reindex",
-                axum::routing::post(reindex_handler),
-            )
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let client = reqwest::Client::new();
-
-        // First request: 202 Accepted (or 500 if DB missing) — but NOT 409
-        let resp1 = client
-            .post(format!("http://{}/repos/testalias/reindex", addr))
-            .send()
-            .await
-            .unwrap();
-        let status1 = resp1.status();
-        assert!(
-            status1 == reqwest::StatusCode::ACCEPTED
-                || status1 == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "first request should be 202 or 500, got {}",
-            status1
-        );
-
-        // If the first request was accepted (202), the reindex is running in background.
-        // Send a second request immediately — should get 409 Conflict.
-        if status1 == reqwest::StatusCode::ACCEPTED {
-            let resp2 = client
-                .post(format!("http://{}/repos/testalias/reindex", addr))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(
-                resp2.status(),
-                reqwest::StatusCode::CONFLICT,
-                "second concurrent request should be 409 Conflict"
-            );
-            let body: serde_json::Value = resp2.json().await.unwrap();
-            assert_eq!(body["status"], "conflict");
-        }
-    }
-
-    /// Unit tests for `validate_path_within_allowed_roots`.
-    ///
-    /// These tests temporarily set/remove the `CODESEARCH_ALLOWED_ROOTS` env var.
-    /// A static Mutex serializes env mutation to prevent races under parallel test execution.
-    #[cfg(test)]
-    mod allowed_roots_tests {
-        use super::*;
-        use std::path::PathBuf;
-        use std::sync::Mutex;
-
-        /// Global lock to serialize env var mutations across parallel test threads.
-        static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-
-        fn lock() -> std::sync::MutexGuard<'static, ()> {
-            ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-        }
-
-        /// Helper: create a unique temp dir per test, return its canonical path.
-        fn temp_root(suffix: &str) -> PathBuf {
-            let dir = std::env::temp_dir().join(format!("codesearch_test_roots_{}", suffix));
-            let _ = std::fs::create_dir_all(&dir);
-            safe_canonicalize(&dir).unwrap()
-        }
-
-        fn clear_env() {
-            std::env::remove_var(ALLOWED_ROOTS_ENV);
-        }
-
-        fn set_env(val: &str) {
-            std::env::set_var(ALLOWED_ROOTS_ENV, val);
-        }
-
-        #[test]
-        fn env_unset_allows_all() {
-            let _guard = lock();
-            clear_env();
-            let path = PathBuf::from("/some/random/path");
-            assert!(validate_path_within_allowed_roots(&path).is_ok());
-        }
-
-        #[test]
-        fn env_empty_allows_all() {
-            let _guard = lock();
-            set_env("");
-            let path = PathBuf::from("/some/random/path");
-            assert!(validate_path_within_allowed_roots(&path).is_ok());
-            clear_env();
-        }
-
-        #[test]
-        fn path_within_root_is_allowed() {
-            let _guard = lock();
-            let root = temp_root("within");
-            set_env(&root.display().to_string());
-            let child = root.join("my-project");
-            let _ = std::fs::create_dir_all(&child);
-            let canonical_child = safe_canonicalize(&child).unwrap();
-            assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
-            clear_env();
-        }
-
-        #[test]
-        fn exact_root_match_is_allowed() {
-            let _guard = lock();
-            let root = temp_root("exact");
-            set_env(&root.display().to_string());
-            assert!(validate_path_within_allowed_roots(&root).is_ok());
-            clear_env();
-        }
-
-        #[test]
-        fn path_outside_root_is_rejected() {
-            let _guard = lock();
-            let root = temp_root("outside");
-            set_env(&root.display().to_string());
-            // Construct a path guaranteed outside the temp root
-            let outside = if cfg!(windows) {
-                PathBuf::from("C:\\Windows\\System32")
-            } else {
-                PathBuf::from("/etc")
-            };
-            assert!(
-                !outside.starts_with(&root),
-                "Test setup error: outside path '{}' must not overlap root '{}'",
-                outside.display(),
-                root.display()
-            );
-            let result = validate_path_within_allowed_roots(&outside);
-            assert!(result.is_err(), "Expected rejection for path outside root");
-            assert!(result.unwrap_err().contains("outside allowed roots"));
-            clear_env();
-        }
-
-        #[test]
-        fn all_nonexistent_roots_rejects() {
-            let _guard = lock();
-            set_env("/nonexistent/path/abc;/also/nonexistent/xyz");
-            let some_path = std::env::temp_dir();
-            let canonical = safe_canonicalize(&some_path).unwrap();
-            let result = validate_path_within_allowed_roots(&canonical);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("No valid roots found"));
-            clear_env();
-        }
-
-        #[test]
-        fn semicolons_with_empty_segments_works() {
-            let _guard = lock();
-            let root = temp_root("semicolons");
-            set_env(&format!(";{};;", root.display()));
-            let child = root.join("project");
-            let _ = std::fs::create_dir_all(&child);
-            let canonical_child = safe_canonicalize(&child).unwrap();
-            assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
-            clear_env();
-        }
-
-        #[test]
-        fn multiple_roots_any_match() {
-            let _guard = lock();
-            let root1 = temp_root("multi1");
-            let root2 = temp_root("multi2");
-
-            set_env(&format!("{};{}", root1.display(), root2.display()));
-
-            // Path under root1
-            let child1 = root1.join("project");
-            let _ = std::fs::create_dir_all(&child1);
-            let canonical1 = safe_canonicalize(&child1).unwrap();
-            assert!(validate_path_within_allowed_roots(&canonical1).is_ok());
-
-            // Path under root2
-            let child2 = root2.join("project");
-            let _ = std::fs::create_dir_all(&child2);
-            let canonical2 = safe_canonicalize(&child2).unwrap();
-            assert!(validate_path_within_allowed_roots(&canonical2).is_ok());
-
-            clear_env();
-        }
-    }
-
-    /// The reserved virtual "all" group must resolve to every registered alias
-    /// via the serve-layer entry point used by MCP tools (issue #131).
-    #[test]
-    fn resolve_group_aliases_all_returns_every_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_a = tmp.path().join("repo-a");
-        let repo_b = tmp.path().join("repo-b");
-        std::fs::create_dir(&repo_a).unwrap();
-        std::fs::create_dir(&repo_b).unwrap();
-
-        let mut config = ReposConfig::default();
-        config
-            .register_with_alias(repo_a, Some("alpha".to_string()))
-            .unwrap();
-        config
-            .register_with_alias(repo_b, Some("beta".to_string()))
-            .unwrap();
-
-        let state = state_with_config(config);
-
-        let aliases = state
-            .resolve_group_aliases(crate::constants::ALL_GROUP_NAME)
-            .expect("'all' should resolve");
-        assert_eq!(aliases, vec!["alpha".to_string(), "beta".to_string()]);
-
-        // "all" is never stored — an unknown real group still errors.
-        assert!(state.resolve_group_aliases("does-not-exist").is_err());
-    }
-
-    /// Tests for `build_streamable_http_config` — DNS rebinding defence env vars
-    /// (`CODESEARCH_ALLOWED_HOSTS`, `CODESEARCH_DISABLE_HOST_VALIDATION`) added
-    /// for issue #149 / GHSA-89vp-x53w-74fx.
-    mod allowed_hosts_tests {
-        use super::*;
-        use std::sync::Mutex;
-
-        /// Serialize env var mutations across parallel test threads (same pattern
-        /// as `allowed_roots_tests`). Different env vars from `allowed_roots_tests`
-        /// so cross-module parallelism is safe.
-        static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-
-        fn lock() -> std::sync::MutexGuard<'static, ()> {
-            ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-        }
-
-        fn clear_env() {
-            std::env::remove_var(ALLOWED_HOSTS_ENV);
-            std::env::remove_var(DISABLE_HOST_VALIDATION_ENV);
-        }
-
-        #[test]
-        fn default_is_loopback_only() {
-            let _guard = lock();
-            clear_env();
-            let config = build_streamable_http_config();
-            assert_eq!(
-                config.allowed_hosts,
-                vec![
-                    "localhost".to_string(),
-                    "127.0.0.1".to_string(),
-                    "::1".to_string(),
-                ]
-            );
-        }
-
-        #[test]
-        fn custom_allowed_hosts_replaces_default() {
-            let _guard = lock();
-            clear_env();
-            std::env::set_var(ALLOWED_HOSTS_ENV, "codesearch.internal, codesearch:39725");
-            let config = build_streamable_http_config();
-            assert_eq!(
-                config.allowed_hosts,
-                vec![
-                    "codesearch.internal".to_string(),
-                    "codesearch:39725".to_string(),
-                ]
-            );
-        }
-
-        #[test]
-        fn disable_validation_clears_allowlist() {
-            let _guard = lock();
-            clear_env();
-            std::env::set_var(DISABLE_HOST_VALIDATION_ENV, "1");
-            let config = build_streamable_http_config();
-            assert!(
-                config.allowed_hosts.is_empty(),
-                "disable_allowed_hosts() should produce an empty allowlist"
-            );
-        }
-
-        #[test]
-        fn disable_validation_accepts_true_case_insensitive() {
-            let _guard = lock();
-            clear_env();
-            std::env::set_var(DISABLE_HOST_VALIDATION_ENV, "TRUE");
-            let config = build_streamable_http_config();
-            assert!(config.allowed_hosts.is_empty());
-        }
-
-        #[test]
-        fn disable_validation_ignores_other_values() {
-            let _guard = lock();
-            clear_env();
-            std::env::set_var(DISABLE_HOST_VALIDATION_ENV, "yes");
-            let config = build_streamable_http_config();
-            // Not "1" or "true" → rmcp default applies.
-            assert_eq!(config.allowed_hosts.len(), 3);
-        }
-
-        #[test]
-        fn empty_allowed_hosts_falls_back_to_default() {
-            let _guard = lock();
-            clear_env();
-            std::env::set_var(ALLOWED_HOSTS_ENV, "  ,  ,  ");
-            let config = build_streamable_http_config();
-            assert_eq!(
-                config.allowed_hosts,
-                vec![
-                    "localhost".to_string(),
-                    "127.0.0.1".to_string(),
-                    "::1".to_string(),
-                ],
-                "all-empty entries should leave the rmcp default intact"
-            );
-        }
-
-        #[test]
-        fn disable_overrides_allowed_hosts() {
-            let _guard = lock();
-            clear_env();
-            std::env::set_var(ALLOWED_HOSTS_ENV, "codesearch.internal");
-            std::env::set_var(DISABLE_HOST_VALIDATION_ENV, "true");
-            let config = build_streamable_http_config();
-            assert!(
-                config.allowed_hosts.is_empty(),
-                "DISABLE_HOST_VALIDATION takes precedence over ALLOWED_HOSTS"
-            );
-        }
-    }
-}
+#[path = "tests.rs"]
+mod tests;

@@ -58,6 +58,8 @@ pub struct RepoRow {
     pub csharp_index: String,
     /// Optional C# error message
     pub csharp_error: Option<String>,
+    /// TypeScript index status: same vocabulary as `csharp_index`.
+    pub typescript_index: String,
     /// Pending file changes detected by file watcher
     pub changes: u64,
     /// Total MCP tool calls since serve start
@@ -72,6 +74,14 @@ pub struct RepoRow {
     /// peer, surfaced locally via `project=<peer>/<alias>`). Rendered italic to
     /// signal it is not a local index.
     pub is_remote: bool,
+    /// True when this *remote* row's activity (`last_tool_call`) is considered
+    /// stale by the embedded TUI — i.e. the peer's `/status` hasn't been
+    /// refreshed within `REMOTE_ACTIVITY_FRESH_SECS` (the slow baseline poll
+    /// hasn't fired and no real tool call has poked an immediate refresh). When
+    /// stale, the activity column renders `-` instead of a possibly-hours-old
+    /// "Xh ago". Always `false` for local repos (which carry live serve state)
+    /// and for the standalone remote dashboard.
+    pub activity_stale: bool,
 }
 
 /// Actions returned by key handling.
@@ -98,6 +108,9 @@ pub enum KeyAction {
 /// mount, so these live on the peer).
 #[derive(Debug, Clone)]
 pub struct RemoteIndexStats {
+    /// On-disk path of the index database on the PEER (not the local
+    /// machine) — the peer's `.codesearch.db` directory for this repo.
+    pub path: String,
     pub chunks: usize,
     pub files: usize,
     pub db_size_human: String,
@@ -121,6 +134,10 @@ pub enum OverlayState {
     /// Info modal: repo name, chunks, files, db size, model, dims, etc.
     Info {
         alias: String,
+        /// On-disk path of this repo's index database (the `.codesearch.db`
+        /// directory), so a user staring at the info panel can find it on
+        /// disk without cross-referencing `repos.json`.
+        path: String,
         chunks: usize,
         files: usize,
         max_chunk_id: u32,
@@ -322,10 +339,14 @@ pub fn render_table(
     let max_alias_w = repos
         .iter()
         .map(|r| {
-            let extra = match r.csharp_index.as_str() {
-                "ready" | "error" | "indexing" => 4,
-                _ => 0,
-            };
+            // Each indicator (" C#·" / " TS·") is 4 display cols; account for both.
+            let mut extra = 0usize;
+            if matches!(r.csharp_index.as_str(), "ready" | "error" | "indexing") {
+                extra += 4;
+            }
+            if matches!(r.typescript_index.as_str(), "ready" | "error" | "indexing") {
+                extra += 4;
+            }
             r.alias.len() + extra
         })
         .max()
@@ -348,12 +369,21 @@ pub fn render_table(
             } else {
                 Cell::from("    -".to_string()).style(Style::default().fg(Color::DarkGray))
             };
-            let tool_cell = Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
-                .style(Style::default().fg(Color::DarkGray));
+            // Federated peers are polled on the slow idle-suspend cadence (no
+            // longer every 30s) so they can scale to zero; between refreshes the
+            // cached activity is stale and rendered as `-` rather than a
+            // misleading "Xh ago". Local repos are always live
+            // (`activity_stale == false`).
+            let tool_cell = if repo.activity_stale {
+                Cell::from("-".to_string()).style(Style::default().fg(Color::DarkGray))
+            } else {
+                Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
+                    .style(Style::default().fg(Color::DarkGray))
+            };
             let lock_cell = lock_cell(&repo.lock_mode);
 
             // Alias text with optional C# indicator suffix, plus its base style.
-            let (alias_text, mut alias_style) = match repo.csharp_index.as_str() {
+            let (mut alias_text, mut alias_style) = match repo.csharp_index.as_str() {
                 "ready" => (
                     format!("{} C#·", repo.alias),
                     Style::default().fg(Color::White),
@@ -374,6 +404,19 @@ pub fn render_table(
                 }
                 _ => (repo.alias.clone(), Style::default().fg(Color::White)),
             };
+
+            // Append the TypeScript indicator alongside the C# one when a TS
+            // index exists. The alias column is the canonical multi-language
+            // symbol-index indicator (the status cell only carries C#).
+            match repo.typescript_index.as_str() {
+                "ready" => alias_text.push_str(" TS·"),
+                "error" => {
+                    alias_text.push_str(" TS!");
+                    alias_style = alias_style.fg(Color::Red);
+                }
+                "indexing" => alias_text.push_str(" TS…"),
+                _ => {}
+            }
 
             // Red bold alias if the repo is in an error state.
             if repo.status == "error" {
@@ -524,8 +567,17 @@ pub fn render_detail(
         ),
     ];
 
-    // Third item: last tool call
-    if let Some(ref tool) = repo.last_tool_call {
+    // Third item: last tool call. For a stale federated row the cached value is
+    // possibly hours old (the peer hasn't been polled since the slow baseline
+    // cadence), so show `-` instead of a misleading age. Local repos are always
+    // live (`activity_stale == false`).
+    if repo.activity_stale {
+        info_spans.push(Span::styled(
+            "  last:",
+            Style::default().fg(Color::DarkGray),
+        ));
+        info_spans.push(Span::styled(" -", Style::default().fg(Color::DarkGray)));
+    } else if let Some(ref tool) = repo.last_tool_call {
         info_spans.push(Span::styled(
             "  last:",
             Style::default().fg(Color::DarkGray),
@@ -645,6 +697,7 @@ pub fn render_footer(
     active: u64,
     cpu: &str,
     csharp_helper: bool,
+    ts_helper: bool,
     flash: Option<&str>,
 ) {
     let selected = table_state.selected().unwrap_or(0);
@@ -657,7 +710,7 @@ pub fn render_footer(
     let sessions_str = format!("Sessions: {}", active);
     let cpu_str = format!("CPU: {}", cpu);
 
-    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len();
+    let right_len = cpu_str.len() + sessions_str.len() + 3 + "C# │ ".len() + "TS │ ".len();
 
     let footer_inner = area.inner(Margin {
         vertical: 0,
@@ -711,8 +764,15 @@ pub fn render_footer(
         Span::styled("C# │ ", Style::default().fg(Color::DarkGray))
     };
 
+    let ts_indicator = if ts_helper {
+        Span::styled("TS │ ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled("TS │ ", Style::default().fg(Color::DarkGray))
+    };
+
     let right_line = Line::from(vec![
         csharp_indicator,
+        ts_indicator,
         Span::styled(cpu_str, Style::default().fg(Color::Green)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(sessions_str, Style::default().fg(Color::Cyan)),
@@ -735,6 +795,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
     match overlay {
         OverlayState::Info {
             alias,
+            path,
             chunks,
             files,
             max_chunk_id,
@@ -746,6 +807,10 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
         } => {
             let title = format!(" {} — Index Info ", alias);
             let lines = vec![
+                Line::from(vec![
+                    Span::styled("  Path:        ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(path.clone(), Style::default().fg(Color::White)),
+                ]),
                 Line::from(vec![
                     Span::styled("  Chunks:      ", Style::default().fg(Color::DarkGray)),
                     Span::styled(format!("{}", chunks), Style::default().fg(Color::White)),
@@ -813,6 +878,10 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             // db-size/model detail a local repo shows in its Info overlay.
             let stat_lines: Vec<Line> = match stats {
                 RemoteStatsState::Ready(s) => vec![
+                    Line::from(vec![
+                        Span::styled("  Path (peer): ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(s.path.clone(), Style::default().fg(Color::White)),
+                    ]),
                     Line::from(vec![
                         Span::styled("  Chunks:      ", Style::default().fg(Color::DarkGray)),
                         Span::styled(format!("{}", s.chunks), Style::default().fg(Color::White)),

@@ -368,16 +368,56 @@ pub const DEFAULT_IDLE_SUSPEND_SECS: u64 = 2 * 60 * 60;
 /// How often the keep-warm task pings its own ingress while active.
 pub const KEEP_WARM_INTERVAL_SECS: u64 = 2 * 60; // 2 minutes
 
+// --- MCP proxy idle-disconnect (client side of scale-to-zero) -----------------
+
+/// Environment variable to override how long the local `codesearch mcp` proxy
+/// keeps its HTTP MCP session to the remote `codesearch serve` open while no
+/// tool calls are flowing.
+///
+/// This is the client-side counterpart of `IDLE_SUSPEND_SECS_ENV`: a single
+/// long-lived Streamable-HTTP session registers as a permanently open request at
+/// the remote's ingress, so a scale-to-zero host (e.g. Azure Container Apps with
+/// a KEDA HTTP scaler) never observes 0 concurrent requests and never suspends
+/// the replica. Closing the session while idle lets it scale down; the next tool
+/// call reconnects on demand.
+pub const MCP_PROXY_IDLE_DISCONNECT_SECS_ENV: &str = "CODESEARCH_MCP_PROXY_IDLE_DISCONNECT_SECS";
+
+/// Default idle window before the local MCP proxy closes its connection to the
+/// remote serve hub (1 minute).
+///
+/// Deliberately short: it has to elapse *before* the host's own scale-in
+/// cooldown can start, otherwise the replica never gets the chance to suspend
+/// after real use stops. Still long enough that closely-spaced tool calls (an
+/// agent issuing `search` → `get_chunk` → `find` in sequence) reuse one session
+/// instead of thrashing connect/teardown.
+///
+/// `0` disables idle-disconnect entirely, restoring the previous behaviour of
+/// one connection held open for the whole lifetime of the proxy process.
+pub const DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS: u64 = 60;
+
+/// How often the MCP proxy's idle-checker task ticks. Bounds how long past the
+/// configured window a connection may linger before being closed.
+pub const MCP_PROXY_IDLE_CHECK_INTERVAL_SECS: u64 = 10;
+
 /// Default per-peer federation request timeout (seconds) when a remote peer
 /// does not specify its own `timeout_secs`. Shared by the federation client
 /// and the `remote` CLI command so both report/apply the same default.
 pub const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 15;
 
-/// How often the embedded TUI re-discovers mounted remote projects (queries each
-/// peer's `/status` in the background). Slow enough that per-peer HTTP never
-/// competes with the ~500ms render tick; a peer blip is masked by the in-memory
-/// last-known list until the next successful poll.
-pub const REMOTE_DISCOVERY_INTERVAL_SECS: u64 = 30;
+/// How long after a federated peer's `/status` refresh the embedded TUI still
+/// considers that peer's activity "live" before reverting the activity column to
+/// a stale `-`.
+///
+/// The baseline re-discovery poll runs on the **serve idle-suspend window** (see
+/// [`IDLE_SUSPEND_SECS_ENV`] / [`DEFAULT_IDLE_SUSPEND_SECS`]) — the same term
+/// after which the host is allowed to scale the replica to zero — so the TUI no
+/// longer pins a federated peer awake with a fixed 30s ping. Instead, an
+/// immediate per-peer refresh is triggered the moment a real tool call hits that
+/// peer (event-driven, see `ServeState::record_remote_peer_activity`), and
+/// *between* refreshes the activity column shows `-`. This window is how long a
+/// freshly polled value stays visible before it goes stale again; it is short
+/// relative to the hourly baseline poll.
+pub const REMOTE_ACTIVITY_FRESH_SECS: u64 = 5 * 60; // 5 minutes
 
 /// Maximum wall-clock duration a single reindex may take before its
 /// `active_reindexes` entry is considered **stale** (leaked).
@@ -403,6 +443,30 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
+
+/// Cooperative join window (seconds) for `await_index_task` and
+/// `await_fsw_shutdown`: how long a background indexing / file-watcher task
+/// is given to observe its `CancellationToken` and exit on its own before it
+/// is force-aborted. Kept short so a stuck task cannot wedge `remove_repo`;
+/// the follow-on DB-delete retry budget (`DB_DELETE_RETRY_BUDGET_SECS`) is
+/// the outer bound for the whole shutdown.
+pub const BG_TASK_COOPERATIVE_TIMEOUT_SECS: u64 = 5;
+
+/// Total wall-clock budget (seconds) `remove_repo` spends retrying a locked
+/// `.codesearch.db` delete after the background task is aborted. An indexing
+/// task that ignores its token is force-aborted, but its `Arc<SharedStores>`
+/// / LMDB handles are only released once the runtime finishes dropping the
+/// aborted future; this budget covers that release window plus any OS
+/// handle-close lag on Windows.
+pub const DB_DELETE_RETRY_BUDGET_SECS: u64 = 60;
+
+/// Initial backoff (milliseconds) for the locked-DB delete retry loop in
+/// `remove_repo`; doubled each attempt up to `DB_DELETE_RETRY_BACKOFF_CAP_MS`.
+pub const DB_DELETE_RETRY_INITIAL_MS: u64 = 200;
+
+/// Upper bound (milliseconds) for the exponential backoff between locked-DB
+/// delete retries in `remove_repo`.
+pub const DB_DELETE_RETRY_BACKOFF_CAP_MS: u64 = 2000;
 
 /// Default embedding dimensions used when metadata is missing or unreadable.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
@@ -458,6 +522,24 @@ pub const SCIP_REF_CACHE_DB_NAME: &str = "scip_ref_cache";
 /// Language identifier for the C# symbol indexer.
 /// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
 pub const LANG_CSHARP: &str = "csharp";
+
+/// Language identifier for the TypeScript symbol indexer.
+/// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
+pub const LANG_TYPESCRIPT: &str = "typescript";
+
+/// Environment variable override for the `scip-typescript` helper/CLI path.
+/// When unset, the indexer falls back to `npx scip-typescript`.
+pub const SCIP_TYPESCRIPT_HELPER_ENV: &str = "CODESEARCH_SCIP_TYPESCRIPT";
+
+/// LMDB metadata key for the TypeScript indexer's last rebuild timestamp.
+/// Namespaced per-language (unlike C#'s un-namespaced `SCIP_REBUILD_TIMESTAMP_KEY`)
+/// so both adapters can safely share the same `scip_meta` table if ever merged.
+pub const SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts:typescript";
+
+/// Debounce window (ms) for the TypeScript file-watcher symbol rebuild.
+/// Mirrors `SCIP_CSHARP_DEBOUNCE_MS` — a single quiet-period flush avoids
+/// spawning `scip-typescript` once per saved file during a burst of edits.
+pub const SCIP_TYPESCRIPT_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 
 /// Environment variable controlling phase-2 C# SCIP rebuild concurrency.
 /// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].

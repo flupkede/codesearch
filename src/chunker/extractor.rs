@@ -89,6 +89,7 @@ pub fn get_extractor(language: Language) -> Option<Box<dyn LanguageExtractor>> {
         Language::Go => Some(Box::new(GoExtractor)),
         Language::Java => Some(Box::new(JavaExtractor)),
         Language::Dart => Some(Box::new(DartExtractor)),
+        Language::Protobuf => Some(Box::new(ProtobufExtractor)),
         _ => None,
     }
 }
@@ -1183,6 +1184,75 @@ fn extract_c_style_doc(node: Node, source: &[u8]) -> Option<String> {
     None
 }
 
+/// Protobuf language extractor (`.proto` schema files).
+///
+/// tree-sitter-proto represents definitions as `message`, `enum`, `service`
+/// and `rpc` nodes. Unlike most grammars here, names are NOT exposed via a
+/// `name` field — they live in dedicated child nodes (`message_name`,
+/// `enum_name`, `service_name`, `rpc_name`).
+pub struct ProtobufExtractor;
+
+impl LanguageExtractor for ProtobufExtractor {
+    fn definition_types(&self) -> &[&'static str] {
+        &["message", "enum", "service", "rpc"]
+    }
+
+    fn extract_name(&self, node: Node, source: &[u8]) -> Option<String> {
+        // proto grammar stores the identifier in a `<kind>_name` child node
+        // rather than a `name` field, so walk the direct named children.
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "message_name" | "enum_name" | "service_name" | "rpc_name" => {
+                    return child.utf8_text(source).ok().map(String::from);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn extract_signature(&self, node: Node, source: &[u8]) -> Option<String> {
+        let kw = match node.kind() {
+            "message" => "message",
+            "enum" => "enum",
+            "service" => "service",
+            "rpc" => "rpc",
+            _ => return None,
+        };
+        let name = self.extract_name(node, source)?;
+        Some(format!("{kw} {name}"))
+    }
+
+    fn extract_docstring(&self, node: Node, source: &[u8]) -> Option<String> {
+        // proto has a single `comment` node kind (`//` and `/* */`); treat an
+        // immediately-preceding comment as the docstring.
+        let parent = node.parent()?;
+        let node_index = (0..parent.named_child_count())
+            .find(|&i| parent.named_child(i as u32).map(|c| c.id()) == Some(node.id()))?;
+        if node_index > 0 {
+            if let Some(prev) = parent.named_child((node_index - 1) as u32) {
+                if prev.kind() == "comment" {
+                    if let Ok(text) = prev.utf8_text(source) {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn classify(&self, node: Node) -> ChunkKind {
+        match node.kind() {
+            "message" => ChunkKind::Struct,
+            "enum" => ChunkKind::Enum,
+            "service" => ChunkKind::Interface,
+            "rpc" => ChunkKind::Method,
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,6 +1268,7 @@ mod tests {
         assert!(get_extractor(Language::CSharp).is_some());
         assert!(get_extractor(Language::Go).is_some());
         assert!(get_extractor(Language::Java).is_some());
+        assert!(get_extractor(Language::Protobuf).is_some());
         assert!(get_extractor(Language::Markdown).is_none());
     }
 
@@ -1210,6 +1281,17 @@ mod tests {
         assert!(types.contains(&"struct_item"));
         assert!(types.contains(&"enum_item"));
         assert!(types.contains(&"impl_item"));
+    }
+
+    #[test]
+    fn test_protobuf_definition_types() {
+        let extractor = ProtobufExtractor;
+        let types = extractor.definition_types();
+
+        assert!(types.contains(&"message"));
+        assert!(types.contains(&"enum"));
+        assert!(types.contains(&"service"));
+        assert!(types.contains(&"rpc"));
     }
 
     #[test]

@@ -34,6 +34,8 @@ struct StatusResponse {
     cpu_percent: String,
     csharp_helper: bool,
     #[serde(default)]
+    ts_helper: bool,
+    #[serde(default)]
     uptime_secs: u64,
 }
 
@@ -49,6 +51,8 @@ struct RepoInfo {
     #[serde(default)]
     csharp_error: Option<String>,
     #[serde(default)]
+    typescript_index: String,
+    #[serde(default)]
     path: String,
 }
 
@@ -59,6 +63,7 @@ impl RepoInfo {
             status: self.status.clone(),
             csharp_index: self.csharp_index.clone(),
             csharp_error: self.csharp_error.clone(),
+            typescript_index: self.typescript_index.clone(),
             changes: self.changes,
             tool_call_count: self.tool_call_count,
             last_tool_call: self.last_tool_call.clone(),
@@ -67,6 +72,10 @@ impl RepoInfo {
             // The standalone remote dashboard shows ONE peer's own repos (local
             // from that peer's view), not projects mounted into another instance.
             is_remote: false,
+            // The standalone dashboard polls its single peer every second, so its
+            // activity is always live; the stale-marker only applies to the
+            // embedded TUI's federated mounts.
+            activity_stale: false,
         }
     }
 }
@@ -76,7 +85,13 @@ impl RepoInfo {
 // ---------------------------------------------------------------------------
 
 /// Run the standalone remote TUI. Polls `GET {serve_url}/status` every second.
-pub async fn run_remote_tui(serve_url: String) -> Result<()> {
+///
+/// `client` is a pre-built `reqwest::Client` (see
+/// [`crate::index::build_serve_client_with_key`]) that already carries the
+/// `Authorization: Bearer <key>` header for every request when the serve
+/// requires authentication; when no key is configured it behaves like a plain
+/// client, unchanged from today's local/no-auth behavior.
+pub async fn run_remote_tui(serve_url: String, client: reqwest::Client) -> Result<()> {
     // Setup terminal
     crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
     terminal::enable_raw_mode()?;
@@ -85,7 +100,7 @@ pub async fn run_remote_tui(serve_url: String) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = run_remote_tui_loop(&mut terminal, &serve_url).await;
+    let result = run_remote_tui_loop(&mut terminal, &serve_url, client).await;
 
     // Always restore terminal
     tui_common::restore_terminal(&mut terminal)?;
@@ -100,6 +115,7 @@ pub async fn run_remote_tui(serve_url: String) -> Result<()> {
 async fn run_remote_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     serve_url: &str,
+    client: reqwest::Client,
 ) -> Result<()> {
     let mut table_state = ratatui::widgets::TableState::default();
     table_state.select(Some(0));
@@ -120,10 +136,11 @@ async fn run_remote_tui_loop(
     // Monotonic id of the most recent doctor/info request; bumped on every spawn.
     let mut doctor_gen: u64 = 0;
 
-    // Single shared HTTP client reused for the status poll and all action
-    // requests. reqwest::Client is cheap to clone and shares one connection
-    // pool; per-request timeouts are still applied via `.timeout()`.
-    let client = reqwest::Client::new();
+    // Single shared HTTP client (passed in by the caller, pre-configured with
+    // the auth header when the serve requires one) reused for the status poll
+    // and all action requests. reqwest::Client is cheap to clone and shares
+    // one connection pool; per-request timeouts are still applied via
+    // `.timeout()`.
 
     loop {
         // Fetch status from serve
@@ -170,6 +187,7 @@ async fn run_remote_tui_loop(
         let active = data.as_ref().map(|d| d.active_sessions).unwrap_or(0);
         let cpu = data.as_ref().map(|d| d.cpu_percent.as_str()).unwrap_or("—");
         let csharp_helper = data.as_ref().map(|d| d.csharp_helper).unwrap_or(false);
+        let ts_helper = data.as_ref().map(|d| d.ts_helper).unwrap_or(false);
         let uptime_str = data
             .as_ref()
             .map(|d| tui_common::format_uptime_secs(d.uptime_secs))
@@ -197,6 +215,7 @@ async fn run_remote_tui_loop(
                     active,
                     cpu,
                     csharp_helper,
+                    ts_helper,
                     None,
                 );
             } else {
@@ -213,7 +232,17 @@ async fn run_remote_tui_loop(
                     ),
                 ]));
                 f.render_widget(connecting, chunks[1]);
-                tui_common::render_footer(f, chunks[3], &[], &table_state, 0, "—", false, None);
+                tui_common::render_footer(
+                    f,
+                    chunks[3],
+                    &[],
+                    &table_state,
+                    0,
+                    "—",
+                    false,
+                    false,
+                    None,
+                );
             }
 
             // Render overlay on top if active
@@ -320,6 +349,7 @@ async fn run_remote_tui_loop(
                                         match resp.json::<InfoResponse>().await {
                                             Ok(info) => OverlayState::Info {
                                                 alias,
+                                                path: info.path,
                                                 chunks: info.chunks,
                                                 files: info.files,
                                                 max_chunk_id: info.max_chunk_id,
@@ -460,6 +490,11 @@ async fn run_remote_tui_loop(
 
 #[derive(Debug, Deserialize)]
 struct InfoResponse {
+    /// On-disk path of this repo's index database on the peer. `#[serde(default)]`
+    /// so a client talking to an older serve that doesn't send this key yet still
+    /// deserializes instead of failing with "missing field" — it just renders empty.
+    #[serde(default)]
+    path: String,
     chunks: usize,
     files: usize,
     max_chunk_id: u32,

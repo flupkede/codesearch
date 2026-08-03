@@ -78,6 +78,7 @@ impl GrammarManager {
             // plain `Parser` like every other language here.
             Language::Markdown => Ok(tree_sitter_md::LANGUAGE.into()),
             Language::Dart => Ok(tree_sitter_dart::LANGUAGE.into()),
+            Language::Protobuf => Ok(tree_sitter_proto::LANGUAGE.into()),
             _ => Err(anyhow!(
                 "Language {} does not support tree-sitter",
                 language.name()
@@ -104,6 +105,7 @@ impl GrammarManager {
             Language::Json,
             Language::Markdown,
             Language::Dart,
+            Language::Protobuf,
         ]
     }
 
@@ -159,111 +161,36 @@ mod tests {
     }
 
     #[test]
-    fn test_load_java_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Java);
+    fn test_load_grammar_for_each_supported_language() {
+        // Every language that ships a compiled-in grammar must load successfully.
+        // Previously this was one #[test] per language; they were identical apart
+        // from the Language variant, so they are collapsed into a table.
+        let cases: &[(&str, Language)] = &[
+            ("java", Language::Java),
+            ("protobuf", Language::Protobuf),
+            ("shell", Language::Shell),
+            ("ruby", Language::Ruby),
+            ("php", Language::Php),
+            ("yaml", Language::Yaml),
+            ("json", Language::Json),
+            ("python", Language::Python),
+            ("javascript", Language::JavaScript),
+            ("typescript", Language::TypeScript),
+            ("c", Language::C),
+            ("cpp", Language::Cpp),
+            ("csharp", Language::CSharp),
+            ("go", Language::Go),
+            ("markdown", Language::Markdown),
+        ];
 
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_bash_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Shell);
-
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_ruby_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Ruby);
-
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_php_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Php);
-
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_yaml_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Yaml);
-
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_json_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Json);
-
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_python_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Python);
-
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_javascript_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::JavaScript);
-
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_typescript_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::TypeScript);
-
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_c_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::C);
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_cpp_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Cpp);
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_csharp_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::CSharp);
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_go_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Go);
-        assert!(grammar.is_some());
-    }
-
-    #[test]
-    fn test_load_markdown_grammar() {
-        let manager = GrammarManager::new();
-        let grammar = manager.get_grammar(Language::Markdown);
-
-        assert!(grammar.is_some());
+        for (name, lang) in cases {
+            let manager = GrammarManager::new();
+            let grammar = manager.get_grammar(*lang);
+            assert!(
+                grammar.is_some(),
+                "expected grammar for language `{name}` to load"
+            );
+        }
     }
 
     #[test]
@@ -322,6 +249,7 @@ mod tests {
         assert!(manager.is_supported(Language::Yaml));
         assert!(manager.is_supported(Language::Json));
         assert!(manager.is_supported(Language::Markdown));
+        assert!(manager.is_supported(Language::Protobuf));
         assert!(!manager.is_supported(Language::Toml));
     }
 }

@@ -17,12 +17,12 @@
 
 use crate::cache::{normalize_path, normalize_path_str};
 use crate::constants::{
-    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, SCIP_CSHARP_DEBOUNCE_MS,
-    WRITER_LOCK_FILE,
+    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
+    SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS, WRITER_LOCK_FILE,
 };
 use crate::embed::ModelType;
 use crate::fts::FtsStore;
-use crate::symbols::{RebuildScope, SymbolIndexerRegistry};
+use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
 use crate::watch::{FileEvent, FileWatcher, GitHeadWatcher};
 use std::collections::HashSet;
@@ -36,15 +36,33 @@ use tracing::{debug, error, info, warn};
 // Import Result from the parent module
 use super::Result;
 
-/// Callback invoked after each watcher-triggered C# symbol rebuild completes.
+/// Signal sent to the serve layer about a watcher-triggered symbol rebuild.
 ///
-/// Arguments: `(success: bool, error_msg: Option<String>)`.
-/// - `(true, None)` on success.
-/// - `(false, Some(msg))` on failure.
+/// Unlike the old two-argument `(success, error)` callback, this carries a
+/// `Started` variant so the serve layer can flip the C# indicator to
+/// `Indexing` for the *duration* of the rebuild — matching what the
+/// serve-side `trigger_symbol_rebuild` already does for the phase-2 /
+/// POST-/reindex paths. Without `Started`, a watcher-triggered rebuild only
+/// ever reported its terminal state, so the C#-specific indicator never showed
+/// "Indexing" while the (35–84s) rebuild was actually running.
+pub enum SymbolRebuildSignal {
+    /// A rebuild is about to run (helper available and project applies).
+    Started,
+    /// Rebuild finished successfully.
+    Succeeded,
+    /// Rebuild failed with the given message.
+    Failed(String),
+}
+
+/// Callback invoked around each watcher-triggered C# symbol rebuild.
+///
+/// Called with [`SymbolRebuildSignal::Started`] just before the rebuild runs,
+/// then exactly once more with [`SymbolRebuildSignal::Succeeded`] or
+/// [`SymbolRebuildSignal::Failed`] when it finishes.
 ///
 /// The serve layer uses this to update `csharp_index_status` / `csharp_index_error`
 /// without coupling `IndexManager` to `ServeState`.
-pub type CSharpRebuildNotifier = Arc<dyn Fn(bool, Option<String>) + Send + Sync>;
+pub type CSharpRebuildNotifier = Arc<dyn Fn(SymbolRebuildSignal) + Send + Sync>;
 
 /// Callback to notify the serve layer that text/vector indexing is active or idle.
 ///
@@ -283,7 +301,37 @@ pub struct IndexManager {
     symbol_registry: Arc<SymbolIndexerRegistry>,
 }
 
+/// Returns true if `path` has one of the TypeScript extensions tracked by the
+/// file-watcher's symbol-rebuild debounce (`.ts`, `.tsx`, `.mts`, `.cts`).
+/// Mirrors the inline `.cs` extension check used for the C# adapter.
+fn is_ts_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("ts") | Some("tsx") | Some("mts") | Some("cts")
+    )
+}
+
 impl IndexManager {
+    /// Cancellation guard shared by every cancellable indexing function.
+    ///
+    /// Indexing passes (`force_reindex_with_stores`,
+    /// `perform_incremental_refresh_with_stores`, `refresh_index_with_stores`,
+    /// `process_batch_with_stores`) receive a `CancellationToken` and call this
+    /// at every safe boundary (loop tops, between phases) so a `remove_repo`
+    /// mid-flight aborts promptly instead of running the full embed pass to
+    /// completion on an alias that is already gone.
+    ///
+    /// Returns a distinct [`anyhow`] error so the caller can tell a clean
+    /// cancellation apart from a genuine failure — the add-repo task checks
+    /// `cancel_token.is_cancelled()` in its error branch (see
+    /// `add_repo_handler`), and the FSW loop simply logs and continues.
+    fn ensure_indexing_active(cancel_token: &CancellationToken) -> Result<()> {
+        if cancel_token.is_cancelled() {
+            return Err(anyhow::anyhow!("indexing cancelled"));
+        }
+        Ok(())
+    }
+
     /// Create a new index manager with shared stores.
     ///
     /// This is the **first method call** - should be called at server startup.
@@ -504,6 +552,7 @@ impl IndexManager {
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
+        cancel_token: &CancellationToken,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::SemanticChunker;
@@ -512,6 +561,10 @@ impl IndexManager {
 
         info!("🔄 Performing incremental refresh with shared stores...");
         let start = std::time::Instant::now();
+
+        // Bail out before reading/deriving anything if a cancellation already
+        // arrived (e.g. remove_repo ran while this task was scheduled).
+        Self::ensure_indexing_active(cancel_token)?;
 
         // Read model name + dims (lenient) for the FileMetaStore. The strict,
         // fail-fast embedding-model resolution happens lazily below, only when
@@ -602,6 +655,11 @@ impl IndexManager {
             info!("✅ Index is up to date!");
             return Ok(());
         }
+
+        // A cancellation that arrived during the file walk must abort BEFORE any
+        // destructive store mutation below (stale-chunk deletion), so a
+        // half-cleaned index is never left behind by a removed repo.
+        Self::ensure_indexing_active(cancel_token)?;
 
         // There is work to do. Resolve the embedding model NOW — before any
         // destructive store mutation below — so that a corrupt index (unknown
@@ -694,6 +752,9 @@ impl IndexManager {
             let mut total_indexed = 0usize;
 
             for (batch_idx, file_batch) in changed_files.chunks(batch_size).enumerate() {
+                // Abort between batches if the repo was removed mid-index.
+                Self::ensure_indexing_active(cancel_token)?;
+
                 // Read + chunk + embed is synchronous, CPU/I/O-heavy work
                 // (file reads, tree-sitter parsing, fastembed/ONNX inference that
                 // saturates all cores). Offload the whole block to `spawn_blocking`
@@ -702,12 +763,22 @@ impl IndexManager {
                 // are not needed on the async side and may not be `Send`.
                 let files_for_embed = file_batch.to_vec();
                 let cache_dir_for_batch = cache_dir.clone();
+                // Clone the token into the blocking closure so a cancel arriving
+                // DURING the (long, core-saturating) embed pass is observed
+                // per-file, not only once the whole batch returns.
+                let batch_cancel = cancel_token.clone();
                 let embedded_chunks = tokio::task::spawn_blocking(
                     move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
                         let mut chunker = SemanticChunker::new(100, 2000, 10);
                         let mut all_chunks = Vec::new();
 
                         for file in &files_for_embed {
+                            // Mid-embed cancellation point: abort inside the
+                            // spawn_blocking task so we stop reading/chunking/
+                            // embedding further files in this batch promptly.
+                            if batch_cancel.is_cancelled() {
+                                return Err(anyhow::anyhow!("indexing cancelled"));
+                            }
                             let content = match std::fs::read_to_string(&file.path) {
                                 Ok(c) => c,
                                 Err(_) => continue,
@@ -725,6 +796,12 @@ impl IndexManager {
                             embed_model,
                             Some(cache_dir_for_batch.as_path()),
                         )?;
+                        // NOTE: embed_chunks runs a single ONNX inference over
+                        // the whole batch atomically, so it is not interruptible
+                        // mid-call. Worst-case cancel latency is bounded to one
+                        // batch's embed (INCREMENTAL_REFRESH_BATCH_SIZE=200
+                        // files); the per-file check above bounds the read/chunk
+                        // phase that precedes it.
                         embedding_service.embed_chunks(all_chunks)
                     },
                 )
@@ -737,6 +814,11 @@ impl IndexManager {
                         e
                     )
                 })??;
+
+                // A cancel arriving after embed completed but before we commit
+                // the batch to the stores must skip the insert + the final
+                // build_index, so a removed repo never receives fresh data.
+                Self::ensure_indexing_active(cancel_token)?;
 
                 if !embedded_chunks.is_empty() {
                     info!(
@@ -811,6 +893,8 @@ impl IndexManager {
 
             // Build the HNSW index once, after every batch has been inserted.
             if total_indexed > 0 {
+                // Don't rebuild the graph for a repo that was removed mid-index.
+                Self::ensure_indexing_active(cancel_token)?;
                 let vector_store = Arc::clone(&stores.vector_store);
                 tokio::task::spawn_blocking(move || {
                     let mut store = vector_store.blocking_write();
@@ -843,8 +927,24 @@ impl IndexManager {
             elapsed.as_secs_f64()
         );
 
-        // Persist chunk/file counts in metadata.json for status(projects)
+        // Persist the resolved model AND the chunk/file counts in metadata.json.
+        //
+        // Writing the model here (mirroring the CLI `index_with_options` path,
+        // which stamps it unconditionally) unifies the two index-creation paths:
+        // an index built via the serve/git-hook path — which may have started
+        // from a model-less metadata.json pre-created by `ensure_schema_version`
+        // — now always ends up with a resolvable `model_short_name`. This is the
+        // structural half of the "model: unknown" fix: it guarantees the model
+        // is recorded regardless of who created the file, so it can never regress
+        // to `unknown` (which also disables the empty-index fallback). Best-effort
+        // — a failed write only affects display/status, not searchability.
         {
+            if let Err(e) = crate::vectordb::merge_metadata_atomic(db_path, |obj| {
+                embed_model.write_metadata_fields(obj);
+            }) {
+                warn!("metadata.json model write warning: {}", e);
+            }
+
             let vs = stores.vector_store.read().await;
             if let Ok(stats) = vs.stats() {
                 super::update_metadata_stats(db_path, stats.total_chunks, stats.total_files);
@@ -867,11 +967,15 @@ impl IndexManager {
         db_path: &Path,
         stores: &SharedStores,
         model_override: Option<ModelType>,
+        cancel_token: &CancellationToken,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use anyhow::Context;
 
         info!("🔄 Force reindex: clearing all store data in-place...");
+
+        // Bail before clearing any store data if the repo was already removed.
+        Self::ensure_indexing_active(cancel_token)?;
 
         // ── Step 0: Read and preserve metadata BEFORE clearing anything ──
         // This is defensive: the DB may be incomplete (no metadata.json at all),
@@ -897,14 +1001,36 @@ impl IndexManager {
 
         // Apply model override if provided (e.g. from `index add --model`)
         if let Some(ref mt) = model_override {
-            preserved_metadata["model_short_name"] =
-                serde_json::Value::String(mt.short_name().to_string());
-            preserved_metadata["model_name"] = serde_json::Value::String(mt.name().to_string());
-            preserved_metadata["dimensions"] = serde_json::Value::Number(mt.dimensions().into());
+            if let Some(obj) = preserved_metadata.as_object_mut() {
+                mt.write_metadata_fields(obj);
+            }
             info!(
                 "📝 Model override applied: {} ({} dims)",
                 mt.short_name(),
                 mt.dimensions()
+            );
+        }
+
+        // If the metadata.json that already exists lacks model fields, stamp the
+        // default model. This is the fix for the "model: unknown" worktree bug:
+        // when a repo is registered via `POST /repos` (the git-hook path), the
+        // store is opened first and `ensure_schema_version` pre-creates a
+        // metadata.json containing only `schema_version`. That defeats the
+        // `else` branch above (which only stamps a default when the whole file is
+        // absent), so without this guard the index is left with no
+        // `model_short_name` — every reader then shows `model: unknown` AND the
+        // live-chunk-count fallback (`live_chunk_count`) bails on that string,
+        // making a perfectly-good index look empty. Only runs when no explicit
+        // override was given (the override block above already populated these).
+        if preserved_metadata.get("model_short_name").is_none() {
+            let default_model = ModelType::default();
+            if let Some(obj) = preserved_metadata.as_object_mut() {
+                default_model.write_metadata_fields(obj);
+            }
+            info!(
+                "📝 metadata.json had no model_short_name (pre-created by schema-version bootstrap) — stamping default model {} ({} dims)",
+                default_model.short_name(),
+                default_model.dimensions()
             );
         }
         let model_name = preserved_metadata
@@ -959,7 +1085,8 @@ impl IndexManager {
         info!("✅ Stores cleared, metadata preserved. Starting full reindex...");
 
         // ── Step 5: Reindex — all files treated as "changed" since metadata is empty ──
-        Self::perform_incremental_refresh_with_stores(codebase_path, db_path, stores).await
+        Self::perform_incremental_refresh_with_stores(codebase_path, db_path, stores, cancel_token)
+            .await
     }
 
     /// Start the file system watcher (begin collecting events) without starting the processing loop.
@@ -974,6 +1101,147 @@ impl IndexManager {
             info!("👀 File watcher pre-started (collecting events)");
         }
         Ok(())
+    }
+
+    /// Trigger a fire-and-forget FULL symbol rebuild for every applicable
+    /// language, used when a branch switch invalidates the symbol index wholesale.
+    ///
+    /// A branch change rewrites arbitrary files in the working tree, so an
+    /// incremental (per-file / per-`.csproj`) scope cannot be computed — the
+    /// buffered `.cs`/`.ts` events were discarded by the branch-change handler.
+    /// A `RebuildScope::Full` is the honest, correct choice here: it re-derives
+    /// the entire symbol index for the new branch. Runs in a detached blocking
+    /// task so the watcher loop is never blocked by the (potentially 35–84s)
+    /// scip-csharp / scip-typescript invocation.
+    ///
+    /// `indexing_cb` (if any) toggles the general TUI "Indexing" label around
+    /// the whole rebuild; `csharp_notifier` (if any) drives the C#-specific
+    /// indicator (`Started`/`Succeeded`/`Failed`). Non-applicable languages
+    /// (no `.sln` / no `tsconfig.json`) or an unavailable helper are skipped
+    /// without touching any status — mirroring the debounce path.
+    fn spawn_branch_change_symbol_rebuild(
+        symbol_registry: Arc<SymbolIndexerRegistry>,
+        repo_path: PathBuf,
+        db_path: PathBuf,
+        repo_label: String,
+        csharp_notifier: Option<CSharpRebuildNotifier>,
+        indexing_cb: Option<IndexingStatusCallback>,
+        cancel_token: CancellationToken,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            // Resolve applicable + available indexers up front so we only toggle
+            // the "Indexing" label when there is real work to do.
+            let csharp = symbol_registry
+                .get(LANG_CSHARP)
+                .filter(|i| i.applies_to(&repo_path) && i.is_available());
+            let typescript = symbol_registry
+                .get(LANG_TYPESCRIPT)
+                .filter(|i| i.applies_to(&repo_path) && i.is_available());
+
+            if csharp.is_none() && typescript.is_none() {
+                // Nothing to rebuild — don't flash the TUI or touch status.
+                return;
+            }
+
+            if let Some(ref cb) = indexing_cb {
+                cb(true);
+            }
+
+            // Check-before-start bounds each language's rebuild: a single
+            // `indexer.rebuild()` call can't be interrupted mid-run (the 35–84s
+            // scip-csharp invocation), but we skip languages whose rebuild hadn't
+            // begun yet once cancellation lands.
+            if let Some(indexer) = csharp {
+                if cancel_token.is_cancelled() {
+                    info!(
+                        "🛑 [{}] symbol rebuild cancelled before C# rebuild",
+                        repo_label
+                    );
+                } else {
+                    // C# drives the serve-side status indicator: Started now,
+                    // terminal signal inside run_full_rebuild_logged.
+                    if let Some(ref n) = csharp_notifier {
+                        n(SymbolRebuildSignal::Started);
+                    }
+                    Self::run_full_rebuild_logged(
+                        indexer,
+                        &repo_path,
+                        &db_path,
+                        &repo_label,
+                        "C#",
+                        csharp_notifier.as_ref(),
+                    );
+                }
+            }
+
+            if let Some(indexer) = typescript {
+                if cancel_token.is_cancelled() {
+                    info!(
+                        "🛑 [{}] symbol rebuild cancelled before TypeScript rebuild",
+                        repo_label
+                    );
+                } else {
+                    // The TypeScript path has no serve-side status notifier yet, so
+                    // only the general "Indexing" label reflects it (via indexing_cb).
+                    Self::run_full_rebuild_logged(
+                        indexer,
+                        &repo_path,
+                        &db_path,
+                        &repo_label,
+                        "TypeScript",
+                        None,
+                    );
+                }
+            }
+
+            if let Some(ref cb) = indexing_cb {
+                cb(false);
+            }
+        });
+    }
+
+    /// Run a `RebuildScope::Full` rebuild for one language's indexer, log the
+    /// outcome with the repo + language label, and (when `notifier` is `Some`,
+    /// i.e. C#) emit the terminal [`SymbolRebuildSignal`] (`Succeeded`/`Failed`).
+    ///
+    /// This is the shared body behind every full-scope rebuild in the watcher
+    /// (branch-change C#/TS and the `.cs` debounce full-solution fallback), so
+    /// the log wording and notifier semantics stay in one place. The caller
+    /// owns the *in-progress* signalling (`indexing_cb(true/false)` and the C#
+    /// `Started` signal), because a single caller may batch several rebuilds
+    /// under one "Indexing" window.
+    fn run_full_rebuild_logged(
+        indexer: &dyn SymbolIndexer,
+        repo_path: &Path,
+        db_path: &Path,
+        repo_label: &str,
+        lang_label: &str,
+        notifier: Option<&CSharpRebuildNotifier>,
+    ) {
+        match indexer.rebuild(repo_path, db_path, RebuildScope::Full) {
+            Ok(summary) => {
+                info!(
+                    "✅ [{}] {} symbol rebuild complete: {} symbols, {} refs in {}ms",
+                    repo_label,
+                    lang_label,
+                    summary.symbols_indexed,
+                    summary.references_stored,
+                    summary.duration_ms
+                );
+                if let Some(n) = notifier {
+                    n(SymbolRebuildSignal::Succeeded);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "⚠️ [{}] {} symbol rebuild failed: {}",
+                    repo_label, lang_label, e
+                );
+                if let Some(n) = notifier {
+                    n(SymbolRebuildSignal::Failed(e.to_string()));
+                }
+            }
+        }
     }
 
     /// Start the background file watcher.
@@ -1021,7 +1289,19 @@ impl IndexManager {
 
         // Spawn background task
         tokio::spawn(async move {
-            info!("👀 File watcher task started for: {}", path.display());
+            // Short human-readable repo label for log attribution in a
+            // multi-repo hub. In serve mode the alias == directory name, so the
+            // last path component is the alias for the common case; fall back to
+            // the full path when there is no file name (e.g. a root path).
+            let repo_label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            info!(
+                "👀 File watcher task started for '{}': {}",
+                repo_label,
+                path.display()
+            );
 
             // Start the watcher inside the task (if not already started by start_watching)
             {
@@ -1053,6 +1333,18 @@ impl IndexManager {
             let mut cs_last_event_time: Option<std::time::Instant> = None;
             let cs_debounce = std::time::Duration::from_millis(SCIP_CSHARP_DEBOUNCE_MS);
 
+            // Symbol indexer debounce: .ts/.tsx/.mts/.cts files are buffered separately
+            // and flushed after SCIP_TYPESCRIPT_DEBOUNCE_MS of quiet time. Unlike C#'s
+            // per-.csproj grouping, the TypeScript MVP only supports a single root
+            // tsconfig.json (no monorepo multi-project resolution), so any tracked
+            // change simply triggers one full rebuild — there is no per-file grouping
+            // to compute, and `ts_files_modified`/`ts_files_deleted` only exist to
+            // decide *whether* to flush and to log counts.
+            let mut ts_files_modified: HashSet<PathBuf> = HashSet::new();
+            let mut ts_files_deleted: HashSet<PathBuf> = HashSet::new();
+            let mut ts_last_event_time: Option<std::time::Instant> = None;
+            let ts_debounce = std::time::Duration::from_millis(SCIP_TYPESCRIPT_DEBOUNCE_MS);
+
             loop {
                 // Check if shutdown was requested
                 if cancel_token.is_cancelled() {
@@ -1064,17 +1356,25 @@ impl IndexManager {
                 if let Some(watcher) = &git_head_watcher {
                     if let Ok(branch_changed) = watcher.check().await {
                         if branch_changed.is_some() {
-                            info!("🔀 Git branch changed, triggering full incremental refresh...");
+                            info!(
+                                "🔀 [{}] Git branch changed, triggering full incremental refresh...",
+                                repo_label
+                            );
                             // Notify serve layer: indexing active
                             if let Some(ref cb) = indexing_cb {
                                 cb(true);
                             }
                             // Perform a real incremental refresh: walk filesystem,
                             // detect changed/deleted files, clean stale chunks, re-index
-                            if let Err(e) =
-                                Self::refresh_index_with_stores(&path, &db_path, &stores).await
+                            if let Err(e) = Self::refresh_index_with_stores(
+                                &path,
+                                &db_path,
+                                &stores,
+                                &cancel_token,
+                            )
+                            .await
                             {
-                                error!("❌ Branch change refresh failed: {}", e);
+                                error!("❌ [{}] Branch change refresh failed: {}", repo_label, e);
                             }
                             // Notify serve layer: indexing idle
                             if let Some(ref cb) = indexing_cb {
@@ -1087,6 +1387,26 @@ impl IndexManager {
                             cs_files_modified.clear();
                             cs_files_deleted.clear();
                             cs_last_event_time = None;
+                            ts_files_modified.clear();
+                            ts_files_deleted.clear();
+                            ts_last_event_time = None;
+
+                            // A branch switch can change arbitrary source files, so
+                            // the symbol index is now stale — but no incremental
+                            // scope can be computed (the working tree changed wholesale
+                            // and the buffered .cs/.ts events were just discarded above).
+                            // Trigger a fire-and-forget FULL symbol rebuild for every
+                            // language that applies, so `find_impact` reflects the new
+                            // branch instead of silently serving stale references.
+                            Self::spawn_branch_change_symbol_rebuild(
+                                symbol_registry.clone(),
+                                path.clone(),
+                                db_path.clone(),
+                                repo_label.clone(),
+                                csharp_notifier.clone(),
+                                indexing_cb.clone(),
+                                cancel_token.clone(),
+                            );
                         }
                     }
                 }
@@ -1126,6 +1446,10 @@ impl IndexManager {
                                     cs_files_deleted.remove(&p);
                                     cs_files_modified.insert(p);
                                     cs_last_event_time = Some(now);
+                                } else if is_ts_extension(&p) {
+                                    ts_files_deleted.remove(&p);
+                                    ts_files_modified.insert(p);
+                                    ts_last_event_time = Some(now);
                                 }
                             }
                             FileEvent::Deleted(p) => {
@@ -1139,6 +1463,10 @@ impl IndexManager {
                                     cs_files_modified.remove(&p);
                                     cs_files_deleted.insert(p);
                                     cs_last_event_time = Some(now);
+                                } else if is_ts_extension(&p) {
+                                    ts_files_modified.remove(&p);
+                                    ts_files_deleted.insert(p);
+                                    ts_last_event_time = Some(now);
                                 }
                             }
                             FileEvent::Renamed(old_p, new_p) => {
@@ -1162,6 +1490,22 @@ impl IndexManager {
                                         cs_files_modified.insert(new_p);
                                     }
                                     cs_last_event_time = Some(now);
+                                } else {
+                                    // Track .ts/.tsx/.mts/.cts renames: old path is a
+                                    // deletion, new path is a modification.
+                                    let old_is_ts = is_ts_extension(&old_p);
+                                    let new_is_ts = is_ts_extension(&new_p);
+                                    if old_is_ts || new_is_ts {
+                                        if old_is_ts {
+                                            ts_files_modified.remove(&old_p);
+                                            ts_files_deleted.insert(old_p);
+                                        }
+                                        if new_is_ts {
+                                            ts_files_deleted.remove(&new_p);
+                                            ts_files_modified.insert(new_p);
+                                        }
+                                        ts_last_event_time = Some(now);
+                                    }
                                 }
                             }
                         }
@@ -1178,18 +1522,35 @@ impl IndexManager {
                     let to_remove: Vec<PathBuf> = files_to_remove.drain().collect();
 
                     info!(
-                        "📦 Flushing batch: {} to index, {} to remove",
+                        "📦 [{}] Flushing batch: {} to index, {} to remove",
+                        repo_label,
                         to_index.len(),
                         to_remove.len()
                     );
 
+                    // Signal "Indexing" to the TUI for the duration of the text
+                    // batch refresh. Without this, ordinary file edits (the most
+                    // common watcher activity) never surface in the TUI status
+                    // column — only branch changes and symbol rebuilds did.
+                    if let Some(ref cb) = indexing_cb {
+                        cb(true);
+                    }
                     // Process batch using shared stores
                     if let Err(e) = Self::process_batch_with_stores(
-                        &path, &db_path, &stores, to_index, to_remove,
+                        &path,
+                        &db_path,
+                        &stores,
+                        to_index,
+                        to_remove,
+                        &cancel_token,
                     )
                     .await
                     {
-                        error!("❌ Batch processing failed: {}", e);
+                        error!("❌ [{}] Batch processing failed: {}", repo_label, e);
+                    }
+                    // Clear "Indexing" regardless of outcome.
+                    if let Some(ref cb) = indexing_cb {
+                        cb(false);
                     }
 
                     // Reset timer
@@ -1209,8 +1570,8 @@ impl IndexManager {
                             cs_last_event_time = None;
 
                             info!(
-                                "🔬 {} modified + {} deleted .cs file(s), triggering incremental symbol rebuild (after {}s debounce)",
-                                modified_count, deleted_count,
+                                "🔬 [{}] {} modified + {} deleted .cs file(s), triggering incremental symbol rebuild (after {}s debounce)",
+                                repo_label, modified_count, deleted_count,
                                 cs_debounce.as_secs()
                             );
 
@@ -1225,6 +1586,9 @@ impl IndexManager {
                             let reg = symbol_registry.clone();
                             let rp = path.clone();
                             let dp = db_path.clone();
+                            // Clone the repo label into the blocking task (the outer
+                            // binding is reused by later loop iterations).
+                            let repo_label = repo_label.clone();
                             let notifier = csharp_notifier.clone();
                             // Clone indexing_cb so the SCIP rebuild can signal
                             // active_reindexes (and therefore show "Indexing" in
@@ -1236,19 +1600,29 @@ impl IndexManager {
                                 if let Some(indexer) = reg.get(LANG_CSHARP) {
                                     if !indexer.applies_to(&rp) {
                                         info!(
-                                            "🔬 symbol rebuild skipped: not applicable (no .sln)"
+                                            "🔬 [{}] symbol rebuild skipped: not applicable (no .sln)",
+                                            repo_label
                                         );
                                         return;
                                     }
                                     if !indexer.is_available() {
-                                        info!("🔬 symbol rebuild skipped: helper not available");
+                                        info!(
+                                            "🔬 [{}] symbol rebuild skipped: helper not available",
+                                            repo_label
+                                        );
                                         return;
                                     }
 
                                     // Signal "Indexing" to the TUI now that we know
-                                    // a real SCIP rebuild will actually run.
+                                    // a real SCIP rebuild will actually run. This
+                                    // toggles both the general repo-state label
+                                    // (indexing_cb → active_reindexes) and the
+                                    // C#-specific indicator (notifier → Indexing).
                                     if let Some(ref cb) = indexing_cb_scip {
                                         cb(true);
+                                    }
+                                    if let Some(ref n) = notifier {
+                                        n(SymbolRebuildSignal::Started);
                                     }
 
                                     // Group modified files by their containing .csproj
@@ -1274,28 +1648,18 @@ impl IndexManager {
                                     // files.first() and silently ignored the rest).
                                     if !ungrouped.is_empty() {
                                         info!(
-                                            "🔬 {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                            "🔬 [{}] {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                            repo_label,
                                             ungrouped.len()
                                         );
-                                        match indexer.rebuild(&rp, &dp, RebuildScope::Full) {
-                                            Ok(summary) => {
-                                                info!(
-                                                    "✅ Symbol rebuild complete: {} symbols, {} refs in {}ms",
-                                                    summary.symbols_indexed,
-                                                    summary.references_stored,
-                                                    summary.duration_ms
-                                                );
-                                                if let Some(ref n) = notifier {
-                                                    n(true, None);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!("⚠️ Symbol rebuild failed: {}", e);
-                                                if let Some(ref n) = notifier {
-                                                    n(false, Some(e.to_string()));
-                                                }
-                                            }
-                                        }
+                                        Self::run_full_rebuild_logged(
+                                            indexer,
+                                            &rp,
+                                            &dp,
+                                            &repo_label,
+                                            "C#",
+                                            notifier.as_ref(),
+                                        );
                                         // Clear "Indexing" regardless of outcome
                                         if let Some(ref cb) = indexing_cb_scip {
                                             cb(false);
@@ -1314,7 +1678,8 @@ impl IndexManager {
                                             .map(|n| n.to_string_lossy().into_owned())
                                             .unwrap_or_default();
                                         info!(
-                                            "🔬 incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
+                                            "🔬 [{}] incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
+                                            repo_label,
                                             i + 1,
                                             total_groups,
                                             csproj_name,
@@ -1362,12 +1727,88 @@ impl IndexManager {
                                     // Notify serve layer about overall outcome
                                     if let Some(ref n) = notifier {
                                         match last_error {
-                                            None => n(true, None),
-                                            Some(msg) => n(false, Some(msg)),
+                                            None => n(SymbolRebuildSignal::Succeeded),
+                                            Some(msg) => n(SymbolRebuildSignal::Failed(msg)),
                                         }
                                     }
                                     // Clear "Indexing" now that all groups are done
                                     if let Some(ref cb) = indexing_cb_scip {
+                                        cb(false);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // Check if we should flush the .ts/.tsx/.mts/.cts symbol rebuild debounce.
+                // Unlike the C# path there is no per-.csproj grouping: TypeScript MVP
+                // only supports a single root tsconfig.json, so any tracked change
+                // simply triggers one full rebuild via the registry's TypeScript
+                // indexer (RebuildScope::Files would fall back to Full internally
+                // anyway — passing Full directly here is more honest about what
+                // actually happens).
+                let has_ts_changes = !ts_files_modified.is_empty() || !ts_files_deleted.is_empty();
+                if has_ts_changes {
+                    if let Some(ts_last) = ts_last_event_time {
+                        let elapsed = now.duration_since(ts_last);
+                        if elapsed >= ts_debounce {
+                            let modified_count = ts_files_modified.len();
+                            let deleted_count = ts_files_deleted.len();
+                            ts_files_modified.clear();
+                            ts_files_deleted.clear();
+                            ts_last_event_time = None;
+
+                            info!(
+                                "🔬 [{}] {} modified + {} deleted .ts/.tsx/.mts/.cts file(s), triggering full symbol rebuild (after {}s debounce)",
+                                repo_label, modified_count, deleted_count,
+                                ts_debounce.as_secs()
+                            );
+
+                            let reg = symbol_registry.clone();
+                            let rp = path.clone();
+                            let dp = db_path.clone();
+                            let indexing_cb_ts = indexing_cb.clone();
+                            // Clone the repo label into the blocking task (the outer
+                            // binding is reused by later loop iterations).
+                            let repo_label = repo_label.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(indexer) = reg.get(LANG_TYPESCRIPT) {
+                                    if !indexer.applies_to(&rp) {
+                                        info!(
+                                            "🔬 [{}] TypeScript symbol rebuild skipped: not applicable (no tsconfig.json)",
+                                            repo_label
+                                        );
+                                        return;
+                                    }
+                                    if !indexer.is_available() {
+                                        info!(
+                                            "🔬 [{}] TypeScript symbol rebuild skipped: scip-typescript not available",
+                                            repo_label
+                                        );
+                                        return;
+                                    }
+
+                                    // Signal "Indexing" to the TUI now that we know
+                                    // a real SCIP rebuild will actually run.
+                                    if let Some(ref cb) = indexing_cb_ts {
+                                        cb(true);
+                                    }
+
+                                    // The TypeScript path has no serve-side status
+                                    // notifier yet, so only the general "Indexing"
+                                    // label reflects it (via indexing_cb_ts).
+                                    Self::run_full_rebuild_logged(
+                                        indexer,
+                                        &rp,
+                                        &dp,
+                                        &repo_label,
+                                        "TypeScript",
+                                        None,
+                                    );
+
+                                    // Clear "Indexing" regardless of outcome
+                                    if let Some(ref cb) = indexing_cb_ts {
                                         cb(false);
                                     }
                                 }
@@ -1402,10 +1843,14 @@ impl IndexManager {
         stores: &SharedStores,
         files_to_index: Vec<PathBuf>,
         files_to_remove: Vec<PathBuf>,
+        cancel_token: &CancellationToken,
     ) -> Result<()> {
         use crate::output::set_quiet;
 
         let start = std::time::Instant::now();
+
+        // Bail before touching any store if the repo was removed.
+        Self::ensure_indexing_active(cancel_token)?;
 
         // Enable quiet mode during FSW batch processing to suppress verbose embedding output
         set_quiet(true);
@@ -1497,6 +1942,9 @@ impl IndexManager {
         }
 
         // Then, index modified/new files
+        // Abort before the per-file index loop if cancellation landed during the
+        // removal phase above.
+        Self::ensure_indexing_active(cancel_token)?;
         for file_path in &files_to_index {
             debug!("📄 Indexing: {}", file_path.display());
             if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
@@ -1550,6 +1998,7 @@ impl IndexManager {
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
+        cancel_token: &CancellationToken,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::file::FileWalker;
@@ -1557,6 +2006,9 @@ impl IndexManager {
 
         let start = std::time::Instant::now();
         set_quiet(true);
+
+        // Abort before the filesystem walk if the repo was already removed.
+        Self::ensure_indexing_active(cancel_token)?;
 
         let result: Result<()> = async {
             // Phase 1: Discover current files on disk.
@@ -1718,6 +2170,9 @@ impl IndexManager {
             }
 
             // Phase 4: Re-index changed/new files
+            // Abort before the per-file re-index loop if cancellation arrived
+            // during the deletion/orphan-cleanup phases above.
+            Self::ensure_indexing_active(cancel_token)?;
             let reindex_count = files_to_reindex.len();
             for file_path in &files_to_reindex {
                 if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
@@ -2111,12 +2566,196 @@ mod tests {
         // Don't create metadata.json
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
             "Should return Ok when no metadata.json exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_incremental_refresh_before_embedding() {
+        // FINDINGS #3: an indexing pass must observe its cancellation token, not
+        // run to completion on an alias that `remove_repo` is tearing down.
+        //
+        // A pre-cancelled token makes `perform_incremental_refresh_with_stores`
+        // bail at its entry checkpoint — BEFORE the file walk, embedding-model
+        // load, or any store mutation — even though the codebase HAS a changed
+        // file that would otherwise trigger a full embed pass. This locks the
+        // contract the in-flight cancel path (`remove_repo` -> `await_index_task`)
+        // depends on.
+        //
+        // Finer mid-pass checkpoints (per-file inside the `spawn_blocking` embed
+        // loop, between batches, before `build_index`) also exist, but reaching
+        // them requires loading the ONNX embedding model, so a true mid-embed
+        // interrupt is an `#[ignore]` integration test, omitted here.
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+        // A real source file so the change-detector WOULD find work to do.
+        std::fs::write(codebase_path.join("a.txt"), "hello world").unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let token = CancellationToken::new();
+        token.cancel(); // already cancelled -> must abort immediately
+
+        let result = IndexManager::perform_incremental_refresh_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &token,
+        )
+        .await;
+
+        let err = result.expect_err("pre-cancelled token must abort indexing");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "loads the ONNX embedding model (~90MB download on first run); \
+                run with `cargo test -- --ignored mid_pass_cancellation`"]
+    async fn mid_pass_cancellation_aborts_a_running_embed() {
+        // FINDINGS #3 (mid-pass, not just entry): the entry-level test above only
+        // proves a pre-cancelled token bails before work begins. This test lets a
+        // REAL embed pass START (past the entry checkpoint, into ONNX inference),
+        // confirms it is still running, and THEN cancels — proving the per-batch /
+        // per-file / pre-build_index checkpoints abort a RUNNING long pass, not
+        // merely one that never began. Uses `force_reindex_with_stores` so the
+        // default model metadata is stamped correctly (a hand-written "test-model"
+        // short name would fail model resolution before reaching the embed loop).
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        let dims = ModelType::default().dimensions();
+        let stores = create_test_stores(&db_path, dims).await;
+
+        // A large corpus so the full pass spans multiple embed batches and takes
+        // long enough to reliably still be running when we cancel. If this flakes
+        // because the pass finishes first, bump the file count.
+        for i in 0..600 {
+            std::fs::write(
+                codebase_path.join(format!("file_{i:03}.txt")),
+                format!("document body number {i} with enough prose to be chunked\n"),
+            )
+            .unwrap();
+        }
+
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let handle = tokio::spawn(async move {
+            IndexManager::force_reindex_with_stores(
+                &codebase_path,
+                &db_path,
+                &stores,
+                None,
+                &task_token,
+            )
+            .await
+        });
+
+        // Give the pass a head start so it is past the entry checkpoint and into
+        // model load / embedding. 200ms is comfortably past the (microsecond)
+        // entry check while leaving the bulk of a 600-file pass ahead.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !handle.is_finished(),
+            "corpus too small: the pass completed before we could cancel — \
+             increase the file count so the embed run outlasts the head start"
+        );
+
+        let cancel_start = std::time::Instant::now();
+        token.cancel();
+
+        let result = handle.await.expect("indexing task panicked");
+        let cancel_latency = cancel_start.elapsed();
+
+        // The pass must abort to a cancellation error, NOT complete Ok — this is
+        // the assertion that fails if the post-entry checkpoints were missing.
+        let err = result.expect_err("a running embed pass must abort to a cancellation error");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {err}"
+        );
+        // The checkpoint fires at the next batch/phase boundary, well before a
+        // full uncancelled pass over 600 files would finish.
+        assert!(
+            cancel_latency < std::time::Duration::from_secs(30),
+            "cancellation took too long to take effect: {cancel_latency:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_reindex_stamps_model_when_metadata_has_only_schema_version() {
+        // Regression for the "model: unknown" worktree bug.
+        //
+        // When a repo is registered via `POST /repos` (the git-hook path), the
+        // store is opened FIRST and `ensure_schema_version` pre-creates a
+        // metadata.json containing ONLY `schema_version` — no model fields.
+        // Before the fix, force_reindex's Step 0 saw the file already exists and
+        // skipped the default-model stamp, so the index was left with no
+        // `model_short_name`: every reader then showed `model: unknown` AND the
+        // live-chunk-count fallback bailed on that string, making the index look
+        // empty (agent falls back to grep). This test reproduces that exact
+        // bootstrap state and asserts force_reindex now stamps the default model.
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        // create_test_stores → VectorStore::new → ensure_schema_version, which
+        // writes the real "schema_version only" metadata.json — the exact bug state.
+        let dims = ModelType::default().dimensions();
+        let stores = create_test_stores(&db_path, dims).await;
+
+        // Precondition: the bootstrap wrote NO model field.
+        let before = std::fs::read_to_string(db_path.join("metadata.json")).unwrap();
+        let before_json: serde_json::Value = serde_json::from_str(&before).unwrap();
+        assert!(
+            before_json.get("model_short_name").is_none(),
+            "precondition: schema-version bootstrap must not write a model, got: {before}"
+        );
+
+        // Empty codebase → perform_incremental_refresh returns before any
+        // embedding, so this exercises Fix A (the Step-0 stamp) without loading
+        // an ONNX model.
+        IndexManager::force_reindex_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("force reindex on empty codebase should succeed");
+
+        let after = std::fs::read_to_string(db_path.join("metadata.json")).unwrap();
+        let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(
+            after_json.get("model_short_name").and_then(|v| v.as_str()),
+            Some(ModelType::default().short_name()),
+            "metadata.json must have the default model_short_name stamped, got: {after}"
+        );
+        assert_eq!(
+            after_json.get("dimensions").and_then(|v| v.as_u64()),
+            Some(dims as u64),
+            "metadata.json must record the default model's dimensions, got: {after}"
         );
     }
 
@@ -2161,8 +2800,13 @@ mod tests {
         let stores = create_test_stores(&db_path, 4).await;
 
         // Run the refresh
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2217,8 +2861,13 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2254,8 +2903,13 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2296,8 +2950,13 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2346,8 +3005,13 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
-        let result =
-            IndexManager::refresh_index_with_stores(&codebase_path, &db_path, &stores).await;
+        let result = IndexManager::refresh_index_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
 
         assert!(result.is_ok(), "Refresh should succeed: {:?}", result);
 
@@ -2389,6 +3053,7 @@ mod tests {
             &codebase_path,
             &db_path,
             &stores,
+            &CancellationToken::new(),
         )
         .await;
 

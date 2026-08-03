@@ -352,7 +352,17 @@ impl PersistentEmbeddingCache {
     /// mixing incompatible embeddings.
     pub fn open(model_name: &str) -> Result<Self> {
         let cache_dir = Self::cache_dir_for(model_name)?;
+        Self::open_with_cache_dir(model_name, cache_dir)
+    }
 
+    /// Open a persistent cache rooted at an explicit `cache_dir` (test seam).
+    ///
+    /// Production callers resolve the directory under
+    /// `~/.codesearch/embedding_cache/<model>` via [`Self::open`] / the
+    /// [`Self::cache_dir_for`] helper and must never call this directly. Tests
+    /// pass a `tempfile::TempDir` path so they never touch the real user cache,
+    /// and the directory is removed automatically on drop — even on panic.
+    pub(crate) fn open_with_cache_dir(model_name: &str, cache_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create embedding cache directory {}: {}",
@@ -368,7 +378,10 @@ impl PersistentEmbeddingCache {
         // exactly once per process via this constructor.
         // TrackedEnv additionally prevents double-open within the same process.
         let mut opts = EnvOpenOptions::new();
-        opts.map_size(512 * 1024 * 1024).max_dbs(1); // 512MB — plenty for cache
+        // 512MB — plenty for cache.
+        opts.map_size(512 * 1024 * 1024).max_dbs(1);
+        // SAFETY: `NO_TLS` only changes reader-slot tracking. See `BASE_ENV_FLAGS`.
+        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
         let env = unsafe {
             TrackedEnv::open(
                 &opts,
@@ -935,8 +948,7 @@ mod tests {
     #[test]
     fn test_live_stats_registry_lifecycle() {
         // Use a unique model name so this test never collides with a real cache
-        // or with parallel test runs. The cache dir lives under the user's global
-        // ~/.codesearch/embedding_cache/ — clean it up at the end.
+        // or with parallel test runs.
         let model_name = format!(
             "__test_live_stats_tmp_{}_{}",
             std::process::id(),
@@ -952,10 +964,15 @@ mod tests {
             "live_stats should be None before any cache is opened"
         );
 
-        let cache_dir = PersistentEmbeddingCache::cache_dir_for(&model_name).unwrap();
+        // Redirect the cache into a tempdir so this test NEVER writes into the
+        // real user cache (~/.codesearch/embedding_cache/). The TempDir removes
+        // itself on drop — including on panic — so there is no manual cleanup
+        // that can leak (BUG3).
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let cache_dir = temp_dir.path().join(&model_name);
 
         // Open populates the registry via refresh_live_stats().
-        let cache = PersistentEmbeddingCache::open(&model_name).unwrap();
+        let cache = PersistentEmbeddingCache::open_with_cache_dir(&model_name, cache_dir).unwrap();
         let live = PersistentEmbeddingCache::live_stats(&model_name)
             .expect("live_stats should be Some immediately after open");
         assert_eq!(
@@ -978,14 +995,98 @@ mod tests {
         let live = PersistentEmbeddingCache::live_stats(&model_name).unwrap();
         assert_eq!(live.entries, 0, "live_stats should be 0 after clear");
 
-        // Dropping the cache removes the registry entry (Drop impl).
+        // Dropping the cache removes the registry entry (Drop impl) and closes
+        // the LMDB env, releasing the mmap so temp_dir can remove the files.
         drop(cache);
         assert!(
             PersistentEmbeddingCache::live_stats(&model_name).is_none(),
             "live_stats should be None after the cache is dropped"
         );
 
-        // Clean up the test cache directory.
-        let _ = std::fs::remove_dir_all(&cache_dir);
+        // temp_dir removes the cache dir on drop (even on panic). No manual
+        // `remove_dir_all` that could leak on an early-return/panic path.
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_cache_dir_absent_after_panic_via_tempdir() {
+        // FINDINGS #5 (BUG3 regression): a panic during use of the injectable
+        // cache dir must clean up via TempDir's Drop during unwind, leaving the
+        // PRODUCTION cache path (`cache_dir_for`) untouched. Before BUG3 a test
+        // pointed at the real `~/.codesearch/embedding_cache/<name>` with a bare
+        // last-line `remove_dir_all`, which leaked on panic (247 leaked dirs).
+        use std::panic;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("panic-test-{}-{}", std::process::id(), now.as_nanos());
+
+        // Compute the production path once; clean up any residue from a
+        // previous leaked run so the assertion below is meaningful.
+        let prod_path = PersistentEmbeddingCache::cache_dir_for(&model).ok();
+        if let Some(ref p) = prod_path {
+            let _ = std::fs::remove_dir_all(p);
+        }
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let cache_dir = temp_dir.path().join(&model);
+            // Open into the redirected dir (the BUG3 seam), then panic mid-use.
+            let _cache = PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir).unwrap();
+            panic!("simulated mid-test failure");
+            // `_cache` then `temp_dir` drop during unwind (reverse order), so the
+            // LMDB env closes before the tempdir removes the files.
+        }));
+        assert!(result.is_err(), "inner closure should have panicked");
+
+        // The production path must NOT exist — TempDir unwound and the prod
+        // path was never opened.
+        if let Some(ref p) = prod_path {
+            assert!(
+                !p.exists(),
+                "production cache dir leaked despite the panic: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn injectable_cache_dir_leaves_production_path_untouched() {
+        // FINDINGS #6 (BUG3 isolation guard): opening via the injectable seam
+        // into a TempDir must leave the PRODUCTION cache path empty and clean up
+        // the TempDir on normal drop. Production code routes through `open`
+        // (real home); tests route through `open_with_cache_dir` (tempdir) — the
+        // two never meet. (A true repo-wide CI guard would snapshot
+        // `~/.codesearch` before/after the whole suite; this focused test locks
+        // the seam's isolation invariant.)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("guard-test-{}-{}", std::process::id(), now.as_nanos());
+
+        let prod_path = PersistentEmbeddingCache::cache_dir_for(&model).ok();
+
+        {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let cache_dir = temp_dir.path().join(&model);
+            let cache = PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir).unwrap();
+            // Drop the LMDB cache first (closes the env / releases the mmap).
+            drop(cache);
+            // `temp_dir` drops at scope end. On Windows the LMDB mmap handle can
+            // briefly delay the tempdir's removal, so we do NOT assert tempdir
+            // cleanup here (the existing `test_live_stats_registry_lifecycle`
+            // trusts Drop the same way) — only the PRODUCTION-path invariant.
+        }
+
+        // The production path must NOT exist — the tempdir-backed open never
+        // touched the real home cache dir.
+        if let Some(ref p) = prod_path {
+            assert!(
+                !p.exists(),
+                "production cache dir was touched by the tempdir-backed open: {}",
+                p.display()
+            );
+        }
     }
 }

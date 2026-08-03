@@ -89,10 +89,11 @@ ENV HOME=/home/app \
     CODESEARCH_SERVE_PORT=39725 \
     DATA_DIR=/data
 
-# Runtime deps: TLS roots, git (KB pull), libgomp (onnxruntime), curl (probe loop).
+# Runtime deps: TLS roots, git (KB pull), libgomp (onnxruntime), curl (probe loop),
+# jq (index-job marks DOCS vendors read-only in repos.json).
 # No libssl: reqwest uses rustls (Cargo.toml), so no OpenSSL at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates git libgomp1 curl \
+        ca-certificates git libgomp1 curl jq \
     && rm -rf /var/lib/apt/lists/*
 
 # azcopy (single static binary from Microsoft).

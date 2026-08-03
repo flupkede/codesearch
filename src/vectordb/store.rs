@@ -112,6 +112,30 @@ fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
 /// combined with `rename` being atomic on the same filesystem, a reader always
 /// observes either the complete old or the complete new content.
 /// On failure the temp file is best-effort removed.
+/// Windows-only classification for a transient handle-holder racing our
+/// rename: ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32),
+/// ERROR_LOCK_VIOLATION (33) — the same raw codes `ServeState::is_db_locked_error`
+/// (`src/serve/mod.rs`) retries on. On Windows, AV/Search-indexer momentarily
+/// opening a just-written small JSON file makes `MOVEFILE_REPLACE_EXISTING`
+/// fail with "Access is denied" purely from timing, not a real conflict —
+/// most visible under `cargo test --lib --bins` parallel load. Unix renames
+/// are atomic replace and never hit this path, so the retry is a no-op there.
+fn is_transient_rename_error(e: &std::io::Error) -> bool {
+    if let Some(raw) = e.raw_os_error() {
+        if matches!(raw, 5 | 32 | 33) {
+            return true;
+        }
+    }
+    let msg = e.to_string();
+    msg.contains("being used") || msg.contains("is in use") || msg.contains("Access is denied")
+}
+
+/// Bounded retry budget for the rename step below: short, since a genuine
+/// conflict (not a transient handle) should surface quickly rather than
+/// stall the caller.
+const RENAME_RETRY_ATTEMPTS: u32 = 5;
+const RENAME_RETRY_DELAY_MS: u64 = 20;
+
 fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
     use std::io::Write;
 
@@ -136,11 +160,37 @@ fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
         return Err(e.into());
     }
 
-    if let Err(e) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e.into());
+    // Retry the rename itself on a transient handle-holder (see
+    // `is_transient_rename_error`) before giving up. Bounded and short: this
+    // is not a lock-contention backoff, just riding out a momentary AV/indexer
+    // handle on the destination file.
+    let mut last_err = None;
+    for attempt in 0..RENAME_RETRY_ATTEMPTS {
+        match fs::rename(&tmp_path, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_transient_rename_error(&e) && attempt + 1 < RENAME_RETRY_ATTEMPTS => {
+                warn!(
+                    "atomic_write_json: rename to {} hit a transient error (attempt {}/{}): {}",
+                    path.display(),
+                    attempt + 1,
+                    RENAME_RETRY_ATTEMPTS,
+                    e
+                );
+                std::thread::sleep(std::time::Duration::from_millis(RENAME_RETRY_DELAY_MS));
+                last_err = Some(e);
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e.into());
+            }
+        }
     }
-    Ok(())
+    // Unreachable in practice (the loop always returns above), but keep the
+    // compiler happy and preserve the last error if it somehow falls through.
+    let _ = fs::remove_file(&tmp_path);
+    Err(last_err
+        .map(Into::into)
+        .unwrap_or_else(|| anyhow!("atomic_write_json: rename failed with no captured error")))
 }
 
 /// Read-modify-write metadata.json, crash-atomically.
@@ -384,6 +434,9 @@ impl VectorStore {
         // TrackedEnv additionally prevents double-open within the same process.
         let mut opts = EnvOpenOptions::new();
         opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
+        // SAFETY: see `BASE_ENV_FLAGS` — `NO_TLS` only changes how LMDB tracks
+        // reader slots, never the on-disk format.
+        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
         let env = unsafe {
             TrackedEnv::open(
                 &opts,
@@ -473,8 +526,10 @@ impl VectorStore {
         // TrackedEnv additionally prevents double-open within the same process.
         let mut opts = EnvOpenOptions::new();
         opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
-        // SAFETY: READ_ONLY flag is safe for concurrent read access.
-        unsafe { opts.flags(EnvFlags::READ_ONLY) };
+        // SAFETY: READ_ONLY is safe for concurrent read access; `NO_TLS` is
+        // required for it to be *usable* — without it a second live read txn on
+        // the same thread fails with MDB_BAD_RSLOT. See `BASE_ENV_FLAGS`.
+        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS | EnvFlags::READ_ONLY) };
         let env = unsafe {
             TrackedEnv::open(
                 &opts,
@@ -507,7 +562,20 @@ impl VectorStore {
             false
         };
 
-        drop(rtxn);
+        // MUST commit, not drop. LMDB keeps a database handle opened inside a
+        // transaction private to that transaction "until the transaction is
+        // successfully committed"; if the transaction is *aborted* instead, the
+        // handle is closed automatically. Dropping an `RoTxn` aborts it, which
+        // silently invalidated `vectors` / `chunks` above — every later use then
+        // failed with a bare EINVAL (os error 22).
+        //
+        // That is why this only ever broke in read-only mode: `new()` opens its
+        // databases in a WRITE txn that is committed, so its handles stay valid.
+        // In production it surfaced as read-only vendors reporting
+        // `indexed: null` / `max_chunk_id: 0` while every search against them
+        // failed, even though the HNSW graph was present (`indexed` is cached
+        // here, before the invalidation, so it still read `true`).
+        rtxn.commit()?;
 
         tracing::debug!(
             "✅ Database opened read-only (next_id: {}, indexed: {})",
@@ -751,6 +819,21 @@ impl VectorStore {
             used_bytes,
             disk_size,
         })
+    }
+
+    /// Cheap health probe: `(total_chunks, indexed)` without the full-table scan
+    /// [`Self::stats`] performs.
+    ///
+    /// `stats()` deserializes every `ChunkMetadata` in the store to count unique
+    /// file paths — tens of thousands of records on a large corpus. Callers that
+    /// only need to know "are there chunks, and is the HNSW graph present?" must
+    /// use this instead: `chunks.len()` is an O(1) LMDB stat and `indexed` is a
+    /// plain field. This matters on the memory/CPU-constrained serve replica,
+    /// where the read-only warmup path exists precisely to do almost no work.
+    pub fn index_health(&self) -> Result<(usize, bool)> {
+        let rtxn = self.env.read_txn()?;
+        let total_chunks = self.chunks.len(&rtxn)? as usize;
+        Ok((total_chunks, self.indexed))
     }
 
     pub fn stats(&self) -> Result<StoreStats> {
