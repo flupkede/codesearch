@@ -16,6 +16,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.2.1] (unreleased)
 
+### Fixed
+
+- **`build.ps1` now self-heals `core.bare=false` before invoking cargo.** This repo lives at `codesearch.git` as a bare+working-tree hybrid — a full checked-out source tree + `.git/index`, but `core.bare=true` in `.git/config`. `core.bare` intermittently resets to `true` (VS Code's git integration rewrites `.git/config` on ref changes; smoking gun: `github-pr-owner-number` duplicated 7× for `develop`), and when it does, cargo's source fingerprinting aborts every build with `did not expect repo ...\.git to be bare`, breaking `copy-to-common.ps1` → `build.ps1` → `cargo build`. `build.ps1` now forces `core.bare=false` right after `Set-Location`, before any cargo invocation. Idempotent and harmless for a normal (truly non-bare) checkout; non-fatal if git is unreachable.
+
 ## [1.2.0] - 2026-08-03
 
 **TypeScript & Protobuf indexing, remote-TUI auth, cloud + cancellation hardening.** First minor bump since the 1.1.0 federation release: TypeScript joins `find_impact` via SCIP, Protobuf is now a tree-sitter-indexed language, the standalone remote TUI works against authenticated serves, and the embedded serve TUI stops waking scale-to-zero cloud peers — plus a cloud-serve OOM/read-only fix, honest index-cancellation, and a self-cleanup backstop for orphaned index dirs.
