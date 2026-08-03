@@ -235,6 +235,13 @@ pub(crate) struct ServeState {
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
     last_tool_call: DashMap<String, (String, std::time::Instant)>,
+    /// Per-federated-peer last activity time — the last time a real tool call was
+    /// dispatched to that peer (`federated_search` / `federated_project_search` /
+    /// `federated_get_chunk`). Drives the embedded TUI's event-driven refresh:
+    /// when a peer's value advances, the TUI pokes an immediate `/status` poll
+    /// of just that peer instead of waiting for the slow baseline poll. This is
+    /// federation-only and never touches local-repo activity tracking.
+    remote_peer_activity: DashMap<String, std::time::Instant>,
     /// Currently active MCP sessions.
     active_sessions: AtomicU64,
     /// Total MCP sessions since serve started.
@@ -270,6 +277,14 @@ pub(crate) struct ServeState {
     reload_count: std::sync::atomic::AtomicUsize,
     /// Instant when ServeState was created — used to compute uptime for TUI header.
     started_at: std::time::Instant,
+    /// Resolved idle-before-suspend window (seconds) — the same value the
+    /// keep-warm task uses to decide when to let the host scale the replica to
+    /// zero. The embedded TUI reuses it as the federated-peer `/status` baseline
+    /// poll interval, so its background polling can never keep a peer awake past
+    /// the host's own suspend term. Resolved in [`Self::new`] from
+    /// `IDLE_SUSPEND_SECS_ENV` (falling back to `DEFAULT_IDLE_SUSPEND_SECS`) and
+    /// overridden by the `--idle-suspend-secs` flag in `run_serve`.
+    idle_suspend_secs: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -325,6 +340,7 @@ impl ServeState {
             active_reindexes: Arc::new(DashMap::new()),
             repo_changes: DashMap::new(),
             last_tool_call: DashMap::new(),
+            remote_peer_activity: DashMap::new(),
             active_sessions: AtomicU64::new(0),
             total_sessions: AtomicU64::new(0),
             sysinfo_system: std::sync::Mutex::new(sys),
@@ -338,6 +354,11 @@ impl ServeState {
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
             started_at: std::time::Instant::now(),
+            idle_suspend_secs: std::env::var(crate::constants::IDLE_SUSPEND_SECS_ENV)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|s| *s > 0)
+                .unwrap_or(crate::constants::DEFAULT_IDLE_SUSPEND_SECS),
         }
     }
 
@@ -2439,6 +2460,35 @@ impl ServeState {
             .iter()
             .map(|entry| entry.value().1)
             .max()
+    }
+
+    /// Record that a federated tool call was dispatched to `peer_name`.
+    ///
+    /// Drives the embedded TUI's event-driven `/status` refresh (see
+    /// [`Self::remote_peer_last_activity`]). Federation-only: local-repo tool
+    /// calls go through [`Self::record_tool_call`] and are completely unaffected.
+    pub(crate) fn record_remote_peer_activity(&self, peer_name: &str) {
+        self.remote_peer_activity
+            .insert(peer_name.to_string(), std::time::Instant::now());
+    }
+
+    /// Last time a federated tool call hit `peer_name`, if any.
+    ///
+    /// The embedded TUI polls this every render tick; an advance (a newer
+    /// `Instant` than the value seen on the previous tick) means a real tool call
+    /// just used that peer, so the TUI pokes an immediate per-peer `/status`
+    /// refresh instead of waiting for the slow baseline poll.
+    pub(crate) fn remote_peer_last_activity(&self, peer_name: &str) -> Option<Instant> {
+        self.remote_peer_activity
+            .get(peer_name)
+            .map(|entry| *entry.value())
+    }
+
+    /// The resolved idle-before-suspend window (seconds) — used by the embedded
+    /// TUI as the federated-peer `/status` baseline poll interval so background
+    /// polling can never keep a peer awake past the host's own suspend term.
+    pub(crate) fn idle_suspend_secs(&self) -> u64 {
+        self.idle_suspend_secs
     }
 
     /// Record that changes were made to a repo (index/reindex).
@@ -4559,7 +4609,17 @@ pub async fn run_serve(
     #[cfg(unix)]
     raise_fd_limit(config.repos.len());
 
-    let serve_state = Arc::new(ServeState::new(config, None));
+    let mut serve_state = ServeState::new(config, None);
+    // The `--idle-suspend-secs` flag takes precedence over the env/default the
+    // constructor already resolved; mirror the keep-warm task's resolution so
+    // the embedded TUI's federated-peer poll interval matches exactly. `0`
+    // means "disabled" for keep-warm, so treat it as "leave the default".
+    if let Some(secs) = idle_suspend_secs {
+        if secs > 0 {
+            serve_state.idle_suspend_secs = secs;
+        }
+    }
+    let serve_state = Arc::new(serve_state);
 
     // Construct the bind address from resolved host + port.
     // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.

@@ -2603,6 +2603,16 @@ impl CodesearchService {
         // 3) Fan out to each mounted remote project concurrently. Each is a
         //    project-scoped query (`project=<remote_alias>`) to its peer, so a
         //    group only ever searches the indexes the user opted into.
+        // Record real activity per targeted peer so the embedded TUI can poke an
+        // immediate `/status` refresh for the peer(s) the operator just used —
+        // scale-to-zero friendly (no fixed-interval polling needed to learn a
+        // peer was active). A peer is already awake the instant it serves this
+        // very search, so the follow-up status poll can't keep it pinned.
+        if let Some(ref serve_state) = self.serve_state {
+            for (peer_name, _, _) in remote_projects.iter() {
+                serve_state.record_remote_peer_activity(peer_name);
+            }
+        }
         let mut join = tokio::task::JoinSet::new();
         for (peer_name, peer, remote_alias) in remote_projects.into_iter() {
             let body = body.clone();
@@ -2691,6 +2701,13 @@ impl CodesearchService {
             }
         };
 
+        // Record real activity on this peer so the embedded TUI pokes an
+        // immediate `/status` refresh (scale-to-zero friendly). See
+        // `federated_search` for the same note.
+        if let Some(ref serve_state) = self.serve_state {
+            serve_state.record_remote_peer_activity(&peer_name);
+        }
+
         let outcome = client.search_project(&peer, body, &remote_alias).await;
         let (mut items, warnings) = match outcome {
             Outcome::Ok(items) => (
@@ -2756,6 +2773,12 @@ impl CodesearchService {
                 ))]));
             }
         };
+        // Record real activity on this peer so the embedded TUI pokes an
+        // immediate `/status` refresh (scale-to-zero friendly). See
+        // `federated_search` for the same note.
+        if let Some(ref serve_state) = self.serve_state {
+            serve_state.record_remote_peer_activity(peer_name);
+        }
         match client
             .get_chunk(&peer, remote_alias, chunk_id, context_lines)
             .await

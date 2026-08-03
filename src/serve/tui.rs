@@ -99,18 +99,83 @@ async fn run_tui_loop(
     let mut doctor_gen: u64 = 0;
 
     // Mounted remote projects (peer-hosted indexes, shown italic). Discovered on
-    // a slow background cadence so per-peer HTTP never blocks the render tick;
-    // the latest snapshot is cached here and appended after the local rows.
-    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel::<Vec<RepoRow>>(1);
+    // a background task whose baseline cadence is the serve idle-suspend window
+    // (so it never keeps a peer awake past the host's own suspend term); an
+    // immediate per-peer refresh is poked the moment a real tool call hits a
+    // peer. The latest snapshot is cached here and appended after the local rows.
+    let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel::<RemoteDiscoveryUpdate>(1);
+    // Poke channel: the render loop sends a peer name here when it detects that
+    // peer's activity advanced (a real tool call), triggering an immediate
+    // single-peer `/status` refresh in the discovery task.
+    let (poke_tx, poke_rx) = tokio::sync::mpsc::channel::<String>(8);
     let mut remote_rows: Vec<RepoRow> = Vec::new();
-    spawn_remote_discovery(state.clone(), remote_tx, cancel_token.clone());
+    // Per-peer wall-clock of the last successful `/status` refresh (reported by
+    // the discovery task). A row whose peer hasn't been refreshed within
+    // `REMOTE_ACTIVITY_FRESH_SECS` renders its activity as a stale `-`.
+    let mut remote_refreshed_at: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+    // High-water mark of each peer's last real activity (from
+    // `ServeState::remote_peer_last_activity`). An advance vs. the previous tick
+    // means a tool call just used that peer → poke an immediate refresh.
+    let mut peer_activity_hwm: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
+    spawn_remote_discovery(state.clone(), remote_tx, poke_rx, cancel_token.clone());
 
     // Main loop
     loop {
         // Absorb the newest remote-projects snapshot, if the background task
         // produced one since the last tick (keep the previous list otherwise).
-        while let Ok(latest) = remote_rx.try_recv() {
-            remote_rows = latest;
+        while let Ok(update) = remote_rx.try_recv() {
+            remote_rows = update.rows;
+            for (peer, t) in update.refreshed_at {
+                remote_refreshed_at.insert(peer, t);
+            }
+        }
+
+        // Federation-only housekeeping (local repos are untouched): for each
+        // mounted remote project, (a) mark its activity stale/fresh from its
+        // peer's last refresh time, and (b) detect peers whose real activity
+        // advanced since the last tick and poke the discovery task to refresh
+        // just them. A peer with no mounts contributes nothing and is never
+        // polled — the idle-suspend cadence + activity poke fully replace the
+        // old fixed 30s ping so federated peers can scale to zero.
+        let fresh_window = Duration::from_secs(crate::constants::REMOTE_ACTIVITY_FRESH_SECS);
+        let mut alias_to_peer: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut peers_to_poke: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (local_name, target) in state.config_snapshot().mounted_remote_projects() {
+            if let crate::db_discovery::repos::Target::RemoteProject { peer_name, .. } = target {
+                alias_to_peer.insert(local_name, peer_name);
+            }
+        }
+        for row in remote_rows.iter_mut() {
+            let Some(peer) = alias_to_peer.get(&row.alias) else {
+                continue;
+            };
+            // (a) staleness: fresh only if refreshed within the window.
+            let fresh = remote_refreshed_at
+                .get(peer)
+                .is_some_and(|t| t.elapsed() < fresh_window);
+            row.activity_stale = !fresh;
+            // (b) activity advance → poke an immediate per-peer refresh.
+            if let Some(activity) = state.remote_peer_last_activity(peer) {
+                match peer_activity_hwm.get(peer).copied() {
+                    None => {
+                        // Seed: don't poke for activity that predates the TUI.
+                        peer_activity_hwm.insert(peer.clone(), activity);
+                    }
+                    Some(prev) if activity > prev => {
+                        peers_to_poke.insert(peer.clone());
+                        peer_activity_hwm.insert(peer.clone(), activity);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for peer in peers_to_poke {
+            // try_send on a capacity-8 channel; a dropped poke just means the
+            // discovery task already has a refresh queued for this peer.
+            let _ = poke_tx.try_send(peer);
         }
 
         // Draw the UI — local repos first, mounted remote projects appended.
@@ -416,6 +481,8 @@ fn map_repo_rows(
                 lock_mode,
                 path,
                 is_remote: false,
+                // Local repos carry live serve state — never stale.
+                activity_stale: false,
             }
         })
         .collect()
@@ -425,16 +492,44 @@ fn map_repo_rows(
 // Mounted remote projects (federation) — background discovery
 // ---------------------------------------------------------------------------
 
-/// Spawn the background task that periodically re-discovers mounted remote
-/// projects and pushes the latest `RepoRow` list through `tx`.
+/// One background-discovery snapshot pushed from [`spawn_remote_discovery`] to
+/// the render loop: the rebuilt remote rows plus the per-peer wall-clock of the
+/// last successful `/status` refresh (used to mark cached activity stale).
+struct RemoteDiscoveryUpdate {
+    rows: Vec<RepoRow>,
+    refreshed_at: std::collections::HashMap<String, std::time::Instant>,
+}
+
+/// Query one peer's `/status`, returning its repo list on success or `None` if
+/// the peer is unreachable / errored this round (caller keeps the cached row).
+async fn poll_peer_status(
+    client: &crate::federation::FederationClient,
+    peer: &crate::db_discovery::repos::RemotePeer,
+) -> Option<Vec<crate::federation::RemoteRepoStatus>> {
+    use crate::federation::ManagementOutcome;
+    match client.list_repos(peer).await {
+        ManagementOutcome::Ok(status) => Some(status.repos),
+        _ => None,
+    }
+}
+
+/// Spawn the background task that discovers mounted remote projects and pushes
+/// snapshots through `tx`.
 ///
-/// Runs off the render loop so per-peer HTTP never blocks a frame. Each round
-/// queries every configured peer's `/status` concurrently; peers that answer
-/// refresh an in-memory "last-known" alias list, and peers that fail this round
-/// reuse it — so a transient blip doesn't make a mount vanish from the table.
+/// **Scale-to-zero design.** The baseline re-discovery cadence is the serve
+/// idle-suspend window ([`ServeState::idle_suspend_secs`]) — the same term after
+/// which the host may scale the replica to zero — NOT a fixed 30s ping, so the
+/// TUI no longer pins a federated peer awake. Between baseline polls the cached
+/// activity is stale and the render loop shows `-`. The moment a real tool call
+/// hits a peer, the render loop detects the advance (via
+/// [`ServeState::remote_peer_last_activity`]) and sends the peer name on
+/// `poke_rx`, triggering an **immediate per-peer** refresh — never a full poll,
+/// so an idle sibling peer is not woken. A peer that blips a round keeps its
+/// cached row (a mount never vanishes on a transient failure).
 fn spawn_remote_discovery(
     state: Arc<ServeState>,
-    tx: tokio::sync::mpsc::Sender<Vec<RepoRow>>,
+    tx: tokio::sync::mpsc::Sender<RemoteDiscoveryUpdate>,
+    mut poke_rx: tokio::sync::mpsc::Receiver<String>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -446,65 +541,114 @@ fn spawn_remote_discovery(
                 return;
             }
         };
-        let interval = Duration::from_secs(crate::constants::REMOTE_DISCOVERY_INTERVAL_SECS);
+        // Baseline poll cadence = the serve idle-suspend window, so background
+        // polling can never keep a federated peer awake past the host's own
+        // suspend term. The real "go live again" trigger is the activity poke.
+        let interval = Duration::from_secs(state.idle_suspend_secs().max(1));
 
-        loop {
+        // Cached per-(peer, remote_alias) status, retained across cycles so a
+        // peer that blips this round keeps showing its last-known row.
+        let mut status_lookup: std::collections::HashMap<
+            (String, String),
+            crate::federation::RemoteRepoStatus,
+        > = std::collections::HashMap::new();
+        // Per-peer wall-clock of the last successful `/status` refresh; shipped
+        // with each snapshot so the render loop can mark stale activity.
+        let mut refreshed_at: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+
+        'outer: loop {
+            // ── Full poll: refresh EVERY configured peer concurrently. ──
             let cfg = state.config_snapshot();
             if !cfg.remotes.is_empty() {
-                let rows = discover_remote_rows(&client, &cfg).await;
+                let now = std::time::Instant::now();
+                let mut join = tokio::task::JoinSet::new();
+                for (peer_name, peer) in cfg.remotes.iter() {
+                    let client = client.clone();
+                    let peer = peer.clone();
+                    let peer_name = peer_name.clone();
+                    join.spawn(async move { (peer_name, poll_peer_status(&client, &peer).await) });
+                }
+                while let Some(res) = join.join_next().await {
+                    if let Ok((peer_name, Some(repos))) = res {
+                        // Drop stale entries for this peer before inserting the
+                        // fresh set (handles repos that vanished on the peer).
+                        status_lookup.retain(|(p, _), _| p != &peer_name);
+                        for r in repos {
+                            status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
+                        }
+                        refreshed_at.insert(peer_name, now);
+                    }
+                    // Unreachable peers keep their cached row + aged refresh
+                    // time (→ stale `-`), never vanishing from the table.
+                }
                 // Capacity-1 channel: replace the pending snapshot if the render
                 // loop hasn't consumed it yet (try_send drops on Full — fine, the
                 // next round supersedes it anyway).
-                let _ = tx.try_send(rows);
+                let _ = tx.try_send(RemoteDiscoveryUpdate {
+                    rows: build_remote_rows(&status_lookup, &cfg),
+                    refreshed_at: refreshed_at.clone(),
+                });
             }
 
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(interval) => {}
+            // ── Wait: baseline interval OR an activity poke. ──
+            // Baseline elapse → continue 'outer (full poll). A poke → single-
+            // peer refresh only, then keep waiting (no full poll, so idle
+            // sibling peers are NOT woken).
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(interval) => continue 'outer,
+                    peer = poke_rx.recv() => {
+                        // poke_rx closes only when the render loop is shutting
+                        // down (it owns poke_tx) → exit the discovery task.
+                        let Some(first) = peer else { return; };
+                        // Drain queued pokes; refresh each unique peer once.
+                        let mut targets = std::collections::HashSet::new();
+                        targets.insert(first);
+                        while let Ok(more) = poke_rx.try_recv() {
+                            targets.insert(more);
+                        }
+                        let cfg = state.config_snapshot();
+                        for peer_name in targets {
+                            let Some(peer) = cfg.remotes.get(&peer_name) else {
+                                continue;
+                            };
+                            if let Some(repos) = poll_peer_status(&client, peer).await {
+                                status_lookup.retain(|(p, _), _| p != &peer_name);
+                                for r in repos {
+                                    status_lookup.insert(
+                                        (peer_name.clone(), r.alias.clone()),
+                                        r,
+                                    );
+                                }
+                                refreshed_at.insert(peer_name, std::time::Instant::now());
+                            }
+                        }
+                        let _ = tx.try_send(RemoteDiscoveryUpdate {
+                            rows: build_remote_rows(&status_lookup, &cfg),
+                            refreshed_at: refreshed_at.clone(),
+                        });
+                    }
+                }
             }
         }
     });
 }
 
-/// Build the mounted remote-project rows for the TUI.
-///
-/// Rows come from the opt-in [`remote_mounts`](crate::db_discovery::repos::ReposConfig::remote_mounts)
-/// allowlist (config-driven, so they always show). Every peer's `/status` is
-/// polled concurrently only to *enrich* those rows with live per-repo state;
-/// a mount whose peer is unreachable this round simply falls back to a "warm"
-/// default. Discovery never defines which projects are mounted.
-async fn discover_remote_rows(
-    client: &crate::federation::FederationClient,
+/// Build the mounted remote-project rows from a cached `(peer, alias) → status`
+/// map. Rows always come from the opt-in `remote_mounts` allowlist
+/// (config-driven, so they always show); the status map only *enriches* them
+/// with live per-repo state. A mount whose peer is unreachable simply falls back
+/// to a "warm" default — discovery never defines which projects are mounted.
+fn build_remote_rows(
+    status_lookup: &std::collections::HashMap<
+        (String, String),
+        crate::federation::RemoteRepoStatus,
+    >,
     cfg: &crate::db_discovery::repos::ReposConfig,
 ) -> Vec<RepoRow> {
     use crate::db_discovery::repos::Target;
-    use crate::federation::ManagementOutcome;
-
-    // 1) Fan out /status to all peers concurrently, keyed (peer, remote_alias).
-    let mut status_lookup: std::collections::HashMap<
-        (String, String),
-        crate::federation::RemoteRepoStatus,
-    > = std::collections::HashMap::new();
-
-    let mut join = tokio::task::JoinSet::new();
-    for (peer_name, peer) in cfg.remotes.iter() {
-        let client = client.clone();
-        let peer = peer.clone();
-        let peer_name = peer_name.clone();
-        join.spawn(async move {
-            let outcome = client.list_repos(&peer).await;
-            (peer_name, outcome)
-        });
-    }
-    while let Some(res) = join.join_next().await {
-        if let Ok((peer_name, ManagementOutcome::Ok(status))) = res {
-            for r in status.repos {
-                status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
-            }
-        }
-    }
-
-    // 2) Build one row per mounted project, enriched with live status.
     cfg.mounted_remote_projects()
         .into_iter()
         .map(|(local_name, target)| {
@@ -535,6 +679,9 @@ async fn discover_remote_rows(
                 // Detail panel shows where the mount lives.
                 path: peer.url.clone(),
                 is_remote: true,
+                // Computed per-tick by the render loop from the per-peer refresh
+                // time; discovery itself leaves it fresh-neutral.
+                activity_stale: false,
             }
         })
         .collect()

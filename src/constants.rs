@@ -404,11 +404,20 @@ pub const MCP_PROXY_IDLE_CHECK_INTERVAL_SECS: u64 = 10;
 /// and the `remote` CLI command so both report/apply the same default.
 pub const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 15;
 
-/// How often the embedded TUI re-discovers mounted remote projects (queries each
-/// peer's `/status` in the background). Slow enough that per-peer HTTP never
-/// competes with the ~500ms render tick; a peer blip is masked by the in-memory
-/// last-known list until the next successful poll.
-pub const REMOTE_DISCOVERY_INTERVAL_SECS: u64 = 30;
+/// How long after a federated peer's `/status` refresh the embedded TUI still
+/// considers that peer's activity "live" before reverting the activity column to
+/// a stale `-`.
+///
+/// The baseline re-discovery poll runs on the **serve idle-suspend window** (see
+/// [`IDLE_SUSPEND_SECS_ENV`] / [`DEFAULT_IDLE_SUSPEND_SECS`]) — the same term
+/// after which the host is allowed to scale the replica to zero — so the TUI no
+/// longer pins a federated peer awake with a fixed 30s ping. Instead, an
+/// immediate per-peer refresh is triggered the moment a real tool call hits that
+/// peer (event-driven, see `ServeState::record_remote_peer_activity`), and
+/// *between* refreshes the activity column shows `-`. This window is how long a
+/// freshly polled value stays visible before it goes stale again; it is short
+/// relative to the hourly baseline poll.
+pub const REMOTE_ACTIVITY_FRESH_SECS: u64 = 5 * 60; // 5 minutes
 
 /// Maximum wall-clock duration a single reindex may take before its
 /// `active_reindexes` entry is considered **stale** (leaked).
