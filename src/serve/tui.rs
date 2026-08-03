@@ -557,34 +557,52 @@ fn spawn_remote_discovery(
         let mut refreshed_at: std::collections::HashMap<String, std::time::Instant> =
             std::collections::HashMap::new();
 
+        // Startup gate: the first cycle builds rows from config ALONE — so
+        // mounted remotes render immediately as stale `-` (no `refreshed_at`
+        // entry → stale) — WITHOUT pinging any peer. A scale-to-zero cloud
+        // peer must not be woken just to fill the dashboard when the operator
+        // restarts their local serve. The first real refresh comes from either
+        // the baseline cadence tick (idle-suspend window) or an activity poke
+        // (a real federated tool call).
+        let mut initial_cycle = true;
+
         'outer: loop {
-            // ── Full poll: refresh EVERY configured peer concurrently. ──
             let cfg = state.config_snapshot();
             if !cfg.remotes.is_empty() {
-                let now = std::time::Instant::now();
-                let mut join = tokio::task::JoinSet::new();
-                for (peer_name, peer) in cfg.remotes.iter() {
-                    let client = client.clone();
-                    let peer = peer.clone();
-                    let peer_name = peer_name.clone();
-                    join.spawn(async move { (peer_name, poll_peer_status(&client, &peer).await) });
-                }
-                while let Some(res) = join.join_next().await {
-                    if let Ok((peer_name, Some(repos))) = res {
-                        // Drop stale entries for this peer before inserting the
-                        // fresh set (handles repos that vanished on the peer).
-                        status_lookup.retain(|(p, _), _| p != &peer_name);
-                        for r in repos {
-                            status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
-                        }
-                        refreshed_at.insert(peer_name, now);
+                if initial_cycle {
+                    // First cycle: emit config-derived rows only; skip the poll
+                    // (empty status_lookup + refreshed_at → every row stale `-`).
+                    initial_cycle = false;
+                } else {
+                    // ── Full poll: refresh EVERY configured peer concurrently. ──
+                    let now = std::time::Instant::now();
+                    let mut join = tokio::task::JoinSet::new();
+                    for (peer_name, peer) in cfg.remotes.iter() {
+                        let client = client.clone();
+                        let peer = peer.clone();
+                        let peer_name = peer_name.clone();
+                        join.spawn(
+                            async move { (peer_name, poll_peer_status(&client, &peer).await) },
+                        );
                     }
-                    // Unreachable peers keep their cached row + aged refresh
-                    // time (→ stale `-`), never vanishing from the table.
+                    while let Some(res) = join.join_next().await {
+                        if let Ok((peer_name, Some(repos))) = res {
+                            // Drop stale entries for this peer before inserting the
+                            // fresh set (handles repos that vanished on the peer).
+                            status_lookup.retain(|(p, _), _| p != &peer_name);
+                            for r in repos {
+                                status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
+                            }
+                            refreshed_at.insert(peer_name, now);
+                        }
+                        // Unreachable peers keep their cached row + aged refresh
+                        // time (→ stale `-`), never vanishing from the table.
+                    }
                 }
                 // Capacity-1 channel: replace the pending snapshot if the render
                 // loop hasn't consumed it yet (try_send drops on Full — fine, the
-                // next round supersedes it anyway).
+                // next round supersedes it anyway). On the skipped first cycle
+                // this ships rows built from an empty status_lookup → stale `-`.
                 let _ = tx.try_send(RemoteDiscoveryUpdate {
                     rows: build_remote_rows(&status_lookup, &cfg),
                     refreshed_at: refreshed_at.clone(),
