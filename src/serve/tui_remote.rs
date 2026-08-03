@@ -81,7 +81,13 @@ impl RepoInfo {
 // ---------------------------------------------------------------------------
 
 /// Run the standalone remote TUI. Polls `GET {serve_url}/status` every second.
-pub async fn run_remote_tui(serve_url: String) -> Result<()> {
+///
+/// `client` is a pre-built `reqwest::Client` (see
+/// [`crate::index::build_serve_client_with_key`]) that already carries the
+/// `Authorization: Bearer <key>` header for every request when the serve
+/// requires authentication; when no key is configured it behaves like a plain
+/// client, unchanged from today's local/no-auth behavior.
+pub async fn run_remote_tui(serve_url: String, client: reqwest::Client) -> Result<()> {
     // Setup terminal
     crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
     terminal::enable_raw_mode()?;
@@ -90,7 +96,7 @@ pub async fn run_remote_tui(serve_url: String) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = run_remote_tui_loop(&mut terminal, &serve_url).await;
+    let result = run_remote_tui_loop(&mut terminal, &serve_url, client).await;
 
     // Always restore terminal
     tui_common::restore_terminal(&mut terminal)?;
@@ -105,6 +111,7 @@ pub async fn run_remote_tui(serve_url: String) -> Result<()> {
 async fn run_remote_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     serve_url: &str,
+    client: reqwest::Client,
 ) -> Result<()> {
     let mut table_state = ratatui::widgets::TableState::default();
     table_state.select(Some(0));
@@ -125,10 +132,11 @@ async fn run_remote_tui_loop(
     // Monotonic id of the most recent doctor/info request; bumped on every spawn.
     let mut doctor_gen: u64 = 0;
 
-    // Single shared HTTP client reused for the status poll and all action
-    // requests. reqwest::Client is cheap to clone and shares one connection
-    // pool; per-request timeouts are still applied via `.timeout()`.
-    let client = reqwest::Client::new();
+    // Single shared HTTP client (passed in by the caller, pre-configured with
+    // the auth header when the serve requires one) reused for the status poll
+    // and all action requests. reqwest::Client is cheap to clone and shares
+    // one connection pool; per-request timeouts are still applied via
+    // `.timeout()`.
 
     loop {
         // Fetch status from serve
