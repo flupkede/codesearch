@@ -15,7 +15,7 @@ codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) d
 - **Multi-repo serve mode**: Fan-out queries across repository groups with cross-repo RRF ranking
 - **Hybrid retrieval**: Vector embeddings + BM25 full-text search fused with Reciprocal Rank Fusion
 - **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents — in the same tool
-- **AST-aware chunking**: Tree-sitter parsing for 16 languages — chunks align to functions/classes (and Markdown sections), not arbitrary line ranges
+- **AST-aware chunking**: Tree-sitter parsing for 17 languages — chunks align to functions/classes (and Markdown sections), not arbitrary line ranges
 - **Token-efficient**: Returns metadata by default; agents fetch full code only when needed via `get_chunk`
 - **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only, no runtime model downloads (works behind enterprise proxies)
 - **Zero config for single repos**: `codesearch index && codesearch mcp` — done
@@ -306,7 +306,7 @@ In multi-repo mode: auto-routes when chunk_id is unique; returns candidates list
 
 ### `find_impact` — Symbol Reference Impact
 
-Find all call-sites and references to a symbol with file/line precision — the recommended tool for "who calls X?" / "what breaks if I rename X?". Powered by per-language SCIP semantic analysis; precision backends ship per language (**C#** today via the bundled `scip-csharp` helper, more planned). When no backend is available for a language, `find_impact` reports it — fall back to `find kind="usages"` (lexical) only then.
+Find all call-sites and references to a symbol with file/line precision — the recommended tool for "who calls X?" / "what breaks if I rename X?". Powered by per-language SCIP semantic analysis; precision backends ship per language: **C#** (bundled `scip-csharp` helper) and **TypeScript** (via `npx scip-typescript`, resolved on the host on demand — no bundle shipped), more planned. When no backend is available for a language, `find_impact` reports it — fall back to `find kind="usages"` (lexical) only then.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -318,7 +318,7 @@ Find all call-sites and references to a symbol with file/line precision — the 
 
 Returns a list of references with `file`, `start_line`, `end_line`, and `kind` (e.g. `"call"`, `"definition"`). Exposes `index_age_seconds` so agents can reason about staleness.
 
-> **Note:** SCIP precision requires the `-with-csharp` release variant (or a separately installed `scip-csharp` helper) for C#. Without a backend for a language, `find_impact` returns a clear message — use `find kind="usages"` as the lexical fallback. See [C# Semantic Search](#c-semantic-search).
+> **Note:** SCIP precision requires the `-with-csharp` release variant (or a separately installed `scip-csharp` helper) for C#, and `npx` (with `scip-typescript`, fetched on first use) on the host's PATH for TypeScript. Without a backend for a language, `find_impact` returns a clear message — use `find kind="usages"` as the lexical fallback. See [C# Semantic Search](#c-semantic-search).
 
 ### `status` — Index Info
 
@@ -348,9 +348,9 @@ This starts a background HTTP server with:
 | `↑` / `↓` | Navigate repo list |
 | `i` | Show info overlay (chunks, files, model, DB size) |
 | `d` | Run doctor diagnostics on selected repo |
-| `f` | Force reindex selected repo |
+| `n` | Force reindex selected repo |
 | `r` | Remove selected repo (with confirmation dialog) |
-| `s` | Reload repos config from disk |
+| `l` | Reload repos config from disk |
 | `q` | Quit serve |
 
 ### Repository Registration
@@ -715,6 +715,7 @@ Tree-sitter AST-aware chunking:
 | JSON | `.json` |
 | Markdown | `.md`, `.markdown`, `.txt` |
 | Jupyter | `.ipynb` |
+| Protobuf | `.proto` |
 
 Markdown uses the tree-sitter-md **block** grammar — chunks align to sections,
 headings, and code fences. Jupyter notebooks are parsed as JSON; code and
