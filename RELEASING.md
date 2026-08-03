@@ -64,7 +64,10 @@ CI (`release.yml`) builds binaries and creates a GitHub Release with auto-genera
     `build.rs`'s `+<commit_count>` suffix.
   - **Minor** bumps manually at release via `scripts/bump-version.sh --type minor`
     (resets patch→0). **Major** on breaking changes.
-- **No manual CHANGELOG.md edits** — GitHub Releases auto-generate release notes
+- **CHANGELOG.md** — no `[Unreleased]` staging section; entries are added directly
+  under the heading for the current pending version (see the convention note at
+  the top of `CHANGELOG.md`) and that section is finalized with a date once the
+  release is tagged.
 - **Merge style:** feature→`develop` = **merge commit** (`--merge`); `develop`→`master`
   release PR = **squash** (one commit per release on master)
 - **Tag format**: `v1.0.X` on master HEAD

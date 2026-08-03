@@ -74,6 +74,14 @@ pub struct RepoRow {
     /// peer, surfaced locally via `project=<peer>/<alias>`). Rendered italic to
     /// signal it is not a local index.
     pub is_remote: bool,
+    /// True when this *remote* row's activity (`last_tool_call`) is considered
+    /// stale by the embedded TUI — i.e. the peer's `/status` hasn't been
+    /// refreshed within `REMOTE_ACTIVITY_FRESH_SECS` (the slow baseline poll
+    /// hasn't fired and no real tool call has poked an immediate refresh). When
+    /// stale, the activity column renders `-` instead of a possibly-hours-old
+    /// "Xh ago". Always `false` for local repos (which carry live serve state)
+    /// and for the standalone remote dashboard.
+    pub activity_stale: bool,
 }
 
 /// Actions returned by key handling.
@@ -361,8 +369,17 @@ pub fn render_table(
             } else {
                 Cell::from("    -".to_string()).style(Style::default().fg(Color::DarkGray))
             };
-            let tool_cell = Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
-                .style(Style::default().fg(Color::DarkGray));
+            // Federated peers are polled on the slow idle-suspend cadence (no
+            // longer every 30s) so they can scale to zero; between refreshes the
+            // cached activity is stale and rendered as `-` rather than a
+            // misleading "Xh ago". Local repos are always live
+            // (`activity_stale == false`).
+            let tool_cell = if repo.activity_stale {
+                Cell::from("-".to_string()).style(Style::default().fg(Color::DarkGray))
+            } else {
+                Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
+                    .style(Style::default().fg(Color::DarkGray))
+            };
             let lock_cell = lock_cell(&repo.lock_mode);
 
             // Alias text with optional C# indicator suffix, plus its base style.
@@ -550,8 +567,17 @@ pub fn render_detail(
         ),
     ];
 
-    // Third item: last tool call
-    if let Some(ref tool) = repo.last_tool_call {
+    // Third item: last tool call. For a stale federated row the cached value is
+    // possibly hours old (the peer hasn't been polled since the slow baseline
+    // cadence), so show `-` instead of a misleading age. Local repos are always
+    // live (`activity_stale == false`).
+    if repo.activity_stale {
+        info_spans.push(Span::styled(
+            "  last:",
+            Style::default().fg(Color::DarkGray),
+        ));
+        info_spans.push(Span::styled(" -", Style::default().fg(Color::DarkGray)));
+    } else if let Some(ref tool) = repo.last_tool_call {
         info_spans.push(Span::styled(
             "  last:",
             Style::default().fg(Color::DarkGray),

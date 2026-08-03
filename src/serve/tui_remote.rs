@@ -72,6 +72,10 @@ impl RepoInfo {
             // The standalone remote dashboard shows ONE peer's own repos (local
             // from that peer's view), not projects mounted into another instance.
             is_remote: false,
+            // The standalone dashboard polls its single peer every second, so its
+            // activity is always live; the stale-marker only applies to the
+            // embedded TUI's federated mounts.
+            activity_stale: false,
         }
     }
 }
