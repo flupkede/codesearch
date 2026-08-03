@@ -5,8 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<!--
+Convention: there is no `[Unreleased]` staging section. New entries are added
+directly under the heading for the current pending version (the one
+`Cargo.toml` on `develop` is presently building toward — patch auto-bumps on
+every PR merge, see RELEASING.md). That section keeps accumulating entries as
+more PRs land; when the release is actually tagged, the same section is
+finalized in place with a date — no renaming/migration step needed.
+-->
 
-## [Unreleased]
+## [1.1.37] (unreleased)
 
 ### Added
 
