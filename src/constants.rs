@@ -163,11 +163,39 @@ pub const ALL_GROUP_NAME: &str = "all";
 /// Override with `CODESEARCH_LMDB_MAP_SIZE_MB` environment variable.
 pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 1024;
 
-/// Maximum LMDB map size in megabytes (8192MB = 8GB).
+/// Maximum LMDB map size in megabytes (32768MB = 32GB).
 ///
 /// This is the hard upper limit for auto-resizing when MDB_MAP_FULL errors occur.
-/// Prevents unbounded growth and potential disk exhaustion.
-pub const MAX_LMDB_MAP_SIZE_MB: usize = 8192;
+/// Prevents unbounded growth and potential disk exhaustion. On 64-bit Linux/macOS
+/// the mapsize is only a virtual-address-space reservation (free until written),
+/// so a high cap is safe; on Windows the LMDB file may be pre-allocated to the
+/// current (grown) size, but growth only happens on demand when MDB_MAP_FULL
+/// actually bites, so raising the ceiling does not change the steady-state size.
+///
+/// The previous 8GB cap was too low for very large corpora — e.g. a 1GB /
+/// 53k-file cargo-registry source producing >1.2M chunks legitimately exceeds
+/// it (GitHub issue #189). 32GB gives headroom for monorepo-scale indexes
+/// without risking disk exhaustion.
+///
+/// Override at runtime with `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` (see
+/// [`max_lmdb_map_size_mb`]); the override is clamped to at least
+/// [`DEFAULT_LMDB_MAP_SIZE_MB`].
+pub const MAX_LMDB_MAP_SIZE_MB: usize = 32768;
+
+/// Resolve the effective maximum LMDB map size in MB for the current process.
+///
+/// Reads the `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` env var if set (clamped to at
+/// least [`DEFAULT_LMDB_MAP_SIZE_MB`]); otherwise falls back to the
+/// [`MAX_LMDB_MAP_SIZE_MB`] compile-time default. This lets operators with
+/// extreme corpora — or Windows instances that want a lower ceiling — tune the
+/// auto-resize cap without rebuilding.
+pub fn max_lmdb_map_size_mb() -> usize {
+    std::env::var("CODESEARCH_MAX_LMDB_MAP_SIZE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|v| v.max(DEFAULT_LMDB_MAP_SIZE_MB))
+        .unwrap_or(MAX_LMDB_MAP_SIZE_MB)
+}
 
 #[allow(dead_code)]
 /// Default maximum number of entries in persistent embedding cache.
