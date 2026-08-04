@@ -216,6 +216,20 @@ pub const DEFAULT_EMBEDDING_CACHE_MAX_ENTRIES: usize = 200_000;
 /// Override with `CODESEARCH_CACHE_MAX_MEMORY` environment variable.
 pub const DEFAULT_CACHE_MAX_MEMORY_MB: usize = 100;
 
+/// Default LMDB map size (in MB) for the **persistent** embedding cache
+/// (`PersistentEmbeddingCache` at `~/.codesearch/embedding_cache/<model>/`).
+///
+/// Each cache entry is a SHA256 key + `Vec<f32>` of 384 dims ≈ 1.5 KB, so 512 MB
+/// holds roughly 340k embeddings — enough for typical multi-branch use. The cache
+/// auto-resizes (doubling, up to [`MAX_LMDB_MAP_SIZE_MB`]) on `MDB_MAP_FULL`, so
+/// this is only the *starting* size: very large corpora (e.g. the >1.2M-chunk
+/// cargo-registry repro from issue #189) will grow past it on demand.
+///
+/// Distinct from [`DEFAULT_LMDB_MAP_SIZE_MB`] (the *vector store* starting size,
+/// 1024 MB) because the cache holds only `(hash → Vec<f32>)`, no arroy tree or
+/// chunk metadata, so it is smaller per-entry.
+pub const DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB: usize = 512;
+
 /// File watcher debounce time in milliseconds
 pub const DEFAULT_FSW_DEBOUNCE_MS: u64 = 2000;
 
