@@ -1273,4 +1273,145 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_resize_environment_grows_map_and_persists() {
+        // Unit test for the resize mechanic itself (Stage 2 of #189):
+        // resize_environment must grow the in-process mmap AND persist the new
+        // size to metadata.json so the next process reopens at it.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("resize-grow-{}-{}", std::process::id(), now.as_nanos());
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join(&model);
+        let cache =
+            PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir.clone()).unwrap();
+
+        // Fresh cache opens at the default (512MB).
+        let initial = cache.current_map_size_mb();
+        assert_eq!(initial, DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB);
+
+        // Grow to 2× the default — well under the cap.
+        cache.resize_environment(initial * 2).unwrap();
+        assert_eq!(
+            cache.current_map_size_mb(),
+            initial * 2,
+            "current_map_size_mb must reflect the resize immediately"
+        );
+
+        // metadata.json must carry the grown size.
+        let persisted = read_persisted_cache_map_size(&cache_dir);
+        assert_eq!(
+            persisted,
+            Some(initial * 2),
+            "resize must persist to metadata.json so a restart reopens at the grown size"
+        );
+
+        drop(cache);
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_put_batch_auto_resizes_on_map_full() {
+        // End-to-end integration test for the MDB_MAP_FULL retry loop
+        // (Stage 2 of #189): when a put_batch hits MDB_MAP_FULL, the cache must
+        // auto-resize and retry, returning Ok.
+        //
+        // Strategy: open at the default (512MB), then shrink to 1MB via
+        // resize_environment. This is safe because the cache is empty —
+        // data.mdb is only a handful of meta pages, well under 1MB. Then a
+        // single put_batch of ~1000 entries (≈1.6MB of 384-dim vectors) exceeds
+        // the 1MB map, forcing MDB_MAP_FULL. The retry loop doubles to 2MB and
+        // the retry succeeds.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("autoresize-{}-{}", std::process::id(), now.as_nanos());
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join(&model);
+        let cache =
+            PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir.clone()).unwrap();
+
+        // Shrink to 1MB — small enough that a modest batch fills it.
+        cache.resize_environment(1).unwrap();
+        assert_eq!(cache.current_map_size_mb(), 1);
+
+        // ~1000 entries × (384 floats × 4 bytes + ~70-byte key) ≈ 1.6 MB.
+        let keys: Vec<String> = (0..1000).map(|i| format!("hash_{i}")).collect();
+        let emb: Vec<f32> = (0..384).map(|x| x as f32).collect();
+        let entries: Vec<(&str, &[f32])> =
+            keys.iter().map(|k| (k.as_str(), emb.as_slice())).collect();
+
+        let result = cache.put_batch(&entries);
+        assert!(
+            result.is_ok(),
+            "put_batch should succeed after auto-resize, got: {:?}",
+            result.err()
+        );
+
+        // The map must have grown past the 1MB we shrank to.
+        let grown = cache.current_map_size_mb();
+        assert!(
+            grown >= 2,
+            "map should have grown from 1MB to at least 2MB after MDB_MAP_FULL retry, got {}MB",
+            grown
+        );
+
+        // The persisted size must reflect the growth.
+        let persisted = read_persisted_cache_map_size(&cache_dir);
+        assert_eq!(persisted, Some(grown));
+
+        // Data integrity: a sample of entries must be retrievable.
+        let fetched = cache.get("hash_0").unwrap();
+        assert!(
+            fetched.is_some(),
+            "hash_0 must be in the cache after the resize"
+        );
+        assert_eq!(fetched.unwrap(), emb);
+
+        drop(cache);
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_open_reopens_at_persisted_map_size() {
+        // Restart invariant (Stage 2 of #189): a process restart must reopen
+        // the cache at the map size persisted by the prior process. LMDB
+        // rejects an open whose map_size is smaller than the on-disk data.mdb,
+        // so the persisted size must be honoured.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("reopen-{}-{}", std::process::id(), now.as_nanos());
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join(&model);
+
+        // Simulate a prior process that grew the cache: pre-write metadata.json
+        // with a size larger than the default.
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let metadata = serde_json::json!({"lmdb_map_size_mb": 1024});
+        std::fs::write(
+            cache_dir.join("metadata.json"),
+            serde_json::to_string(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let cache = PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir)
+            .expect("open should succeed with a persisted map size > default");
+
+        // Open logic: max(persisted=1024, default=512) = 1024, capped at max
+        // (32768) = 1024.
+        assert_eq!(
+            cache.current_map_size_mb(),
+            1024,
+            "cache should reopen at the persisted size, not the default"
+        );
+
+        drop(cache);
+        drop(temp_dir);
+    }
 }
