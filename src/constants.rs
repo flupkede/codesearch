@@ -163,7 +163,7 @@ pub const ALL_GROUP_NAME: &str = "all";
 /// Override with `CODESEARCH_LMDB_MAP_SIZE_MB` environment variable.
 pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 1024;
 
-/// Maximum LMDB map size in megabytes (32768MB = 32GB).
+/// Maximum LMDB map size in megabytes (16384MB = 16GB).
 ///
 /// This is the hard upper limit for auto-resizing when MDB_MAP_FULL errors occur.
 /// Prevents unbounded growth and potential disk exhaustion. On 64-bit Linux/macOS
@@ -174,13 +174,15 @@ pub const DEFAULT_LMDB_MAP_SIZE_MB: usize = 1024;
 ///
 /// The previous 8GB cap was too low for very large corpora — e.g. a 1GB /
 /// 53k-file cargo-registry source producing >1.2M chunks legitimately exceeds
-/// it (GitHub issue #189). 32GB gives headroom for monorepo-scale indexes
-/// without risking disk exhaustion.
+/// it (GitHub issue #189). 16GB is ample headroom for monorepo-scale indexes
+/// (the #189 repro needed just past 8GB; ~1.2M 384-dim quantized vectors +
+/// arroy overhead ≈ 1.8GB raw), without risking disk exhaustion.
 ///
 /// Override at runtime with `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` (see
 /// [`max_lmdb_map_size_mb`]); the override is clamped to at least
-/// [`DEFAULT_LMDB_MAP_SIZE_MB`].
-pub const MAX_LMDB_MAP_SIZE_MB: usize = 32768;
+/// [`DEFAULT_LMDB_MAP_SIZE_MB`] — use it to raise the ceiling on extreme corpora
+/// that need more than the 16GB default.
+pub const MAX_LMDB_MAP_SIZE_MB: usize = 16384;
 
 /// Resolve the effective maximum LMDB map size in MB for the current process.
 ///

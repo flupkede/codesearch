@@ -1404,7 +1404,7 @@ mod tests {
             .expect("open should succeed with a persisted map size > default");
 
         // Open logic: max(persisted=1024, default=512) = 1024, capped at max
-        // (32768) = 1024.
+        // (16384) = 1024.
         assert_eq!(
             cache.current_map_size_mb(),
             1024,
