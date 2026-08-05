@@ -98,11 +98,11 @@ async fn run_tui_loop(
     // Monotonic id of the most recent doctor request; bumped on every spawn.
     let mut doctor_gen: u64 = 0;
 
-    // Mounted remote projects (peer-hosted indexes, shown italic). Discovered on
-    // a background task whose baseline cadence is the serve idle-suspend window
-    // (so it never keeps a peer awake past the host's own suspend term); an
-    // immediate per-peer refresh is poked the moment a real tool call hits a
-    // peer. The latest snapshot is cached here and appended after the local rows.
+    // Mounted remote projects (peer-hosted indexes, shown italic). The background
+    // task rebuilds these rows from config alone and NEVER polls a peer on a
+    // timer; the only refresh trigger is a poke sent the moment a real tool call
+    // hits a peer (so a scale-to-zero peer is never woken by the dashboard). The
+    // latest snapshot is cached here and appended after the local rows.
     let (remote_tx, mut remote_rx) = tokio::sync::mpsc::channel::<RemoteDiscoveryUpdate>(1);
     // Poke channel: the render loop sends a peer name here when it detects that
     // peer's activity advanced (a real tool call), triggering an immediate
@@ -137,8 +137,9 @@ async fn run_tui_loop(
         // peer's last refresh time, and (b) detect peers whose real activity
         // advanced since the last tick and poke the discovery task to refresh
         // just them. A peer with no mounts contributes nothing and is never
-        // polled — the idle-suspend cadence + activity poke fully replace the
-        // old fixed 30s ping so federated peers can scale to zero.
+        // polled — the activity poke is the *only* thing that ever contacts a
+        // peer from here, so a federated peer can stay scaled to zero for as
+        // long as nobody actually queries it.
         let fresh_window = Duration::from_secs(crate::constants::REMOTE_ACTIVITY_FRESH_SECS);
         let mut alias_to_peer: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -516,16 +517,35 @@ async fn poll_peer_status(
 /// Spawn the background task that discovers mounted remote projects and pushes
 /// snapshots through `tx`.
 ///
-/// **Scale-to-zero design.** The baseline re-discovery cadence is the serve
-/// idle-suspend window ([`ServeState::idle_suspend_secs`]) — the same term after
-/// which the host may scale the replica to zero — NOT a fixed 30s ping, so the
-/// TUI no longer pins a federated peer awake. Between baseline polls the cached
-/// activity is stale and the render loop shows `-`. The moment a real tool call
-/// hits a peer, the render loop detects the advance (via
-/// [`ServeState::remote_peer_last_activity`]) and sends the peer name on
-/// `poke_rx`, triggering an **immediate per-peer** refresh — never a full poll,
-/// so an idle sibling peer is not woken. A peer that blips a round keeps its
-/// cached row (a mount never vanishes on a transient failure).
+/// **Scale-to-zero design: a federated peer is NEVER polled on a timer.** Local
+/// repos are refreshed freely by the render loop; a *federated* peer is
+/// contacted only when there is a real reason to:
+///
+/// - an **activity poke** — a genuine federated tool call just hit that peer, so
+///   it is already awake and refreshing it costs nothing. The render loop detects
+///   the advance via [`ServeState::remote_peer_last_activity`] and sends the peer
+///   name on `poke_rx`; only that peer is refreshed, never a full fan-out, so an
+///   idle sibling peer is not touched.
+/// - an explicit operator keypress — `i` on a remote row fetches that peer's
+///   index stats for the info overlay (see `spawn_remote_info`). That is a
+///   deliberate human action, not background traffic. `l` (reload) only re-reads
+///   the local config and contacts nobody.
+///
+/// The periodic tick below is **config-only**
+/// ([`crate::constants::REMOTE_ROW_REFRESH_SECS`]): it rebuilds the rows from the
+/// `remote_mounts` allowlist so mount/unmount edits and `l` reloads appear
+/// promptly, and issues no HTTP whatsoever. Outside of active use a mount
+/// therefore renders its activity as a stale `-` and a scale-to-zero peer stays
+/// asleep indefinitely. A peer that blips on a poke keeps its cached row (a mount
+/// never vanishes on a transient failure).
+///
+/// **Why there is no baseline poll.** An earlier version ran a `/status` fan-out
+/// on the *local* serve's idle-suspend window (2h by default), on the theory that
+/// polling no faster than the suspend term was harmless. It is not: each poll
+/// *woke* a sleeping replica, which then held itself warm for its own full idle
+/// window (1h on the cloud deploy) — a ~50% duty cycle on a peer nobody queried.
+/// Not keeping a peer awake past its suspend term is not the same as not waking
+/// it, and the two windows were unrelated values besides (local vs. peer).
 fn spawn_remote_discovery(
     state: Arc<ServeState>,
     tx: tokio::sync::mpsc::Sender<RemoteDiscoveryUpdate>,
@@ -541,10 +561,10 @@ fn spawn_remote_discovery(
                 return;
             }
         };
-        // Baseline poll cadence = the serve idle-suspend window, so background
-        // polling can never keep a federated peer awake past the host's own
-        // suspend term. The real "go live again" trigger is the activity poke.
-        let interval = Duration::from_secs(state.idle_suspend_secs().max(1));
+        // Cadence of the CONFIG-ONLY row rebuild. This tick contacts no peer, so
+        // it cannot wake a scale-to-zero replica and is safe to run often; it
+        // exists purely so mount/unmount edits and `l` reloads surface promptly.
+        let row_refresh = Duration::from_secs(crate::constants::REMOTE_ROW_REFRESH_SECS.max(1));
 
         // Cached per-(peer, remote_alias) status, retained across cycles so a
         // peer that blips this round keeps showing its last-known row.
@@ -557,97 +577,66 @@ fn spawn_remote_discovery(
         let mut refreshed_at: std::collections::HashMap<String, std::time::Instant> =
             std::collections::HashMap::new();
 
-        // Startup gate: the first cycle builds rows from config ALONE — so
-        // mounted remotes render immediately as stale `-` (no `refreshed_at`
-        // entry → stale) — WITHOUT pinging any peer. A scale-to-zero cloud
-        // peer must not be woken just to fill the dashboard when the operator
-        // restarts their local serve. The first real refresh comes from either
-        // the baseline cadence tick (idle-suspend window) or an activity poke
-        // (a real federated tool call).
-        let mut initial_cycle = true;
-
-        'outer: loop {
+        loop {
+            // ── Config-only snapshot. Rows come from the `remote_mounts`
+            // allowlist and are merely *enriched* by whatever status is already
+            // cached, so this issues no HTTP and cannot wake a sleeping peer. A
+            // mount with no cached refresh (`refreshed_at` miss) renders its
+            // activity as a stale `-`, which is the correct display for a peer
+            // that is scaled to zero.
+            //
+            // Emitted UNCONDITIONALLY, including when no peers are configured:
+            // the old code gated this on `!cfg.remotes.is_empty()`, so removing
+            // the last peer from `repos.json` left the previously emitted rows
+            // rendered forever (no snapshot was ever sent to clear them). With
+            // no peers `build_remote_rows` yields an empty vec, which clears
+            // them. Still zero HTTP, so this costs nothing.
             let cfg = state.config_snapshot();
-            if !cfg.remotes.is_empty() {
-                if initial_cycle {
-                    // First cycle: emit config-derived rows only; skip the poll
-                    // (empty status_lookup + refreshed_at → every row stale `-`).
-                    initial_cycle = false;
-                } else {
-                    // ── Full poll: refresh EVERY configured peer concurrently. ──
-                    let now = std::time::Instant::now();
-                    let mut join = tokio::task::JoinSet::new();
-                    for (peer_name, peer) in cfg.remotes.iter() {
-                        let client = client.clone();
-                        let peer = peer.clone();
-                        let peer_name = peer_name.clone();
-                        join.spawn(
-                            async move { (peer_name, poll_peer_status(&client, &peer).await) },
-                        );
+            // Capacity-1 channel: replace the pending snapshot if the render
+            // loop hasn't consumed it yet (try_send drops on Full — fine, the
+            // next tick supersedes it anyway).
+            let _ = tx.try_send(RemoteDiscoveryUpdate {
+                rows: build_remote_rows(&status_lookup, &cfg),
+                refreshed_at: refreshed_at.clone(),
+            });
+
+            // ── Wait: config-only tick OR an activity poke. ──
+            // The tick merely loops back and re-emits rows. A poke means a real
+            // federated tool call just landed on that peer, so it is provably
+            // awake already — refresh that ONE peer; idle sibling peers are never
+            // contacted. There is deliberately no timer branch that polls peers.
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(row_refresh) => {}
+                peer = poke_rx.recv() => {
+                    // poke_rx closes only when the render loop is shutting
+                    // down (it owns poke_tx) → exit the discovery task.
+                    let Some(first) = peer else { return; };
+                    // Drain queued pokes; refresh each unique peer once.
+                    let mut targets = std::collections::HashSet::new();
+                    targets.insert(first);
+                    while let Ok(more) = poke_rx.try_recv() {
+                        targets.insert(more);
                     }
-                    while let Some(res) = join.join_next().await {
-                        if let Ok((peer_name, Some(repos))) = res {
+                    let cfg = state.config_snapshot();
+                    for peer_name in targets {
+                        let Some(peer) = cfg.remotes.get(&peer_name) else {
+                            continue;
+                        };
+                        if let Some(repos) = poll_peer_status(&client, peer).await {
                             // Drop stale entries for this peer before inserting the
                             // fresh set (handles repos that vanished on the peer).
                             status_lookup.retain(|(p, _), _| p != &peer_name);
                             for r in repos {
-                                status_lookup.insert((peer_name.clone(), r.alias.clone()), r);
+                                status_lookup
+                                    .insert((peer_name.clone(), r.alias.clone()), r);
                             }
-                            refreshed_at.insert(peer_name, now);
+                            refreshed_at.insert(peer_name, std::time::Instant::now());
                         }
-                        // Unreachable peers keep their cached row + aged refresh
+                        // An unreachable peer keeps its cached row + aged refresh
                         // time (→ stale `-`), never vanishing from the table.
                     }
-                }
-                // Capacity-1 channel: replace the pending snapshot if the render
-                // loop hasn't consumed it yet (try_send drops on Full — fine, the
-                // next round supersedes it anyway). On the skipped first cycle
-                // this ships rows built from an empty status_lookup → stale `-`.
-                let _ = tx.try_send(RemoteDiscoveryUpdate {
-                    rows: build_remote_rows(&status_lookup, &cfg),
-                    refreshed_at: refreshed_at.clone(),
-                });
-            }
-
-            // ── Wait: baseline interval OR an activity poke. ──
-            // Baseline elapse → continue 'outer (full poll). A poke → single-
-            // peer refresh only, then keep waiting (no full poll, so idle
-            // sibling peers are NOT woken).
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(interval) => continue 'outer,
-                    peer = poke_rx.recv() => {
-                        // poke_rx closes only when the render loop is shutting
-                        // down (it owns poke_tx) → exit the discovery task.
-                        let Some(first) = peer else { return; };
-                        // Drain queued pokes; refresh each unique peer once.
-                        let mut targets = std::collections::HashSet::new();
-                        targets.insert(first);
-                        while let Ok(more) = poke_rx.try_recv() {
-                            targets.insert(more);
-                        }
-                        let cfg = state.config_snapshot();
-                        for peer_name in targets {
-                            let Some(peer) = cfg.remotes.get(&peer_name) else {
-                                continue;
-                            };
-                            if let Some(repos) = poll_peer_status(&client, peer).await {
-                                status_lookup.retain(|(p, _), _| p != &peer_name);
-                                for r in repos {
-                                    status_lookup.insert(
-                                        (peer_name.clone(), r.alias.clone()),
-                                        r,
-                                    );
-                                }
-                                refreshed_at.insert(peer_name, std::time::Instant::now());
-                            }
-                        }
-                        let _ = tx.try_send(RemoteDiscoveryUpdate {
-                            rows: build_remote_rows(&status_lookup, &cfg),
-                            refreshed_at: refreshed_at.clone(),
-                        });
-                    }
+                    // Loop back: the snapshot at the top ships the refreshed rows.
                 }
             }
         }

@@ -5,11 +5,22 @@ on:
     # No `pull_request` trigger: this repo's PRs target `develop` (feature/fix →
     # develop, merge-commit style) and `master` (develop/release → master,
     # squash), never `main` — a `pull_request: branches: [main]` trigger would be
-    # permanently dead here since no such branch exists. `push` already covers
-    # every commit that matters, including the develop→master release merge
-    # (added below) which previously had ZERO CI build/test coverage —
-    # protect-master.yml only checks the source-branch name, not code quality.
-    branches: [develop, master, "feature/**", "features/**"]
+    # permanently dead here since no such branch exists.
+    #
+    # ⚠️ The branch list below is an ALLOWLIST OF PREFIXES, and that is a
+    # standing footgun: a branch whose prefix is missing gets NO ci.yml run at
+    # all, silently — the PR still shows green because CodeQL (a separate
+    # workflow, `pull_request`-triggered) runs and is the only check present.
+    # This is not hypothetical: `fix/**` was missing until PR #192, so every
+    # `fix/...` branch — the repo's own documented naming convention, named in
+    # the "feature/fix → develop" line above — merged into develop having never
+    # run fmt, clippy or a single test in CI. The local pre-push QC gate was the
+    # only thing standing between those branches and develop.
+    #
+    # When adding a new branch-naming convention, ADD IT HERE. To verify a
+    # branch is actually covered, check that `gh pr checks <n>` lists the CI
+    # jobs and not just CodeQL.
+    branches: [develop, master, "feature/**", "features/**", "fix/**"]
 
 # Cancel a stale in-flight run when the same branch is pushed again before the
 # previous run finished — e.g. a stage commit immediately followed by a

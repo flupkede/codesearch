@@ -1593,3 +1593,131 @@ mod allowed_hosts_tests {
         );
     }
 }
+
+/// Tests for `extract_host_from_url` — used solely by the keep-warm
+/// misconfiguration sanity check (a keep-warm target host that doesn't look
+/// like "self" gets a loud warning; see the diagnosis this shipped with in
+/// docs/diagnose-federated-keep-warm.md).
+mod keep_warm_host_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_host_from_plain_http_url() {
+        assert_eq!(
+            extract_host_from_url("http://127.0.0.1:8080/healthz"),
+            Some("127.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_host_from_https_url_without_port() {
+        assert_eq!(
+            extract_host_from_url("https://happywave-063747be.azurecontainerapps.io/healthz"),
+            Some("happywave-063747be.azurecontainerapps.io".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_host_with_no_scheme() {
+        // The keep-warm URL is user-supplied (CLI flag or env var) and never
+        // validated to include a scheme — must not panic or silently return
+        // the whole string including a path.
+        assert_eq!(
+            extract_host_from_url("localhost:39725/healthz"),
+            Some("localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_ipv6_host_preserving_brackets() {
+        // A bare rsplit_once(':') would wrongly split inside the IPv6
+        // literal itself (e.g. on the last `:` in `::1`) if not guarded.
+        assert_eq!(
+            extract_host_from_url("http://[::1]:8080/healthz"),
+            Some("[::1]".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_query_and_fragment_before_host_ends() {
+        assert_eq!(
+            extract_host_from_url("http://example.com/healthz?x=1#frag"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_empty_host() {
+        assert_eq!(extract_host_from_url("http:///healthz"), None);
+    }
+}
+
+/// The keep-warm "target isn't self" warning must fire on a genuine
+/// misconfiguration and stay silent on the cloud deployment where keep-warm is
+/// actually supposed to run. Getting the latter wrong is worse than having no
+/// check at all: a warning that fires on every correct cold start trains
+/// operators to ignore it.
+#[cfg(test)]
+mod keep_warm_foreign_target_tests {
+    use super::*;
+
+    /// The regression this rule exists for: on Azure Container Apps the process
+    /// binds `0.0.0.0` while the keep-warm target is correctly the ingress
+    /// FQDN. A naive host comparison flags that as "not self" and warns on
+    /// every cold start of the only correct deployment.
+    #[test]
+    fn wildcard_bind_never_warns_even_for_a_foreign_looking_fqdn() {
+        for wildcard in ["0.0.0.0", "::", "[::]", "0:0:0:0:0:0:0:0", ""] {
+            assert_eq!(
+                keep_warm_foreign_target(
+                    "https://codesearch-serve.azurecontainerapps.io",
+                    wildcard
+                ),
+                None,
+                "wildcard bind {wildcard:?} must not warn — our external host is unknown"
+            );
+        }
+    }
+
+    /// The case the check exists to catch: a concretely-bound local serve whose
+    /// keep-warm URL points at somebody else's cloud replica.
+    #[test]
+    fn concrete_bind_warns_for_a_different_host() {
+        assert_eq!(
+            keep_warm_foreign_target("https://peer.example.com/healthz", "192.168.1.10"),
+            Some("peer.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn matching_host_does_not_warn() {
+        assert_eq!(
+            keep_warm_foreign_target("http://192.168.1.10:39725/healthz", "192.168.1.10"),
+            None
+        );
+    }
+
+    #[test]
+    fn loopback_targets_are_always_treated_as_self() {
+        for target in [
+            "http://localhost:39725/healthz",
+            "http://127.0.0.1:39725/healthz",
+            "http://[::1]:39725/healthz",
+        ] {
+            assert_eq!(
+                keep_warm_foreign_target(target, "192.168.1.10"),
+                None,
+                "{target} is loopback and must not warn"
+            );
+        }
+    }
+
+    /// No extractable host → nothing to compare → no warning.
+    #[test]
+    fn unparseable_target_does_not_warn() {
+        assert_eq!(
+            keep_warm_foreign_target("http:///healthz", "192.168.1.10"),
+            None
+        );
+    }
+}
