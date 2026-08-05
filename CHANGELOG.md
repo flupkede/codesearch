@@ -14,10 +14,11 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.2.1] (unreleased)
+## [1.2.4] (unreleased)
 
 ### Fixed
 
+- **`MDB_MAP_FULL` fatal crash on large corpora — LMDB mapsize cap raised + persistent embedding cache now auto-resizes too (#189).** Indexing a large corpus (e.g. a 1GB / 53k-file cargo-registry source producing >1.2M chunks) could crash with `MDB_MAP_FULL: Environment mapsize limit reached` once the vector store's auto-resize (already in place since an earlier fix) hit its old 8GB hard cap. Two changes: (1) the cap is raised to 16GB by default, and made runtime-overridable via `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` (clamped to at least 1GB) for corpora that legitimately need more; (2) the **persistent embedding cache** (`~/.codesearch/embedding_cache/<model>/`) previously had no resize logic at all — it hit the same `MDB_MAP_FULL` on a hardcoded 512MB cap and silently degraded to a WARN-and-continue path, turning every subsequent embedding into a full ONNX-inference cache miss. It now retries with the same doubling-resize pattern as the vector store (up to 3 attempts, capped at the same runtime limit), persisting the grown size to `metadata.json` so a restart reopens at the correct size. When either store's cap is genuinely exhausted, the error/warning message now names the env var that raises it, instead of just reporting the size.
 - **`build.ps1` now self-heals `core.bare=false` before invoking cargo.** This repo lives at `codesearch.git` as a bare+working-tree hybrid — a full checked-out source tree + `.git/index`, but `core.bare=true` in `.git/config`. `core.bare` intermittently resets to `true` (VS Code's git integration rewrites `.git/config` on ref changes; smoking gun: `github-pr-owner-number` duplicated 7× for `develop`), and when it does, cargo's source fingerprinting aborts every build with `did not expect repo ...\.git to be bare`, breaking `copy-to-common.ps1` → `build.ps1` → `cargo build`. `build.ps1` now forces `core.bare=false` right after `Set-Location`, before any cargo invocation. Idempotent and harmless for a normal (truly non-bare) checkout; non-fatal if git is unreachable.
 
 ## [1.2.0] - 2026-08-03
