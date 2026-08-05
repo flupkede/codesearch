@@ -4591,6 +4591,36 @@ fn build_streamable_http_config() -> StreamableHttpServerConfig {
     }
 }
 
+/// Extracts the host (no scheme, no port, no path) from a URL string, without
+/// pulling in the `url` crate as a new direct dependency (it is only
+/// transitive via reqwest today). Deliberately best-effort: used solely for
+/// the keep-warm misconfiguration warning in `run_serve`, where a parse
+/// failure just means the sanity check is skipped, not a hard error.
+fn extract_host_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_and_rest = after_scheme.split(['/', '?', '#']).next()?;
+    // Strip a trailing `:port`, but not the `:` inside an IPv6 literal like
+    // `[::1]:8080` — only split on the LAST colon when the host isn't
+    // bracketed.
+    let host = if host_and_rest.starts_with('[') {
+        host_and_rest
+            .split(']')
+            .next()
+            .map(|h| format!("{h}]"))
+            .unwrap_or_else(|| host_and_rest.to_string())
+    } else {
+        host_and_rest
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| host_and_rest.to_string())
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
 pub async fn run_serve(
     host: Option<String>,
     port: Option<u16>,
@@ -4921,6 +4951,43 @@ pub async fn run_serve(
             crate::constants::KEEP_WARM_INTERVAL_SECS,
             idle_suspend
         );
+        // Sanity check: keep-warm exists to self-ping THIS replica's own
+        // ingress so the platform sees traffic and doesn't suspend it — it
+        // is not meant to point at any other host, and nothing upstream of
+        // this function validates that. If CODESEARCH_KEEP_WARM_URL (or
+        // --keep-warm-url) was ever set to a DIFFERENT host — e.g. copied
+        // from a cloud deployment's env into a local shell profile — this
+        // task would silently generate periodic outbound traffic to that
+        // other host with zero per-request log line (only this one-time
+        // "enabled" message), which is exactly the failure mode a user
+        // reported: a local `serve --no-tui` process quietly keeping a
+        // mounted federation peer's cloud replica warm every
+        // KEEP_WARM_INTERVAL_SECS, defeating its scale-to-zero, discoverable
+        // only by noticing outbound network traffic — not by anything in
+        // the local server's own logs. This can't be fully auto-corrected
+        // (we don't reliably know our own externally-visible host), but a
+        // loud one-time warning when the target doesn't look like "self"
+        // (differs from the bind host/port this process is actually
+        // listening on) turns a silent misconfiguration into a visible one.
+        if let Some(target_host) = extract_host_from_url(&ping_url) {
+            let self_host = effective_host.as_str();
+            let looks_like_self = target_host == self_host
+                || target_host == "localhost"
+                || target_host == "127.0.0.1"
+                || target_host == "::1";
+            if !looks_like_self {
+                tracing::warn!(
+                    "⚠️  keep-warm target host '{target_host}' does not match this \
+                     server's own bind host '{self_host}'. keep-warm exists to \
+                     self-ping THIS replica, not another peer — verify \
+                     CODESEARCH_KEEP_WARM_URL / --keep-warm-url is not \
+                     accidentally pointing at a different (e.g. cloud/federated) \
+                     server, which would silently keep that OTHER server warm \
+                     every {}s.",
+                    crate::constants::KEEP_WARM_INTERVAL_SECS
+                );
+            }
+        }
         tokio::spawn(async move {
             let interval =
                 std::time::Duration::from_secs(crate::constants::KEEP_WARM_INTERVAL_SECS);
@@ -4933,11 +5000,31 @@ pub async fn run_serve(
                         // for the full idle window before first use.
                         let last = kw_state.most_recent_tool_call().unwrap_or(start);
                         if last.elapsed().as_secs() < idle_suspend {
-                            let _ = client
+                            // Previously this ping was completely silent — no log
+                            // line at all, success or failure. That silence is
+                            // exactly what made a misconfigured keep-warm target
+                            // (see the sanity check above) undiagnosable from the
+                            // logs alone. debug! on success keeps normal operation
+                            // quiet by default while still being traceable with
+                            // RUST_LOG=debug; failures are always worth a warn.
+                            match client
                                 .get(&ping_url)
                                 .timeout(std::time::Duration::from_secs(10))
                                 .send()
-                                .await;
+                                .await
+                            {
+                                Ok(resp) => {
+                                    tracing::debug!(
+                                        "keep-warm ping to {ping_url} -> {}",
+                                        resp.status()
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "keep-warm ping to {ping_url} failed: {e:#}"
+                                    );
+                                }
+                            }
                         }
                     }
                     _ = kw_cancel.cancelled() => break,

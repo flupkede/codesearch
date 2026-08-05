@@ -1593,3 +1593,61 @@ mod allowed_hosts_tests {
         );
     }
 }
+
+/// Tests for `extract_host_from_url` — used solely by the keep-warm
+/// misconfiguration sanity check (a keep-warm target host that doesn't look
+/// like "self" gets a loud warning; see the diagnosis this shipped with in
+/// docs/diagnose-federated-keep-warm.md).
+mod keep_warm_host_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_host_from_plain_http_url() {
+        assert_eq!(
+            extract_host_from_url("http://127.0.0.1:8080/healthz"),
+            Some("127.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_host_from_https_url_without_port() {
+        assert_eq!(
+            extract_host_from_url("https://happywave-063747be.azurecontainerapps.io/healthz"),
+            Some("happywave-063747be.azurecontainerapps.io".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_host_with_no_scheme() {
+        // The keep-warm URL is user-supplied (CLI flag or env var) and never
+        // validated to include a scheme — must not panic or silently return
+        // the whole string including a path.
+        assert_eq!(
+            extract_host_from_url("localhost:39725/healthz"),
+            Some("localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_ipv6_host_preserving_brackets() {
+        // A bare rsplit_once(':') would wrongly split inside the IPv6
+        // literal itself (e.g. on the last `:` in `::1`) if not guarded.
+        assert_eq!(
+            extract_host_from_url("http://[::1]:8080/healthz"),
+            Some("[::1]".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_query_and_fragment_before_host_ends() {
+        assert_eq!(
+            extract_host_from_url("http://example.com/healthz?x=1#frag"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_empty_host() {
+        assert_eq!(extract_host_from_url("http:///healthz"), None);
+    }
+}
