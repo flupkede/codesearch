@@ -2442,6 +2442,13 @@ impl ServeState {
     /// "active". Only genuine tool calls update `last_tool_call`; health/status
     /// probes and the keep-warm self-ping do not, so this reflects real query
     /// activity — not the keep-warm traffic that keeps the replica alive.
+    ///
+    /// `None` therefore means "this replica has served no real query since it
+    /// started", and keep-warm treats that as *do not ping* rather than falling
+    /// back to the process start time. Substituting the start time would make
+    /// every spurious wake (a probe, a dashboard poll) self-sustain for the
+    /// whole idle window — and, because a real tool call always sets this,
+    /// such a fallback can only ever fire when the wake was not real work.
     pub(crate) fn most_recent_tool_call(&self) -> Option<Instant> {
         self.last_tool_call
             .iter()
@@ -4603,6 +4610,41 @@ fn extract_host_from_url(url: &str) -> Option<String> {
     }
 }
 
+/// Decide whether the keep-warm target looks like it points at a host *other*
+/// than this replica, returning the offending target host when it does.
+///
+/// `None` means "do not warn" — either the target does look like self, or we
+/// cannot tell. Returning `None` for "cannot tell" is deliberate:
+///
+/// - A **wildcard bind** (`0.0.0.0`, `::`) means our externally-visible host is
+///   genuinely unknown. This is the normal cloud case — on Azure Container Apps
+///   the process binds `0.0.0.0` while `keep_warm_url` is correctly the ingress
+///   FQDN — so comparing the two proves nothing. Warning here would fire on
+///   every cold start of the one deployment where keep-warm is *supposed* to
+///   run, and a check that cries wolf on the correct configuration trains
+///   operators to ignore the case that actually matters.
+/// - A URL with no extractable host cannot be compared at all.
+fn keep_warm_foreign_target(ping_url: &str, self_host: &str) -> Option<String> {
+    // Wildcard / unspecified binds: externally-visible host unknown.
+    if matches!(
+        self_host,
+        "0.0.0.0" | "::" | "[::]" | "0:0:0:0:0:0:0:0" | "[0:0:0:0:0:0:0:0]" | ""
+    ) {
+        return None;
+    }
+    let target_host = extract_host_from_url(ping_url)?;
+    let looks_like_self = target_host == self_host
+        || target_host == "localhost"
+        || target_host == "127.0.0.1"
+        || target_host == "::1"
+        || target_host == "[::1]";
+    if looks_like_self {
+        None
+    } else {
+        Some(target_host)
+    }
+}
+
 pub async fn run_serve(
     host: Option<String>,
     port: Option<u16>,
@@ -4920,7 +4962,6 @@ pub async fn run_serve(
         let ping_url = format!("{}{}", base_url.trim_end_matches('/'), HEALTHZ_PATH);
         let kw_state = serve_state.clone();
         let kw_cancel = cancel_token.clone();
-        let start = Instant::now();
         info!(
             "🔥 keep-warm enabled: pinging {} every {}s while idle < {}s",
             ping_url,
@@ -4945,24 +4986,22 @@ pub async fn run_serve(
         // loud one-time warning when the target doesn't look like "self"
         // (differs from the bind host/port this process is actually
         // listening on) turns a silent misconfiguration into a visible one.
-        if let Some(target_host) = extract_host_from_url(&ping_url) {
-            let self_host = effective_host.as_str();
-            let looks_like_self = target_host == self_host
-                || target_host == "localhost"
-                || target_host == "127.0.0.1"
-                || target_host == "::1";
-            if !looks_like_self {
-                tracing::warn!(
-                    "⚠️  keep-warm target host '{target_host}' does not match this \
-                     server's own bind host '{self_host}'. keep-warm exists to \
-                     self-ping THIS replica, not another peer — verify \
-                     CODESEARCH_KEEP_WARM_URL / --keep-warm-url is not \
-                     accidentally pointing at a different (e.g. cloud/federated) \
-                     server, which would silently keep that OTHER server warm \
-                     every {}s.",
-                    crate::constants::KEEP_WARM_INTERVAL_SECS
-                );
-            }
+        //
+        // A WILDCARD bind is the one case where this check must stay silent —
+        // see [`keep_warm_foreign_target`], which owns that rule so it can be
+        // unit-tested.
+        let self_host = effective_host.as_str();
+        if let Some(target_host) = keep_warm_foreign_target(&ping_url, self_host) {
+            tracing::warn!(
+                "⚠️  keep-warm target host '{target_host}' does not match this \
+                 server's own bind host '{self_host}'. keep-warm exists to \
+                 self-ping THIS replica, not another peer — verify \
+                 CODESEARCH_KEEP_WARM_URL / --keep-warm-url is not \
+                 accidentally pointing at a different (e.g. cloud/federated) \
+                 server, which would silently keep that OTHER server warm \
+                 every {}s.",
+                crate::constants::KEEP_WARM_INTERVAL_SECS
+            );
         }
         tokio::spawn(async move {
             let interval =
@@ -4971,10 +5010,27 @@ pub async fn run_serve(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        // Fall back to the server start time when no query has
-                        // happened yet, so a freshly deployed replica stays warm
-                        // for the full idle window before first use.
-                        let last = kw_state.most_recent_tool_call().unwrap_or(start);
+                        // Keep-warm sustains warmth only AFTER real use. With no
+                        // tool call recorded there is nothing to keep warm for,
+                        // so we simply don't ping and let the host suspend us;
+                        // the next real request wakes us.
+                        //
+                        // This previously fell back to the process start time
+                        // ("a freshly deployed replica stays warm for the full
+                        // idle window before first use"). That was actively
+                        // harmful, and unreachable in the case it was written
+                        // for: a genuine tool call always records itself, so the
+                        // fallback could only ever fire when the wake was NOT
+                        // real work. `/status` and `/healthz` have their own
+                        // handlers and never call `record_tool_call`, so ANY
+                        // spurious wake — a dashboard poll, a platform probe —
+                        // made the replica self-ping for the whole idle window.
+                        // Measured on the cloud peer: ~67 min warm instead of
+                        // the ~6 min a bare wake costs, ≈11x amplification. Its
+                        // entire practical effect was rewarding spurious wakes.
+                        let Some(last) = kw_state.most_recent_tool_call() else {
+                            continue;
+                        };
                         if last.elapsed().as_secs() < idle_suspend {
                             // Previously this ping was completely silent — no log
                             // line at all, success or failure. That silence is
