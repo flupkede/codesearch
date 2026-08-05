@@ -20,7 +20,7 @@ on:
     # When adding a new branch-naming convention, ADD IT HERE. To verify a
     # branch is actually covered, check that `gh pr checks <n>` lists the CI
     # jobs and not just CodeQL.
-    branches: [develop, master, "feature/**", "features/**", "fix/**"]
+    branches: [develop, master, "feature/**", "features/**", "fix/**", "chore/**"]
 
 # Cancel a stale in-flight run when the same branch is pushed again before the
 # previous run finished — e.g. a stage commit immediately followed by a

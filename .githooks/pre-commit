@@ -1,7 +1,9 @@
 #!/bin/bash
-# Pre-commit hook: format Rust code only.
+# pre-commit hook: format Rust code only.
 #
 # Runs `cargo fmt` and stages any reformatting so CI's fmt-check can't fail.
+#
+# Installed via `git config core.hooksPath .githooks` — see .githooks/README.md.
 #
 # This hook deliberately does NOT bump the version or build a binary. It used
 # to auto-bump the Cargo.toml patch version and run `cargo build` on every
