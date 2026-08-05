@@ -277,14 +277,6 @@ pub(crate) struct ServeState {
     reload_count: std::sync::atomic::AtomicUsize,
     /// Instant when ServeState was created — used to compute uptime for TUI header.
     started_at: std::time::Instant,
-    /// Resolved idle-before-suspend window (seconds) — the same value the
-    /// keep-warm task uses to decide when to let the host scale the replica to
-    /// zero. The embedded TUI reuses it as the federated-peer `/status` baseline
-    /// poll interval, so its background polling can never keep a peer awake past
-    /// the host's own suspend term. Resolved in [`Self::new`] from
-    /// `IDLE_SUSPEND_SECS_ENV` (falling back to `DEFAULT_IDLE_SUSPEND_SECS`) and
-    /// overridden by the `--idle-suspend-secs` flag in `run_serve`.
-    idle_suspend_secs: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -354,11 +346,6 @@ impl ServeState {
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
             started_at: std::time::Instant::now(),
-            idle_suspend_secs: std::env::var(crate::constants::IDLE_SUSPEND_SECS_ENV)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|s| *s > 0)
-                .unwrap_or(crate::constants::DEFAULT_IDLE_SUSPEND_SECS),
         }
     }
 
@@ -2477,18 +2464,13 @@ impl ServeState {
     /// The embedded TUI polls this every render tick; an advance (a newer
     /// `Instant` than the value seen on the previous tick) means a real tool call
     /// just used that peer, so the TUI pokes an immediate per-peer `/status`
-    /// refresh instead of waiting for the slow baseline poll.
+    /// refresh. This poke is the ONLY thing that ever makes the dashboard contact
+    /// a federated peer — there is no baseline poll, so a peer nobody queries is
+    /// left asleep (see `spawn_remote_discovery`).
     pub(crate) fn remote_peer_last_activity(&self, peer_name: &str) -> Option<Instant> {
         self.remote_peer_activity
             .get(peer_name)
             .map(|entry| *entry.value())
-    }
-
-    /// The resolved idle-before-suspend window (seconds) — used by the embedded
-    /// TUI as the federated-peer `/status` baseline poll interval so background
-    /// polling can never keep a peer awake past the host's own suspend term.
-    pub(crate) fn idle_suspend_secs(&self) -> u64 {
-        self.idle_suspend_secs
     }
 
     /// Record that changes were made to a repo (index/reindex).
@@ -4699,17 +4681,11 @@ pub async fn run_serve(
     #[cfg(unix)]
     raise_fd_limit(config.repos.len());
 
-    let mut serve_state = ServeState::new(config, None);
-    // The `--idle-suspend-secs` flag takes precedence over the env/default the
-    // constructor already resolved; mirror the keep-warm task's resolution so
-    // the embedded TUI's federated-peer poll interval matches exactly. `0`
-    // means "disabled" for keep-warm, so treat it as "leave the default".
-    if let Some(secs) = idle_suspend_secs {
-        if secs > 0 {
-            serve_state.idle_suspend_secs = secs;
-        }
-    }
-    let serve_state = Arc::new(serve_state);
+    // The idle-suspend window is resolved by the keep-warm task alone (flag >
+    // env > default); nothing else consumes it, so `ServeState` does not carry
+    // it. In particular the embedded TUI must NOT derive a poll cadence from it
+    // — it never polls a federated peer on a timer at all.
+    let serve_state = Arc::new(ServeState::new(config, None));
 
     // Construct the bind address from resolved host + port.
     // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.

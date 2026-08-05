@@ -76,8 +76,10 @@ pub struct RepoRow {
     pub is_remote: bool,
     /// True when this *remote* row's activity (`last_tool_call`) is considered
     /// stale by the embedded TUI — i.e. the peer's `/status` hasn't been
-    /// refreshed within `REMOTE_ACTIVITY_FRESH_SECS` (the slow baseline poll
-    /// hasn't fired and no real tool call has poked an immediate refresh). When
+    /// refreshed within `REMOTE_ACTIVITY_FRESH_SECS`. There is no background
+    /// poll that could refresh it: a federated peer is contacted only when a
+    /// real tool call pokes an immediate refresh (or on the `i` keypress), so
+    /// for an idle mount this is the *normal* steady state, not a fault. When
     /// stale, the activity column renders `-` instead of a possibly-hours-old
     /// "Xh ago". Always `false` for local repos (which carry live serve state)
     /// and for the standalone remote dashboard.
