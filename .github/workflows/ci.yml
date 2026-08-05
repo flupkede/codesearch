@@ -11,6 +11,14 @@ on:
     # protect-master.yml only checks the source-branch name, not code quality.
     branches: [develop, master, "feature/**", "features/**"]
 
+# Cancel a stale in-flight run when the same branch is pushed again before the
+# previous run finished — e.g. a stage commit immediately followed by a
+# review-fix amend + re-push. Without this, both runs complete and only the
+# newer commit's result matters; the older run's compute is pure waste.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -73,18 +81,36 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+          fetch-depth: 0
+      # Skip the rest of this job when C# helper / symbol-indexing code did
+      # not change — the dotnet publish + cargo test cycle below is expensive
+      # and was previously running unconditionally on every single push.
+      - name: Check for C# helper changes
+        id: changed
+        run: |
+          if [ -z "${{ github.event.before }}" ] || ! git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"   # new branch / force-push base gone — be safe, run it
+          elif git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -q '^helpers/csharp/'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
       # pin@v4
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        if: steps.changed.outputs.relevant == 'true'
         with:
           dotnet-version: '10.0.x'
       - name: Build scip-csharp helper (self-contained single-file)
+        if: steps.changed.outputs.relevant == 'true'
         run: |
           cd helpers/csharp
           dotnet publish scip-csharp.csproj -c Release -r linux-x64 --self-contained -p:PublishSingleFile=true -o bin/Release/net10.0
       # pin@stable
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        if: steps.changed.outputs.relevant == 'true'
       # pin@v4
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: steps.changed.outputs.relevant == 'true'
         with:
           path: |
             ~/.cargo/registry/
@@ -92,6 +118,7 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Run C# integration tests
+        if: steps.changed.outputs.relevant == 'true'
         run: |
           export CODESEARCH_SCIP_CSHARP="$PWD/helpers/csharp/bin/Release/net10.0/scip-csharp"
           cargo test --features csharp_helper_integration -- --nocapture
