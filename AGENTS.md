@@ -63,7 +63,7 @@ Single source of truth for outstanding codesearch work. Items marked 🔒 live i
 
 ### GitHub issues
 
-- [~] **#162: include protobuf as a language aware** — Niveau 1 (text-aware `tree-sitter-proto` chunking on `message`/`enum`/`service`/`rpc` boundaries) shipped in PR #175. Niveau 2 (SCIP symbols → `find_impact`/call-graph) deferred pending a `.proto`-heavy repo — no `scip-protobuf` emitter exists today.
+- [x] **#162: include protobuf as a language aware** — Niveau 1 (text-aware `tree-sitter-proto` chunking on `message`/`enum`/`service`/`rpc` boundaries) shipped in PR #175. Niveau 2 (SCIP symbols → `find_impact`/call-graph) deferred pending a `.proto`-heavy repo — no `scip-protobuf` emitter exists today.
 - [x] **#161: missing macOS binary in v1.1.31** — fixed: C1/C3/C4 (APFS disk-pressure retry: stage binary out of `target/` + `cargo clean` + tar/cp retry loops with `df -h` diagnostics) merged via #166; PR #173 pinned the `actions/checkout` `ref:` so `workflow_dispatch` builds the tagged commit (related mismatch class). GitHub issue #161 closed 2026-07-29.
 
 ### Defensive / low priority
@@ -91,13 +91,15 @@ This repo uses a **`develop`-based** gitflow. The GitHub default branch is `mast
 
 Common mistake: a subagent runs `/git pr create` with no explicit `--base`, the tooling picks `master` (GitHub default), and the PR lands against the wrong branch. Always specify `--base develop`.
 
-> **Note (2026-07-10):** the "merge commits, not squash" rule above is about feature/fix PRs into `develop`. Release PRs (`develop → master`) are, by contrast, squash-merged — which means master's release commits never become ancestors of develop. Over time this regresses `git merge-base(master, develop)` and can produce a false `CONFLICTING` mergeable state on a release PR even when the content is identical. If that happens, do not merge `master` into `develop` directly (history rewrite) — cut a throwaway `release/vX.Y.Z` branch off `develop`, merge `origin/master -X ours` into *that* branch, verify an empty content diff, and PR it into `master` instead.
+> **Note (2026-08-03):** the "merge commits, not squash" rule above is about feature/fix PRs into `develop`. Release PRs (`develop → master`) are, by contrast, squash-merged — which means master's release commits never become ancestors of develop. Over time this regresses `git merge-base(master, develop)` and can produce a false `CONFLICTING` mergeable state on a release PR even when the content is identical. If that happens, do not merge `master` into `develop` directly (history rewrite) — cut a throwaway `release/vX.Y.Z` branch off `develop`, run **`git merge -s ours origin/master`** in *that* branch (the merge **strategy** `-s ours`, *not* the option `-X ours`), verify the content diff is empty (`git diff origin/master`), and PR it into `master` instead.
+>
+> Why the strategy and not the option: against the regressed merge-base, `-X ours` still runs a real three-way merge that treats both sides' content as additions and drags master's stale lines in — a Frankenstein diff (`src/mcp/mod.rs` gained +333 stale lines this way on the v1.2.0 attempt). `-s ours` ignores master's tree entirely and keeps develop's content exactly, which is the desired result here (in this scenario develop's tree already equals master's content); the merge commit only exists to record master as a parent so the merge-base advances. Confirmed empirically on the v1.2.0 release: the `develop → master` PR #185 came back `CONFLICTING`; the throwaway `release/v1.2.0` branch built with `git merge -s ours origin/master` produced an empty content diff and merged clean (#186).
 
 ## Notes for OpenCode / agents
 
 - **Validation:** `cargo check` and `cargo clippy` for iteration. No `--release` builds — always dev/debug until the very end.
 - **Runtime:** `C:\Users\develterf\.local\bin\` — `codesearch.exe` + `helpers/csharp/scip-csharp.exe`
-- **Build:** `target/release/` — outside repo (via `CARGO_TARGET_DIR`)
+- **Build:** `target/release/` — outside repo (via `CARGO_TARGET_DIR`). `build.ps1` self-heals `core.bare=false` before invoking cargo — this checkout is a bare+working-tree hybrid whose `core.bare` intermittently resets to `true` (VS Code's git integration rewrites `.git/config` on ref changes), which makes cargo abort with `did not expect repo to be bare`. No need to flip it manually before building; `build.ps1` does it.
 - **Deploy:** `..\copy-to-common.ps1` — builds + copies both binaries to `~/.local/bin/`. A running `codesearch.exe` is file-locked on Windows; stop serve before deploying.
 - **Canonical paths:** NEVER call `.canonicalize()` directly. Always use `safe_canonicalize()`.
 - **LMDB rule:** No two `EnvOpenOptions::open()` on same dir in same process. All access via `get_or_open_stores()` → `Arc<SharedStores>`.

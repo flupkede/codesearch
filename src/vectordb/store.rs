@@ -1,4 +1,4 @@
-use crate::constants::MAX_LMDB_MAP_SIZE_MB;
+use crate::constants::max_lmdb_map_size_mb;
 use crate::embed::EmbeddedChunk;
 use crate::info_print;
 use anyhow::{anyhow, Result};
@@ -70,7 +70,7 @@ fn map_size_pin_key(db_path: &Path) -> std::path::PathBuf {
 /// Pin (or raise) the process map size for `db_path` and return the effective
 /// value. Monotonically non-decreasing and capped at `MAX_LMDB_MAP_SIZE_MB`.
 fn pin_map_size(db_path: &Path, candidate: usize) -> usize {
-    let candidate = candidate.min(MAX_LMDB_MAP_SIZE_MB);
+    let candidate = candidate.min(max_lmdb_map_size_mb());
     let pins = map_size_pins();
     let mut entry = pins.entry(map_size_pin_key(db_path)).or_insert(candidate);
     if candidate > *entry {
@@ -608,11 +608,12 @@ impl VectorStore {
     /// environment, which avoids the "an environment is already opened with
     /// different options" error when a live serve process needs to grow the map.
     fn resize_environment(&mut self, new_size_mb: usize) -> Result<()> {
-        if new_size_mb > MAX_LMDB_MAP_SIZE_MB {
+        if new_size_mb > max_lmdb_map_size_mb() {
             return Err(anyhow::anyhow!(
-                "Requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB",
+                "Requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB \
+                 (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                 new_size_mb,
-                MAX_LMDB_MAP_SIZE_MB
+                max_lmdb_map_size_mb()
             ));
         }
 
@@ -723,7 +724,7 @@ impl VectorStore {
                     }
 
                     let new_size = self.map_size_mb * 2;
-                    if new_size <= MAX_LMDB_MAP_SIZE_MB {
+                    if new_size <= max_lmdb_map_size_mb() {
                         warn!(
                             "MDB_MAP_FULL error in build_index(), resizing to {}MB (attempt {}/{})",
                             new_size, attempts, max_attempts
@@ -731,7 +732,8 @@ impl VectorStore {
                         self.resize_environment(new_size)?;
                     } else {
                         warn!(
-                            "MDB_MAP_FULL error in build_index(), already at max size {}MB",
+                            "MDB_MAP_FULL error in build_index(), already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                             self.map_size_mb
                         );
                         return result;
@@ -914,13 +916,14 @@ impl VectorStore {
 
                     // Double map size and retry
                     let new_size = self.map_size_mb * 2;
-                    if new_size <= MAX_LMDB_MAP_SIZE_MB {
+                    if new_size <= max_lmdb_map_size_mb() {
                         warn!("MDB_MAP_FULL error in delete_chunks(), resizing to {}MB (attempt {}/{})",
                               new_size, attempts, max_attempts);
                         self.resize_environment(new_size)?;
                     } else {
                         warn!(
-                            "MDB_MAP_FULL error, already at max size {}MB",
+                            "MDB_MAP_FULL error, already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                             self.map_size_mb
                         );
                         return result;
@@ -984,13 +987,14 @@ impl VectorStore {
 
                     // Double map size and retry
                     let new_size = self.map_size_mb * 2;
-                    if new_size <= MAX_LMDB_MAP_SIZE_MB {
+                    if new_size <= max_lmdb_map_size_mb() {
                         warn!("MDB_MAP_FULL error in insert_chunks_with_ids(), resizing to {}MB (attempt {}/{})",
                               new_size, attempts, max_attempts);
                         self.resize_environment(new_size)?;
                     } else {
                         warn!(
-                            "MDB_MAP_FULL error, already at max size {}MB",
+                            "MDB_MAP_FULL error, already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                             self.map_size_mb
                         );
                         return result;
@@ -1305,8 +1309,9 @@ mod tests {
         let db_path = temp_dir.path().join("capped.db");
         std::fs::create_dir_all(&db_path).unwrap();
 
-        let pinned = pin_map_size(&db_path, MAX_LMDB_MAP_SIZE_MB + 4096);
-        assert_eq!(pinned, MAX_LMDB_MAP_SIZE_MB);
+        let cap = max_lmdb_map_size_mb();
+        let pinned = pin_map_size(&db_path, cap + 4096);
+        assert_eq!(pinned, cap);
     }
 
     #[test]

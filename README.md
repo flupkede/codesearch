@@ -556,6 +556,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
+| `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` | Hard cap (MB) for LMDB auto-resize on `MDB_MAP_FULL`, applied to both the vector store and the persistent embedding cache (default: 16384 = 16GB; clamped to at least 1024). Raise this for very large corpora (millions of chunks) that legitimately exceed the default cap — see #189. |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `CODESEARCH_EXTENSION_MAP` | Path to the extension→language map (default: `~/.codesearch/extensions.json`) — see [Extension map](#extension-map) |

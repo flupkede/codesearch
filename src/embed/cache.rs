@@ -1,6 +1,8 @@
 use super::batch::EmbeddedChunk;
 use crate::chunker::Chunk;
+use crate::constants::{max_lmdb_map_size_mb, DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB};
 use crate::lmdb_registry::TrackedEnv;
+use crate::vectordb::merge_metadata_atomic;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -308,6 +310,24 @@ fn live_cache_stats() -> &'static DashMap<String, PersistentCacheStats> {
     LIVE_CACHE_STATS.get_or_init(DashMap::new)
 }
 
+/// Read the persisted LMDB map size (MB) for an embedding cache dir, from
+/// `metadata.json`'s `lmdb_map_size_mb` field written by
+/// [`PersistentEmbeddingCache::resize_environment`] (and any prior process that
+/// grew the cache). Returns `None` when the file or the field is absent — the
+/// caller then falls back to `DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB`.
+///
+/// Mirrors `vectordb::store::read_persisted_map_size`, but for the cache's
+/// separate `metadata.json`. Kept local rather than shared because the cache
+/// and the vector store never share a path and the read is trivial.
+fn read_persisted_cache_map_size(cache_dir: &Path) -> Option<usize> {
+    let metadata_path = cache_dir.join("metadata.json");
+    let content = std::fs::read_to_string(&metadata_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json.get("lmdb_map_size_mb")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+}
+
 impl PersistentEmbeddingCache {
     /// Resolve the on-disk cache directory for a model — without opening LMDB
     /// and without creating the directory.
@@ -371,6 +391,20 @@ impl PersistentEmbeddingCache {
             )
         })?;
 
+        // Resolve the initial LMDB map size:
+        //   max(persisted-from-metadata.json, DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB)
+        //   capped at max_lmdb_map_size_mb().
+        //
+        // Reading the persisted size is required because LMDB's on-disk file
+        // (`data.mdb`) grows to match the last process's mapsize after an
+        // auto-resize: reopening that file with a *smaller* `map_size` than its
+        // current length is rejected by LMDB. So a process restart must reopen
+        // at least as large as the last size the cache grew to.
+        let initial_mb = read_persisted_cache_map_size(&cache_dir)
+            .unwrap_or(DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB)
+            .max(DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB)
+            .min(max_lmdb_map_size_mb());
+
         // SAFETY: heed's `EnvOpenOptions::open` is unsafe because the caller must
         // ensure no other process maps this LMDB environment with incompatible options
         // (different map_size or flags) at the same time. The cache directory is
@@ -378,8 +412,7 @@ impl PersistentEmbeddingCache {
         // exactly once per process via this constructor.
         // TrackedEnv additionally prevents double-open within the same process.
         let mut opts = EnvOpenOptions::new();
-        // 512MB — plenty for cache.
-        opts.map_size(512 * 1024 * 1024).max_dbs(1);
+        opts.map_size(initial_mb * 1024 * 1024).max_dbs(1);
         // SAFETY: `NO_TLS` only changes reader-slot tracking. See `BASE_ENV_FLAGS`.
         unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
         let env = unsafe {
@@ -423,6 +456,78 @@ impl PersistentEmbeddingCache {
         }
     }
 
+    /// Check if an error is an `MDB_MAP_FULL` error. Same classifier as the
+    /// vector store (`VectorStore::is_map_full_error`): the LMDB error string
+    /// contains `MDB_MAP_FULL` or `map full`.
+    fn is_map_full_error(&self, error: &dyn std::error::Error) -> bool {
+        let msg = error.to_string();
+        msg.contains("MDB_MAP_FULL") || msg.contains("map full")
+    }
+
+    /// Current LMDB env map size in MB, read live from the env (so it reflects
+    /// any prior in-process resize). `heed::Env::info().map_size` returns the
+    /// current byte size of the mmap.
+    fn current_map_size_mb(&self) -> usize {
+        self.env.info().map_size / (1024 * 1024)
+    }
+
+    /// Resize the LMDB environment to `new_size_mb`.
+    ///
+    /// Mirrors `VectorStore::resize_environment` (`src/vectordb/store.rs`):
+    /// `mdb_env_set_mapsize()` is safe to call when no transaction is active,
+    /// so the caller (the retry loops in [`put`](Self::put) /
+    /// [`put_batch`](Self::put_batch)) must have dropped the write txn that
+    /// triggered `MDB_MAP_FULL` before reaching here. `heed::Env::resize` takes
+    /// `&self`, which is why the cache's write methods can stay `&self`.
+    ///
+    /// Persists the new size into `metadata.json` (via
+    /// [`merge_metadata_atomic`]) so a process restart reopens at the grown
+    /// size — LMDB rejects an open whose `map_size` is smaller than the
+    /// on-disk `data.mdb` file, so the persisted value must track every growth.
+    fn resize_environment(&self, new_size_mb: usize) -> Result<()> {
+        if new_size_mb > max_lmdb_map_size_mb() {
+            return Err(anyhow::anyhow!(
+                "Embedding cache: requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB \
+                 (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                new_size_mb,
+                max_lmdb_map_size_mb()
+            ));
+        }
+
+        let new_size_bytes = new_size_mb * 1024 * 1024;
+        tracing::warn!(
+            "🔧 Resizing embedding cache LMDB env to {}MB (in-place, no reopen)",
+            new_size_mb
+        );
+
+        // SAFETY: no transaction is active — the caller dropped the write txn
+        // that returned MDB_MAP_FULL before invoking the retry loop. See the
+        // safety note on `heed::Env::resize`.
+        unsafe {
+            self.env.resize(new_size_bytes)?;
+        }
+
+        // Persist so the next process open uses ≥ this size. A failure here is
+        // non-fatal for the current write (the in-process env is already
+        // resized), but it WOULD cause the next process to fail to open the
+        // cache — so warn loudly rather than silently ignore.
+        if let Err(e) = merge_metadata_atomic(&self.cache_dir, |obj| {
+            obj.insert(
+                "lmdb_map_size_mb".to_string(),
+                serde_json::Value::Number(new_size_mb.into()),
+            );
+        }) {
+            tracing::warn!(
+                "Failed to persist embedding cache map size (next open may fail): {}",
+                e
+            );
+        }
+
+        tracing::info!("✅ Embedding cache LMDB env resized to {}MB", new_size_mb);
+
+        Ok(())
+    }
+
     /// Read the live stats for a model WITHOUT opening the LMDB environment.
     ///
     /// Returns `Some` only when a `PersistentEmbeddingCache` for `model_name`
@@ -444,8 +549,52 @@ impl PersistentEmbeddingCache {
         Ok(self.db.get(&rtxn, content_hash)?)
     }
     #[allow(dead_code)]
-    /// Store embedding in cache
+    /// Store embedding in cache (with MDB_MAP_FULL auto-resize).
+    ///
+    /// Mirrors `VectorStore::build_index`: on `MDB_MAP_FULL`, drop the failed
+    /// write txn, double the env map size, persist it, and retry — up to
+    /// `max_attempts` times. The cap is [`max_lmdb_map_size_mb`]; once the
+    /// resize target would exceed it, the original error is propagated and the
+    /// caller (typically `EmbeddingService::embed_chunks`) logs a WARN and
+    /// continues without caching — embeddings are still computed and returned.
     pub fn put(&self, content_hash: &str, embedding: &[f32]) -> Result<()> {
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+            let result = self.put_impl(content_hash, embedding);
+            match &result {
+                Ok(_) => return result,
+                Err(e) => {
+                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+                    let new_size = self.current_map_size_mb().saturating_mul(2);
+                    if new_size <= max_lmdb_map_size_mb() && new_size > self.current_map_size_mb() {
+                        tracing::warn!(
+                            "MDB_MAP_FULL in embedding cache put(), resizing {}MB → {}MB (attempt {}/{})",
+                            self.current_map_size_mb(),
+                            new_size,
+                            attempts,
+                            max_attempts
+                        );
+                        self.resize_environment(new_size)?;
+                    } else {
+                        tracing::warn!(
+                            "MDB_MAP_FULL in embedding cache put(), already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                            self.current_map_size_mb()
+                        );
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Implementation of [`put`](Self::put) without the retry loop.
+    fn put_impl(&self, content_hash: &str, embedding: &[f32]) -> Result<()> {
         let mut wtxn = self.env.write_txn()?;
         self.db.put(&mut wtxn, content_hash, &embedding.to_vec())?;
         wtxn.commit()?;
@@ -453,8 +602,46 @@ impl PersistentEmbeddingCache {
         Ok(())
     }
 
-    /// Batch insert for efficiency (single transaction)
+    /// Batch insert for efficiency (single transaction) with MDB_MAP_FULL
+    /// auto-resize. See [`put`](Self::put) for the retry / resize contract.
     pub fn put_batch(&self, entries: &[(&str, &[f32])]) -> Result<()> {
+        let mut attempts = 0;
+        let max_attempts = 3;
+
+        loop {
+            attempts += 1;
+            let result = self.put_batch_impl(entries);
+            match &result {
+                Ok(_) => return result,
+                Err(e) => {
+                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+                    let new_size = self.current_map_size_mb().saturating_mul(2);
+                    if new_size <= max_lmdb_map_size_mb() && new_size > self.current_map_size_mb() {
+                        tracing::warn!(
+                            "MDB_MAP_FULL in embedding cache put_batch(), resizing {}MB → {}MB (attempt {}/{})",
+                            self.current_map_size_mb(),
+                            new_size,
+                            attempts,
+                            max_attempts
+                        );
+                        self.resize_environment(new_size)?;
+                    } else {
+                        tracing::warn!(
+                            "MDB_MAP_FULL in embedding cache put_batch(), already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                            self.current_map_size_mb()
+                        );
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Implementation of [`put_batch`](Self::put_batch) without the retry loop.
+    fn put_batch_impl(&self, entries: &[(&str, &[f32])]) -> Result<()> {
         let mut wtxn = self.env.write_txn()?;
         for (hash, embedding) in entries {
             self.db.put(&mut wtxn, hash, &embedding.to_vec())?;
@@ -1088,5 +1275,146 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    #[test]
+    fn test_resize_environment_grows_map_and_persists() {
+        // Unit test for the resize mechanic itself (Stage 2 of #189):
+        // resize_environment must grow the in-process mmap AND persist the new
+        // size to metadata.json so the next process reopens at it.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("resize-grow-{}-{}", std::process::id(), now.as_nanos());
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join(&model);
+        let cache =
+            PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir.clone()).unwrap();
+
+        // Fresh cache opens at the default (512MB).
+        let initial = cache.current_map_size_mb();
+        assert_eq!(initial, DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB);
+
+        // Grow to 2× the default — well under the cap.
+        cache.resize_environment(initial * 2).unwrap();
+        assert_eq!(
+            cache.current_map_size_mb(),
+            initial * 2,
+            "current_map_size_mb must reflect the resize immediately"
+        );
+
+        // metadata.json must carry the grown size.
+        let persisted = read_persisted_cache_map_size(&cache_dir);
+        assert_eq!(
+            persisted,
+            Some(initial * 2),
+            "resize must persist to metadata.json so a restart reopens at the grown size"
+        );
+
+        drop(cache);
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_put_batch_auto_resizes_on_map_full() {
+        // End-to-end integration test for the MDB_MAP_FULL retry loop
+        // (Stage 2 of #189): when a put_batch hits MDB_MAP_FULL, the cache must
+        // auto-resize and retry, returning Ok.
+        //
+        // Strategy: open at the default (512MB), then shrink to 1MB via
+        // resize_environment. This is safe because the cache is empty —
+        // data.mdb is only a handful of meta pages, well under 1MB. Then a
+        // single put_batch of ~1000 entries (≈1.6MB of 384-dim vectors) exceeds
+        // the 1MB map, forcing MDB_MAP_FULL. The retry loop doubles to 2MB and
+        // the retry succeeds.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("autoresize-{}-{}", std::process::id(), now.as_nanos());
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join(&model);
+        let cache =
+            PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir.clone()).unwrap();
+
+        // Shrink to 1MB — small enough that a modest batch fills it.
+        cache.resize_environment(1).unwrap();
+        assert_eq!(cache.current_map_size_mb(), 1);
+
+        // ~1000 entries × (384 floats × 4 bytes + ~70-byte key) ≈ 1.6 MB.
+        let keys: Vec<String> = (0..1000).map(|i| format!("hash_{i}")).collect();
+        let emb: Vec<f32> = (0..384).map(|x| x as f32).collect();
+        let entries: Vec<(&str, &[f32])> =
+            keys.iter().map(|k| (k.as_str(), emb.as_slice())).collect();
+
+        let result = cache.put_batch(&entries);
+        assert!(
+            result.is_ok(),
+            "put_batch should succeed after auto-resize, got: {:?}",
+            result.err()
+        );
+
+        // The map must have grown past the 1MB we shrank to.
+        let grown = cache.current_map_size_mb();
+        assert!(
+            grown >= 2,
+            "map should have grown from 1MB to at least 2MB after MDB_MAP_FULL retry, got {}MB",
+            grown
+        );
+
+        // The persisted size must reflect the growth.
+        let persisted = read_persisted_cache_map_size(&cache_dir);
+        assert_eq!(persisted, Some(grown));
+
+        // Data integrity: a sample of entries must be retrievable.
+        let fetched = cache.get("hash_0").unwrap();
+        assert!(
+            fetched.is_some(),
+            "hash_0 must be in the cache after the resize"
+        );
+        assert_eq!(fetched.unwrap(), emb);
+
+        drop(cache);
+        drop(temp_dir);
+    }
+
+    #[test]
+    fn test_open_reopens_at_persisted_map_size() {
+        // Restart invariant (Stage 2 of #189): a process restart must reopen
+        // the cache at the map size persisted by the prior process. LMDB
+        // rejects an open whose map_size is smaller than the on-disk data.mdb,
+        // so the persisted size must be honoured.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let model = format!("reopen-{}-{}", std::process::id(), now.as_nanos());
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join(&model);
+
+        // Simulate a prior process that grew the cache: pre-write metadata.json
+        // with a size larger than the default.
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let metadata = serde_json::json!({"lmdb_map_size_mb": 1024});
+        std::fs::write(
+            cache_dir.join("metadata.json"),
+            serde_json::to_string(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let cache = PersistentEmbeddingCache::open_with_cache_dir(&model, cache_dir)
+            .expect("open should succeed with a persisted map size > default");
+
+        // Open logic: max(persisted=1024, default=512) = 1024, capped at max
+        // (16384) = 1024.
+        assert_eq!(
+            cache.current_map_size_mb(),
+            1024,
+            "cache should reopen at the persisted size, not the default"
+        );
+
+        drop(cache);
+        drop(temp_dir);
     }
 }
