@@ -1,0 +1,57 @@
+#!/bin/sh
+# pre-push hook — blocks direct pushes to master, then runs QC gate before
+# allowing the push through.
+# Install: cp scripts/pre-push .git/hooks/pre-push
+#
+# This mirrors .github/workflows/ci.yml checks locally so CI failures
+# are caught before they reach GitHub.
+#
+# NOTE: the installed .git/hooks/pre-push additionally carries a local-only
+# customer-ref-leak check (patterns must never be tracked in git history —
+# see the comment in that file), inserted BEFORE this file's final `exit 0`
+# (not appended after it — a straight `cp` would leave the customer check
+# unreachable dead code). This tracked copy is a complete, standalone hook
+# on its own; the installed one is a hand-maintained superset, not a
+# byte-for-byte copy.
+
+# --- Guard: block direct pushes to master ---
+# master only ever advances via a squash-merged release PR (develop/release/*
+# -> master, see RELEASING.md). A direct `git push origin master` is always
+# either a mistake (e.g. committing while HEAD happened to already be on
+# master — this has actually happened once) or an emergency hotfix that
+# should go through the same PR path anyway. GitHub's branch ruleset already
+# blocks non-admin pushes to master, but the repo owner's own bypass
+# privilege makes that toothless against exactly this kind of accidental
+# local push — hence this local, unconditional, checked-first guard.
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+        refs/heads/master)
+            echo ""
+            echo "❌ BLOCKED: direct push to 'master' is not allowed."
+            echo "   master only advances via a squash-merged release PR (see RELEASING.md)."
+            echo "   If this is genuinely intentional, use 'git push --no-verify'."
+            echo ""
+            exit 1
+            ;;
+    esac
+done
+
+echo ""
+echo "🔍 Running QC gate (mirrors CI)..."
+echo ""
+
+pwsh -NoProfile -File "$(git rev-parse --show-toplevel)/scripts/qc.ps1" -Fast
+
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "❌ QC gate FAILED. Push blocked."
+    echo "   Fix the errors above, or use 'git push --no-verify' to skip (not recommended)."
+    echo ""
+    exit 1
+fi
+
+echo ""
+echo "✅ QC gate passed."
+echo ""
+exit 0
+
