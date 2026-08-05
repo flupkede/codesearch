@@ -2,9 +2,14 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, "feature/**", "features/**"]
-  pull_request:
-    branches: [main]
+    # No `pull_request` trigger: this repo's PRs target `develop` (feature/fix →
+    # develop, merge-commit style) and `master` (develop/release → master,
+    # squash), never `main` — a `pull_request: branches: [main]` trigger would be
+    # permanently dead here since no such branch exists. `push` already covers
+    # every commit that matters, including the develop→master release merge
+    # (added below) which previously had ZERO CI build/test coverage —
+    # protect-master.yml only checks the source-branch name, not code quality.
+    branches: [develop, master, "feature/**", "features/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,7 +36,11 @@ jobs:
             ~/.cargo/git/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo build --release
+      # No `cargo build --release` here — nothing in this job consumes that
+      # binary (release.yml builds isolated per-platform release artifacts at
+      # tag time). `cargo test --lib` below already compiles what it needs in
+      # debug profile; the release build was pure wasted CI minutes on every
+      # push, duplicated across every feature-branch push AND its develop merge.
       - run: cargo test --lib -- --nocapture
       - run: cargo test --test '*' -- --nocapture --skip ignore
       - run: cargo fmt -- --check
