@@ -610,7 +610,8 @@ impl VectorStore {
     fn resize_environment(&mut self, new_size_mb: usize) -> Result<()> {
         if new_size_mb > max_lmdb_map_size_mb() {
             return Err(anyhow::anyhow!(
-                "Requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB",
+                "Requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB \
+                 (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                 new_size_mb,
                 max_lmdb_map_size_mb()
             ));
@@ -731,7 +732,8 @@ impl VectorStore {
                         self.resize_environment(new_size)?;
                     } else {
                         warn!(
-                            "MDB_MAP_FULL error in build_index(), already at max size {}MB",
+                            "MDB_MAP_FULL error in build_index(), already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                             self.map_size_mb
                         );
                         return result;
@@ -920,7 +922,8 @@ impl VectorStore {
                         self.resize_environment(new_size)?;
                     } else {
                         warn!(
-                            "MDB_MAP_FULL error, already at max size {}MB",
+                            "MDB_MAP_FULL error, already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                             self.map_size_mb
                         );
                         return result;
@@ -990,7 +993,8 @@ impl VectorStore {
                         self.resize_environment(new_size)?;
                     } else {
                         warn!(
-                            "MDB_MAP_FULL error, already at max size {}MB",
+                            "MDB_MAP_FULL error, already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                             self.map_size_mb
                         );
                         return result;

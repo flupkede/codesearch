@@ -487,7 +487,8 @@ impl PersistentEmbeddingCache {
     fn resize_environment(&self, new_size_mb: usize) -> Result<()> {
         if new_size_mb > max_lmdb_map_size_mb() {
             return Err(anyhow::anyhow!(
-                "Embedding cache: requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB",
+                "Embedding cache: requested map size {}MB exceeds MAX_LMDB_MAP_SIZE_MB {}MB \
+                 (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                 new_size_mb,
                 max_lmdb_map_size_mb()
             ));
@@ -581,7 +582,8 @@ impl PersistentEmbeddingCache {
                         self.resize_environment(new_size)?;
                     } else {
                         tracing::warn!(
-                            "MDB_MAP_FULL in embedding cache put(), already at max size {}MB",
+                            "MDB_MAP_FULL in embedding cache put(), already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                             self.current_map_size_mb()
                         );
                         return result;
@@ -627,7 +629,8 @@ impl PersistentEmbeddingCache {
                         self.resize_environment(new_size)?;
                     } else {
                         tracing::warn!(
-                            "MDB_MAP_FULL in embedding cache put_batch(), already at max size {}MB",
+                            "MDB_MAP_FULL in embedding cache put_batch(), already at max size {}MB \
+                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
                             self.current_map_size_mb()
                         );
                         return result;
