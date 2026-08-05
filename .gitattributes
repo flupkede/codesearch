@@ -9,8 +9,8 @@ AGENTS.md merge=ours
 *.sh text eol=lf
 docker/entrypoint.sh text eol=lf
 
-# Extensionless shell scripts (git hooks + their tracked sources) — same LF
-# requirement: a CRLF shebang silently breaks the hook when copied into
-# .git/hooks on Windows.
-scripts/pre-commit text eol=lf
+# Extensionless shell scripts (the git hooks) — same LF requirement: a CRLF
+# shebang silently breaks the hook on Windows. All hooks live in .githooks/ and
+# are activated with `git config core.hooksPath .githooks`; there is no longer a
+# tracked copy under scripts/ that needs its own rule here.
 .githooks/** text eol=lf

@@ -1,0 +1,152 @@
+#!/bin/sh
+# pre-push — three guards, run in order. Any one of them can block the push.
+#
+#   1. never push straight to master
+#   2. QC gate (mirrors CI) — skipped when the branch changes no Rust
+#   3. customer-reference leak scan
+#
+# Installed via `git config core.hooksPath .githooks` — see .githooks/README.md.
+# There is deliberately no second copy of this file anywhere: the previous
+# setup kept a tracked template in scripts/ that had to be copied into
+# .git/hooks/ by hand, and the two drifted apart (the template was missing
+# guard 3 entirely, so following its own documented install instructions
+# silently removed the leak scan).
+
+REPO="$(git rev-parse --show-toplevel)"
+
+# --- 1. block direct pushes to master ---------------------------------------
+# master only ever advances via a squash-merged release PR (see RELEASING.md).
+# A direct `git push origin master` is either an accident — committing while
+# HEAD happened to be on master, which has genuinely happened here — or an
+# emergency hotfix that should still go through the same PR path.
+#
+# GitHub's ruleset also blocks this, but the repo owner can bypass rulesets,
+# which makes the server-side rule toothless against exactly this accident.
+# Hence a local, unconditional guard, checked before anything expensive runs.
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    case "$remote_ref" in
+        refs/heads/master)
+            echo ""
+            echo "BLOCKED: direct push to 'master' is not allowed."
+            echo "  master advances only via a squash-merged release PR (RELEASING.md)."
+            echo "  Genuinely intentional? Use: git push --no-verify"
+            echo ""
+            exit 1
+            ;;
+    esac
+done
+
+# --- 2. QC gate, only when Rust actually changed ----------------------------
+# Compared against origin/develop instead of the pushed ref range from stdin.
+# Two reasons: stdin is already consumed by guard 1 above, and "what does this
+# branch change relative to develop" answers the same question without the
+# all-zeros remote_sha edge case a brand-new branch produces.
+#
+# Every uncertain case runs the gate rather than skipping it: no origin/develop
+# to compare against, or a git failure, means we cannot prove Rust is untouched.
+#
+# "Touches Rust" is wider than *.rs and Cargo.*: qc.ps1 runs fmt, clippy and
+# tests, and a toolchain or cargo-config change flips any of those without a
+# single .rs file changing. rustfmt.toml and clippy.toml are not tracked today
+# but are listed so that adding one later cannot silently reopen this gap.
+RUST_PATHS='\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$'
+RUST_PATHS="$RUST_PATHS"'|(^|/)(rustfmt|clippy)\.toml$|(^|/)\.cargo/|(^|/)scripts/qc\.'
+
+RUN_QC=1
+if git rev-parse --verify --quiet origin/develop >/dev/null; then
+    CHANGED=$(git diff --name-only origin/develop...HEAD)
+    if [ $? -eq 0 ] && ! printf '%s\n' "$CHANGED" | grep -qE "$RUST_PATHS"; then
+        RUN_QC=0
+    fi
+fi
+
+if [ "$RUN_QC" -eq 0 ]; then
+    echo ""
+    echo "QC gate skipped — this branch changes no Rust vs origin/develop."
+else
+    echo ""
+    echo "Running QC gate (mirrors CI)..."
+    echo ""
+    if ! pwsh -NoProfile -File "$REPO/scripts/qc.ps1" -Fast; then
+        echo ""
+        echo "QC gate FAILED. Push blocked."
+        echo "  Fix the errors above, or use 'git push --no-verify' to skip."
+        echo ""
+        exit 1
+    fi
+    echo ""
+    echo "QC gate passed."
+fi
+
+# --- 3. customer-reference leak scan ----------------------------------------
+# The pattern list lives in an untracked file because the list *is* the thing
+# being hidden — committing it would leak exactly what it exists to catch.
+#
+# A missing pattern file therefore cannot fail the push, but it must never pass
+# silently either: a guard that quietly stops running is worse than no guard,
+# because it is still trusted. Say so, loudly, every time.
+PATTERNS_FILE="$REPO/.githooks/customer-patterns.local"
+
+if [ ! -f "$PATTERNS_FILE" ]; then
+    echo ""
+    echo "WARNING: customer-reference scan SKIPPED — nothing was checked."
+    echo "  Missing: .githooks/customer-patterns.local"
+    echo "  Create it with one regex per line (customer names and project codes"
+    echo "  that must never be committed). It is gitignored on purpose."
+    echo ""
+    exit 0
+fi
+
+# Trim surrounding whitespace, drop full-line comments and blanks, join the rest
+# into one ERE alternation.
+#
+# Only whole-line comments are honoured — a `#` mid-line stays part of the
+# pattern. Stripping inline comments would silently truncate a legitimate
+# pattern like `Acme(NV#|BV)` into the invalid ERE `Acme(NV`, and one bad line
+# poisons the entire alternation, not just itself.
+PATTERNS=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$PATTERNS_FILE" |
+           grep -v '^#' | grep -v '^$' | paste -sd'|' -)
+
+if [ -z "$PATTERNS" ]; then
+    echo ""
+    echo "WARNING: customer-reference scan SKIPPED — nothing was checked."
+    echo "  .githooks/customer-patterns.local exists but contains no patterns."
+    echo ""
+    exit 0
+fi
+
+# git grep, not `git ls-files | xargs grep`: it searches tracked files natively,
+# so paths with spaces are safe, there is no argument-length limit, and no
+# stderr noise to suppress. -I skips binaries.
+#
+# Exit status must be branched on, not discarded. 0 = matched, 1 = no match,
+# anything else = git grep itself failed (an invalid regex in the pattern file
+# exits 128). A bare `|| true` would turn that failure into empty output and
+# therefore into a clean pass — a leak scan reporting "clean" when it never ran
+# is the exact silent failure this hook exists to prevent.
+LEAKS=$(git grep -lIE "$PATTERNS" -- .)
+GREP_RC=$?
+
+if [ "$GREP_RC" -gt 1 ]; then
+    echo ""
+    echo "WARNING: customer-reference scan SKIPPED — nothing was checked."
+    echo "  git grep failed (exit $GREP_RC); the error is printed above."
+    echo "  Most likely an invalid regex in .githooks/customer-patterns.local."
+    echo ""
+    exit 0
+fi
+
+if [ -n "$LEAKS" ]; then
+    echo ""
+    echo "BLOCKED: customer-specific references found in tracked files:"
+    printf '%s\n' "$LEAKS" | sed 's/^/   /'
+    echo ""
+    echo "  Remove the identifiers before pushing."
+    echo "  Use 'git push --no-verify' to skip (not recommended)."
+    echo ""
+    exit 1
+fi
+
+echo "No customer references detected."
+echo ""
+exit 0

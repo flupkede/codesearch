@@ -6,14 +6,18 @@
 feature/fix branches  →  develop  →  master (tagged = release)
 ```
 
-## Pre-commit hook
+## Git hooks
 
-Install once:
+Install once per clone — this single setting enables all hooks:
 ```bash
-cp scripts/pre-commit .git/hooks/pre-commit
+git config core.hooksPath .githooks
 ```
 
-Behavior:
+Nothing is copied into `.git/hooks/`; with `core.hooksPath` set, git ignores that
+directory entirely, so anything placed there would look installed and never run.
+See [`.githooks/README.md`](.githooks/README.md) for what each hook does.
+
+Pre-commit behavior:
 - Runs `cargo fmt` and stages any reformatting (keeps CI's fmt-check green).
 - Does **not** bump the version or build a binary. Every build already gets a
   unique `+<commit_count>` suffix from `build.rs` (`git rev-list --count HEAD`),

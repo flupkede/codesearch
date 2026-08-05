@@ -426,7 +426,9 @@ When using `git worktree add` to create parallel working directories, codesearch
 codesearch hooks git install
 ```
 
-This writes a `post-checkout` hook to `.git/hooks/` that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
+This installs a `post-checkout` hook that POSTs the worktree path to the running serve instance whenever a new worktree is checked out. The hook reads the serve URL from `~/.codesearch/serve_url` (automatically managed by `codesearch serve`).
+
+The install target is resolved with `git rev-parse --git-path hooks`, so it honours `core.hooksPath` (and, inside a linked worktree, the shared common-dir hooks) rather than assuming `.git/hooks/`. An existing `post-checkout` is not overwritten — codesearch's logic is chained in as a marker-delimited block.
 
 **How it works:**
 1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` on startup (deletes on shutdown)

@@ -3,7 +3,8 @@
 # Runs after: git checkout, git switch, git checkout -b
 #
 # Only copies if AGENTS.md does not yet exist — never overwrites an existing work plan.
-# Install once per machine: git config core.hooksPath .githooks
+#
+# Installed via `git config core.hooksPath .githooks` — see .githooks/README.md.
 
 AGENTS_DEVELOP="AGENTS.develop.md"
 AGENTS_MD="AGENTS.md"
