@@ -5,8 +5,8 @@
 | **Branch** | `fix/federated-silent-poll-diagnosis` |
 | **Base SHA** | `55fa36b` (🐛 fix: log keep-warm pings + warn when target isn't self) |
 | **Scope** | Stop a scale-to-zero federated cloud peer being woken, and kept warm, with no federated query behind it. Local repo polling must stay untouched. |
-| **Status** | Complete — 3 commits, all reviewed and passed. Not pushed. |
-| **Latest test result** | `cargo test --lib --bins` → **1134 passed, 42 ignored**; `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean |
+| **Status** | **Shipped and verified in production.** Merged to `develop` via PR #192 (`b6cb48f`); deployed to the cloud peer as revision `codesearch-serve--0000024`. |
+| **Latest test result** | CI green on PR #192 (test-linux, test-windows, csharp-integration-tests, CodeQL, Analyze). Locally: `cargo test --lib --bins` → **1134 passed, 42 ignored**; `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean |
 
 ## The requirement
 
@@ -103,6 +103,51 @@ Two defects, one triggering and one amplifying:
 **Files:** `AGENTS.md`, `CHANGELOG.md`, `README.md`,
 `DIAGNOSE_FEDERATED_KEEP_WARM.md` *(new)*, `docs/diagnose-federated-keep-warm.md` *(deleted)*
 
+## Stage 4 — the branch had no CI at all
+
+- **Commit:** `4add0d1` · **Review:** covered by the final full-branch review.
+- While preparing the PR it turned out `ci.yml`'s push trigger is a **prefix
+  allowlist** that did not include `fix/**`. Every `fix/...` branch — the
+  repo's own documented naming convention — had therefore merged into
+  `develop` without ever running fmt, clippy or a single test. The PR still
+  showed green because CodeQL is a separate `pull_request`-triggered workflow
+  and was the only check present.
+- Added `fix/**`, plus a comment explaining the footgun and how to verify
+  (`gh pr checks <n>` must list the CI jobs, not just CodeQL).
+- Proven by self-test: `08276de` → CodeQL only; `4add0d1` → CI + CodeQL.
+- `chore/**` was added later, in PR #193.
+
+**Files:** `.github/workflows/ci.yml`
+
+## Stage 5 — deployment and production verification
+
+- **Merged:** PR #192 → `develop` (`b6cb48f`), auto-bumped to 1.2.5.
+- **Local instance:** deployed by the user via `copy-to-common`. This carries
+  Defect 1 (the TUI timer poll), which only ever ran on the *local* side — so
+  the trigger was removed first.
+- **Cloud peer:** image `codesearch-serve:8d7261e6d` built from a clean
+  `git archive` of `develop` and deployed as revision
+  `codesearch-serve--0000024`. Config verified intact across the update: 12
+  env vars, 4 secretRefs, `CODESEARCH_IDLE_SUSPEND_SECS=1800`. `/healthz`
+  returned 200 in 147 ms. Registry size 160,647,888 B vs 160,629,714 B for the
+  previous image — an 18 KB difference, so no size regression.
+- **Idle window** was separately reduced 3600 → 1800 s at the user's request,
+  halving the cost of any wake that does still occur.
+- **Verified:** the replica scaled to 0 about 10 minutes after deploy and
+  **stayed at 0 across six consecutive one-minute checks with no traffic**.
+  This is positive evidence rather than mere absence of symptoms: under the old
+  binary `most_recent_tool_call()` would have been `None`, fallen back to the
+  process start time, and self-pinged every 120 s for the full 30-minute idle
+  window — reaching 0 at 10 minutes was not possible.
+
+**Build note:** two `az acr build` runs failed at the identical step
+(`COPY --from=builder /models.tar.gz`) with
+`failed to export image: ... layer does not exist`. Layer digests differed
+between runs, so it was not a poisoned cache; the Dockerfile is byte-identical
+to the one that built the previously deployed image. Root cause sits in the ACR
+Tasks build agent (registry is Basic SKU), not in this repo. A local
+`docker build` + `docker push` succeeded first time and was used instead.
+
 ## Why this took three attempts across three PRs
 
 PR #181 introduced the cadence on the reasoning that polling no faster than the
@@ -116,18 +161,20 @@ direction.
 
 ## Open follow-ups
 
-- **Not pushed.** Three commits sit locally on `fix/federated-silent-poll-diagnosis`.
-  Per project workflow a PR targets `develop`.
 - **Residual, known and not currently exploitable:** the MCP `status` **tool**,
   when project-scoped, *does* record a tool call (`allow_unscoped=true` reduces
   the guard to `!is_multi`), so an automated poller of that tool would still buy
   a warm window. No such poller exists — both `Watch-CodesearchServeReplicas.ps1`
   and `FederationClient::list_repos` use the HTTP `/status` endpoint, which does
   not record. First place to look if the symptom recurs.
-- **Unverified in production:** the fix is validated by tests and review, not yet
-  by observing the deployed peer stay asleep. Worth re-running the Log Analytics
-  query after this reaches the cloud replica — expected: no wakes without a
-  federated query.
+- **Verified in production** (see Stage 5) over a ~6-minute window. Worth
+  re-running the original Log Analytics query over a **full day** to confirm the
+  duty cycle: was ≈13.4 h warm/day (~56%) at zero searches, expected now ≈0 with
+  wakes only behind real federated queries. The short window proves the
+  self-ping is gone; only a 24 h sample proves nothing else wakes it.
+- **ACR Tasks cannot currently build this image** (Stage 5 build note). The
+  local `docker build` path works, but a CI/automated deploy would hit the same
+  failure. Worth a look before anyone automates the cloud deploy.
 
 ## Security note
 
