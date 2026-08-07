@@ -2,8 +2,9 @@
 #
 # What this does:
 #   1. Copies hooks/*.ps1 into ~/.claude/hooks/codesearch/
-#   2. Merges two PreToolUse hook registrations into ~/.claude/settings.json
-#      (Grep -> grep-guard.ps1, Agent -> subagent-preamble.ps1)
+#   2. Merges three PreToolUse hook registrations into ~/.claude/settings.json
+#      (Grep -> grep-guard.ps1, Agent -> subagent-preamble.ps1,
+#       WebSearch|WebFetch -> web-guard.ps1)
 #   3. Backs up settings.json before touching it
 #
 # Safe to re-run: registrations are matched by command string and skipped if

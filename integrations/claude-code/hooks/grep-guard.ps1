@@ -1,7 +1,7 @@
 # PreToolUse hook: enforce codesearch-first for Grep on internal repo paths.
 #
 # Why this exists: Claude Code loads MCP tool schemas lazily. codesearch's own
-# `initialize` instructions (see docs) are advisory only — nothing stops the
+# `initialize` instructions (see docs) are advisory only - nothing stops the
 # model from reaching for the always-on Grep/Glob tools instead, especially
 # under time pressure. This hook makes the preference structural instead of
 # advisory: a Grep call against an indexed internal path is blocked with
@@ -9,7 +9,7 @@
 #
 # Grep is auto-allowed ONLY when codesearch is genuinely unreachable ("plat").
 # Crucially, a low-confidence / empty codesearch *result* is a SUCCESSFUL call
-# ("reformulate your query"), NOT "codesearch is down" — so it must never open
+# ("reformulate your query"), NOT "codesearch is down" - so it must never open
 # the grep escape hatch. The previous version used a blind "same query retried
 # within 5 min" proxy that could not tell those two apart and leaked grep on
 # every low-confidence result. We now probe the unauthenticated /healthz
@@ -27,7 +27,7 @@
 #   - the path is outside the current git repo (codesearch doesn't cover
 #     arbitrary external paths well; grep is the right tool there)
 #   - codesearch does not cover this repo (no local index, no CODESEARCH_SERVER)
-#   - the codesearch serve hub does not answer /healthz — it's down, so grep
+#   - the codesearch serve hub does not answer /healthz - it's down, so grep
 #     is genuinely all you have
 #
 # Install: see ../README.md (or run ../install.ps1 to wire this up automatically).
@@ -82,7 +82,7 @@ if (-not $isInternal) { exit 0 }
 #
 # NOTE: we deliberately do NOT treat "a codesearch process is running" as
 # sufficient. codesearch commonly runs as a persistent background `serve`
-# hub covering many registered repos (`codesearch index list`) — that
+# hub covering many registered repos (`codesearch index list`) - that
 # process is alive nearly all the time on a dev machine, regardless of
 # whether the CURRENT directory is one of the repos it actually indexes.
 # Using process-presence alone made this hook fire in every directory on
@@ -116,7 +116,7 @@ if (-not (Test-CodesearchCoversRepo)) { exit 0 }
 # genuinely unreachable ("plat"). We probe the unauthenticated /healthz
 # liveness endpoint (fixed {"status":"ok"} body, no API key required). A
 # reachable server -> DENY grep and force a codesearch reformulation, even
-# when a previous codesearch call returned a low-confidence / empty result —
+# when a previous codesearch call returned a low-confidence / empty result -
 # an empty *result* is a SUCCESSFUL call, not a dead server, so it must NOT
 # open the escape hatch. Only a connection-level failure (refused / DNS /
 # timeout) means the server is down -> ALLOW grep.
@@ -155,19 +155,19 @@ if (-not (Test-CodesearchLive)) { exit 0 }
 # 4. Block with actionable guidance
 # ------------------------------------------------------------------
 $msg = @"
-codesearch is LIVE for this repo (its /healthz probe just answered) — use it,
+codesearch is LIVE for this repo (its /healthz probe just answered) - use it,
 do NOT fall back to Grep. Grep on an indexed internal path is only auto-allowed
 when the codesearch serve hub is actually DOWN, which it is not right now.
 
 IMPORTANT: a low-confidence or EMPTY codesearch result is a SUCCESSFUL call that
-means "reformulate your query" — it does NOT mean codesearch is down and it will
+means "reformulate your query" - it does NOT mean codesearch is down and it will
 NOT unblock Grep. Reformulate instead of grepping.
 
-Step 1 — load the deferred MCP tool schemas (Claude Code defers all MCP tools;
+Step 1 - load the deferred MCP tool schemas (Claude Code defers all MCP tools;
 this is a one-time step per conversation):
   ToolSearch("select:mcp__codesearch__search,mcp__codesearch__find,mcp__codesearch__explore,mcp__codesearch__get_chunk")
 
-Step 2 — pick the RIGHT tool (this is usually why a query came back empty):
+Step 2 - pick the RIGHT tool (this is usually why a query came back empty):
   find(symbol="Name", kind="definition")   -- known symbol / type / function definition
   find(symbol="Name", kind="usages")       -- all call sites of a known symbol
   explore(kind="outline", target="path")   -- every symbol in one file
@@ -176,14 +176,14 @@ Step 2 — pick the RIGHT tool (this is usually why a query came back empty):
 
 Query hygiene (this is what produces "low_confidence: []"):
   * Do NOT paste grep-style multi-term alternations ("a|b|c", "::", "fn foo(")
-    into search — BM25 tokenises on punctuation and the match scores below the
+    into search - BM25 tokenises on punctuation and the match scores below the
     relevance floor, so you get an empty result even though the string exists.
   * Use ONE clean term, or switch to find()/explore() for exact symbols.
 
 Multi-repo serve mode: if the call returns a "scope_required" or "Unknown alias"
 error, you MUST pass project="<repo-alias>" (single repo) or group="<group>"
 (cross-repo). The error response LISTS the valid available_projects /
-available_groups — pick from that list (the alias may differ from the folder
+available_groups - pick from that list (the alias may differ from the folder
 name).
 
 Grep is always allowed for paths OUTSIDE the current repo.

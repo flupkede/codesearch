@@ -2,7 +2,7 @@
 #
 # Why this exists: when codesearch has remote documentation projects mounted
 # (e.g. cloud/inriver, cloud/example-dam), those indexes usually answer product /
-# API / docs questions more precisely — and more currently — than an open web
+# API / docs questions more precisely - and more currently - than an open web
 # search. Nothing structurally stops the model from reaching for the always-on
 # WebSearch/WebFetch tools first, so this hook makes the preference structural:
 # the FIRST WebSearch/WebFetch is blocked with actionable guidance; if the same
@@ -33,7 +33,7 @@ $inp  = $data.tool_input
 if ($tool -ne 'WebSearch' -and $tool -ne 'WebFetch') { exit 0 }
 if ($null -eq $inp) { exit 0 }
 
-# Query (WebSearch) or target URL (WebFetch) — used for the cache key + guidance.
+# Query (WebSearch) or target URL (WebFetch) - used for the cache key + guidance.
 $names = @($inp.PSObject.Properties.Name)
 $q = if ($names -contains 'query') { [string]$inp.query }
      elseif ($names -contains 'url') { [string]$inp.url }
@@ -43,7 +43,7 @@ $q = if ($names -contains 'query') { [string]$inp.query }
 # 1. Are there any remote doc mounts to steer toward?
 #
 # Mounts live in repos.json under `.remote_mounts` (canonical "<peer>/<alias>"
-# names — the opt-in allowlist). No mounts -> nothing to prefer -> allow.
+# names - the opt-in allowlist). No mounts -> nothing to prefer -> allow.
 # ------------------------------------------------------------------
 $config = if ($env:CODESEARCH_REPOS_CONFIG) { $env:CODESEARCH_REPOS_CONFIG }
           else { Join-Path $HOME '.codesearch/repos.json' }
@@ -94,23 +94,23 @@ try {
 # 3. Block with actionable guidance.
 # ------------------------------------------------------------------
 $msg = @"
-codesearch has remote documentation mounts — search those before the web.
+codesearch has remote documentation mounts - search those before the web.
 Mounted remotes: $mounts
 
 These indexed mounts often answer product/API/docs questions more precisely
 (and more currently) than a web search. Try codesearch first.
 
-Step 1 — load the deferred MCP tool schemas (one-time per conversation):
+Step 1 - load the deferred MCP tool schemas (one-time per conversation):
   ToolSearch("select:mcp__codesearch__search,mcp__codesearch__get_chunk")
 
-Step 2 — search the relevant mount (compact=false reads matching content inline):
+Step 2 - search the relevant mount (compact=false reads matching content inline):
   mcp__codesearch__search(query="$q", project="<peer/alias>", compact=false)
   mcp__codesearch__get_chunk(chunk_ref="<peer/alias:id from a result>")  # full context
 
 Pick the relevant project from the mounted remotes above.
 
 This exact $tool call is auto-unblocked if you retry it within 5 minutes
-(i.e. the mounts didn't have the answer — go ahead and use the web).
+(i.e. the mounts didn't have the answer - go ahead and use the web).
 "@
 
 $out = @{

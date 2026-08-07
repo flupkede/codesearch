@@ -9,6 +9,19 @@ AGENTS.md merge=ours
 *.sh text eol=lf
 docker/entrypoint.sh text eol=lf
 
+# PowerShell scripts — LF too, for a different reason than the .sh rule above.
+# The Claude Code hook guards ship as .sh/.ps1 twins that must emit IDENTICAL
+# text, and three of them build their output from here-strings that span the
+# file's own lines. With a CRLF working copy the .ps1 twin emitted one extra
+# byte per line versus its .sh twin (measured: grep-guard 1939B/31CR against
+# 1908B/0CR) — invisible when diffing the sources, since both files say the
+# same thing. It also reaches the shipped binary: `include_str!` in
+# src/cli/claude_hooks.rs reads the WORKING TREE, so a CRLF checkout bakes CRLF
+# into the embedded hook bodies and into whatever `hooks claude install` writes
+# out. Pinning eol=lf kills the class at the source rather than normalising at
+# runtime in each script.
+*.ps1 text eol=lf
+
 # Extensionless shell scripts (the git hooks) — same LF requirement: a CRLF
 # shebang silently breaks the hook on Windows. All hooks live in .githooks/ and
 # are activated with `git config core.hooksPath .githooks`; there is no longer a

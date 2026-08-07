@@ -14,12 +14,118 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.2.4] (unreleased)
+## [1.2.6] (unreleased)
+
+<!-- Heading was `[1.2.4]` while `Cargo.toml` on develop already read 1.2.6: the
+     patch auto-bump on each PR merge (#192, #193) moved the version but not this
+     heading. Per the convention note above, the pending section is named after
+     the version develop is presently building toward — corrected in place, no
+     entries moved. -->
+
+### Added
+
+- **The Claude Code subagent preamble now resolves the multi-repo scope for the
+  current directory** and injects it concretely — `project="<alias>"` plus the
+  `group=` values that alias belongs to — instead of telling the subagent to
+  recover it from a failed call. Previously scope was learned only *reactively*,
+  off a `scope_required` / `Unknown alias` error, which costs a wasted call and
+  presumes the agent gets a second try. It also isn't guessable: a directory
+  named `NWND.ACME` is registered under the alias `NWND.Acme`. The more
+  expensive failure was the silent one — an agent that guesses a plausible
+  `project=` gets *results*, just not from the sibling repos a `group=` would
+  have unioned in, so configuration kept in its own repo reads as simply absent
+  and the agent reports back that the code doesn't exist. Only the alias and the
+  group *names* are injected, never the membership list: that is what the group
+  definition in `repos.json` is for and what `status(kind="projects")` reports.
+  Read straight from `repos.json` — no HTTP, no auth, no latency — resolved the
+  way the binary's own `config_path()` resolves it: `$CODESEARCH_REPOS_CONFIG`
+  when set, else `~/.codesearch/repos.json`, matching the sibling `web-guard`
+  hook so one session can't end up reading two different configs. Fail-open
+  throughout: no git root, no config file, malformed config, or an unregistered
+  directory all fall back to the previous generic wording.
+
+### Changed
+
+- **The Claude Code subagent preamble no longer lumps `Glob` in with `Grep`.** It
+  told every spawned subagent to "load codesearch before any Grep or Glob" and to
+  "fall back to Grep/Glob only after codesearch returns no useful results" — but
+  only `Grep` is actually gated (by `grep-guard`); there is no Glob guard and
+  deliberately won't be. Glob matches *filenames*, and codesearch has no
+  file-listing primitive to replace it: `search`'s `file_glob` is a filter on a
+  content search, not an enumerator. A guard couldn't hold anyway, since `ls`,
+  `find` and `git ls-files` reach the same answer through Bash, which isn't gated
+  — so the only effect would be friction on the honest path. Promising more than
+  is enforced had a real cost: it taught subagents to avoid Glob for exactly the
+  filename and existence questions it is best at, including the one thing
+  codesearch genuinely cannot do — return a trustworthy *negative*, since an
+  empty index result cannot distinguish "not present" from "not indexed"
+  (`.venv`, `node_modules`, build output and binary assets are never indexed).
+  The preamble now steers Grep only and states positively when Glob is the right
+  tool. Also fixed in the bash twin: `$(cat <<EOF)` strips the trailing newline,
+  so the `---` separator ran into the first line of the original prompt (the
+  PowerShell here-string version was already correct).
 
 ### Fixed
 
 - **A federated peer is now never polled on a timer — the two 1.2.0 "scale-to-zero" fixes did not actually stop the cloud peer being woken.** 1.2.0 replaced the TUI's hardcoded 30s peer poll with the local serve's own `idle_suspend_secs` cadence and suppressed the startup poke, on the theory that polling no faster than the host's suspend term is harmless. It is not, and the release notes above overstated the fix. Measured on the deployed Azure Container Apps peer over a period with **zero** federated searches: wakes exactly **120/121/120 minutes** apart, each warm period **~67 min** — roughly a 50% duty cycle on an index nobody queried, each wake additionally paying an `azcopy sync` of the docs blob and a KB `git pull`. Two independent defects combined. **(1) The trigger:** the poll *itself* was the ingress traffic that woke the replica. Not keeping a peer awake *past* its suspend term is strictly weaker than not *waking* it, and the two windows were unrelated values anyway — the cadence read the **local** host's 2h default, not the peer's ~1h (which is why the 120-minute spacing, not 60, is the tell). **(2) The amplifier:** the cloud keep-warm loop fell back to the process start time when no tool call was recorded (`most_recent_tool_call().unwrap_or(start)`), and since `/status` and `/healthz` never call `record_tool_call`, any non-tool-call wake made the replica self-ping every 120s for its whole idle window — ~11× amplification. That fallback was unreachable in the case it was written for: a real tool call always records itself, so it could only ever fire when the wake was *not* real work. Now: the TUI's discovery tick is **config-only** (5s, zero HTTP) and merely rebuilds mounted-remote rows from the `remote_mounts` allowlist so mount/unmount edits and `l` reloads still surface; a peer is contacted only by an **activity poke** (a real federated search/get_chunk just hit that peer, so it is demonstrably already awake — single-peer, never a fan-out) or the explicit `i` info-overlay keypress. Keep-warm requires a real recorded tool call and otherwise lets the host suspend the replica. A peer staying warm for an hour *after real use* is correct and unchanged. Idle mounts render activity as `-`, now the normal steady state rather than a fault. Also fixed: removing the *last* peer from `repos.json` left its rows on screen forever (the snapshot was gated on a non-empty peer list), and the 1.2.0 "keep-warm target isn't self" warning false-positived on the only deployment where keep-warm is correct (the process binds `0.0.0.0` while the target is the ingress FQDN — a wildcard bind means the external host is unknown, so the check now stays silent). Background polling of **local** repos is unchanged and unaffected: the local/federated split is a deliberate design constraint.
 - **`MDB_MAP_FULL` fatal crash on large corpora — LMDB mapsize cap raised + persistent embedding cache now auto-resizes too (#189).** Indexing a large corpus (e.g. a 1GB / 53k-file cargo-registry source producing >1.2M chunks) could crash with `MDB_MAP_FULL: Environment mapsize limit reached` once the vector store's auto-resize (already in place since an earlier fix) hit its old 8GB hard cap. Two changes: (1) the cap is raised to 16GB by default, and made runtime-overridable via `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` (clamped to at least 1GB) for corpora that legitimately need more; (2) the **persistent embedding cache** (`~/.codesearch/embedding_cache/<model>/`) previously had no resize logic at all — it hit the same `MDB_MAP_FULL` on a hardcoded 512MB cap and silently degraded to a WARN-and-continue path, turning every subsequent embedding into a full ONNX-inference cache miss. It now retries with the same doubling-resize pattern as the vector store (up to 3 attempts, capped at the same runtime limit), persisting the grown size to `metadata.json` so a restart reopens at the correct size. When either store's cap is genuinely exhausted, the error/warning message now names the env var that raises it, instead of just reporting the size.
+- **`integrations/claude-code/README.md` documented two hooks while three ship.** Both
+  from-source installers (`install.ps1` / `install.sh`) and the native
+  `codesearch hooks claude install` register a third `PreToolUse` hook —
+  `web-guard`, on `WebSearch`/`WebFetch` — but the integration README described
+  only `grep-guard` and `subagent-preamble`, so its manual-install JSON silently
+  produced an incomplete setup and its uninstall instructions left an entry
+  behind. Added the missing bullet, matcher and uninstall step, corrected the
+  "two hooks" / "both hooks" counts and `install.ps1`'s header comment, and
+  documented the preferred native install command (the README only mentioned the
+  from-source installers). The fail-open paragraph is now also stated per hook
+  rather than as one blanket claim, because `web-guard` satisfies neither half
+  of the general rule: it never probes the server (a mount that is configured
+  but unreachable still denies the first call, bounded by the 5-minute retry
+  cache rather than by a liveness check), and it blocks *only* paths outside the
+  current repo, which is the exact inverse of `grep-guard`.
+- **The Claude Code hook scripts are now ASCII-only, and a test enforces it.** All
+  six carried non-ASCII prose (49 × U+2014 EM DASH, 1 × U+2026). Claude Code
+  spawns the `.ps1` guards via `pwsh -File`, and when the spawning console's
+  codepage is not UTF-8 Windows best-fit-maps `—` down to `-` on the way out —
+  so the `.sh` and `.ps1` twins emitted **different** text for identical input
+  while looking identical on disk. That is the worst shape for this class of
+  bug: a reviewer diffing the two sources sees nothing wrong, and which text an
+  agent actually receives depends on who spawned the hook. Swept to `-` / `...`
+  (comments and string literals only; `.gitattributes` already pins `eol=lf` for
+  `*.sh`, so no line endings moved), and `embedded_hook_bodies_are_ascii_only`
+  in `src/cli/claude_hooks.rs` now fails the build on any non-ASCII byte in an
+  embedded `GUARD_HOOKS` body, naming the offending file and line. Fixing the
+  encoding exposed a second, larger divergence underneath it: **all three**
+  `.ps1` guards build their output from here-strings that span the file's own
+  lines, so a Windows checkout emitted one extra byte per line than the `.sh`
+  twin — `grep-guard` 1939 B / 31 CR against 1908 B / 0 CR, `web-guard` 884/16
+  against 868/0, the preamble ~35 stray bytes. Fixed at the source with
+  `*.ps1 text eol=lf` in `.gitattributes` rather than normalising at runtime in
+  each script. That distinction matters for what actually ships: `include_str!`
+  reads the **working tree**, so a CRLF checkout baked CRLF into the embedded
+  hook bodies and into whatever `hooks claude install` wrote out. All three twin
+  pairs are now byte-identical at zero CR (2029 / 1908 / 941 bytes), verified
+  against a positive control proving the comparison can report a difference.
+- **The Claude Code `.sh` hooks aborted instead of failing open on malformed
+  input.** All three run under `set -euo pipefail`, so a hook handed invalid
+  JSON died on its first `jq` with exit 5 and a `jq: parse error` on stderr —
+  which Claude Code surfaces as a hook *execution failure*, not the silent
+  pass-through these guards are meant to provide. Their `.ps1` twins already
+  exited 0, so the behaviour differed by shell, and the README documented the
+  `.ps1` behaviour for both. All three `.sh` hooks now validate the payload once
+  up front (`jq -e . || exit 0`) before any extraction. Empty stdin was already
+  handled; this covers malformed and truncated payloads.
+  `integrations/claude-code/install.sh` was also swept to ASCII, matching its
+  `.ps1` twin.
+- **`integrations/claude-code/README.md` claimed `subagent-preamble` fails open
+  when "codesearch isn't running/indexed".** It has no availability check of any
+  kind — it rewrites the prompt on every `Agent` spawn regardless. That is the
+  correct behaviour (the preamble explains how to load the deferred tools and
+  what to do when `ToolSearch` returns nothing, so it stays useful in a repo
+  codesearch doesn't cover), but the README described a probe that does not
+  exist. The fail-open paragraph now states what each hook actually checks,
+  since only `grep-guard` checks anything at all.
 - **`build.ps1` now self-heals `core.bare=false` before invoking cargo.** This repo lives at `codesearch.git` as a bare+working-tree hybrid — a full checked-out source tree + `.git/index`, but `core.bare=true` in `.git/config`. `core.bare` intermittently resets to `true` (VS Code's git integration rewrites `.git/config` on ref changes; smoking gun: `github-pr-owner-number` duplicated 7× for `develop`), and when it does, cargo's source fingerprinting aborts every build with `did not expect repo ...\.git to be bare`, breaking `copy-to-common.ps1` → `build.ps1` → `cargo build`. `build.ps1` now forces `core.bare=false` right after `Set-Location`, before any cargo invocation. Idempotent and harmless for a normal (truly non-bare) checkout; non-fatal if git is unreachable.
 
 ## [1.2.0] - 2026-08-03

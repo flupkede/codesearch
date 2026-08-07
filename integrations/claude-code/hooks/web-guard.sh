@@ -3,7 +3,7 @@
 #
 # Why this exists: when codesearch has remote documentation projects mounted
 # (e.g. cloud/inriver, cloud/example-dam), those indexes usually answer product /
-# API / docs questions more precisely — and more currently — than an open web
+# API / docs questions more precisely - and more currently - than an open web
 # search. Nothing structurally stops the model from reaching for the always-on
 # WebSearch/WebFetch tools first, so this hook makes the preference structural:
 # the FIRST WebSearch/WebFetch is blocked with actionable guidance; if the same
@@ -23,20 +23,27 @@ set -euo pipefail
 raw="$(cat)"
 [ -z "$raw" ] && exit 0
 
+# Fail open on malformed input. Every extraction below runs under
+# `set -euo pipefail`, so a jq parse error would abort the hook with exit 5
+# and surface to Claude Code as a hook EXECUTION FAILURE rather than the
+# silent pass-through these guards promise. Validating once up front keeps
+# the .sh twins matching the .ps1 twins, which already exit 0 on bad JSON.
+printf '%s' "$raw" | jq -e . >/dev/null 2>&1 || exit 0
+
 tool=$(echo "$raw" | jq -r '.tool_name // empty')
 case "$tool" in
     WebSearch | WebFetch) ;;
     *) exit 0 ;;
 esac
 
-# Query (WebSearch) or target URL (WebFetch) — used for the cache key + guidance.
+# Query (WebSearch) or target URL (WebFetch) - used for the cache key + guidance.
 q=$(echo "$raw" | jq -r '.tool_input.query // .tool_input.url // empty')
 
 # ------------------------------------------------------------------
 # 1. Are there any remote doc mounts to steer toward?
 #
 # Mounts live in repos.json under `.remote_mounts` (canonical "<peer>/<alias>"
-# names — the opt-in allowlist). No mounts -> nothing to prefer -> allow the
+# names - the opt-in allowlist). No mounts -> nothing to prefer -> allow the
 # web call unimpeded.
 # ------------------------------------------------------------------
 config="${CODESEARCH_REPOS_CONFIG:-$HOME/.codesearch/repos.json}"
@@ -50,7 +57,7 @@ mounts=$(jq -r '(.remote_mounts // []) | join(", ")' < "$config" 2>/dev/null || 
 #    Covers "tried the mounts, they had nothing, now use the web".
 #
 # NOTE: feed the cache file to jq via stdin redirection (`< file`), never as a
-# positional path argument — see grep-guard.sh for the Windows/Git-Bash rationale.
+# positional path argument - see grep-guard.sh for the Windows/Git-Bash rationale.
 # ------------------------------------------------------------------
 cache_file="${TMPDIR:-/tmp}/.codesearch-web-guard.json"
 cache_ttl=300
@@ -78,23 +85,23 @@ fi
 # 3. Block with actionable guidance.
 # ------------------------------------------------------------------
 msg=$(cat <<EOF
-codesearch has remote documentation mounts — search those before the web.
+codesearch has remote documentation mounts - search those before the web.
 Mounted remotes: ${mounts}
 
 These indexed mounts often answer product/API/docs questions more precisely
 (and more currently) than a web search. Try codesearch first.
 
-Step 1 — load the deferred MCP tool schemas (one-time per conversation):
+Step 1 - load the deferred MCP tool schemas (one-time per conversation):
   ToolSearch("select:mcp__codesearch__search,mcp__codesearch__get_chunk")
 
-Step 2 — search the relevant mount (compact=false reads matching content inline):
+Step 2 - search the relevant mount (compact=false reads matching content inline):
   mcp__codesearch__search(query="${q}", project="<peer/alias>", compact=false)
   mcp__codesearch__get_chunk(chunk_ref="<peer/alias:id from a result>")  # full context
 
 Pick the relevant project from the mounted remotes above.
 
 This exact ${tool} call is auto-unblocked if you retry it within 5 minutes
-(i.e. the mounts didn't have the answer — go ahead and use the web).
+(i.e. the mounts didn't have the answer - go ahead and use the web).
 EOF
 )
 

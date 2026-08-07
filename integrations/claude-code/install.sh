@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs the codesearch <-> Claude Code enforcement hooks.
-# Bash/macOS/Linux twin of install.ps1 — see that file for full description.
+# Bash/macOS/Linux twin of install.ps1 - see that file for full description.
 # Requires: jq
 #
 # Usage:

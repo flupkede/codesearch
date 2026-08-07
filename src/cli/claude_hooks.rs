@@ -291,6 +291,37 @@ mod tests {
     }
 
     #[test]
+    fn embedded_hook_bodies_are_ascii_only() {
+        // These scripts must stay pure ASCII, and it is not a style preference.
+        //
+        // Claude Code spawns the .ps1 guards via `pwsh -File`. When the
+        // spawning console's codepage is not UTF-8, Windows best-fit-maps
+        // characters like U+2014 EM DASH down to '-' on the way out, so the
+        // .sh and .ps1 twins emit DIFFERENT text for identical input even
+        // though both files say the same thing on disk. That divergence is
+        // invisible when reading the two files side by side, which is exactly
+        // how it survived: a reviewer diffing the sources sees no difference,
+        // while the agent receives two different prompts depending on who
+        // spawned the hook.
+        //
+        // Keeping the bodies ASCII makes the twins byte-identical by
+        // construction and immune to the host's codepage. Use '-' for dashes
+        // and '...' for ellipses.
+        for gh in GUARD_HOOKS {
+            for (name, body) in gh.files {
+                if let Some((idx, ch)) = body.char_indices().find(|(_, c)| !c.is_ascii()) {
+                    let line = body[..idx].matches('\n').count() + 1;
+                    panic!(
+                        "{name}: non-ASCII {ch:?} (U+{:04X}) at line {line}. \
+                         Hook scripts must be ASCII-only - see this test for why.",
+                        ch as u32
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hook_command_targets_host_shell() {
         let cmd = hook_command(Path::new("/home/u/.claude/hooks/codesearch"), "grep-guard");
         if cfg!(windows) {
