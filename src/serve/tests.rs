@@ -525,6 +525,70 @@ async fn conflicted_error_mentions_stop_and_retry() {
     );
 }
 
+/// A repo that failed to open because the DB was write-locked must recover on a
+/// later query once that lock is gone — WITHOUT restarting serve.
+///
+/// Regression guard: `Conflicted` was cached in `self.repos` and the fast path in
+/// `get_or_open_stores` replayed it forever. Its only documented exit was idle
+/// eviction, which was unreachable — the reaper iterates `last_access`, but the
+/// paths that mark a repo Conflicted return via `?` before ever calling
+/// `touch_access`, so such a repo has no `last_access` entry and is never
+/// considered for eviction however long it sits idle. Observed in the wild: a
+/// repo left untouched for days was still returning the cached error, curable
+/// only by restarting serve — while `conflicted_msg` claimed "the next query will
+/// retry automatically".
+#[tokio::test]
+async fn conflicted_repo_recovers_after_lock_released() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("myrepo");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir(&db_path).unwrap();
+    let meta = db_path.join("metadata.json");
+    let mut f = std::fs::File::create(&meta).unwrap();
+    write!(f, "{{\"dimensions\":384}}").unwrap();
+    drop(f);
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+        .unwrap();
+    let state = state_with_config(config);
+
+    // Hold the write lock so the first open genuinely conflicts.
+    let lock = SharedStores::new(&db_path, 384).unwrap();
+
+    // Control: without a real conflict here the recovery assertion below would
+    // pass vacuously, so failure of the FIRST call is what gives the test teeth.
+    assert!(
+        state.get_or_open_stores("testalias", true).await.is_err(),
+        "precondition: holding the write lock must make the first open fail"
+    );
+
+    // Second control: the failure must actually have been CACHED as Conflicted.
+    // Without this the retry path under test is never exercised, and the test
+    // would go green even if the fix were reverted.
+    assert!(
+        state
+            .repos
+            .get("testalias")
+            .is_some_and(|e| matches!(e.value(), RepoState::Conflicted)),
+        "precondition: the failed open must be cached as Conflicted"
+    );
+
+    // Release the lock — the underlying cause is now gone.
+    drop(lock);
+
+    // The next query must recover on its own. No restart, no idle timeout, and
+    // notably no waiting: recovery must not depend on the repo going untouched.
+    let res = state.get_or_open_stores("testalias", true).await;
+    assert!(
+        res.is_ok(),
+        "conflicted repo must reopen once the lock is released, got: {:?}",
+        res.err()
+    );
+}
+
 // ------------------------------------------------------------------
 // Central store-creation / register path — regression guards.
 //

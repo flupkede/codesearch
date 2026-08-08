@@ -1923,6 +1923,54 @@ impl ServeState {
     ) -> std::result::Result<Arc<SharedStores>, String> {
         let _ = self.reload_if_changed();
 
+        // A cached `Conflicted` is a STALE FAILURE, not a terminal state: drop it
+        // and fall through to a fresh open attempt below.
+        //
+        // Without this the repo stays broken for the entire lifetime of the serve
+        // process, and NEITHER using it nor leaving it alone can heal it.
+        //
+        // `Conflicted` has exactly one documented exit — idle eviction in
+        // `evict_idle_repos` — and that exit is unreachable. The reaper iterates
+        // `last_access`, but every path that marks a repo Conflicted (`warmup_repo`
+        // and the slow path below) propagates the error with `?` BEFORE reaching
+        // its `touch_access` call. A repo that conflicts on first open therefore
+        // never gets a `last_access` entry at all, so the reaper never considers
+        // it — no matter how long it sits idle.
+        //
+        // Querying it does not help either: the fast path below replays the cached
+        // error verbatim, and calls `touch_access` on the way. So the only queries
+        // that would register the repo for eviction are also the ones that keep
+        // resetting its idle timer.
+        //
+        // Net effect: a transient lock — e.g. an indexing run holding the DB when
+        // one query happens to arrive — is indistinguishable from permanent
+        // corruption, curable only by restarting serve, while `conflicted_msg`
+        // promises the exact opposite ("the next query will retry automatically").
+        //
+        // Re-opening is cheap when it still fails (a refused file lock), and this
+        // mirrors the missing-DB path, which already refuses to cache `Conflicted`
+        // for the same reason (see `missing_db_not_cached_as_conflicted`).
+        //
+        // `remove_if` holds the shard's write lock for the predicate check +
+        // removal (same primitive as `is_indexing` above), so this can only ever
+        // delete an entry that is STILL `Conflicted` at the moment of removal.
+        // A plain `get()` + unconditional `remove()` would be a check-then-act
+        // race: between the check and the removal, another thread could install
+        // a fresh `RepoState::Write` for this alias (e.g. `add_repo_handler` or
+        // the force-reindex path), and the unconditional removal would delete
+        // that live entry instead — dropping its `cancel_token` without
+        // cancelling it, unlike every other removal site in this file.
+        if self
+            .repos
+            .remove_if(alias, |_, v| matches!(v, RepoState::Conflicted))
+            .is_some()
+        {
+            tracing::info!(
+                "Retrying open for '{}' (clearing cached conflict rather than replaying it)",
+                alias
+            );
+        }
+
         // Fast path: already opened
         if let Some(entry) = self.repos.get(alias) {
             if touch {
