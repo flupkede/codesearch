@@ -37,7 +37,75 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     }
 }
 
-/// Canonicalize a path and strip any Windows UNC `\\?\` prefix.
+/// Translate an MSYS / Git Bash POSIX-style drive path (`/c/Users/...`) to
+/// its Windows drive-path equivalent (`C:/Users/...`). Idempotent on every
+/// other input. On non-Windows this is a no-op (a Unix path like `/c/...`
+/// is a legitimate absolute path, not an MSYS-ism).
+///
+/// # Why this exists
+/// When an agent (or any non-MSYS caller — e.g. an MCP client) sends
+/// codesearch a path like `/c/Users/foo`, Rust on Windows interprets the
+/// leading `/` as "rooted on the *current drive*" — i.e. it resolves to
+/// `<current-drive>:\c\Users\foo`, creating junk directories like
+/// `C:\c\Users\...` and silently indexing the wrong project. This is the
+/// path-pollution defect behind the orphan `<repo>-propagate-tmp` indexes:
+/// an agent-supplied POSIX path slipped past `safe_canonicalize` and got
+/// materialised on disk as `C:\c\...`.
+///
+/// # What it matches
+/// A leading `/` followed by a **single ASCII letter** followed by either
+/// `/` or end-of-string. So `/c`, `/c/`, `/c/Users/foo` all match (drive `C`);
+/// `/ab/foo`, `/usr/bin`, `relative/c/x` do **not** match (left untouched).
+///
+/// # What it does not match
+/// Existing Windows paths (`C:\...`, `C:/...`) — the first byte is not `/`,
+/// so they pass through unchanged. Verbatim UNC (`\\?\C:\...`) likewise.
+#[cfg(windows)]
+pub fn translate_msys_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0] == b'/' {
+        let second = b[1];
+        if second.is_ascii_alphabetic() && (b.len() == 2 || b[2] == b'/') {
+            // `/c/Users/foo` → `C:/Users/foo`. Windows accepts `/` as a path
+            // separator, so we don't need to rewrite subsequent slashes.
+            // Drive letter is upper-cased so `/c/...` and `/C/...` collapse
+            // to the same canonical form before they reach the registry.
+            let drive = (second as char).to_ascii_uppercase();
+            let rest = if b.len() > 2 { &s[2..] } else { "/" };
+            return PathBuf::from(format!("{}:{}", drive, rest));
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Non-Windows: legitimate absolute POSIX path, must not be rewritten.
+/// (See the Windows variant above for the full rationale.)
+#[cfg(not(windows))]
+pub fn translate_msys_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Normalize a raw user-supplied path: translate any MSYS POSIX drive prefix
+/// (`/c/...` → `C:/...`) AND strip any Windows UNC `\\?\` prefix.
+///
+/// Use this as the **fallback** when [`safe_canonicalize`] fails (path
+/// doesn't exist yet, permission denied, etc.) so the registry never stores
+/// a raw path that Windows would later resolve to a polluted
+/// `<drive>:\c\...` location. Both operations are idempotent and no-ops on
+/// non-Windows, so this is safe to call unconditionally.
+///
+/// This helper exists precisely to avoid the per-site discipline trap of
+/// repeating `translate_msys_path(&strip_unc_prefix(path))` at every
+/// fallback site — that pattern was the original defect: `register()` had
+/// it, but `unregister_path()` and `alias_for_path()` did not, breaking
+/// register/unregister symmetry.
+pub fn normalize_user_path(path: &Path) -> PathBuf {
+    strip_unc_prefix(translate_msys_path(path))
+}
+
+/// Canonicalize a path, translate any MSYS POSIX-style prefix first, and
+/// strip any Windows UNC `\\?\` prefix from the result.
 ///
 /// **This is the ONLY approved way to canonicalize paths in codesearch.**
 /// It returns the same error as `Path::canonicalize()` on failure (path does
@@ -48,8 +116,13 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
 /// `.join()` and `Path::exists()` to fail inconsistently on sub-paths, and
 /// produces diverging HashMap keys when the same directory is accessed with
 /// and without the prefix. `safe_canonicalize` eliminates this class of bug.
+///
+/// It also calls [`translate_msys_path`] *before* canonicalising, so that
+/// caller-supplied POSIX-style paths (`/c/Users/foo`) are routed to
+/// `C:/Users/foo` rather than being materialised as `<drive>:\c\Users\foo`.
 pub fn safe_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
-    path.canonicalize().map(strip_unc_prefix)
+    let translated = translate_msys_path(path);
+    translated.canonicalize().map(strip_unc_prefix)
 }
 
 /// Normalize a file path for consistent HashMap lookups.

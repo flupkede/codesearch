@@ -59,6 +59,105 @@ fn safe_canonicalize_on_nonexistent_path_returns_error() {
     );
 }
 
+// ── translate_msys_path ─────────────────────────────────────────────────
+//
+// Regression guard for the `<repo>-propagate-tmp` path-pollution defect:
+// an agent-supplied POSIX path (`/c/Users/...`) slipped past canonicalize
+// and got materialised on Windows as `<current-drive>:\c\Users\...`, creating
+// junk `C:\c\Users\...` directories. translate_msys_path closes that hole.
+
+#[cfg(windows)]
+#[test]
+fn translate_msys_path_converts_single_letter_drive() {
+    let cases: &[(&str, &str)] = &[
+        // lowercase drive → uppercase
+        ("/c/Users/foo", "C:/Users/foo"),
+        // uppercase drive → unchanged
+        ("/D/data/repo", "D:/data/repo"),
+        // bare drive root
+        ("/c", "C:/"),
+        // drive root with trailing slash
+        ("/c/", "C://"),
+        // deeply nested
+        ("/z/a/b/c/d/e/f", "Z:/a/b/c/d/e/f"),
+    ];
+    for (input, expected) in cases {
+        let got = translate_msys_path(&PathBuf::from(input));
+        assert_eq!(
+            got,
+            PathBuf::from(*expected),
+            "translate_msys_path({:?}): expected {:?}, got {:?}",
+            input,
+            expected,
+            got
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn translate_msys_path_leaves_non_drive_paths_untouched() {
+    // These look like POSIX paths but are NOT single-letter-drive MSYS paths
+    // — they must be left as-is so genuine Unix-isms (/usr, /etc, multi-char)
+    // aren't accidentally rewritten.
+    let cases: &[&str] = &[
+        "/usr/bin/foo",    // multi-char first segment
+        "/ab/foo",         // two-letter drive → not a Windows drive
+        "/home/user",      // multi-char
+        "/1/foo",          // digit, not a letter
+        "/_foo",           // underscore, not a letter
+        "relative/path",   // not absolute
+        "relative/c/path", // relative despite single-letter segment
+        ".",               // bare relative
+        "",                // empty
+    ];
+    for input in cases {
+        let got = translate_msys_path(&PathBuf::from(*input));
+        assert_eq!(
+            got,
+            PathBuf::from(*input),
+            "translate_msys_path({:?}) must be a no-op, got {:?}",
+            input,
+            got
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn translate_msys_path_leaves_existing_windows_paths_untouched() {
+    let cases: &[&str] = &[
+        r"C:\Users\foo",
+        "C:/Users/foo",
+        r"\\?\C:\Users\foo", // UNC verbatim
+        r"D:\",
+    ];
+    for input in cases {
+        let got = translate_msys_path(&PathBuf::from(*input));
+        assert_eq!(
+            got,
+            PathBuf::from(*input),
+            "translate_msys_path must not touch existing Windows paths: {:?} → {:?}",
+            input,
+            got
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn translate_msys_path_is_noop_on_unix() {
+    // On Unix `/c/Users/foo` is a legitimate absolute path, not an MSYS-ism.
+    assert_eq!(
+        translate_msys_path(&PathBuf::from("/c/Users/foo")),
+        PathBuf::from("/c/Users/foo")
+    );
+    assert_eq!(
+        translate_msys_path(&PathBuf::from("/home/user")),
+        PathBuf::from("/home/user")
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn test_normalize_path_windows_forms() {
