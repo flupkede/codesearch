@@ -366,8 +366,12 @@ pub fn resolve_database_with_message(
         PathBuf::from(".")
     };
 
-    // Try to canonicalize, but fall back to original path if it fails
-    let canonical_path = safe_canonicalize(&project_path).unwrap_or(project_path.clone());
+    // Try to canonicalize, but fall back to original path if it fails.
+    // normalize_user_path on the fallback translates caller-supplied POSIX
+    // paths (`/c/...` → `C:/...`) even when the path doesn't exist yet
+    // (safe_canonicalize itself already translates before canonicalising).
+    let canonical_path = safe_canonicalize(&project_path)
+        .unwrap_or_else(|_| crate::cache::normalize_user_path(&project_path));
     let db_path = canonical_path.join(".codesearch.db");
     Ok((db_path, canonical_path))
 }

@@ -4742,7 +4742,12 @@ pub async fn run_serve(
     // Load repos config (register any --register paths first)
     let mut config = ReposConfig::load().unwrap_or_default();
     for path in &register_paths {
-        let canonical = safe_canonicalize(path).unwrap_or_else(|_| path.clone());
+        // normalize_user_path on the fallback: a `--register /c/Users/...`
+        // invocation must not register a polluted `C:\c\Users\...` path. The
+        // validate_path_within_allowed_roots check below also needs the
+        // canonical form, not the raw MSYS path.
+        let canonical =
+            safe_canonicalize(path).unwrap_or_else(|_| crate::cache::normalize_user_path(path));
 
         // Validate path against allowed roots (if configured)
         if let Err(e) = validate_path_within_allowed_roots(&canonical) {
