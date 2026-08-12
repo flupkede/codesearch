@@ -130,6 +130,182 @@ fn register_derives_alias_from_directory_name() {
     assert!(cfg.repos.contains_key(&alias));
 }
 
+/// Regression for the `<repo>-propagate-tmp` path-pollution defect.
+///
+/// An agent (or any non-MSYS caller) supplied a POSIX-style path
+/// `/c/Users/.../repo` to `register()`. Before the fix, `safe_canonicalize`
+/// failed (LMDB-style paths that exist on disk did translate, but fresh
+/// not-yet-created paths fell through to `strip_unc_prefix` which is a no-op
+/// on `/c/...`), and Windows then resolved `/c/...` as
+/// `<current-drive>:\c\...`, creating junk `C:\c\Users\...` directories and
+/// silently indexing the wrong project.
+///
+/// After the fix, the POSIX path is translated to `C:/...` (or `D:/...`, etc.)
+/// on the success path AND the fallback path, so the registry entry points
+/// at the real Windows location regardless of whether the dir exists yet.
+#[test]
+#[cfg(windows)]
+fn register_translates_msys_posix_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let win_repo = tmp.path().join("propagate-tmp-repo");
+    std::fs::create_dir(&win_repo).unwrap();
+    // Pre-canonicalize so 8.3 short names (e.g. `RUNNER~1` on Windows CI)
+    // are resolved to their long form BEFORE we build both the MSYS input
+    // and the expected output. Otherwise `safe_canonicalize` inside
+    // `register()` resolves the short name but our expected value keeps it,
+    // and the equality assertion fails on runners whose temp root sits
+    // under a short-named user folder.
+    let canonical = safe_canonicalize(&win_repo).unwrap();
+    let win_str = canonical.to_string_lossy().replace('\\', "/");
+    // win_str looks like "C:/Users/.../propagate-tmp-repo"
+    let (drive_letter, rest) = win_str.split_at(2); // "C:" + "/Users/..."
+    let drive_letter = drive_letter.chars().next().unwrap();
+    let msys_path = format!(
+        "/{}/{}",
+        drive_letter.to_ascii_lowercase(),
+        rest.trim_start_matches('/')
+    );
+    // msys_path now looks like "/c/Users/.../propagate-tmp-repo"
+
+    let mut cfg = ReposConfig::default();
+    let alias = cfg.register(PathBuf::from(&msys_path));
+
+    // The registered path must be the canonical Windows path, NOT a polluted
+    // `C:\c\Users\...` form. Compare normalized (forward-slash, lower-cased
+    // drive) so the assertion is robust against canonicalize's exact casing.
+    let stored = cfg.repos.get(&alias).expect("alias must be registered");
+    let stored_norm = stored.to_string_lossy().replace('\\', "/").to_lowercase();
+    let expected_norm = win_str.to_lowercase();
+    assert_eq!(
+        stored_norm, expected_norm,
+        "register() must translate MSYS path {:?} to {:?}, got {:?}",
+        msys_path, win_str, stored
+    );
+
+    // And the registered path must actually resolve to the same directory
+    // (i.e. no `C:\c\...` junk was created alongside).
+    assert!(
+        stored.exists(),
+        "registered path must exist (no path pollution): {}",
+        stored.display()
+    );
+}
+
+/// Pins the **non-existing-path** branch — the actual defect site.
+///
+/// The sibling test `register_translates_msys_posix_path` creates the dir on
+/// disk first, so `safe_canonicalize` succeeds on the first call and the
+/// fallback (where the bug lived) never executes. This test deliberately
+/// does NOT create the dir, forcing `safe_canonicalize` to fail and the
+/// `normalize_user_path` fallback to run. If someone "simplifies" the
+/// fallback to `strip_unc_prefix(path)` (the pre-fix code), this test goes
+/// red: stored path would be `/c/...` instead of `C:/...`.
+#[test]
+#[cfg(windows)]
+fn register_translates_msys_posix_path_when_dir_does_not_exist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let win_repo = tmp.path().join("never-created-propagate-tmp");
+    // Deliberately do NOT create_dir — the path must not exist.
+    assert!(!win_repo.exists());
+
+    let win_str = win_repo.to_string_lossy().replace('\\', "/");
+    let (drive_letter, rest) = win_str.split_at(2);
+    let drive_letter = drive_letter.chars().next().unwrap();
+    let msys_path = format!(
+        "/{}/{}",
+        drive_letter.to_ascii_lowercase(),
+        rest.trim_start_matches('/')
+    );
+
+    let mut cfg = ReposConfig::default();
+    let alias = cfg.register(PathBuf::from(&msys_path));
+
+    let stored = cfg.repos.get(&alias).expect("alias must be registered");
+    let stored_norm = stored.to_string_lossy().replace('\\', "/").to_lowercase();
+    assert_eq!(
+        stored_norm,
+        win_str.to_lowercase(),
+        "register() fallback must translate MSYS path {:?} to {:?}, got {:?} — \
+         if this fails, the fallback in register() was reverted to strip_unc_prefix \
+         and the original path-pollution defect is back",
+        msys_path,
+        win_str,
+        stored
+    );
+}
+
+/// Pins **register/unregister symmetry** — the second defect the reviewer
+/// flagged. Before the structural fix, `register("/c/Users/foo")` stored
+/// `C:\Users\foo` but `unregister_path("/c/Users/foo")` compared against the
+/// untranslated `/c/Users/foo` (its fallback used `strip_unc_prefix`, which
+/// is a no-op on `/c/...`) and returned `false`, leaving the entry stuck in
+/// the registry. After the fix, both sides use `normalize_user_path` on the
+/// fallback, so they agree.
+#[test]
+#[cfg(windows)]
+fn unregister_path_matches_msys_posix_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    let win_repo = tmp.path().join("propagate-tmp-unreg");
+    std::fs::create_dir(&win_repo).unwrap();
+    // Pre-canonicalize for the same reason as register_translates_msys_posix_path:
+    // we delete the dir later, after which `safe_canonicalize` fails and the
+    // `normalize_user_path` fallback runs WITHOUT short-name resolution. If
+    // we built the MSYS input from the raw short-named path, register() would
+    // store the long form (canonicalized) but unregister()'s fallback would
+    // produce the short form, and the comparison would miss. Building from
+    // the canonical form makes both sides agree regardless of which branch
+    // runs.
+    let canonical = safe_canonicalize(&win_repo).unwrap();
+    let win_str = canonical.to_string_lossy().replace('\\', "/");
+    let (drive_letter, rest) = win_str.split_at(2);
+    let drive_letter = drive_letter.chars().next().unwrap();
+    let msys_path = format!(
+        "/{}/{}",
+        drive_letter.to_ascii_lowercase(),
+        rest.trim_start_matches('/')
+    );
+
+    let mut cfg = ReposConfig::default();
+    let alias = cfg.register(PathBuf::from(&msys_path));
+    assert!(cfg.repos.contains_key(&alias));
+
+    // Now delete the dir so unregister_path's safe_canonicalize fails and the
+    // normalize_user_path fallback runs (this is the branch that used to miss).
+    std::fs::remove_dir(&win_repo).unwrap();
+    assert!(!win_repo.exists());
+
+    let removed = cfg.unregister_path(&PathBuf::from(&msys_path));
+    assert!(
+        removed,
+        "unregister_path must match the MSYS form via normalize_user_path fallback"
+    );
+    assert!(
+        !cfg.repos.contains_key(&alias),
+        "alias must be gone after unregister"
+    );
+}
+
+/// On Unix, `/c/Users/...` is a legitimate absolute path (not an MSYS-ism),
+/// so `register()` must store it verbatim. This guards against the Windows
+/// fix accidentally rewriting paths on the wrong platform.
+#[test]
+#[cfg(not(windows))]
+fn register_leaves_unix_path_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("propagate-tmp-repo");
+    std::fs::create_dir(&repo).unwrap();
+    let path_str = repo.to_string_lossy().to_string();
+
+    let mut cfg = ReposConfig::default();
+    let alias = cfg.register(repo.clone());
+    let stored = cfg.repos.get(&alias).expect("alias must be registered");
+    assert_eq!(
+        stored.to_string_lossy(),
+        path_str,
+        "register() must not rewrite Unix paths"
+    );
+}
+
 #[test]
 #[cfg_attr(
     windows,

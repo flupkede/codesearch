@@ -2,9 +2,33 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, "feature/**", "features/**"]
-  pull_request:
-    branches: [main]
+    # No `pull_request` trigger: this repo's PRs target `develop` (feature/fix →
+    # develop, merge-commit style) and `master` (develop/release → master,
+    # squash), never `main` — a `pull_request: branches: [main]` trigger would be
+    # permanently dead here since no such branch exists.
+    #
+    # ⚠️ The branch list below is an ALLOWLIST OF PREFIXES, and that is a
+    # standing footgun: a branch whose prefix is missing gets NO ci.yml run at
+    # all, silently — the PR still shows green because CodeQL (a separate
+    # workflow, `pull_request`-triggered) runs and is the only check present.
+    # This is not hypothetical: `fix/**` was missing until PR #192, so every
+    # `fix/...` branch — the repo's own documented naming convention, named in
+    # the "feature/fix → develop" line above — merged into develop having never
+    # run fmt, clippy or a single test in CI. The local pre-push QC gate was the
+    # only thing standing between those branches and develop.
+    #
+    # When adding a new branch-naming convention, ADD IT HERE. To verify a
+    # branch is actually covered, check that `gh pr checks <n>` lists the CI
+    # jobs and not just CodeQL.
+    branches: [develop, master, "feature/**", "features/**", "fix/**", "chore/**"]
+
+# Cancel a stale in-flight run when the same branch is pushed again before the
+# previous run finished — e.g. a stage commit immediately followed by a
+# review-fix amend + re-push. Without this, both runs complete and only the
+# newer commit's result matters; the older run's compute is pure waste.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,7 +55,11 @@ jobs:
             ~/.cargo/git/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo build --release
+      # No `cargo build --release` here — nothing in this job consumes that
+      # binary (release.yml builds isolated per-platform release artifacts at
+      # tag time). `cargo test --lib` below already compiles what it needs in
+      # debug profile; the release build was pure wasted CI minutes on every
+      # push, duplicated across every feature-branch push AND its develop merge.
       - run: cargo test --lib -- --nocapture
       - run: cargo test --test '*' -- --nocapture --skip ignore
       - run: cargo fmt -- --check
@@ -64,18 +92,36 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+          fetch-depth: 0
+      # Skip the rest of this job when C# helper / symbol-indexing code did
+      # not change — the dotnet publish + cargo test cycle below is expensive
+      # and was previously running unconditionally on every single push.
+      - name: Check for C# helper changes
+        id: changed
+        run: |
+          if [ -z "${{ github.event.before }}" ] || ! git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"   # new branch / force-push base gone — be safe, run it
+          elif git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -q '^helpers/csharp/'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
       # pin@v4
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        if: steps.changed.outputs.relevant == 'true'
         with:
           dotnet-version: '10.0.x'
       - name: Build scip-csharp helper (self-contained single-file)
+        if: steps.changed.outputs.relevant == 'true'
         run: |
           cd helpers/csharp
           dotnet publish scip-csharp.csproj -c Release -r linux-x64 --self-contained -p:PublishSingleFile=true -o bin/Release/net10.0
       # pin@stable
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        if: steps.changed.outputs.relevant == 'true'
       # pin@v4
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: steps.changed.outputs.relevant == 'true'
         with:
           path: |
             ~/.cargo/registry/
@@ -83,6 +129,7 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Run C# integration tests
+        if: steps.changed.outputs.relevant == 'true'
         run: |
           export CODESEARCH_SCIP_CSHARP="$PWD/helpers/csharp/bin/Release/net10.0/scip-csharp"
           cargo test --features csharp_helper_integration -- --nocapture

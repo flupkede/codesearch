@@ -525,6 +525,70 @@ async fn conflicted_error_mentions_stop_and_retry() {
     );
 }
 
+/// A repo that failed to open because the DB was write-locked must recover on a
+/// later query once that lock is gone — WITHOUT restarting serve.
+///
+/// Regression guard: `Conflicted` was cached in `self.repos` and the fast path in
+/// `get_or_open_stores` replayed it forever. Its only documented exit was idle
+/// eviction, which was unreachable — the reaper iterates `last_access`, but the
+/// paths that mark a repo Conflicted return via `?` before ever calling
+/// `touch_access`, so such a repo has no `last_access` entry and is never
+/// considered for eviction however long it sits idle. Observed in the wild: a
+/// repo left untouched for days was still returning the cached error, curable
+/// only by restarting serve — while `conflicted_msg` claimed "the next query will
+/// retry automatically".
+#[tokio::test]
+async fn conflicted_repo_recovers_after_lock_released() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("myrepo");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir(&db_path).unwrap();
+    let meta = db_path.join("metadata.json");
+    let mut f = std::fs::File::create(&meta).unwrap();
+    write!(f, "{{\"dimensions\":384}}").unwrap();
+    drop(f);
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("testalias".to_string()))
+        .unwrap();
+    let state = state_with_config(config);
+
+    // Hold the write lock so the first open genuinely conflicts.
+    let lock = SharedStores::new(&db_path, 384).unwrap();
+
+    // Control: without a real conflict here the recovery assertion below would
+    // pass vacuously, so failure of the FIRST call is what gives the test teeth.
+    assert!(
+        state.get_or_open_stores("testalias", true).await.is_err(),
+        "precondition: holding the write lock must make the first open fail"
+    );
+
+    // Second control: the failure must actually have been CACHED as Conflicted.
+    // Without this the retry path under test is never exercised, and the test
+    // would go green even if the fix were reverted.
+    assert!(
+        state
+            .repos
+            .get("testalias")
+            .is_some_and(|e| matches!(e.value(), RepoState::Conflicted)),
+        "precondition: the failed open must be cached as Conflicted"
+    );
+
+    // Release the lock — the underlying cause is now gone.
+    drop(lock);
+
+    // The next query must recover on its own. No restart, no idle timeout, and
+    // notably no waiting: recovery must not depend on the repo going untouched.
+    let res = state.get_or_open_stores("testalias", true).await;
+    assert!(
+        res.is_ok(),
+        "conflicted repo must reopen once the lock is released, got: {:?}",
+        res.err()
+    );
+}
+
 // ------------------------------------------------------------------
 // Central store-creation / register path — regression guards.
 //
@@ -1590,6 +1654,134 @@ mod allowed_hosts_tests {
         assert!(
             config.allowed_hosts.is_empty(),
             "DISABLE_HOST_VALIDATION takes precedence over ALLOWED_HOSTS"
+        );
+    }
+}
+
+/// Tests for `extract_host_from_url` — used solely by the keep-warm
+/// misconfiguration sanity check (a keep-warm target host that doesn't look
+/// like "self" gets a loud warning; see the diagnosis this shipped with in
+/// docs/diagnose-federated-keep-warm.md).
+mod keep_warm_host_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_host_from_plain_http_url() {
+        assert_eq!(
+            extract_host_from_url("http://127.0.0.1:8080/healthz"),
+            Some("127.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_host_from_https_url_without_port() {
+        assert_eq!(
+            extract_host_from_url("https://happywave-063747be.azurecontainerapps.io/healthz"),
+            Some("happywave-063747be.azurecontainerapps.io".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_host_with_no_scheme() {
+        // The keep-warm URL is user-supplied (CLI flag or env var) and never
+        // validated to include a scheme — must not panic or silently return
+        // the whole string including a path.
+        assert_eq!(
+            extract_host_from_url("localhost:39725/healthz"),
+            Some("localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_ipv6_host_preserving_brackets() {
+        // A bare rsplit_once(':') would wrongly split inside the IPv6
+        // literal itself (e.g. on the last `:` in `::1`) if not guarded.
+        assert_eq!(
+            extract_host_from_url("http://[::1]:8080/healthz"),
+            Some("[::1]".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_query_and_fragment_before_host_ends() {
+        assert_eq!(
+            extract_host_from_url("http://example.com/healthz?x=1#frag"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_empty_host() {
+        assert_eq!(extract_host_from_url("http:///healthz"), None);
+    }
+}
+
+/// The keep-warm "target isn't self" warning must fire on a genuine
+/// misconfiguration and stay silent on the cloud deployment where keep-warm is
+/// actually supposed to run. Getting the latter wrong is worse than having no
+/// check at all: a warning that fires on every correct cold start trains
+/// operators to ignore it.
+#[cfg(test)]
+mod keep_warm_foreign_target_tests {
+    use super::*;
+
+    /// The regression this rule exists for: on Azure Container Apps the process
+    /// binds `0.0.0.0` while the keep-warm target is correctly the ingress
+    /// FQDN. A naive host comparison flags that as "not self" and warns on
+    /// every cold start of the only correct deployment.
+    #[test]
+    fn wildcard_bind_never_warns_even_for_a_foreign_looking_fqdn() {
+        for wildcard in ["0.0.0.0", "::", "[::]", "0:0:0:0:0:0:0:0", ""] {
+            assert_eq!(
+                keep_warm_foreign_target(
+                    "https://codesearch-serve.azurecontainerapps.io",
+                    wildcard
+                ),
+                None,
+                "wildcard bind {wildcard:?} must not warn — our external host is unknown"
+            );
+        }
+    }
+
+    /// The case the check exists to catch: a concretely-bound local serve whose
+    /// keep-warm URL points at somebody else's cloud replica.
+    #[test]
+    fn concrete_bind_warns_for_a_different_host() {
+        assert_eq!(
+            keep_warm_foreign_target("https://peer.example.com/healthz", "192.168.1.10"),
+            Some("peer.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn matching_host_does_not_warn() {
+        assert_eq!(
+            keep_warm_foreign_target("http://192.168.1.10:39725/healthz", "192.168.1.10"),
+            None
+        );
+    }
+
+    #[test]
+    fn loopback_targets_are_always_treated_as_self() {
+        for target in [
+            "http://localhost:39725/healthz",
+            "http://127.0.0.1:39725/healthz",
+            "http://[::1]:39725/healthz",
+        ] {
+            assert_eq!(
+                keep_warm_foreign_target(target, "192.168.1.10"),
+                None,
+                "{target} is loopback and must not warn"
+            );
+        }
+    }
+
+    /// No extractable host → nothing to compare → no warning.
+    #[test]
+    fn unparseable_target_does_not_warn() {
+        assert_eq!(
+            keep_warm_foreign_target("http:///healthz", "192.168.1.10"),
+            None
         );
     }
 }

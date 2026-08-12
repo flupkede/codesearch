@@ -277,14 +277,6 @@ pub(crate) struct ServeState {
     reload_count: std::sync::atomic::AtomicUsize,
     /// Instant when ServeState was created — used to compute uptime for TUI header.
     started_at: std::time::Instant,
-    /// Resolved idle-before-suspend window (seconds) — the same value the
-    /// keep-warm task uses to decide when to let the host scale the replica to
-    /// zero. The embedded TUI reuses it as the federated-peer `/status` baseline
-    /// poll interval, so its background polling can never keep a peer awake past
-    /// the host's own suspend term. Resolved in [`Self::new`] from
-    /// `IDLE_SUSPEND_SECS_ENV` (falling back to `DEFAULT_IDLE_SUSPEND_SECS`) and
-    /// overridden by the `--idle-suspend-secs` flag in `run_serve`.
-    idle_suspend_secs: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -354,11 +346,6 @@ impl ServeState {
             #[cfg(test)]
             reload_count: std::sync::atomic::AtomicUsize::new(0),
             started_at: std::time::Instant::now(),
-            idle_suspend_secs: std::env::var(crate::constants::IDLE_SUSPEND_SECS_ENV)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|s| *s > 0)
-                .unwrap_or(crate::constants::DEFAULT_IDLE_SUSPEND_SECS),
         }
     }
 
@@ -1936,6 +1923,54 @@ impl ServeState {
     ) -> std::result::Result<Arc<SharedStores>, String> {
         let _ = self.reload_if_changed();
 
+        // A cached `Conflicted` is a STALE FAILURE, not a terminal state: drop it
+        // and fall through to a fresh open attempt below.
+        //
+        // Without this the repo stays broken for the entire lifetime of the serve
+        // process, and NEITHER using it nor leaving it alone can heal it.
+        //
+        // `Conflicted` has exactly one documented exit — idle eviction in
+        // `evict_idle_repos` — and that exit is unreachable. The reaper iterates
+        // `last_access`, but every path that marks a repo Conflicted (`warmup_repo`
+        // and the slow path below) propagates the error with `?` BEFORE reaching
+        // its `touch_access` call. A repo that conflicts on first open therefore
+        // never gets a `last_access` entry at all, so the reaper never considers
+        // it — no matter how long it sits idle.
+        //
+        // Querying it does not help either: the fast path below replays the cached
+        // error verbatim, and calls `touch_access` on the way. So the only queries
+        // that would register the repo for eviction are also the ones that keep
+        // resetting its idle timer.
+        //
+        // Net effect: a transient lock — e.g. an indexing run holding the DB when
+        // one query happens to arrive — is indistinguishable from permanent
+        // corruption, curable only by restarting serve, while `conflicted_msg`
+        // promises the exact opposite ("the next query will retry automatically").
+        //
+        // Re-opening is cheap when it still fails (a refused file lock), and this
+        // mirrors the missing-DB path, which already refuses to cache `Conflicted`
+        // for the same reason (see `missing_db_not_cached_as_conflicted`).
+        //
+        // `remove_if` holds the shard's write lock for the predicate check +
+        // removal (same primitive as `is_indexing` above), so this can only ever
+        // delete an entry that is STILL `Conflicted` at the moment of removal.
+        // A plain `get()` + unconditional `remove()` would be a check-then-act
+        // race: between the check and the removal, another thread could install
+        // a fresh `RepoState::Write` for this alias (e.g. `add_repo_handler` or
+        // the force-reindex path), and the unconditional removal would delete
+        // that live entry instead — dropping its `cancel_token` without
+        // cancelling it, unlike every other removal site in this file.
+        if self
+            .repos
+            .remove_if(alias, |_, v| matches!(v, RepoState::Conflicted))
+            .is_some()
+        {
+            tracing::info!(
+                "Retrying open for '{}' (clearing cached conflict rather than replaying it)",
+                alias
+            );
+        }
+
         // Fast path: already opened
         if let Some(entry) = self.repos.get(alias) {
             if touch {
@@ -2455,6 +2490,13 @@ impl ServeState {
     /// "active". Only genuine tool calls update `last_tool_call`; health/status
     /// probes and the keep-warm self-ping do not, so this reflects real query
     /// activity — not the keep-warm traffic that keeps the replica alive.
+    ///
+    /// `None` therefore means "this replica has served no real query since it
+    /// started", and keep-warm treats that as *do not ping* rather than falling
+    /// back to the process start time. Substituting the start time would make
+    /// every spurious wake (a probe, a dashboard poll) self-sustain for the
+    /// whole idle window — and, because a real tool call always sets this,
+    /// such a fallback can only ever fire when the wake was not real work.
     pub(crate) fn most_recent_tool_call(&self) -> Option<Instant> {
         self.last_tool_call
             .iter()
@@ -2477,18 +2519,13 @@ impl ServeState {
     /// The embedded TUI polls this every render tick; an advance (a newer
     /// `Instant` than the value seen on the previous tick) means a real tool call
     /// just used that peer, so the TUI pokes an immediate per-peer `/status`
-    /// refresh instead of waiting for the slow baseline poll.
+    /// refresh. This poke is the ONLY thing that ever makes the dashboard contact
+    /// a federated peer — there is no baseline poll, so a peer nobody queries is
+    /// left asleep (see `spawn_remote_discovery`).
     pub(crate) fn remote_peer_last_activity(&self, peer_name: &str) -> Option<Instant> {
         self.remote_peer_activity
             .get(peer_name)
             .map(|entry| *entry.value())
-    }
-
-    /// The resolved idle-before-suspend window (seconds) — used by the embedded
-    /// TUI as the federated-peer `/status` baseline poll interval so background
-    /// polling can never keep a peer awake past the host's own suspend term.
-    pub(crate) fn idle_suspend_secs(&self) -> u64 {
-        self.idle_suspend_secs
     }
 
     /// Record that changes were made to a repo (index/reindex).
@@ -4591,6 +4628,71 @@ fn build_streamable_http_config() -> StreamableHttpServerConfig {
     }
 }
 
+/// Extracts the host (no scheme, no port, no path) from a URL string, without
+/// pulling in the `url` crate as a new direct dependency (it is only
+/// transitive via reqwest today). Deliberately best-effort: used solely for
+/// the keep-warm misconfiguration warning in `run_serve`, where a parse
+/// failure just means the sanity check is skipped, not a hard error.
+fn extract_host_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_and_rest = after_scheme.split(['/', '?', '#']).next()?;
+    // Strip a trailing `:port`, but not the `:` inside an IPv6 literal like
+    // `[::1]:8080` — only split on the LAST colon when the host isn't
+    // bracketed.
+    let host = if host_and_rest.starts_with('[') {
+        host_and_rest
+            .split(']')
+            .next()
+            .map(|h| format!("{h}]"))
+            .unwrap_or_else(|| host_and_rest.to_string())
+    } else {
+        host_and_rest
+            .rsplit_once(':')
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_else(|| host_and_rest.to_string())
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// Decide whether the keep-warm target looks like it points at a host *other*
+/// than this replica, returning the offending target host when it does.
+///
+/// `None` means "do not warn" — either the target does look like self, or we
+/// cannot tell. Returning `None` for "cannot tell" is deliberate:
+///
+/// - A **wildcard bind** (`0.0.0.0`, `::`) means our externally-visible host is
+///   genuinely unknown. This is the normal cloud case — on Azure Container Apps
+///   the process binds `0.0.0.0` while `keep_warm_url` is correctly the ingress
+///   FQDN — so comparing the two proves nothing. Warning here would fire on
+///   every cold start of the one deployment where keep-warm is *supposed* to
+///   run, and a check that cries wolf on the correct configuration trains
+///   operators to ignore the case that actually matters.
+/// - A URL with no extractable host cannot be compared at all.
+fn keep_warm_foreign_target(ping_url: &str, self_host: &str) -> Option<String> {
+    // Wildcard / unspecified binds: externally-visible host unknown.
+    if matches!(
+        self_host,
+        "0.0.0.0" | "::" | "[::]" | "0:0:0:0:0:0:0:0" | "[0:0:0:0:0:0:0:0]" | ""
+    ) {
+        return None;
+    }
+    let target_host = extract_host_from_url(ping_url)?;
+    let looks_like_self = target_host == self_host
+        || target_host == "localhost"
+        || target_host == "127.0.0.1"
+        || target_host == "::1"
+        || target_host == "[::1]";
+    if looks_like_self {
+        None
+    } else {
+        Some(target_host)
+    }
+}
+
 pub async fn run_serve(
     host: Option<String>,
     port: Option<u16>,
@@ -4640,7 +4742,12 @@ pub async fn run_serve(
     // Load repos config (register any --register paths first)
     let mut config = ReposConfig::load().unwrap_or_default();
     for path in &register_paths {
-        let canonical = safe_canonicalize(path).unwrap_or_else(|_| path.clone());
+        // normalize_user_path on the fallback: a `--register /c/Users/...`
+        // invocation must not register a polluted `C:\c\Users\...` path. The
+        // validate_path_within_allowed_roots check below also needs the
+        // canonical form, not the raw MSYS path.
+        let canonical =
+            safe_canonicalize(path).unwrap_or_else(|_| crate::cache::normalize_user_path(path));
 
         // Validate path against allowed roots (if configured)
         if let Err(e) = validate_path_within_allowed_roots(&canonical) {
@@ -4669,17 +4776,11 @@ pub async fn run_serve(
     #[cfg(unix)]
     raise_fd_limit(config.repos.len());
 
-    let mut serve_state = ServeState::new(config, None);
-    // The `--idle-suspend-secs` flag takes precedence over the env/default the
-    // constructor already resolved; mirror the keep-warm task's resolution so
-    // the embedded TUI's federated-peer poll interval matches exactly. `0`
-    // means "disabled" for keep-warm, so treat it as "leave the default".
-    if let Some(secs) = idle_suspend_secs {
-        if secs > 0 {
-            serve_state.idle_suspend_secs = secs;
-        }
-    }
-    let serve_state = Arc::new(serve_state);
+    // The idle-suspend window is resolved by the keep-warm task alone (flag >
+    // env > default); nothing else consumes it, so `ServeState` does not carry
+    // it. In particular the embedded TUI must NOT derive a poll cadence from it
+    // — it never polls a federated peer on a timer at all.
+    let serve_state = Arc::new(ServeState::new(config, None));
 
     // Construct the bind address from resolved host + port.
     // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.
@@ -4914,13 +5015,47 @@ pub async fn run_serve(
         let ping_url = format!("{}{}", base_url.trim_end_matches('/'), HEALTHZ_PATH);
         let kw_state = serve_state.clone();
         let kw_cancel = cancel_token.clone();
-        let start = Instant::now();
         info!(
             "🔥 keep-warm enabled: pinging {} every {}s while idle < {}s",
             ping_url,
             crate::constants::KEEP_WARM_INTERVAL_SECS,
             idle_suspend
         );
+        // Sanity check: keep-warm exists to self-ping THIS replica's own
+        // ingress so the platform sees traffic and doesn't suspend it — it
+        // is not meant to point at any other host, and nothing upstream of
+        // this function validates that. If CODESEARCH_KEEP_WARM_URL (or
+        // --keep-warm-url) was ever set to a DIFFERENT host — e.g. copied
+        // from a cloud deployment's env into a local shell profile — this
+        // task would silently generate periodic outbound traffic to that
+        // other host with zero per-request log line (only this one-time
+        // "enabled" message), which is exactly the failure mode a user
+        // reported: a local `serve --no-tui` process quietly keeping a
+        // mounted federation peer's cloud replica warm every
+        // KEEP_WARM_INTERVAL_SECS, defeating its scale-to-zero, discoverable
+        // only by noticing outbound network traffic — not by anything in
+        // the local server's own logs. This can't be fully auto-corrected
+        // (we don't reliably know our own externally-visible host), but a
+        // loud one-time warning when the target doesn't look like "self"
+        // (differs from the bind host/port this process is actually
+        // listening on) turns a silent misconfiguration into a visible one.
+        //
+        // A WILDCARD bind is the one case where this check must stay silent —
+        // see [`keep_warm_foreign_target`], which owns that rule so it can be
+        // unit-tested.
+        let self_host = effective_host.as_str();
+        if let Some(target_host) = keep_warm_foreign_target(&ping_url, self_host) {
+            tracing::warn!(
+                "⚠️  keep-warm target host '{target_host}' does not match this \
+                 server's own bind host '{self_host}'. keep-warm exists to \
+                 self-ping THIS replica, not another peer — verify \
+                 CODESEARCH_KEEP_WARM_URL / --keep-warm-url is not \
+                 accidentally pointing at a different (e.g. cloud/federated) \
+                 server, which would silently keep that OTHER server warm \
+                 every {}s.",
+                crate::constants::KEEP_WARM_INTERVAL_SECS
+            );
+        }
         tokio::spawn(async move {
             let interval =
                 std::time::Duration::from_secs(crate::constants::KEEP_WARM_INTERVAL_SECS);
@@ -4928,16 +5063,53 @@ pub async fn run_serve(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        // Fall back to the server start time when no query has
-                        // happened yet, so a freshly deployed replica stays warm
-                        // for the full idle window before first use.
-                        let last = kw_state.most_recent_tool_call().unwrap_or(start);
+                        // Keep-warm sustains warmth only AFTER real use. With no
+                        // tool call recorded there is nothing to keep warm for,
+                        // so we simply don't ping and let the host suspend us;
+                        // the next real request wakes us.
+                        //
+                        // This previously fell back to the process start time
+                        // ("a freshly deployed replica stays warm for the full
+                        // idle window before first use"). That was actively
+                        // harmful, and unreachable in the case it was written
+                        // for: a genuine tool call always records itself, so the
+                        // fallback could only ever fire when the wake was NOT
+                        // real work. `/status` and `/healthz` have their own
+                        // handlers and never call `record_tool_call`, so ANY
+                        // spurious wake — a dashboard poll, a platform probe —
+                        // made the replica self-ping for the whole idle window.
+                        // Measured on the cloud peer: ~67 min warm instead of
+                        // the ~6 min a bare wake costs, ≈11x amplification. Its
+                        // entire practical effect was rewarding spurious wakes.
+                        let Some(last) = kw_state.most_recent_tool_call() else {
+                            continue;
+                        };
                         if last.elapsed().as_secs() < idle_suspend {
-                            let _ = client
+                            // Previously this ping was completely silent — no log
+                            // line at all, success or failure. That silence is
+                            // exactly what made a misconfigured keep-warm target
+                            // (see the sanity check above) undiagnosable from the
+                            // logs alone. debug! on success keeps normal operation
+                            // quiet by default while still being traceable with
+                            // RUST_LOG=debug; failures are always worth a warn.
+                            match client
                                 .get(&ping_url)
                                 .timeout(std::time::Duration::from_secs(10))
                                 .send()
-                                .await;
+                                .await
+                            {
+                                Ok(resp) => {
+                                    tracing::debug!(
+                                        "keep-warm ping to {ping_url} -> {}",
+                                        resp.status()
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "keep-warm ping to {ping_url} failed: {e:#}"
+                                    );
+                                }
+                            }
                         }
                     }
                     _ = kw_cancel.cancelled() => break,

@@ -452,16 +452,22 @@ pub const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 15;
 /// considers that peer's activity "live" before reverting the activity column to
 /// a stale `-`.
 ///
-/// The baseline re-discovery poll runs on the **serve idle-suspend window** (see
-/// [`IDLE_SUSPEND_SECS_ENV`] / [`DEFAULT_IDLE_SUSPEND_SECS`]) — the same term
-/// after which the host is allowed to scale the replica to zero — so the TUI no
-/// longer pins a federated peer awake with a fixed 30s ping. Instead, an
-/// immediate per-peer refresh is triggered the moment a real tool call hits that
-/// peer (event-driven, see `ServeState::record_remote_peer_activity`), and
-/// *between* refreshes the activity column shows `-`. This window is how long a
-/// freshly polled value stays visible before it goes stale again; it is short
-/// relative to the hourly baseline poll.
+/// There is **no background `/status` poll of a federated peer at all**: a peer
+/// is contacted only when a real tool call hits it (event-driven, see
+/// `ServeState::record_remote_peer_activity`) or on an explicit operator
+/// keypress (`i` info overlay). Outside of active use a mount's activity column
+/// simply reads `-`, so this window only governs how long a *poked* value stays
+/// visible before going stale again.
 pub const REMOTE_ACTIVITY_FRESH_SECS: u64 = 5 * 60; // 5 minutes
+
+/// Cadence of the embedded TUI's **config-only** mounted-remote row rebuild.
+///
+/// This tick issues NO HTTP to any peer: it re-reads the repos config (via
+/// `ServeState::config_snapshot`) and rebuilds the mounted-remote rows so
+/// mount/unmount edits and `l` reloads show up promptly. Because it never
+/// contacts a peer it cannot wake a scale-to-zero replica, which is precisely
+/// why it is safe to run on a short interval.
+pub const REMOTE_ROW_REFRESH_SECS: u64 = 5;
 
 /// Maximum wall-clock duration a single reindex may take before its
 /// `active_reindexes` entry is considered **stale** (leaked).

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::cache::{safe_canonicalize, strip_unc_prefix};
+use crate::cache::{normalize_user_path, safe_canonicalize, strip_unc_prefix};
 use crate::constants::{CONFIG_DIR_NAME, REPOS_CONFIG_FILE};
 
 /// A remote `codesearch serve` peer that can be queried for federation.
@@ -335,10 +335,12 @@ impl ReposConfig {
     }
 
     pub fn register(&mut self, path: PathBuf) -> String {
-        // safe_canonicalize strips \\?\ on success; strip_unc_prefix handles the
-        // fallback so UNC paths never enter the registry even if the path doesn't
-        // exist yet (e.g. a path that will be created during indexing).
-        let canonical = safe_canonicalize(&path).unwrap_or_else(|_| strip_unc_prefix(path));
+        // safe_canonicalize strips \\?\ on success AND translates MSYS POSIX
+        // paths (`/c/...` → `C:/...`); the fallback re-applies both via
+        // normalize_user_path so a not-yet-existing path still enters the
+        // registry as `C:/...` instead of the raw `/c/...` (which Windows
+        // would later resolve to `<drive>:\c\...`, the path-pollution defect).
+        let canonical = safe_canonicalize(&path).unwrap_or_else(|_| normalize_user_path(&path));
 
         if let Some((alias, _)) = self
             .repos
@@ -357,7 +359,7 @@ impl ReposConfig {
     }
 
     pub fn register_with_alias(&mut self, path: PathBuf, alias: Option<String>) -> Result<String> {
-        let canonical = safe_canonicalize(&path).unwrap_or_else(|_| strip_unc_prefix(path));
+        let canonical = safe_canonicalize(&path).unwrap_or_else(|_| normalize_user_path(&path));
 
         if let Some((existing_alias, _)) = self
             .repos
@@ -428,8 +430,12 @@ impl ReposConfig {
     }
 
     pub fn unregister_path(&mut self, path: &Path) -> bool {
-        let canonical =
-            safe_canonicalize(path).unwrap_or_else(|_| strip_unc_prefix(path.to_path_buf()));
+        // normalize_user_path on the fallback keeps register/unregister
+        // symmetry: if `register("/c/Users/foo")` stored `C:\Users\foo`, then
+        // `unregister_path("/c/Users/foo")` must match it even when the dir
+        // no longer exists (canonicalize fails) — see AGENTS.md "structural
+        // fix" rule for the warnings-channel class defect this mirrors.
+        let canonical = safe_canonicalize(path).unwrap_or_else(|_| normalize_user_path(path));
         let to_remove = self
             .repos
             .iter()
@@ -955,8 +961,9 @@ impl ReposConfig {
     }
 
     pub fn alias_for_path(&self, path: &Path) -> Option<String> {
-        let canonical =
-            safe_canonicalize(path).unwrap_or_else(|_| strip_unc_prefix(path.to_path_buf()));
+        // See unregister_path: normalize_user_path on the fallback preserves
+        // lookup symmetry for not-on-disk paths.
+        let canonical = safe_canonicalize(path).unwrap_or_else(|_| normalize_user_path(path));
         self.repos
             .iter()
             .find(|(_, p)| normalize_path_for_compare(p) == normalize_path_for_compare(&canonical))
@@ -1217,7 +1224,10 @@ fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<
         if git_remote_url(dir).as_deref() == Some(target_remote) {
             // Canonicalize to resolve 8.3 short names on Windows (e.g. RUNNER~1 →
             // runneradmin) so stored and found paths are always in the same form.
-            out.push(safe_canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+            // normalize_user_path on the fallback is defensive (paths here come
+            // from a filesystem scan, so they are already clean Windows paths,
+            // but the helper is a no-op then).
+            out.push(safe_canonicalize(dir).unwrap_or_else(|_| normalize_user_path(dir)));
         }
         return;
     }

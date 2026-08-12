@@ -2060,8 +2060,11 @@ async fn try_delegate_reindex_to_serve(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     // Canonicalize and strip UNC prefix (\\?\) for reliable path operations.
-    let project_path =
-        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
+    // normalize_user_path on the fallback handles caller-supplied MSYS POSIX
+    // paths (`/c/...` → `C:/...`) even when canonicalize fails (path doesn't
+    // exist yet) — same defect class as register(), see AGENTS.md.
+    let project_path = safe_canonicalize(&raw_project_path)
+        .unwrap_or_else(|_| crate::cache::normalize_user_path(&raw_project_path));
 
     let config = crate::db_discovery::repos::ReposConfig::load()
         .map_err(|e| format!("cannot load repos.json: {}", e))?;
@@ -2070,7 +2073,10 @@ async fn try_delegate_reindex_to_serve(
     /// relative components), then normalize via `cache::normalize_path` (strips
     /// Windows UNC prefix, converts backslashes) and lowercases for case-insensitive match.
     fn normalize_for_cmp(p: &std::path::Path) -> String {
-        let canonical = safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        // Same translate-on-fallback discipline as the outer call site and the
+        // twin closure in try_delegate_rm_to_serve — see stage-1/stage-2.
+        let canonical =
+            safe_canonicalize(p).unwrap_or_else(|_| crate::cache::normalize_user_path(p));
         crate::cache::normalize_path(&canonical).to_lowercase()
     }
 
@@ -2292,8 +2298,10 @@ pub(crate) async fn try_delegate_add_to_serve(
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let project_path =
-        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
+    // normalize_user_path on the fallback: caller-supplied MSYS POSIX paths
+    // (`/c/...` → `C:/...`) must not leak to the serve POST body.
+    let project_path = safe_canonicalize(&raw_project_path)
+        .unwrap_or_else(|_| crate::cache::normalize_user_path(&raw_project_path));
 
     // 3. Build request body
     let mut body = serde_json::json!({
@@ -2390,11 +2398,14 @@ pub(crate) async fn try_delegate_rm_to_serve(
     let raw_project_path = path
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let project_path =
-        safe_canonicalize(&raw_project_path).unwrap_or_else(|_| raw_project_path.clone());
+    // normalize_user_path on the fallback: same defect-class fix as register().
+    let project_path = safe_canonicalize(&raw_project_path)
+        .unwrap_or_else(|_| crate::cache::normalize_user_path(&raw_project_path));
 
     fn normalize_for_cmp(p: &std::path::Path) -> String {
-        let canonical = safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        // Same translate-on-fallback discipline as the outer call site.
+        let canonical =
+            safe_canonicalize(p).unwrap_or_else(|_| crate::cache::normalize_user_path(p));
         crate::cache::normalize_path(&canonical).to_lowercase()
     }
 
