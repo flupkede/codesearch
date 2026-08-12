@@ -2073,7 +2073,10 @@ async fn try_delegate_reindex_to_serve(
     /// relative components), then normalize via `cache::normalize_path` (strips
     /// Windows UNC prefix, converts backslashes) and lowercases for case-insensitive match.
     fn normalize_for_cmp(p: &std::path::Path) -> String {
-        let canonical = safe_canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        // Same translate-on-fallback discipline as the outer call site and the
+        // twin closure in try_delegate_rm_to_serve — see stage-1/stage-2.
+        let canonical =
+            safe_canonicalize(p).unwrap_or_else(|_| crate::cache::normalize_user_path(p));
         crate::cache::normalize_path(&canonical).to_lowercase()
     }
 
