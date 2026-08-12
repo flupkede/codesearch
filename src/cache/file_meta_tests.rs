@@ -158,6 +158,50 @@ fn translate_msys_path_is_noop_on_unix() {
     );
 }
 
+// ── normalize_user_path ─────────────────────────────────────────────────
+//
+// Single helper used by every "safe_canonicalize(...).unwrap_or_else(_)"
+// fallback site (register, unregister_path, alias_for_path, scan_for_remote,
+// resolve_database_with_message, try_delegate_*_to_serve, run_serve). Tests
+// pin both the translate + UNC-strip composition and the contract that
+// makes it safe to call on already-clean paths.
+
+#[cfg(windows)]
+#[test]
+fn normalize_user_path_translates_msys_and_strips_unc() {
+    // MSYS path → translated, no UNC to strip (input is not yet canonical).
+    assert_eq!(
+        normalize_user_path(&PathBuf::from("/c/Users/foo")),
+        PathBuf::from("C:/Users/foo")
+    );
+    // Already-canonical UNC path → UNC stripped, no translate needed
+    // (first byte is `\`, not `/`).
+    assert_eq!(
+        normalize_user_path(&PathBuf::from(r"\\?\C:\Users\foo")),
+        PathBuf::from(r"C:\Users\foo")
+    );
+    // Already-clean Windows path → idempotent.
+    assert_eq!(
+        normalize_user_path(&PathBuf::from(r"C:\Users\foo")),
+        PathBuf::from(r"C:\Users\foo")
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn normalize_user_path_only_strips_unc_on_unix() {
+    // No MSYS translation on Unix; UNC strip is a no-op on a non-Windows
+    // path but the function must still be safe to call.
+    assert_eq!(
+        normalize_user_path(&PathBuf::from("/c/Users/foo")),
+        PathBuf::from("/c/Users/foo")
+    );
+    assert_eq!(
+        normalize_user_path(&PathBuf::from("/home/user")),
+        PathBuf::from("/home/user")
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn test_normalize_path_windows_forms() {
