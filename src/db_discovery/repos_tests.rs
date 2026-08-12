@@ -147,11 +147,16 @@ fn register_derives_alias_from_directory_name() {
 #[cfg(windows)]
 fn register_translates_msys_posix_path() {
     let tmp = tempfile::tempdir().unwrap();
-    // Construct the Windows path of a temp dir, then express its parent+name
-    // as the MSYS POSIX equivalent (`/c/...`).
     let win_repo = tmp.path().join("propagate-tmp-repo");
     std::fs::create_dir(&win_repo).unwrap();
-    let win_str = win_repo.to_string_lossy().replace('\\', "/");
+    // Pre-canonicalize so 8.3 short names (e.g. `RUNNER~1` on Windows CI)
+    // are resolved to their long form BEFORE we build both the MSYS input
+    // and the expected output. Otherwise `safe_canonicalize` inside
+    // `register()` resolves the short name but our expected value keeps it,
+    // and the equality assertion fails on runners whose temp root sits
+    // under a short-named user folder.
+    let canonical = safe_canonicalize(&win_repo).unwrap();
+    let win_str = canonical.to_string_lossy().replace('\\', "/");
     // win_str looks like "C:/Users/.../propagate-tmp-repo"
     let (drive_letter, rest) = win_str.split_at(2); // "C:" + "/Users/..."
     let drive_letter = drive_letter.chars().next().unwrap();
@@ -242,7 +247,16 @@ fn unregister_path_matches_msys_posix_form() {
     let tmp = tempfile::tempdir().unwrap();
     let win_repo = tmp.path().join("propagate-tmp-unreg");
     std::fs::create_dir(&win_repo).unwrap();
-    let win_str = win_repo.to_string_lossy().replace('\\', "/");
+    // Pre-canonicalize for the same reason as register_translates_msys_posix_path:
+    // we delete the dir later, after which `safe_canonicalize` fails and the
+    // `normalize_user_path` fallback runs WITHOUT short-name resolution. If
+    // we built the MSYS input from the raw short-named path, register() would
+    // store the long form (canonicalized) but unregister()'s fallback would
+    // produce the short form, and the comparison would miss. Building from
+    // the canonical form makes both sides agree regardless of which branch
+    // runs.
+    let canonical = safe_canonicalize(&win_repo).unwrap();
+    let win_str = canonical.to_string_lossy().replace('\\', "/");
     let (drive_letter, rest) = win_str.split_at(2);
     let drive_letter = drive_letter.chars().next().unwrap();
     let msys_path = format!(
