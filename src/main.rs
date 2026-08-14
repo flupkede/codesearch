@@ -17,6 +17,8 @@ mod rerank;
 mod search;
 mod serve;
 mod symbols;
+#[cfg(test)]
+mod testing;
 mod vectordb;
 mod watch;
 
