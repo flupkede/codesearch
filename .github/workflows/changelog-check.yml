@@ -1,0 +1,82 @@
+name: Changelog check
+
+# Enforces the CHANGELOG.md convention documented at the top of that file:
+# every PR into `develop` is expected to add an entry under the current
+# pending-version heading. This exists because it kept NOT happening —
+# several PRs (git-hooks unification #193, the MSYS path-translation fix
+# #196/#197) landed on develop with no changelog entry, and nobody noticed
+# until a later /overview pass asked "wait, which bugs did we actually fix?"
+# and the answer wasn't written down anywhere but commit messages.
+#
+# This is a visible PR check (red X + annotation), not a hard merge block:
+# this repo's "block develop" ruleset requires 1 review, and PRs here are
+# routinely merged with `gh pr merge --admin` (admin bypass), which would
+# also bypass a "required status check" the same way. Making this check
+# required in the ruleset would not add real enforcement on top of that
+# pattern — it would just be a required check nobody's token is forced to
+# wait for. What this DOES do: put a clear, hard-to-miss red mark on the PR
+# and in `gh pr checks <n>` output, so the reason to skip a changelog entry
+# has to be a deliberate `no-changelog` label, not silence.
+#
+# Bypass: add the `no-changelog` label to the PR for genuinely
+# user-invisible changes (pure CI/tooling/docs-only churn, no behavior
+# change). Created once via:
+#   gh label create no-changelog --color 999999 \
+#     --description "Skip the CHANGELOG.md-touched CI check (docs/CI-only PR)"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: changelog-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  require-changelog:
+    runs-on: ubuntu-latest
+    steps:
+      # pin@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check CHANGELOG.md was touched (or PR is exempt)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+
+          if printf '%s' "$LABELS" | grep -qiw "no-changelog"; then
+            echo "::notice::'no-changelog' label present — skipping CHANGELOG.md check."
+            exit 0
+          fi
+
+          # Diff from the MERGE BASE, not the raw base SHA: after a rebase or
+          # a develop-merge into the branch, the two-dot range includes
+          # develop's own commits — including the CHANGELOG.md touches every
+          # other PR was required to make — and the check would false-pass on
+          # a PR that adds no entry of its own.
+          MB=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          CHANGED=$(git diff --name-only "$MB" "$HEAD_SHA")
+          if printf '%s\n' "$CHANGED" | grep -qx "CHANGELOG.md"; then
+            echo "CHANGELOG.md was updated in this PR — good."
+            exit 0
+          fi
+
+          {
+            echo "::error::This PR does not touch CHANGELOG.md."
+            echo "::error::Add an entry under the current pending-version heading"
+            echo "::error::(see the convention comment at the top of CHANGELOG.md)."
+            echo "::error::If this PR genuinely has nothing user-visible to record"
+            echo "::error::(pure CI/tooling/docs-only churn, no behavior change),"
+            echo "::error::add the 'no-changelog' label to this PR to bypass this check."
+          } >&2
+          exit 1

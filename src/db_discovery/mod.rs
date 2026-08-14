@@ -278,7 +278,14 @@ pub fn register_repository(project_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Unregister a repository from global tracking
+/// Unregister a repository from global tracking.
+///
+/// No longer called from `remove_from_index` (todo #48 fix folded this
+/// load/unregister_path/save sequence inline there so the file-delete could
+/// run first and the config mutation only happen after it succeeded) — kept
+/// `pub` for CLI/admin tooling that wants a plain unregister with no
+/// file-removal side effect.
+#[allow(dead_code)] // Available for CLI and admin tooling, see doc comment above
 pub fn unregister_repository(project_path: &Path) -> Result<()> {
     let mut config = ReposConfig::load()?;
     if config.unregister_path(project_path) {
