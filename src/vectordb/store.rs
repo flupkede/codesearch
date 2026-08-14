@@ -1568,4 +1568,118 @@ mod tests {
         assert!(emb.is_some());
         assert_eq!(emb.unwrap().len(), 4);
     }
+
+    // === cross-generation chunk-id drift (mechanism repro) ===
+    //
+    // Ids are autoincrement (`next_id = max_key + 1` recomputed on every
+    // open, see `VectorStore::new`). Deleting the chunks that hold the
+    // HIGHEST ids lowers `max_key`, so the next reopen hands those same ids
+    // to whatever is indexed next — possibly unrelated content. On the
+    // cloud peer every scale-to-zero wake replays custom-kb's incremental
+    // git history on a restored snapshot (delete + re-insert at the top of
+    // the range is routine there), which is why this mechanism matters for
+    // `get_chunk(chunk_id)` stability across cold starts. See AGENTS.md
+    // Open TODOs ("custom-kb chunk_id drift", secondary hypothesis) and
+    // develterf_dlwr/todo#51: these tests reproduce the MECHANISM locally;
+    // whether it fires in production still needs a live two-cold-start
+    // comparison before a fix (content-keyed ids / generation stamps) is
+    // spent on.
+
+    fn drift_chunk(path: &str, content: &str, id: usize) -> EmbeddedChunk {
+        EmbeddedChunk::new(
+            Chunk::new(
+                content.to_string(),
+                id,
+                id,
+                ChunkKind::Other,
+                path.to_string(),
+            ),
+            vec![1.0, 0.0, 0.0, 0.0],
+        )
+    }
+
+    #[test]
+    fn reopen_after_top_of_range_delete_reassigns_ids_to_new_content() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("drift.db");
+
+        // Generation 1: file A (ids 0,1), file B (ids 2,3). B holds the top
+        // of the id range.
+        let b_ids = {
+            let mut store = VectorStore::new(&db_path, 4).unwrap();
+            let ids = store
+                .insert_chunks_with_ids(vec![
+                    drift_chunk("a.md", "content A0", 0),
+                    drift_chunk("a.md", "content A1", 1),
+                    drift_chunk("b.md", "content B0", 2),
+                    drift_chunk("b.md", "content B1", 3),
+                ])
+                .unwrap();
+            assert_eq!(ids, vec![0, 1, 2, 3]);
+            // B deleted upstream → its chunks are the top of the range.
+            store.delete_chunks(&[2, 3]).unwrap();
+            vec![2u32, 3]
+        }; // store dropped → env closed (LMDB single-open-per-process rule)
+
+        // Generation 2 (new container / cold start): reopen. max_key is now
+        // 1, so next_id drops from 4 to 2 — the deleted range is back in
+        // play.
+        let mut store2 = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(
+            store2.next_id, 2,
+            "top-of-range delete must lower next_id on reopen (the drift mechanism)"
+        );
+
+        // An unrelated file C is indexed and receives B's old ids.
+        let c_ids = store2
+            .insert_chunks_with_ids(vec![
+                drift_chunk("c.md", "content C0", 0),
+                drift_chunk("c.md", "content C1", 1),
+            ])
+            .unwrap();
+        assert_eq!(c_ids, b_ids, "C reuses B's freed top-of-range ids");
+
+        // An id that meant a B chunk in generation 1 now resolves to C's
+        // content — the wrong file, with no error and no ambiguity signal.
+        let chunk = store2.get_chunk(2).unwrap().expect("id 2 must resolve");
+        assert_eq!(chunk.path, "c.md");
+        assert!(chunk.content.contains("content C0"));
+    }
+
+    #[test]
+    fn reopen_after_low_range_delete_keeps_remaining_ids_stable() {
+        // Boundary control for the test above: deleting BELOW the top of the
+        // range leaves max_key untouched, so surviving ids stay stable across
+        // reopens and new inserts never collide with them. Only top-of-range
+        // deletion triggers reuse.
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("drift-low.db");
+
+        {
+            let mut store = VectorStore::new(&db_path, 4).unwrap();
+            store
+                .insert_chunks_with_ids(vec![
+                    drift_chunk("a.md", "content A0", 0),
+                    drift_chunk("a.md", "content A1", 1),
+                    drift_chunk("b.md", "content B0", 2),
+                    drift_chunk("b.md", "content B1", 3),
+                ])
+                .unwrap();
+            // A (ids 0,1) deleted; B keeps the top of the range.
+            store.delete_chunks(&[0, 1]).unwrap();
+        }
+
+        let mut store2 = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(store2.next_id, 4, "max_key (B's id 3) keeps next_id at 4");
+
+        // B's ids still resolve to B after the reopen.
+        let chunk = store2.get_chunk(2).unwrap().expect("id 2 must resolve");
+        assert_eq!(chunk.path, "b.md");
+
+        // New inserts start above the surviving range — no reuse.
+        let c_ids = store2
+            .insert_chunks_with_ids(vec![drift_chunk("c.md", "content C0", 0)])
+            .unwrap();
+        assert_eq!(c_ids, vec![4]);
+    }
 }
