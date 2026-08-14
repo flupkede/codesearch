@@ -2853,7 +2853,10 @@ mod remove_order_tests {
                 crate::constants::REPOS_CONFIG_ENV,
                 &cfg_path.to_string_lossy(),
             ),
-            (crate::constants::SERVE_PORT_ENV, &serve_port.to_string()),
+            (
+                crate::constants::SERVE_PORT_ENV,
+                serve_port.to_string().as_str(),
+            ),
         ]);
         let mut cfg = ReposConfig::default();
         cfg.register(proj.to_path_buf());
