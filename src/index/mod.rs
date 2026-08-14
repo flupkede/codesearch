@@ -9,9 +9,7 @@ use tracing::{debug, info};
 
 use crate::cache::{normalize_path, safe_canonicalize, FileMetaStore};
 use crate::chunker::SemanticChunker;
-use crate::db_discovery::{
-    find_best_database, is_registered_repository, register_repository, unregister_repository,
-};
+use crate::db_discovery::{find_best_database, is_registered_repository, register_repository};
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
@@ -1669,51 +1667,64 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
         return Ok(());
     }
 
-    // Auto-unregister from repos.json unless --keep-config
+    // FILE REMOVAL FIRST. The previous order (unregister from repos.json,
+    // then delete the files) left an inconsistent state whenever the delete
+    // failed — typically LMDB files still held by a serve instance the
+    // delegation probe could not see (a second serve on another port, a
+    // crashed one, or a CLI process holding the env): the entry was already
+    // gone from repos.json while the still-locked database sat on disk, and
+    // nothing could clean that up except a manual serve-stop. Now repos.json
+    // is only mutated after the files are actually gone, so a failed delete
+    // leaves the config untouched and the same command can simply be retried.
+    if has_local {
+        if has_global {
+            println!(
+                "\n{}",
+                "⚠️  Warning: Both local and global indexes exist!".yellow()
+            );
+        }
+        println!("\n{}", "Removing local index...".cyan());
+        if let Err(e) = fs::remove_dir_all(&local_db) {
+            eprintln!(
+                "⚠️ Database files may be locked by a running codesearch serve. \
+                 repos.json was NOT modified — stop the locking process and re-run \
+                 the same command."
+            );
+            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
+        }
+        println!("{}", "✅ Local index removed!".green());
+    }
+
+    // Files are gone (or never existed) — only now update repos.json.
+    // (This also folds the old "both exist" early-return into the same
+    // files-then-config flow: that path used to print "(Global index
+    // remains)" AFTER the unregister above had already removed the global
+    // entry, and the global-only path used to unregister twice.)
     if !keep_config {
         let mut config = crate::db_discovery::repos::ReposConfig::load().unwrap_or_default();
         if config.unregister_path(&canonical_path) {
             if let Err(e) = config.save() {
-                eprintln!("⚠️ Failed to update repos config: {}", e);
-            } else {
-                println!("{}", "🗑️  Unregistered from repos.json".green());
+                // The files are gone but the registry still names them. Say so
+                // and fail loudly instead of reporting partial success as Ok —
+                // re-running the same command finishes the job (the file
+                // removal step is now a no-op).
+                eprintln!(
+                    "⚠️ Local index files were removed, but saving repos.json failed. \
+                     The config entry remains; re-run the same command to unregister it."
+                );
+                return Err(anyhow::anyhow!("Failed to update repos config: {}", e));
             }
+            println!("{}", "🗑️  Unregistered from repos.json".green());
         }
     } else {
         println!("{}", "ℹ️ Config entry preserved.".cyan());
     }
 
-    // If both exist (shouldn't happen), remove local with warning
-    if has_local && has_global {
-        println!(
-            "\n{}",
-            "⚠️  Warning: Both local and global indexes exist!".yellow()
-        );
-        println!("   Removing local index...");
-        if let Err(e) = fs::remove_dir_all(&local_db) {
-            eprintln!(
-                "⚠️ Database files may be locked by a running codesearch serve. Stop it and retry."
-            );
-            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
-        }
-        println!("   {}", "✅ Local index removed".green());
-        println!("   (Global index remains)");
-        return Ok(());
-    }
-
-    // Remove whichever exists
-    if has_local {
-        println!("\n{}", "Removing local index...".cyan());
-        if let Err(e) = fs::remove_dir_all(&local_db) {
-            eprintln!(
-                "⚠️ Database files may be locked by a running codesearch serve. Stop it and retry."
-            );
-            return Err(anyhow::anyhow!("Failed to remove local index: {}", e));
-        }
-        println!("{}", "✅ Local index removed!".green());
-    } else if has_global {
-        println!("\n{}", "Removing global index...".cyan());
-        unregister_repository(&canonical_path)?;
+    // `!keep_config` matters: with --keep-config the entry is deliberately
+    // left in repos.json, so claiming the global index was removed would
+    // contradict the "Config entry preserved." line printed just above and
+    // send the caller looking for a cleanup that never happened.
+    if !has_local && has_global && !keep_config {
         println!("{}", "✅ Global index removed!".green());
     }
 
@@ -2758,5 +2769,268 @@ mod index_quality_tests {
         let rebuilt =
             ensure_hnsw_index_if_needed(&db_path, DIMS).expect("should succeed on empty DB");
         assert!(!rebuilt, "empty DB needs no rebuild");
+    }
+}
+
+/// Regression tests for `remove_from_index`'s operation ORDER (todo #48).
+///
+/// The bug: repos.json was unregistered BEFORE the database files were
+/// deleted. When the delete failed — typically LMDB files locked by a serve
+/// instance the delegation probe could not see — the command errored out
+/// with the config entry already gone: the registry claimed the repo no
+/// longer existed while its still-locked database sat on disk. The fix
+/// deletes the files first and only mutates repos.json on success, so a
+/// failed delete leaves the config untouched and the same command can be
+/// retried after stopping the locking process.
+#[cfg(test)]
+mod remove_order_tests {
+    use super::remove_from_index;
+    use crate::db_discovery::repos::ReposConfig;
+    use crate::testing::EnvRestore;
+    use serial_test::serial;
+    use std::path::{Path, PathBuf};
+
+    // Every test in this module is `#[serial]`: they mutate the
+    // process-global CODESEARCH_REPOS_CONFIG (the same var the doctor
+    // tests read) and CODESEARCH_SERVE_PORT. The EnvRestore guard returned
+    // by seed_repos_config snapshots and restores both on drop, so even a
+    // panicking assertion cannot leak a stale value into a later test.
+
+    /// Create a project dir and return its CANONICAL path. Everything in
+    /// these tests (db path, registered path, assertions) must use the
+    /// canonical form — `ReposConfig::register` canonicalizes before
+    /// storing, and on Windows CI the temp root sits under an 8.3 short
+    /// name (`RUNNER~1`) that only `canonicalize` resolves (the same trap
+    /// the MSYS regression tests hit in PR #197).
+    fn make_proj(tmp: &std::path::Path, name: &str) -> PathBuf {
+        let raw = tmp.join(name);
+        std::fs::create_dir(&raw).unwrap();
+        crate::cache::safe_canonicalize(&raw).unwrap()
+    }
+
+    /// Bind an ephemeral listener whose connections are accepted and closed
+    /// immediately (TCP RST). Pointing CODESEARCH_SERVE_PORT here makes the
+    /// delegation health probe inside `remove_from_index` fail FAST and
+    /// hermetically: the reset surfaces as a non-timeout connect error, which
+    /// the probe classifies as `ServeProbe::Down` on the first attempt.
+    /// Without this the probe would either reach a REAL serve on the default
+    /// port (live DELETE /repos/<alias> against the developer's registry —
+    /// observed during review) or, on an unused port, hit the Windows
+    /// loopback hang: 3 retries x 3s client timeout of dead air per
+    /// delegating test.
+    async fn spawn_reset_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+                // The accepted TcpStream drops at the end of this arm ->
+                // immediate close -> RST to the probing client.
+            }
+        });
+        port
+    }
+
+    /// Seed an isolated repos.json with `proj` registered, and isolate both
+    /// env vars the remove path reads (config path + serve port). The
+    /// returned guard restores the previous values when the test ends.
+    fn seed_repos_config(
+        tmp: &std::path::Path,
+        proj: &std::path::Path,
+        serve_port: u16,
+    ) -> EnvRestore {
+        let cfg_path = tmp.join("repos.json");
+        // Env vars FIRST, then save: `ReposConfig::save()` resolves its
+        // destination the same way `load()` does (env override, else the
+        // global default). Saving before the override is set writes the
+        // seed into the developer's REAL ~/.codesearch/repos.json — which
+        // is exactly how this test once destroyed a registry during
+        // development. The canary below pins that invariant.
+        let guard = EnvRestore::set(&[
+            (
+                crate::constants::REPOS_CONFIG_ENV,
+                &cfg_path.to_string_lossy(),
+            ),
+            (crate::constants::SERVE_PORT_ENV, &serve_port.to_string()),
+        ]);
+        let mut cfg = ReposConfig::default();
+        cfg.register(proj.to_path_buf());
+        cfg.save().expect("seed repos.json save must succeed");
+        // Paranoia guard: the seed MUST have landed in the temp dir.
+        assert!(
+            cfg_path.exists(),
+            "seed repos.json must be written to the temp path, not the global default"
+        );
+        guard
+    }
+
+    /// Snapshot of the developer's REAL global repos.json (if present).
+    /// Tests assert it is byte-identical when they finish — a mis-ordered
+    /// seed or a stray save must fail the test, not silently destroy the
+    /// registry.
+    fn global_config_canary() -> Option<String> {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default();
+        if home.is_empty() {
+            return None;
+        }
+        let p = std::path::Path::new(&home)
+            .join(".codesearch")
+            .join("repos.json");
+        std::fs::read_to_string(p).ok()
+    }
+
+    fn assert_global_config_unchanged(before: Option<String>) {
+        let now = global_config_canary();
+        assert_eq!(
+            before, now,
+            "the developer's global repos.json changed during the test —              a save bypassed the CODESEARCH_REPOS_CONFIG override"
+        );
+    }
+
+    fn registered_paths() -> Vec<String> {
+        ReposConfig::load()
+            .expect("repos.json load must succeed")
+            .repos
+            .values()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// The actual defect: a delete that FAILS must leave repos.json
+    /// untouched. `.codesearch.db` as a FILE (not a directory) makes
+    /// `fs::remove_dir_all` fail deterministically on every platform —
+    /// standing in for a locked LMDB dir.
+    #[tokio::test]
+    #[serial]
+    async fn failed_delete_leaves_repos_json_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj");
+        std::fs::write(proj.join(".codesearch.db"), b"not a directory").unwrap();
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        let result = remove_from_index(Some(proj.clone()), false).await;
+        assert!(
+            result.is_err(),
+            "remove must fail when the db dir cannot be deleted"
+        );
+
+        // The entry must STILL be registered — the whole point of the fix.
+        let paths = registered_paths();
+        assert!(
+            paths.iter().any(|p| Path::new(p) == proj),
+            "repos.json must be untouched after a failed delete, got: {:?}",
+            paths
+        );
+        // And the db file itself is still there (nothing half-deleted).
+        assert!(
+            proj.join(".codesearch.db").exists(),
+            "the db path must still exist"
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// Happy path: files removed AND entry unregistered, in that order.
+    #[tokio::test]
+    #[serial]
+    async fn successful_delete_unregisters_from_repos_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj");
+        let db = proj.join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("data.mdb"), b"fake").unwrap();
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        remove_from_index(Some(proj.clone()), false)
+            .await
+            .expect("remove must succeed when nothing locks the db");
+
+        assert!(!db.exists(), "db dir must be gone");
+        let paths = registered_paths();
+        assert!(
+            !paths.iter().any(|p| Path::new(p) == proj),
+            "entry must be unregistered after successful delete, got: {:?}",
+            paths
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// `--keep-config`: files removed, entry preserved.
+    #[tokio::test]
+    #[serial]
+    async fn keep_config_removes_files_but_preserves_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj");
+        let db = proj.join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("data.mdb"), b"fake").unwrap();
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        remove_from_index(Some(proj.clone()), true)
+            .await
+            .expect("keep-config remove must succeed");
+
+        assert!(!db.exists(), "db dir must be gone");
+        let paths = registered_paths();
+        assert!(
+            paths.iter().any(|p| Path::new(p) == proj),
+            "entry must be PRESERVED with keep_config, got: {:?}",
+            paths
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// Global-only WITH `--keep-config`: the entry must survive. Before the
+    /// todo #48 rework this quadrant ran `unregister_repository(..)?` in an
+    /// `else if has_global` arm that never consulted `keep_config`, so the
+    /// flag was silently ignored and the entry was removed anyway.
+    #[tokio::test]
+    #[serial]
+    async fn keep_config_global_only_preserves_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj"); // no .codesearch.db at all
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        remove_from_index(Some(proj.clone()), true)
+            .await
+            .expect("keep-config global-only remove must succeed");
+
+        let paths = registered_paths();
+        assert!(
+            paths.iter().any(|p| Path::new(p) == proj),
+            "entry must be PRESERVED with keep_config in the global-only case, got: {:?}",
+            paths
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// Global-only (no local db, only a repos.json entry): unregister works,
+    /// previously via a redundant second unregister call.
+    #[tokio::test]
+    #[serial]
+    async fn global_only_unregisters_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj"); // no .codesearch.db at all
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+
+        remove_from_index(Some(proj.clone()), false)
+            .await
+            .expect("global-only remove must succeed");
+
+        let paths = registered_paths();
+        assert!(
+            !paths.iter().any(|p| Path::new(p) == proj),
+            "entry must be unregistered in global-only case, got: {:?}",
+            paths
+        );
+        assert_global_config_unchanged(_canary);
     }
 }
