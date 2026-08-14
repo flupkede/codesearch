@@ -164,7 +164,7 @@ fn pick_filter_root_stdio_falls_back_to_project_path() {
 
 fn ns_item(path: &str) -> super::SearchResultItem {
     super::SearchResultItem {
-        chunk_id: 1,
+        chunk_id: Some(1),
         path: path.to_string(),
         start_line: 1,
         end_line: 2,
@@ -334,7 +334,7 @@ fn test_low_confidence_response_serialization() {
 fn test_normal_response_omits_confidence_fields() {
     let response = super::SemanticSearchResponse {
         results: vec![super::SearchResultItem {
-            chunk_id: 1,
+            chunk_id: Some(1),
             path: "test.rs".to_string(),
             start_line: 1,
             end_line: 10,
@@ -890,7 +890,7 @@ fn test_literal_search_result_item_omits_none_fields() {
 fn test_semantic_search_response_with_results() {
     let response = super::SemanticSearchResponse {
         results: vec![super::SearchResultItem {
-            chunk_id: 1,
+            chunk_id: Some(1),
             path: "test.rs".to_string(),
             start_line: 1,
             end_line: 10,

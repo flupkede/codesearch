@@ -268,7 +268,17 @@ pub struct SimilarChunksRequest {
 /// Search result item — returned by semantic search
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResultItem {
-    pub chunk_id: u32,
+    /// Store-assigned chunk id. `Some` for semantic hits (where the store
+    /// returned a real id); **`None` for literal-mode hits** — literal results
+    /// carry no chunk id and the field is omitted from the JSON entirely.
+    ///
+    /// Never fabricate an id (e.g. `unwrap_or(0)`) for absent values: a
+    /// caller can combine a rendered `0` with the item's `source` into a
+    /// bogus `chunk_ref` (`"<peer>/<alias>:0"`) that `get_chunk` will
+    /// silently resolve to an *unrelated* chunk. An absent id must render
+    /// as an absent field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_id: Option<u32>,
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
