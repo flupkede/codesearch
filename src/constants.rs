@@ -349,6 +349,20 @@ pub const MCP_ENDPOINT_PATH: &str = "/mcp";
 /// Returns JSON snapshot of all repo states, sessions, and CPU usage.
 pub const STATUS_PATH: &str = "/status";
 
+/// Indexing-freshness endpoint path served by `codesearch serve`.
+///
+/// Cheap single-question probe for the grep-guard hook (and any caller that
+/// needs to distinguish "no results" from "index mid-rebuild"): takes
+/// `?path=<absolute path>`, resolves the containing registered repo, and
+/// returns `{"covered":bool,"alias":..,"indexing":bool}` — `indexing` is true
+/// while that repo has an active (non-stale) reindex in flight, which
+/// includes the full refresh fired by a branch switch. Same auth class as
+/// [`STATUS_PATH`]: reachable without the admin key on localhost, protected
+/// by `require_auth_for_network` on network binds. `/healthz` remains the
+/// ONLY always-unauthenticated endpoint — liveness and freshness are
+/// different questions and stay on different paths.
+pub const INDEXING_PATH: &str = "/indexing";
+
 /// Remotes endpoint path served by `codesearch serve`.
 ///
 /// Observability companion to [`STATUS_PATH`]: lists the configured federation

@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.2.13] (unreleased)
+
+### Added
+
+- **`GET /indexing?path=<absolute path>` — per-repo freshness probe, and grep-guard now waits instead of forcing a grep fallback after a branch switch (todos #54/#55).** Two related fixes shipped together. (1) `codesearch serve` exposes a cheap new endpoint that resolves an absolute filesystem path to its containing registered repo (longest-root-wins, component-boundary match so `/x/alpha` never matches `/x/alpha-x`) and reports `{"covered":bool,"alias":..,"indexing":bool}` — `indexing` is true while that repo has an active (non-stale, lazily-evicted) reindex in flight, which includes the full refresh the file watcher fires on every branch switch. Same auth class as `/status` (open on localhost, bearer-protected on network binds); `/healthz` deliberately stays the only always-unauthenticated endpoint — liveness and freshness are different questions. (2) The Claude Code `grep-guard` hook (both `.ps1` and `.sh`, kept in sync) now probes this endpoint when the serve hub is live: if the target repo is mid-reindex, the deny message becomes a **wait-and-retry instruction** (sleep 15-30s, then re-run the codesearch call) instead of the standard "use codesearch" one — searching a mid-rebuild index returns stale/empty results, which previously pushed the agent into a manual `(approved fallback)` grep on every routine checkout. The probe is skipped silently (standard deny) on serves that predate the endpoint, so hook and server versions mix freely. Additionally fixed in the same hooks: repo resolution now follows the **grep target** (the git root of the path being searched) instead of the hook's cwd — an absolute-path Grep into a different indexed repo previously looked "external" against the cwd's repo root and slipped the guard uncovered.
+
 ## [1.2.11] (unreleased)
 
 ### Fixed
