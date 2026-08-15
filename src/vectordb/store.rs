@@ -1763,4 +1763,74 @@ mod tests {
         // unchanged legacy risk for stores written before the mark existed.)
         assert_eq!(insert_one(&mut store, "gen2/c.rs"), 2);
     }
+
+    // === cross-generation chunk-id drift (mechanism repro → FIXED) ===
+    //
+    // History: ids were autoincrement (`next_id = max_key + 1` recomputed on
+    // every open), so deleting the chunks holding the HIGHEST ids lowered
+    // `max_key` and the next reopen handed those ids to unrelated content —
+    // `get_chunk(old_id)` returned the wrong file with no error. On the cloud
+    // peer every scale-to-zero wake replays custom-kb's incremental git
+    // history on a restored snapshot (delete + re-insert at the top of the
+    // range is routine there), which is why this mattered for chunk-id
+    // stability across cold starts. See develterf_dlwr/todo#51.
+    //
+    // The original repro on `fix/custom-kb-chunk-id-drift`
+    // (`reopen_after_top_of_range_delete_reassigns_ids_to_new_content`)
+    // asserted the OLD reassignment behaviour; it is superseded by the
+    // high-water-mark tests above (`reopen_after_top_of_range_delete_does_
+    // not_reuse_ids`, `reopen_after_full_delete_never_restarts_from_zero`)
+    // which pin the FIXED behaviour. The boundary control below is kept
+    // verbatim: low-range deletes were always safe and must stay safe.
+
+    fn drift_chunk(path: &str, content: &str, id: usize) -> EmbeddedChunk {
+        EmbeddedChunk::new(
+            Chunk::new(
+                content.to_string(),
+                id,
+                id,
+                ChunkKind::Other,
+                path.to_string(),
+            ),
+            vec![1.0, 0.0, 0.0, 0.0],
+        )
+    }
+
+    #[test]
+    fn reopen_after_low_range_delete_keeps_remaining_ids_stable() {
+        // Boundary control: deleting BELOW the top of the range leaves
+        // max_key untouched, so surviving ids stay stable across reopens and
+        // new inserts never collide with them. Under the high-water mark this
+        // holds trivially (the mark only ever raises next_id) — the test
+        // pins that the mark did not CHANGE this always-safe case.
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("drift-low.db");
+
+        {
+            let mut store = VectorStore::new(&db_path, 4).unwrap();
+            store
+                .insert_chunks_with_ids(vec![
+                    drift_chunk("a.md", "content A0", 0),
+                    drift_chunk("a.md", "content A1", 1),
+                    drift_chunk("b.md", "content B0", 2),
+                    drift_chunk("b.md", "content B1", 3),
+                ])
+                .unwrap();
+            // A (ids 0,1) deleted; B keeps the top of the range.
+            store.delete_chunks(&[0, 1]).unwrap();
+        }
+
+        let mut store2 = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(store2.next_id, 4, "max_key (B's id 3) keeps next_id at 4");
+
+        // B's ids still resolve to B after the reopen.
+        let chunk = store2.get_chunk(2).unwrap().expect("id 2 must resolve");
+        assert_eq!(chunk.path, "b.md");
+
+        // New inserts start above the surviving range — no reuse.
+        let c_ids = store2
+            .insert_chunks_with_ids(vec![drift_chunk("c.md", "content C0", 0)])
+            .unwrap();
+        assert_eq!(c_ids, vec![4]);
+    }
 }
