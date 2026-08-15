@@ -17,18 +17,26 @@
 # "codesearch is down".
 #
 # Blocks the Grep call when ALL of:
-#   - the search path is internal (empty/relative, or absolute-but-inside the
-#     current git repo), AND
-#   - codesearch covers THIS repo (indexed .codesearch.db at git root, or the
-#     CODESEARCH_SERVER opt-in for remote/hub-only setups), AND
+#   - the search target resolves to a git repo (its OWN root, not the cwd's —
+#     absolute paths into a different repo resolve against THAT repo, todo
+#     #54), AND
+#   - codesearch covers THAT repo (indexed .codesearch.db at its git root, or
+#     the CODESEARCH_SERVER opt-in for remote/hub-only setups), AND
 #   - the codesearch serve hub answers its /healthz liveness probe (it's UP)
 #
 # Passes through (exit 0, no block) when:
-#   - the path is outside the current git repo (codesearch doesn't cover
-#     arbitrary external paths well; grep is the right tool there)
-#   - codesearch does not cover this repo (no local index, no CODESEARCH_SERVER)
+#   - the target is not inside any git repo (external path — grep is the
+#     right tool there)
+#   - codesearch does not cover the target's repo (no local index, no
+#     CODESEARCH_SERVER)
 #   - the codesearch serve hub does not answer /healthz — it's down, so grep
 #     is genuinely all you have
+#
+# When the target repo is covered and LIVE but MID-REINDEX (branch switch
+# full refresh, todo #55), the deny message is a WAIT-AND-RETRY instruction
+# instead of the standard "use codesearch" one — searching a mid-rebuild
+# index returns stale/empty results and must not degrade into a manual grep
+# approval on every routine checkout.
 #
 # Install: see ../README.md (or run ../install.ps1 to wire this up automatically).
 
@@ -52,62 +60,53 @@ $names = @($inp.PSObject.Properties.Name)
 $path  = if ($names -contains 'path') { [string]$inp.path } else { '' }
 
 # ------------------------------------------------------------------
-# 1. Is the path internal to the current repo?
-# ------------------------------------------------------------------
-$isInternal = $true
-if ($path -and $path -ne '.' -and $path -ne './') {
-    $normPath = $path.TrimEnd('/\')
-    # Absolute paths (Windows drive letter, or Git-Bash /c/... style)
-    if ($normPath -match '^([A-Za-z]:[\\/]|/[a-zA-Z]/|//)') {
-        try {
-            $gr = (& git rev-parse --show-toplevel 2>$null)
-            if ($LASTEXITCODE -eq 0 -and $gr) {
-                $gr  = $gr.Trim() -replace '[/\\]', [System.IO.Path]::DirectorySeparatorChar
-                $abs = $normPath   -replace '[/\\]', [System.IO.Path]::DirectorySeparatorChar
-                if (-not $abs.StartsWith($gr, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $isInternal = $false
-                }
-            }
-        } catch {
-            $isInternal = $false  # can't determine git root -> assume external, allow grep
-        }
-    }
-    # Relative paths ("src/", "../sibling/") stay internal = $true
-}
-
-if (-not $isInternal) { exit 0 }
-
-# ------------------------------------------------------------------
-# 2. Does codesearch COVER this repo? Don't block if it doesn't.
+# 1+2. Resolve the TARGET repo (the repo this Grep is aimed at) and check
+#      codesearch coverage THERE — never in the hook's cwd.
 #
-# NOTE: we deliberately do NOT treat "a codesearch process is running" as
-# sufficient. codesearch commonly runs as a persistent background `serve`
-# hub covering many registered repos (`codesearch index list`) — that
-# process is alive nearly all the time on a dev machine, regardless of
-# whether the CURRENT directory is one of the repos it actually indexes.
-# Using process-presence alone made this hook fire in every directory on
-# the machine, including ones with no index at all. A local `.codesearch.db`
-# at the git root is the precise, fast signal that THIS repo is indexed.
+# History (#54): coverage used to be resolved from the hook's cwd. An
+# absolute-path Grep into a DIFFERENT indexed repo then failed the
+# startswith(cwd-repo-root) test, looked "external", and was allowed even
+# though its target repo was fully covered. The guard now follows the
+# target: empty/relative paths resolve against the cwd repo (they are
+# relative to it by definition), absolute paths resolve against the git
+# root of the path itself.
 # ------------------------------------------------------------------
-function Test-CodesearchCoversRepo {
+$targetRoot = $null
+$normPath   = $path.TrimEnd('/\')
+$isAbsolute = $normPath -match '^([A-Za-z]:[\\/]|/[a-zA-Z]/|//)'
+
+if (-not $path -or $path -eq '.' -or $path -eq './' -or -not $isAbsolute) {
+    # Empty or relative path: resolves against the cwd repo.
     try {
         $gr = (& git rev-parse --show-toplevel 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $gr) {
-            $gr = $gr.Trim()
-            if (Test-Path (Join-Path $gr '.codesearch.db')) { return $true }
-        }
+        if ($LASTEXITCODE -eq 0 -and $gr) { $targetRoot = $gr.Trim() }
     } catch {}
-
-    # Explicit opt-in escape hatch for pure remote-serve setups with no local
-    # .codesearch.db (this repo's index lives only on a remote `codesearch
-    # serve` host). Requires the user to consciously set this env var, so it
-    # can't spuriously fire the way "any process running" did.
-    if ($env:CODESEARCH_SERVER) { return $true }
-
-    return $false
+} else {
+    # Absolute path: find the git root OF THE TARGET (may be a different
+    # repo than the cwd one — that is the whole point of #54).
+    $probe = $normPath
+    if (Test-Path -LiteralPath $probe -PathType Leaf) {
+        $probe = Split-Path -Parent $probe
+    }
+    try {
+        $gr = (& git -C $probe rev-parse --show-toplevel 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $gr) { $targetRoot = $gr.Trim() }
+    } catch {}
 }
 
-if (-not (Test-CodesearchCoversRepo)) { exit 0 }
+# Not inside any git repo (or git unusable) -> external target: grep is right.
+if (-not $targetRoot) { exit 0 }
+
+# Coverage: a local .codesearch.db at the TARGET repo's root is the precise,
+# fast signal that THIS repo is indexed (a running serve hub alone is NOT —
+# it covers many repos and being alive says nothing about this one).
+# CODESEARCH_SERVER stays the explicit opt-in for pure remote-serve setups.
+$covered = $false
+try {
+    if (Test-Path (Join-Path $targetRoot '.codesearch.db')) { $covered = $true }
+} catch {}
+if (-not $covered -and $env:CODESEARCH_SERVER) { $covered = $true }
+if (-not $covered) { exit 0 }
 
 # ------------------------------------------------------------------
 # 3. Is the codesearch serve hub actually UP right now? (Liveness probe.)
@@ -133,10 +132,10 @@ function Get-CodesearchBaseUrl {
 }
 
 function Test-CodesearchLive {
-    $base = Get-CodesearchBaseUrl
+    param([string]$Base)
     try {
         # Short timeout keeps grep latency low; /healthz answers instantly.
-        $null = Invoke-WebRequest -Uri "$base/healthz" -TimeoutSec 2 -UseBasicParsing
+        $null = Invoke-WebRequest -Uri "$Base/healthz" -TimeoutSec 2 -UseBasicParsing
         return $true
     } catch {
         # An HTTP error RESPONSE (4xx/5xx) still proves the server is reachable
@@ -149,7 +148,58 @@ function Test-CodesearchLive {
 }
 
 # codesearch is DOWN -> grep is genuinely all you have, let it through.
-if (-not (Test-CodesearchLive)) { exit 0 }
+$base = Get-CodesearchBaseUrl
+if (-not (Test-CodesearchLive -Base $base)) { exit 0 }
+
+# ------------------------------------------------------------------
+# 3.5 Is the TARGET repo mid-reindex right now? (Freshness probe, #55.)
+#
+# Liveness (/healthz) says the server is UP; it says nothing about index
+# FRESHNESS. Right after a branch switch the serve watcher fires a full
+# refresh, and searches against the mid-rebuild index return stale/empty
+# results — which used to push the agent into a manual grep approval on
+# every routine checkout (the exact "stale after branch switch" report).
+# GET /indexing?path=<repo root> resolves the target to its registered repo
+# and reports an active reindex. When one is in flight, deny with a
+# WAIT-AND-RETRY instruction: the tree did not change, the index is just
+# catching up — waiting beats grepping.
+#
+# Backward compat: an older serve without this endpoint answers 404, the
+# probe is skipped (catch below), and behaviour is exactly the pre-#55 deny.
+# ------------------------------------------------------------------
+try {
+    $enc  = [uri]::EscapeDataString(($targetRoot -replace '\\', '/'))
+    $resp = Invoke-WebRequest -Uri "$base/indexing?path=$enc" -TimeoutSec 2 -UseBasicParsing
+    $fresh = $resp.Content | ConvertFrom-Json
+    if ($fresh.covered -eq $true -and $fresh.indexing -eq $true) {
+        $waitMsg = @"
+codesearch is LIVE, but THIS repo's index is being rebuilt right now (a
+branch switch or file change fired the serve watcher's full refresh).
+Searching immediately would return stale or empty results — that is the
+rebuild in progress, not a miss, and NOT a reason to grep.
+
+WAIT 15-30 seconds (Bash: sleep 20), then RETRY your codesearch call — it
+will answer normally once the rebuild lands. The working tree did not
+change; only the index is catching up, so grep adds nothing here.
+
+If the rebuild still has not landed after ~2 minutes, run your codesearch
+call anyway (a partially fresh index still beats grep) or ask the user how
+to proceed.
+"@
+        $waitOut = @{
+            hookSpecificOutput = @{
+                hookEventName            = 'PreToolUse'
+                permissionDecision       = 'deny'
+                permissionDecisionReason = $waitMsg
+            }
+        }
+        $waitOut | ConvertTo-Json -Depth 10 -Compress
+        exit 0
+    }
+} catch {
+    # 404 (older serve) or probe failure: no freshness signal — fall through
+    # to the standard deny below.
+}
 
 # ------------------------------------------------------------------
 # 4. Block with actionable guidance
@@ -186,7 +236,8 @@ error, you MUST pass project="<repo-alias>" (single repo) or group="<group>"
 available_groups — pick from that list (the alias may differ from the folder
 name).
 
-Grep is always allowed for paths OUTSIDE the current repo.
+Grep is always allowed for targets outside any git repo, and for repos
+codesearch does not cover (no local index, no CODESEARCH_SERVER).
 "@
 
 $out = @{

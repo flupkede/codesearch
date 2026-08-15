@@ -1785,3 +1785,164 @@ mod keep_warm_foreign_target_tests {
         );
     }
 }
+
+// ===========================================================================
+// GET /indexing — freshness probe (grep-guard wait-and-retry, todo #55)
+// ===========================================================================
+
+/// Helper: a repos map from (alias, root) pairs.
+fn repos_map(entries: &[(&str, &str)]) -> std::collections::HashMap<String, std::path::PathBuf> {
+    entries
+        .iter()
+        .map(|(a, p)| (a.to_string(), std::path::PathBuf::from(p)))
+        .collect()
+}
+
+#[test]
+fn containing_repo_alias_matches_subdir_but_not_sibling_prefix() {
+    let repos = repos_map(&[("alpha", "/base/alpha"), ("beta", "/base/beta")]);
+
+    // Exact root.
+    assert_eq!(
+        containing_repo_alias(&repos, Path::new("/base/alpha")),
+        Some("alpha".to_string())
+    );
+    // File inside the repo.
+    assert_eq!(
+        containing_repo_alias(&repos, Path::new("/base/alpha/src/main.rs")),
+        Some("alpha".to_string())
+    );
+    // Component boundary: /base/alpha-x is NOT inside /base/alpha.
+    assert_eq!(
+        containing_repo_alias(&repos, Path::new("/base/alpha-x/file.rs")),
+        None,
+        "string-prefix sibling must not match"
+    );
+    // Entirely outside.
+    assert_eq!(containing_repo_alias(&repos, Path::new("/elsewhere")), None);
+}
+
+#[test]
+fn containing_repo_alias_prefers_nested_repo() {
+    // Two registered repos, one nested inside the other's tree: the inner
+    // (longer root) must win so the freshness answer is about the repo the
+    // path actually belongs to.
+    let repos = repos_map(&[("outer", "/base"), ("inner", "/base/inner")]);
+    assert_eq!(
+        containing_repo_alias(&repos, Path::new("/base/inner/src/a.rs")),
+        Some("inner".to_string())
+    );
+    assert_eq!(
+        containing_repo_alias(&repos, Path::new("/base/other/src/b.rs")),
+        Some("outer".to_string())
+    );
+}
+
+#[test]
+fn containing_repo_alias_case_insensitive_only_on_windows() {
+    let repos = repos_map(&[("alpha", "/Base/Alpha")]);
+    let hit = containing_repo_alias(&repos, Path::new("/base/alpha/x.rs"));
+    if cfg!(windows) {
+        assert_eq!(hit, Some("alpha".to_string()));
+    } else {
+        assert_eq!(hit, None, "unix path matching stays case-sensitive");
+    }
+}
+
+#[test]
+fn freshness_for_path_reports_indexing_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("repo");
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("fresh".to_string()))
+        .unwrap();
+
+    let state = Arc::new(ServeState::new(config, None));
+    let target = repo_path.join("src").join("lib.rs");
+
+    // Idle: covered, not indexing.
+    let (alias, indexing) = state.freshness_for_path(&target.to_string_lossy());
+    assert_eq!(alias.as_deref(), Some("fresh"));
+    assert!(!indexing);
+
+    // Mid-reindex (the exact state a branch-switch full refresh puts the
+    // repo in — make_indexing_status_callback inserts around it).
+    state.begin_indexing("fresh");
+    let (_, indexing) = state.freshness_for_path(&target.to_string_lossy());
+    assert!(indexing, "begin_indexing must surface as indexing=true");
+
+    state.end_indexing("fresh");
+    let (_, indexing) = state.freshness_for_path(&target.to_string_lossy());
+    assert!(!indexing);
+
+    // Unknown path: not covered, no crash.
+    let (alias, indexing) = state.freshness_for_path("/definitely/not/registered");
+    assert_eq!(alias, None);
+    assert!(!indexing);
+}
+
+#[tokio::test]
+async fn indexing_route_answers_json() {
+    // Route + handler wiring: a GET with a covered path returns our JSON
+    // (never axum's empty 404), with the covered/indexing fields present.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("hooked");
+    std::fs::create_dir(&repo_path).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("hooked".to_string()))
+        .unwrap();
+
+    let state = Arc::new(ServeState::new(config, None));
+
+    let app = axum::Router::new()
+        .route(
+            crate::constants::INDEXING_PATH,
+            axum::routing::get(indexing_handler),
+        )
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    // Temp paths are safe ASCII; normalise backslashes so the query string is
+    // legal as-is (component matching treats / and \ identically on Windows).
+    let covered = repo_path.to_string_lossy().replace('\\', "/");
+
+    // Covered path.
+    let resp = client
+        .get(format!(
+            "http://{addr}/indexing?path={covered}",
+            addr = addr
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["covered"], serde_json::json!(true));
+    assert_eq!(body["alias"], serde_json::json!("hooked"));
+    assert_eq!(body["indexing"], serde_json::json!(false));
+
+    // Uncovered path.
+    let resp = client
+        .get(format!(
+            "http://{addr}/indexing?path=/nowhere/at/all",
+            addr = addr
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["covered"], serde_json::json!(false));
+    assert_eq!(body["indexing"], serde_json::json!(false));
+}
