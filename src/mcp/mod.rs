@@ -3346,35 +3346,51 @@ impl CodesearchService {
                     continue;
                 }
 
-                let maybe_resolved = self
+                let maybe_resolved = match self
                     .with_vector_store_read_for(
                         |store| {
-                            if let Ok(Some(chunk)) = store.get_chunk(fts.chunk_id) {
-                                Ok(Some(crate::vectordb::SearchResult {
-                                    id: fts.chunk_id,
-                                    content: chunk.content,
-                                    path: chunk.path,
-                                    start_line: chunk.start_line,
-                                    end_line: chunk.end_line,
-                                    kind: chunk.kind,
-                                    signature: chunk.signature,
-                                    docstring: chunk.docstring,
-                                    context: chunk.context,
-                                    hash: chunk.hash,
-                                    distance: 0.0,
-                                    score: fts.score,
-                                    context_prev: chunk.context_prev,
-                                    context_next: chunk.context_next,
-                                }))
-                            } else {
-                                Ok(None)
-                            }
+                            // `Ok(None)` means "this store does not hold that
+                            // chunk" — a normal miss to skip. `Err` means the
+                            // store is broken and must propagate: flattening
+                            // the two silently dropped every remaining literal
+                            // hit whenever the vector store was down, turning a
+                            // dead store into an ordinary-looking short result.
+                            let chunk = match store.get_chunk(fts.chunk_id)? {
+                                Some(c) => c,
+                                None => return Ok(None),
+                            };
+                            Ok(Some(crate::vectordb::SearchResult {
+                                id: fts.chunk_id,
+                                content: chunk.content,
+                                path: chunk.path,
+                                start_line: chunk.start_line,
+                                end_line: chunk.end_line,
+                                kind: chunk.kind,
+                                signature: chunk.signature,
+                                docstring: chunk.docstring,
+                                context: chunk.context,
+                                hash: chunk.hash,
+                                distance: 0.0,
+                                score: fts.score,
+                                context_prev: chunk.context_prev,
+                                context_next: chunk.context_next,
+                            }))
                         },
                         ctx.stores.clone(),
                     )
                     .await
-                    .ok()
-                    .flatten();
+                {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        // The old `.ok()` here folded a dead store into "no
+                        // more literal hits" with zero signal to the caller —
+                        // the exact false negative `single_warnings` exists
+                        // for. Note it and stop: every further lookup against
+                        // this store would fail the same way.
+                        single_warnings.push(format!("literal-hit chunk lookup failed: {e:#}"));
+                        break;
+                    }
+                };
 
                 if let Some(resolved) = maybe_resolved {
                     existing_ids.insert(resolved.id);
@@ -4118,11 +4134,26 @@ impl CodesearchService {
         // Resolve chunk metadata and filter by definition kinds
         let requested_kind = request.kind.clone();
         let mut items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
+            let aliases = ctx.aliases();
             let mut items: Vec<ReferenceItem> = Vec::new();
             'outer: for fts_result in &fts_results {
-                for store_arc in sv {
+                for (store_idx, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
-                    if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                    let looked_up = store.get_chunk(fts_result.chunk_id);
+                    if let Err(ref e) = looked_up {
+                        // `Ok(None)` = chunk not in this store (normal during
+                        // fan-out); `Err` = broken store. Skipping the `Err`
+                        // silently made a dead store look like "symbol not
+                        // found" — carry it in the warnings channel instead.
+                        note_store_failure(
+                            &mut find_warnings,
+                            aliases,
+                            store_idx,
+                            "chunk lookup",
+                            e,
+                        );
+                    }
+                    if let Ok(Some(chunk)) = looked_up {
                         // Skip non-definition kinds — try next FTS result, not next store
                         if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
                             continue 'outer;
@@ -4146,36 +4177,46 @@ impl CodesearchService {
                         break; // Found in this store — move to next FTS result
                     }
                 }
-                // If we get here, chunk wasn't found in any store — just skip it
+                // If we get here, the chunk was Ok(None) in every store (not
+                // held anywhere — skip it) or its lookups failed (noted in
+                // find_warnings above).
             }
             items
         } else {
             match self
                 .with_vector_store_read_for(
                     |store| {
-                        let items = fts_results
+                        // Resolve chunk metadata first: a store `Err` must
+                        // reach the error arm below ("Error opening database")
+                        // instead of masquerading as a non-definition or
+                        // missing chunk — `Ok(None)` alone is a true miss.
+                        let resolved: anyhow::Result<Vec<_>> = fts_results
                             .iter()
-                            .filter_map(|fts_result| {
-                                if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
-                                    if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
+                            .map(|fts_result| {
+                                let chunk = store.get_chunk(fts_result.chunk_id)?;
+                                Ok((chunk, fts_result.chunk_id, fts_result.score))
+                            })
+                            .collect();
+                        let items = resolved?
+                            .into_iter()
+                            .filter_map(|(looked_up, chunk_id, score)| {
+                                let chunk = looked_up?;
+                                if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
+                                    return None;
+                                }
+                                if let Some(ref requested_kind) = requested_kind {
+                                    if chunk.kind != *requested_kind {
                                         return None;
                                     }
-                                    if let Some(ref requested_kind) = requested_kind {
-                                        if chunk.kind != *requested_kind {
-                                            return None;
-                                        }
-                                    }
-                                    Some(ReferenceItem {
-                                        chunk_id: fts_result.chunk_id,
-                                        path: chunk.path,
-                                        line: chunk.start_line,
-                                        kind: chunk.kind,
-                                        signature: chunk.signature,
-                                        score: fts_result.score,
-                                    })
-                                } else {
-                                    None
                                 }
+                                Some(ReferenceItem {
+                                    chunk_id,
+                                    path: chunk.path,
+                                    line: chunk.start_line,
+                                    kind: chunk.kind,
+                                    signature: chunk.signature,
+                                    score,
+                                })
                             })
                             .take(limit)
                             .collect();
@@ -4288,11 +4329,24 @@ impl CodesearchService {
 
         // Resolve chunks and exclude definition chunks
         let mut items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
+            let aliases = ctx.aliases();
             let mut items: Vec<ReferenceItem> = Vec::new();
             for fts_result in &fts_results {
-                for store_arc in sv {
+                for (store_idx, store_arc) in sv.iter().enumerate() {
                     let store = store_arc.vector_store.read().await;
-                    if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
+                    let looked_up = store.get_chunk(fts_result.chunk_id);
+                    if let Err(ref e) = looked_up {
+                        // Same rule as find_definition: `Err` is a broken
+                        // store, not "no usages" — carry it in the channel.
+                        note_store_failure(
+                            &mut find_warnings,
+                            aliases,
+                            store_idx,
+                            "chunk lookup",
+                            e,
+                        );
+                    }
+                    if let Ok(Some(chunk)) = looked_up {
                         if !is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
                             items.push(ReferenceItem {
                                 chunk_id: fts_result.chunk_id,
@@ -4315,24 +4369,31 @@ impl CodesearchService {
             match self
                 .with_vector_store_read_for(
                     |store| {
-                        let items = fts_results
+                        // Resolve first: a store `Err` must reach the error
+                        // arm below instead of masquerading as a definition
+                        // chunk or a miss — `Ok(None)` alone is a true miss.
+                        let resolved: anyhow::Result<Vec<_>> = fts_results
                             .iter()
-                            .filter_map(|fts_result| {
-                                if let Ok(Some(chunk)) = store.get_chunk(fts_result.chunk_id) {
-                                    if is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
-                                        return None;
-                                    }
-                                    Some(ReferenceItem {
-                                        chunk_id: fts_result.chunk_id,
-                                        path: chunk.path,
-                                        line: chunk.start_line,
-                                        kind: chunk.kind,
-                                        signature: chunk.signature,
-                                        score: fts_result.score,
-                                    })
-                                } else {
-                                    None
+                            .map(|fts_result| {
+                                let chunk = store.get_chunk(fts_result.chunk_id)?;
+                                Ok((chunk, fts_result.chunk_id, fts_result.score))
+                            })
+                            .collect();
+                        let items = resolved?
+                            .into_iter()
+                            .filter_map(|(looked_up, chunk_id, score)| {
+                                let chunk = looked_up?;
+                                if is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
+                                    return None;
                                 }
+                                Some(ReferenceItem {
+                                    chunk_id,
+                                    path: chunk.path,
+                                    line: chunk.start_line,
+                                    kind: chunk.kind,
+                                    signature: chunk.signature,
+                                    score,
+                                })
                             })
                             .take(limit)
                             .collect();
@@ -5981,11 +6042,23 @@ impl CodesearchService {
                 match self
                     .with_vector_store_read_for(
                         |store| {
-                            let items: Vec<LiteralSearchResultItem> = fts_results
+                            // Resolve chunk metadata first so a store `Err`
+                            // propagates to the error arm below ("Error
+                            // resolving search results") instead of silently
+                            // dropping the hit — `Ok(None)` alone is a true
+                            // miss ("chunk not in this store").
+                            let resolved: anyhow::Result<Vec<_>> = fts_results
                                 .iter()
-                                .filter_map(|fts_result| {
-                                    let chunk = store.get_chunk(fts_result.chunk_id).ok()??;
-                                    Some((chunk, fts_result.score))
+                                .map(|fts_result| {
+                                    let chunk = store.get_chunk(fts_result.chunk_id)?;
+                                    Ok((chunk, fts_result.score))
+                                })
+                                .collect();
+                            let items: Vec<LiteralSearchResultItem> = resolved?
+                                .into_iter()
+                                .filter_map(|(looked_up, score)| {
+                                    let chunk = looked_up?;
+                                    Some((chunk, score))
                                 })
                                 .filter(|(chunk, _)| {
                                     if let Some(ref lang) = lang_filter {
