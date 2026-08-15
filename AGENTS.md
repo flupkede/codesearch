@@ -1,6 +1,6 @@
 # AGENTS.md — codesearch
 
-_Last updated: 2026-08-05_
+_Last updated: 2026-08-14_
 
 ## Current state
 
@@ -46,6 +46,16 @@ Single source of truth for outstanding codesearch work.
   **Scoped first step shipped (2026-07-08):** incremental reindex in-process on serve is live — but *only* for the small **custom-kb** repo (`docker/entrypoint.sh`'s serve-mode KB pull loop fires `POST /repos/custom-kb/reindex` whenever `git pull` moves `HEAD`). Safe on the 1-2 GiB replica because incremental refresh is memory-bounded. The heavy DOCS corpus deliberately stays job-only.
 
   **Still open:** retire `codesearch-indexer` entirely or keep for DR; scheduled script vs Logic App vs wrapper CLI command (`codesearch cloud rebuild --remote <peer>`?).
+
+### Federation / custom-kb — literal-mode `chunk_id: 0` fabrication + cross-generation chunk-id drift (BOTH FIXED)
+
+**Symptom (reproduced 2026-08-14):** `search(project="cloud/custom-kb", mode="literal")` for a term found in a file's frontmatter tags returned `chunk_id: 0` for `custom-kb/troubleshoot/classification-importer-namepath-built-from-a-mutable-displayname-causes-duplica.md`. A separate `get_chunk(chunk_ref="cloud/custom-kb:0")` call built from that displayed id returned the **wrong file** — content from `custom-kb/troubleshoot/retro-prod-scan-fix-of-stuck-no-watermark-released-assets-1-5-17-6-cheap-waterma.md` — with no error and no ambiguity warning. A `mode="semantic"` search of the same original file independently returned a self-consistent global id range (321-328) that `get_chunk` resolved correctly.
+
+- [x] **Primary fix — SHIPPED (merged to develop via PR #201):** `LiteralSearchResultItem`/`RemoteSearchItem.chunk_id` had no real id for literal hits; both flatten sites did `.unwrap_or(0)`, rendering an *absent* id as a real-looking `chunk_id: 0`. A caller hand-building `chunk_ref "peer:0"` from that got whatever unrelated file held slot 0 — confident, wrong, zero signal. Literal results now keep `chunk_id` `Option`al/omitted (`src/mcp/types.rs`), so no bogus ref can be constructed.
+- [x] **Secondary fix — SHIPPED (merged to develop via PR #201): monotone chunk-id allocation (persistent id high-water mark).** The unit repro on `fix/custom-kb-chunk-id-drift` confirmed the mechanism: `next_id = max_key + 1` recomputed on EVERY open, so a top-of-range delete (every rename = delete+add — routine on the custom-kb replica's incremental git replay) lowered the ceiling and the next reopen handed those ids to unrelated content; `get_chunk(old_id)` returned the wrong file, no error. Fix: highest id ever assigned persists in a `meta` LMDB db (`id_hwm`), written in the same txn as the data; `next_id = max(live max_key + 1, mark + 1)` on every open. Deleted ids stay dead forever (`Ok(None)` safe miss). `clear()`/full rebuild wipes the mark with the data (new generation may restart at 0 — stale refs miss safely). Legacy stores without the mark behave as before until first insert; snapshot/restore carries the mark automatically. Tests: `reopen_after_top_of_range_delete_does_not_reuse_ids`, `reopen_after_full_delete_never_restarts_from_zero`, `clear_resets_the_id_generation`, `reopen_without_mark_falls_back_to_live_keys`, + boundary control `reopen_after_low_range_delete_keeps_remaining_ids_stable`. (The original repro asserting the OLD reassignment behaviour was superseded by these at merge time — see store.rs test comments.)
+- [x] **Severity note (resolved by both fixes):** silently resolving to the *wrong* file was worse than the empty-result footgun this repo hardened against — both routes to a confident wrong answer are closed; stale refs now fail as safe `Ok(None)` misses.
+- [ ] **Verification only (no longer a build gate):** the live two-cold-start comparison on the cloud peer (same custom-kb file's id across two wakes) remains useful to CONFIRM the production symptom is gone with the HWM fix deployed — run it after the next peer redeploy.
+- [ ] **Unrelated, low-severity, still open:** literal-mode (Tantivy) search's compact snippet for markdown chunks sometimes shows just the chunk's opening line (e.g. the YAML frontmatter `---` delimiter) instead of the actually-matched line (`src/mcp/mod.rs`, the `match_info.unwrap_or_else` fallback in the literal resolver), making a correctly-matched literal-mode result look like a false negative during triage. Independent of the chunk_id issues above.
 
 ### Historical context (for C1/C2 above)
 

@@ -3955,7 +3955,7 @@ impl CodesearchService {
                 }
             })
             .map(|r| SearchResultItem {
-                chunk_id: r.id,
+                chunk_id: Some(r.id),
                 path: r.path,
                 start_line: r.start_line,
                 end_line: r.end_line,
@@ -5619,7 +5619,7 @@ impl CodesearchService {
                         for r in neighbors {
                             if seen_ids.insert(r.id) {
                                 all_results.push(SearchResultItem {
-                                    chunk_id: r.id,
+                                    chunk_id: Some(r.id),
                                     path: r.path,
                                     start_line: r.start_line,
                                     end_line: r.end_line,
@@ -5676,7 +5676,7 @@ impl CodesearchService {
                         let items = neighbors
                             .into_iter()
                             .map(|r| SearchResultItem {
-                                chunk_id: r.id,
+                                chunk_id: Some(r.id),
                                 path: r.path,
                                 start_line: r.start_line,
                                 end_line: r.end_line,
@@ -6815,11 +6815,14 @@ fn parse_search_items_from_call_result(
             .filter_map(|v| serde_json::from_value::<SearchResultItem>(v.clone()).ok())
             .collect(),
         // Literal items lack `chunk_id`; map their `snippet` into `content` so
-        // the merged list renders uniformly.
+        // the merged list renders uniformly. The absent id stays `None` —
+        // fabricating `0` here once let callers build a bogus
+        // `<peer>/<alias>:0` chunk_ref that `get_chunk` silently resolved to
+        // an unrelated chunk.
         _ => results
             .iter()
             .map(|v| SearchResultItem {
-                chunk_id: v.get("chunk_id").and_then(|c| c.as_u64()).unwrap_or(0) as u32,
+                chunk_id: v.get("chunk_id").and_then(|c| c.as_u64()).map(|c| c as u32),
                 path: v
                     .get("path")
                     .and_then(|p| p.as_str())
@@ -6860,6 +6863,11 @@ fn parse_search_items_from_call_result(
 /// alias as a `project=` scope to disambiguate. Omitting it (the old
 /// `"<peer>:<id>"` shape) made every remote `get_chunk` fail with
 /// `ambiguous_chunk_id` whenever the peer hosted more than one project.
+///
+/// Literal hits carry no chunk id: both `chunk_id` and `chunk_ref` stay
+/// `None` (the fields are omitted from the rendered JSON). Never substitute
+/// a default here — a fabricated `chunk_id: 0` invites callers to hand-build
+/// a `"<peer>/<alias>:0"` ref that resolves to an unrelated chunk.
 fn convert_remote_item(
     peer_name: &str,
     remote_alias: &str,
@@ -6869,7 +6877,7 @@ fn convert_remote_item(
         .chunk_id
         .map(|id| format!("{peer_name}/{remote_alias}:{id}"));
     SearchResultItem {
-        chunk_id: item.chunk_id.unwrap_or(0),
+        chunk_id: item.chunk_id,
         path: item.path,
         start_line: item.start_line,
         end_line: item.end_line,
