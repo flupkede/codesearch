@@ -384,10 +384,46 @@ pub struct VectorStore {
     env: TrackedEnv,
     vectors: ArroyDatabase<Cosine>,
     chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
+    /// Persisted high-water mark of chunk ids ever handed out ("meta" DB,
+    /// key [`META_KEY_ID_HWM`]). `None` only in read-only mode on a legacy
+    /// store created before the mark existed.
+    ///
+    /// Without this, `next_id` is derived from `chunks.last()` on every open,
+    /// so deleting the chunks holding the highest ids lowers `max_key` and the
+    /// next reopen hands those ids to unrelated content — `get_chunk(old_id)`
+    /// then silently returns the wrong file. The mark never decreases on
+    /// delete; deleted ids stay dead forever (safe `Ok(None)` misses).
+    id_hwm_db: Option<Database<Str, SerdeBincode<u32>>>,
     next_id: u32,
     dimensions: usize,
     indexed: bool,
     pub map_size_mb: usize,
+}
+
+/// Key in the "meta" database holding the highest chunk id ever assigned.
+const META_KEY_ID_HWM: &str = "id_hwm";
+
+/// Derive `next_id` so ids are NEVER reused across reopens.
+///
+/// Takes the max of (highest live key + 1) and (persisted high-water mark + 1):
+/// - live keys alone regress when top-of-range chunks are deleted;
+/// - the mark alone is absent on legacy stores (falls back to live keys —
+///   pre-mark behaviour, unchanged until the first write persists the mark).
+///
+/// A full rebuild wipes the DB and the mark with it, which is correct: a new
+/// generation may restart at 0, and stale references then fail as `Ok(None)`
+/// (safe miss) instead of resolving to unrelated content.
+fn next_id_from(
+    chunks: &Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
+    hwm: Option<u32>,
+    txn: &heed::RoTxn,
+) -> Result<u32> {
+    let from_live = match chunks.last(txn)? {
+        Some((max_key, _)) => max_key + 1,
+        None => 0,
+    };
+    let from_mark = hwm.map(|h| h.saturating_add(1)).unwrap_or(0);
+    Ok(from_live.max(from_mark))
 }
 
 /// Lightweight chunk metadata used for file-outline style navigation.
@@ -451,14 +487,17 @@ impl VectorStore {
         let vectors: ArroyDatabase<Cosine> = env.create_database(&mut wtxn, Some("vectors"))?;
         let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
             env.create_database(&mut wtxn, Some("chunks"))?;
+        let id_hwm_db: Database<Str, SerdeBincode<u32>> =
+            env.create_database(&mut wtxn, Some("meta"))?;
 
-        // Get the next ID from the maximum existing key + 1
-        // Using len() is wrong after delete+insert cycles: deleted IDs create gaps
-        // so len() < max_key + 1, causing ID collisions on re-open
-        let next_id = match chunks.last(&wtxn)? {
-            Some((max_key, _)) => max_key + 1,
-            None => 0,
-        };
+        // Get the next ID from the maximum existing key + 1 and the persisted
+        // high-water mark, whichever is higher — see `next_id_from`. Using
+        // len() is wrong after delete+insert cycles: deleted IDs create gaps
+        // so len() < max_key + 1, causing ID collisions on re-open; using
+        // max_key alone is wrong after TOP-OF-RANGE deletes, which lower
+        // max_key and would hand those ids to unrelated new content.
+        let hwm: Option<u32> = id_hwm_db.get(&wtxn, META_KEY_ID_HWM)?;
+        let next_id = next_id_from(&chunks, hwm, &wtxn)?;
 
         wtxn.commit()?;
 
@@ -485,6 +524,7 @@ impl VectorStore {
             env,
             vectors,
             chunks,
+            id_hwm_db: Some(id_hwm_db),
             next_id,
             dimensions,
             indexed,
@@ -547,13 +587,20 @@ impl VectorStore {
         let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> = env
             .open_database(&rtxn, Some("chunks"))?
             .ok_or_else(|| anyhow::anyhow!("chunks database not found"))?;
+        // The mark DB may be absent on legacy stores (created before ids were
+        // made monotonic) — `None` then, and `next_id_from` falls back to the
+        // live-keys derivation. Read-only never inserts, so the mark is only
+        // informational here anyway.
+        let id_hwm_db: Option<Database<Str, SerdeBincode<u32>>> =
+            env.open_database(&rtxn, Some("meta"))?;
 
-        // Get the next ID from the maximum existing key + 1
-        // Using len() is wrong after delete+insert cycles: deleted IDs create gaps
-        let next_id = match chunks.last(&rtxn)? {
-            Some((max_key, _)) => max_key + 1,
-            None => 0,
+        // Get the next ID from the maximum existing key + 1 and the persisted
+        // high-water mark, whichever is higher — see `next_id_from`.
+        let hwm: Option<u32> = match &id_hwm_db {
+            Some(db) => db.get(&rtxn, META_KEY_ID_HWM)?,
+            None => None,
         };
+        let next_id = next_id_from(&chunks, hwm, &rtxn)?;
 
         // Check if database is already indexed
         let indexed = if next_id > 0 {
@@ -587,6 +634,7 @@ impl VectorStore {
             env,
             vectors,
             chunks,
+            id_hwm_db,
             next_id,
             dimensions,
             indexed,
@@ -685,6 +733,11 @@ impl VectorStore {
             self.chunks.put(&mut wtxn, &id, &metadata)?;
 
             self.next_id += 1;
+        }
+
+        // Same-transaction mark persist as in insert_chunks_with_ids_impl.
+        if let Some(db) = &self.id_hwm_db {
+            db.put(&mut wtxn, META_KEY_ID_HWM, &(self.next_id - 1))?;
         }
 
         wtxn.commit()?;
@@ -1032,6 +1085,15 @@ impl VectorStore {
             self.next_id += 1;
         }
 
+        // Persist the high-water mark in the SAME transaction as the data:
+        // if this txn aborts, neither the chunks nor the mark land, so the
+        // mark can never claim ids that were not actually assigned. On
+        // abort the in-memory next_id may have advanced past the persisted
+        // mark — that only wastes ids (gaps), it can never reuse one.
+        if let Some(db) = &self.id_hwm_db {
+            db.put(&mut wtxn, META_KEY_ID_HWM, &(self.next_id - 1))?;
+        }
+
         wtxn.commit()?;
         self.indexed = false;
 
@@ -1049,6 +1111,14 @@ impl VectorStore {
         // Clear both databases
         self.chunks.clear(&mut wtxn)?;
         self.vectors.clear(&mut wtxn)?;
+
+        // A deliberate wipe starts a new id generation: drop the high-water
+        // mark with the data so the counter may restart at 0. Stale references
+        // into the wiped generation then fail as `Ok(None)` (safe miss) —
+        // they can never resolve to the new generation's unrelated content.
+        if let Some(db) = &self.id_hwm_db {
+            db.delete(&mut wtxn, META_KEY_ID_HWM)?;
+        }
 
         wtxn.commit()?;
 
@@ -1567,5 +1637,200 @@ mod tests {
         let emb = store.get_embedding(0).unwrap();
         assert!(emb.is_some());
         assert_eq!(emb.unwrap().len(), 4);
+    }
+
+    /// Helper: a 1-chunk insert carrying a distinguishing path, returning the
+    /// id assigned to it.
+    fn insert_one(store: &mut VectorStore, path: &str) -> u32 {
+        let ids = store
+            .insert_chunks_with_ids(vec![EmbeddedChunk::new(
+                Chunk::new(
+                    format!("fn {path}() {{}}"),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )])
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        ids[0]
+    }
+
+    /// Deleting the chunks that hold the HIGHEST ids must not let a reopen
+    /// hand those ids to new content. Pre-mark behaviour recomputed
+    /// `next_id = max_key + 1` on every open, so the delete lowered max_key
+    /// and the next insert silently reused a dead id — `get_chunk(old_id)`
+    /// then returned the WRONG file with no error (the custom-kb
+    /// wrong-file-resolution defect class, todo #51).
+    #[test]
+    fn reopen_after_top_of_range_delete_does_not_reuse_ids() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("hwm-top.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
+        assert_eq!(insert_one(&mut store, "gen1/b.rs"), 1);
+
+        // Delete the top-of-range chunk (id 1) — lowers max_key to 0.
+        assert_eq!(store.delete_chunks(&[1]).unwrap(), 1);
+        drop(store);
+
+        // Reopen: next_id must come from the persisted high-water mark (1),
+        // NOT from the lowered max_key (0). The new chunk gets id 2.
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen2/c.rs"), 2);
+
+        // The deleted id stays dead: a safe miss, never unrelated content.
+        let stale = store.get_chunk(1).unwrap();
+        assert!(stale.is_none(), "deleted id 1 must stay dead");
+        // And it did not alias the new content either.
+        assert_eq!(store.get_chunk(2).unwrap().unwrap().path, "gen2/c.rs");
+    }
+
+    /// The sharpest variant: delete EVERYTHING. Live keys are then empty, so
+    /// the legacy derivation would restart at id 0 and hand it to unrelated
+    /// new content. The mark must keep the counter past every dead id.
+    /// (Custom-kb routinely hits delete+add via renames and repo rewrites.)
+    #[test]
+    fn reopen_after_full_delete_never_restarts_from_zero() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("hwm-full.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
+        assert_eq!(insert_one(&mut store, "gen1/b.rs"), 1);
+        assert_eq!(insert_one(&mut store, "gen1/c.rs"), 2);
+
+        assert_eq!(store.delete_chunks(&[0, 1, 2]).unwrap(), 3);
+        drop(store);
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen2/d.rs"), 3);
+        for dead in 0..3 {
+            assert!(
+                store.get_chunk(dead).unwrap().is_none(),
+                "deleted id {dead} must stay dead"
+            );
+        }
+    }
+
+    /// A deliberate `clear()` wipes the mark with the data: the next
+    /// generation may restart at 0, and old references miss safely.
+    #[test]
+    fn clear_resets_the_id_generation() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("hwm-clear.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
+        store.clear().unwrap();
+        drop(store);
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen2/b.rs"), 0);
+    }
+
+    /// Legacy-store compat: a store whose "meta" DB carries no mark (written
+    /// by pre-mark code) opens fine and derives next_id from live keys only —
+    /// behaviour is unchanged until the first write persists the mark.
+    #[test]
+    fn reopen_without_mark_falls_back_to_live_keys() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("hwm-legacy.db");
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(insert_one(&mut store, "gen1/a.rs"), 0);
+        assert_eq!(insert_one(&mut store, "gen1/b.rs"), 1);
+
+        // Simulate a legacy store: strip the mark, keep the data.
+        {
+            let mut wtxn = store.env.write_txn().unwrap();
+            store
+                .id_hwm_db
+                .as_ref()
+                .unwrap()
+                .delete(&mut wtxn, META_KEY_ID_HWM)
+                .unwrap();
+            wtxn.commit().unwrap();
+        }
+        drop(store);
+
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        // No mark, max_key = 1 → legacy derivation: next id is 2. (With the
+        // top chunk deleted this WOULD reuse id 1 — that is the documented,
+        // unchanged legacy risk for stores written before the mark existed.)
+        assert_eq!(insert_one(&mut store, "gen2/c.rs"), 2);
+    }
+
+    // === cross-generation chunk-id drift (mechanism repro → FIXED) ===
+    //
+    // History: ids were autoincrement (`next_id = max_key + 1` recomputed on
+    // every open), so deleting the chunks holding the HIGHEST ids lowered
+    // `max_key` and the next reopen handed those ids to unrelated content —
+    // `get_chunk(old_id)` returned the wrong file with no error. On the cloud
+    // peer every scale-to-zero wake replays custom-kb's incremental git
+    // history on a restored snapshot (delete + re-insert at the top of the
+    // range is routine there), which is why this mattered for chunk-id
+    // stability across cold starts. See develterf_dlwr/todo#51.
+    //
+    // The original repro on `fix/custom-kb-chunk-id-drift`
+    // (`reopen_after_top_of_range_delete_reassigns_ids_to_new_content`)
+    // asserted the OLD reassignment behaviour; it is superseded by the
+    // high-water-mark tests above (`reopen_after_top_of_range_delete_does_
+    // not_reuse_ids`, `reopen_after_full_delete_never_restarts_from_zero`)
+    // which pin the FIXED behaviour. The boundary control below is kept
+    // verbatim: low-range deletes were always safe and must stay safe.
+
+    fn drift_chunk(path: &str, content: &str, id: usize) -> EmbeddedChunk {
+        EmbeddedChunk::new(
+            Chunk::new(
+                content.to_string(),
+                id,
+                id,
+                ChunkKind::Other,
+                path.to_string(),
+            ),
+            vec![1.0, 0.0, 0.0, 0.0],
+        )
+    }
+
+    #[test]
+    fn reopen_after_low_range_delete_keeps_remaining_ids_stable() {
+        // Boundary control: deleting BELOW the top of the range leaves
+        // max_key untouched, so surviving ids stay stable across reopens and
+        // new inserts never collide with them. Under the high-water mark this
+        // holds trivially (the mark only ever raises next_id) — the test
+        // pins that the mark did not CHANGE this always-safe case.
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("drift-low.db");
+
+        {
+            let mut store = VectorStore::new(&db_path, 4).unwrap();
+            store
+                .insert_chunks_with_ids(vec![
+                    drift_chunk("a.md", "content A0", 0),
+                    drift_chunk("a.md", "content A1", 1),
+                    drift_chunk("b.md", "content B0", 2),
+                    drift_chunk("b.md", "content B1", 3),
+                ])
+                .unwrap();
+            // A (ids 0,1) deleted; B keeps the top of the range.
+            store.delete_chunks(&[0, 1]).unwrap();
+        }
+
+        let mut store2 = VectorStore::new(&db_path, 4).unwrap();
+        assert_eq!(store2.next_id, 4, "max_key (B's id 3) keeps next_id at 4");
+
+        // B's ids still resolve to B after the reopen.
+        let chunk = store2.get_chunk(2).unwrap().expect("id 2 must resolve");
+        assert_eq!(chunk.path, "b.md");
+
+        // New inserts start above the surviving range — no reuse.
+        let c_ids = store2
+            .insert_chunks_with_ids(vec![drift_chunk("c.md", "content C0", 0)])
+            .unwrap();
+        assert_eq!(c_ids, vec![4]);
     }
 }

@@ -38,7 +38,7 @@ use crate::constants::{
     ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV,
     CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
     DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_PATH,
-    HEALTHZ_PATH, HEALTH_PATH, LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS,
+    HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS,
     MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS,
     REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV,
     SERVE_PORT_ENV, STATUS_PATH,
@@ -2922,6 +2922,107 @@ async fn healthz_handler() -> AxumJson<serde_json::Value> {
     AxumJson(json!({ "status": "ok" }))
 }
 
+/// Query parameters for `GET /indexing`.
+#[derive(serde::Deserialize)]
+struct IndexingQuery {
+    /// Absolute filesystem path of the search target (file or directory).
+    path: String,
+}
+
+/// Response body for `GET /indexing`.
+///
+/// `covered=false` means the path is not inside any registered repo — the
+/// caller should treat that as "no freshness signal" and behave exactly as
+/// before this endpoint existed (backwards-compatible for older hooks).
+#[derive(serde::Serialize)]
+struct IndexingResponse {
+    covered: bool,
+    alias: Option<String>,
+    indexing: bool,
+}
+
+/// Component-boundary prefix match: does `target` lie inside `root`?
+///
+/// `/x/xy` must NOT match root `/x` — comparing components (not string
+/// prefixes) makes the boundary exact. On Windows the comparison is
+/// case-insensitive (`repos.json` may record a different case than the
+/// caller's path); on other platforms it is exact.
+fn path_contains(target: &Path, root: &Path) -> bool {
+    let t: Vec<_> = target.components().collect();
+    let r: Vec<_> = root.components().collect();
+    if r.len() > t.len() {
+        return false;
+    }
+    let eq = |a: &std::path::Component<'_>, b: &std::path::Component<'_>| {
+        if a == b {
+            return true;
+        }
+        if cfg!(windows) {
+            a.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+        } else {
+            false
+        }
+    };
+    r.iter().zip(t.iter()).all(|(a, b)| eq(a, b))
+}
+
+/// Resolve `target` to the registered repo that contains it.
+///
+/// Longest root wins, so nested registered repos (a repo inside another
+/// repo's tree) resolve to the inner one. Returns `None` for paths outside
+/// every registered repo (including relative paths — callers must pass
+/// absolute paths).
+fn containing_repo_alias(
+    repos: &std::collections::HashMap<String, PathBuf>,
+    target: &Path,
+) -> Option<String> {
+    repos
+        .iter()
+        .filter(|(_, root)| path_contains(target, root))
+        .max_by_key(|(_, root)| root.components().count())
+        .map(|(alias, _)| alias.clone())
+}
+
+impl ServeState {
+    /// Freshness for an absolute filesystem path: which registered repo
+    /// contains it (if any), and is that repo mid-reindex right now?
+    ///
+    /// The `is_indexing` side lazily evicts stale markers, so a leaked
+    /// indexing task cannot report "indexing" forever.
+    fn freshness_for_path(&self, target: &str) -> (Option<String>, bool) {
+        let config = match self.config.read() {
+            Ok(c) => c,
+            Err(_) => return (None, false),
+        };
+        match containing_repo_alias(&config.repos, Path::new(target)) {
+            Some(alias) => {
+                let indexing = self.is_indexing(&alias);
+                (Some(alias), indexing)
+            }
+            None => (None, false),
+        }
+    }
+}
+
+/// Indexing-freshness handler: GET /indexing?path=<absolute path>
+///
+/// Lets a caller distinguish "empty result because nothing matches" from
+/// "stale result because the index is mid-rebuild" — the exact distinction
+/// the grep-guard hook needs after a branch switch. See [`INDEXING_PATH`].
+async fn indexing_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+    axum::extract::Query(q): axum::extract::Query<IndexingQuery>,
+) -> AxumJson<IndexingResponse> {
+    let (alias, indexing) = state.freshness_for_path(&q.path);
+    AxumJson(IndexingResponse {
+        covered: alias.is_some(),
+        alias,
+        indexing,
+    })
+}
+
 /// Status handler: GET /status
 ///
 /// Returns a JSON snapshot of all repo states, active sessions, and CPU usage.
@@ -4869,6 +4970,10 @@ pub async fn run_serve(
         .route(HEALTH_PATH, axum::routing::get(health_handler))
         .route(HEALTHZ_PATH, axum::routing::get(healthz_handler))
         .route(STATUS_PATH, axum::routing::get(status_handler))
+        // Freshness probe for the grep-guard hook — same auth class as
+        // /status (localhost: open, network bind: bearer key). NOT in the
+        // always-unauthenticated set: /healthz stays the only one of those.
+        .route(INDEXING_PATH, axum::routing::get(indexing_handler))
         // /remotes is a status-like read-only observability endpoint (lists the
         // configured federation peers). It is NOT in require_admin_auth's
         // `is_management` set, so it inherits exactly the same auth policy as

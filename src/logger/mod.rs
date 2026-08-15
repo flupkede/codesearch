@@ -108,11 +108,21 @@ pub fn ensure_log_dir(log_dir: &Path) -> Result<()> {
 /// Try to extract a date from a daily-rotated log filename.
 ///
 /// tracing-appender DAILY rotation produces files named `<prefix>.YYYY-MM-DD`.
-/// Returns `None` if the filename doesn't match the expected pattern.
+/// Accepts both the CLI prefix (`codesearch.log.`) and the serve prefix
+/// (`serve.log.`) — a cleanup pass over the shared global log directory must
+/// retire both, which is exactly the gap that let 4 months of serve logs
+/// pile up (183 files / 299 MB) while the code defaulted to 5 files /
+/// 5 days. Returns `None` if the filename doesn't match either pattern.
 fn parse_log_date(file_name: &str) -> Option<NaiveDate> {
-    // Pattern: "codesearch.log.YYYY-MM-DD"
-    let suffix = file_name.strip_prefix(&format!("{}.", LOG_FILE_NAME))?;
-    NaiveDate::parse_from_str(suffix, "%Y-%m-%d").ok()
+    // Patterns: "codesearch.log.YYYY-MM-DD" / "serve.log.YYYY-MM-DD"
+    for prefix in [LOG_FILE_NAME, SERVE_LOG_FILE_NAME] {
+        if let Some(suffix) = file_name.strip_prefix(&format!("{}.", prefix)) {
+            if let Ok(date) = NaiveDate::parse_from_str(suffix, "%Y-%m-%d") {
+                return Some(date);
+            }
+        }
+    }
+    None
 }
 
 /// Remove old log files based on retention period and max file count.
@@ -211,6 +221,13 @@ pub fn init_logger(db_path: &Path, log_level: LogLevel, quiet: bool) -> Result<L
 
     let config = LogRotationConfig::from_env();
 
+    // Retire old logs before wiring the new appender. The cleanup used to run
+    // only in standalone-MCP mode, so CLI invocations against the global cache
+    // dir accumulated rotated files forever.
+    if let Err(e) = cleanup_old_logs(&log_dir, &config) {
+        tracing::debug!("Log cleanup skipped: {}", e);
+    }
+
     // Create file appender with DAILY rotation.
     // Produces files like: logs/codesearch.log.2026-02-09
     let file_appender = RollingFileAppender::new(Rotation::DAILY, &log_dir, LOG_FILE_NAME);
@@ -305,6 +322,14 @@ pub fn init_serve_logger(log_level: LogLevel, _quiet: bool) -> Result<LoggerInit
     ensure_log_dir(&log_dir)?;
 
     let config = LogRotationConfig::from_env();
+
+    // Retire old logs (both serve.* and codesearch.* prefixes) before wiring
+    // the new appender. This init is the only long-lived writer of the global
+    // log dir — without a cleanup here the directory grows forever, which is
+    // exactly what happened: serve had never called cleanup_old_logs at all.
+    if let Err(e) = cleanup_old_logs(&log_dir, &config) {
+        tracing::debug!("Log cleanup skipped: {}", e);
+    }
 
     // Separate file name so serve logs don't mix with per-repo MCP client logs.
     let file_appender = RollingFileAppender::new(Rotation::DAILY, &log_dir, SERVE_LOG_FILE_NAME);

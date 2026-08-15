@@ -316,17 +316,92 @@ impl ReposConfig {
     }
 
     pub fn save(&self) -> Result<()> {
+        // Under cargo test, writing the REAL global repos.json is always a
+        // bug: every test must point CODESEARCH_REPOS_CONFIG at a temp file
+        // before anything on the save path runs. This guard exists because
+        // its absence once let a mis-ordered test seed overwrite a
+        // developer's entire registry (17 repos, groups, remotes — all of
+        // it) with a one-entry fixture, recovered only from serve logs.
+        #[cfg(test)]
+        {
+            let override_set = std::env::var(crate::constants::REPOS_CONFIG_ENV)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            let escape = std::env::var("CODESEARCH_TEST_ALLOW_GLOBAL_SAVE").is_ok();
+            if !override_set && !escape {
+                panic!(
+                    "ReposConfig::save() under cargo test would write the real global \
+                     repos.json. Set CODESEARCH_REPOS_CONFIG to a temp path first (or set \
+                     CODESEARCH_TEST_ALLOW_GLOBAL_SAVE if this is genuinely intended)."
+                );
+            }
+        }
         let path = Self::path()?;
         self.save_to(&path)
     }
 
     /// Save to an explicit path (useful in tests).
+    ///
+    /// Hardened after a real incident (see `save`'s test guard): the
+    /// previous plain `fs::write` was neither atomic nor recoverable.
+    /// This now (1) keeps one generation of the previous file as
+    /// `<path>.bak` — best-effort, a failed backup never blocks the save —
+    /// and (2) writes to a sibling temp file and renames it into place
+    /// with a bounded retry for transient Windows handle races (AV /
+    /// search indexer), mirroring `vectordb::store::atomic_write_json`.
     pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, serde_json::to_string_pretty(self)?)?;
-        Ok(())
+
+        // (1) One-generation backup, best-effort.
+        if path.exists() {
+            let mut bak = path.as_os_str().to_os_string();
+            bak.push(".bak");
+            let _ = fs::copy(path, std::path::PathBuf::from(bak));
+        }
+
+        // (2) Atomic replace: temp file + rename over the target.
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".new");
+        let tmp_path = std::path::PathBuf::from(tmp);
+        let data = serde_json::to_string_pretty(self)?;
+        let write_result = (|| -> std::io::Result<()> {
+            let mut f = fs::File::create(&tmp_path)?;
+            f.write_all(data.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+
+        for attempt in 0..5 {
+            match fs::rename(&tmp_path, path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let transient = e
+                        .raw_os_error()
+                        .is_some_and(|raw| matches!(raw, 5 | 32 | 33))
+                        || {
+                            let msg = e.to_string();
+                            msg.contains("being used")
+                                || msg.contains("is in use")
+                                || msg.contains("Access is denied")
+                        };
+                    if transient && attempt < 4 {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(e.into());
+                }
+            }
+        }
+        unreachable!("retry loop always returns")
     }
 
     /// Return the path to the repos config file.

@@ -18,6 +18,8 @@ pub mod rerank;
 pub mod search;
 pub mod serve;
 pub mod symbols;
+#[cfg(test)]
+pub mod testing;
 pub mod utils;
 pub mod vectordb;
 pub mod watch;

@@ -1,6 +1,6 @@
 # AGENTS.md — codesearch
 
-_Last updated: 2026-08-05_
+_Last updated: 2026-08-14_
 
 ## Current state
 
@@ -29,25 +29,17 @@ Release narratives live in `CHANGELOG.md`; this list keeps only the load-bearing
 
 Single source of truth for outstanding codesearch work.
 
-### Cloud / infra — needs decision before pickup
+### Federation / custom-kb — literal-mode `chunk_id: 0` fabrication + cross-generation chunk-id drift (BOTH FIXED)
 
-- [ ] **C1: Automate the manual `codesearch-indexer` trigger** — currently `triggerType: "Manual"`; every rebuild today is a human running `az containerapp job start` by hand. The 2026-07-04 batching fix (see "Historical context" below) means large batches can no longer crash anything, but staleness is still only resolved manually. Options, not yet decided (needs vendor content update-cadence info):
-  - **Schedule trigger** on the existing job (`az containerapp job update --trigger-type Schedule --cron-expression "..."`) — no new Azure resources, just a cron cadence.
-  - **Event-driven** (Event Grid on the blob source triggering job start) — more precise, needs a new Event Grid subscription + small trigger function/Logic App.
-  - The single-app redesign (C2) remains a separate, bigger follow-up.
-- [ ] **C2: Single-app collapse redesign** (collapse indexer job + serve into one scalable app) — proposed design ready:
-  1. `az containerapp update -n codesearch-serve --cpu 2.0 --memory 4Gi` — new revision, cold start (restore last snapshot, sync corpus, start incremental reindex in-process).
-  2. Poll `GET /status` every ~10-15s (timeout e.g. 15 min) until **all repos report `"status": "warm"`** — replaces the fragile in-process `indexing`-flag/120s-timeout detection in `entrypoint.sh` that caused the 2026-07-04 crash.
-  3. Once warm, trigger a snapshot upload (existing `upload_snapshot` logic).
-  4. `az containerapp update -n codesearch-serve --cpu 1.0 --memory 2Gi` — new revision, cold start, restore-only.
+**Symptom (reproduced 2026-08-14):** `search(project="cloud/custom-kb", mode="literal")` for a term found in a file's frontmatter tags returned `chunk_id: 0` for `custom-kb/troubleshoot/classification-importer-namepath-built-from-a-mutable-displayname-causes-duplica.md`. A separate `get_chunk(chunk_ref="cloud/custom-kb:0")` call built from that displayed id returned the **wrong file** — content from `custom-kb/troubleshoot/retro-prod-scan-fix-of-stuck-no-watermark-released-assets-1-5-17-6-cheap-waterma.md` — with no error and no ambiguity warning. A `mode="semantic"` search of the same original file independently returned a self-consistent global id range (321-328) that `get_chunk` resolved correctly.
 
-  **Why the blob round-trip is unavoidable:** LMDB (mmap-based) is not safe on network-mounted volumes (Azure Files/NFS — mmap needs local POSIX byte-range locking a network share can't reliably provide). The index must live on local ephemeral disk, and ephemeral disk does not survive a Container Apps revision change (any `--cpu`/`--memory` update triggers one) — hence some durable handoff (blob snapshot) is structurally required.
+- [x] **Primary fix — SHIPPED (merged to develop via PR #201):** `LiteralSearchResultItem`/`RemoteSearchItem.chunk_id` had no real id for literal hits; both flatten sites did `.unwrap_or(0)`, rendering an *absent* id as a real-looking `chunk_id: 0`. A caller hand-building `chunk_ref "peer:0"` from that got whatever unrelated file held slot 0 — confident, wrong, zero signal. Literal results now keep `chunk_id` `Option`al/omitted (`src/mcp/types.rs`), so no bogus ref can be constructed.
+- [x] **Secondary fix — SHIPPED (merged to develop via PR #201): monotone chunk-id allocation (persistent id high-water mark).** The unit repro on `fix/custom-kb-chunk-id-drift` confirmed the mechanism: `next_id = max_key + 1` recomputed on EVERY open, so a top-of-range delete (every rename = delete+add — routine on the custom-kb replica's incremental git replay) lowered the ceiling and the next reopen handed those ids to unrelated content; `get_chunk(old_id)` returned the wrong file, no error. Fix: highest id ever assigned persists in a `meta` LMDB db (`id_hwm`), written in the same txn as the data; `next_id = max(live max_key + 1, mark + 1)` on every open. Deleted ids stay dead forever (`Ok(None)` safe miss). `clear()`/full rebuild wipes the mark with the data (new generation may restart at 0 — stale refs miss safely). Legacy stores without the mark behave as before until first insert; snapshot/restore carries the mark automatically. Tests: `reopen_after_top_of_range_delete_does_not_reuse_ids`, `reopen_after_full_delete_never_restarts_from_zero`, `clear_resets_the_id_generation`, `reopen_without_mark_falls_back_to_live_keys`, + boundary control `reopen_after_low_range_delete_keeps_remaining_ids_stable`. (The original repro asserting the OLD reassignment behaviour was superseded by these at merge time — see store.rs test comments.)
+- [x] **Severity note (resolved by both fixes):** silently resolving to the *wrong* file was worse than the empty-result footgun this repo hardened against — both routes to a confident wrong answer are closed; stale refs now fail as safe `Ok(None)` misses.
+- [ ] **Verification only (no longer a build gate):** the live two-cold-start comparison on the cloud peer (same custom-kb file's id across two wakes) remains useful to CONFIRM the production symptom is gone with the HWM fix deployed — run it after the next peer redeploy.
+- [ ] **Unrelated, low-severity, still open:** literal-mode (Tantivy) search's compact snippet for markdown chunks sometimes shows just the chunk's opening line (e.g. the YAML frontmatter `---` delimiter) instead of the actually-matched line (`src/mcp/mod.rs`, the `match_info.unwrap_or_else` fallback in the literal resolver), making a correctly-matched literal-mode result look like a false negative during triage. Independent of the chunk_id issues above.
 
-  **Scoped first step shipped (2026-07-08):** incremental reindex in-process on serve is live — but *only* for the small **custom-kb** repo (`docker/entrypoint.sh`'s serve-mode KB pull loop fires `POST /repos/custom-kb/reindex` whenever `git pull` moves `HEAD`). Safe on the 1-2 GiB replica because incremental refresh is memory-bounded. The heavy DOCS corpus deliberately stays job-only.
-
-  **Still open:** retire `codesearch-indexer` entirely or keep for DR; scheduled script vs Logic App vs wrapper CLI command (`codesearch cloud rebuild --remote <peer>`?).
-
-### Historical context (for C1/C2 above)
+### Historical context (load-bearing — why the indexer-job split looks the way it does)
 
 **Fixed — incremental-refresh OOM crash-loop (2026-07-04):** `IndexManager::perform_incremental_refresh_with_stores` (`src/index/manager.rs`) used to chunk + embed the ENTIRE changed-file delta in one unbounded in-memory `Vec` before writing anything to the stores. A normal incremental delta was harmless; a vendor sync dropping thousands of files at once OOM'd the 1 vCPU/2 GiB `codesearch-serve` container, which then crash-looped. Fixed by batching: `changed_files.chunks(batch_size)` processed sequentially (chunk+embed+insert+commit per batch, single `build_index()` at the end), bounding peak memory to O(batch) regardless of delta size. Batch size defaults to `INCREMENTAL_REFRESH_BATCH_SIZE = 200` (`src/constants.rs`), override via `CODESEARCH_INCREMENTAL_BATCH_SIZE`. No test for the multi-batch path itself (existing `manager.rs` tests avoid real embedding, same reasoning as the gated `csharp_helper_integration` test) — verify end-to-end on a real large corpus if in doubt.
 
@@ -64,6 +56,7 @@ This repo uses a **`develop`-based** gitflow. The GitHub default branch is `mast
 - **`master`** only receives release merges from `develop` (cut at release time).
 - **Merge style = merge commits** (`--merge`), not squash. Repo history is full of `Merge pull request #N`.
 - **Review requirement** is enforced by a repo ruleset (not branch protection). As repo owner, override with `gh pr merge <n> --merge --admin --delete-branch`.
+- **CHANGELOG.md is CI-checked on every PR into `develop`** (`.github/workflows/changelog-check.yml`) — added after several PRs (#193, #196/#197) landed with no entry and nobody could later tell which bugs a given release actually fixed. It's a visible check (red X + annotation on `gh pr checks <n>`), not a hard block: the same `--admin` override that bypasses the review-requirement ruleset also bypasses a required status check, so this doesn't add real enforcement on top of that pattern — it makes skipping the changelog a *visible, deliberate* choice instead of silence. Add an entry under the current pending-version heading (see the convention comment at the top of `CHANGELOG.md`), or label the PR `no-changelog` for genuinely user-invisible changes (pure CI/tooling/docs-only churn).
 - Before creating a PR, **verify the base**: `gh pr view <n> --json baseRefName`. If it says `master`, retarget: `gh pr edit <n> --base develop`.
 
 Common mistake: a subagent runs `/git pr create` with no explicit `--base`, the tooling picks `master` (GitHub default), and the PR lands against the wrong branch. Always specify `--base develop`.
@@ -79,6 +72,7 @@ Common mistake: a subagent runs `/git pr create` with no explicit `--base`, the 
 - **Build:** `target/release/` — outside repo (via `CARGO_TARGET_DIR`). `build.ps1` self-heals `core.bare=false` before invoking cargo — this checkout is a bare+working-tree hybrid whose `core.bare` intermittently resets to `true` (VS Code's git integration rewrites `.git/config` on ref changes), which makes cargo abort with `did not expect repo to be bare`. No need to flip it manually before building; `build.ps1` does it.
 - **Deploy:** `..\copy-to-common.ps1` — builds + copies both binaries to `~/.local/bin/`. A running `codesearch.exe` is file-locked on Windows; stop serve before deploying.
 - **Tests live in sibling `_tests.rs` files**, not in embedded `#[cfg(test)]` blocks inside `mod.rs` (mcp/serve/search/cache/db_discovery follow this). Prefer table-driven tests over near-duplicate per-case fns.
+- **Tests that mutate process-global env vars must be `#[serial]` (serial_test) and set them via `crate::testing::EnvRestore`** — cargo test runs all tests as parallel threads of one process, so an unserialised `set_var` races every reader of that var (doctor's `find_best_database` reads `CODESEARCH_REPOS_CONFIG` on paths that raced `remove_order_tests` writes until this rule existed). The guard restores previous values on drop, including on panic. To keep serve-delegation paths hermetic, point `CODESEARCH_SERVE_PORT` at a reset-server (see `spawn_reset_server` in `index/mod.rs`'s `remove_order_tests`) — never let a test's delegation probe reach a real serve.
 - **Canonical paths:** NEVER call `.canonicalize()` directly. Always use `safe_canonicalize()`.
 - **Windows transient file errors:** `fs::rename` (and friends) can fail with raw OS errors 5/32/33 (ACCESS_DENIED/SHARING_VIOLATION/LOCK_VIOLATION) purely from an AV/Search-Indexer handle race — not a real conflict. Classify with `is_transient_rename_error()` / `ServeState::is_db_locked_error` and wrap in a bounded retry (see `atomic_write_json`, the FTS commit retry in `fts/tantivy_store.rs`). Never retry non-transient errors.
 - **LMDB rule:** No two `EnvOpenOptions::open()` on same dir in same process. All access via `get_or_open_stores()` → `Arc<SharedStores>`.
