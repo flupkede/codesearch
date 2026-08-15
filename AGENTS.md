@@ -29,24 +29,6 @@ Release narratives live in `CHANGELOG.md`; this list keeps only the load-bearing
 
 Single source of truth for outstanding codesearch work.
 
-### Cloud / infra — needs decision before pickup
-
-- [ ] **C1: Automate the manual `codesearch-indexer` trigger** — currently `triggerType: "Manual"`; every rebuild today is a human running `az containerapp job start` by hand. The 2026-07-04 batching fix (see "Historical context" below) means large batches can no longer crash anything, but staleness is still only resolved manually. Options, not yet decided (needs vendor content update-cadence info):
-  - **Schedule trigger** on the existing job (`az containerapp job update --trigger-type Schedule --cron-expression "..."`) — no new Azure resources, just a cron cadence.
-  - **Event-driven** (Event Grid on the blob source triggering job start) — more precise, needs a new Event Grid subscription + small trigger function/Logic App.
-  - The single-app redesign (C2) remains a separate, bigger follow-up.
-- [ ] **C2: Single-app collapse redesign** (collapse indexer job + serve into one scalable app) — proposed design ready:
-  1. `az containerapp update -n codesearch-serve --cpu 2.0 --memory 4Gi` — new revision, cold start (restore last snapshot, sync corpus, start incremental reindex in-process).
-  2. Poll `GET /status` every ~10-15s (timeout e.g. 15 min) until **all repos report `"status": "warm"`** — replaces the fragile in-process `indexing`-flag/120s-timeout detection in `entrypoint.sh` that caused the 2026-07-04 crash.
-  3. Once warm, trigger a snapshot upload (existing `upload_snapshot` logic).
-  4. `az containerapp update -n codesearch-serve --cpu 1.0 --memory 2Gi` — new revision, cold start, restore-only.
-
-  **Why the blob round-trip is unavoidable:** LMDB (mmap-based) is not safe on network-mounted volumes (Azure Files/NFS — mmap needs local POSIX byte-range locking a network share can't reliably provide). The index must live on local ephemeral disk, and ephemeral disk does not survive a Container Apps revision change (any `--cpu`/`--memory` update triggers one) — hence some durable handoff (blob snapshot) is structurally required.
-
-  **Scoped first step shipped (2026-07-08):** incremental reindex in-process on serve is live — but *only* for the small **custom-kb** repo (`docker/entrypoint.sh`'s serve-mode KB pull loop fires `POST /repos/custom-kb/reindex` whenever `git pull` moves `HEAD`). Safe on the 1-2 GiB replica because incremental refresh is memory-bounded. The heavy DOCS corpus deliberately stays job-only.
-
-  **Still open:** retire `codesearch-indexer` entirely or keep for DR; scheduled script vs Logic App vs wrapper CLI command (`codesearch cloud rebuild --remote <peer>`?).
-
 ### Federation / custom-kb — literal-mode `chunk_id: 0` fabrication + cross-generation chunk-id drift (BOTH FIXED)
 
 **Symptom (reproduced 2026-08-14):** `search(project="cloud/custom-kb", mode="literal")` for a term found in a file's frontmatter tags returned `chunk_id: 0` for `custom-kb/troubleshoot/classification-importer-namepath-built-from-a-mutable-displayname-causes-duplica.md`. A separate `get_chunk(chunk_ref="cloud/custom-kb:0")` call built from that displayed id returned the **wrong file** — content from `custom-kb/troubleshoot/retro-prod-scan-fix-of-stuck-no-watermark-released-assets-1-5-17-6-cheap-waterma.md` — with no error and no ambiguity warning. A `mode="semantic"` search of the same original file independently returned a self-consistent global id range (321-328) that `get_chunk` resolved correctly.
@@ -57,7 +39,7 @@ Single source of truth for outstanding codesearch work.
 - [ ] **Verification only (no longer a build gate):** the live two-cold-start comparison on the cloud peer (same custom-kb file's id across two wakes) remains useful to CONFIRM the production symptom is gone with the HWM fix deployed — run it after the next peer redeploy.
 - [ ] **Unrelated, low-severity, still open:** literal-mode (Tantivy) search's compact snippet for markdown chunks sometimes shows just the chunk's opening line (e.g. the YAML frontmatter `---` delimiter) instead of the actually-matched line (`src/mcp/mod.rs`, the `match_info.unwrap_or_else` fallback in the literal resolver), making a correctly-matched literal-mode result look like a false negative during triage. Independent of the chunk_id issues above.
 
-### Historical context (for C1/C2 above)
+### Historical context (load-bearing — why the indexer-job split looks the way it does)
 
 **Fixed — incremental-refresh OOM crash-loop (2026-07-04):** `IndexManager::perform_incremental_refresh_with_stores` (`src/index/manager.rs`) used to chunk + embed the ENTIRE changed-file delta in one unbounded in-memory `Vec` before writing anything to the stores. A normal incremental delta was harmless; a vendor sync dropping thousands of files at once OOM'd the 1 vCPU/2 GiB `codesearch-serve` container, which then crash-looped. Fixed by batching: `changed_files.chunks(batch_size)` processed sequentially (chunk+embed+insert+commit per batch, single `build_index()` at the end), bounding peak memory to O(batch) regardless of delta size. Batch size defaults to `INCREMENTAL_REFRESH_BATCH_SIZE = 200` (`src/constants.rs`), override via `CODESEARCH_INCREMENTAL_BATCH_SIZE`. No test for the multi-batch path itself (existing `manager.rs` tests avoid real embedding, same reasoning as the gated `csharp_helper_integration` test) — verify end-to-end on a real large corpus if in doubt.
 
