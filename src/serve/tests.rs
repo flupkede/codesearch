@@ -1946,3 +1946,124 @@ async fn indexing_route_answers_json() {
     assert_eq!(body["covered"], serde_json::json!(false));
     assert_eq!(body["indexing"], serde_json::json!(false));
 }
+
+// ===========================================================================
+// `codesearch index rm` → running serve: end-to-end delegation (todo #48 L2)
+// ===========================================================================
+
+/// The full Layer-2 acceptance path: a running serve instance holds the
+/// repo's registration; `remove_from_index` (the CLI code path) must
+/// DELEGATE to it (health probe → DELETE /repos/:alias), serve must stop
+/// holders and delete the DB directory WITHOUT being stopped, repos.json
+/// must lose the entry, and a later query for the alias must be a clean
+/// "Unknown alias" (no zombie stores) — all without stopping serve.
+///
+/// Hermetic per the repo env-var rule: `#[serial]` + `EnvRestore` pins
+/// `CODESEARCH_REPOS_CONFIG` (temp repos.json shared by CLI and serve) and
+/// `CODESEARCH_SERVE_PORT` (the spawned test serve), so the delegation
+/// probe can never reach a developer's real serve or registry.
+#[tokio::test]
+#[serial_test::serial]
+async fn index_rm_delegates_to_running_serve_end_to_end() {
+    use crate::testing::EnvRestore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let raw_proj = tmp.path().join("e2eproj");
+    std::fs::create_dir(&raw_proj).unwrap();
+    let proj = crate::cache::safe_canonicalize(&raw_proj).unwrap();
+    // A real (empty) DB directory — stand-in for the LMDB dir; deleting it
+    // exercises the same remove_dir_all path without opening a real env.
+    std::fs::create_dir(proj.join(".codesearch.db")).unwrap();
+
+    // Env vars FIRST, then seed repos.json (same ordering trap the
+    // remove_order_tests document: saving before the override writes the
+    // developer's real registry).
+    let cfg_path = tmp.path().join("repos.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // NOTE: local_addr() is a SocketAddr — take .port() or the env var and
+    // URLs below silently become "127.0.0.1:127.0.0.1:<port>" and the port
+    // parse falls back to the DEFAULT port (39725), pointing the delegation
+    // at a developer's REAL serve. Exactly the failure this test hunted down.
+    let port = listener.local_addr().unwrap().port();
+    // SERVE_HOST_ENV too: `try_delegate_rm_to_serve` resolves the host via
+    // `resolve_serve_host()` — without pinning it to loopback, a machine with
+    // CODESEARCH_SERVE_HOST set (or a future default change) sends the probe
+    // somewhere else entirely.
+    let _env = EnvRestore::set(&[
+        (
+            crate::constants::REPOS_CONFIG_ENV,
+            &cfg_path.to_string_lossy(),
+        ),
+        (crate::constants::SERVE_PORT_ENV, port.to_string().as_str()),
+        (crate::constants::SERVE_HOST_ENV, "127.0.0.1"),
+    ]);
+    let mut cfg = ReposConfig::default();
+    cfg.register(proj.clone());
+    // Capture the alias the registration derived (directory-name based) so
+    // the post-removal probe below addresses exactly what was registered.
+    let alias = cfg
+        .repos
+        .iter()
+        .find(|(_, p)| *p == &proj)
+        .map(|(a, _)| a.clone())
+        .expect("seeded config must contain the proj");
+    cfg.save().expect("seed repos.json save must succeed");
+    assert!(
+        cfg_path.exists(),
+        "seed repos.json must land in the temp path, not the global default"
+    );
+
+    // A running serve instance sharing the SAME repos.json. Routes are the
+    // two the CLI delegation touches: GET /health and the real
+    // remove_repo_handler (DELETE /repos/:alias).
+    let state = Arc::new(ServeState::new(cfg, Some(cfg_path.clone())));
+    let app = axum::Router::new()
+        .route(
+            crate::constants::HEALTH_PATH,
+            axum::routing::get(health_handler),
+        )
+        .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
+        .with_state(state.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    // Bounded readiness wait (same pattern as federation's spawn_test_server).
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The CLI path — must delegate (serve is reachable) and succeed.
+    crate::index::remove_from_index(Some(proj.clone()), false)
+        .await
+        .expect("delegated index rm must succeed");
+
+    // DB directory gone WITHOUT stopping serve.
+    assert!(
+        !proj.join(".codesearch.db").exists(),
+        "serve must delete the DB dir during delegation — no serve stop needed"
+    );
+    // repos.json (the shared temp file) lost the entry.
+    let after = ReposConfig::load().expect("repos.json reload after rm");
+    assert!(
+        !after.repos.values().any(|p| p == &proj),
+        "entry must be unregistered from repos.json, still has: {:?}",
+        after.repos.values().collect::<Vec<_>>()
+    );
+
+    // Later queries for the alias: a clean "Unknown alias", not a zombie
+    // store resurrecting the repo (todo #48 L2 acceptance criterion 3).
+    let err = state
+        .remove_repo(&alias)
+        .await
+        .expect_err("removing an unregistered alias must fail");
+    assert!(
+        err.to_string().contains("Unknown alias"),
+        "expected a clean Unknown-alias error, got: {err:#}"
+    );
+}
