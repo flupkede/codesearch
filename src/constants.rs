@@ -508,6 +508,31 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
 
+/// Total number of attempts (initial request + retries) the federation client
+/// makes against a remote peer that answers with a transient HTTP status
+/// (502/503/504). Federated peers commonly run on scale-to-zero hosts (Azure
+/// Container Apps): the first request after an idle period can hit a cold
+/// start and surface as a 503 even though the peer is perfectly healthy. A
+/// short bounded retry inside the active tool call absorbs most cold starts
+/// before the caller ever sees them. This is NOT a poll: retries only happen
+/// while a user-initiated tool call is already in flight against that peer
+/// (the "never contact a federated peer on a cadence" rule in AGENTS.md is
+/// about timers, and stays intact).
+pub const REMOTE_PEER_RETRY_ATTEMPTS: u32 = 3;
+
+/// Backoff (milliseconds) between federation retry attempts, one entry per
+/// retry (so `REMOTE_PEER_RETRY_ATTEMPTS - 1` entries; the last entry is
+/// reused if there are ever more retries than entries). Short by design —
+/// the retry exists to catch a peer that is already warming, not to outwait
+/// a long deployment. If the peer is still transient-failing after the last
+/// attempt, the error message tells the caller to retry the same call in
+/// ~30s instead of blocking the tool call longer.
+pub const REMOTE_PEER_RETRY_BACKOFF_MS: &[u64] = &[3000, 8000];
+
+/// Environment variable overriding every federation retry backoff with a
+/// single millisecond value (test hook so retry tests don't sleep for real).
+pub const REMOTE_PEER_RETRY_BACKOFF_ENV: &str = "CODESEARCH_REMOTE_RETRY_BACKOFF_MS";
+
 /// Cooperative join window (seconds) for `await_index_task` and
 /// `await_fsw_shutdown`: how long a background indexing / file-watcher task
 /// is given to observe its `CancellationToken` and exit on its own before it

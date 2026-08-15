@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.2.14] (unreleased)
+
+### Fixed
+
+- **A scale-to-zero cold start on a federated peer surfaced as a raw, undiagnosable error instead of a retry (todo #58).** `get_chunk`/`search` against a remote peer that answered 503 (non-JSON body — an Azure Container App waking from idle) failed immediately with `remote /chunk returned non-JSON body (http=503 Service Unavailable)`, giving the caller no way to tell a transient cold start apart from a broken mirror. Observed consequence: an agent abandoned a verification that was one retry away from succeeding, and read "503" as "mirror down" — pushing toward fallbacks that cannot work. Both federation read paths now retry transient statuses (502/503/504) a bounded number of times (3 attempts, 3s/8s backoff — [`REMOTE_PEER_RETRY_ATTEMPTS`] in `src/constants.rs`, test-overridable via `CODESEARCH_REMOTE_RETRY_BACKOFF_MS`) inside the already-active tool call, which is not a poll: the "never contact a federated peer on a cadence" design constraint is untouched. Most cold starts never reach the caller. If the peer is still transient-failing after the retries, the message names the likely cause and the remedy (`remote /chunk did not respond in time (http=503 after 2 retries) — likely a cold start on a scale-to-zero host; retry the same call in ~30s`) so "temporarily unavailable" stays distinguishable from "misconfigured/auth failed". Non-transient statuses (4xx, the peer's own 5xx tool errors) are NOT retried — a real answer fails identically on retry, just slower. Transport errors are not retried either (the per-request timeout already spent the budget). Four tests pin it: 503→200 get_chunk succeeds after exactly 3 attempts, persistent 503 carries the cold-start hint + retry count and stops at the configured attempts, a 500 is answered after exactly 1 request (no retry), and search gets the same treatment (it shared the identical pre-fix code shape).
+
 ## [1.2.13] (unreleased)
 
 ### Added
