@@ -2890,7 +2890,8 @@ mod remove_order_tests {
         let now = global_config_canary();
         assert_eq!(
             before, now,
-            "the developer's global repos.json changed during the test —              a save bypassed the CODESEARCH_REPOS_CONFIG override"
+            "the developer's global repos.json changed during the test — \
+             a save bypassed the CODESEARCH_REPOS_CONFIG override"
         );
     }
 

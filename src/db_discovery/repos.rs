@@ -330,7 +330,9 @@ impl ReposConfig {
             let escape = std::env::var("CODESEARCH_TEST_ALLOW_GLOBAL_SAVE").is_ok();
             if !override_set && !escape {
                 panic!(
-                    "ReposConfig::save() under cargo test would write the real global                      repos.json. Set CODESEARCH_REPOS_CONFIG to a temp path first (or set                      CODESEARCH_TEST_ALLOW_GLOBAL_SAVE if this is genuinely intended)."
+                    "ReposConfig::save() under cargo test would write the real global \
+                     repos.json. Set CODESEARCH_REPOS_CONFIG to a temp path first (or set \
+                     CODESEARCH_TEST_ALLOW_GLOBAL_SAVE if this is genuinely intended)."
                 );
             }
         }
