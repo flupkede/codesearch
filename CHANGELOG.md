@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.2.15] (unreleased)
+
+### Fixed
+
+- **`index rm` against a running serve: the Layer-2 acceptance path is now pinned end-to-end (todo #48).** The server-side unload flow (FSW stop → await shutdown → unregister → lock-class retry delete) and the CLI's serve delegation existed, but nothing exercised the *composition*: CLI `remove_from_index` → health probe → `DELETE /repos/:alias` → serve deletes the DB directory **without being stopped** → entry gone from repos.json → later queries a clean "Unknown alias" (no zombie stores). A new serial, hermetic integration test in `src/serve/tests.rs` drives exactly that: it spawns a real axum router with the genuine `remove_repo_handler` and `health_handler` over a `ServeState` seeded from a temp `repos.json`, points `CODESEARCH_REPOS_CONFIG`/`CODESEARCH_SERVE_PORT`/`CODESEARCH_SERVE_HOST` at it (`EnvRestore`), runs the actual CLI code path, and asserts the DB dir is deleted, the registration is gone, and a second removal fails with "Unknown alias". Mutation-verified: disabling the delegation makes the test fail on the zombie-store assertion. Getting the port right exposed a subtle trap now documented in the test: `TcpListener::local_addr()` returns a `SocketAddr` — binding the *address* instead of `.port()` silently produces `127.0.0.1:127.0.0.1:<port>` URLs and a port-parse fallback to the default 39725, which pointed the delegation at the developer's REAL serve (the test's isolation guard is exactly what caught it).
+
 ## [1.2.14] (unreleased)
 
 ### Fixed
