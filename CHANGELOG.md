@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.3.2]
+
+### Fixed
+
+- **`index rm` against a running serve no longer claims "DB deleted" when serve could not delete the files (todo #48).** The delegation path (`remove_from_index` → `DELETE /repos/:alias`) checked only the HTTP status: serve's handler deliberately answers 200 with `db_deleted: false` (`removed_db_locked`) when the repo is functionally removed but a transient `Arc<SharedStores>` holder outlasted the lock-class retry delete — the exact honest-reporting contract BUG2 established on the serve side. The CLI flattened that to plain success and printed "DB deleted." for files that were still on disk. `try_delegate_rm_to_serve` now parses the response payload and returns a `ServeRemoval` (alias, path, `db_deleted`, `db_delete_error`); on the locked outcome the CLI prints a warning naming the leftover directory and the reason plus the recovery (re-run the same command — with the alias gone from repos.json the next run skips delegation and finishes via the local file-delete path) instead of a false success line. The outcome stays `Ok` deliberately: serve has already unregistered the alias, so the Layer-1 "repos.json was NOT modified" error text would be false here. Regression test pins the IPC boundary: a 200/`removed_db_locked` mock serve must surface `db_deleted == false` plus the carried reason (mutation-verified). The `remove_order_tests` helper now also pins `CODESEARCH_SERVE_HOST` to loopback — the delegation resolves its probe host from that var, so a stray value could send a test's DELETE somewhere other than the listener it bound.
+
 ## [1.3.0] - 2026-08-15
 
 ### Added
