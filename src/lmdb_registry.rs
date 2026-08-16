@@ -110,6 +110,36 @@ pub fn is_open(path: &Path) -> bool {
     }
 }
 
+/// Descriptions of every live [`TrackedEnv`] whose canonical path is `path`
+/// itself or lives UNDER it (component-wise prefix, so `base/foo` does not
+/// match `base/foobar`). An empty `Vec` means no in-process holder keeps any
+/// LMDB env open anywhere in that subtree.
+///
+/// This is the single source of truth for "can this DB directory be deleted
+/// by this process right now": it sees through every holder shape — an outer
+/// `Arc<SharedStores>` clone held by an in-flight search, an inner
+/// `Arc<RwLock<VectorStore>>` captured by a `spawn_blocking` embed pass, a
+/// `SCIP(...)` env in a `scip/` subdirectory — because all of them keep their
+/// `TrackedEnv` (and therefore its registry slot) alive. `remove_repo` waits
+/// on this before retrying a locked delete.
+///
+/// A path that cannot be canonicalized (e.g. already deleted) reports no
+/// holders — the safe "nothing left to wait for" answer.
+pub fn open_holders_under(path: &Path) -> Vec<String> {
+    let canonical = match safe_canonicalize(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    match LMDB_REGISTRY.get() {
+        Some(registry) => registry
+            .iter()
+            .filter(|entry| entry.key().starts_with(&canonical))
+            .map(|entry| entry.value().description.clone())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 // ── TrackedEnv wrapper ──────────────────────────────────────────
 
 /// Wrapper around [`heed::Env`] that prevents double-open panics.
