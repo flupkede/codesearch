@@ -1888,8 +1888,14 @@ async fn indexing_route_answers_json() {
     // Route + handler wiring: a GET with a covered path returns our JSON
     // (never axum's empty 404), with the covered/indexing fields present.
     let tmp = tempfile::tempdir().unwrap();
-    let repo_path = tmp.path().join("hooked");
-    std::fs::create_dir(&repo_path).unwrap();
+    let raw_repo = tmp.path().join("hooked");
+    std::fs::create_dir(&raw_repo).unwrap();
+    // CANONICALIZE (same trap as remove_order_tests' make_proj): on the
+    // Windows CI runner the temp root sits under an 8.3 short name
+    // (RUNNER~1) that only canonicalize resolves, and register canonicalizes
+    // before storing — querying with the raw path made covered=false there
+    // (green locally, red on CI).
+    let repo_path = crate::cache::safe_canonicalize(&raw_repo).unwrap();
 
     let mut config = ReposConfig::default();
     config
