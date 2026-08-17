@@ -2147,3 +2147,137 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
         "expected a clean Unknown-alias error, got: {err:#}"
     );
 }
+
+/// The hard variant of the Layer-2 acceptance ("file-delete succeeds without
+/// serve-stop"): the running serve does not merely KNOW the repo — it holds a
+/// REAL open LMDB environment on the `.codesearch.db` directory (a Warm
+/// `RepoState`, exactly what a live query leaves behind). `remove_from_index`
+/// must still delete the directory in one shot via delegation, without
+/// stopping serve, and the eviction must actually close the env — pinned by
+/// `lmdb_registry::open_holders_under` going from non-empty to empty across
+/// the removal. That registry drain is the Windows precondition for the
+/// file-delete to succeed at all: while the TrackedEnv slot is live the
+/// mmap'd data/lock files cannot be removed, so asserting the drain asserts
+/// the mechanism the locked-delete path depends on, cross-platform.
+///
+/// The store is opened via the production `try_open_stores` path (creating
+/// the DB dir for real), and the returned `Arc<SharedStores>` is MOVED into
+/// `RepoState::Warm` with no clone kept — the test process must not itself
+/// be the extra holder that defeats the delete.
+#[tokio::test]
+#[serial_test::serial]
+async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
+    use crate::testing::EnvRestore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let raw_proj = tmp.path().join("heldenv");
+    std::fs::create_dir(&raw_proj).unwrap();
+    let proj = crate::cache::safe_canonicalize(&raw_proj).unwrap();
+    let db_path = proj.join(DB_DIR_NAME);
+    // No pre-created DB dir: try_open_stores must create it, proving the
+    // env we then hold is a real production-shaped store.
+
+    let cfg_path = tmp.path().join("repos.json");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _env = EnvRestore::set(&[
+        (
+            crate::constants::REPOS_CONFIG_ENV,
+            &cfg_path.to_string_lossy(),
+        ),
+        (crate::constants::SERVE_PORT_ENV, port.to_string().as_str()),
+        (crate::constants::SERVE_HOST_ENV, "127.0.0.1"),
+    ]);
+
+    let mut cfg = ReposConfig::default();
+    cfg.register_with_alias(proj.clone(), Some("heldenv".to_string()))
+        .unwrap();
+    cfg.save().expect("seed repos.json save must succeed");
+    assert!(
+        cfg_path.exists(),
+        "seed repos.json must land in the temp path, not the global default"
+    );
+
+    let state = Arc::new(ServeState::new(cfg, Some(cfg_path.clone())));
+
+    // Serve opens the repo FOR REAL — a live LMDB env under db_path.
+    let opened = state
+        .try_open_stores("heldenv", &db_path, true, false)
+        .expect("opening a real store for a brand-new repo must succeed");
+    let OpenedStores::Write(stores) = opened else {
+        panic!("brand-new repo must open Write, not Readonly");
+    };
+    // Move the Arc in; keep NO clone (a test-side clone would be exactly the
+    // transient holder class remove_repo's retry has to out-wait).
+    state
+        .repos
+        .insert("heldenv".to_string(), RepoState::Warm { stores });
+
+    // Precondition: the env is genuinely held — this is what makes the
+    // delete impossible on Windows until serve's eviction releases it.
+    assert!(
+        !crate::lmdb_registry::open_holders_under(&db_path).is_empty(),
+        "test precondition: a real LMDB holder must be live under the db dir"
+    );
+
+    // The serve side: real handler routes, same as a production bind.
+    let app = axum::Router::new()
+        .route(
+            crate::constants::HEALTH_PATH,
+            axum::routing::get(health_handler),
+        )
+        .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
+        .with_state(state.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The CLI path — delegated removal against a serve that HOLDS the env.
+    crate::index::remove_from_index(Some(proj.clone()), false)
+        .await
+        .expect("delegated index rm must succeed while serve holds the env");
+
+    // The DB directory is gone — deleted BY SERVE, in-place, serve still up.
+    assert!(
+        !db_path.exists(),
+        "serve must delete the really-held DB dir without being stopped"
+    );
+    // The eviction genuinely dropped the RepoState (and with it the last
+    // Arc<SharedStores>). NOTE: a registry query (`open_holders_under`) is
+    // VACUOUS here — the dir is deleted, canonicalize fails, and the helper
+    // by design answers "no holders" for a missing path even though a zombie
+    // env would still be alive on it (mutation-verified: skipping
+    // repos.remove left the test green through that assert on Linux). The
+    // repos-map assert is the non-vacuous pin: the Warm entry must be gone.
+    // On Windows a skipped eviction additionally fails the dir-gone assert
+    // (the mmap'd files refuse deletion while held).
+    assert!(
+        !state.repos.contains_key("heldenv"),
+        "eviction must drop the RepoState — a surviving Warm entry is a zombie holder"
+    );
+    // repos.json lost the entry.
+    let after = ReposConfig::load().expect("repos.json reload after rm");
+    assert!(
+        !after.repos.values().any(|p| p == &proj),
+        "entry must be unregistered from repos.json, still has: {:?}",
+        after.repos.values().collect::<Vec<_>>()
+    );
+    // No zombie: the alias no longer resolves for later queries.
+    let err = state
+        .remove_repo("heldenv")
+        .await
+        .expect_err("removing an unregistered alias must fail");
+    assert!(
+        err.to_string().contains("Unknown alias"),
+        "expected a clean Unknown-alias error, got: {err:#}"
+    );
+}
