@@ -2031,45 +2031,39 @@ async fn indexing_route_answers_json() {
 // `codesearch index rm` → running serve: end-to-end delegation (todo #48 L2)
 // ===========================================================================
 
-/// The full Layer-2 acceptance path: a running serve instance holds the
-/// repo's registration; `remove_from_index` (the CLI code path) must
-/// DELEGATE to it (health probe → DELETE /repos/:alias), serve must stop
-/// holders and delete the DB directory WITHOUT being stopped, repos.json
-/// must lose the entry, and a later query for the alias must be a clean
-/// "Unknown alias" (no zombie stores) — all without stopping serve.
+/// Shared envelope for the Layer-2 e2e tests below: pin the delegation env
+/// vars to a fresh temp repos.json, seed it via `seed`, spawn a REAL serve
+/// (the two routes the CLI `index rm` delegation touches: `GET /health` and
+/// the real `remove_repo_handler` at `DELETE /repos/:alias`) sharing that
+/// config, and wait (bounded, panicking on timeout) for it to accept.
 ///
-/// Hermetic per the repo env-var rule: `#[serial]` + `EnvRestore` pins
-/// `CODESEARCH_REPOS_CONFIG` (temp repos.json shared by CLI and serve) and
-/// `CODESEARCH_SERVE_PORT` (the spawned test serve), so the delegation
-/// probe can never reach a developer's real serve or registry.
-#[tokio::test]
-#[serial_test::serial]
-async fn index_rm_delegates_to_running_serve_end_to_end() {
-    use crate::testing::EnvRestore;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let raw_proj = tmp.path().join("e2eproj");
-    std::fs::create_dir(&raw_proj).unwrap();
-    let proj = crate::cache::safe_canonicalize(&raw_proj).unwrap();
-    // A real (empty) DB directory — stand-in for the LMDB dir; deleting it
-    // exercises the same remove_dir_all path without opening a real env.
-    std::fs::create_dir(proj.join(".codesearch.db")).unwrap();
-
-    // Env vars FIRST, then seed repos.json (same ordering trap the
-    // remove_order_tests document: saving before the override writes the
-    // developer's real registry).
-    let cfg_path = tmp.path().join("repos.json");
+/// Every step here is trap-sensitive, which is why it is a helper and not
+/// copy-paste: env vars must be pinned BEFORE `cfg.save()` or the seed lands
+/// in the developer's REAL registry; the port must come from
+/// `listener.local_addr().port()` (never the SocketAddr — its Display form
+/// makes the env var unparseable, the port silently falls back to the
+/// DEFAULT 39725, and the delegation fires a live DELETE at a developer's
+/// running serve); `SERVE_HOST_ENV` must be pinned to loopback or a stray
+/// machine-level value sends the probe elsewhere entirely.
+///
+/// Returns `(state, port, env_guard)`. The caller MUST keep the
+/// [`crate::testing::EnvRestore`] guard bound for the whole test — dropping
+/// it (e.g. letting a helper-internal guard die) unpins the vars before the
+/// delegation runs. This is why the guard is returned rather than held here.
+/// The helper lives in this module rather than `src/testing.rs` because the
+/// handlers it routes are private to `serve`.
+async fn spawn_rm_delegation_test_serve<F>(
+    tmp: &std::path::Path,
+    seed: F,
+) -> (Arc<ServeState>, u16, crate::testing::EnvRestore)
+where
+    F: FnOnce(&mut ReposConfig),
+{
+    let cfg_path = tmp.join("repos.json");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    // NOTE: local_addr() is a SocketAddr — take .port() or the env var and
-    // URLs below silently become "127.0.0.1:127.0.0.1:<port>" and the port
-    // parse falls back to the DEFAULT port (39725), pointing the delegation
-    // at a developer's REAL serve. Exactly the failure this test hunted down.
     let port = listener.local_addr().unwrap().port();
-    // SERVE_HOST_ENV too: `try_delegate_rm_to_serve` resolves the host via
-    // `resolve_serve_host()` — without pinning it to loopback, a machine with
-    // CODESEARCH_SERVE_HOST set (or a future default change) sends the probe
-    // somewhere else entirely.
-    let _env = EnvRestore::set(&[
+    // Env vars FIRST, then seed repos.json (ordering trap: see doc above).
+    let env = crate::testing::EnvRestore::set(&[
         (
             crate::constants::REPOS_CONFIG_ENV,
             &cfg_path.to_string_lossy(),
@@ -2078,24 +2072,13 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
         (crate::constants::SERVE_HOST_ENV, "127.0.0.1"),
     ]);
     let mut cfg = ReposConfig::default();
-    cfg.register(proj.clone());
-    // Capture the alias the registration derived (directory-name based) so
-    // the post-removal probe below addresses exactly what was registered.
-    let alias = cfg
-        .repos
-        .iter()
-        .find(|(_, p)| *p == &proj)
-        .map(|(a, _)| a.clone())
-        .expect("seeded config must contain the proj");
+    seed(&mut cfg);
     cfg.save().expect("seed repos.json save must succeed");
     assert!(
         cfg_path.exists(),
         "seed repos.json must land in the temp path, not the global default"
     );
 
-    // A running serve instance sharing the SAME repos.json. Routes are the
-    // two the CLI delegation touches: GET /health and the real
-    // remove_repo_handler (DELETE /repos/:alias).
     let state = Arc::new(ServeState::new(cfg, Some(cfg_path.clone())));
     let app = axum::Router::new()
         .route(
@@ -2107,16 +2090,53 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Bounded readiness wait (same pattern as federation's spawn_test_server).
+    // Bounded readiness wait that FAILS LOUDLY on timeout (a silent exit
+    // here surfaces downstream as an unrelated delegation failure).
+    let mut ready = false;
     for _ in 0..200 {
         if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .is_ok()
         {
+            ready = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    assert!(ready, "test serve never became ready on port {port}");
+    (state, port, env)
+}
+
+/// The full Layer-2 acceptance path: a running serve instance holds the
+/// repo's registration; `remove_from_index` (the CLI code path) must
+/// DELEGATE to it (health probe → DELETE /repos/:alias), serve must stop
+/// holders and delete the DB directory WITHOUT being stopped, repos.json
+/// must lose the entry, and a later query for the alias must be a clean
+/// "Unknown alias" (no zombie stores) — all without stopping serve.
+#[tokio::test]
+#[serial_test::serial]
+async fn index_rm_delegates_to_running_serve_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let raw_proj = tmp.path().join("e2eproj");
+    std::fs::create_dir(&raw_proj).unwrap();
+    let proj = crate::cache::safe_canonicalize(&raw_proj).unwrap();
+    // A real (empty) DB directory — stand-in for the LMDB dir; deleting it
+    // exercises the same remove_dir_all path without opening a real env.
+    std::fs::create_dir(proj.join(".codesearch.db")).unwrap();
+
+    let (state, _port, _env) = spawn_rm_delegation_test_serve(tmp.path(), |cfg| {
+        cfg.register(proj.clone());
+    })
+    .await;
+    // Capture the alias the registration derived (directory-name based) so
+    // the post-removal probe below addresses exactly what was registered.
+    let alias = ReposConfig::load()
+        .expect("seeded repos.json reload")
+        .repos
+        .iter()
+        .find(|(_, p)| **p == proj)
+        .map(|(a, _)| a.clone())
+        .expect("seeded config must contain the proj");
 
     // The CLI path — must delegate (serve is reachable) and succeed.
     crate::index::remove_from_index(Some(proj.clone()), false)
@@ -2153,12 +2173,12 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
 /// REAL open LMDB environment on the `.codesearch.db` directory (a Warm
 /// `RepoState`, exactly what a live query leaves behind). `remove_from_index`
 /// must still delete the directory in one shot via delegation, without
-/// stopping serve, and the eviction must actually close the env — pinned by
-/// `lmdb_registry::open_holders_under` going from non-empty to empty across
-/// the removal. That registry drain is the Windows precondition for the
-/// file-delete to succeed at all: while the TrackedEnv slot is live the
-/// mmap'd data/lock files cannot be removed, so asserting the drain asserts
-/// the mechanism the locked-delete path depends on, cross-platform.
+/// stopping serve. The eviction is pinned from both sides: the registry
+/// provably held a live env BEFORE the removal (precondition assert), and the
+/// repos-map entry is gone AFTER it — while a holder is live the mmap'd
+/// data/lock files cannot be deleted on Windows, so the dir-gone assert and
+/// the eviction assert together prove the mechanism the locked-delete path
+/// depends on, cross-platform.
 ///
 /// The store is opened via the production `try_open_stores` path (creating
 /// the DB dir for real), and the returned `Arc<SharedStores>` is MOVED into
@@ -2167,8 +2187,6 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
 #[tokio::test]
 #[serial_test::serial]
 async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
-    use crate::testing::EnvRestore;
-
     let tmp = tempfile::tempdir().unwrap();
     let raw_proj = tmp.path().join("heldenv");
     std::fs::create_dir(&raw_proj).unwrap();
@@ -2177,28 +2195,11 @@ async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
     // No pre-created DB dir: try_open_stores must create it, proving the
     // env we then hold is a real production-shaped store.
 
-    let cfg_path = tmp.path().join("repos.json");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let _env = EnvRestore::set(&[
-        (
-            crate::constants::REPOS_CONFIG_ENV,
-            &cfg_path.to_string_lossy(),
-        ),
-        (crate::constants::SERVE_PORT_ENV, port.to_string().as_str()),
-        (crate::constants::SERVE_HOST_ENV, "127.0.0.1"),
-    ]);
-
-    let mut cfg = ReposConfig::default();
-    cfg.register_with_alias(proj.clone(), Some("heldenv".to_string()))
-        .unwrap();
-    cfg.save().expect("seed repos.json save must succeed");
-    assert!(
-        cfg_path.exists(),
-        "seed repos.json must land in the temp path, not the global default"
-    );
-
-    let state = Arc::new(ServeState::new(cfg, Some(cfg_path.clone())));
+    let (state, _port, _env) = spawn_rm_delegation_test_serve(tmp.path(), |cfg| {
+        cfg.register_with_alias(proj.clone(), Some("heldenv".to_string()))
+            .expect("seed registration must succeed");
+    })
+    .await;
 
     // Serve opens the repo FOR REAL — a live LMDB env under db_path.
     let opened = state
@@ -2219,27 +2220,6 @@ async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
         !crate::lmdb_registry::open_holders_under(&db_path).is_empty(),
         "test precondition: a real LMDB holder must be live under the db dir"
     );
-
-    // The serve side: real handler routes, same as a production bind.
-    let app = axum::Router::new()
-        .route(
-            crate::constants::HEALTH_PATH,
-            axum::routing::get(health_handler),
-        )
-        .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
-        .with_state(state.clone());
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    for _ in 0..200 {
-        if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
 
     // The CLI path — delegated removal against a serve that HOLDS the env.
     crate::index::remove_from_index(Some(proj.clone()), false)
