@@ -13,8 +13,11 @@
 #
 # The target repo is resolved from the GREP TARGET itself (its own git root),
 # never from the hook's cwd — absolute paths into a different repo resolve
-# against THAT repo (#54). When the target repo is covered and LIVE but
-# MID-REINDEX (branch-switch full refresh, #55), the deny is a WAIT-AND-RETRY
+# against THAT repo (#54, and see the #199 note below: POSIX absolute paths
+# used to slip through this very test). Coverage is decided by REGISTRATION
+# with the local serve hub (repos.json), not by a .codesearch.db directory
+# (#199). When the target repo is covered and LIVE but MID-REINDEX
+# (branch-switch full refresh, #55), the deny is a WAIT-AND-RETRY
 # instruction instead: searching a mid-rebuild index returns stale/empty
 # results and must not degrade into a manual grep approval on every checkout.
 #
@@ -30,6 +33,68 @@ tool=$(echo "$raw" | jq -r '.tool_name // empty')
 
 path=$(echo "$raw" | jq -r '.tool_input.path // empty')
 
+# --- begin coverage helpers (repos.json registration, #199) ---------------
+
+# repos.json location — mirrors src/db_discovery/repos.rs `config_path()`:
+# CODESEARCH_REPOS_CONFIG override > ~/.codesearch/repos.json.
+repos_config_file() {
+    if [ -n "${CODESEARCH_REPOS_CONFIG:-}" ]; then
+        printf '%s' "$CODESEARCH_REPOS_CONFIG"
+    else
+        printf '%s' "${HOME:-}/.codesearch/repos.json"
+    fi
+}
+
+# Normalize one path for comparison: drop a Windows extended-length prefix
+# (\\?\ — exactly 4 chars), unify backslashes to forward slashes (Git-Bash
+# reports C:/x/y while repos.json records "C:\\x\\y"), and trim trailing
+# separators. Registration canonicalizes paths before writing them
+# (safe_canonicalize), so after this both sides agree byte-for-byte on
+# POSIX and component-wise on Windows.
+norm_repo_path() {
+    local p="$1"
+    case "$p" in
+        '\\?\'*) p="${p:4}" ;;
+    esac
+    p="${p//\\//}"
+    while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do
+        p="${p%/}"
+    done
+    printf '%s' "$p"
+}
+
+# Path equality: exact on POSIX, case-insensitive for Windows drive-letter
+# paths (NTFS is case-insensitive throughout) — mirrors the serve hub's own
+# /indexing resolver, which folds case on Windows only.
+repo_path_eq() {
+    local a b
+    a="$(norm_repo_path "$1")"
+    b="$(norm_repo_path "$2")"
+    case "$a" in [A-Za-z]:/*) a="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')" ;; esac
+    case "$b" in [A-Za-z]:/*) b="$(printf '%s' "$b" | tr '[:upper:]' '[:lower:]')" ;; esac
+    [ "$a" = "$b" ]
+}
+
+# Is the target's git root one of the repos registered with the local serve
+# hub? Fails OPEN on any resolver problem (missing/unreadable/malformed
+# repos.json, missing jq): a guard that cannot resolve coverage must allow,
+# never deny.
+target_registered() {
+    local root="$1" cfg reg
+    cfg="$(repos_config_file)"
+    [ -n "$cfg" ] || return 1
+    [ -r "$cfg" ] || return 1
+    while IFS= read -r reg; do
+        [ -n "$reg" ] || continue
+        if repo_path_eq "$reg" "$root"; then
+            return 0
+        fi
+    done < <(jq -r '(.repos // {}) | to_entries[] | .value | tostring' "$cfg" 2>/dev/null)
+    return 1
+}
+
+# --- end coverage helpers ----------------------------------------------------
+
 # ------------------------------------------------------------------
 # 1+2. Resolve the TARGET repo (the repo this Grep is aimed at) and check
 #      codesearch coverage THERE — never in the hook's cwd.
@@ -42,18 +107,41 @@ path=$(echo "$raw" | jq -r '.tool_input.path // empty')
 # relative to it by definition), absolute paths resolve against the git
 # root of the path itself.
 #
-# Coverage signal: a local .codesearch.db at the TARGET repo's root (a
-# running serve hub alone is NOT a signal — it covers many repos and being
-# alive says nothing about this one), or the explicit CODESEARCH_SERVER
-# opt-in for pure remote-serve setups.
+# History (#199): the #54 rewrite still mis-binned POSIX absolute paths
+# (/home/..., /tmp/...): its absolute-detection pattern only matched
+# Windows-style roots (C:\, C:/, MSYS /c/, UNC //server), so a POSIX
+# absolute target fell into the relative branch and resolved against the
+# hook's cwd — with a session cwd that is not itself a git repo (a parent
+# directory holding several repos) the target resolved to NOTHING, looked
+# external, and the guard silently allowed every grep. `/*` now covers
+# every absolute path.
+#
+# Coverage signal (#199): the target's git root is REGISTERED with the
+# local serve hub (~/.codesearch/repos.json — the same registration list
+# the hub itself resolves queries by). A `.codesearch.db` directory at
+# the git root was only ever a proxy for that and is wrong in both
+# directions: a stale db from a since-unregistered repo denied Grep while
+# the hub could not actually answer for it (unknown alias), and a
+# registered repo whose db directory was gone slipped through uncovered.
+# Matching the git ROOT (never a path prefix) also carves out nested
+# repos for free: an unregistered clone nested inside a registered repo
+# resolves to its OWN git root, equals no registration, and is correctly
+# treated as uncovered. The explicit CODESEARCH_SERVER opt-in stays for
+# pure remote-serve setups with no local repos.json (#199 tracks that it
+# is a URL override rather than a coverage signal — to be reworked
+# separately).
 # ------------------------------------------------------------------
 target_root=""
 norm="${path%/}"
 norm="${norm%\\}"
 case "$norm" in
-    [A-Za-z]:[\\/]*|/[a-zA-Z]/*|//*)
-        # Absolute path: find the git root OF THE TARGET (may be a different
-        # repo than the cwd one — that is the whole point of #54).
+    [A-Za-z]:[\\/]*|/*)
+        # Absolute path (Windows drive root, or any POSIX/UNC root): find
+        # the git root OF THE TARGET (may be a different repo than the cwd
+        # one — that is the whole point of #54). `/*` matches every POSIX
+        # absolute path; the old `/[a-zA-Z]/*` alternative only matched
+        # MSYS single-letter drive roots and left /home/... /tmp/...
+        # targets cwd-anchored (#199).
         probe="$norm"
         [ -f "$probe" ] && probe="$(dirname "$probe")"
         target_root=$(git -C "$probe" rev-parse --show-toplevel 2>/dev/null || true)
@@ -68,7 +156,7 @@ esac
 [ -z "$target_root" ] && exit 0
 
 codesearch_covers=false
-if [ -d "$target_root/.codesearch.db" ]; then
+if target_registered "$target_root"; then
     codesearch_covers=true
 elif [ -n "${CODESEARCH_SERVER:-}" ]; then
     codesearch_covers=true
@@ -194,8 +282,9 @@ error, you MUST pass project="<repo-alias>" (single repo) or group="<group>"
 available_groups — pick from that list (the alias may differ from the folder
 name).
 
-Grep is always allowed for targets outside any git repo, and for repos
-codesearch does not cover (no local index, no CODESEARCH_SERVER).
+Grep is always allowed for targets outside any git repo, for repos that are
+not registered with the codesearch serve hub (repos.json), and for pure
+remote-serve setups opted in via CODESEARCH_SERVER.
 EOF
 )
 
