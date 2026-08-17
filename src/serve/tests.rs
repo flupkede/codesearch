@@ -305,7 +305,10 @@ fn is_db_locked_error_classifies_lock_and_non_lock_errors() {
 /// Open a real registered LMDB env at `path` — the same holder shape
 /// `remove_repo`'s lock-class retry waits on (a live `TrackedEnv` keeps the
 /// mmap file handles on Windows and its registry slot everywhere).
-fn open_test_lmdb_env(path: &std::path::Path, description: &str) -> crate::lmdb_registry::TrackedEnv {
+fn open_test_lmdb_env(
+    path: &std::path::Path,
+    description: &str,
+) -> crate::lmdb_registry::TrackedEnv {
     let mut opts = heed::EnvOpenOptions::new();
     opts.map_size(1024 * 1024).max_dbs(1);
     unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };

@@ -1444,8 +1444,7 @@ impl ServeState {
                                 holders.len(),
                                 holders
                             );
-                            let remaining =
-                                Self::await_lmdb_release(&db_path, deadline).await;
+                            let remaining = Self::await_lmdb_release(&db_path, deadline).await;
                             if remaining.is_empty() {
                                 tracing::debug!(
                                     "DB delete for '{}': in-process holders released; \
@@ -1666,10 +1665,7 @@ impl ServeState {
     /// `Arc<RwLock<VectorStore>>` captured by a `spawn_blocking` embed pass, a
     /// `SCIP(...)` env in a `scip/` subdirectory — keeps its `TrackedEnv`
     /// (and therefore its registry slot) alive until it is truly dropped.
-    async fn await_lmdb_release(
-        db_path: &Path,
-        deadline: std::time::Instant,
-    ) -> Vec<String> {
+    async fn await_lmdb_release(db_path: &Path, deadline: std::time::Instant) -> Vec<String> {
         loop {
             let holders = crate::lmdb_registry::open_holders_under(db_path);
             if holders.is_empty() || std::time::Instant::now() >= deadline {

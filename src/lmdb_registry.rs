@@ -243,6 +243,10 @@ mod tests {
     fn make_opts_sized(map_size: usize) -> heed::EnvOpenOptions {
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(map_size).max_dbs(1);
+        // Every test open carries the baseline flags per the AGENTS.md rule
+        // ("open every env with BASE_ENV_FLAGS") so new tests cannot drift
+        // from production open options.
+        unsafe { opts.flags(BASE_ENV_FLAGS) };
         opts
     }
 
@@ -322,15 +326,11 @@ mod tests {
         std::fs::create_dir_all(db_dir.join("scip")).unwrap();
         let opts = make_opts();
 
-        let _env_db = unsafe {
-            TrackedEnv::open(&opts, &db_dir, "SharedStores(proj)").unwrap()
-        };
-        let _env_scip = unsafe {
-            TrackedEnv::open(&opts, &db_dir.join("scip"), "SCIP(proj)").unwrap()
-        };
+        let _env_db = unsafe { TrackedEnv::open(&opts, &db_dir, "SharedStores(proj)").unwrap() };
+        let _env_scip =
+            unsafe { TrackedEnv::open(&opts, &db_dir.join("scip"), "SCIP(proj)").unwrap() };
 
-        let holders =
-            open_holders_under(&tmp.path().join("proj").join(".codesearch.db"));
+        let holders = open_holders_under(&tmp.path().join("proj").join(".codesearch.db"));
         assert_eq!(
             holders.len(),
             2,
@@ -370,8 +370,7 @@ mod tests {
         let opts = make_opts();
 
         {
-            let _env =
-                unsafe { TrackedEnv::open(&opts, dir.path(), "transient-search").unwrap() };
+            let _env = unsafe { TrackedEnv::open(&opts, dir.path(), "transient-search").unwrap() };
             assert!(
                 !open_holders_under(dir.path()).is_empty(),
                 "holder must be visible while the env is live"
