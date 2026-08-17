@@ -565,12 +565,16 @@ pub const DB_DELETE_RETRY_BACKOFF_CAP_MS: u64 = 2000;
 /// an actually-unlocked directory instead of burning attempts blind.
 pub const DB_DELETE_ENV_RELEASE_POLL_MS: u64 = 100;
 
-/// Extra allowance (seconds) on the CLI's delegated `DELETE /repos/:alias`
-/// request beyond serve's own `DB_DELETE_RETRY_BUDGET_SECS`, so the CLI
-/// receives serve's honest locked-DB outcome (`db_deleted` / payload) instead
-/// of its own request timeout firing first. The shared delegation client's
-/// 3 s total timeout is fine for the `/health` probe but far shorter than a
-/// legitimate slow removal (warmup cancellation + env-release wait + retries).
+/// Unallocated margin (seconds) the CLI's delegated `DELETE /repos/:alias`
+/// request adds on top of serve's legitimate worst-case removal time —
+/// `DB_DELETE_RETRY_BUDGET_SECS` plus one `BG_TASK_COOPERATIVE_TIMEOUT_SECS`
+/// per cooperative join (FSW task + index task) — so the CLI receives
+/// serve's honest locked-DB outcome (`db_deleted` / payload) instead of its
+/// own request timeout firing first. The shared delegation client's 3 s
+/// total timeout is fine for the `/health` probe but far shorter than a
+/// legitimate slow removal (warmup cancellation + env-release wait +
+/// retries); `try_delegate_rm_to_serve` builds the DELETE its own client
+/// sized from these constants.
 pub const RM_DELEGATE_DELETE_MARGIN_SECS: u64 = 10;
 
 /// Default embedding dimensions used when metadata is missing or unreadable.
