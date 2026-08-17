@@ -1419,9 +1419,51 @@ impl ServeState {
                             alias,
                             msg
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        backoff_ms =
-                            (backoff_ms * 2).min(crate::constants::DB_DELETE_RETRY_BACKOFF_CAP_MS);
+                        // A lock-class failure with the holders still IN THIS
+                        // PROCESS is the common transient case (an in-flight
+                        // search holding an `Arc<SharedStores>` clone, a
+                        // `spawn_blocking` embed pass). Blind backoff burns
+                        // attempts against a directory that cannot possibly
+                        // delete yet; instead wait on the registry — the single
+                        // source of truth for "can this process delete the dir
+                        // right now" — until every in-process env under the DB
+                        // dir is released, then retry immediately. Only when
+                        // the registry is ALREADY empty (the holder is
+                        // external: another process, AV scanner) fall back to
+                        // the exponential backoff above.
+                        let holders = crate::lmdb_registry::open_holders_under(&db_path);
+                        if holders.is_empty() {
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                            backoff_ms = (backoff_ms * 2)
+                                .min(crate::constants::DB_DELETE_RETRY_BACKOFF_CAP_MS);
+                        } else {
+                            tracing::debug!(
+                                "DB delete for '{}': waiting for {} in-process LMDB holder(s) \
+                                 to release: {:?}",
+                                alias,
+                                holders.len(),
+                                holders
+                            );
+                            let remaining =
+                                Self::await_lmdb_release(&db_path, deadline).await;
+                            if remaining.is_empty() {
+                                tracing::debug!(
+                                    "DB delete for '{}': in-process holders released; \
+                                     retrying immediately",
+                                    alias
+                                );
+                            } else {
+                                // Budget expired with holders still present —
+                                // the loop's deadline check breaks on the next
+                                // iteration's error arm.
+                                tracing::debug!(
+                                    "DB delete for '{}': budget expired with in-process \
+                                     holder(s) still present: {:?}",
+                                    alias,
+                                    remaining
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1606,6 +1648,38 @@ impl ServeState {
             || msg.contains("is in use")
             || msg.contains("locked")
             || msg.contains("busy")
+    }
+
+    /// Wait until no in-process LMDB env remains open under `db_path`, polling
+    /// [`crate::lmdb_registry::open_holders_under`] every
+    /// [`crate::constants::DB_DELETE_ENV_RELEASE_POLL_MS`].
+    ///
+    /// Returns the holder descriptions still open when `deadline` was reached
+    /// — an empty `Vec` means every in-process holder released in time and the
+    /// directory is (as far as THIS process is concerned) immediately
+    /// deletable again. Holders owned by OTHER processes are invisible to the
+    /// registry by design; callers cover that case with plain backoff.
+    ///
+    /// The registry is the single source of truth this waits on: every holder
+    /// shape that can keep the LMDB mmap open on Windows — an outer
+    /// `Arc<SharedStores>` clone held by an in-flight search, an inner
+    /// `Arc<RwLock<VectorStore>>` captured by a `spawn_blocking` embed pass, a
+    /// `SCIP(...)` env in a `scip/` subdirectory — keeps its `TrackedEnv`
+    /// (and therefore its registry slot) alive until it is truly dropped.
+    async fn await_lmdb_release(
+        db_path: &Path,
+        deadline: std::time::Instant,
+    ) -> Vec<String> {
+        loop {
+            let holders = crate::lmdb_registry::open_holders_under(db_path);
+            if holders.is_empty() || std::time::Instant::now() >= deadline {
+                return holders;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                crate::constants::DB_DELETE_ENV_RELEASE_POLL_MS,
+            ))
+            .await;
+        }
     }
 
     /// Best-effort delete of an orphaned `.codesearch.db` directory, called

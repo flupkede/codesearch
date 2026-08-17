@@ -302,6 +302,77 @@ fn is_db_locked_error_classifies_lock_and_non_lock_errors() {
     )));
 }
 
+/// Open a real registered LMDB env at `path` — the same holder shape
+/// `remove_repo`'s lock-class retry waits on (a live `TrackedEnv` keeps the
+/// mmap file handles on Windows and its registry slot everywhere).
+fn open_test_lmdb_env(path: &std::path::Path, description: &str) -> crate::lmdb_registry::TrackedEnv {
+    let mut opts = heed::EnvOpenOptions::new();
+    opts.map_size(1024 * 1024).max_dbs(1);
+    unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
+    unsafe { crate::lmdb_registry::TrackedEnv::open(&opts, path, description).unwrap() }
+}
+
+/// `await_lmdb_release` returns empty once the last in-process holder drops,
+/// and does NOT return early while the holder is alive. A spawned dropper
+/// releases the env after 200 ms; the helper (deadline 5 s) must observe the
+/// drain. The elapsed lower bound only rules out an instant-return bug —
+/// it cannot flake, since the env provably lived that long.
+#[tokio::test]
+async fn await_lmdb_release_drains_after_holder_drops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    let env = open_test_lmdb_env(&db_path, "transient-search-holder");
+    let held_from = std::time::Instant::now();
+    // Drop the env from a spawned task after a short delay — mimics an
+    // in-flight search finishing and dropping its Arc<SharedStores>.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(env);
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let remaining = ServeState::await_lmdb_release(&db_path, deadline).await;
+
+    assert!(
+        remaining.is_empty(),
+        "helper must report a full drain, still sees: {remaining:?}"
+    );
+    assert!(
+        held_from.elapsed() >= std::time::Duration::from_millis(200),
+        "helper returned before the holder actually dropped — early-return bug"
+    );
+}
+
+/// The budget-expiry arm: a holder that never releases must not hang the
+/// helper past its deadline — it returns the surviving holder descriptions so
+/// `remove_repo` can log exactly who outlived the budget.
+#[tokio::test]
+async fn await_lmdb_release_returns_holders_at_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    let _env = open_test_lmdb_env(&db_path, "stuck-embed-pass");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+    // Outer bound so a regression to an unbounded loop fails the test fast
+    // instead of hanging the suite.
+    let remaining = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ServeState::await_lmdb_release(&db_path, deadline),
+    )
+    .await
+    .expect("helper must return at its deadline, not hang");
+
+    assert_eq!(
+        remaining,
+        vec!["stuck-embed-pass".to_string()],
+        "deadline expiry must carry the surviving holder's description"
+    );
+}
+
 #[test]
 fn is_alias_live_reflects_config_and_cancellation() {
     // FINDINGS #4: the resurrection guard. A detached indexing task must
