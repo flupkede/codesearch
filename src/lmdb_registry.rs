@@ -186,10 +186,12 @@ impl TrackedEnv {
 
 impl Drop for TrackedEnv {
     fn drop(&mut self) {
-        // Ordering here is load-bearing. heed maintains its OWN process-global
-        // registry of opened environments (`OPENED_ENV`), keyed by canonical
-        // path, that outlives a `heed::Env` until its last strong ref drops.
-        // If we `unregister()` from our registry FIRST and let the field drop
+        // Ordering here is load-bearing, twice over.
+        //
+        // (1) The env must be closed BEFORE we free our own registry slot.
+        // heed maintains its OWN process-global registry of opened
+        // environments (`OPENED_ENV`), keyed by canonical path. If we
+        // `unregister()` from our registry FIRST and let the field drop
         // afterwards (the default Rust drop order: body, then fields), there is
         // a window where our slot is free but heed's env is still alive. A
         // concurrent `TrackedEnv::open` on the same path — e.g. the idle reaper
@@ -198,18 +200,37 @@ impl Drop for TrackedEnv {
         // rejects with the cryptic "an environment is already opened with
         // different options" (once a prior MDB_MAP_FULL resize left the live
         // env's recorded map_size differing from the reopen's resolved size).
+        // Closing the env before `unregister()` enforces the invariant
+        // "our slot free ⟹ heed's slot free": a concurrent open either sees
+        // our slot still occupied (clear "double-open prevented" + retry) or
+        // sees both free (clean reopen). It can never observe the inconsistent
+        // state that produces heed's raw error.
         //
-        // Dropping the `heed::Env` BEFORE `unregister()` enforces the invariant
-        // "our slot free ⟹ heed's slot free": a concurrent open either sees our
-        // slot still occupied (clear "double-open prevented" + retry) or sees
-        // both free (clean reopen). It can never observe the inconsistent state
-        // that produces heed's raw error.
+        // (2) A plain drop of the `heed::Env` does NOT close the environment.
+        // heed 0.20's `OPENED_ENV` entry itself holds a strong `Env` clone
+        // (`EnvEntry { env: Some(env.clone()), .. }` — inserted at open, used
+        // to hand out further clones on re-open). With our wrapper as the only
+        // user-side reference, dropping it leaves the Arc count at exactly 1:
+        // the entry's own clone. `EnvInner::drop` — and with it
+        // `mdb_env_close` — therefore NEVER runs. On POSIX that leaks an fd
+        // and an mmap silently; on Windows it locks `data.mdb`/`lock.mdb`
+        // against deletion for the lifetime of the process, which is why
+        // `index rm` against a running serve could not delete the DB dir
+        // (deterministic os error 32 after the whole retry budget, LMDB
+        // registry long empty — the holder is invisible to it).
+        // `prepare_for_closing()` is heed's one real close path: it takes the
+        // entry's reference out and drops the last one synchronously
+        // (entry removed, `mdb_env_close` called, waiters signalled) before
+        // returning. It is correct here because nothing in this codebase
+        // clones the `heed::Env` out of a `TrackedEnv` (the deref only lends
+        // `&Env`; `TrackedEnv` itself is not `Clone`), so this wrapper holds
+        // the last user-side reference.
         //
-        // SAFETY: `inner` is dropped exactly once, here, and never accessed
-        // again (the surrounding `TrackedEnv` is being destroyed).
-        unsafe {
-            ManuallyDrop::drop(&mut self.inner);
-        }
+        // SAFETY: `inner` is taken exactly once, here, and the `ManuallyDrop`
+        // slot is never touched again afterwards (the surrounding
+        // `TrackedEnv` is being destroyed).
+        let env = unsafe { ManuallyDrop::take(&mut self.inner) };
+        env.prepare_for_closing();
         unregister(&self.canonical);
     }
 }
@@ -288,7 +309,6 @@ mod tests {
         assert!(err.contains("double-open prevented"));
         assert!(err.contains("test-1"));
     }
-
     #[test]
     fn test_registry_allows_reopen_after_drop() {
         let dir = TempDir::new().unwrap();
@@ -302,6 +322,49 @@ mod tests {
 
         // Should succeed after drop
         let _env2 = unsafe { TrackedEnv::open(&opts, path, "test-2").unwrap() };
+    }
+
+    /// Dropping the last `TrackedEnv` must REALLY close the heed environment.
+    ///
+    /// heed 0.20's `OPENED_ENV` entry holds a strong `Env` clone of its own,
+    /// so a plain drop of the user-side `Env` leaves the Arc count at 1 (the
+    /// entry's) and `mdb_env_close` never runs — the env stays open invisibly:
+    /// `env_closing_event` keeps answering `Some`, and on Windows `data.mdb`/
+    /// `lock.mdb` stay locked against deletion for the life of the process
+    /// (the deterministic `index rm` os-error-32 failure this test pins).
+    /// `TrackedEnv::drop` therefore closes via `prepare_for_closing()`.
+    ///
+    /// Cross-platform: the `env_closing_event` assert fails everywhere when
+    /// the close path regresses; the directory-delete assert is the
+    /// Windows-visible consequence of the same leak and guards it directly.
+    #[test]
+    fn drop_really_closes_heed_env_and_releases_the_files() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db");
+        std::fs::create_dir(&db_path).unwrap();
+        let opts = make_opts();
+
+        {
+            let _env = unsafe { TrackedEnv::open(&opts, &db_path, "close-on-drop-test").unwrap() };
+            assert!(
+                heed::env_closing_event(&db_path).is_some(),
+                "while the TrackedEnv lives, heed must report the env open"
+            );
+        }
+
+        // The env must now be gone from heed's own registry too — not just
+        // from ours (`open_holders_under` is vacuous here, it tracks
+        // TrackedEnvs only).
+        assert!(
+            heed::env_closing_event(&db_path).is_none(),
+            "heed's OPENED_ENV entry must be removed on TrackedEnv drop; \
+             a surviving entry means mdb_env_close never ran"
+        );
+
+        // ...which is what makes the DB directory deletable on Windows.
+        std::fs::remove_dir_all(&db_path)
+            .expect("db dir must be deletable after the last TrackedEnv drops");
+        assert!(!db_path.exists());
     }
 
     #[test]
