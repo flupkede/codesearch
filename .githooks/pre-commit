@@ -47,7 +47,10 @@ while IFS= read -r staged; do
     case "$staged" in
         */*) continue ;;
     esac
-    case "${staged,,}" in
+    # tr, not ${var,,}: the parameter-expansion lowercase needs bash >= 4 and
+    # stock macOS still ships bash 3.2, where it is a fatal "bad substitution"
+    # that would block EVERY commit containing a root-level file.
+    case "$(printf '%s' "$staged" | tr 'A-Z' 'a-z')" in
         *.md) ;;
         *) continue ;;
     esac
