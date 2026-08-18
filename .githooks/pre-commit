@@ -1,7 +1,8 @@
 #!/bin/bash
-# pre-commit hook: format Rust code only.
+# pre-commit hook: format Rust code + root-md allowlist guard.
 #
-# Runs `cargo fmt` and stages any reformatting so CI's fmt-check can't fail.
+# 1. Runs `cargo fmt` and stages any reformatting so CI's fmt-check can't fail.
+# 2. Rejects commits that introduce a root-level *.md outside the allowlist.
 #
 # Installed via `git config core.hooksPath .githooks` — see .githooks/README.md.
 #
@@ -26,5 +27,47 @@ if [ -n "$FMT_CHANGED" ]; then
     git add -- '*.rs'
     echo "pre-commit: staged rustfmt changes ($FMT_CHANGED)"
 fi
+
+# --- root-md allowlist guard -------------------------------------------------
+# The repo root keeps only its sanctioned markdown files (AGENTS.md, section
+# "Root file hygiene (markdown)"). Anything else — diagnoses, plans, test
+# scenarios, worklogs — belongs in .docs/ (gitignored, local-only). Blocking
+# here is cheaper than a follow-up cleanup commit after a stray lands on
+# develop.
+#
+# Only introductions are checked (added/copied/renamed). Modifying an already
+# tracked stray is only possible after a deliberate --no-verify bypass — the
+# file itself is the violation then, and review catches it. Dot-folders
+# (.githooks/, .github/, .claude/, ...) are out of scope by construction: a
+# root-level file cannot be inside one.
+ALLOWED_ROOT_MD="AGENTS.md AGENTS.develop.md CLAUDE.md README.md README_CSharp.md CHANGELOG.md RELEASING.md"
+
+while IFS= read -r staged; do
+    # root level = no slash anywhere in the staged (post-rename) path
+    case "$staged" in
+        */*) continue ;;
+    esac
+    # tr, not ${var,,}: the parameter-expansion lowercase needs bash >= 4 and
+    # stock macOS still ships bash 3.2, where it is a fatal "bad substitution"
+    # that would block EVERY commit containing a root-level file.
+    case "$(printf '%s' "$staged" | tr 'A-Z' 'a-z')" in
+        *.md) ;;
+        *) continue ;;
+    esac
+    for allowed in $ALLOWED_ROOT_MD; do
+        [ "$staged" = "$allowed" ] && continue 2
+    done
+    echo ""
+    echo "pre-commit: BLOCKED — root-level '$staged' is not on the md allowlist."
+    echo "  Root markdown is limited to: $ALLOWED_ROOT_MD"
+    echo "  Diagnoses, plans, worklogs and test scenarios belong in .docs/ (gitignored)."
+    echo "  See AGENTS.md, section \"Root file hygiene (markdown)\"."
+    echo "  Deliberate? Use: git commit --no-verify"
+    echo ""
+    exit 1
+# core.quotePath=false: with the default (true), git C-quotes non-ASCII paths
+# (DIAGNOSE_ü.md -> "DIAGNOSE_\303\274.md"), and the quoted trailing `"` makes
+# the *.md pattern miss — a stray with a non-ASCII name would sail through.
+done < <(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACR)
 
 exit 0

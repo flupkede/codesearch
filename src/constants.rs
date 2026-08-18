@@ -557,6 +557,26 @@ pub const DB_DELETE_RETRY_INITIAL_MS: u64 = 200;
 /// delete retries in `remove_repo`.
 pub const DB_DELETE_RETRY_BACKOFF_CAP_MS: u64 = 2000;
 
+/// Poll interval (milliseconds) for the in-process LMDB-holder release wait
+/// inside `remove_repo`'s locked-DB delete retry loop. After a lock-class
+/// delete failure the loop polls `lmdb_registry::open_holders_under` at this
+/// cadence until every in-process env under the DB dir is released (or
+/// `DB_DELETE_RETRY_BUDGET_SECS` expires), so the next attempt runs against
+/// an actually-unlocked directory instead of burning attempts blind.
+pub const DB_DELETE_ENV_RELEASE_POLL_MS: u64 = 100;
+
+/// Unallocated margin (seconds) the CLI's delegated `DELETE /repos/:alias`
+/// request adds on top of serve's legitimate worst-case removal time —
+/// `DB_DELETE_RETRY_BUDGET_SECS` plus one `BG_TASK_COOPERATIVE_TIMEOUT_SECS`
+/// per cooperative join (FSW task + index task) — so the CLI receives
+/// serve's honest locked-DB outcome (`db_deleted` / payload) instead of its
+/// own request timeout firing first. The shared delegation client's 3 s
+/// total timeout is fine for the `/health` probe but far shorter than a
+/// legitimate slow removal (warmup cancellation + env-release wait +
+/// retries); `try_delegate_rm_to_serve` builds the DELETE its own client
+/// sized from these constants.
+pub const RM_DELEGATE_DELETE_MARGIN_SECS: u64 = 10;
+
 /// Default embedding dimensions used when metadata is missing or unreadable.
 pub const DEFAULT_EMBEDDING_DIMENSIONS: usize = 384;
 

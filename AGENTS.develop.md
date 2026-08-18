@@ -155,6 +155,12 @@ Single-file native binaries, no runtime dependencies. macOS build is manual-trig
 - **Never write separate `AGENTS_xxx.md` sibling files** unless explicitly requested.
   OpenCode reads `AGENTS.md` only. Out-of-repo planning goes to
   `C:\WorkArea\AI\codesearch\instructions\`.
+- **Root file hygiene (markdown)**: the repo root keeps only `AGENTS.md`,
+  `AGENTS.develop.md`, `CLAUDE.md`, `README.md`, `README_CSharp.md`,
+  `CHANGELOG.md`, `RELEASING.md`. Any other markdown (diagnoses, plans,
+  test scenarios, worklogs) goes into `.docs/` (gitignored, local-only),
+  never committed, and never in a recreated tracked `docs/` folder.
+  Enforced by the `pre-commit` hook root-md allowlist guard.
 - **Path normalization**: all path comparisons must go through a single normalize utility.
   Windows UNC prefixes (`\\?\C:\`), backslash/forward-slash mismatches, and worktree
   `.git` file resolution have each caused subtle bugs in the past.

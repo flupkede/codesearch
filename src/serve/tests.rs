@@ -302,6 +302,80 @@ fn is_db_locked_error_classifies_lock_and_non_lock_errors() {
     )));
 }
 
+/// Open a real registered LMDB env at `path` — the same holder shape
+/// `remove_repo`'s lock-class retry waits on (a live `TrackedEnv` keeps the
+/// mmap file handles on Windows and its registry slot everywhere).
+fn open_test_lmdb_env(
+    path: &std::path::Path,
+    description: &str,
+) -> crate::lmdb_registry::TrackedEnv {
+    let mut opts = heed::EnvOpenOptions::new();
+    opts.map_size(1024 * 1024).max_dbs(1);
+    unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
+    unsafe { crate::lmdb_registry::TrackedEnv::open(&opts, path, description).unwrap() }
+}
+
+/// `await_lmdb_release` returns empty once the last in-process holder drops,
+/// and does NOT return early while the holder is alive. A spawned dropper
+/// releases the env after 200 ms; the helper (deadline 5 s) must observe the
+/// drain. The elapsed lower bound only rules out an instant-return bug —
+/// it cannot flake, since the env provably lived that long.
+#[tokio::test]
+async fn await_lmdb_release_drains_after_holder_drops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    let env = open_test_lmdb_env(&db_path, "transient-search-holder");
+    let held_from = std::time::Instant::now();
+    // Drop the env from a spawned task after a short delay — mimics an
+    // in-flight search finishing and dropping its Arc<SharedStores>.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(env);
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let remaining = ServeState::await_lmdb_release(&db_path, deadline).await;
+
+    assert!(
+        remaining.is_empty(),
+        "helper must report a full drain, still sees: {remaining:?}"
+    );
+    assert!(
+        held_from.elapsed() >= std::time::Duration::from_millis(200),
+        "helper returned before the holder actually dropped — early-return bug"
+    );
+}
+
+/// The budget-expiry arm: a holder that never releases must not hang the
+/// helper past its deadline — it returns the surviving holder descriptions so
+/// `remove_repo` can log exactly who outlived the budget.
+#[tokio::test]
+async fn await_lmdb_release_returns_holders_at_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    let _env = open_test_lmdb_env(&db_path, "stuck-embed-pass");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+    // Outer bound so a regression to an unbounded loop fails the test fast
+    // instead of hanging the suite.
+    let remaining = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ServeState::await_lmdb_release(&db_path, deadline),
+    )
+    .await
+    .expect("helper must return at its deadline, not hang");
+
+    assert_eq!(
+        remaining,
+        vec!["stuck-embed-pass".to_string()],
+        "deadline expiry must carry the surviving holder's description"
+    );
+}
+
 #[test]
 fn is_alias_live_reflects_config_and_cancellation() {
     // FINDINGS #4: the resurrection guard. A detached indexing task must
@@ -1661,7 +1735,7 @@ mod allowed_hosts_tests {
 /// Tests for `extract_host_from_url` — used solely by the keep-warm
 /// misconfiguration sanity check (a keep-warm target host that doesn't look
 /// like "self" gets a loud warning; see the diagnosis this shipped with in
-/// docs/diagnose-federated-keep-warm.md).
+/// `.docs/DIAGNOSE_FEDERATED_KEEP_WARM.md`).
 mod keep_warm_host_extraction_tests {
     use super::*;
 
@@ -1888,8 +1962,14 @@ async fn indexing_route_answers_json() {
     // Route + handler wiring: a GET with a covered path returns our JSON
     // (never axum's empty 404), with the covered/indexing fields present.
     let tmp = tempfile::tempdir().unwrap();
-    let repo_path = tmp.path().join("hooked");
-    std::fs::create_dir(&repo_path).unwrap();
+    let raw_repo = tmp.path().join("hooked");
+    std::fs::create_dir(&raw_repo).unwrap();
+    // CANONICALIZE (same trap as remove_order_tests' make_proj): on the
+    // Windows CI runner the temp root sits under an 8.3 short name
+    // (RUNNER~1) that only canonicalize resolves, and register canonicalizes
+    // before storing — querying with the raw path made covered=false there
+    // (green locally, red on CI).
+    let repo_path = crate::cache::safe_canonicalize(&raw_repo).unwrap();
 
     let mut config = ReposConfig::default();
     config
@@ -1951,45 +2031,39 @@ async fn indexing_route_answers_json() {
 // `codesearch index rm` → running serve: end-to-end delegation (todo #48 L2)
 // ===========================================================================
 
-/// The full Layer-2 acceptance path: a running serve instance holds the
-/// repo's registration; `remove_from_index` (the CLI code path) must
-/// DELEGATE to it (health probe → DELETE /repos/:alias), serve must stop
-/// holders and delete the DB directory WITHOUT being stopped, repos.json
-/// must lose the entry, and a later query for the alias must be a clean
-/// "Unknown alias" (no zombie stores) — all without stopping serve.
+/// Shared envelope for the Layer-2 e2e tests below: pin the delegation env
+/// vars to a fresh temp repos.json, seed it via `seed`, spawn a REAL serve
+/// (the two routes the CLI `index rm` delegation touches: `GET /health` and
+/// the real `remove_repo_handler` at `DELETE /repos/:alias`) sharing that
+/// config, and wait (bounded, panicking on timeout) for it to accept.
 ///
-/// Hermetic per the repo env-var rule: `#[serial]` + `EnvRestore` pins
-/// `CODESEARCH_REPOS_CONFIG` (temp repos.json shared by CLI and serve) and
-/// `CODESEARCH_SERVE_PORT` (the spawned test serve), so the delegation
-/// probe can never reach a developer's real serve or registry.
-#[tokio::test]
-#[serial_test::serial]
-async fn index_rm_delegates_to_running_serve_end_to_end() {
-    use crate::testing::EnvRestore;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let raw_proj = tmp.path().join("e2eproj");
-    std::fs::create_dir(&raw_proj).unwrap();
-    let proj = crate::cache::safe_canonicalize(&raw_proj).unwrap();
-    // A real (empty) DB directory — stand-in for the LMDB dir; deleting it
-    // exercises the same remove_dir_all path without opening a real env.
-    std::fs::create_dir(proj.join(".codesearch.db")).unwrap();
-
-    // Env vars FIRST, then seed repos.json (same ordering trap the
-    // remove_order_tests document: saving before the override writes the
-    // developer's real registry).
-    let cfg_path = tmp.path().join("repos.json");
+/// Every step here is trap-sensitive, which is why it is a helper and not
+/// copy-paste: env vars must be pinned BEFORE `cfg.save()` or the seed lands
+/// in the developer's REAL registry; the port must come from
+/// `listener.local_addr().port()` (never the SocketAddr — its Display form
+/// makes the env var unparseable, the port silently falls back to the
+/// DEFAULT 39725, and the delegation fires a live DELETE at a developer's
+/// running serve); `SERVE_HOST_ENV` must be pinned to loopback or a stray
+/// machine-level value sends the probe elsewhere entirely.
+///
+/// Returns `(state, port, env_guard)`. The caller MUST keep the
+/// [`crate::testing::EnvRestore`] guard bound for the whole test — dropping
+/// it (e.g. letting a helper-internal guard die) unpins the vars before the
+/// delegation runs. This is why the guard is returned rather than held here.
+/// The helper lives in this module rather than `src/testing.rs` because the
+/// handlers it routes are private to `serve`.
+async fn spawn_rm_delegation_test_serve<F>(
+    tmp: &std::path::Path,
+    seed: F,
+) -> (Arc<ServeState>, u16, crate::testing::EnvRestore)
+where
+    F: FnOnce(&mut ReposConfig),
+{
+    let cfg_path = tmp.join("repos.json");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    // NOTE: local_addr() is a SocketAddr — take .port() or the env var and
-    // URLs below silently become "127.0.0.1:127.0.0.1:<port>" and the port
-    // parse falls back to the DEFAULT port (39725), pointing the delegation
-    // at a developer's REAL serve. Exactly the failure this test hunted down.
     let port = listener.local_addr().unwrap().port();
-    // SERVE_HOST_ENV too: `try_delegate_rm_to_serve` resolves the host via
-    // `resolve_serve_host()` — without pinning it to loopback, a machine with
-    // CODESEARCH_SERVE_HOST set (or a future default change) sends the probe
-    // somewhere else entirely.
-    let _env = EnvRestore::set(&[
+    // Env vars FIRST, then seed repos.json (ordering trap: see doc above).
+    let env = crate::testing::EnvRestore::set(&[
         (
             crate::constants::REPOS_CONFIG_ENV,
             &cfg_path.to_string_lossy(),
@@ -1998,24 +2072,13 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
         (crate::constants::SERVE_HOST_ENV, "127.0.0.1"),
     ]);
     let mut cfg = ReposConfig::default();
-    cfg.register(proj.clone());
-    // Capture the alias the registration derived (directory-name based) so
-    // the post-removal probe below addresses exactly what was registered.
-    let alias = cfg
-        .repos
-        .iter()
-        .find(|(_, p)| *p == &proj)
-        .map(|(a, _)| a.clone())
-        .expect("seeded config must contain the proj");
+    seed(&mut cfg);
     cfg.save().expect("seed repos.json save must succeed");
     assert!(
         cfg_path.exists(),
         "seed repos.json must land in the temp path, not the global default"
     );
 
-    // A running serve instance sharing the SAME repos.json. Routes are the
-    // two the CLI delegation touches: GET /health and the real
-    // remove_repo_handler (DELETE /repos/:alias).
     let state = Arc::new(ServeState::new(cfg, Some(cfg_path.clone())));
     let app = axum::Router::new()
         .route(
@@ -2027,16 +2090,53 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Bounded readiness wait (same pattern as federation's spawn_test_server).
+    // Bounded readiness wait that FAILS LOUDLY on timeout (a silent exit
+    // here surfaces downstream as an unrelated delegation failure).
+    let mut ready = false;
     for _ in 0..200 {
         if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .is_ok()
         {
+            ready = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    assert!(ready, "test serve never became ready on port {port}");
+    (state, port, env)
+}
+
+/// The full Layer-2 acceptance path: a running serve instance holds the
+/// repo's registration; `remove_from_index` (the CLI code path) must
+/// DELEGATE to it (health probe → DELETE /repos/:alias), serve must stop
+/// holders and delete the DB directory WITHOUT being stopped, repos.json
+/// must lose the entry, and a later query for the alias must be a clean
+/// "Unknown alias" (no zombie stores) — all without stopping serve.
+#[tokio::test]
+#[serial_test::serial]
+async fn index_rm_delegates_to_running_serve_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let raw_proj = tmp.path().join("e2eproj");
+    std::fs::create_dir(&raw_proj).unwrap();
+    let proj = crate::cache::safe_canonicalize(&raw_proj).unwrap();
+    // A real (empty) DB directory — stand-in for the LMDB dir; deleting it
+    // exercises the same remove_dir_all path without opening a real env.
+    std::fs::create_dir(proj.join(".codesearch.db")).unwrap();
+
+    let (state, _port, _env) = spawn_rm_delegation_test_serve(tmp.path(), |cfg| {
+        cfg.register(proj.clone());
+    })
+    .await;
+    // Capture the alias the registration derived (directory-name based) so
+    // the post-removal probe below addresses exactly what was registered.
+    let alias = ReposConfig::load()
+        .expect("seeded repos.json reload")
+        .repos
+        .iter()
+        .find(|(_, p)| **p == proj)
+        .map(|(a, _)| a.clone())
+        .expect("seeded config must contain the proj");
 
     // The CLI path — must delegate (serve is reachable) and succeed.
     crate::index::remove_from_index(Some(proj.clone()), false)
@@ -2060,6 +2160,100 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
     // store resurrecting the repo (todo #48 L2 acceptance criterion 3).
     let err = state
         .remove_repo(&alias)
+        .await
+        .expect_err("removing an unregistered alias must fail");
+    assert!(
+        err.to_string().contains("Unknown alias"),
+        "expected a clean Unknown-alias error, got: {err:#}"
+    );
+}
+
+/// The hard variant of the Layer-2 acceptance ("file-delete succeeds without
+/// serve-stop"): the running serve does not merely KNOW the repo — it holds a
+/// REAL open LMDB environment on the `.codesearch.db` directory (a Warm
+/// `RepoState`, exactly what a live query leaves behind). `remove_from_index`
+/// must still delete the directory in one shot via delegation, without
+/// stopping serve. The eviction is pinned from both sides: the registry
+/// provably held a live env BEFORE the removal (precondition assert), and the
+/// repos-map entry is gone AFTER it — while a holder is live the mmap'd
+/// data/lock files cannot be deleted on Windows, so the dir-gone assert and
+/// the eviction assert together prove the mechanism the locked-delete path
+/// depends on, cross-platform.
+///
+/// The store is opened via the production `try_open_stores` path (creating
+/// the DB dir for real), and the returned `Arc<SharedStores>` is MOVED into
+/// `RepoState::Warm` with no clone kept — the test process must not itself
+/// be the extra holder that defeats the delete.
+#[tokio::test]
+#[serial_test::serial]
+async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let raw_proj = tmp.path().join("heldenv");
+    std::fs::create_dir(&raw_proj).unwrap();
+    let proj = crate::cache::safe_canonicalize(&raw_proj).unwrap();
+    let db_path = proj.join(DB_DIR_NAME);
+    // No pre-created DB dir: try_open_stores must create it, proving the
+    // env we then hold is a real production-shaped store.
+
+    let (state, _port, _env) = spawn_rm_delegation_test_serve(tmp.path(), |cfg| {
+        cfg.register_with_alias(proj.clone(), Some("heldenv".to_string()))
+            .expect("seed registration must succeed");
+    })
+    .await;
+
+    // Serve opens the repo FOR REAL — a live LMDB env under db_path.
+    let opened = state
+        .try_open_stores("heldenv", &db_path, true, false)
+        .expect("opening a real store for a brand-new repo must succeed");
+    let OpenedStores::Write(stores) = opened else {
+        panic!("brand-new repo must open Write, not Readonly");
+    };
+    // Move the Arc in; keep NO clone (a test-side clone would be exactly the
+    // transient holder class remove_repo's retry has to out-wait).
+    state
+        .repos
+        .insert("heldenv".to_string(), RepoState::Warm { stores });
+
+    // Precondition: the env is genuinely held — this is what makes the
+    // delete impossible on Windows until serve's eviction releases it.
+    assert!(
+        !crate::lmdb_registry::open_holders_under(&db_path).is_empty(),
+        "test precondition: a real LMDB holder must be live under the db dir"
+    );
+
+    // The CLI path — delegated removal against a serve that HOLDS the env.
+    crate::index::remove_from_index(Some(proj.clone()), false)
+        .await
+        .expect("delegated index rm must succeed while serve holds the env");
+
+    // The DB directory is gone — deleted BY SERVE, in-place, serve still up.
+    assert!(
+        !db_path.exists(),
+        "serve must delete the really-held DB dir without being stopped"
+    );
+    // The eviction genuinely dropped the RepoState (and with it the last
+    // Arc<SharedStores>). NOTE: a registry query (`open_holders_under`) is
+    // VACUOUS here — the dir is deleted, canonicalize fails, and the helper
+    // by design answers "no holders" for a missing path even though a zombie
+    // env would still be alive on it (mutation-verified: skipping
+    // repos.remove left the test green through that assert on Linux). The
+    // repos-map assert is the non-vacuous pin: the Warm entry must be gone.
+    // On Windows a skipped eviction additionally fails the dir-gone assert
+    // (the mmap'd files refuse deletion while held).
+    assert!(
+        !state.repos.contains_key("heldenv"),
+        "eviction must drop the RepoState — a surviving Warm entry is a zombie holder"
+    );
+    // repos.json lost the entry.
+    let after = ReposConfig::load().expect("repos.json reload after rm");
+    assert!(
+        !after.repos.values().any(|p| p == &proj),
+        "entry must be unregistered from repos.json, still has: {:?}",
+        after.repos.values().collect::<Vec<_>>()
+    );
+    // No zombie: the alias no longer resolves for later queries.
+    let err = state
+        .remove_repo("heldenv")
         .await
         .expect_err("removing an unregistered alias must fail");
     assert!(

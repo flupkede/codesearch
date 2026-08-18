@@ -1643,10 +1643,35 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
     // which the serve endpoint doesn't support — serve always unregisters).
     if !keep_config {
         match try_delegate_rm_to_serve(&effective_path).await {
-            Ok((alias, _)) => {
+            Ok(removed) => {
                 println!("\n{}", "✅ Delegated to running serve instance.".green());
-                println!("   Removed alias '{}'.", alias);
-                println!("   FSW stopped, repo evicted from memory, DB deleted.");
+                println!("   Removed alias '{}'.", removed.alias);
+                println!("   FSW stopped, repo evicted from memory, unregistered from repos.json.");
+                if removed.db_deleted {
+                    println!("   Database files deleted.");
+                } else {
+                    // Serve answered 200 but its DB dir survived the delete
+                    // (`removed_db_locked`): report what actually happened —
+                    // never claim a delete that did not occur. This stays Ok
+                    // rather than Err because serve has ALREADY unregistered
+                    // the alias: the Layer-1 local-path error text
+                    // ("repos.json was NOT modified") would be false here, and
+                    // the leftover files are retryable — with the alias gone
+                    // from repos.json the next run skips delegation and
+                    // finishes via the local file-delete path below.
+                    let db_dir = removed.project_path.join(crate::constants::DB_DIR_NAME);
+                    eprintln!(
+                        "⚠️ Database files could not be deleted and are still on disk at {}: {}",
+                        db_dir.display(),
+                        removed
+                            .db_delete_error
+                            .as_deref()
+                            .unwrap_or("unknown error")
+                    );
+                    eprintln!(
+                        "The alias is already unregistered; re-run the same command to retry the file delete."
+                    );
+                }
                 return Ok(());
             }
             Err(reason) => {
@@ -2360,13 +2385,29 @@ pub(crate) async fn try_delegate_add_to_serve(
     }
 }
 
+/// The outcome a running serve instance reported for a delegated `index rm`
+/// — the parsed `DELETE /repos/:alias` success payload.
+///
+/// `db_deleted == false` means the repo is functionally removed (FSW stopped,
+/// evicted from memory, unregistered from repos.json) but the database
+/// directory is still on disk: serve's lock-class retry budget was exhausted
+/// by a transient `Arc<SharedStores>` holder. Callers must report that
+/// honestly instead of claiming the files were deleted (BUG2 class).
+pub(crate) struct ServeRemoval {
+    pub(crate) alias: String,
+    pub(crate) project_path: PathBuf,
+    pub(crate) db_deleted: bool,
+    pub(crate) db_delete_error: Option<String>,
+}
+
 /// Try to delegate `index rm` to a running serve instance.
 ///
-/// Returns `Ok((alias, project_path))` if the serve accepted the remove request.
+/// Returns `Ok(removed)` — including serve's honest DB-delete outcome — if
+/// the serve accepted the remove request.
 /// Returns `Err(reason)` with a human-readable reason if delegation failed.
 pub(crate) async fn try_delegate_rm_to_serve(
     path: &Option<PathBuf>,
-) -> std::result::Result<(String, PathBuf), String> {
+) -> std::result::Result<ServeRemoval, String> {
     use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
     let port: u16 = std::env::var(SERVE_PORT_ENV)
@@ -2432,14 +2473,57 @@ pub(crate) async fn try_delegate_rm_to_serve(
         .ok_or_else(|| format!("path '{}' not found in repos.json", project_path.display()))?;
 
     // 3. DELETE /repos/:alias
-    let delete_resp = client
+    //
+    // The DELETE needs its OWN client with a timeout that covers serve's
+    // legitimate worst-case removal time: `remove_repo` can spend up to
+    // BG_TASK_COOPERATIVE_TIMEOUT_SECS per cooperative join (FSW + index
+    // task) plus the full DB_DELETE_RETRY_BUDGET_SECS lock-class retry
+    // window while transient holders release. Reusing the 3 s health-probe
+    // client here fired the CLI's own timeout MID-REMOVAL, surfaced as
+    // "delete failed: operation timed out", and fell through to the local
+    // path — whose delete then failed on the files serve was still tearing
+    // down. That made "stop serve and re-run" the only working flow, which
+    // is exactly what todo #48 Layer 2 removes. The health probe KEEPS the
+    // short timeout: it must classify Down/Unresponsive quickly.
+    let delete_client = build_serve_client(std::time::Duration::from_secs(
+        crate::constants::DB_DELETE_RETRY_BUDGET_SECS
+            + 2 * crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS
+            + crate::constants::RM_DELEGATE_DELETE_MARGIN_SECS,
+    ))?;
+    let delete_resp = delete_client
         .delete(format!("{}/repos/{}", base_url, alias))
         .send()
         .await
         .map_err(|e| format!("delete failed: {}", e))?;
 
     if delete_resp.status().is_success() {
-        Ok((alias, project_path))
+        // BUG2-class honesty: a 200 from `remove_repo_handler` is NOT a
+        // guarantee the DB files are gone — serve reports the real outcome in
+        // the body (`db_deleted` / `db_delete_error`) because a transient
+        // Arc<SharedStores> holder can outlast its lock-class retry budget.
+        // Parse and carry it; returning only `(alias, path)` flattened that
+        // to plain success and the CLI printed "DB deleted." for files that
+        // were still on disk.
+        let body = delete_resp.text().await.unwrap_or_default();
+        let payload: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        // Pre-BUG2 serves have no `db_deleted` field and only ever answered
+        // "removed" — defaulting to true keeps their behavior unchanged
+        // instead of fabricating a failure they did not report.
+        let db_deleted = payload
+            .get("db_deleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let db_delete_error = payload
+            .get("db_delete_error")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        Ok(ServeRemoval {
+            alias,
+            project_path,
+            db_deleted,
+            db_delete_error,
+        })
     } else {
         let status = delete_resp.status();
         let text = delete_resp.text().await.unwrap_or_default();
@@ -2848,6 +2932,11 @@ mod remove_order_tests {
         // seed into the developer's REAL ~/.codesearch/repos.json — which
         // is exactly how this test once destroyed a registry during
         // development. The canary below pins that invariant.
+        //
+        // SERVE_HOST_ENV is pinned too: `try_delegate_rm_to_serve` resolves
+        // the probe host via `resolve_serve_host()` — a machine with the var
+        // set would send the delegation somewhere other than the 127.0.0.1
+        // listener these tests bind (same trap the serve e2e test documents).
         let guard = EnvRestore::set(&[
             (
                 crate::constants::REPOS_CONFIG_ENV,
@@ -2857,6 +2946,7 @@ mod remove_order_tests {
                 crate::constants::SERVE_PORT_ENV,
                 serve_port.to_string().as_str(),
             ),
+            (crate::constants::SERVE_HOST_ENV, "127.0.0.1"),
         ]);
         let mut cfg = ReposConfig::default();
         cfg.register(proj.to_path_buf());
@@ -3034,6 +3124,153 @@ mod remove_order_tests {
             !paths.iter().any(|p| Path::new(p) == proj),
             "entry must be unregistered in global-only case, got: {:?}",
             paths
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// Serve answered 200 but honestly reported `removed_db_locked` — the
+    /// delegated removal must CARRY that outcome (`db_deleted == false` plus
+    /// the reason), never flatten it to plain success. The old delegation
+    /// checked only `status().is_success()`, so the CLI printed "DB deleted."
+    /// for files that were still on disk (BUG2 class, at the IPC boundary).
+    #[tokio::test]
+    #[serial]
+    async fn delegated_removal_carries_locked_db_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "proj");
+        let db = proj.join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("data.mdb"), b"fake").unwrap();
+
+        // A stand-in serve answering what `remove_repo_handler` emits when
+        // the lock-class retry budget is exhausted: 200 + honest payload.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "codesearch_server": true }))
+                }),
+            )
+            .route(
+                "/repos/:alias",
+                axum::routing::delete(
+                    |axum::extract::Path(alias): axum::extract::Path<String>| async move {
+                        axum::Json(serde_json::json!({
+                            "status": "removed_db_locked",
+                            "alias": alias,
+                            "db_deleted": false,
+                            "db_delete_error": "mock: dir still held by a transient store holder",
+                        }))
+                    },
+                ),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // Bounded readiness wait (same pattern as the serve e2e test — take
+        // `.port()`, never the SocketAddr, or URLs silently degrade).
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let _env = seed_repos_config(tmp.path(), &proj, port);
+        let _canary = global_config_canary();
+
+        let removed = super::try_delegate_rm_to_serve(&Some(proj.clone()))
+            .await
+            .expect("delegation must succeed against a 200-answering serve");
+
+        assert_eq!(removed.alias, "proj");
+        assert_eq!(removed.project_path, proj);
+        assert!(
+            !removed.db_deleted,
+            "the locked-DB outcome must be carried, not flattened to success"
+        );
+        assert_eq!(
+            removed.db_delete_error.as_deref(),
+            Some("mock: dir still held by a transient store holder"),
+            "serve's delete-error reason must survive the IPC boundary"
+        );
+        // The stand-in left the files alone, exactly like a locked serve.
+        assert!(db.exists(), "db dir must still be on disk in this scenario");
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// The DELETE request must wait out serve's legitimate slow removal
+    /// instead of firing the CLI's own 3 s health-probe timeout
+    /// mid-removal (todo #48 L2: "file-delete succeeds without
+    /// serve-stop"). A stand-in serve whose DELETE handler sleeps 4 s —
+    /// past the old client timeout, far under the new budget-derived one —
+    /// then answers the honest payload: delegation must succeed and carry
+    /// the outcome. Under the old shared 3 s client this test fails with
+    /// "delete failed: operation timed out" (mutation-verified), which in
+    /// production dropped the CLI onto the local path whose delete then
+    /// failed on the files serve was still tearing down.
+    #[tokio::test]
+    #[serial]
+    async fn delegated_rm_delete_outlives_slow_serve_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "slowproj");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // 4 s: comfortably past the old 3 s client timeout, comfortably
+        // under the new one (60 + 2*5 + 10 = 80 s) so the test stays fast.
+        let app = axum::Router::new()
+            .route(
+                "/health",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({ "codesearch_server": true }))
+                }),
+            )
+            .route(
+                "/repos/:alias",
+                axum::routing::delete(
+                    |axum::extract::Path(alias): axum::extract::Path<String>| async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                        axum::Json(serde_json::json!({
+                            "status": "removed",
+                            "alias": alias,
+                            "db_deleted": true,
+                            "db_delete_error": serde_json::Value::Null,
+                        }))
+                    },
+                ),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // Bounded readiness wait (same pattern as the serve e2e test — take
+        // `.port()`, never the SocketAddr, or URLs silently degrade).
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let _env = seed_repos_config(tmp.path(), &proj, port);
+        let _canary = global_config_canary();
+
+        let removed = super::try_delegate_rm_to_serve(&Some(proj.clone()))
+            .await
+            .expect("the DELETE must outlive a slow serve removal, not time out at 3 s");
+
+        assert_eq!(removed.alias, "slowproj");
+        assert!(
+            removed.db_deleted,
+            "the slow-but-successful outcome must be carried"
         );
         assert_global_config_unchanged(_canary);
     }
