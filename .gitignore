@@ -36,6 +36,12 @@ criterion/
 # Testing
 /test-repos/
 
+# Local-only markdown (diagnoses, plans, worklogs, test scenarios).
+# The repo root keeps only its allowlisted .md files — see AGENTS.md
+# "Root file hygiene (markdown)". Also covered by the `.*/` rule above;
+# listed explicitly so the intent survives a future edit of that rule.
+.docs/
+
 # codesearch database (local index, binary files)
 .codesearch.db/
 test_tools.jsonl

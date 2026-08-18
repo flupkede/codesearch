@@ -1735,7 +1735,7 @@ mod allowed_hosts_tests {
 /// Tests for `extract_host_from_url` — used solely by the keep-warm
 /// misconfiguration sanity check (a keep-warm target host that doesn't look
 /// like "self" gets a loud warning; see the diagnosis this shipped with in
-/// docs/diagnose-federated-keep-warm.md).
+/// `.docs/DIAGNOSE_FEDERATED_KEEP_WARM.md`).
 mod keep_warm_host_extraction_tests {
     use super::*;
 
