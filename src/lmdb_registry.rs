@@ -110,6 +110,36 @@ pub fn is_open(path: &Path) -> bool {
     }
 }
 
+/// Descriptions of every live [`TrackedEnv`] whose canonical path is `path`
+/// itself or lives UNDER it (component-wise prefix, so `base/foo` does not
+/// match `base/foobar`). An empty `Vec` means no in-process holder keeps any
+/// LMDB env open anywhere in that subtree.
+///
+/// This is the single source of truth for "can this DB directory be deleted
+/// by this process right now": it sees through every holder shape — an outer
+/// `Arc<SharedStores>` clone held by an in-flight search, an inner
+/// `Arc<RwLock<VectorStore>>` captured by a `spawn_blocking` embed pass, a
+/// `SCIP(...)` env in a `scip/` subdirectory — because all of them keep their
+/// `TrackedEnv` (and therefore its registry slot) alive. `remove_repo` waits
+/// on this before retrying a locked delete.
+///
+/// A path that cannot be canonicalized (e.g. already deleted) reports no
+/// holders — the safe "nothing left to wait for" answer.
+pub fn open_holders_under(path: &Path) -> Vec<String> {
+    let canonical = match safe_canonicalize(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    match LMDB_REGISTRY.get() {
+        Some(registry) => registry
+            .iter()
+            .filter(|entry| entry.key().starts_with(&canonical))
+            .map(|entry| entry.value().description.clone())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 // ── TrackedEnv wrapper ──────────────────────────────────────────
 
 /// Wrapper around [`heed::Env`] that prevents double-open panics.
@@ -213,6 +243,10 @@ mod tests {
     fn make_opts_sized(map_size: usize) -> heed::EnvOpenOptions {
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(map_size).max_dbs(1);
+        // Every test open carries the baseline flags per the AGENTS.md rule
+        // ("open every env with BASE_ENV_FLAGS") so new tests cannot drift
+        // from production open options.
+        unsafe { opts.flags(BASE_ENV_FLAGS) };
         opts
     }
 
@@ -278,6 +312,84 @@ mod tests {
 
         let _env1 = unsafe { TrackedEnv::open(&opts, dir1.path(), "test-1").unwrap() };
         let _env2 = unsafe { TrackedEnv::open(&opts, dir2.path(), "test-2").unwrap() };
+    }
+
+    /// `open_holders_under` reports every live env at or under the queried
+    /// path — the precondition check `remove_repo`'s lock-class retry waits
+    /// on. Must see (a) an env whose path IS the queried path and (b) an env
+    /// in a SUBDIRECTORY (the `scip/` case), with each holder's description
+    /// carried for triage.
+    #[test]
+    fn open_holders_under_reports_envs_at_and_below_path() {
+        let tmp = TempDir::new().unwrap();
+        let db_dir = tmp.path().join("proj").join(".codesearch.db");
+        std::fs::create_dir_all(db_dir.join("scip")).unwrap();
+        let opts = make_opts();
+
+        let _env_db = unsafe { TrackedEnv::open(&opts, &db_dir, "SharedStores(proj)").unwrap() };
+        let _env_scip =
+            unsafe { TrackedEnv::open(&opts, &db_dir.join("scip"), "SCIP(proj)").unwrap() };
+
+        let holders = open_holders_under(&tmp.path().join("proj").join(".codesearch.db"));
+        assert_eq!(
+            holders.len(),
+            2,
+            "both the db-dir env and the scip-subdir env must be reported, got: {holders:?}"
+        );
+        assert!(holders.contains(&"SharedStores(proj)".to_string()));
+        assert!(holders.contains(&"SCIP(proj)".to_string()));
+    }
+
+    /// Component-boundary safety: `base/foobar` must NOT count as a holder
+    /// under `base/foo` — `Path::starts_with` is component-wise, and a string
+    /// prefix match here would make `remove_repo` wait on (and warn about)
+    /// holders of an entirely different repo's database.
+    #[test]
+    fn open_holders_under_does_not_match_partial_component() {
+        let tmp = TempDir::new().unwrap();
+        let foo = tmp.path().join("foo");
+        let foobar = tmp.path().join("foobar");
+        std::fs::create_dir_all(&foo).unwrap();
+        std::fs::create_dir_all(&foobar).unwrap();
+        let opts = make_opts();
+
+        let _env = unsafe { TrackedEnv::open(&opts, &foobar, "other-repo").unwrap() };
+
+        assert!(
+            open_holders_under(&foo).is_empty(),
+            "env at a sibling path sharing a string prefix must not be reported"
+        );
+    }
+
+    /// The drain contract: once the last `TrackedEnv` drops, its registry slot
+    /// goes with it — an empty `Vec` is `remove_repo`'s "deletable now" signal
+    /// and must not lag behind the actual drop.
+    #[test]
+    fn open_holders_under_is_empty_after_env_drops() {
+        let dir = TempDir::new().unwrap();
+        let opts = make_opts();
+
+        {
+            let _env = unsafe { TrackedEnv::open(&opts, dir.path(), "transient-search").unwrap() };
+            assert!(
+                !open_holders_under(dir.path()).is_empty(),
+                "holder must be visible while the env is live"
+            );
+        }
+
+        assert!(
+            open_holders_under(dir.path()).is_empty(),
+            "holder must be gone after the env drops"
+        );
+    }
+
+    /// A path that cannot be canonicalized (e.g. already deleted by a
+    /// concurrent cleaner) reports no holders — the safe "nothing left to
+    /// wait for" answer, never a spurious error.
+    #[test]
+    fn open_holders_under_reports_none_for_missing_path() {
+        let missing = std::env::temp_dir().join("codesearch-never-exists-here");
+        assert!(open_holders_under(&missing).is_empty());
     }
 
     /// Regression guard for the concurrent open→drop→reopen path that produced
