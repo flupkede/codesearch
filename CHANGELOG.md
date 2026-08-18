@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.3.1]
+
+### Added
+
+- **`pre-commit` hook now enforces the root-md allowlist** (`.githooks/`): a commit that introduces (adds/copies/renames) a root-level `*.md` outside `AGENTS.md`, `AGENTS.develop.md`, `CLAUDE.md`, `README.md`, `README_CSharp.md`, `CHANGELOG.md`, `RELEASING.md` is rejected with a pointer to `.docs/`. Shipped together with the cleanup itself: the stray root mds (`DIAGNOSE_*`, `PLAN_*`, `TEST-SCENARIO-*`) and the tracked `docs/` folder were dissolved into the gitignored `.docs/` folder, and the rule is documented in AGENTS.md, section *Root file hygiene (markdown)*. Requires `git config core.hooksPath .githooks` (already set in existing clones; fresh clones see `.githooks/README.md`).
+
 ## [1.3.0] - 2026-08-15
 
 ### Added
