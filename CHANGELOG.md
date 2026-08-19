@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.3.4]
+
+### Fixed
+
+- **`TrackedEnv` drop never actually closed the heed environment — the real cause of `index rm`'s deterministic Windows failure (os error 32).** heed 0.20's process-global `OPENED_ENV` cache holds a strong `Env` clone inside its entry, so dropping the last user-side `Env` leaves the Arc count at exactly 1 (the entry's own) and `mdb_env_close` never runs. On POSIX that silently leaks an fd + mmap; on Windows it locks `data.mdb`/`lock.mdb` against deletion for the life of the process — which made `serve::tests::index_rm_deletes_db_while_serve_holds_real_lmdb_env` fail deterministically through the whole 60 s retry budget with an *empty* LMDB registry (the holder is invisible to it: the registry tracks `TrackedEnv`s, not heed-internal Arc clones), and would equally block a real `codesearch index rm` against a running serve from ever deleting the DB dir. Diagnosed with a minimal serve-free repro (open `SharedStores` → drop → `data.mdb` still locked, `env_closing_event` still `Some`). `TrackedEnv::drop` now closes via `Env::prepare_for_closing()` — heed's one real close path, which takes the entry's reference out and closes synchronously — before freeing our own registry slot (the existing slot-ordering invariant is preserved and now actually holds). Regression tests pin both levels: `drop_really_closes_heed_env_and_releases_the_files` (registry level: heed's `OPENED_ENV` entry must be gone after drop, db dir deletable) and `sharedstores_drop_releases_db_dir_for_deletion` (production shape, serve-free, instant). The previously failing acceptance test now passes 3/3 in ~0.6 s instead of failing in ~62 s; full lib suite 612/612.
+
 ## [1.3.3] - 2026-08-18
 
 ### Added
