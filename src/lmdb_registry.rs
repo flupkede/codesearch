@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
 use crate::cache::safe_canonicalize;
@@ -137,6 +137,77 @@ pub fn open_holders_under(path: &Path) -> Vec<String> {
             .map(|entry| entry.value().description.clone())
             .collect(),
         None => Vec::new(),
+    }
+}
+
+// ── Shared-env cache ────────────────────────────────────────────
+
+/// Process-wide cache of LMDB environments that multiple components must use
+/// CONCURRENTLY (queries, rebuilds, per-language adapters on the same
+/// directory). Holds only [`Weak`] references: the cache never keeps an
+/// environment alive, it just hands out the live one when it exists. When the
+/// last user drops their `Arc`, the [`TrackedEnv`] drops, its registry slot
+/// frees, and the stale cache entry is reaped on the next lookup.
+static SHARED_ENVS: OnceLock<DashMap<PathBuf, Weak<TrackedEnv>>> = OnceLock::new();
+
+/// Open the environment at `path`, or return the already-open shared instance.
+///
+/// LMDB permits exactly one open environment per directory per process, so
+/// callers that may overlap in time (a rebuild vs. an in-flight query, the C#
+/// vs. TypeScript adapters on the same `db_path/scip`) must not each open
+/// their own — the second [`TrackedEnv::open`] trips the double-open guard and
+/// one side fails outright. This getter makes the collision impossible: the
+/// first caller opens (running `init` once to create the named databases) and
+/// everyone else receives a clone of the same `Arc`.
+///
+/// `build_opts` configures the [`heed::EnvOpenOptions`] and `init` runs once
+/// per environment lifetime, right after the open, before the handle is
+/// published to other threads. Writers then serialise on LMDB's own
+/// single-writer mutex and readers never block.
+///
+/// Both closures run while the cache's shard lock is held: they must not
+/// re-enter `get_or_open_shared_env` (a path hashing to the same shard
+/// self-deadlocks) and should stay cheap.
+///
+/// The env-var lookups inside `build_opts`/`init` run only when the directory
+/// is opened for the first time in this process — later override changes do
+/// not affect an already-shared environment.
+pub fn get_or_open_shared_env(
+    path: &Path,
+    description: &str,
+    build_opts: impl FnOnce(&mut heed::EnvOpenOptions),
+    init: impl FnOnce(&TrackedEnv) -> Result<()>,
+) -> Result<Arc<TrackedEnv>> {
+    let canonical = safe_canonicalize(path)
+        .with_context(|| format!("Cannot canonicalize LMDB path: {}", path.display()))?;
+    let cache = SHARED_ENVS.get_or_init(DashMap::new);
+
+    loop {
+        use dashmap::mapref::entry::Entry;
+        match cache.entry(canonical.clone()) {
+            Entry::Occupied(occupied) => {
+                if let Some(env) = occupied.get().upgrade() {
+                    return Ok(env);
+                }
+                // Last Arc dropped but the entry survived — reap and retry so
+                // the Vacant arm below performs a fresh open.
+                occupied.remove();
+            }
+            Entry::Vacant(vacant) => {
+                let mut opts = heed::EnvOpenOptions::new();
+                build_opts(&mut opts);
+                // SAFETY: caller contract — same as `TrackedEnv::open`. The
+                // registry slot guards against any concurrent direct open.
+                let tracked = unsafe { TrackedEnv::open(&opts, path, description)? };
+                // Run init before publishing: the `?` early-return drops
+                // `tracked`, freeing the registry slot, so a failed init
+                // leaves the path openable.
+                init(&tracked)?;
+                let env = Arc::new(tracked);
+                vacant.insert(Arc::downgrade(&env));
+                return Ok(env);
+            }
+        }
     }
 }
 
@@ -375,6 +446,104 @@ mod tests {
 
         let _env1 = unsafe { TrackedEnv::open(&opts, dir1.path(), "test-1").unwrap() };
         let _env2 = unsafe { TrackedEnv::open(&opts, dir2.path(), "test-2").unwrap() };
+    }
+
+    fn shared_opts(opts: &mut heed::EnvOpenOptions) {
+        opts.map_size(1024 * 1024).max_dbs(4);
+        // Every test open carries the baseline flags per the AGENTS.md rule.
+        unsafe { opts.flags(BASE_ENV_FLAGS) };
+    }
+
+    /// Direct-open options IDENTICAL to `shared_opts`. heed refuses to reopen
+    /// a path with different options (max_dbs included) even after the prior
+    /// env dropped — the AGENTS.md "same options on every open" rule — so the
+    /// direct opens in the shared-env tests must not reuse `make_opts`
+    /// (max_dbs 1).
+    fn shared_compatible_opts() -> heed::EnvOpenOptions {
+        let mut opts = heed::EnvOpenOptions::new();
+        shared_opts(&mut opts);
+        opts
+    }
+
+    /// Two callers of the shared getter receive the SAME environment — this is
+    /// the property whose absence made a watcher rebuild fail with
+    /// `LMDB double-open prevented` while a lazy find-refs held its own env.
+    #[test]
+    fn shared_env_returns_live_instance_to_concurrent_callers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let env1 = get_or_open_shared_env(&path, "shared-1", shared_opts, |_| Ok(())).unwrap();
+        let env2 = get_or_open_shared_env(&path, "shared-2", shared_opts, |_| Ok(())).unwrap();
+        assert!(Arc::ptr_eq(&env1, &env2));
+
+        // While the shared env is alive, a DIRECT open on the same path must
+        // still trip the guard — the shared env genuinely occupies the slot.
+        let direct = unsafe { TrackedEnv::open(&shared_compatible_opts(), &path, "direct") };
+        let err = direct.unwrap_err().to_string();
+        assert!(err.contains("double-open prevented"));
+        assert!(err.contains("shared-1"));
+    }
+
+    /// The cache holds only weak refs: once the last user drops their Arc the
+    /// registry slot frees (a direct open succeeds) and the next shared caller
+    /// transparently reopens.
+    #[test]
+    fn shared_env_reopens_after_all_arcs_drop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+
+        {
+            let _env = get_or_open_shared_env(&path, "shared-1", shared_opts, |_| Ok(())).unwrap();
+        }
+
+        // Slot freed after the last Arc dropped.
+        {
+            let _direct =
+                unsafe { TrackedEnv::open(&shared_compatible_opts(), &path, "direct").unwrap() };
+        }
+
+        // And the shared getter opens fresh again.
+        let _again = get_or_open_shared_env(&path, "shared-2", shared_opts, |_| Ok(())).unwrap();
+    }
+
+    /// An `init` failure must not leak the registry slot: the error propagates
+    /// and the env is dropped, leaving the path openable.
+    #[test]
+    fn shared_env_init_failure_frees_slot() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let result = get_or_open_shared_env(&path, "shared-1", shared_opts, |_| {
+            Err(anyhow::anyhow!("boom"))
+        });
+        assert!(result.is_err());
+
+        let _direct =
+            unsafe { TrackedEnv::open(&shared_compatible_opts(), &path, "direct").unwrap() };
+    }
+
+    /// N threads racing the FIRST open all succeed and all hold the same env —
+    /// no thread sees the double-open error the per-caller open produced.
+    #[test]
+    fn shared_env_concurrent_first_open_is_safe() {
+        let dir = TempDir::new().unwrap();
+        let path = Arc::new(dir.path().to_path_buf());
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    get_or_open_shared_env(&p, "shared-race", shared_opts, |_| Ok(()))
+                })
+            })
+            .collect();
+
+        let envs: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked").expect("open failed"))
+            .collect();
+        assert!(envs.windows(2).all(|w| Arc::ptr_eq(&w[0], &w[1])));
     }
 
     /// `open_holders_under` reports every live env at or under the queried

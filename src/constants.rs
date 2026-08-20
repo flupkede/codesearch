@@ -611,6 +611,9 @@ pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 /// LMDB database name for the SCIP symbols table.
 pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
 
+/// LMDB database name for the SCIP per-repo metadata table.
+pub const SCIP_META_DB_NAME: &str = "scip_meta";
+
 /// LMDB metadata key for the last rebuild timestamp.
 pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
 
