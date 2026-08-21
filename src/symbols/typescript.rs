@@ -20,20 +20,20 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::lmdb_registry::TrackedEnv;
 use anyhow::{Context, Result};
 use heed::types::{Bytes, Str};
-use heed::{Database, EnvOpenOptions};
+use heed::Database;
 use serde::{Deserialize, Serialize};
 
 use super::scip_proto;
 use super::{RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
 use crate::constants::{
-    LANG_TYPESCRIPT, SCIP_LMDB_DEFAULT_MAP_SIZE_MB, SCIP_LMDB_MAP_SIZE_MB_ENV,
-    SCIP_POSITION_DB_NAME, SCIP_SIMPLE_NAMES_DB_NAME, SCIP_SYMBOLS_DB_NAME,
+    LANG_TYPESCRIPT, SCIP_POSITION_DB_NAME, SCIP_SIMPLE_NAMES_DB_NAME, SCIP_SYMBOLS_DB_NAME,
     SCIP_TYPESCRIPT_HELPER_ENV, SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY,
 };
 
@@ -45,7 +45,7 @@ const SCIP_DB_NAME: &str = SCIP_SYMBOLS_DB_NAME;
 /// LMDB database name for the rebuild timestamp / metadata table.
 /// Shares the physical table with the C# adapter, but keys are namespaced
 /// per-language (see `SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY`).
-const SCIP_META_DB_NAME: &str = "scip_meta";
+const SCIP_META_DB_NAME: &str = crate::constants::SCIP_META_DB_NAME;
 
 /// LMDB database name for the position-to-symbols index.
 const SCIP_POS_DB_NAME: &str = SCIP_POSITION_DB_NAME;
@@ -263,33 +263,14 @@ impl TypeScriptSymbolIndexer {
         }
     }
 
-    /// Open or create the SCIP LMDB environment for a given repo database path.
-    /// Shares the same on-disk tables as the C# adapter (`db_path/scip/`),
-    /// distinguished by namespaced keys/values where needed.
-    fn open_scip_env(&self, db_path: &Path) -> Result<TrackedEnv> {
-        let scip_dir = db_path.join("scip");
-        std::fs::create_dir_all(&scip_dir)
-            .with_context(|| format!("Failed to create SCIP directory: {}", scip_dir.display()))?;
-
-        let map_size_mb = std::env::var(SCIP_LMDB_MAP_SIZE_MB_ENV)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(SCIP_LMDB_DEFAULT_MAP_SIZE_MB);
-        let mut opts = EnvOpenOptions::new();
-        opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
-        // SAFETY: `NO_TLS` only changes reader-slot tracking. See `BASE_ENV_FLAGS`.
-        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
-        let env =
-            unsafe { TrackedEnv::open(&opts, &scip_dir, &format!("SCIP({})", db_path.display()))? };
-
-        let mut wtxn = env.write_txn()?;
-        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_DB_NAME))?;
-        env.create_database::<Str, Str>(&mut wtxn, Some(SCIP_META_DB_NAME))?;
-        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_POS_DB_NAME))?;
-        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_NAMES_DB_NAME))?;
-        wtxn.commit()?;
-
-        Ok(env)
+    /// Open the shared SCIP LMDB environment for a given repo database path.
+    ///
+    /// Delegates to [`crate::symbols::get_shared_scip_env`] — TS shares the
+    /// C# adapter's `db_path/scip/` directory (distinguished by namespaced
+    /// keys), so it must also share its environment: two adapters opening the
+    /// same directory concurrently would trip the double-open guard.
+    fn open_scip_env(&self, db_path: &Path) -> Result<Arc<TrackedEnv>> {
+        crate::symbols::get_shared_scip_env(db_path)
     }
 
     /// Invoke `scip-typescript index` against `project_root`, writing the SCIP

@@ -14,7 +14,7 @@ pub mod typescript;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 // ── Common types ──────────────────────────────────────────────────
@@ -77,6 +77,72 @@ pub enum RebuildScope {
         /// Deleted `.cs` files (not present in the new index output).
         deleted: Vec<PathBuf>,
     },
+}
+
+// ── Shared SCIP environment ──────────────────────────────────────
+
+/// Open (or reuse) the process-wide shared SCIP LMDB environment for `db_path`.
+///
+/// Both the C# and TypeScript adapters store symbol data in the same
+/// `db_path/scip` directory, and LMDB allows exactly ONE open environment per
+/// directory per process. Historically every operation opened its own
+/// short-lived env, so two overlapping operations — e.g. a watcher-triggered
+/// rebuild starting while a lazy `find-refs` call held its env for minutes —
+/// tripped the double-open guard and one side failed outright
+/// (`LMDB double-open prevented`, surfaced as a red `C#!` in the TUI).
+/// Routing every open through this getter hands all concurrent users the SAME
+/// environment: writers serialise on LMDB's single-writer mutex, readers never
+/// block, and the double-open error class cannot occur.
+pub(crate) fn get_shared_scip_env(
+    db_path: &Path,
+) -> Result<std::sync::Arc<crate::lmdb_registry::TrackedEnv>> {
+    let scip_dir = db_path.join("scip");
+    std::fs::create_dir_all(&scip_dir)
+        .with_context(|| format!("Failed to create SCIP directory: {}", scip_dir.display()))?;
+
+    crate::lmdb_registry::get_or_open_shared_env(
+        &scip_dir,
+        &format!("SCIP({})", db_path.display()),
+        |opts| {
+            // map_size is virtual address space (not RSS); the OS only faults
+            // in written pages. Read once per env lifetime.
+            let map_size_mb = std::env::var(crate::constants::SCIP_LMDB_MAP_SIZE_MB_ENV)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(crate::constants::SCIP_LMDB_DEFAULT_MAP_SIZE_MB);
+            opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
+            // SAFETY: `NO_TLS` only changes reader-slot tracking. See `BASE_ENV_FLAGS`.
+            unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
+        },
+        |env| {
+            // Pre-create every named database (both languages') exactly once
+            // per env session: LMDB requires named DBs to exist before they
+            // can be opened in read txns.
+            let mut wtxn = env.write_txn()?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_SYMBOLS_DB_NAME),
+            )?;
+            env.create_database::<heed::types::Str, heed::types::Str>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_META_DB_NAME),
+            )?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_POSITION_DB_NAME),
+            )?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_SIMPLE_NAMES_DB_NAME),
+            )?;
+            env.create_database::<heed::types::Str, heed::types::Bytes>(
+                &mut wtxn,
+                Some(crate::constants::SCIP_REF_CACHE_DB_NAME),
+            )?;
+            wtxn.commit()?;
+            Ok(())
+        },
+    )
 }
 
 /// Summary returned after a rebuild completes.
@@ -233,5 +299,23 @@ impl SymbolIndexerRegistry {
 impl Default for SymbolIndexerRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scip getter must hand out ONE shared env per `db_path` — the exact
+    /// property that stops a rebuild and an in-flight lazy find-refs (or the
+    /// TypeScript adapter) from failing each other with the double-open error.
+    #[test]
+    fn shared_scip_env_is_shared_across_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("codesearch.db");
+
+        let env1 = get_shared_scip_env(&db_path).unwrap();
+        let env2 = get_shared_scip_env(&db_path).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&env1, &env2));
     }
 }

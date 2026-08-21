@@ -1509,9 +1509,28 @@ impl ServeState {
         None
     }
 
+    /// Drop cached C# symbol-index status/error for `alias`.
+    ///
+    /// `repo_statuses_lightweight()` prefers these cached entries over its
+    /// on-disk probe, so a cached `Error` outlives the repo itself: a closed
+    /// repo has no watcher left to retry a rebuild or emit `Succeeded`, and
+    /// the red `C#!` it causes in the TUI freezes forever (observed on a repo
+    /// whose rebuild lost a one-shot LMDB double-open race days earlier).
+    /// Remove the entries letting the probe (helper available + index
+    /// exists → Ready) restore the on-disk truth. Called from idle eviction
+    /// and `close_repo` (force-reindex reopen). `remove_repo` deliberately
+    /// does NOT call this: once the alias is unregistered the entries are
+    /// display-unreachable (`repo_statuses_lightweight` iterates registered
+    /// repos only), so a clear there would be dead code.
+    fn clear_csharp_index_state(&self, alias: &str) {
+        self.csharp_index_status.remove(alias);
+        self.csharp_index_error.remove(alias);
+    }
+
     /// Remove a repo from the DashMap, dropping its stores and releasing
     /// LMDB file handles. Used before force-reindex reopen.
     fn close_repo(&self, alias: &str) {
+        self.clear_csharp_index_state(alias);
         if self.repos.remove(alias).is_some() {
             tracing::info!(
                 "Closed repo '{}' (dropped stores, released LMDB handles)",
@@ -2945,6 +2964,10 @@ impl ServeState {
             // deleted (the repo can be re-opened on the next query), so we
             // don't need to await — the cancelled task drains on its own.
             self.fsw_tasks.remove(alias);
+            // Cached C# symbol-index state must not outlive the repo (see
+            // clear_csharp_index_state): without this, an Error entry frozen
+            // from a lost double-open race renders red forever.
+            self.clear_csharp_index_state(alias);
             match self.repos.remove(alias) {
                 Some((_, RepoState::Write { cancel_token, .. })) => {
                     cancel_token.cancel();
