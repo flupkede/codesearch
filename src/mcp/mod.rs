@@ -434,7 +434,11 @@ pub(crate) enum ImpactLookupOutcome {
 /// hinted by the busy answer is served warm. `budget_secs == 0` disables the
 /// race entirely. Kept generic over the future so tests can plant a sleeping
 /// handler instead of a real SCIP helper.
-pub(crate) async fn find_impact_with_budget<F>(budget_secs: u64, state: String, lookup: F) -> ImpactLookupOutcome
+pub(crate) async fn find_impact_with_budget<F>(
+    budget_secs: u64,
+    state: String,
+    lookup: F,
+) -> ImpactLookupOutcome
 where
     F: std::future::Future<Output = Result<Vec<SymbolReference>, anyhow::Error>>,
 {
@@ -464,6 +468,12 @@ mod proxy_idle_tests;
 #[cfg(test)]
 #[path = "await_peer_tests.rs"]
 mod await_peer_tests;
+
+/// Tests for the `find_impact` wall-clock budget: sleeping-handler race
+/// tests (generic lookup future) plus `#[serial]` env-resolution tests.
+#[cfg(test)]
+#[path = "find_impact_tests.rs"]
+mod find_impact_tests;
 
 impl ServerHandler for McpProxyService {
     fn get_info(&self) -> ServerInfo {
@@ -5063,10 +5073,7 @@ impl CodesearchService {
             None
         };
         let what = if has_name {
-            format!(
-                "'{}'",
-                symbol_name_for_lookup.as_deref().unwrap_or("?")
-            )
+            format!("'{}'", symbol_name_for_lookup.as_deref().unwrap_or("?"))
         } else {
             format!(
                 "{}:{}",
@@ -5095,9 +5102,7 @@ impl CodesearchService {
                 if has_name {
                     indexer.find_references(
                         &db_path_for_lookup,
-                        symbol_name_for_lookup
-                            .as_deref()
-                            .unwrap_or(""),
+                        symbol_name_for_lookup.as_deref().unwrap_or(""),
                     )
                 } else {
                     indexer.find_references_by_position(
@@ -5133,9 +5138,9 @@ impl CodesearchService {
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            ImpactLookupOutcome::Done(Err(e)) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Symbol lookup failed: {e:#}"
-            ))])),
+            ImpactLookupOutcome::Done(Err(e)) => Ok(CallToolResult::success(vec![Content::text(
+                format!("Symbol lookup failed: {e:#}"),
+            )])),
             ImpactLookupOutcome::Busy { state, waited_ms } => {
                 tracing::warn!(
                     "find_impact budget overrun after {}ms (budget {}s): {} — answering busy, lookup continues in background",
