@@ -707,6 +707,28 @@ pub const SCIP_LMDB_DEFAULT_MAP_SIZE_MB: usize = 512;
 /// When set, takes precedence over `SCIP_LMDB_DEFAULT_MAP_SIZE_MB`.
 pub const SCIP_LMDB_MAP_SIZE_MB_ENV: &str = "CODESEARCH_SCIP_LMDB_MAP_MB";
 
+/// Internal wall-clock budget (seconds) for a single `find_impact` reference
+/// lookup.
+///
+/// A cold reference-cache miss makes the `find_impact` handler invoke the
+/// external SCIP helper (`scip-csharp find-refs`), which can take several
+/// minutes on a large solution. Without an internal deadline the MCP client
+/// is the timeout mechanism: it aborts with an opaque `-32001 Request timed
+/// out` and the calling agent falls back to plain-text search exactly when
+/// the precise SCIP call graph is most useful. This budget makes the server
+/// answer first with a structured busy envelope
+/// (`{"busy": true, "state": ..., "waited_ms": ..., "advice": ...}`) while
+/// the lookup continues in the background, so a retry is served warm from
+/// the reference cache instead of cold again.
+///
+/// Override at runtime with `CODESEARCH_FIND_IMPACT_BUDGET_SECS` (integer
+/// seconds). `0` disables the budget entirely, restoring the previous
+/// unbounded-blocking behaviour. Unparseable values fall back to the default.
+pub const DEFAULT_FIND_IMPACT_BUDGET_SECS: u64 = 60;
+
+/// Environment variable to override `DEFAULT_FIND_IMPACT_BUDGET_SECS`.
+pub const FIND_IMPACT_BUDGET_SECS_ENV: &str = "CODESEARCH_FIND_IMPACT_BUDGET_SECS";
+
 /// Debounce window (seconds) for persisting repos.json metadata updates.
 /// Coalesces bursts of file changes into a single write.
 pub const PERSIST_DEBOUNCE_SECS: u64 = 10;

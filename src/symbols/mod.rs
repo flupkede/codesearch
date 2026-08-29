@@ -58,6 +58,27 @@ pub struct SymbolIndexError {
     pub hint_for_agent: String,
 }
 
+/// Structured busy answer returned when a `find_impact` lookup exceeds its
+/// internal wall-clock budget.
+///
+/// The MCP client must never be the timeout mechanism: when the budget
+/// overruns, the server answers with this envelope (serialized as JSON in
+/// the tool-result text) while the lookup keeps running in the background.
+/// A caller can branch on `busy == true` instead of parsing an opaque
+/// client-side timeout, and the retry hinted in `advice` is served from the
+/// reference cache the running lookup will have populated.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolLookupBusy {
+    /// Always `true`; makes the envelope self-describing.
+    pub busy: bool,
+    /// What is still running, e.g. `"resolving 'Ns.I.M' via the csharp SCIP helper"`.
+    pub state: String,
+    /// Wall-clock time the request waited before the budget overran.
+    pub waited_ms: u64,
+    /// Actionable retry hint, e.g. `"retry the same call in ~60s"`.
+    pub advice: String,
+}
+
 /// Which files/projects to reindex.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

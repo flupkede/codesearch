@@ -34,7 +34,7 @@ use crate::fts::FtsStore;
 use crate::index::{IndexManager, SharedStores};
 use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_RRF_K};
 use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
-use crate::symbols::SymbolIndexerRegistry;
+use crate::symbols::{SymbolIndexerRegistry, SymbolReference};
 use crate::vectordb::VectorStore;
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -398,6 +398,57 @@ fn is_idle(
         return false;
     }
     now.saturating_duration_since(last_activity).as_secs() >= threshold_secs
+}
+
+/// Resolve the `find_impact` wall-clock budget: env var →
+/// `DEFAULT_FIND_IMPACT_BUDGET_SECS`. `0` disables the budget (unbounded
+/// lookup, the pre-budget behaviour). Mirrors
+/// `resolve_proxy_idle_disconnect_secs`.
+fn resolve_find_impact_budget_secs() -> u64 {
+    std::env::var(crate::constants::FIND_IMPACT_BUDGET_SECS_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(crate::constants::DEFAULT_FIND_IMPACT_BUDGET_SECS)
+}
+
+/// Outcome of a budget-bounded `find_impact` lookup.
+pub(crate) enum ImpactLookupOutcome {
+    /// The lookup finished within the budget (or the budget is disabled).
+    /// `Err` preserves the store/helper failure for the caller to report.
+    Done(Result<Vec<SymbolReference>, anyhow::Error>),
+    /// The budget overran; the lookup keeps running in the background.
+    Busy {
+        /// What is still running (goes into the busy envelope verbatim).
+        state: String,
+        /// Wall-clock time actually waited before giving up.
+        waited_ms: u64,
+    },
+}
+
+/// Race a `find_impact` lookup against its wall-clock budget.
+///
+/// `lookup` is the already-offloaded lookup future (the handler runs the
+/// blocking SCIP call on `spawn_blocking`); it is NOT cancelled on overrun —
+/// dropping the future abandons it while the detached blocking task keeps
+/// running, so its reference-cache writes still land in LMDB and the retry
+/// hinted by the busy answer is served warm. `budget_secs == 0` disables the
+/// race entirely. Kept generic over the future so tests can plant a sleeping
+/// handler instead of a real SCIP helper.
+pub(crate) async fn find_impact_with_budget<F>(budget_secs: u64, state: String, lookup: F) -> ImpactLookupOutcome
+where
+    F: std::future::Future<Output = Result<Vec<SymbolReference>, anyhow::Error>>,
+{
+    if budget_secs == 0 {
+        return ImpactLookupOutcome::Done(lookup.await);
+    }
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(std::time::Duration::from_secs(budget_secs), lookup).await {
+        Ok(result) => ImpactLookupOutcome::Done(result),
+        Err(_elapsed) => ImpactLookupOutcome::Busy {
+            state,
+            waited_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -4990,13 +5041,19 @@ impl CodesearchService {
             )]));
         }
 
-        // Perform the lookup.
+        // Perform the lookup under an internal wall-clock budget.
         //
         // `find_references` may invoke `scip-csharp find-refs` on a cache miss
         // (lazy Opt-2 reference resolution). That subprocess can take several minutes
-        // on a large solution, so we use `block_in_place` to avoid blocking the async
-        // executor thread. `block_in_place` is safe here: we are inside a
-        // multi-threaded tokio runtime and do not hold any async locks.
+        // on a large solution. The call therefore runs on `spawn_blocking` (it never
+        // blocks an async worker thread) and is raced against
+        // CODESEARCH_FIND_IMPACT_BUDGET_SECS: on overrun the caller gets a structured
+        // busy answer instead of the MCP client winning the timeout race. The
+        // blocking task is abandoned, not cancelled — its cache writes still land
+        // in LMDB, so the hinted retry is served warm.
+        let language_for_lookup = indexer.language().to_string();
+        let symbol_name_for_lookup = request.symbol_name.clone();
+        let line_for_lookup = request.line;
         let file_for_pos = if !has_name {
             Some(self.normalize_symbol_query_path(
                 &project_root,
@@ -5005,22 +5062,57 @@ impl CodesearchService {
         } else {
             None
         };
-        let symbol_name_for_lookup = request.symbol_name.clone();
-        let line_for_lookup = request.line;
-        let result = tokio::task::block_in_place(|| {
-            if has_name {
-                indexer.find_references(&db_path, symbol_name_for_lookup.as_ref().unwrap())
-            } else {
-                indexer.find_references_by_position(
-                    &db_path,
-                    &file_for_pos.unwrap(),
-                    line_for_lookup.unwrap(),
-                )
-            }
-        });
+        let what = if has_name {
+            format!(
+                "'{}'",
+                symbol_name_for_lookup.as_deref().unwrap_or("?")
+            )
+        } else {
+            format!(
+                "{}:{}",
+                request.file.as_deref().unwrap_or("?"),
+                line_for_lookup.unwrap_or(0)
+            )
+        };
+        let busy_state = format!(
+            "resolving {} via the {} SCIP helper (cold reference cache)",
+            what, language_for_lookup
+        );
+        let budget_secs = resolve_find_impact_budget_secs();
+        let registry_for_lookup = self.symbol_registry.clone();
+        let db_path_for_lookup = db_path.clone();
+        let file_for_lookup = file_for_pos;
+        let lookup = async move {
+            tokio::task::spawn_blocking(move || {
+                let indexer = registry_for_lookup
+                    .get(&language_for_lookup)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "symbol indexer for '{}' disappeared mid-request",
+                            language_for_lookup
+                        )
+                    })?;
+                if has_name {
+                    indexer.find_references(
+                        &db_path_for_lookup,
+                        symbol_name_for_lookup
+                            .as_deref()
+                            .unwrap_or(""),
+                    )
+                } else {
+                    indexer.find_references_by_position(
+                        &db_path_for_lookup,
+                        &file_for_lookup.unwrap_or_default(),
+                        line_for_lookup.unwrap_or(0),
+                    )
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("symbol lookup task failed: {e:#}"))?
+        };
 
-        match result {
-            Ok(references) => {
+        match find_impact_with_budget(budget_secs, busy_state, lookup).await {
+            ImpactLookupOutcome::Done(Ok(references)) => {
                 let age = indexer.index_age(&db_path);
                 let impact = crate::symbols::FindImpactResult {
                     symbol: request.symbol_name.clone().unwrap_or_else(|| {
@@ -5041,9 +5133,29 @@ impl CodesearchService {
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+            ImpactLookupOutcome::Done(Err(e)) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Symbol lookup failed: {e:#}"
             ))])),
+            ImpactLookupOutcome::Busy { state, waited_ms } => {
+                tracing::warn!(
+                    "find_impact budget overrun after {}ms (budget {}s): {} — answering busy, lookup continues in background",
+                    waited_ms,
+                    budget_secs,
+                    state
+                );
+                let busy = crate::symbols::SymbolLookupBusy {
+                    busy: true,
+                    state,
+                    waited_ms,
+                    advice: format!(
+                        "retry the same call in ~{}s; the lookup keeps running in the background and the retry is served from cache once it completes",
+                        budget_secs.max(1)
+                    ),
+                };
+                let json =
+                    serde_json::to_string(&busy).unwrap_or_else(|_| "{\"busy\":true}".to_string());
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
         }
     }
 
