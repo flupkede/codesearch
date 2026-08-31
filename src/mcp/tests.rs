@@ -2613,3 +2613,225 @@ fn test_grep_format_no_comment_when_plain() {
     let output = lines.join("\n");
     assert!(!output.starts_with('#'));
 }
+
+// === shared-store second-open policy (stdio MCP vs standalone CLI) ===
+
+#[test]
+fn stdio_shared_stores_must_not_open_second_vector_store() {
+    // codesearch mcp --mode local: SharedStores is Some, serve_state is None.
+    // Old code gated only on serve_state and still called VectorStore::new / open_readonly.
+    assert!(
+        !super::allow_vector_store_second_open(true),
+        "stdio MCP with live shared_stores must not open a second LMDB VectorStore"
+    );
+}
+
+#[test]
+fn serve_shared_stores_must_not_open_second_vector_store() {
+    assert!(!super::allow_vector_store_second_open(true));
+}
+
+#[test]
+fn standalone_cli_without_shared_stores_may_open_vector_store() {
+    assert!(super::allow_vector_store_second_open(false));
+}
+
+#[tokio::test]
+async fn shared_store_failure_preserves_original_error_without_reopening_lmdb() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let db_path = root.path().join(".codesearch.db");
+    let stores =
+        std::sync::Arc::new(crate::index::SharedStores::new(&db_path, 2).expect("shared stores"));
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .expect("metadata");
+    let service =
+        super::CodesearchService::new_with_stores(Some(root.path().to_path_buf()), Some(stores))
+            .expect("service");
+
+    let result: anyhow::Result<()> = service
+        .with_vector_store_read_for(
+            |_| Err(anyhow::anyhow!("sentinel shared-store read failure")),
+            None,
+        )
+        .await;
+    let error = result.expect_err("shared-store failure must propagate");
+    assert!(
+        format!("{error:#}").contains("sentinel shared-store read failure"),
+        "fallback must not replace the original error with a second-open error"
+    );
+}
+
+#[test]
+fn prebuilt_index_health_requires_vector_and_full_text_data() {
+    let db_path = std::path::Path::new("/tmp/test-codesearch.db");
+    assert!(super::validate_prebuilt_index_health(db_path, 10, true, 10, false).is_ok());
+
+    for (chunks, indexed, fts_documents, partial) in [
+        (0, true, 10, false),
+        (10, false, 10, false),
+        (10, true, 0, false),
+        (10, true, 10, true),
+    ] {
+        let error =
+            super::validate_prebuilt_index_health(db_path, chunks, indexed, fts_documents, partial)
+                .expect_err("incomplete prebuilt index must fail");
+        assert!(error.to_string().contains("Run `codesearch index`"));
+    }
+}
+
+#[tokio::test]
+async fn require_ready_reads_live_stores_and_rejects_partial_metadata() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let db_path = root.path().join(".codesearch.db");
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    {
+        let mut vector_store = stores.vector_store.write().await;
+        let chunk = crate::chunker::Chunk::new(
+            "fn ready() {}".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/lib.rs".to_string(),
+        );
+        vector_store
+            .insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+                chunk,
+                vec![0.0, 1.0],
+            )])
+            .expect("insert vector chunk");
+        vector_store.build_index().expect("build vector index");
+    }
+    {
+        let mut fts_store = stores.fts_store.write().await;
+        fts_store
+            .add_chunk(0, "fn ready() {}", "src/lib.rs", None, "Function")
+            .expect("insert FTS document");
+        fts_store.commit().expect("commit FTS document");
+    }
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"partial":false}"#,
+    )
+    .expect("complete metadata");
+
+    super::require_prebuilt_index_ready(&stores, &db_path)
+        .await
+        .expect("complete live stores must be ready");
+
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"partial":true}"#,
+    )
+    .expect("partial metadata");
+    let error = super::require_prebuilt_index_ready(&stores, &db_path)
+        .await
+        .expect_err("partial index must not be ready");
+    assert!(error.to_string().contains("partial=true"));
+
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2}"#,
+    )
+    .expect("metadata without readiness marker");
+    let error = super::require_prebuilt_index_ready(&stores, &db_path)
+        .await
+        .expect_err("missing partial marker must not be ready");
+    assert!(error
+        .to_string()
+        .contains("missing the partial readiness marker"));
+
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"partial":"false"}"#,
+    )
+    .expect("malformed metadata");
+    let error = super::require_prebuilt_index_ready(&stores, &db_path)
+        .await
+        .expect_err("non-boolean partial marker must not be ready");
+    assert!(error.to_string().contains("partial must be a boolean"));
+}
+
+#[test]
+fn readiness_gate_runs_before_the_transport_opens() {
+    // Startup must fail while the caller can still see the error, rather than
+    // serving `status: building` on an index nothing in this process can build.
+    let src = include_str!("mod.rs");
+    let gate = src
+        .find("if startup.require_ready {")
+        .expect("run_mcp_server must gate on --require-ready");
+    let readiness = src[gate..]
+        .find("require_prebuilt_index_ready(&shared_stores, &db_path).await?")
+        .map(|offset| gate + offset)
+        .expect("--require-ready must validate index readiness");
+    let serve = src[readiness..]
+        .find("service.serve(stdio()).await?")
+        .map(|offset| readiness + offset)
+        .expect("MCP server startup must follow readiness validation");
+    assert!(readiness < serve);
+}
+
+#[test]
+fn mcp_write_access_is_decided_by_readonly_not_create_index() {
+    let src = include_str!("mod.rs");
+    let start = src
+        .find("pub async fn run_mcp_server")
+        .expect("run_mcp_server must exist");
+    let body = &src[start..];
+    assert!(
+        body.contains("let (shared_stores, is_readonly) = if startup.readonly {"),
+        "write access must be decided by --readonly alone"
+    );
+    assert!(
+        !body.contains("create_index && !is_readonly"),
+        "background refresh must not be gated on --create-index"
+    );
+}
+
+#[test]
+fn local_startup_flags_fail_in_modes_that_would_ignore_them() {
+    for mode in [super::McpMode::Auto, super::McpMode::Client] {
+        assert!(super::validate_local_startup_flags(mode, true, false).is_err());
+        assert!(super::validate_local_startup_flags(mode, false, true).is_err());
+    }
+    assert!(super::validate_local_startup_flags(super::McpMode::Local, true, true).is_ok());
+}
+
+#[test]
+fn readonly_or_require_ready_never_creates_a_missing_index() {
+    assert!(super::may_create_missing_index(true, false, false));
+    assert!(!super::may_create_missing_index(false, false, false));
+    assert!(!super::may_create_missing_index(true, true, false));
+    assert!(!super::may_create_missing_index(true, false, true));
+}
+
+#[test]
+fn with_vector_store_read_for_does_not_fallback_when_shared_stores_live() {
+    // Source contract: after a shared-store action Err, do not call VectorStore::new
+    // or open_readonly. The helper above is the runtime gate; this catches a
+    // serve_state-only guard being reintroduced next to the fallback opens.
+    let src = include_str!("mod.rs");
+    let marker = "async fn with_vector_store_read_for";
+    let start = src
+        .find(marker)
+        .expect("with_vector_store_read_for must exist");
+    let rest = &src[start..];
+    let end = rest
+        .find("/// Execute a read-only action against the FTS store")
+        .expect("FTS read helper must follow vector read helper");
+    let body = &rest[..end];
+    assert!(
+        body.contains("allow_vector_store_second_open"),
+        "vector-store read fallback must consult the shared-store second-open gate"
+    );
+    assert!(
+        !body.contains("serve_state.is_some()"),
+        "stdio MCP has no serve_state; do not gate LMDB second-open on serve only"
+    );
+    assert!(
+        !body.contains("VectorStore::open_readonly"),
+        "must not reopen LMDB readonly while shared_stores is live"
+    );
+}
