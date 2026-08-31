@@ -729,6 +729,15 @@ pub const DEFAULT_FIND_IMPACT_BUDGET_SECS: u64 = 60;
 /// Environment variable to override `DEFAULT_FIND_IMPACT_BUDGET_SECS`.
 pub const FIND_IMPACT_BUDGET_SECS_ENV: &str = "CODESEARCH_FIND_IMPACT_BUDGET_SECS";
 
+/// How long (seconds) a budget-overrun `find_impact` lookup stays tracked
+/// for retry observation. Must comfortably exceed the slowest legitimate
+/// `scip-csharp find-refs` run (several minutes on a large solution): an
+/// entry dropped while its lookup is still running would turn a retry into
+/// a cold restart, voiding the dedupe the busy advice promises. Finished
+/// entries are removed on their first retry read, so this cap only bounds
+/// abandoned lookups.
+pub const FIND_IMPACT_TRACK_TTL_SECS: u64 = 1800;
+
 /// Debounce window (seconds) for persisting repos.json metadata updates.
 /// Coalesces bursts of file changes into a single write.
 pub const PERSIST_DEBOUNCE_SECS: u64 = 10;

@@ -73,7 +73,9 @@ pub struct SymbolLookupBusy {
     pub busy: bool,
     /// What is still running, e.g. `"resolving 'Ns.I.M' via the csharp SCIP helper"`.
     pub state: String,
-    /// Wall-clock time the request waited before the budget overran.
+    /// Wall-clock time the request waited before the budget overran. On the
+    /// retry answer for a tracked lookup this is the background lookup's
+    /// cumulative elapsed time instead.
     pub waited_ms: u64,
     /// Actionable retry hint, e.g. `"retry the same call in ~60s"`.
     pub advice: String,

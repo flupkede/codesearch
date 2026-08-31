@@ -475,6 +475,11 @@ mod await_peer_tests;
 #[path = "find_impact_tests.rs"]
 mod find_impact_tests;
 
+/// Background-continuation registry for budget-overrun `find_impact`
+/// lookups: in-flight tracking keyed by (project, symbol) so a retry
+/// observes progress or the warm result instead of restarting cold.
+mod find_impact_tracker;
+
 impl ServerHandler for McpProxyService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -5060,7 +5065,9 @@ impl CodesearchService {
         // CODESEARCH_FIND_IMPACT_BUDGET_SECS: on overrun the caller gets a structured
         // busy answer instead of the MCP client winning the timeout race. The
         // blocking task is abandoned, not cancelled — its cache writes still land
-        // in LMDB, so the hinted retry is served warm.
+        // in LMDB, so the hinted retry is served warm; the lookup tracker
+        // (find_impact_tracker) makes that retry observe progress or the warm
+        // result explicitly instead of re-running the helper.
         let language_for_lookup = indexer.language().to_string();
         let symbol_name_for_lookup = request.symbol_name.clone();
         let line_for_lookup = request.line;
@@ -5086,9 +5093,77 @@ impl CodesearchService {
             what, language_for_lookup
         );
         let budget_secs = resolve_find_impact_budget_secs();
+
+        // Shared result construction: the warm-retry path (below) must be
+        // byte-identical to a budget-fast completion, so both build the
+        // response through this one closure.
+        let build_impact =
+            |references: Vec<crate::symbols::SymbolReference>| crate::symbols::FindImpactResult {
+                symbol: request.symbol_name.clone().unwrap_or_else(|| {
+                    format!(
+                        "{}:{}",
+                        request.file.as_deref().unwrap_or("?"),
+                        request.line.unwrap_or(0)
+                    )
+                }),
+                references,
+                index_age_seconds: indexer.index_age(&db_path),
+                language: indexer.language().to_string(),
+                scope: ctx
+                    .project_alias
+                    .map(|a| format!("project:{}", a))
+                    .unwrap_or_else(|| "local".to_string()),
+            };
+
+        // Background continuation: consult the tracker before starting a
+        // (potentially cold, minutes-long) lookup. A retry of an overran
+        // lookup observes progress or the warm result instead of racing a
+        // second identical helper subprocess against the cold cache.
+        let tracker_key: find_impact_tracker::LookupKey = (db_path.clone(), what.clone());
+        match find_impact_tracker::IMPACT_LOOKUP_TRACKER.check(&tracker_key) {
+            Some(find_impact_tracker::TrackedStatus::Running { elapsed_ms }) => {
+                tracing::info!(
+                    "find_impact retry: lookup still running ({}ms elapsed): {}",
+                    elapsed_ms,
+                    busy_state
+                );
+                let busy = crate::symbols::SymbolLookupBusy {
+                    busy: true,
+                    state: busy_state.clone(),
+                    waited_ms: elapsed_ms,
+                    advice: format!(
+                        "still running ({}s elapsed); retry the same call in ~{}s",
+                        elapsed_ms / 1000,
+                        budget_secs.max(1)
+                    ),
+                };
+                let json =
+                    serde_json::to_string(&busy).unwrap_or_else(|_| "{\"busy\":true}".to_string());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+            Some(find_impact_tracker::TrackedStatus::Done(Ok(references))) => {
+                tracing::info!(
+                    "find_impact retry: serving warm result ({} references) from the finished background lookup: {}",
+                    references.len(),
+                    busy_state
+                );
+                let impact = build_impact(references);
+                let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
+            }
+            Some(find_impact_tracker::TrackedStatus::Done(Err(chain))) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Symbol lookup failed: {chain}"
+                ))]));
+            }
+            None => {}
+        }
+
         let registry_for_lookup = self.symbol_registry.clone();
         let db_path_for_lookup = db_path.clone();
         let file_for_lookup = file_for_pos;
+        let lookup_entry = find_impact_tracker::IMPACT_LOOKUP_TRACKER.register(tracker_key.clone());
+        let lookup_entry_in_task = lookup_entry;
         let lookup = async move {
             tokio::task::spawn_blocking(move || {
                 let indexer = registry_for_lookup
@@ -5099,7 +5174,7 @@ impl CodesearchService {
                             language_for_lookup
                         )
                     })?;
-                if has_name {
+                let result = if has_name {
                     indexer.find_references(
                         &db_path_for_lookup,
                         symbol_name_for_lookup.as_deref().unwrap_or(""),
@@ -5110,7 +5185,15 @@ impl CodesearchService {
                         &file_for_lookup.unwrap_or_default(),
                         line_for_lookup.unwrap_or(0),
                     )
-                }
+                };
+                // Record INSIDE the blocking task: the handler's awaiting
+                // future is dropped at budget overrun, but this detached
+                // task survives and the recorded outcome is what the hinted
+                // retry observes. (`anyhow::Error` is not `Clone`, so the
+                // failure side is recorded as its rendered `{:#}` chain.)
+                let recorded = result.as_ref().map_err(|e| format!("{e:#}")).cloned();
+                lookup_entry_in_task.finish(recorded);
+                result
             })
             .await
             .map_err(|e| anyhow::anyhow!("symbol lookup task failed: {e:#}"))?
@@ -5118,29 +5201,19 @@ impl CodesearchService {
 
         match find_impact_with_budget(budget_secs, busy_state, lookup).await {
             ImpactLookupOutcome::Done(Ok(references)) => {
-                let age = indexer.index_age(&db_path);
-                let impact = crate::symbols::FindImpactResult {
-                    symbol: request.symbol_name.clone().unwrap_or_else(|| {
-                        format!(
-                            "{}:{}",
-                            request.file.as_deref().unwrap_or("?"),
-                            request.line.unwrap_or(0)
-                        )
-                    }),
-                    references,
-                    index_age_seconds: age,
-                    language: indexer.language().to_string(),
-                    scope: ctx
-                        .project_alias
-                        .map(|a| format!("project:{}", a))
-                        .unwrap_or_else(|| "local".to_string()),
-                };
+                // Completed within the budget: nothing is in flight, so a
+                // later lookup must consult the real cache, not the tracker.
+                find_impact_tracker::IMPACT_LOOKUP_TRACKER.remove(&tracker_key);
+                let impact = build_impact(references);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            ImpactLookupOutcome::Done(Err(e)) => Ok(CallToolResult::success(vec![Content::text(
-                format!("Symbol lookup failed: {e:#}"),
-            )])),
+            ImpactLookupOutcome::Done(Err(e)) => {
+                find_impact_tracker::IMPACT_LOOKUP_TRACKER.remove(&tracker_key);
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Symbol lookup failed: {e:#}"
+                ))]))
+            }
             ImpactLookupOutcome::Busy { state, waited_ms } => {
                 tracing::warn!(
                     "find_impact budget overrun after {}ms (budget {}s): {} — answering busy, lookup continues in background",
