@@ -165,3 +165,54 @@ fn budget_env_overrides_parses_and_falls_back() {
         DEFAULT_FIND_IMPACT_BUDGET_SECS
     );
 }
+
+#[test]
+fn failure_envelope_serializes_exactly_the_three_documented_fields() {
+    let failure = crate::symbols::SymbolLookupFailure::failed("helper exited 1");
+    let json: serde_json::Value = serde_json::to_value(&failure).unwrap();
+    assert_eq!(json["class"], "failed");
+    assert_eq!(json["error"], "helper exited 1");
+    let hint = json["hint_for_agent"].as_str().unwrap();
+    assert!(!hint.is_empty(), "hint must be non-empty: {hint}");
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["class", "error", "hint_for_agent"]);
+}
+
+#[test]
+fn classify_maps_unknown_index_age_to_stale_and_readability_to_failed() {
+    use crate::symbols::SymbolLookupFailureClass as Class;
+    // (index_age_seconds, expected class) — u64::MAX is what `index_age`
+    // returns whenever the index cannot be opened or read.
+    let cases: &[(u64, Class)] = &[
+        (u64::MAX, Class::Stale),
+        (0, Class::Failed),
+        (3_600, Class::Failed),
+    ];
+    for (age, expected) in cases {
+        let failure = crate::symbols::SymbolLookupFailure::classify("chain", *age);
+        assert_eq!(failure.class, *expected, "age {age} must classify");
+        assert!(!failure.error.is_empty());
+    }
+}
+
+#[test]
+fn failure_hints_are_actionable_per_class() {
+    let failed = crate::symbols::SymbolLookupFailure::failed("boom");
+    let stale = crate::symbols::SymbolLookupFailure::stale("gone");
+    assert!(
+        failed.hint_for_agent.contains("usages"),
+        "failed hint must point at the text-search fallback: {}",
+        failed.hint_for_agent
+    );
+    assert!(
+        stale.hint_for_agent.contains("index"),
+        "stale hint must point at (re)building the index: {}",
+        stale.hint_for_agent
+    );
+}

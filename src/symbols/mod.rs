@@ -81,6 +81,74 @@ pub struct SymbolLookupBusy {
     pub advice: String,
 }
 
+/// Machine-branchable class of a failed `find_impact` lookup.
+///
+/// `busy` needs no class here: an overran lookup answers with the typed
+/// `SymbolLookupFailure`-free `SymbolLookupBusy` envelope instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SymbolLookupFailureClass {
+    /// The helper ran and failed (non-zero exit, crash, unusable output)
+    /// against a readable index. Retrying cannot succeed until the cause
+    /// changes; fall back to text search.
+    Failed,
+    /// No readable symbol index (`index_age` reports unknown): retrying
+    /// the lookup cannot succeed until the index is built or rebuilt.
+    Stale,
+}
+
+/// Typed failure envelope for `find_impact` lookups, serialized as JSON in
+/// the tool-result text (same convention as `SymbolIndexError`). Replaces
+/// the former soft-string render (`Symbol lookup failed: ...`) so an agent
+/// can branch on `class` instead of parsing prose.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolLookupFailure {
+    /// Rendered `{:#}` error chain.
+    pub error: String,
+    /// Machine-branchable failure class.
+    pub class: SymbolLookupFailureClass,
+    /// Actionable hint for the agent.
+    pub hint_for_agent: String,
+}
+
+impl SymbolLookupFailure {
+    /// A failed lookup against a readable index.
+    pub fn failed(error_chain: impl Into<String>) -> Self {
+        Self {
+            error: error_chain.into(),
+            class: SymbolLookupFailureClass::Failed,
+            hint_for_agent: "The SCIP helper failed for this lookup. Do not retry the same call \
+                             immediately; fall back to `find` with kind=\"usages\" (text-based) \
+                             and/or reindex the project to rebuild the symbol index."
+                .to_string(),
+        }
+    }
+
+    /// A failed lookup with an unreadable/absent symbol index.
+    pub fn stale(error_chain: impl Into<String>) -> Self {
+        Self {
+            error: error_chain.into(),
+            class: SymbolLookupFailureClass::Stale,
+            hint_for_agent: "No readable symbol index for this project. Build or rebuild it \
+                             first (`codesearch index` / `index reindex`), then retry the \
+                             same call."
+                .to_string(),
+        }
+    }
+
+    /// Classify a lookup failure by the index age reported for the same db:
+    /// an unknown age (`u64::MAX`, what `index_age` returns whenever the
+    /// index cannot be opened or read) means stale; anything else means the
+    /// index was readable and the lookup itself failed.
+    pub fn classify(error_chain: impl Into<String>, index_age_seconds: u64) -> Self {
+        if index_age_seconds == u64::MAX {
+            Self::stale(error_chain)
+        } else {
+            Self::failed(error_chain)
+        }
+    }
+}
+
 /// Which files/projects to reindex.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

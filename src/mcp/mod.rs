@@ -5152,9 +5152,15 @@ impl CodesearchService {
                 return Ok(CallToolResult::success(vec![Content::text(json)]));
             }
             Some(find_impact_tracker::TrackedStatus::Done(Err(chain))) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Symbol lookup failed: {chain}"
-                ))]));
+                // Same classification as a fresh failure: the tracked chain
+                // is already `{:#}`-rendered, the index age decides the class.
+                let failure = crate::symbols::SymbolLookupFailure::classify(
+                    chain,
+                    indexer.index_age(&db_path),
+                );
+                let json =
+                    serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
+                return Ok(CallToolResult::success(vec![Content::text(json)]));
             }
             None => {}
         }
@@ -5210,9 +5216,15 @@ impl CodesearchService {
             }
             ImpactLookupOutcome::Done(Err(e)) => {
                 find_impact_tracker::IMPACT_LOOKUP_TRACKER.remove(&tracker_key);
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Symbol lookup failed: {e:#}"
-                ))]))
+                // Typed failure envelope (busy/stale/failed must stay
+                // machine-branchable; the index age decides stale vs failed).
+                let failure = crate::symbols::SymbolLookupFailure::classify(
+                    format!("{e:#}"),
+                    indexer.index_age(&db_path),
+                );
+                let json =
+                    serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
+                Ok(CallToolResult::success(vec![Content::text(json)]))
             }
             ImpactLookupOutcome::Busy { state, waited_ms } => {
                 tracing::warn!(
