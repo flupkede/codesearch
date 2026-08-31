@@ -216,3 +216,62 @@ fn failure_hints_are_actionable_per_class() {
         stale.hint_for_agent
     );
 }
+
+#[test]
+fn fingerprint_fields_present_when_set_and_omitted_when_none() {
+    use crate::symbols::SymbolReference;
+    let base = |index_head_sha: Option<String>, current_head_sha: Option<String>| {
+        crate::symbols::FindImpactResult {
+            symbol: "csharp Ns.T.M()".to_string(),
+            references: vec![SymbolReference {
+                file: PathBuf::from("a.cs"),
+                start_line: 1,
+                end_line: 1,
+                kind: "definition".to_string(),
+            }],
+            index_age_seconds: 12,
+            language: "csharp".to_string(),
+            scope: "project:p".to_string(),
+            index_head_sha,
+            current_head_sha,
+        }
+    };
+    let both: serde_json::Value =
+        serde_json::to_value(base(Some("a".repeat(40)), Some("b".repeat(40)))).unwrap();
+    assert_eq!(both["index_head_sha"], "a".repeat(40));
+    assert_eq!(both["current_head_sha"], "b".repeat(40));
+
+    // None must OMIT the key, not serialize null — old consumers see an
+    // unchanged shape when the fingerprint is unknown.
+    let neither: serde_json::Value = serde_json::to_value(base(None, None)).unwrap();
+    let keys: Vec<&str> = neither
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(!keys.contains(&"index_head_sha"), "keys: {keys:?}");
+    assert!(!keys.contains(&"current_head_sha"), "keys: {keys:?}");
+}
+
+#[test]
+fn current_git_head_resolves_the_crate_checkout() {
+    // The crate dir is always a git checkout (build.rs already depends on
+    // git metadata), so this is deterministic in dev and CI alike.
+    let head = crate::symbols::current_git_head(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let sha = head.expect("crate checkout must resolve a HEAD sha");
+    assert_eq!(sha.len(), 40, "full sha expected: {sha}");
+    assert!(
+        sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "hex sha expected: {sha}"
+    );
+}
+
+#[test]
+fn current_git_head_is_none_outside_a_repo() {
+    // A directory that is not a git repo must yield None, not an error —
+    // the fingerprint is best-effort by design.
+    let tmp = std::env::temp_dir().join("codesearch_no_git_head_check");
+    let _ = std::fs::create_dir_all(&tmp);
+    assert!(crate::symbols::current_git_head(&tmp).is_none());
+}

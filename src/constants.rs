@@ -617,6 +617,11 @@ pub const SCIP_META_DB_NAME: &str = "scip_meta";
 /// LMDB metadata key for the last rebuild timestamp.
 pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
 
+/// LMDB metadata key for the git HEAD sha the symbol index was built for.
+/// Written on rebuild when the repo HEAD is readable; absent means unknown
+/// (never written, or git could not be read at build time).
+pub const SCIP_HEAD_SHA_KEY: &str = "head_sha";
+
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
 pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
@@ -647,6 +652,10 @@ pub const SCIP_TYPESCRIPT_HELPER_ENV: &str = "CODESEARCH_SCIP_TYPESCRIPT";
 /// Namespaced per-language (unlike C#'s un-namespaced `SCIP_REBUILD_TIMESTAMP_KEY`)
 /// so both adapters can safely share the same `scip_meta` table if ever merged.
 pub const SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts:typescript";
+
+/// TypeScript-specific key for `SCIP_HEAD_SHA_KEY` (the C# and TypeScript
+/// adapters share one `scip_meta` table, so keys are language-prefixed).
+pub const SCIP_TYPESCRIPT_HEAD_SHA_KEY: &str = "head_sha:typescript";
 
 /// Debounce window (ms) for the TypeScript file-watcher symbol rebuild.
 /// Mirrors `SCIP_CSHARP_DEBOUNCE_MS` — a single quiet-period flush avoids

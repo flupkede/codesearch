@@ -34,7 +34,8 @@ use super::{RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
 use crate::constants::{
     LANG_TYPESCRIPT, SCIP_POSITION_DB_NAME, SCIP_SIMPLE_NAMES_DB_NAME, SCIP_SYMBOLS_DB_NAME,
-    SCIP_TYPESCRIPT_HELPER_ENV, SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY,
+    SCIP_TYPESCRIPT_HEAD_SHA_KEY, SCIP_TYPESCRIPT_HELPER_ENV,
+    SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY,
 };
 
 // ── Constants ─────────────────────────────────────────────────────
@@ -55,6 +56,9 @@ const SCIP_NAMES_DB_NAME: &str = SCIP_SIMPLE_NAMES_DB_NAME;
 
 /// Key in the meta database storing the last rebuild timestamp for TypeScript.
 const META_REBUILD_TS: &str = SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY;
+
+/// Key in the meta database storing the git HEAD sha the index was built for.
+const META_HEAD_SHA: &str = SCIP_TYPESCRIPT_HEAD_SHA_KEY;
 
 /// Key in the meta database storing the count of indexed symbols.
 const META_SYMBOL_COUNT: &str = "symbol_count:typescript";
@@ -556,6 +560,12 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
             META_SYMBOL_COUNT,
             total_symbols.to_string().as_str(),
         )?;
+        // Fingerprint the index: which HEAD it was built for (language-
+        // prefixed key — the meta table is shared with the C# adapter).
+        // Skipped when git is unreadable, same policy as the C# adapter.
+        if let Some(sha) = super::current_git_head(repo_path) {
+            meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
+        }
 
         wtxn.commit()?;
 
@@ -669,6 +679,18 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
             .as_secs();
 
         now.saturating_sub(stored_ts)
+    }
+
+    fn index_head_sha(&self, db_path: &Path) -> Option<String> {
+        let env = self.open_scip_env(db_path).ok()?;
+        let rtxn = env.read_txn().ok()?;
+        let meta_db: Database<Str, Str> = env
+            .open_database(&rtxn, Some(SCIP_META_DB_NAME))
+            .ok()
+            .flatten()?;
+        let sha = meta_db.get(&rtxn, META_HEAD_SHA).ok().flatten()?;
+        let sha = sha.trim().to_string();
+        (!sha.is_empty()).then_some(sha)
     }
 
     fn has_index(&self, db_path: &Path) -> bool {

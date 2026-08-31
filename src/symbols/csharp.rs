@@ -69,6 +69,9 @@ const SCIP_REF_CACHE_DB_NAME: &str = crate::constants::SCIP_REF_CACHE_DB_NAME;
 /// Key in the meta database that stores the last rebuild timestamp (UNIX epoch seconds).
 const META_REBUILD_TS: &str = crate::constants::SCIP_REBUILD_TIMESTAMP_KEY;
 
+/// Key in the meta database storing the git HEAD sha the index was built for.
+const META_HEAD_SHA: &str = crate::constants::SCIP_HEAD_SHA_KEY;
+
 /// Key in the meta database storing the count of indexed symbols.
 #[allow(dead_code)]
 const META_SYMBOL_COUNT: &str = "symbol_count";
@@ -1480,6 +1483,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             META_REPO_PATH,
             repo_path.to_string_lossy().as_ref(),
         )?;
+        // Fingerprint the index: which HEAD it was built for. Skipped when
+        // git is unreadable (better absent than a wrong claim); an older
+        // value from a previous build may then survive, which stays
+        // approximately right for the usual same-branch rebuild.
+        if let Some(sha) = super::current_git_head(repo_path) {
+            meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
+        }
 
         wtxn.commit()?;
 
@@ -1582,6 +1592,18 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             .as_secs();
 
         now.saturating_sub(stored_ts)
+    }
+
+    fn index_head_sha(&self, db_path: &Path) -> Option<String> {
+        let env = self.open_scip_env(db_path).ok()?;
+        let rtxn = env.read_txn().ok()?;
+        let meta_db: Database<Str, Str> = env
+            .open_database(&rtxn, Some(SCIP_META_DB_NAME))
+            .ok()
+            .flatten()?;
+        let sha = meta_db.get(&rtxn, META_HEAD_SHA).ok().flatten()?;
+        let sha = sha.trim().to_string();
+        (!sha.is_empty()).then_some(sha)
     }
 
     fn has_index(&self, db_path: &Path) -> bool {

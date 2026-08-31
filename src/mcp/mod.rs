@@ -5094,6 +5094,17 @@ impl CodesearchService {
         );
         let budget_secs = resolve_find_impact_budget_secs();
 
+        // Index fingerprint: the repository HEAD at response time. The
+        // non-fatal git read is offloaded like every blocking call; a
+        // failed read simply omits the field. Drift against
+        // `index_head_sha` is surfaced, never auto-reindexed (deliberate:
+        // reindexing a large solution on every branch switch would thrash).
+        let head_root = project_root.clone();
+        let current_head_sha =
+            tokio::task::spawn_blocking(move || crate::symbols::current_git_head(&head_root))
+                .await
+                .unwrap_or(None);
+
         // Shared result construction: the warm-retry path (below) must be
         // byte-identical to a budget-fast completion, so both build the
         // response through this one closure.
@@ -5113,6 +5124,8 @@ impl CodesearchService {
                     .project_alias
                     .map(|a| format!("project:{}", a))
                     .unwrap_or_else(|| "local".to_string()),
+                index_head_sha: indexer.index_head_sha(&db_path),
+                current_head_sha: current_head_sha.clone(),
             };
 
         // Background continuation: consult the tracker before starting a

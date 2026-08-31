@@ -45,6 +45,36 @@ pub struct FindImpactResult {
     pub language: String,
     /// Scope that was searched, e.g. `"project:example-org"`.
     pub scope: String,
+    /// Git HEAD sha the symbol index was built for, when recorded. Compare
+    /// with `current_head_sha` to spot index drift after a branch switch.
+    /// Drift is surfaced, never auto-reindexed (deliberate — see
+    /// `SymbolIndexer::index_head_sha`). Omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_head_sha: Option<String>,
+    /// Repository HEAD at response time, when readable. Omitted when the
+    /// read fails (git unavailable, transient Windows handle race — must
+    /// never fail the response).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_head_sha: Option<String>,
+}
+
+/// Resolve the repository HEAD sha for `repo_root` (40-hex), or `None`
+/// when git is unavailable, the path is not a work tree, or the read
+/// fails. Non-fatal BY DESIGN: a transient Windows git failure (see the
+/// `GitHeadWatcher` note in `src/watch/mod.rs`) must never take down a
+/// response that only wanted the fingerprint.
+pub(crate) fn current_git_head(repo_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let is_40_hex = sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit());
+    is_40_hex.then_some(sha)
 }
 
 /// Error returned when the symbol index is unavailable.
@@ -297,6 +327,17 @@ pub trait SymbolIndexer: Send + Sync {
 
     /// How old is the current symbol index (seconds since last rebuild)?
     fn index_age(&self, db_path: &Path) -> u64;
+
+    /// The git HEAD sha the current symbol index was built for, when
+    /// recorded. `None` means unknown (pre-fingerprint index, or git was
+    /// unreadable at build time). Compare with the repository's current
+    /// HEAD to make index drift after a branch switch visible — drift is
+    /// surfaced, never auto-reindexed (deliberate: reindexing a large
+    /// solution on every branch switch would thrash; refresh stays an
+    /// explicit operator action).
+    fn index_head_sha(&self, _db_path: &Path) -> Option<String> {
+        None
+    }
 
     /// Whether the helper binary for this language is available.
     fn is_available(&self) -> bool;
