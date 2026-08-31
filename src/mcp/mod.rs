@@ -816,6 +816,15 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
     items
 }
 
+/// Whether a failed shared vector-store read may open a second `VectorStore` on `db_path`.
+///
+/// Stdio MCP (`--mode local`) and HTTP serve both hold a live `SharedStores` on
+/// the same LMDB path. A second open is rejected by `TrackedEnv`. Gating only on
+/// `serve_state` left stdio (shared stores, no serve state) on the fallback path.
+pub(crate) fn allow_vector_store_second_open(has_shared_stores: bool) -> bool {
+    !has_shared_stores
+}
+
 // === Tool Router Implementation ===
 
 #[tool_router]
@@ -1189,30 +1198,19 @@ impl CodesearchService {
                 Err(shared_err) => {
                     tracing::error!("Shared vector store read failed: {:?}", shared_err);
 
-                    // In serve mode, do NOT fall back to a standalone VectorStore —
-                    // it would open a second LMDB handle on the same .codesearch.db,
-                    // which LMDB rejects ("environment already opened with different options").
-                    if self.serve_state.is_some() {
+                    // This branch already holds a live SharedStores (stdio and serve).
+                    // Do not open a second VectorStore on the same db_path.
+                    if !allow_vector_store_second_open(true) {
                         return Err(shared_err.context(
-                            "Shared vector store read failed in serve mode; \
+                            "Shared vector store read failed; \
                              standalone fallback disabled to prevent LMDB double-open",
                         ));
                     }
                 }
             }
-
-            // Standalone readonly fallback (non-serve mode only).
-            // In serve mode the guard above already returned.
-            if stores.readonly {
-                let ro_store = VectorStore::open_readonly(&self.db_path, self.dimensions)
-                    .context("Error opening readonly database for read fallback")?;
-                return action(&ro_store)
-                    .context("Error reading from readonly fallback vector store");
-            }
         }
 
-        // Standalone fallback (non-serve mode only — CLI / stdio MCP).
-        // In serve mode, either Priority 1/2 succeeded or the guard above returned Err.
+        // No live shared store: true standalone CLI (not stdio MCP with SharedStores).
         let store = VectorStore::new(&self.db_path, self.dimensions)
             .context("Error opening database for read fallback")?;
         action(&store).context("Error reading from vector store")
