@@ -746,6 +746,71 @@ const DEFINITION_KINDS: &[&str] = &[
     "Interface",
 ];
 
+/// Re-order lexical `usages` hits so source-code paths come before everything
+/// else (docs, configs, markdown). Stable: score order is preserved within
+/// each group, so this only demotes non-code noise, it never re-ranks code.
+fn rank_code_first(items: &mut [ReferenceItem]) {
+    items.sort_by_key(|item| !is_source_path(&item.path));
+}
+
+/// True when the path looks like source code rather than docs/config. Used
+/// only to re-order lexical `find(kind="usages")` hits code-first — never to
+/// filter them: a markdown hit is noise the agent can discard, a missing hit
+/// would be a silent false negative.
+fn is_source_path(path: &str) -> bool {
+    const SOURCE_EXTS: &[&str] = &[
+        "rs", "py", "go", "cs", "ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs", "java", "kt",
+        "kts", "swift", "c", "h", "cpp", "hpp", "cc", "cxx", "hh", "rb", "php", "proto", "scala",
+        "dart",
+    ];
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| SOURCE_EXTS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Agent-facing note for lexical `find(kind="usages")` results.
+///
+/// Returns `Some(note)` only when BOTH hold: the hits actually include
+/// SCIP-backed source files (C#/TypeScript) AND a matching symbol indexer is
+/// installed and available — precisely the case where the lexical list is a
+/// lossy stand-in for `find_impact`'s precise references. Any other
+/// combination returns `None`, keeping the legacy response shape
+/// byte-identical (no nagging where the advice cannot be acted on).
+fn scip_usages_note(
+    registry: &SymbolIndexerRegistry,
+    items: &[ReferenceItem],
+    symbol: &str,
+) -> Option<String> {
+    const SCIP_BACKED_EXTS: &[&str] = &["cs", "ts", "tsx", "mts", "cts"];
+    let has_backed_source = items.iter().any(|item| {
+        Path::new(&item.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| SCIP_BACKED_EXTS.contains(&e.to_lowercase().as_str()))
+            .unwrap_or(false)
+    });
+    if !has_backed_source {
+        return None;
+    }
+    let backend = [
+        crate::constants::LANG_CSHARP,
+        crate::constants::LANG_TYPESCRIPT,
+    ]
+    .into_iter()
+    .find(|lang| {
+        registry
+            .get(lang)
+            .is_some_and(|indexer| indexer.is_available())
+    })?;
+    Some(format!(
+        "lexical text matching — hits may be docs/comments rather than code references; \
+         for precise SCIP call-sites use find_impact (symbol_name='{symbol}', project=...) \
+         (backend: {backend})"
+    ))
+}
+
 /// Codesearch MCP service
 pub struct CodesearchService {
     #[allow(dead_code)]
@@ -1731,19 +1796,54 @@ fn respond_with_items<T: serde::Serialize>(
     warnings: &[String],
     empty_message: impl FnOnce() -> String,
 ) -> Result<CallToolResult, McpError> {
+    respond_with_items_noted(items, warnings, None, empty_message)
+}
+
+/// `respond_with_items` with an optional agent-facing `note` key — the shared
+/// exit for item-list handlers whose result carries an advisory the caller
+/// should act on (e.g. `find(kind="usages")` pointing lexical hits at
+/// `find_impact`). Same discipline as `respond_with_items`: one exit, the
+/// warnings channel terminates on every path.
+///
+/// Shape:
+/// - empty items → text via `qualify_empty_result`; when a note is present it
+///   is appended to the empty message (an empty lexical result is exactly
+///   where the SCIP upgrade path matters most)
+/// - note + warnings → `{results, note, warnings}`
+/// - note only → `{results, note}`
+/// - warnings only → `{results, warnings}` (identical to `respond_with_items`)
+/// - healthy, no note → bare JSON array, byte-identical to the legacy shape
+fn respond_with_items_noted<T: serde::Serialize>(
+    items: &[T],
+    warnings: &[String],
+    note: Option<&str>,
+    empty_message: impl FnOnce() -> String,
+) -> Result<CallToolResult, McpError> {
     if items.is_empty() {
+        let mut message = empty_message();
+        if let Some(note) = note {
+            message.push(' ');
+            message.push_str(note);
+        }
         return Ok(CallToolResult::success(vec![Content::text(
-            qualify_empty_result(empty_message(), warnings),
+            qualify_empty_result(message, warnings),
         )]));
+    }
+    if note.is_none() && warnings.is_empty() {
+        let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string());
+        return Ok(CallToolResult::success(vec![Content::text(json)]));
+    }
+    let mut payload = serde_json::Map::new();
+    payload.insert("results".to_string(), serde_json::json!(items));
+    if let Some(note) = note {
+        payload.insert("note".to_string(), serde_json::json!(note));
     }
     if !warnings.is_empty() {
-        let payload = serde_json::json!({ "results": items, "warnings": warnings });
-        return Ok(CallToolResult::success(vec![Content::text(
-            payload.to_string(),
-        )]));
+        payload.insert("warnings".to_string(), serde_json::json!(warnings));
     }
-    let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string());
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![Content::text(
+        serde_json::Value::Object(payload).to_string(),
+    )]))
 }
 
 /// The object-shaped sibling of `respond_with_items`: one exit for handlers that
@@ -2980,7 +3080,7 @@ impl CodesearchService {
 
     /// Unified symbol navigation — dispatches based on `kind`.
     #[tool(
-        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find all call-sites and references to a symbol (lexical/text-based; for IDE-precise call-graphs prefer `find_impact`)\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
+        description = "Unified symbol navigation. Set `kind` to choose the action:\n\n- `definition` (default): locate where a symbol is defined (function, class, struct, etc.)\n- `usages`: find call-sites of a symbol via LEXICAL TEXT matching — hits may be docs/comments rather than code references; ranking puts source files first and a `note` field flags the precise upgrade path when one exists. On C#/TypeScript projects ALWAYS prefer `find_impact` for usages — it returns exact SCIP references, while this kind is only a text fallback\n- `imports`: list all imports/dependencies declared in a file (set `symbol` to the file path)\n- `dependents`: find all files that import or depend on a module, file, or symbol\n\nFor `imports`, set `symbol` to a file path. For other kinds, `symbol` is the symbol name.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     async fn find(
         &self,
@@ -4483,7 +4583,18 @@ impl CodesearchService {
             item.path = ctx.prefix_result_path(&item.path);
         }
 
-        respond_with_items(&items, &find_warnings, || {
+        // Lexical FTS ranks docs, comments and code by the same text score,
+        // so a usages query can bury the real call-sites under markdown.
+        // Re-order code first (stable: score order preserved within each
+        // group); nothing is filtered — this is presentation, not truth.
+        rank_code_first(&mut items);
+
+        // When the hits include SCIP-backed source files and a precise
+        // backend is installed, tell the agent the exact upgrade path —
+        // otherwise the lexical list silently stands in for real references.
+        let note = scip_usages_note(&self.symbol_registry, &items, &symbol);
+
+        respond_with_items_noted(&items, &find_warnings, note.as_deref(), || {
             format!(
                 "No usages found for '{symbol}' (only definitions were found). Try \
                  find_definition() to locate the declaration."
