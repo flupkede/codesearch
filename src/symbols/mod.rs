@@ -451,3 +451,11 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&env1, &env2));
     }
 }
+
+/// Lock-visibility verification (todo #96 step 5): readers never block on
+/// an open write transaction — the property that lets `find_impact` serve
+/// during an indexer rebuild without needing a `lock_status` in the busy
+/// envelope. Sibling `_tests.rs` file per repo convention.
+#[cfg(test)]
+#[path = "lock_visibility_tests.rs"]
+mod lock_visibility_tests;
