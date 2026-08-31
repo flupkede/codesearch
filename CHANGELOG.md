@@ -14,11 +14,17 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.3.4]
+## [Unreleased]
 
 ### Added
 
 - **`find_impact` robustness: internal budget, tracked background continuation, typed failure classes, HEAD-sha index fingerprint (todo #96).** A cold reference-cache miss makes `find_impact` invoke the SCIP helper (minutes on a large solution); without an internal deadline the MCP client won the timeout race with an opaque `-32001`, and the precise call graph went unused exactly when it was most needed. Four layers fix that. (1) **Budget** (`CODESEARCH_FIND_IMPACT_BUDGET_SECS`, default 60s, `0` disables): on overrun the server answers a structured busy envelope (`{"busy":true,"state":…,"waited_ms":…,"advice":…}`) while the lookup keeps running detached. (2) **Background continuation**: overran lookups are tracked per (project, symbol); a retry observes cumulative progress, or consumes the warm precise result once the detached lookup finished, instead of racing a second identical helper subprocess against the cold cache. Done entries are consumed on first read; a 30-min TTL bounds abandoned entries. (3) **Typed failures**: `SymbolLookupFailure { error, class, hint_for_agent }` with machine-branchable classes `failed` (helper failed against a readable index → fall back to `find kind="usages"`) and `stale` (index unreadable → rebuild first) replace the former soft-string `Symbol lookup failed: …` render. Lock-visibility was verified rather than assumed: LMDB readers never block on an open write transaction (pinned by tests), so the busy envelope needs no `lock_status`. (4) **Index fingerprint**: every result carries `index_head_sha` (recorded at rebuild time) and `current_head_sha` (repo HEAD at response time, omitted when unreadable). Drift after a branch switch is **surfaced, never auto-reindexed** — reindexing a large solution on every switch would thrash; refresh stays an explicit operator action.
+
+## [1.3.4]
+
+### Changed
+
+- **build.ps1: cargo output goes to a repo-local `.tmp/build-<mode>.log` (printed afterwards) instead of a live pipe, and the script warns (never kills) when cargo/rustc processes are already running.** A lingering cargo child (stale rustc/watchexec) could hold the pipe open and stall output capture indefinitely; a killed previous run can hold the target-dir build lock ("Blocking waiting for file lock" hangs forever) but other sessions' builds are legitimate, so detection is warn-only with pid/start-time details and the human decides. `.tmp/` is gitignored. Harness-independent: replaces the Claude Code post-tool hook that doesn't run under opencode/oc-runner.
 
 ### Fixed
 
