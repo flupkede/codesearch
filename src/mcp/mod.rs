@@ -4526,9 +4526,6 @@ impl CodesearchService {
                         break;
                     }
                 }
-                if items.len() >= limit {
-                    break;
-                }
             }
             items
         } else {
@@ -4561,7 +4558,6 @@ impl CodesearchService {
                                     score,
                                 })
                             })
-                            .take(limit)
                             .collect();
                         Ok(items)
                     },
@@ -4584,10 +4580,14 @@ impl CodesearchService {
         }
 
         // Lexical FTS ranks docs, comments and code by the same text score,
-        // so a usages query can bury the real call-sites under markdown.
-        // Re-order code first (stable: score order preserved within each
-        // group); nothing is filtered — this is presentation, not truth.
+        // so a usages query can bury the real call-sites under markdown. The
+        // cut to `limit` MUST happen after the re-order: BM25 systematically
+        // scores short markdown blocks above long source files (document
+        // length normalisation), so ranking after a `take(limit)` would have
+        // nothing left to reorder exactly when it matters most. Stable sort
+        // preserves score order within each group; nothing is filtered.
         rank_code_first(&mut items);
+        items.truncate(limit);
 
         // When the hits include SCIP-backed source files and a precise
         // backend is installed, tell the agent the exact upgrade path —
