@@ -746,6 +746,36 @@ const DEFINITION_KINDS: &[&str] = &[
     "Interface",
 ];
 
+/// Collapse exact-duplicate references from the SCIP find-refs output.
+///
+/// The helper can emit multiple occurrences of the same symbol at the same
+/// file:line (declaration plus multiple roles on one line), which reaches the
+/// agent as visible noise (observed live: a definition listed 5×). Two
+/// references that are identical in ALL of (file, line range, kind) carry no
+/// information the agent could act on separately — `SymbolReference` has no
+/// column, so two genuinely distinct same-line calls are indistinguishable
+/// from duplicates and collapse too, which is the right call for a caller
+/// that wants "where is this used", not occurrence counts. Order is stable.
+fn dedupe_references(
+    refs: Vec<crate::symbols::SymbolReference>,
+) -> Vec<crate::symbols::SymbolReference> {
+    let mut seen: std::collections::HashSet<(String, u32, u32, String)> =
+        std::collections::HashSet::with_capacity(refs.len());
+    let mut out = Vec::with_capacity(refs.len());
+    for r in refs {
+        let key = (
+            r.file.to_string_lossy().into_owned(),
+            r.start_line,
+            r.end_line,
+            r.kind.clone(),
+        );
+        if seen.insert(key) {
+            out.push(r);
+        }
+    }
+    out
+}
+
 /// Re-order lexical `usages` hits so source-code paths come before everything
 /// else (docs, configs, markdown). Stable: score order is preserved within
 /// each group, so this only demotes non-code noise, it never re-ranks code.
@@ -5228,7 +5258,7 @@ impl CodesearchService {
                         request.line.unwrap_or(0)
                     )
                 }),
-                references,
+                references: dedupe_references(references),
                 index_age_seconds: indexer.index_age(&db_path),
                 language: indexer.language().to_string(),
                 scope: ctx

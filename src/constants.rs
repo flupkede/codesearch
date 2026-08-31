@@ -733,7 +733,12 @@ pub const SCIP_LMDB_MAP_SIZE_MB_ENV: &str = "CODESEARCH_SCIP_LMDB_MAP_MB";
 /// Override at runtime with `CODESEARCH_FIND_IMPACT_BUDGET_SECS` (integer
 /// seconds). `0` disables the budget entirely, restoring the previous
 /// unbounded-blocking behaviour. Unparseable values fall back to the default.
-pub const DEFAULT_FIND_IMPACT_BUDGET_SECS: u64 = 60;
+///
+/// The default is deliberately BELOW typical MCP client timeouts (observed
+/// live: an MCP client gave up at ~60s with `-32001` while the busy answer
+/// was still being prepared at the 60s budget) — the structured busy answer
+/// is only useful if it arrives before the client stops listening.
+pub const DEFAULT_FIND_IMPACT_BUDGET_SECS: u64 = 45;
 
 /// Environment variable to override `DEFAULT_FIND_IMPACT_BUDGET_SECS`.
 pub const FIND_IMPACT_BUDGET_SECS_ENV: &str = "CODESEARCH_FIND_IMPACT_BUDGET_SECS";
