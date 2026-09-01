@@ -756,7 +756,33 @@ impl CSharpSymbolIndexer {
             canonical
         );
 
-        let lazy_refs = self.invoke_find_refs_helper(&helper, &solution, canonical)?;
+        // Preferred path: the resident workspace pool (todo #115) — the
+        // solution's Roslyn workspace stays loaded for MAX_RESIDENT repos,
+        // so after the first lookup this answers in seconds instead of
+        // spawning a fresh helper per call. Fallback: the one-shot spawn,
+        // which keeps working when the pool cannot (spawn failure, heap-cap
+        // death, eviction race) — correctness never depends on residency.
+        let lazy_refs: Vec<StoredReference> = match crate::symbols::resident::WORKSPACE_POOL
+            .find_refs(&helper, &solution, canonical)
+        {
+            Ok(refs) => refs
+                .into_iter()
+                .map(|r| StoredReference {
+                    file: r.file,
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    kind: r.kind,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    "resident helper unavailable ({e:#}); falling back to one-shot \
+                     find-refs for '{}'",
+                    canonical
+                );
+                self.invoke_find_refs_helper(&helper, &solution, canonical)?
+            }
+        };
 
         // ── Write phase — cache the resolved references ────────────
         {
