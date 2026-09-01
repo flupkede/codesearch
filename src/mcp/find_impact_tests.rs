@@ -104,23 +104,29 @@ async fn zero_budget_disables_the_race() {
 }
 
 #[test]
-fn busy_envelope_serializes_the_four_documented_fields() {
+fn busy_envelope_serializes_the_five_documented_fields() {
     let busy = SymbolLookupBusy {
         busy: true,
         state: "resolving 'Ns.I.M' via the csharp SCIP helper".to_string(),
         waited_ms: 60_012,
         advice: "retry the same call in ~60s".to_string(),
+        retry_after_seconds: 45,
     };
     let json: serde_json::Value = serde_json::to_value(&busy).unwrap();
     assert_eq!(json["busy"], serde_json::Value::Bool(true));
     assert!(json["state"].is_string());
     assert_eq!(json["waited_ms"], serde_json::Value::from(60_012));
+    assert_eq!(
+        json["retry_after_seconds"],
+        serde_json::Value::from(45),
+        "retry_after_seconds must be present: harnesses branch on it instead of parsing prose"
+    );
     let advice = json["advice"].as_str().unwrap();
     assert!(
         advice.contains("retry the same call in ~"),
         "advice must carry the retry hint: {advice}"
     );
-    // Exactly the documented envelope shape — the four fields, no extras.
+    // Exactly the documented envelope shape — the five fields, no extras.
     // (Key ORDER is deliberately not asserted: serde_json::to_value routes
     // through a BTreeMap and re-sorts keys, so an order assertion here would
     // test serde's map type, not the handler. Field order on the wire comes
@@ -132,7 +138,16 @@ fn busy_envelope_serializes_the_four_documented_fields() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, vec!["advice", "busy", "state", "waited_ms"]);
+    assert_eq!(
+        keys,
+        vec![
+            "advice",
+            "busy",
+            "retry_after_seconds",
+            "state",
+            "waited_ms"
+        ]
+    );
 }
 
 #[test]

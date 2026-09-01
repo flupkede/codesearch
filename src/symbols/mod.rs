@@ -110,6 +110,10 @@ pub struct SymbolLookupBusy {
     pub waited_ms: u64,
     /// Actionable retry hint, e.g. `"retry the same call in ~60s"`.
     pub advice: String,
+    /// Machine-branchable retry interval in seconds, mirroring the prose in
+    /// `advice`: how long a harness with auto-retry semantics should sleep
+    /// before repeating the SAME call. Busy is progress, not failure.
+    pub retry_after_seconds: u64,
 }
 
 /// Machine-branchable class of a failed `find_impact` lookup.
