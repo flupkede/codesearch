@@ -2144,7 +2144,7 @@ impl CodesearchService {
         };
 
         Ok(Self {
-            tool_router: Self::tool_router(),
+            tool_router: Self::merged_tool_router(),
             db_path,
             project_path,
             model_type,
@@ -2164,7 +2164,7 @@ impl CodesearchService {
     pub(crate) fn new_for_serve(serve_state: Arc<crate::serve::ServeState>) -> Result<Self> {
         let symbol_registry = serve_state.symbol_registry();
         Ok(Self {
-            tool_router: Self::tool_router(),
+            tool_router: Self::merged_tool_router(),
             db_path: PathBuf::from("serve://multi-repo"),
             project_path: PathBuf::from("serve://multi-repo"),
             model_type: ModelType::default(),
@@ -7452,7 +7452,19 @@ pub(crate) async fn rest_get_chunk_handler(
     Ok(AxumJson(call_tool_result_to_json(result)))
 }
 
-#[tool_handler]
+impl CodesearchService {
+    /// Single composition point for the tool router: this file's own routes
+    /// plus every per-module router merged in. `#[tool_handler]` and both
+    /// ctors wire through here, so extracting a `#[tool]` method into its own
+    /// module only adds one `ToolRouter::merge` line — and the registration
+    /// test in `tests.rs` proves nothing was silently dropped (`#[tool]` fns
+    /// in an impl block the router macro does not scan are NOT registered).
+    fn merged_tool_router() -> ToolRouter<CodesearchService> {
+        Self::tool_router()
+    }
+}
+
+#[tool_handler(router = Self::merged_tool_router())]
 impl ServerHandler for CodesearchService {
     fn get_info(&self) -> ServerInfo {
         let db_exists = self.db_path.exists();

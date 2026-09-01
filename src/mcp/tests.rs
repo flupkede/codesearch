@@ -38,6 +38,37 @@ fn test_mcp_no_raw_stdout_calls() {
     );
 }
 
+// === Tool registration pin ===
+//
+// Safety net for the mod.rs split: a `#[tool]` method that lands in an impl
+// block the `#[tool_router]` macro does not scan is SILENTLY not registered.
+// This asserts on the exact router the service wires up (`merged_tool_router`,
+// the same expression both ctors and `#[tool_handler]` use) so every
+// extraction stage must keep the 6-tool surface intact.
+
+#[test]
+fn test_tool_registration_exposes_exactly_the_six_tools() {
+    let router = super::CodesearchService::merged_tool_router();
+    let mut names: Vec<String> = router
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    let expected: Vec<&str> = vec![
+        "explore",
+        "find",
+        "find_impact",
+        "get_chunk",
+        "search",
+        "status",
+    ];
+    assert_eq!(
+        names, expected,
+        "tools/list must expose exactly the consolidated 6-tool surface"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn test_mcp_filter_matches_absolute_path_under_project_root() {
