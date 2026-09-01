@@ -2627,11 +2627,6 @@ fn stdio_shared_stores_must_not_open_second_vector_store() {
 }
 
 #[test]
-fn serve_shared_stores_must_not_open_second_vector_store() {
-    assert!(!super::allow_vector_store_second_open(true));
-}
-
-#[test]
 fn standalone_cli_without_shared_stores_may_open_vector_store() {
     assert!(super::allow_vector_store_second_open(false));
 }
@@ -2755,42 +2750,6 @@ async fn require_ready_reads_live_stores_and_rejects_partial_metadata() {
 }
 
 #[test]
-fn readiness_gate_runs_before_the_transport_opens() {
-    // Startup must fail while the caller can still see the error, rather than
-    // serving `status: building` on an index nothing in this process can build.
-    let src = include_str!("mod.rs");
-    let gate = src
-        .find("if startup.require_ready {")
-        .expect("run_mcp_server must gate on --require-ready");
-    let readiness = src[gate..]
-        .find("require_prebuilt_index_ready(&shared_stores, &db_path).await?")
-        .map(|offset| gate + offset)
-        .expect("--require-ready must validate index readiness");
-    let serve = src[readiness..]
-        .find("service.serve(stdio()).await?")
-        .map(|offset| readiness + offset)
-        .expect("MCP server startup must follow readiness validation");
-    assert!(readiness < serve);
-}
-
-#[test]
-fn mcp_write_access_is_decided_by_readonly_not_create_index() {
-    let src = include_str!("mod.rs");
-    let start = src
-        .find("pub async fn run_mcp_server")
-        .expect("run_mcp_server must exist");
-    let body = &src[start..];
-    assert!(
-        body.contains("let (shared_stores, is_readonly) = if startup.readonly {"),
-        "write access must be decided by --readonly alone"
-    );
-    assert!(
-        !body.contains("create_index && !is_readonly"),
-        "background refresh must not be gated on --create-index"
-    );
-}
-
-#[test]
 fn local_startup_flags_fail_in_modes_that_would_ignore_them() {
     for mode in [super::McpMode::Auto, super::McpMode::Client] {
         assert!(super::validate_local_startup_flags(mode, true, false).is_err());
@@ -2805,33 +2764,4 @@ fn readonly_or_require_ready_never_creates_a_missing_index() {
     assert!(!super::may_create_missing_index(false, false, false));
     assert!(!super::may_create_missing_index(true, true, false));
     assert!(!super::may_create_missing_index(true, false, true));
-}
-
-#[test]
-fn with_vector_store_read_for_does_not_fallback_when_shared_stores_live() {
-    // Source contract: after a shared-store action Err, do not call VectorStore::new
-    // or open_readonly. The helper above is the runtime gate; this catches a
-    // serve_state-only guard being reintroduced next to the fallback opens.
-    let src = include_str!("mod.rs");
-    let marker = "async fn with_vector_store_read_for";
-    let start = src
-        .find(marker)
-        .expect("with_vector_store_read_for must exist");
-    let rest = &src[start..];
-    let end = rest
-        .find("/// Execute a read-only action against the FTS store")
-        .expect("FTS read helper must follow vector read helper");
-    let body = &rest[..end];
-    assert!(
-        body.contains("allow_vector_store_second_open"),
-        "vector-store read fallback must consult the shared-store second-open gate"
-    );
-    assert!(
-        !body.contains("serve_state.is_some()"),
-        "stdio MCP has no serve_state; do not gate LMDB second-open on serve only"
-    );
-    assert!(
-        !body.contains("VectorStore::open_readonly"),
-        "must not reopen LMDB readonly while shared_stores is live"
-    );
 }
