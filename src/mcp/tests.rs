@@ -5,25 +5,53 @@ fn test_mcp_no_raw_stdout_calls() {
     // Verify that no raw print!/println! calls exist in the MCP module sources.
     // MCP communicates over stdout (JSON-RPC), so any stdout pollution breaks the protocol.
     // All informational output must go through info_print!/warn_print!/eprintln! (stderr).
-    let src = include_str!("mod.rs");
-    let violations: Vec<(usize, &str)> = src
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            let trimmed = line.trim_start();
-            // Skip comments and lines that are part of the detection logic itself
-            if trimmed.starts_with("//") || trimmed.starts_with("\"") {
-                return false;
-            }
-            // Only flag lines that actually invoke print! or println! as a macro call
-            // (i.e. the identifier immediately followed by '!'), not lines discussing them
-            let call_println = line.contains("println!(");
-            let call_print = trimmed.starts_with("print!(")
-                || line.contains(" print!(")
-                || line.contains("\tprint!(");
-            let is_prefixed = line.contains("info_print!(") || line.contains("warn_print!(");
-            let is_detection_code = line.contains("line.contains(");
-            (call_println || call_print) && !is_prefixed && !is_detection_code
+    // Scans EVERY source file under src/mcp (todo #105 split the module), so a
+    // new per-tool file cannot silently escape the detector.
+    const MCP_SOURCES: &[(&str, &str)] = &[
+        ("mod.rs", include_str!("mod.rs")),
+        ("search.rs", include_str!("search.rs")),
+        ("find.rs", include_str!("find.rs")),
+        ("explore.rs", include_str!("explore.rs")),
+        ("get_chunk.rs", include_str!("get_chunk.rs")),
+        ("status.rs", include_str!("status.rs")),
+        ("find_impact.rs", include_str!("find_impact.rs")),
+        (
+            "find_impact_tracker.rs",
+            include_str!("find_impact_tracker.rs"),
+        ),
+        ("graph.rs", include_str!("graph.rs")),
+        ("literal_search.rs", include_str!("literal_search.rs")),
+        (
+            "federation_helpers.rs",
+            include_str!("federation_helpers.rs"),
+        ),
+        ("helpers.rs", include_str!("helpers.rs")),
+        ("instructions.rs", include_str!("instructions.rs")),
+        ("responses.rs", include_str!("responses.rs")),
+        ("proxy.rs", include_str!("proxy.rs")),
+        ("runtime.rs", include_str!("runtime.rs")),
+        ("types.rs", include_str!("types.rs")),
+    ];
+    let violations: Vec<(String, usize, &str)> = MCP_SOURCES
+        .iter()
+        .flat_map(|(file, src)| {
+            src.lines().enumerate().filter_map(move |(i, line)| {
+                let trimmed = line.trim_start();
+                // Skip comments and lines that are part of the detection logic itself
+                if trimmed.starts_with("//") || trimmed.starts_with("\"") {
+                    return None;
+                }
+                // Only flag lines that actually invoke print! or println! as a macro call
+                // (i.e. the identifier immediately followed by '!'), not lines discussing them
+                let call_println = line.contains("println!(");
+                let call_print = trimmed.starts_with("print!(")
+                    || line.contains(" print!(")
+                    || line.contains("\tprint!(");
+                let is_prefixed = line.contains("info_print!(") || line.contains("warn_print!(");
+                let is_detection_code = line.contains("line.contains(");
+                ((call_println || call_print) && !is_prefixed && !is_detection_code)
+                    .then(|| ((*file).to_string(), i + 1, line))
+            })
         })
         .collect();
 
@@ -32,9 +60,40 @@ fn test_mcp_no_raw_stdout_calls() {
         "MCP module has raw stdout calls that break the JSON-RPC protocol:\n{}",
         violations
             .iter()
-            .map(|(i, l)| format!("  line {}: {}", i + 1, l.trim()))
+            .map(|(f, i, l)| format!("  {}:{}: {}", f, i, l.trim()))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+// === Tool registration pin ===
+//
+// Safety net for the mod.rs split: a `#[tool]` method that lands in an impl
+// block the `#[tool_router]` macro does not scan is SILENTLY not registered.
+// This asserts on the exact router the service wires up (`merged_tool_router`,
+// the same expression both ctors and `#[tool_handler]` use) so every
+// extraction stage must keep the 6-tool surface intact.
+
+#[test]
+fn test_tool_registration_exposes_exactly_the_six_tools() {
+    let router = super::CodesearchService::merged_tool_router();
+    let mut names: Vec<String> = router
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    let expected: Vec<&str> = vec![
+        "explore",
+        "find",
+        "find_impact",
+        "get_chunk",
+        "search",
+        "status",
+    ];
+    assert_eq!(
+        names, expected,
+        "tools/list must expose exactly the consolidated 6-tool surface"
     );
 }
 
