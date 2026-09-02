@@ -45,6 +45,36 @@ pub struct FindImpactResult {
     pub language: String,
     /// Scope that was searched, e.g. `"project:example-org"`.
     pub scope: String,
+    /// Git HEAD sha the symbol index was built for, when recorded. Compare
+    /// with `current_head_sha` to spot index drift after a branch switch.
+    /// Drift is surfaced, never auto-reindexed (deliberate — see
+    /// `SymbolIndexer::index_head_sha`). Omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_head_sha: Option<String>,
+    /// Repository HEAD at response time, when readable. Omitted when the
+    /// read fails (git unavailable, transient Windows handle race — must
+    /// never fail the response).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_head_sha: Option<String>,
+}
+
+/// Resolve the repository HEAD sha for `repo_root` (40-hex), or `None`
+/// when git is unavailable, the path is not a work tree, or the read
+/// fails. Non-fatal BY DESIGN: a transient Windows git failure (see the
+/// `GitHeadWatcher` note in `src/watch/mod.rs`) must never take down a
+/// response that only wanted the fingerprint.
+pub(crate) fn current_git_head(repo_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let is_40_hex = sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit());
+    is_40_hex.then_some(sha)
 }
 
 /// Error returned when the symbol index is unavailable.
@@ -56,6 +86,97 @@ pub struct SymbolIndexError {
     pub available_languages: Vec<String>,
     /// Suggestion for the agent.
     pub hint_for_agent: String,
+}
+
+/// Structured busy answer returned when a `find_impact` lookup exceeds its
+/// internal wall-clock budget.
+///
+/// The MCP client must never be the timeout mechanism: when the budget
+/// overruns, the server answers with this envelope (serialized as JSON in
+/// the tool-result text) while the lookup keeps running in the background.
+/// A caller can branch on `busy == true` instead of parsing an opaque
+/// client-side timeout, and the retry hinted in `advice` is served from the
+/// reference cache the running lookup will have populated.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolLookupBusy {
+    /// Always `true`; makes the envelope self-describing.
+    pub busy: bool,
+    /// What is still running, e.g. `"resolving 'Ns.I.M' via the csharp SCIP helper"`.
+    pub state: String,
+    /// Wall-clock time the request waited before the budget overran. On the
+    /// retry answer for a tracked lookup this is the background lookup's
+    /// cumulative elapsed time instead.
+    pub waited_ms: u64,
+    /// Actionable retry hint, e.g. `"retry the same call in ~60s"`.
+    pub advice: String,
+}
+
+/// Machine-branchable class of a failed `find_impact` lookup.
+///
+/// `busy` needs no class here: an overran lookup answers with the typed
+/// `SymbolLookupFailure`-free `SymbolLookupBusy` envelope instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SymbolLookupFailureClass {
+    /// The helper ran and failed (non-zero exit, crash, unusable output)
+    /// against a readable index. Retrying cannot succeed until the cause
+    /// changes; fall back to text search.
+    Failed,
+    /// No readable symbol index (`index_age` reports unknown): retrying
+    /// the lookup cannot succeed until the index is built or rebuilt.
+    Stale,
+}
+
+/// Typed failure envelope for `find_impact` lookups, serialized as JSON in
+/// the tool-result text (same convention as `SymbolIndexError`). Replaces
+/// the former soft-string render (`Symbol lookup failed: ...`) so an agent
+/// can branch on `class` instead of parsing prose.
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolLookupFailure {
+    /// Rendered `{:#}` error chain.
+    pub error: String,
+    /// Machine-branchable failure class.
+    pub class: SymbolLookupFailureClass,
+    /// Actionable hint for the agent.
+    pub hint_for_agent: String,
+}
+
+impl SymbolLookupFailure {
+    /// A failed lookup against a readable index.
+    pub fn failed(error_chain: impl Into<String>) -> Self {
+        Self {
+            error: error_chain.into(),
+            class: SymbolLookupFailureClass::Failed,
+            hint_for_agent: "The SCIP helper failed for this lookup. Do not retry the same call \
+                             immediately; fall back to `find` with kind=\"usages\" (text-based) \
+                             and/or reindex the project to rebuild the symbol index."
+                .to_string(),
+        }
+    }
+
+    /// A failed lookup with an unreadable/absent symbol index.
+    pub fn stale(error_chain: impl Into<String>) -> Self {
+        Self {
+            error: error_chain.into(),
+            class: SymbolLookupFailureClass::Stale,
+            hint_for_agent: "No readable symbol index for this project. Build or rebuild it \
+                             first (`codesearch index` / `index reindex`), then retry the \
+                             same call."
+                .to_string(),
+        }
+    }
+
+    /// Classify a lookup failure by the index age reported for the same db:
+    /// an unknown age (`u64::MAX`, what `index_age` returns whenever the
+    /// index cannot be opened or read) means stale; anything else means the
+    /// index was readable and the lookup itself failed.
+    pub fn classify(error_chain: impl Into<String>, index_age_seconds: u64) -> Self {
+        if index_age_seconds == u64::MAX {
+            Self::stale(error_chain)
+        } else {
+            Self::failed(error_chain)
+        }
+    }
 }
 
 /// Which files/projects to reindex.
@@ -207,6 +328,17 @@ pub trait SymbolIndexer: Send + Sync {
     /// How old is the current symbol index (seconds since last rebuild)?
     fn index_age(&self, db_path: &Path) -> u64;
 
+    /// The git HEAD sha the current symbol index was built for, when
+    /// recorded. `None` means unknown (pre-fingerprint index, or git was
+    /// unreadable at build time). Compare with the repository's current
+    /// HEAD to make index drift after a branch switch visible — drift is
+    /// surfaced, never auto-reindexed (deliberate: reindexing a large
+    /// solution on every branch switch would thrash; refresh stays an
+    /// explicit operator action).
+    fn index_head_sha(&self, _db_path: &Path) -> Option<String> {
+        None
+    }
+
     /// Whether the helper binary for this language is available.
     fn is_available(&self) -> bool;
 
@@ -319,3 +451,11 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&env1, &env2));
     }
 }
+
+/// Lock-visibility verification (todo #96 step 5): readers never block on
+/// an open write transaction — the property that lets `find_impact` serve
+/// during an indexer rebuild without needing a `lock_status` in the busy
+/// envelope. Sibling `_tests.rs` file per repo convention.
+#[cfg(test)]
+#[path = "lock_visibility_tests.rs"]
+mod lock_visibility_tests;

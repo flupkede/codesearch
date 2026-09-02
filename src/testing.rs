@@ -28,6 +28,18 @@ impl EnvRestore {
         }
         Self { saved }
     }
+
+    /// Snapshot the current values of `vars` (including "was unset"), then
+    /// REMOVE them all. Restores on drop. Complements [`EnvRestore::set`]
+    /// for the "variable must be absent" cases (e.g. asserting the default
+    /// fallback of an env-overridable knob).
+    pub fn remove(vars: &[&'static str]) -> Self {
+        let saved = vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in vars {
+            std::env::remove_var(k);
+        }
+        Self { saved }
+    }
 }
 
 impl Drop for EnvRestore {

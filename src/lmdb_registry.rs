@@ -413,12 +413,23 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("db");
         std::fs::create_dir(&db_path).unwrap();
+        // heed's OPENED_ENV is keyed by its own `canonicalize_path`, and the
+        // query in `env_closing_event` is an EXACT un-normalized lookup. On
+        // Windows heed canonicalizes and then round-trips through a file URL,
+        // which strips the `\\?\` UNC prefix — the key is the plain long
+        // path. A raw TempDir path here can be an 8.3 short name
+        // (`DEVELT~1`), which normalizes to a different string than the
+        // query, so the lookup misses and the test fails on Windows while
+        // passing on Linux (where both forms are identical). `safe_canonicalize`
+        // (canonicalize + UNC-strip) is exactly heed's Windows normalization,
+        // so the query matches the registry key on every OS.
+        let heed_key = safe_canonicalize(&db_path).unwrap();
         let opts = make_opts();
 
         {
             let _env = unsafe { TrackedEnv::open(&opts, &db_path, "close-on-drop-test").unwrap() };
             assert!(
-                heed::env_closing_event(&db_path).is_some(),
+                heed::env_closing_event(&heed_key).is_some(),
                 "while the TrackedEnv lives, heed must report the env open"
             );
         }
@@ -427,7 +438,7 @@ mod tests {
         // from ours (`open_holders_under` is vacuous here, it tracks
         // TrackedEnvs only).
         assert!(
-            heed::env_closing_event(&db_path).is_none(),
+            heed::env_closing_event(&heed_key).is_none(),
             "heed's OPENED_ENV entry must be removed on TrackedEnv drop; \
              a surviving entry means mdb_env_close never ran"
         );

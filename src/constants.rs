@@ -617,6 +617,11 @@ pub const SCIP_META_DB_NAME: &str = "scip_meta";
 /// LMDB metadata key for the last rebuild timestamp.
 pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
 
+/// LMDB metadata key for the git HEAD sha the symbol index was built for.
+/// Written on rebuild when the repo HEAD is readable; absent means unknown
+/// (never written, or git could not be read at build time).
+pub const SCIP_HEAD_SHA_KEY: &str = "head_sha";
+
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
 pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
@@ -647,6 +652,10 @@ pub const SCIP_TYPESCRIPT_HELPER_ENV: &str = "CODESEARCH_SCIP_TYPESCRIPT";
 /// Namespaced per-language (unlike C#'s un-namespaced `SCIP_REBUILD_TIMESTAMP_KEY`)
 /// so both adapters can safely share the same `scip_meta` table if ever merged.
 pub const SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts:typescript";
+
+/// TypeScript-specific key for `SCIP_HEAD_SHA_KEY` (the C# and TypeScript
+/// adapters share one `scip_meta` table, so keys are language-prefixed).
+pub const SCIP_TYPESCRIPT_HEAD_SHA_KEY: &str = "head_sha:typescript";
 
 /// Debounce window (ms) for the TypeScript file-watcher symbol rebuild.
 /// Mirrors `SCIP_CSHARP_DEBOUNCE_MS` — a single quiet-period flush avoids
@@ -706,6 +715,37 @@ pub const SCIP_LMDB_DEFAULT_MAP_SIZE_MB: usize = 512;
 /// Environment variable to override the SCIP LMDB map size in megabytes.
 /// When set, takes precedence over `SCIP_LMDB_DEFAULT_MAP_SIZE_MB`.
 pub const SCIP_LMDB_MAP_SIZE_MB_ENV: &str = "CODESEARCH_SCIP_LMDB_MAP_MB";
+
+/// Internal wall-clock budget (seconds) for a single `find_impact` reference
+/// lookup.
+///
+/// A cold reference-cache miss makes the `find_impact` handler invoke the
+/// external SCIP helper (`scip-csharp find-refs`), which can take several
+/// minutes on a large solution. Without an internal deadline the MCP client
+/// is the timeout mechanism: it aborts with an opaque `-32001 Request timed
+/// out` and the calling agent falls back to plain-text search exactly when
+/// the precise SCIP call graph is most useful. This budget makes the server
+/// answer first with a structured busy envelope
+/// (`{"busy": true, "state": ..., "waited_ms": ..., "advice": ...}`) while
+/// the lookup continues in the background, so a retry is served warm from
+/// the reference cache instead of cold again.
+///
+/// Override at runtime with `CODESEARCH_FIND_IMPACT_BUDGET_SECS` (integer
+/// seconds). `0` disables the budget entirely, restoring the previous
+/// unbounded-blocking behaviour. Unparseable values fall back to the default.
+pub const DEFAULT_FIND_IMPACT_BUDGET_SECS: u64 = 60;
+
+/// Environment variable to override `DEFAULT_FIND_IMPACT_BUDGET_SECS`.
+pub const FIND_IMPACT_BUDGET_SECS_ENV: &str = "CODESEARCH_FIND_IMPACT_BUDGET_SECS";
+
+/// How long (seconds) a budget-overrun `find_impact` lookup stays tracked
+/// for retry observation. Must comfortably exceed the slowest legitimate
+/// `scip-csharp find-refs` run (several minutes on a large solution): an
+/// entry dropped while its lookup is still running would turn a retry into
+/// a cold restart, voiding the dedupe the busy advice promises. Finished
+/// entries are removed on their first retry read, so this cap only bounds
+/// abandoned lookups.
+pub const FIND_IMPACT_TRACK_TTL_SECS: u64 = 1800;
 
 /// Debounce window (seconds) for persisting repos.json metadata updates.
 /// Coalesces bursts of file changes into a single write.
