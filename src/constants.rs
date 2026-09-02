@@ -733,10 +733,40 @@ pub const SCIP_LMDB_MAP_SIZE_MB_ENV: &str = "CODESEARCH_SCIP_LMDB_MAP_MB";
 /// Override at runtime with `CODESEARCH_FIND_IMPACT_BUDGET_SECS` (integer
 /// seconds). `0` disables the budget entirely, restoring the previous
 /// unbounded-blocking behaviour. Unparseable values fall back to the default.
-pub const DEFAULT_FIND_IMPACT_BUDGET_SECS: u64 = 60;
+///
+/// The default is deliberately BELOW typical MCP client timeouts (observed
+/// live: an MCP client gave up at ~60s with `-32001` while the busy answer
+/// was still being prepared at the 60s budget) — the structured busy answer
+/// is only useful if it arrives before the client stops listening.
+pub const DEFAULT_FIND_IMPACT_BUDGET_SECS: u64 = 45;
 
 /// Environment variable to override `DEFAULT_FIND_IMPACT_BUDGET_SECS`.
 pub const FIND_IMPACT_BUDGET_SECS_ENV: &str = "CODESEARCH_FIND_IMPACT_BUDGET_SECS";
+
+/// Maximum number of resident SCIP helper workspaces (todo #115).
+///
+/// Admission control IS the memory governor: each resident workspace holds a
+/// fully loaded Roslyn solution (1-2 GB on large solutions), so the pool cap
+/// bounds total helper memory to `MAX_RESIDENT x heap cap`. A third repo's
+/// lookup evicts the least-recently-used workspace — eviction is safe because
+/// resolved references persist in the LMDB ref cache, so only latency is
+/// lost, never data.
+pub const DEFAULT_SCIP_MAX_RESIDENT_WORKSPACES: usize = 2;
+pub const SCIP_MAX_RESIDENT_WORKSPACES_ENV: &str = "CODESEARCH_SCIP_MAX_RESIDENT";
+
+/// Per-workspace managed-heap cap passed to the helper as
+/// `DOTNET_GCHeapHardLimit` (bytes; the env var is interpreted as hex by the
+/// .NET runtime, so the Rust side formats it without a prefix). A runaway
+/// workspace fails fast at the cap instead of taking the machine with it —
+/// the typed `failed` path turns that into an agent-actionable answer.
+pub const DEFAULT_SCIP_WORKSPACE_HEAP_CAP: u64 = 1_610_612_736; // 1.5 GiB
+pub const SCIP_WORKSPACE_HEAP_CAP_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_HEAP_CAP";
+
+/// Resident workspaces idle longer than this are torn down by lazy reaping
+/// (checked on pool access). Restarting a workspace costs one solution load —
+/// acceptable for an idle repo, which is exactly what the TTL measures.
+pub const DEFAULT_SCIP_WORKSPACE_IDLE_SECS: u64 = 600;
+pub const SCIP_WORKSPACE_IDLE_SECS_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_IDLE_SECS";
 
 /// How long (seconds) a budget-overrun `find_impact` lookup stays tracked
 /// for retry observation. Must comfortably exceed the slowest legitimate

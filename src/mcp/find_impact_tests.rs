@@ -275,3 +275,51 @@ fn current_git_head_is_none_outside_a_repo() {
     let _ = std::fs::create_dir_all(&tmp);
     assert!(crate::symbols::current_git_head(&tmp).is_none());
 }
+
+#[test]
+fn dedupe_references_collapses_identical_entries_and_keeps_distinct_ones() {
+    // Live observation (2026-08-31): a definition arrived 5× — the SCIP
+    // find-refs output emits multiple occurrences at the same file:line for
+    // the declaring symbol. Identical (file, line range, kind) entries carry
+    // no separately-actionable information and collapse to the first.
+    let r = |file: &str, start: u32, end: u32, kind: &str| crate::symbols::SymbolReference {
+        file: std::path::PathBuf::from(file),
+        start_line: start,
+        end_line: end,
+        kind: kind.to_string(),
+    };
+    let input = vec![
+        r("src/A.cs", 9, 9, "definition"),
+        r("src/A.cs", 9, 9, "definition"),
+        r("src/A.cs", 9, 9, "definition"),
+        r("src/B.cs", 192, 192, "reference"),
+        r("src/A.cs", 9, 9, "definition"),
+        r("src/A.cs", 40, 44, "reference"),
+        r("src/A.cs", 9, 9, "reference"), // same line, DIFFERENT kind → kept
+    ];
+    let out = super::dedupe_references(input);
+    let summary: Vec<(String, u32, u32, &str)> = out
+        .iter()
+        .map(|x| {
+            (
+                x.file.to_string_lossy().into_owned(),
+                x.start_line,
+                x.end_line,
+                x.kind.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("src/A.cs".to_string(), 9, 9, "definition"),
+            ("src/B.cs".to_string(), 192, 192, "reference"),
+            ("src/A.cs".to_string(), 40, 44, "reference"),
+            ("src/A.cs".to_string(), 9, 9, "reference"),
+        ],
+        "identical entries collapse to the first, distinct ones survive, order is stable: {summary:?}"
+    );
+
+    // Empty input stays empty (no panic on the with_capacity path).
+    assert!(super::dedupe_references(Vec::new()).is_empty());
+}

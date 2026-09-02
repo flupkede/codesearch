@@ -8,6 +8,7 @@
 //! `SymbolIndexer` impls here.
 
 pub mod csharp;
+pub mod resident;
 pub mod scip_parse;
 pub mod scip_proto;
 pub mod typescript;
@@ -459,3 +460,9 @@ mod tests {
 #[cfg(test)]
 #[path = "lock_visibility_tests.rs"]
 mod lock_visibility_tests;
+
+/// Resident-helper WorkspacePool tests (todo #115). Sibling `_tests.rs`
+/// file per repo convention.
+#[cfg(test)]
+#[path = "resident_tests.rs"]
+mod resident_tests;

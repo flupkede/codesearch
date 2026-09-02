@@ -2216,6 +2216,128 @@ fn respond_with_items_carries_warnings_on_every_path() {
 }
 
 #[test]
+fn respond_with_items_noted_shapes_on_every_path() {
+    use rmcp::model::RawContent;
+    let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
+        match &r.unwrap().content[0].raw {
+            RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    };
+    let warned = vec!["repo 'inriver' usage search failed: os error 22".to_string()];
+    let note = Some("lexical text matching — use find_impact for precise references");
+
+    // Healthy, no note: byte-identical bare array (the delegated legacy path).
+    let out = text(super::respond_with_items_noted(
+        &[1u32, 2],
+        &[],
+        None,
+        || "unused".to_string(),
+    ));
+    assert_eq!(
+        out, "[1,2]",
+        "healthy no-note response must not change shape"
+    );
+
+    // Note only: results + note, no warnings key (absent, not null).
+    let out = text(super::respond_with_items_noted(
+        &[1u32, 2],
+        &[],
+        note,
+        || "unused".to_string(),
+    ));
+    let p: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(p["results"][0], 1);
+    assert!(p["note"].as_str().unwrap().contains("find_impact"));
+    assert!(p.get("warnings").is_none(), "no null warnings key: {p}");
+
+    // Note + warnings: the channel still terminates, next to the note.
+    let out = text(super::respond_with_items_noted(
+        &[1u32],
+        &warned,
+        note,
+        || "unused".to_string(),
+    ));
+    let p: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(p["note"].as_str().is_some(), "got: {p}");
+    assert_eq!(p["warnings"][0], warned[0].as_str());
+
+    // Warnings only (note absent): identical to respond_with_items shape.
+    let out = text(super::respond_with_items_noted(
+        &[1u32],
+        &warned,
+        None,
+        || "unused".to_string(),
+    ));
+    let p: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(p.get("note").is_none(), "got: {p}");
+    assert!(p["warnings"][0].as_str().is_some(), "got: {p}");
+
+    // Empty + note: the note rides on the empty message — an empty lexical
+    // result is exactly where the SCIP upgrade path matters most.
+    let out = text(super::respond_with_items_noted(
+        &[0u32; 0],
+        &[],
+        note,
+        || "No usages found for 'Foo'.".to_string(),
+    ));
+    assert!(out.contains("No usages found for 'Foo'."), "got: {out}");
+    assert!(out.contains("find_impact"), "got: {out}");
+}
+
+#[test]
+fn rank_code_first_demotes_docs_without_reordering_code() {
+    let item = |path: &str, score: f32| super::ReferenceItem {
+        chunk_id: 0,
+        path: path.to_string(),
+        line: 1,
+        kind: "Block".to_string(),
+        signature: None,
+        score,
+    };
+    // Score order deliberately NOT aligned with code/doc grouping: the
+    // highest-scoring hit is markdown. Stable sort must keep cs before ts
+    // (both code, 5.0 before 4.0) and md before AGENTS.md (both docs,
+    // 9.0 before 1.0), while every code item outranks every doc item.
+    let mut items = vec![
+        item("docs/README.md", 9.0),
+        item("src/A.cs", 5.0),
+        item("src/b.ts", 4.0),
+        item("AGENTS.md", 1.0),
+    ];
+    super::rank_code_first(&mut items);
+    let paths: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["src/A.cs", "src/b.ts", "docs/README.md", "AGENTS.md"],
+        "code first (score order kept), docs demoted as a block: {paths:?}"
+    );
+}
+
+#[test]
+fn scip_usages_note_is_suppressed_without_backed_source_files() {
+    // Machine-independent half of the gate: no C#/TS source in the hits →
+    // no note, regardless of what indexers the host happens to have (the
+    // registry must not even be consulted). The positive branch is gated on
+    // helper availability and therefore structure-covered only, same
+    // reasoning as the csharp_helper_integration test.
+    let registry = std::sync::Arc::new(crate::symbols::SymbolIndexerRegistry::new());
+    let item = |path: &str| super::ReferenceItem {
+        chunk_id: 0,
+        path: path.to_string(),
+        line: 1,
+        kind: "Block".to_string(),
+        signature: None,
+        score: 1.0,
+    };
+    let markdown_only = vec![item("docs/notes.md"), item("src/lib.rs"), item("AGENTS.md")];
+    assert!(
+        super::scip_usages_note(&registry, &markdown_only, "Foo").is_none(),
+        "a Rust/docs hit list must not advertise a SCIP upgrade path"
+    );
+}
+
+#[test]
 fn ambiguous_chunk_payload_declares_an_incomplete_candidate_list() {
     // `candidate_projects` reads as exhaustive. When a store failed to
     // answer, the repo the caller wants may be the one missing from it, so
