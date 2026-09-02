@@ -8,7 +8,7 @@ use crate::embed::ModelType;
 use crate::index::{IndexManager, SharedStores};
 use anyhow::{Context, Result};
 use rmcp::RoleClient;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -57,6 +57,99 @@ impl std::str::FromStr for McpMode {
             )),
         }
     }
+}
+
+pub(crate) fn validate_local_startup_flags(
+    mode: McpMode,
+    readonly: bool,
+    require_ready: bool,
+) -> Result<()> {
+    if mode != McpMode::Local && (readonly || require_ready) {
+        return Err(anyhow::anyhow!(
+            "--readonly and --require-ready apply only to local MCP mode; \
+             pass --mode local instead of --mode {}",
+            mode,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn may_create_missing_index(
+    create_index: bool,
+    readonly: bool,
+    require_ready: bool,
+) -> bool {
+    create_index && !readonly && !require_ready
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct McpStartupOptions {
+    pub create_index: bool,
+    pub readonly: bool,
+    pub require_ready: bool,
+}
+
+pub(crate) fn validate_prebuilt_index_health(
+    db_path: &Path,
+    total_chunks: usize,
+    vector_indexed: bool,
+    fts_documents: usize,
+    partial: bool,
+) -> Result<()> {
+    if total_chunks == 0 || !vector_indexed || fts_documents == 0 || partial {
+        return Err(anyhow::anyhow!(
+            "Prebuilt codesearch index is not ready at {}: \
+             chunks={}, vector_indexed={}, fts_documents={}, partial={}. \
+             Run `codesearch index` before starting MCP with --require-ready.",
+            db_path.display(),
+            total_chunks,
+            vector_indexed,
+            fts_documents,
+            partial,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn require_prebuilt_index_ready(
+    stores: &SharedStores,
+    db_path: &Path,
+) -> Result<()> {
+    let (total_chunks, vector_indexed) = {
+        let vector_store = stores.vector_store.read().await;
+        vector_store
+            .index_health()
+            .context("Failed to inspect prebuilt vector index")?
+    };
+    let fts_documents = {
+        let fts_store = stores.fts_store.read().await;
+        fts_store
+            .stats()
+            .context("Failed to inspect prebuilt full-text index")?
+            .num_documents
+    };
+    let metadata = std::fs::read_to_string(db_path.join("metadata.json"))
+        .context("Failed to read prebuilt index metadata")?;
+    let metadata: serde_json::Value =
+        serde_json::from_str(&metadata).context("Failed to parse prebuilt index metadata")?;
+    let partial = match metadata.get("partial") {
+        None => {
+            return Err(anyhow::anyhow!(
+                "Prebuilt index metadata is missing the partial readiness marker; \
+                 run `codesearch index` before starting MCP with --require-ready"
+            ));
+        }
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("Prebuilt index metadata partial must be a boolean"))?,
+    };
+    validate_prebuilt_index_health(
+        db_path,
+        total_chunks,
+        vector_indexed,
+        fts_documents,
+        partial,
+    )
 }
 
 /// Probe the serve health endpoint. Returns Ok(serve_url) if serve is alive.
@@ -455,6 +548,10 @@ async fn connect_to_serve(
 /// - No incremental refresh
 ///
 /// This allows multiple terminal windows to use codesearch simultaneously.
+///
+/// This library entry retains the original writable, non-blocking startup
+/// behavior. CLI callers that need explicit ownership controls use
+/// [`run_mcp_server_with_options`].
 pub async fn run_mcp_server(
     path: Option<PathBuf>,
     create_index: bool,
@@ -463,6 +560,36 @@ pub async fn run_mcp_server(
     mode: McpMode,
     cancel_token: CancellationToken,
 ) -> Result<()> {
+    run_mcp_server_with_options(
+        path,
+        McpStartupOptions {
+            create_index,
+            readonly: false,
+            require_ready: false,
+        },
+        log_level,
+        quiet,
+        mode,
+        cancel_token,
+    )
+    .await
+}
+
+/// Run MCP with explicit local index ownership and readiness controls.
+///
+/// `startup.readonly` requests read-only mode up front.
+/// `startup.require_ready` independently rejects an incomplete index at startup.
+/// They are separate because a read-only secondary window over an index another
+/// process is still building is legitimate.
+pub async fn run_mcp_server_with_options(
+    path: Option<PathBuf>,
+    startup: McpStartupOptions,
+    log_level: crate::logger::LogLevel,
+    quiet: bool,
+    mode: McpMode,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    validate_local_startup_flags(mode, startup.readonly, startup.require_ready)?;
     let serve_url = serve_url_from_env();
 
     // Set FASTEMBED_CACHE_DIR early (before any embedding work) to ensure fastembed
@@ -534,10 +661,15 @@ pub async fn run_mcp_server(
         (info.project_path, info.db_path)
     } else {
         // No database found
-        if !create_index {
+        if !may_create_missing_index(
+            startup.create_index,
+            startup.readonly,
+            startup.require_ready,
+        ) {
             return Err(anyhow::anyhow!(
                 "No database found in current directory, parent directories, or globally tracked repositories. \
-                 Run 'codesearch index' first to index the codebase, or use --create-index=true flag to automatically create it."
+                 Run 'codesearch index' first, or start writable local MCP with \
+                 --create-index=true and without --readonly/--require-ready."
             ));
         }
 
@@ -625,16 +757,30 @@ pub async fn run_mcp_server(
         crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
     };
 
-    // Create shared stores - try write mode first, fall back to readonly if locked
-    // This enables multiple terminal windows to use the same database
+    // `--readonly` serves a caller-owned index and never takes the writer lock.
+    // Otherwise try write mode first and fall back to readonly if it is held,
+    // so multiple terminal windows can use the same database.
     tracing::info!("📦 Creating shared stores...");
-    let (shared_stores, is_readonly) = SharedStores::new_or_readonly(&db_path, dimensions)?;
+    let (shared_stores, is_readonly) = if startup.readonly {
+        (SharedStores::new_readonly(&db_path, dimensions)?, true)
+    } else {
+        SharedStores::new_or_readonly(&db_path, dimensions)?
+    };
     let shared_stores = Arc::new(shared_stores);
 
-    if is_readonly {
+    if startup.readonly {
+        tracing::info!("📖 Readonly mode requested: the caller owns this index");
+    } else if is_readonly {
         tracing::warn!("🔒 Running in READONLY mode (another instance has write access)");
         tracing::warn!("   ↳ Searches work normally, but index won't auto-update");
         tracing::warn!("   ↳ Close the other instance to enable write mode");
+    }
+
+    // Reject an incomplete index before the transport exists, so the caller sees
+    // a startup failure instead of a served "building" status it cannot fix.
+    if startup.require_ready {
+        require_prebuilt_index_ready(&shared_stores, &db_path).await?;
+        tracing::info!("✅ Vector and full-text indexes are ready");
     }
 
     // Create MCP service with shared stores (ready immediately)
