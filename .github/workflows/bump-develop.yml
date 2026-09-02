@@ -26,8 +26,14 @@ name: Bump develop version
 #      actions/create-github-app-token instead of the secret below.
 # Until CI_PAT exists, every run fails fast at checkout (empty token).
 
+# `pull_request_target` (not `pull_request`): fork PRs run `pull_request`
+# WITHOUT repo secrets, so CI_PAT is empty and checkout fails
+# ("Input required and not supplied: token" — seen on fork PR #220).
+# pull_request_target runs in base-repo context WITH secrets. Safe here: the
+# workflow file comes from develop (never from the PR) and this job checks out
+# `ref: develop` only — the PR's code is never executed or checked out.
 on:
-  pull_request:
+  pull_request_target:
     types: [closed]
     branches: [develop]
 
