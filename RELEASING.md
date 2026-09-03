@@ -49,6 +49,22 @@ git push -u origin release/v1.0.X
 
 Create PR → `master`. **Squash merge.**
 
+> **Keep contributors credited** — a squash commit is authored by whoever clicks
+> merge, so individual authorship never reaches master, and the GitHub
+> contributors list counts only the default branch. Carry the author trailers
+> in the squash commit body (review the list first — it may contain device/test
+> identities you don't want credited):
+>
+> ```bash
+> scripts/release-coauthors.sh   # prints Co-authored-by: lines
+> gh pr merge --squash --admin \
+>   --subject "release: v1.0.X" \
+>   --body "$(scripts/release-coauthors.sh)"
+> ```
+>
+> Squash-merging via the GitHub web UI instead? Its default squash message
+> already appends co-author trailers automatically — no script needed.
+
 ### 3. Tag release
 
 ```bash

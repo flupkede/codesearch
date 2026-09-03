@@ -2489,6 +2489,35 @@ mod tests {
     use crate::cache::FileMetaStore;
     use tempfile::tempdir;
 
+    /// Dropping the last `Arc<SharedStores>` must release every handle inside
+    /// the DB directory — the precondition `index rm`'s delete path depends on.
+    ///
+    /// Pins the Windows manifestation of a heed 0.20 leak fixed in
+    /// `TrackedEnv::drop`: the `OPENED_ENV` cache entry held a strong `Env`
+    /// clone, so `mdb_env_close` never ran after a plain drop and
+    /// `data.mdb`/`lock.mdb` stayed locked for the life of the process —
+    /// `serve::tests::index_rm_deletes_db_while_serve_holds_real_lmdb_env`
+    /// failed deterministically on os error 32 through the whole 60 s retry
+    /// budget with an EMPTY LMDB registry (the holder was invisible to it).
+    /// This is the serve-free, instant version of that acceptance test.
+    #[test]
+    fn sharedstores_drop_releases_db_dir_for_deletion() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join(".codesearch.db");
+        let stores = SharedStores::new(&db, 384).expect("open SharedStores");
+        assert!(
+            !crate::lmdb_registry::open_holders_under(&db).is_empty(),
+            "holder must be visible while SharedStores lives"
+        );
+        drop(stores);
+        assert!(
+            crate::lmdb_registry::open_holders_under(&db).is_empty(),
+            "registry must drain after the last Arc<SharedStores> drops"
+        );
+        std::fs::remove_dir_all(&db)
+            .expect("db dir must be deletable after SharedStores drops (no leaked LMDB handles)");
+    }
+
     /// Helper: create metadata.json in db_path with given dimensions
     fn create_metadata_json(db_path: &Path, dimensions: usize) {
         let metadata = serde_json::json!({

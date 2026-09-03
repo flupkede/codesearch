@@ -517,6 +517,24 @@ pub enum Commands {
         )]
         create_index: bool,
 
+        /// Serve a caller-owned local index without writing to it.
+        ///
+        /// Opens the database read-only and never runs incremental refresh or
+        /// file watching. On its own this still serves an index another process
+        /// is building; pair it with --require-ready to reject that case.
+        /// Requires --mode local.
+        #[arg(long)]
+        readonly: bool,
+
+        /// Refuse to start unless the existing local index is complete.
+        ///
+        /// Verifies the vector and full-text stores hold data before the MCP
+        /// transport opens, so an incomplete index fails startup instead of
+        /// answering `status` with "building" and `search` with no results.
+        /// Requires --mode local.
+        #[arg(long)]
+        require_ready: bool,
+
         /// MCP connection mode (default: auto, override with CODESEARCH_MCP_MODE)
         ///
         /// - auto:   Connect to serve if running, otherwise use local DB
@@ -1228,6 +1246,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
         Commands::Mcp {
             path,
             create_index,
+            readonly,
+            require_ready,
             mode,
         } => {
             // Logger is initialized inside run_mcp_server() once db_path is known.
@@ -1235,8 +1255,24 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             //
             // MCP stdio transport uses stdout for JSON-RPC — always force file-only
             // logging to keep the channel clean, regardless of the global --quiet flag.
-            crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token)
+            if readonly || require_ready {
+                crate::mcp::run_mcp_server_with_options(
+                    path,
+                    crate::mcp::McpStartupOptions {
+                        create_index,
+                        readonly,
+                        require_ready,
+                    },
+                    log_level,
+                    true,
+                    mode,
+                    cancel_token,
+                )
                 .await
+            } else {
+                crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token)
+                    .await
+            }
         }
         Commands::Cache { command } => match command {
             CacheCommands::Stats { model } => run_cache_stats(model).await,
@@ -2046,6 +2082,61 @@ mod tests {
             .expect("cli parse should succeed");
         match cli.command {
             Commands::Mcp { create_index, .. } => assert!(create_index),
+            _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_readonly_and_require_ready_default_to_false() {
+        let cli = Cli::try_parse_from(["codesearch", "mcp"]).expect("cli parse should succeed");
+        match cli.command {
+            Commands::Mcp {
+                readonly,
+                require_ready,
+                ..
+            } => {
+                assert!(!readonly);
+                assert!(!require_ready);
+            }
+            _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_readonly_does_not_imply_other_flags() {
+        let cli = Cli::try_parse_from(["codesearch", "mcp", "--readonly"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Mcp {
+                readonly,
+                require_ready,
+                create_index,
+                ..
+            } => {
+                assert!(readonly);
+                assert!(!require_ready, "--readonly must not imply --require-ready");
+                assert!(
+                    create_index,
+                    "--readonly must not imply --create-index=false"
+                );
+            }
+            _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_require_ready_does_not_imply_readonly() {
+        let cli = Cli::try_parse_from(["codesearch", "mcp", "--require-ready"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Mcp {
+                require_ready,
+                readonly,
+                ..
+            } => {
+                assert!(require_ready);
+                assert!(!readonly, "--require-ready must not imply --readonly");
+            }
             _ => panic!("expected Mcp command"),
         }
     }
