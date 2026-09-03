@@ -30,6 +30,17 @@ emails=$(git log --no-merges --format='%an <%ae>' "$BASE..$HEAD" \
   | grep -viE 'github-actions\[bot\]|dependabot\[bot\]|41898282\+github-actions|test@example\.com' \
   || true)
 
+# Optional local blocklist (.docs/ is gitignored): one grep -E pattern per
+# line, e.g. a device identity you never want credited. NEVER commit it.
+BLOCKLIST=".docs/coauthors-blocklist"
+if [ -f "$BLOCKLIST" ]; then
+  while IFS= read -r pattern; do
+    [ -z "$pattern" ] && continue
+    case "$pattern" in \#*) continue ;; esac
+    emails=$(printf '%s\n' "$emails" | grep -viE "$pattern" || true)
+  done < "$BLOCKLIST"
+fi
+
 if [ -z "$emails" ]; then
   echo "(no human commits between $BASE and $HEAD — nothing to credit)" >&2
   exit 0
