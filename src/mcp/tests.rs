@@ -5,25 +5,53 @@ fn test_mcp_no_raw_stdout_calls() {
     // Verify that no raw print!/println! calls exist in the MCP module sources.
     // MCP communicates over stdout (JSON-RPC), so any stdout pollution breaks the protocol.
     // All informational output must go through info_print!/warn_print!/eprintln! (stderr).
-    let src = include_str!("mod.rs");
-    let violations: Vec<(usize, &str)> = src
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            let trimmed = line.trim_start();
-            // Skip comments and lines that are part of the detection logic itself
-            if trimmed.starts_with("//") || trimmed.starts_with("\"") {
-                return false;
-            }
-            // Only flag lines that actually invoke print! or println! as a macro call
-            // (i.e. the identifier immediately followed by '!'), not lines discussing them
-            let call_println = line.contains("println!(");
-            let call_print = trimmed.starts_with("print!(")
-                || line.contains(" print!(")
-                || line.contains("\tprint!(");
-            let is_prefixed = line.contains("info_print!(") || line.contains("warn_print!(");
-            let is_detection_code = line.contains("line.contains(");
-            (call_println || call_print) && !is_prefixed && !is_detection_code
+    // Scans EVERY source file under src/mcp (todo #105 split the module), so a
+    // new per-tool file cannot silently escape the detector.
+    const MCP_SOURCES: &[(&str, &str)] = &[
+        ("mod.rs", include_str!("mod.rs")),
+        ("search.rs", include_str!("search.rs")),
+        ("find.rs", include_str!("find.rs")),
+        ("explore.rs", include_str!("explore.rs")),
+        ("get_chunk.rs", include_str!("get_chunk.rs")),
+        ("status.rs", include_str!("status.rs")),
+        ("find_impact.rs", include_str!("find_impact.rs")),
+        (
+            "find_impact_tracker.rs",
+            include_str!("find_impact_tracker.rs"),
+        ),
+        ("graph.rs", include_str!("graph.rs")),
+        ("literal_search.rs", include_str!("literal_search.rs")),
+        (
+            "federation_helpers.rs",
+            include_str!("federation_helpers.rs"),
+        ),
+        ("helpers.rs", include_str!("helpers.rs")),
+        ("instructions.rs", include_str!("instructions.rs")),
+        ("responses.rs", include_str!("responses.rs")),
+        ("proxy.rs", include_str!("proxy.rs")),
+        ("runtime.rs", include_str!("runtime.rs")),
+        ("types.rs", include_str!("types.rs")),
+    ];
+    let violations: Vec<(String, usize, &str)> = MCP_SOURCES
+        .iter()
+        .flat_map(|(file, src)| {
+            src.lines().enumerate().filter_map(move |(i, line)| {
+                let trimmed = line.trim_start();
+                // Skip comments and lines that are part of the detection logic itself
+                if trimmed.starts_with("//") || trimmed.starts_with("\"") {
+                    return None;
+                }
+                // Only flag lines that actually invoke print! or println! as a macro call
+                // (i.e. the identifier immediately followed by '!'), not lines discussing them
+                let call_println = line.contains("println!(");
+                let call_print = trimmed.starts_with("print!(")
+                    || line.contains(" print!(")
+                    || line.contains("\tprint!(");
+                let is_prefixed = line.contains("info_print!(") || line.contains("warn_print!(");
+                let is_detection_code = line.contains("line.contains(");
+                ((call_println || call_print) && !is_prefixed && !is_detection_code)
+                    .then(|| ((*file).to_string(), i + 1, line))
+            })
         })
         .collect();
 
@@ -32,9 +60,40 @@ fn test_mcp_no_raw_stdout_calls() {
         "MCP module has raw stdout calls that break the JSON-RPC protocol:\n{}",
         violations
             .iter()
-            .map(|(i, l)| format!("  line {}: {}", i + 1, l.trim()))
+            .map(|(f, i, l)| format!("  {}:{}: {}", f, i, l.trim()))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+// === Tool registration pin ===
+//
+// Safety net for the mod.rs split: a `#[tool]` method that lands in an impl
+// block the `#[tool_router]` macro does not scan is SILENTLY not registered.
+// This asserts on the exact router the service wires up (`merged_tool_router`,
+// the same expression both ctors and `#[tool_handler]` use) so every
+// extraction stage must keep the 6-tool surface intact.
+
+#[test]
+fn test_tool_registration_exposes_exactly_the_six_tools() {
+    let router = super::CodesearchService::merged_tool_router();
+    let mut names: Vec<String> = router
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    let expected: Vec<&str> = vec![
+        "explore",
+        "find",
+        "find_impact",
+        "get_chunk",
+        "search",
+        "status",
+    ];
+    assert_eq!(
+        names, expected,
+        "tools/list must expose exactly the consolidated 6-tool surface"
     );
 }
 
@@ -2216,6 +2275,128 @@ fn respond_with_items_carries_warnings_on_every_path() {
 }
 
 #[test]
+fn respond_with_items_noted_shapes_on_every_path() {
+    use rmcp::model::RawContent;
+    let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
+        match &r.unwrap().content[0].raw {
+            RawContent::Text(t) => t.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    };
+    let warned = vec!["repo 'inriver' usage search failed: os error 22".to_string()];
+    let note = Some("lexical text matching — use find_impact for precise references");
+
+    // Healthy, no note: byte-identical bare array (the delegated legacy path).
+    let out = text(super::respond_with_items_noted(
+        &[1u32, 2],
+        &[],
+        None,
+        || "unused".to_string(),
+    ));
+    assert_eq!(
+        out, "[1,2]",
+        "healthy no-note response must not change shape"
+    );
+
+    // Note only: results + note, no warnings key (absent, not null).
+    let out = text(super::respond_with_items_noted(
+        &[1u32, 2],
+        &[],
+        note,
+        || "unused".to_string(),
+    ));
+    let p: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(p["results"][0], 1);
+    assert!(p["note"].as_str().unwrap().contains("find_impact"));
+    assert!(p.get("warnings").is_none(), "no null warnings key: {p}");
+
+    // Note + warnings: the channel still terminates, next to the note.
+    let out = text(super::respond_with_items_noted(
+        &[1u32],
+        &warned,
+        note,
+        || "unused".to_string(),
+    ));
+    let p: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(p["note"].as_str().is_some(), "got: {p}");
+    assert_eq!(p["warnings"][0], warned[0].as_str());
+
+    // Warnings only (note absent): identical to respond_with_items shape.
+    let out = text(super::respond_with_items_noted(
+        &[1u32],
+        &warned,
+        None,
+        || "unused".to_string(),
+    ));
+    let p: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(p.get("note").is_none(), "got: {p}");
+    assert!(p["warnings"][0].as_str().is_some(), "got: {p}");
+
+    // Empty + note: the note rides on the empty message — an empty lexical
+    // result is exactly where the SCIP upgrade path matters most.
+    let out = text(super::respond_with_items_noted(
+        &[0u32; 0],
+        &[],
+        note,
+        || "No usages found for 'Foo'.".to_string(),
+    ));
+    assert!(out.contains("No usages found for 'Foo'."), "got: {out}");
+    assert!(out.contains("find_impact"), "got: {out}");
+}
+
+#[test]
+fn rank_code_first_demotes_docs_without_reordering_code() {
+    let item = |path: &str, score: f32| super::ReferenceItem {
+        chunk_id: 0,
+        path: path.to_string(),
+        line: 1,
+        kind: "Block".to_string(),
+        signature: None,
+        score,
+    };
+    // Score order deliberately NOT aligned with code/doc grouping: the
+    // highest-scoring hit is markdown. Stable sort must keep cs before ts
+    // (both code, 5.0 before 4.0) and md before AGENTS.md (both docs,
+    // 9.0 before 1.0), while every code item outranks every doc item.
+    let mut items = vec![
+        item("docs/README.md", 9.0),
+        item("src/A.cs", 5.0),
+        item("src/b.ts", 4.0),
+        item("AGENTS.md", 1.0),
+    ];
+    super::rank_code_first(&mut items);
+    let paths: Vec<&str> = items.iter().map(|i| i.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["src/A.cs", "src/b.ts", "docs/README.md", "AGENTS.md"],
+        "code first (score order kept), docs demoted as a block: {paths:?}"
+    );
+}
+
+#[test]
+fn scip_usages_note_is_suppressed_without_backed_source_files() {
+    // Machine-independent half of the gate: no C#/TS source in the hits →
+    // no note, regardless of what indexers the host happens to have (the
+    // registry must not even be consulted). The positive branch is gated on
+    // helper availability and therefore structure-covered only, same
+    // reasoning as the csharp_helper_integration test.
+    let registry = std::sync::Arc::new(crate::symbols::SymbolIndexerRegistry::new());
+    let item = |path: &str| super::ReferenceItem {
+        chunk_id: 0,
+        path: path.to_string(),
+        line: 1,
+        kind: "Block".to_string(),
+        signature: None,
+        score: 1.0,
+    };
+    let markdown_only = vec![item("docs/notes.md"), item("src/lib.rs"), item("AGENTS.md")];
+    assert!(
+        super::scip_usages_note(&registry, &markdown_only, "Foo").is_none(),
+        "a Rust/docs hit list must not advertise a SCIP upgrade path"
+    );
+}
+
+#[test]
 fn ambiguous_chunk_payload_declares_an_incomplete_candidate_list() {
     // `candidate_projects` reads as exhaustive. When a store failed to
     // answer, the repo the caller wants may be the one missing from it, so
@@ -2431,4 +2612,156 @@ fn test_grep_format_no_comment_when_plain() {
     }
     let output = lines.join("\n");
     assert!(!output.starts_with('#'));
+}
+
+// === shared-store second-open policy (stdio MCP vs standalone CLI) ===
+
+#[test]
+fn stdio_shared_stores_must_not_open_second_vector_store() {
+    // codesearch mcp --mode local: SharedStores is Some, serve_state is None.
+    // Old code gated only on serve_state and still called VectorStore::new / open_readonly.
+    assert!(
+        !super::allow_vector_store_second_open(true),
+        "stdio MCP with live shared_stores must not open a second LMDB VectorStore"
+    );
+}
+
+#[test]
+fn standalone_cli_without_shared_stores_may_open_vector_store() {
+    assert!(super::allow_vector_store_second_open(false));
+}
+
+#[tokio::test]
+async fn shared_store_failure_preserves_original_error_without_reopening_lmdb() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let db_path = root.path().join(".codesearch.db");
+    let stores =
+        std::sync::Arc::new(crate::index::SharedStores::new(&db_path, 2).expect("shared stores"));
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .expect("metadata");
+    let service =
+        super::CodesearchService::new_with_stores(Some(root.path().to_path_buf()), Some(stores))
+            .expect("service");
+
+    let result: anyhow::Result<()> = service
+        .with_vector_store_read_for(
+            |_| Err(anyhow::anyhow!("sentinel shared-store read failure")),
+            None,
+        )
+        .await;
+    let error = result.expect_err("shared-store failure must propagate");
+    assert!(
+        format!("{error:#}").contains("sentinel shared-store read failure"),
+        "fallback must not replace the original error with a second-open error"
+    );
+}
+
+#[test]
+fn prebuilt_index_health_requires_vector_and_full_text_data() {
+    let db_path = std::path::Path::new("/tmp/test-codesearch.db");
+    assert!(super::validate_prebuilt_index_health(db_path, 10, true, 10, false).is_ok());
+
+    for (chunks, indexed, fts_documents, partial) in [
+        (0, true, 10, false),
+        (10, false, 10, false),
+        (10, true, 0, false),
+        (10, true, 10, true),
+    ] {
+        let error =
+            super::validate_prebuilt_index_health(db_path, chunks, indexed, fts_documents, partial)
+                .expect_err("incomplete prebuilt index must fail");
+        assert!(error.to_string().contains("Run `codesearch index`"));
+    }
+}
+
+#[tokio::test]
+async fn require_ready_reads_live_stores_and_rejects_partial_metadata() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let db_path = root.path().join(".codesearch.db");
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    {
+        let mut vector_store = stores.vector_store.write().await;
+        let chunk = crate::chunker::Chunk::new(
+            "fn ready() {}".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/lib.rs".to_string(),
+        );
+        vector_store
+            .insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+                chunk,
+                vec![0.0, 1.0],
+            )])
+            .expect("insert vector chunk");
+        vector_store.build_index().expect("build vector index");
+    }
+    {
+        let mut fts_store = stores.fts_store.write().await;
+        fts_store
+            .add_chunk(0, "fn ready() {}", "src/lib.rs", None, "Function")
+            .expect("insert FTS document");
+        fts_store.commit().expect("commit FTS document");
+    }
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"partial":false}"#,
+    )
+    .expect("complete metadata");
+
+    super::require_prebuilt_index_ready(&stores, &db_path)
+        .await
+        .expect("complete live stores must be ready");
+
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"partial":true}"#,
+    )
+    .expect("partial metadata");
+    let error = super::require_prebuilt_index_ready(&stores, &db_path)
+        .await
+        .expect_err("partial index must not be ready");
+    assert!(error.to_string().contains("partial=true"));
+
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2}"#,
+    )
+    .expect("metadata without readiness marker");
+    let error = super::require_prebuilt_index_ready(&stores, &db_path)
+        .await
+        .expect_err("missing partial marker must not be ready");
+    assert!(error
+        .to_string()
+        .contains("missing the partial readiness marker"));
+
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"partial":"false"}"#,
+    )
+    .expect("malformed metadata");
+    let error = super::require_prebuilt_index_ready(&stores, &db_path)
+        .await
+        .expect_err("non-boolean partial marker must not be ready");
+    assert!(error.to_string().contains("partial must be a boolean"));
+}
+
+#[test]
+fn local_startup_flags_fail_in_modes_that_would_ignore_them() {
+    for mode in [super::McpMode::Auto, super::McpMode::Client] {
+        assert!(super::validate_local_startup_flags(mode, true, false).is_err());
+        assert!(super::validate_local_startup_flags(mode, false, true).is_err());
+    }
+    assert!(super::validate_local_startup_flags(super::McpMode::Local, true, true).is_ok());
+}
+
+#[test]
+fn readonly_or_require_ready_never_creates_a_missing_index() {
+    assert!(super::may_create_missing_index(true, false, false));
+    assert!(!super::may_create_missing_index(false, false, false));
+    assert!(!super::may_create_missing_index(true, true, false));
+    assert!(!super::may_create_missing_index(true, false, true));
 }

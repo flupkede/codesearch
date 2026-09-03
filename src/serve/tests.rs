@@ -2261,3 +2261,43 @@ async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
         "expected a clean Unknown-alias error, got: {err:#}"
     );
 }
+
+/// A cached C# symbol-index Error must NOT outlive the repo it belongs to.
+///
+/// `repo_statuses_lightweight()` prefers the cached entry over its on-disk
+/// probe, so an Error left behind by idle eviction renders a red `C#!` in the
+/// TUI forever — a closed repo has no watcher left to retry a rebuild and
+/// flip the state to Ready. Regression guard for the frozen-`!` fix observed
+/// on a repo whose rebuild lost a one-shot LMDB double-open race days
+/// earlier.
+#[serial_test::serial]
+#[test]
+fn evicting_idle_repo_clears_frozen_csharp_error_state() {
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::REPO_IDLE_TIMEOUT_ENV, "1")]);
+    let state = ServeState::new(ReposConfig::default(), None);
+
+    // Simulate the poisoned state: an Error + message cached by a failed
+    // watcher rebuild, and a last-access old enough to be evicted.
+    state
+        .csharp_index_status
+        .insert("frozen".to_string(), CSharpIndexStatus::Error);
+    state.csharp_index_error.insert(
+        "frozen".to_string(),
+        "LMDB double-open prevented".to_string(),
+    );
+    state.last_access.insert(
+        "frozen".to_string(),
+        std::time::Instant::now() - std::time::Duration::from_secs(5),
+    );
+
+    state.evict_idle_repos();
+
+    assert!(
+        !state.csharp_index_status.contains_key("frozen"),
+        "eviction must clear the cached C# status — a frozen Error renders red forever otherwise"
+    );
+    assert!(
+        !state.csharp_index_error.contains_key("frozen"),
+        "eviction must clear the cached C# error message along with the status"
+    );
+}

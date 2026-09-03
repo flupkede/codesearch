@@ -611,8 +611,16 @@ pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 /// LMDB database name for the SCIP symbols table.
 pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
 
+/// LMDB database name for the SCIP per-repo metadata table.
+pub const SCIP_META_DB_NAME: &str = "scip_meta";
+
 /// LMDB metadata key for the last rebuild timestamp.
 pub const SCIP_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts";
+
+/// LMDB metadata key for the git HEAD sha the symbol index was built for.
+/// Written on rebuild when the repo HEAD is readable; absent means unknown
+/// (never written, or git could not be read at build time).
+pub const SCIP_HEAD_SHA_KEY: &str = "head_sha";
 
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
@@ -644,6 +652,10 @@ pub const SCIP_TYPESCRIPT_HELPER_ENV: &str = "CODESEARCH_SCIP_TYPESCRIPT";
 /// Namespaced per-language (unlike C#'s un-namespaced `SCIP_REBUILD_TIMESTAMP_KEY`)
 /// so both adapters can safely share the same `scip_meta` table if ever merged.
 pub const SCIP_TYPESCRIPT_REBUILD_TIMESTAMP_KEY: &str = "last_rebuild_ts:typescript";
+
+/// TypeScript-specific key for `SCIP_HEAD_SHA_KEY` (the C# and TypeScript
+/// adapters share one `scip_meta` table, so keys are language-prefixed).
+pub const SCIP_TYPESCRIPT_HEAD_SHA_KEY: &str = "head_sha:typescript";
 
 /// Debounce window (ms) for the TypeScript file-watcher symbol rebuild.
 /// Mirrors `SCIP_CSHARP_DEBOUNCE_MS` — a single quiet-period flush avoids
@@ -703,6 +715,67 @@ pub const SCIP_LMDB_DEFAULT_MAP_SIZE_MB: usize = 512;
 /// Environment variable to override the SCIP LMDB map size in megabytes.
 /// When set, takes precedence over `SCIP_LMDB_DEFAULT_MAP_SIZE_MB`.
 pub const SCIP_LMDB_MAP_SIZE_MB_ENV: &str = "CODESEARCH_SCIP_LMDB_MAP_MB";
+
+/// Internal wall-clock budget (seconds) for a single `find_impact` reference
+/// lookup.
+///
+/// A cold reference-cache miss makes the `find_impact` handler invoke the
+/// external SCIP helper (`scip-csharp find-refs`), which can take several
+/// minutes on a large solution. Without an internal deadline the MCP client
+/// is the timeout mechanism: it aborts with an opaque `-32001 Request timed
+/// out` and the calling agent falls back to plain-text search exactly when
+/// the precise SCIP call graph is most useful. This budget makes the server
+/// answer first with a structured busy envelope
+/// (`{"busy": true, "state": ..., "waited_ms": ..., "advice": ...}`) while
+/// the lookup continues in the background, so a retry is served warm from
+/// the reference cache instead of cold again.
+///
+/// Override at runtime with `CODESEARCH_FIND_IMPACT_BUDGET_SECS` (integer
+/// seconds). `0` disables the budget entirely, restoring the previous
+/// unbounded-blocking behaviour. Unparseable values fall back to the default.
+///
+/// The default is deliberately BELOW typical MCP client timeouts (observed
+/// live: an MCP client gave up at ~60s with `-32001` while the busy answer
+/// was still being prepared at the 60s budget) — the structured busy answer
+/// is only useful if it arrives before the client stops listening.
+pub const DEFAULT_FIND_IMPACT_BUDGET_SECS: u64 = 45;
+
+/// Environment variable to override `DEFAULT_FIND_IMPACT_BUDGET_SECS`.
+pub const FIND_IMPACT_BUDGET_SECS_ENV: &str = "CODESEARCH_FIND_IMPACT_BUDGET_SECS";
+
+/// Maximum number of resident SCIP helper workspaces (todo #115).
+///
+/// Admission control IS the memory governor: each resident workspace holds a
+/// fully loaded Roslyn solution (1-2 GB on large solutions), so the pool cap
+/// bounds total helper memory to `MAX_RESIDENT x heap cap`. A third repo's
+/// lookup evicts the least-recently-used workspace — eviction is safe because
+/// resolved references persist in the LMDB ref cache, so only latency is
+/// lost, never data.
+pub const DEFAULT_SCIP_MAX_RESIDENT_WORKSPACES: usize = 2;
+pub const SCIP_MAX_RESIDENT_WORKSPACES_ENV: &str = "CODESEARCH_SCIP_MAX_RESIDENT";
+
+/// Per-workspace managed-heap cap passed to the helper as
+/// `DOTNET_GCHeapHardLimit` (bytes; the env var is interpreted as hex by the
+/// .NET runtime, so the Rust side formats it without a prefix). A runaway
+/// workspace fails fast at the cap instead of taking the machine with it —
+/// the typed `failed` path turns that into an agent-actionable answer.
+pub const DEFAULT_SCIP_WORKSPACE_HEAP_CAP: u64 = 1_610_612_736; // 1.5 GiB
+pub const SCIP_WORKSPACE_HEAP_CAP_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_HEAP_CAP";
+
+/// Resident workspaces idle longer than this are torn down by lazy reaping
+/// (checked on pool access). Restarting a workspace costs one solution load —
+/// acceptable for an idle repo, which is exactly what the TTL measures.
+pub const DEFAULT_SCIP_WORKSPACE_IDLE_SECS: u64 = 600;
+pub const SCIP_WORKSPACE_IDLE_SECS_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_IDLE_SECS";
+
+/// How long (seconds) a budget-overrun `find_impact` lookup stays tracked
+/// for retry observation. Must comfortably exceed the slowest legitimate
+/// `scip-csharp find-refs` run (several minutes on a large solution): an
+/// entry dropped while its lookup is still running would turn a retry into
+/// a cold restart, voiding the dedupe the busy advice promises. Finished
+/// entries are removed on their first retry read, so this cap only bounds
+/// abandoned lookups.
+pub const FIND_IMPACT_TRACK_TTL_SECS: u64 = 1800;
 
 /// Debounce window (seconds) for persisting repos.json metadata updates.
 /// Coalesces bursts of file changes into a single write.

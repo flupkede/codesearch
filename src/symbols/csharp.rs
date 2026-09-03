@@ -36,19 +36,18 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::lmdb_registry::TrackedEnv;
 use anyhow::{bail, Context, Result};
 use heed::types::{Bytes, Str};
-use heed::{Database, EnvOpenOptions};
+use heed::Database;
 use serde::{Deserialize, Serialize};
 
 use super::scip_parse;
 use super::{PrewarmSummary, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
-
-use crate::constants::{SCIP_LMDB_DEFAULT_MAP_SIZE_MB, SCIP_LMDB_MAP_SIZE_MB_ENV};
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -56,7 +55,7 @@ use crate::constants::{SCIP_LMDB_DEFAULT_MAP_SIZE_MB, SCIP_LMDB_MAP_SIZE_MB_ENV}
 const SCIP_DB_NAME: &str = crate::constants::SCIP_SYMBOLS_DB_NAME;
 
 /// LMDB database name for the rebuild timestamp.
-const SCIP_META_DB_NAME: &str = "scip_meta";
+const SCIP_META_DB_NAME: &str = crate::constants::SCIP_META_DB_NAME;
 
 /// LMDB database name for the position-to-symbols index.
 const SCIP_POSITION_DB_NAME: &str = crate::constants::SCIP_POSITION_DB_NAME;
@@ -69,6 +68,9 @@ const SCIP_REF_CACHE_DB_NAME: &str = crate::constants::SCIP_REF_CACHE_DB_NAME;
 
 /// Key in the meta database that stores the last rebuild timestamp (UNIX epoch seconds).
 const META_REBUILD_TS: &str = crate::constants::SCIP_REBUILD_TIMESTAMP_KEY;
+
+/// Key in the meta database storing the git HEAD sha the index was built for.
+const META_HEAD_SHA: &str = crate::constants::SCIP_HEAD_SHA_KEY;
 
 /// Key in the meta database storing the count of indexed symbols.
 #[allow(dead_code)]
@@ -390,44 +392,15 @@ impl CSharpSymbolIndexer {
         None
     }
 
-    /// Open or create the SCIP LMDB environment for a given repo database path.
+    /// Open the shared SCIP LMDB environment for a given repo database path.
     ///
-    /// Pre-opens ALL named databases so they exist before first use.
-    /// LMDB requires named DBs to be created (or opened) in a write txn
-    /// before they can be read in later read txns within the same env session.
-    fn open_scip_env(&self, db_path: &Path) -> Result<TrackedEnv> {
-        let scip_dir = db_path.join("scip");
-        std::fs::create_dir_all(&scip_dir)
-            .with_context(|| format!("Failed to create SCIP directory: {}", scip_dir.display()))?;
-
-        // SAFETY: same pattern as vectordb/store.rs — LMDB mmap contract.
-        // TrackedEnv additionally prevents double-open within the same process.
-        //
-        // map_size is virtual address space (not RSS). 512 MB default is safe on
-        // both Windows and POSIX; the OS only faults in pages that are written.
-        // Enterprise repos with thousands of symbols + Phase-3 ref_cache can
-        // exceed the old 64 MB limit, causing MDB_MAP_FULL on cache writes.
-        let map_size_mb = std::env::var(SCIP_LMDB_MAP_SIZE_MB_ENV)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(SCIP_LMDB_DEFAULT_MAP_SIZE_MB);
-        let mut opts = EnvOpenOptions::new();
-        opts.map_size(map_size_mb * 1024 * 1024).max_dbs(10);
-        // SAFETY: `NO_TLS` only changes reader-slot tracking. See `BASE_ENV_FLAGS`.
-        unsafe { opts.flags(crate::lmdb_registry::BASE_ENV_FLAGS) };
-        let env =
-            unsafe { TrackedEnv::open(&opts, &scip_dir, &format!("SCIP({})", db_path.display()))? };
-
-        // Eagerly create / re-open all named databases.
-        let mut wtxn = env.write_txn()?;
-        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_DB_NAME))?;
-        env.create_database::<Str, Str>(&mut wtxn, Some(SCIP_META_DB_NAME))?;
-        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_POSITION_DB_NAME))?;
-        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_SIMPLE_NAMES_DB_NAME))?;
-        env.create_database::<Str, Bytes>(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
-        wtxn.commit()?;
-
-        Ok(env)
+    /// Delegates to [`crate::symbols::get_shared_scip_env`]: one environment
+    /// per `db_path/scip` for the whole process, shared across concurrent
+    /// queries, rebuilds and the TypeScript adapter, so overlapping users
+    /// serialise on LMDB's writer mutex instead of failing the double-open
+    /// guard.
+    fn open_scip_env(&self, db_path: &Path) -> Result<Arc<TrackedEnv>> {
+        crate::symbols::get_shared_scip_env(db_path)
     }
 
     // ── Helper invocation ──────────────────────────────────────────
@@ -674,9 +647,9 @@ impl CSharpSymbolIndexer {
     ///
     /// Inner implementation: fetch references for an EXACT (canonical) symbol key.
     ///
-    /// Opens its own LMDB environment so the caller's env handle (if any) is not
-    /// held concurrently with the internal write txn that caches lazy results.
-    /// This avoids the "two Env objects on the same path" footgun.
+    /// Uses the shared SCIP env ([`crate::symbols::get_shared_scip_env`]); the
+    /// internal write txn that caches lazy results serialises against other
+    /// writers on LMDB's single-writer mutex instead of erroring the loser.
     fn find_refs_for_canonical_key(
         &self,
         db_path: &Path,
@@ -783,7 +756,33 @@ impl CSharpSymbolIndexer {
             canonical
         );
 
-        let lazy_refs = self.invoke_find_refs_helper(&helper, &solution, canonical)?;
+        // Preferred path: the resident workspace pool (todo #115) — the
+        // solution's Roslyn workspace stays loaded for MAX_RESIDENT repos,
+        // so after the first lookup this answers in seconds instead of
+        // spawning a fresh helper per call. Fallback: the one-shot spawn,
+        // which keeps working when the pool cannot (spawn failure, heap-cap
+        // death, eviction race) — correctness never depends on residency.
+        let lazy_refs: Vec<StoredReference> = match crate::symbols::resident::WORKSPACE_POOL
+            .find_refs(&helper, &solution, canonical)
+        {
+            Ok(refs) => refs
+                .into_iter()
+                .map(|r| StoredReference {
+                    file: r.file,
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    kind: r.kind,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    "resident helper unavailable ({e:#}); falling back to one-shot \
+                     find-refs for '{}'",
+                    canonical
+                );
+                self.invoke_find_refs_helper(&helper, &solution, canonical)?
+            }
+        };
 
         // ── Write phase — cache the resolved references ────────────
         {
@@ -1510,6 +1509,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             META_REPO_PATH,
             repo_path.to_string_lossy().as_ref(),
         )?;
+        // Fingerprint the index: which HEAD it was built for. Skipped when
+        // git is unreadable (better absent than a wrong claim); an older
+        // value from a previous build may then survive, which stays
+        // approximately right for the usual same-branch rebuild.
+        if let Some(sha) = super::current_git_head(repo_path) {
+            meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
+        }
 
         wtxn.commit()?;
 
@@ -1531,9 +1537,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     }
 
     fn find_references(&self, db_path: &Path, symbol: &str) -> Result<Vec<SymbolReference>> {
-        // Resolve to canonical key in a short-lived env scope, then drop it before
-        // entering find_refs_for_canonical_key (which opens its own env).
-        // This ensures no two Env handles are live on the same path simultaneously.
+        // Resolve to canonical key, then delegate. The env handle is the
+        // process-shared one; this scope just bounds how long we hold a
+        // reference — concurrent opens are impossible by construction.
         let canonical = {
             let env = self.open_scip_env(db_path)?;
             match self.resolve_canonical_key(&env, symbol)? {
@@ -1573,7 +1579,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // Pick shortest (most specific) symbol defined at this position
         let chosen = candidate_keys.iter().min_by_key(|k| k.len()).cloned();
         drop(rtxn);
-        drop(env); // must drop before find_refs_for_canonical_key opens its own env
+        drop(env); // release this reference before delegation; the shared env may stay alive
 
         match chosen {
             Some(k) => self.find_refs_for_canonical_key(db_path, &k),
@@ -1612,6 +1618,18 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             .as_secs();
 
         now.saturating_sub(stored_ts)
+    }
+
+    fn index_head_sha(&self, db_path: &Path) -> Option<String> {
+        let env = self.open_scip_env(db_path).ok()?;
+        let rtxn = env.read_txn().ok()?;
+        let meta_db: Database<Str, Str> = env
+            .open_database(&rtxn, Some(SCIP_META_DB_NAME))
+            .ok()
+            .flatten()?;
+        let sha = meta_db.get(&rtxn, META_HEAD_SHA).ok().flatten()?;
+        let sha = sha.trim().to_string();
+        (!sha.is_empty()).then_some(sha)
     }
 
     fn has_index(&self, db_path: &Path) -> bool {

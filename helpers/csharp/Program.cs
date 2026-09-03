@@ -8,8 +8,12 @@ namespace ScipCsharp;
 /// CLI entrypoint for scip-csharp.
 ///
 /// Subcommands:
-///   index     — compile solution, collect definitions, write SCIP JSON (fast, no FindReferencesAsync)
-///   find-refs — resolve references for a single symbol on demand (for lazy find_impact caching)
+///   index           — compile solution, collect definitions, write SCIP JSON (fast, no FindReferencesAsync)
+///   find-refs       — resolve references for a single symbol on demand (for lazy find_impact caching)
+///   batch-find-refs — resolve multiple symbols in one workspace session
+///   serve           — resident mode: load the workspace once, answer find-refs/reload
+///                     requests as JSON lines on stdin/stdout (todo #115; the Rust host
+///                     kills the process for teardown)
 /// </summary>
 public static class Program
 {
@@ -44,8 +48,81 @@ public static class Program
             "index" => await RunIndexAsync(args[1..]).ConfigureAwait(false),
             "find-refs" => await RunFindRefsAsync(args[1..]).ConfigureAwait(false),
             "batch-find-refs" => await RunBatchFindRefsAsync(args[1..]).ConfigureAwait(false),
+            "serve" => await RunServeAsync(args[1..]).ConfigureAwait(false),
             _ => await UnknownCommand(args[0]).ConfigureAwait(false),
         };
+    }
+
+    /// <summary>
+    /// Solution path the serve loop was started with. Remembered so a
+    /// "reload" request without an explicit path re-opens the same solution.
+    /// Only meaningful in serve mode (resident); other subcommands are
+    /// single-shot processes.
+    /// </summary>
+    internal static string? CurrentServeSolution { get; private set; }
+
+    // ── serve subcommand (resident mode) ─────────────────────────────
+
+    private static async Task<int> RunServeAsync(string[] args)
+    {
+        var parsed = ParseServeArgs(args);
+        if (parsed is null) return 1;
+
+        if (!TryRegisterMsBuild(out var regErr)) { await Console.Error.WriteLineAsync(regErr).ConfigureAwait(false); return 1; }
+
+        using var workspace = CreateTolerantWorkspace();
+
+        try
+        {
+            Console.Error.WriteLine($"serve: loading solution: {parsed}");
+            await OpenSolutionFilteredAsync(workspace, parsed).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await Console.Error.WriteLineAsync(
+                $"serve: [WARN] Solution load partially failed ({ex.GetType().Name}: {ex.Message}); " +
+                $"continuing with {workspace.CurrentSolution.Projects.Count()} loaded project(s).")
+                .ConfigureAwait(false);
+
+            if (!workspace.CurrentSolution.Projects.Any())
+            {
+                await Console.Error.WriteLineAsync(
+                    $"serve: no projects loaded — cannot serve. Full error:{Environment.NewLine}{ex.StackTrace}")
+                    .ConfigureAwait(false);
+                return 1;
+            }
+        }
+
+        CurrentServeSolution = parsed;
+
+        // The loop owns the process lifetime from here: stdin EOF or a
+        // "shutdown" request exits 0. The Rust host kills the process for
+        // teardown — disposing the Roslyn workspace reliably is not possible,
+        // process death is (todo #115).
+        return await ServeHost.LoopAsync(
+            workspace,
+            solution => OpenSolutionFilteredAsync(workspace, solution)).ConfigureAwait(false);
+    }
+
+    private static string? ParseServeArgs(string[] args)
+    {
+        string? solutionPath = null;
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--solution":
+                    solutionPath = RequireValidPath(args, ref i, "--solution", mustExist: true);
+                    if (solutionPath is null) return null;
+                    break;
+                default:
+                    Console.Error.WriteLine($"Unknown argument: {args[i]}");
+                    return null;
+            }
+        }
+
+        if (string.IsNullOrEmpty(solutionPath)) { Console.Error.WriteLine("serve: --solution is required"); return null; }
+        return solutionPath;
     }
 
     // ── index subcommand ─────────────────────────────────────────────
@@ -780,6 +857,7 @@ public static class Program
         Console.WriteLine("  scip-csharp find-refs --solution <path> --symbol <scip-key> --output <path>");
         Console.WriteLine("  scip-csharp batch-find-refs --solution <path> --symbols-file <path> --output <path>");
         Console.WriteLine("  scip-csharp batch-find-refs --solution <path> --symbols <key1;key2;...> --output <path>");
+        Console.WriteLine("  scip-csharp serve --solution <path>");
         Console.WriteLine();
         Console.WriteLine("Options (index):");
         Console.WriteLine("  --solution <path>         Path to .sln file");
@@ -798,12 +876,17 @@ public static class Program
         Console.WriteLine("  --symbols-file <path>     File with one SCIP key per line");
         Console.WriteLine("  --symbols <key1;key2>     Semicolon-separated SCIP keys");
         Console.WriteLine("  --output <path>           Output JSON file path");
+        Console.WriteLine();
+        Console.WriteLine("Options (serve):");
+        Console.WriteLine("  --solution <path>         Path to .sln file (loaded once; the process then");
+        Console.WriteLine("                            serves find-refs/reload requests as JSON lines on");
+        Console.WriteLine("                            stdin/stdout until EOF or a shutdown request)");
     }
 
     [ExcludeFromCodeCoverage]
     private static async Task<int> UnknownCommand(string cmd)
     {
-        await Console.Error.WriteLineAsync($"Unknown command: '{cmd}'. Use 'index', 'find-refs', or 'batch-find-refs'.").ConfigureAwait(false);
+        await Console.Error.WriteLineAsync($"Unknown command: '{cmd}'. Use 'index', 'find-refs', 'batch-find-refs', or 'serve'.").ConfigureAwait(false);
         return 1;
     }
 }

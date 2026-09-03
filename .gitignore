@@ -52,3 +52,6 @@ test_tools.jsonl
 # last on purpose — .gitignore is last-match-wins, and the `!.githooks/` negation
 # above would otherwise re-admit it.
 .githooks/customer-patterns.local
+
+# build.ps1 output logs
+.tmp/
