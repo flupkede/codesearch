@@ -497,11 +497,11 @@ impl CSharpSymbolIndexer {
         let stdout_handle = child.stdout.take().map(|stdout| {
             let label = solution_short.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                drain_pipe_to_tracing(stdout, |line| {
                     if !line.is_empty() {
                         tracing::debug!("[scip-csharp:{}] {}", label, line);
                     }
-                }
+                });
             })
         });
 
@@ -589,11 +589,11 @@ impl CSharpSymbolIndexer {
         let stdout_handle = child.stdout.take().map(|stdout| {
             let label = solution_short.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                drain_pipe_to_tracing(stdout, |line| {
                     if !line.is_empty() {
                         tracing::debug!("[scip-csharp find-refs:{}] {}", label, line);
                     }
-                }
+                });
             })
         });
 
@@ -1048,11 +1048,11 @@ impl CSharpSymbolIndexer {
         let stdout_handle = child.stdout.take().map(|stdout| {
             let label = solution_short.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                drain_pipe_to_tracing(stdout, |line| {
                     if !line.is_empty() {
                         tracing::debug!("[scip-csharp batch-find-refs:{}] {}", label, line);
                     }
-                }
+                });
             })
         });
 
