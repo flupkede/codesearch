@@ -42,6 +42,42 @@ fn drain_stops_at_eof_and_handles_empty_pipe() {
     assert_eq!(drained(b"only\n"), vec!["only".to_string()]);
 }
 
+/// Read impl whose first read fails with `Interrupted` (EINTR), then
+/// behaves like a normal pipe.
+struct InterruptedOnce {
+    armed: bool,
+    inner: Cursor<Vec<u8>>,
+}
+
+impl std::io::Read for InterruptedOnce {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.armed {
+            self.armed = false;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "eintr",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
+#[test]
+fn drain_retries_after_transient_interrupted_read() {
+    // EINTR on a blocking pipe read must not end the drain: on Linux a
+    // signal during the minutes-long workspace load would otherwise kill
+    // the drain thread and stall the helper on a full pipe.
+    let mut out: Vec<String> = Vec::new();
+    drain_pipe_to_tracing(
+        InterruptedOnce {
+            armed: true,
+            inner: Cursor::new(b"before\nafter\n".to_vec()),
+        },
+        |line| out.push(line.to_string()),
+    );
+    assert_eq!(out, vec!["before".to_string(), "after".to_string()]);
+}
+
 #[test]
 fn helper_warning_classification_table() {
     let cases: [(&str, bool); 10] = [

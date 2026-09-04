@@ -90,6 +90,9 @@ pub(crate) fn drain_pipe_to_tracing<R: std::io::Read>(pipe: R, mut emit: impl Fn
                 }
                 emit(&String::from_utf8_lossy(&buf));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                continue; // transient (EINTR) — retry the read, do NOT end the drain
+            }
             Err(_) => break, // dead pipe — nothing more to drain
         }
     }
