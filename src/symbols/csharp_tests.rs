@@ -64,9 +64,11 @@ impl std::io::Read for InterruptedOnce {
 
 #[test]
 fn drain_retries_after_transient_interrupted_read() {
-    // EINTR on a blocking pipe read must not end the drain: on Linux a
-    // signal during the minutes-long workspace load would otherwise kill
-    // the drain thread and stall the helper on a full pipe.
+    // Contract: a transient Interrupted read must not end the drain. std's
+    // own read_until already retries Interrupted internally (rustc 1.98,
+    // library/std/src/io/mod.rs), so the local arm in drain_pipe_to_tracing
+    // is belt-and-braces and unreachable via its internal BufReader — this
+    // test pins the observable contract, not that arm.
     let mut out: Vec<String> = Vec::new();
     drain_pipe_to_tracing(
         InterruptedOnce {
