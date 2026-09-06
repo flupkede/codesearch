@@ -49,6 +49,55 @@ use serde::{Deserialize, Serialize};
 use super::scip_parse;
 use super::{PrewarmSummary, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
+// ── Helper stderr routing ─────────────────────────────────────────
+
+/// True when a scip-csharp stderr line carries warning-severity output:
+/// the helper's own `[WARN]` prefix or MSBuildWorkspace's `[Failure]`
+/// workspace diagnostics (e.g. project-load failures).
+pub(crate) fn is_helper_warning_line(line: &str) -> bool {
+    line.contains("[WARN]") || line.contains("[Failure]")
+}
+
+/// Route one scip-csharp stderr line into tracing at the right severity.
+/// This is the ONLY sanctioned path for helper stderr: spawn helpers with
+/// `Stdio::piped()` and drain through here — never `Stdio::inherit()`,
+/// which bypasses tracing entirely and sprays raw MSBuild output over the
+/// serve process (file-only logging, TUI on stderr), scrambling it.
+pub(crate) fn emit_helper_stderr_line(tag: &str, label: &str, line: &str) {
+    if is_helper_warning_line(line) {
+        tracing::warn!("[{tag}:{label}] {line}");
+    } else {
+        tracing::info!("[{tag}:{label}] {line}");
+    }
+}
+
+/// Drain a helper output pipe to EOF, invoking `emit` once per line.
+/// Undecodable bytes are lossy-decoded and the line is still emitted, and
+/// a persistent read error ends the drain. A drain must never stop on
+/// individual bad lines: a stalled drain lets the pipe fill and blocks the
+/// helper mid-workspace-load (`lines().map_while(Result::ok)` had exactly
+/// that failure mode; `filter_map(Result::ok)` traded it for a busy spin
+/// under `clippy::lines_filter_map_ok` — read_until has neither problem).
+pub(crate) fn drain_pipe_to_tracing<R: std::io::Read>(pipe: R, mut emit: impl FnMut(&str)) {
+    let mut reader = BufReader::new(pipe);
+    loop {
+        let mut buf = Vec::new();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break, // EOF — helper died; drain thread exits here
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+                    buf.pop();
+                }
+                emit(&String::from_utf8_lossy(&buf));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                continue; // transient (EINTR) — retry the read, do NOT end the drain
+            }
+            Err(_) => break, // dead pipe — nothing more to drain
+        }
+    }
+}
+
 // ── Constants ─────────────────────────────────────────────────────
 
 /// LMDB database name for the SCIP symbol table (definitions only after Opt 2).
@@ -440,22 +489,22 @@ impl CSharpSymbolIndexer {
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                drain_pipe_to_tracing(stderr, |line| {
                     if !line.is_empty() {
-                        tracing::info!("[scip-csharp:{}] {}", label, line);
+                        emit_helper_stderr_line("scip-csharp", &label, line);
                     }
-                }
+                });
             })
         });
 
         let stdout_handle = child.stdout.take().map(|stdout| {
             let label = solution_short.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                drain_pipe_to_tracing(stdout, |line| {
                     if !line.is_empty() {
                         tracing::debug!("[scip-csharp:{}] {}", label, line);
                     }
-                }
+                });
             })
         });
 
@@ -532,22 +581,22 @@ impl CSharpSymbolIndexer {
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                drain_pipe_to_tracing(stderr, |line| {
                     if !line.is_empty() {
-                        tracing::info!("[scip-csharp find-refs:{}] {}", label, line);
+                        emit_helper_stderr_line("scip-csharp find-refs", &label, line);
                     }
-                }
+                });
             })
         });
 
         let stdout_handle = child.stdout.take().map(|stdout| {
             let label = solution_short.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                drain_pipe_to_tracing(stdout, |line| {
                     if !line.is_empty() {
                         tracing::debug!("[scip-csharp find-refs:{}] {}", label, line);
                     }
-                }
+                });
             })
         });
 
@@ -991,22 +1040,22 @@ impl CSharpSymbolIndexer {
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                drain_pipe_to_tracing(stderr, |line| {
                     if !line.is_empty() {
-                        tracing::info!("[scip-csharp batch-find-refs:{}] {}", label, line);
+                        emit_helper_stderr_line("scip-csharp batch-find-refs", &label, line);
                     }
-                }
+                });
             })
         });
 
         let stdout_handle = child.stdout.take().map(|stdout| {
             let label = solution_short.clone();
             thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                drain_pipe_to_tracing(stdout, |line| {
                     if !line.is_empty() {
                         tracing::debug!("[scip-csharp batch-find-refs:{}] {}", label, line);
                     }
-                }
+                });
             })
         });
 
