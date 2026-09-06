@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::SymbolReference;
@@ -61,9 +62,11 @@ impl ServeClient {
             .arg(solution)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Helper stderr is diagnostics (load progress); route it into the
-            // host's log stream instead of piping and draining a third pipe.
-            .stderr(Stdio::inherit())
+            // Helper stderr is diagnostics (load progress + workspace-load
+            // warnings). Pipe it and drain via tracing: an inherited stderr
+            // bypasses the file-only serve logger entirely and sprays raw
+            // MSBuild output straight onto the TUI, scrambling it.
+            .stderr(Stdio::piped())
             .env("DOTNET_GCHeapHardLimit", heap_cap_hex)
             .spawn()
             .with_context(|| {
@@ -81,6 +84,25 @@ impl ServeClient {
             .stdout
             .take()
             .context("serve helper has no stdout pipe")?;
+
+        // Drain helper stderr through tracing (warnings classified as warn).
+        // Detached: the thread lives until the helper dies (EOF), so kill and
+        // Drop teardown need no coordination with it. Without a concurrent
+        // drain the pipe buffer would fill during the minutes-long workspace
+        // load and block the helper.
+        if let Some(stderr) = child.stderr.take() {
+            let label = solution
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| solution.display().to_string());
+            thread::spawn(move || {
+                super::csharp::drain_pipe_to_tracing(stderr, |line| {
+                    if !line.is_empty() {
+                        super::csharp::emit_helper_stderr_line("scip-csharp serve", &label, line);
+                    }
+                });
+            });
+        }
 
         let client = Self {
             stdin: Mutex::new(stdin),

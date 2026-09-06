@@ -470,3 +470,9 @@ mod lock_visibility_tests;
 #[cfg(test)]
 #[path = "resident_tests.rs"]
 mod resident_tests;
+
+/// Helper stderr routing tests (`csharp.rs`). Sibling `_tests.rs` file
+/// per repo convention.
+#[cfg(test)]
+#[path = "csharp_tests.rs"]
+mod csharp_tests;

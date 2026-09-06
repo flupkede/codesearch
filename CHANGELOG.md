@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.3.14] - 2026-09-06
+
+### Fixed
+
+- **scip-csharp stderr no longer scrambles the serve TUI.** The resident `scip-csharp serve` helper inherited the host's stderr, so MSBuild workspace diagnostics (e.g. project-load failures from stale NuGet restore state) were sprayed raw over the TUI, bypassing the file-only serve logger. Helper stderr is now piped and drained through tracing, with helper `[WARN]`/`[Failure]` lines classified as warn level across all invokers (index, find-refs, batch-find-refs, serve) — workspace-load errors land in the codesearch log and surface as warnings instead of corrupting the terminal.
+
 ## [1.3.10] - 2026-09-03
 
 ### Added
