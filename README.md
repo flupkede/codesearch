@@ -320,6 +320,8 @@ Returns a list of references with `file`, `start_line`, `end_line`, and `kind` (
 
 > **Note:** SCIP precision requires the `-with-csharp` release variant (or a separately installed `scip-csharp` helper) for C#, and `npx` (with `scip-typescript`, fetched on first use) on the host's PATH for TypeScript. Without a backend for a language, `find_impact` returns a clear message — use `find kind="usages"` as the lexical fallback. See [C# Semantic Search](#c-semantic-search).
 
+On a running `codesearch serve` the same lookup is available over plain REST — `POST /find-impact` with the identical request body, no MCP session required (same auth class as the other read-only REST endpoints).
+
 ### `status` — Index Info
 
 | Parameter | Type | Description |

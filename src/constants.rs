@@ -390,6 +390,11 @@ pub const EXPLORE_PATH: &str = "/explore";
 /// GET `/chunk/:id?context_lines=&project=&group=`.
 pub const CHUNK_PATH: &str = "/chunk/:id";
 
+/// REST find-impact endpoint (HTTP mirror of the `find_impact` MCP tool).
+/// POST a `FindImpactRequest` body; returns the tool's JSON payload
+/// (busy envelope and index-freshness fields included).
+pub const FIND_IMPACT_PATH: &str = "/find-impact";
+
 /// How long an open repo may remain idle (no queries) before it is evicted.
 /// Eviction closes the DB handles, stops the FSW, and releases memory.
 /// The repo is automatically re-opened on the next query.

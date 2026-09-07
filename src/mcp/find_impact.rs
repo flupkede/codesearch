@@ -439,3 +439,23 @@ mod find_impact_tests;
 // under src/mcp/find_impact/, and the file stays at src/mcp/.
 #[path = "find_impact_tracker.rs"]
 mod find_impact_tracker;
+
+// ── REST mirror ──
+// Defined here rather than beside the other rest_* handlers in the parent
+// module because it calls the #[tool] method above, which is private to
+// this module; the parent would need its visibility widened instead.
+
+/// REST mirror of the `find_impact` MCP tool: POST a `FindImpactRequest`
+/// body, receive the tool's JSON payload. Read-only, same auth class as
+/// the other REST mirrors (see `FIND_IMPACT_PATH`).
+pub(crate) async fn rest_find_impact_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::serve::ServeState>>,
+    axum::Json(req): axum::Json<FindImpactRequest>,
+) -> Result<axum::response::Json<serde_json::Value>, super::RestError> {
+    let service = super::make_service(&state)?;
+    let result = service
+        .find_impact(Parameters(req))
+        .await
+        .map_err(super::mcp_err_to_http)?;
+    Ok(axum::Json(super::call_tool_result_to_json(result)))
+}
