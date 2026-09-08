@@ -538,6 +538,80 @@ async fn missing_db_not_cached_as_conflicted() {
     assert!(res.is_ok(), "expected ok after recreating DB, got: Err");
 }
 
+/// Pin for the cold-open single-flight (todo #131): a second opener must PARK
+/// on the per-alias open lock instead of racing into `try_open_stores` and
+/// tripping the LMDB double-open guard. Deterministic: every step before the
+/// lock acquire is synchronous, so one yield lets the spawned task reach the
+/// lock await; on revert (no single-flight) the whole call completes on that
+/// same poll and the `!is_finished()` assertion fails.
+#[tokio::test]
+async fn cold_open_parks_second_opener_behind_alias_lock() {
+    let (_tmp, _repo_path, state) = state_with_repo("testalias");
+    let state = std::sync::Arc::new(state);
+
+    // Hold the alias open lock like an in-flight cold open would.
+    let alias_lock = state.open_lock("testalias");
+    let guard = alias_lock.lock().await;
+
+    let s2 = std::sync::Arc::clone(&state);
+    let task = tokio::spawn(async move { s2.get_or_open_stores("testalias", true).await });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "second opener must park on the alias open lock, not run (and fail) concurrently"
+    );
+
+    drop(guard);
+    let res = task.await.unwrap();
+    // No DB seeded → the parked opener resumes and fails with the ordinary
+    // missing-DB error; what matters is that it ran to completion AFTER the
+    // lock was released, never concurrently.
+    assert!(
+        res.is_err(),
+        "expected the ordinary missing-DB error after the lock was released"
+    );
+}
+
+/// Invariant: N concurrent cold opens of the same repo must all succeed and
+/// share ONE stores Arc (single open, everyone else hits the cache re-check).
+/// Pre-single-flight this race could produce the LMDB double-open error on
+/// the losers; with it, exactly one opener reaches `try_open_stores`.
+#[tokio::test]
+async fn concurrent_cold_opens_share_one_stores_arc() {
+    let (_tmp, repo_path, state) = state_with_repo("testalias");
+    // Seed an openable DB (same recipe as missing_db_not_cached_as_conflicted).
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir(&db_path).unwrap();
+    let mut f = std::fs::File::create(db_path.join("metadata.json")).unwrap();
+    write!(f, "{{\"dimensions\":384}}").unwrap();
+    drop(f);
+
+    let state = std::sync::Arc::new(state);
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let s = std::sync::Arc::clone(&state);
+        handles.push(tokio::spawn(async move {
+            s.get_or_open_stores("testalias", true).await
+        }));
+    }
+
+    let mut first: Option<std::sync::Arc<SharedStores>> = None;
+    for h in handles {
+        let stores = h
+            .await
+            .unwrap()
+            .expect("concurrent cold open must not fail (double-open guard)");
+        match &first {
+            None => first = Some(stores),
+            Some(fst) => assert!(
+                std::sync::Arc::ptr_eq(fst, &stores),
+                "concurrent openers must share one stores Arc"
+            ),
+        }
+    }
+}
+
 #[tokio::test]
 async fn not_found_error_mentions_fix_commands() {
     let tmp = tempfile::tempdir().unwrap();
