@@ -187,6 +187,22 @@ pub(crate) struct ServeState {
     /// Repo alias → timestamp of last query that touched this repo.
     /// Used by the idle-reaper to evict repos after `REPO_IDLE_TIMEOUT_SECS`.
     last_access: DashMap<String, std::time::Instant>,
+    /// Repo alias → cold-open single-flight lock (see [`Self::open_lock`]).
+    ///
+    /// A cold open (fast-path miss → `try_open_stores` → insert) must never run
+    /// concurrently with another cold open of the SAME alias: the second LMDB
+    /// open trips the double-open guard and caches `RepoState::Conflicted`,
+    /// which the Conflicted self-heal can then never cure while the first
+    /// opener's env is still alive — the winner of the race holds the env from
+    /// `try_open_stores` until its insert, and a request stuck in between (e.g.
+    /// a long HNSW build) wedges the repo for the process lifetime
+    /// (todo #131, 2026-09-08 incident). Both cold-open entry points
+    /// (`get_or_open_stores`, `warmup_repo`) hold this lock across their slow
+    /// path and RE-CHECK the fast path after acquiring it, so the race loser
+    /// waits and then hits the winner's cache entry. The `Arc` indirection
+    /// keeps the DashMap shard guard short-lived — never held across the lock
+    /// await.
+    open_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Repo alias → `JoinHandle` of its background file-system-watcher (FSW) task.
     ///
     /// The FSW task holds its own clones of `Arc<SharedStores>` and
@@ -324,6 +340,7 @@ impl ServeState {
         Self {
             repos: DashMap::new(),
             last_access: DashMap::new(),
+            open_locks: DashMap::new(),
             fsw_tasks: DashMap::new(),
             index_tasks: DashMap::new(),
             config: std::sync::RwLock::new(config),
@@ -347,6 +364,79 @@ impl ServeState {
             reload_count: std::sync::atomic::AtomicUsize::new(0),
             started_at: std::time::Instant::now(),
         }
+    }
+
+    /// Per-alias cold-open single-flight lock. Cloned out of the map so the
+    /// DashMap shard guard is never held across the lock's `.await`.
+    fn open_lock(&self, alias: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.open_locks
+            .entry(alias.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Fast-path lookup: `Some(result)` when `alias` already has opened stores
+    /// in the cache, `None` when a cold open is needed. Shared by the pre-lock
+    /// fast path and the re-check after the single-flight acquire — identical
+    /// semantics both times, including the Warm → Write transition on touch.
+    fn try_cached_stores(
+        &self,
+        alias: &str,
+        touch: bool,
+    ) -> Option<std::result::Result<Arc<SharedStores>, String>> {
+        let entry = self.repos.get(alias)?;
+        if touch {
+            self.touch_access(alias);
+        }
+        Some(match entry.value() {
+            RepoState::Write { stores, .. } | RepoState::Readonly { stores } => Ok(stores.clone()),
+            RepoState::Warm { stores } => {
+                // Lazy FSW start: transition Warm → Write only on real query access.
+                // Fan-out/candidate-detection callers pass touch=false and must not
+                // trigger Warm → Write or start FSW.
+                let stores = stores.clone();
+                if !touch {
+                    return Some(Ok(stores));
+                }
+                drop(entry); // release DashMap read guard before mutation
+
+                // Only one caller should do the transition; use a compare-and-swap pattern.
+                // Check if someone else already transitioned it.
+                if let Some(mut mut_entry) = self.repos.get_mut(alias) {
+                    if let RepoState::Write { stores, .. } = mut_entry.value() {
+                        return Some(Ok(stores.clone()));
+                    }
+                    if let RepoState::Warm { stores } = mut_entry.value() {
+                        let stores = stores.clone();
+                        let path = {
+                            let config = match self.config.read() {
+                                Ok(c) => c,
+                                Err(e) => return Some(Err(format!("Mutex poisoned: {}", e))),
+                            };
+                            match config.resolve(alias) {
+                                Some(p) => p,
+                                None => {
+                                    return Some(Err(format!("Unknown alias '{}'", alias)));
+                                }
+                            }
+                        };
+
+                        // Start FSW in background for this repo
+                        self.spawn_fsw_for_warm(alias, &path, stores.clone(), &mut mut_entry);
+                        return Some(Ok(stores));
+                    }
+                    // Someone else transitioned it already
+                    if let RepoState::Readonly { stores } = mut_entry.value() {
+                        return Some(Ok(stores.clone()));
+                    }
+                    if let RepoState::Conflicted = mut_entry.value() {
+                        return Some(Err(Self::conflicted_msg(alias)));
+                    }
+                }
+                Ok(stores)
+            }
+            RepoState::Conflicted => Err(Self::conflicted_msg(alias)),
+        })
     }
 
     /// Return a clone of the shared symbol indexer registry Arc.
@@ -1875,6 +1965,21 @@ impl ServeState {
             }
         }
 
+        // Single-flight per alias (see get_or_open_stores): a warmup racing a
+        // first query — or another warmup — must not reach try_open_stores
+        // twice, or the loser trips the LMDB double-open guard and the repo
+        // wedges as an incurable Conflicted (todo #131).
+        let open_lock = self.open_lock(alias);
+        let _open_guard = open_lock.lock().await;
+        if let Some(entry) = self.repos.get(alias) {
+            match entry.value() {
+                RepoState::Write { .. } | RepoState::Warm { .. } | RepoState::Readonly { .. } => {
+                    return Ok(());
+                }
+                RepoState::Conflicted => return Err(Self::conflicted_msg(alias)),
+            }
+        }
+
         let (path, force_readonly) = {
             let config = self
                 .config
@@ -2061,58 +2166,19 @@ impl ServeState {
         }
 
         // Fast path: already opened
-        if let Some(entry) = self.repos.get(alias) {
-            if touch {
-                self.touch_access(alias);
-            }
-            return match entry.value() {
-                RepoState::Write { stores, .. } | RepoState::Readonly { stores } => {
-                    Ok(stores.clone())
-                }
-                RepoState::Warm { stores } => {
-                    // Lazy FSW start: transition Warm → Write only on real query access.
-                    // Fan-out/candidate-detection callers pass touch=false and must not
-                    // trigger Warm → Write or start FSW.
-                    let stores = stores.clone();
-                    if !touch {
-                        return Ok(stores);
-                    }
-                    drop(entry); // release DashMap read guard before mutation
+        if let Some(result) = self.try_cached_stores(alias, touch) {
+            return result;
+        }
 
-                    // Only one caller should do the transition; use a compare-and-swap pattern.
-                    // Check if someone else already transitioned it.
-                    if let Some(mut mut_entry) = self.repos.get_mut(alias) {
-                        if let RepoState::Write { stores, .. } = mut_entry.value() {
-                            return Ok(stores.clone());
-                        }
-                        if let RepoState::Warm { stores } = mut_entry.value() {
-                            let stores = stores.clone();
-                            let path = {
-                                let config = self
-                                    .config
-                                    .read()
-                                    .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                                config
-                                    .resolve(alias)
-                                    .ok_or_else(|| format!("Unknown alias '{}'", alias))?
-                            };
-
-                            // Start FSW in background for this repo
-                            self.spawn_fsw_for_warm(alias, &path, stores.clone(), &mut mut_entry);
-                            return Ok(stores);
-                        }
-                        // Someone else transitioned it already
-                        if let RepoState::Readonly { stores } = mut_entry.value() {
-                            return Ok(stores.clone());
-                        }
-                        if let RepoState::Conflicted = mut_entry.value() {
-                            return Err(Self::conflicted_msg(alias));
-                        }
-                    }
-                    Ok(stores)
-                }
-                RepoState::Conflicted => Err(Self::conflicted_msg(alias)),
-            };
+        // Single-flight per alias: wait for any in-flight cold open of this
+        // repo, then re-check the cache. Without this, two concurrent cold
+        // opens both reach try_open_stores; the second trips the LMDB
+        // double-open guard and caches Conflicted — incurable while the first
+        // opener holds its env (todo #131).
+        let open_lock = self.open_lock(alias);
+        let _open_guard = open_lock.lock().await;
+        if let Some(result) = self.try_cached_stores(alias, touch) {
+            return result;
         }
 
         // Slow path: need to open

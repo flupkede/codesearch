@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.3.14]
+
+### Fixed
+
+- **Concurrent cold opens no longer wedge a repo behind the LMDB double-open guard.** Two overlapping first opens of the same repo (e.g. a `find_impact` racing its own retry) could both reach `try_open_stores`; the loser tripped the double-open guard and cached `Conflicted`, which the self-heal could never cure while the winner held its env — the repo stayed broken until a serve restart (2026-09-08 incident, todo #131). Cold opens are now single-flight per alias in `ServeState`: the loser waits on a per-repo lock and then hits the winner's cache entry. Covers both cold-open entry points (`get_or_open_stores`, `warmup_repo`); the fast path stays lock-free.
+
 ## [1.3.13]
 
 ### Fixed
