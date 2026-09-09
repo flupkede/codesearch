@@ -37,11 +37,14 @@ fn main() {
     // Construct full version string
     let version_full = format!("{}+{}", cargo_version, commit_count);
 
-    // Set environment variables for the main binary
-    println!("cargo:rustc-env=DEMONGREP_VERSION_FULL={}", version_full);
-    println!("cargo:rustc-env=DEMONGREP_COMMIT_HASH={}", commit_hash);
-    println!("cargo:rustc-env=DEMONGREP_COMMIT_COUNT={}", commit_count);
-    println!("cargo:rustc-env=DEMONGREP_BRANCH={}", branch_name);
+    // Set environment variables for the main binary. Emitted under the
+    // CODESEARCH_ prefix so they are identifiable in build output as this
+    // project's provenance (the DEMONGREP_ prefix was a leftover from the
+    // project this fork started from; nothing read it).
+    println!("cargo:rustc-env=CODESEARCH_VERSION_FULL={}", version_full);
+    println!("cargo:rustc-env=CODESEARCH_COMMIT_HASH={}", commit_hash);
+    println!("cargo:rustc-env=CODESEARCH_COMMIT_COUNT={}", commit_count);
+    println!("cargo:rustc-env=CODESEARCH_BRANCH={}", branch_name);
 
     // Also set for display in --version output
     println!("cargo:rustc-env=CARGO_PKG_VERSION_FULL={}", version_full);
