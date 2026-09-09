@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.3.16]
+
+### Added
+
+- **REST `/find-impact` endpoint (HTTP mirror of the `find_impact` MCP tool).** The read-only REST surface (`/search`, `/find`, `/explore`, `/chunk/:id`) now also mirrors `find_impact`: POST a `FindImpactRequest` body (`symbol_name`, or `file`+`line`; optional `language`, `project`, `group`) and receive the tool's JSON payload — busy envelope and `index_head_sha`/`current_head_sha` freshness fields included. Same auth class as the other REST mirrors: open on localhost binds, bearer key on network binds. Lets non-MCP clients — notably the `audit` binary — consume SCIP reference evidence without an MCP session.
+
 ## [1.3.15]
 
 ### Added

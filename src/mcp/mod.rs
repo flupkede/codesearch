@@ -69,6 +69,7 @@ mod status;
 // Re-export the extracted modules' items so every existing path keeps working:
 // `super::X` from sibling test files and `crate::mcp::X` from serve/cli.
 pub(crate) use federation_helpers::*;
+pub(crate) use find_impact::rest_find_impact_handler;
 pub(crate) use helpers::*;
 pub(crate) use instructions::*;
 pub(crate) use responses::*;

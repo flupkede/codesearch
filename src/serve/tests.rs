@@ -1334,6 +1334,10 @@ async fn rest_routes_are_registered() {
             crate::constants::CHUNK_PATH,
             axum::routing::get(crate::mcp::rest_get_chunk_handler),
         )
+        .route(
+            crate::constants::FIND_IMPACT_PATH,
+            axum::routing::post(crate::mcp::rest_find_impact_handler),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1404,6 +1408,24 @@ async fn rest_routes_are_registered() {
         .json()
         .await
         .expect("POST /find should return JSON from our handler");
+
+    // POST /find-impact — dispatches to rest_find_impact_handler.
+    let resp = client
+        .post(format!("http://{}/find-impact", addr))
+        .json(&serde_json::json!({"symbol_name": "foo", "project": "testalias"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status() == reqwest::StatusCode::OK
+            || resp.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "POST /find-impact -> unexpected status {} (route not registered?)",
+        resp.status()
+    );
+    let _: serde_json::Value = resp
+        .json()
+        .await
+        .expect("POST /find-impact should return JSON from our handler");
 
     // POST /explore — dispatches to rest_explore_handler.
     let resp = client
