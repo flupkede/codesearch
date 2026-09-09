@@ -33,11 +33,17 @@ mkdir -p "$HOOKS_DEST"
 cp "$HOOKS_SRC/grep-guard.sh" "$HOOKS_DEST/"
 cp "$HOOKS_SRC/subagent-preamble.sh" "$HOOKS_DEST/"
 cp "$HOOKS_SRC/web-guard.sh" "$HOOKS_DEST/"
-chmod +x "$HOOKS_DEST/grep-guard.sh" "$HOOKS_DEST/subagent-preamble.sh" "$HOOKS_DEST/web-guard.sh"
+cp "$HOOKS_SRC/edit-guard.sh" "$HOOKS_DEST/"
+cp "$HOOKS_SRC/edit-guard-post.sh" "$HOOKS_DEST/"
+cp "$HOOKS_SRC/codesearch-common.sh" "$HOOKS_DEST/"
+chmod +x "$HOOKS_DEST/grep-guard.sh" "$HOOKS_DEST/subagent-preamble.sh" "$HOOKS_DEST/web-guard.sh" \
+         "$HOOKS_DEST/edit-guard.sh" "$HOOKS_DEST/edit-guard-post.sh"
 
 GREP_GUARD_CMD="bash \"$HOOKS_DEST/grep-guard.sh\""
 PREAMBLE_CMD="bash \"$HOOKS_DEST/subagent-preamble.sh\""
 WEB_GUARD_CMD="bash \"$HOOKS_DEST/web-guard.sh\""
+EDIT_GUARD_CMD="bash \"$HOOKS_DEST/edit-guard.sh\""
+EDIT_GUARD_POST_CMD="bash \"$HOOKS_DEST/edit-guard-post.sh\""
 
 mkdir -p "$CLAUDE_DIR"
 if [ -f "$SETTINGS_PATH" ]; then
@@ -49,30 +55,33 @@ else
     settings='{}'
 fi
 
-# Ensure hooks.PreToolUse exists as an array
+# Ensure hooks.PreToolUse and hooks.PostToolUse exist as arrays
 settings=$(echo "$settings" | jq 'if has("hooks") then . else . + {hooks: {}} end
-  | .hooks |= (if has("PreToolUse") then . else . + {PreToolUse: []} end)')
+  | .hooks |= (if has("PreToolUse") then . else . + {PreToolUse: []} end)
+  | .hooks |= (if has("PostToolUse") then . else . + {PostToolUse: []} end)')
 
 already_registered() {
-    local cmd="$1"
-    echo "$settings" | jq -e --arg cmd "$cmd" \
-        '.hooks.PreToolUse[]?.hooks[]? | select(.command == $cmd)' >/dev/null 2>&1
+    local event="$1" cmd="$2"
+    echo "$settings" | jq -e --arg ev "$event" --arg cmd "$cmd" \
+        '.hooks[$ev][]?.hooks[]? | select(.command == $cmd)' >/dev/null 2>&1
 }
 
 add_matcher_hook() {
-    local matcher="$1" cmd="$2"
-    if already_registered "$cmd"; then
-        echo "Already registered: $matcher -> $cmd (skipping)"
+    local event="$1" matcher="$2" cmd="$3"
+    if already_registered "$event" "$cmd"; then
+        echo "Already registered: $event $matcher -> $cmd (skipping)"
         return
     fi
-    settings=$(echo "$settings" | jq --arg matcher "$matcher" --arg cmd "$cmd" \
-        '.hooks.PreToolUse += [{matcher: $matcher, hooks: [{type: "command", command: $cmd}]}]')
-    echo "Registered $matcher hook -> $cmd"
+    settings=$(echo "$settings" | jq --arg ev "$event" --arg matcher "$matcher" --arg cmd "$cmd" \
+        '.hooks[$ev] += [{matcher: $matcher, hooks: [{type: "command", command: $cmd}]}]')
+    echo "Registered $event $matcher hook -> $cmd"
 }
 
-add_matcher_hook "Grep"             "$GREP_GUARD_CMD"
-add_matcher_hook "Agent"            "$PREAMBLE_CMD"
-add_matcher_hook "WebSearch|WebFetch" "$WEB_GUARD_CMD"
+add_matcher_hook "PreToolUse"  "Grep"                 "$GREP_GUARD_CMD"
+add_matcher_hook "PreToolUse"  "Agent"                "$PREAMBLE_CMD"
+add_matcher_hook "PreToolUse"  "WebSearch|WebFetch"   "$WEB_GUARD_CMD"
+add_matcher_hook "PreToolUse"  "Edit|Write|MultiEdit" "$EDIT_GUARD_CMD"
+add_matcher_hook "PostToolUse" "mcp__codesearch__find_impact|mcp__codesearch__find" "$EDIT_GUARD_POST_CMD"
 
 echo "$settings" | jq '.' > "$SETTINGS_PATH"
 

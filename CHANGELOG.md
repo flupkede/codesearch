@@ -14,11 +14,23 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.3.14]
+## [1.3.16]
 
 ### Added
 
 - **REST `/find-impact` endpoint (HTTP mirror of the `find_impact` MCP tool).** The read-only REST surface (`/search`, `/find`, `/explore`, `/chunk/:id`) now also mirrors `find_impact`: POST a `FindImpactRequest` body (`symbol_name`, or `file`+`line`; optional `language`, `project`, `group`) and receive the tool's JSON payload — busy envelope and `index_head_sha`/`current_head_sha` freshness fields included. Same auth class as the other REST mirrors: open on localhost binds, bearer key on network binds. Lets non-MCP clients — notably the `audit` binary — consume SCIP reference evidence without an MCP session.
+
+## [1.3.15]
+
+### Added
+
+- **`edit-guard` — a fourth Claude Code guard hook: edits now require a codesearch consultation first.** On `Edit`/`Write`/`MultiEdit` against a file in a codesearch-registered repo, the hook denies the edit unless codesearch was consulted for that exact path within the last 5 minutes: `find_impact` for SCIP-backed languages (`.cs .ts .tsx .mts .cts`), `find(kind="usages")` for everything else. Markers are recorded by `edit-guard-post`, the first Claude Code `PostToolUse` hook in this repo: it fires on every `find_impact` call and every `find(kind="usages")` (kind check done script-side — matchers only see tool names), counts any outcome ("no results" and "no SCIP backend" included, so the guard can never wedge permanently), and prunes expired entries on write. The guard accepts ANY marker for the path within the window and fails open on unregistered repos, non-git paths and a crashed hook; missing/corrupt state counts as not consulted (deny on covered repos, allow everywhere else). Shared target-resolution/coverage helpers moved into `codesearch-common.sh/.ps1` (grep-guard sources them too; its PowerShell twin is thereby ported off the last `.codesearch.db`/Windows-only-path coverage signals, closing the #199 gap). The native installer writes the new scripts plus a `PostToolUse` registration, idempotent by exact command as before; the subagent preamble gained an EDIT RULE line. Hook self-tests: `bash integrations/claude-code/hooks/run-tests.sh` (todo #134).
+
+## [1.3.14]
+
+### Fixed
+
+- **Concurrent cold opens no longer wedge a repo behind the LMDB double-open guard.** Two overlapping first opens of the same repo (e.g. a `find_impact` racing its own retry) could both reach `try_open_stores`; the loser tripped the double-open guard and cached `Conflicted`, which the self-heal could never cure while the winner held its env — the repo stayed broken until a serve restart (2026-09-08 incident, todo #131). Cold opens are now single-flight per alias in `ServeState`: the loser waits on a per-repo lock and then hits the winner's cache entry. Covers both cold-open entry points (`get_or_open_stores`, `warmup_repo`); the fast path stays lock-free.
 
 ## [1.3.13]
 
