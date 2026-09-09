@@ -25,75 +25,17 @@
 
 set -euo pipefail
 
+# Shared coverage/target-resolution helpers (repos.json registration, path
+# normalization) live in codesearch-common.sh, shared with edit-guard.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/codesearch-common.sh"
+
 raw="$(cat)"
 [ -z "$raw" ] && exit 0
 
-tool=$(echo "$raw" | jq -r '.tool_name // empty')
+tool=$(echo "$raw" | jq -r '.tool_name // empty' | jq_str)
 [ "$tool" != "Grep" ] && exit 0
 
-path=$(echo "$raw" | jq -r '.tool_input.path // empty')
-
-# --- begin coverage helpers (repos.json registration, #199) ---------------
-
-# repos.json location — mirrors src/db_discovery/repos.rs `config_path()`:
-# CODESEARCH_REPOS_CONFIG override > ~/.codesearch/repos.json.
-repos_config_file() {
-    if [ -n "${CODESEARCH_REPOS_CONFIG:-}" ]; then
-        printf '%s' "$CODESEARCH_REPOS_CONFIG"
-    else
-        printf '%s' "${HOME:-}/.codesearch/repos.json"
-    fi
-}
-
-# Normalize one path for comparison: drop a Windows extended-length prefix
-# (\\?\ — exactly 4 chars), unify backslashes to forward slashes (Git-Bash
-# reports C:/x/y while repos.json records "C:\\x\\y"), and trim trailing
-# separators. Registration canonicalizes paths before writing them
-# (safe_canonicalize), so after this both sides agree byte-for-byte on
-# POSIX and component-wise on Windows.
-norm_repo_path() {
-    local p="$1"
-    case "$p" in
-        '\\?\'*) p="${p:4}" ;;
-    esac
-    p="${p//\\//}"
-    while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do
-        p="${p%/}"
-    done
-    printf '%s' "$p"
-}
-
-# Path equality: exact on POSIX, case-insensitive for Windows drive-letter
-# paths (NTFS is case-insensitive throughout) — mirrors the serve hub's own
-# /indexing resolver, which folds case on Windows only.
-repo_path_eq() {
-    local a b
-    a="$(norm_repo_path "$1")"
-    b="$(norm_repo_path "$2")"
-    case "$a" in [A-Za-z]:/*) a="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')" ;; esac
-    case "$b" in [A-Za-z]:/*) b="$(printf '%s' "$b" | tr '[:upper:]' '[:lower:]')" ;; esac
-    [ "$a" = "$b" ]
-}
-
-# Is the target's git root one of the repos registered with the local serve
-# hub? Fails OPEN on any resolver problem (missing/unreadable/malformed
-# repos.json, missing jq): a guard that cannot resolve coverage must allow,
-# never deny.
-target_registered() {
-    local root="$1" cfg reg
-    cfg="$(repos_config_file)"
-    [ -n "$cfg" ] || return 1
-    [ -r "$cfg" ] || return 1
-    while IFS= read -r reg; do
-        [ -n "$reg" ] || continue
-        if repo_path_eq "$reg" "$root"; then
-            return 0
-        fi
-    done < <(jq -r '(.repos // {}) | to_entries[] | .value | tostring' "$cfg" 2>/dev/null)
-    return 1
-}
-
-# --- end coverage helpers ----------------------------------------------------
+path=$(echo "$raw" | jq -r '.tool_input.path // empty' | jq_str)
 
 # ------------------------------------------------------------------
 # 1+2. Resolve the TARGET repo (the repo this Grep is aimed at) and check
@@ -131,38 +73,14 @@ target_registered() {
 # is a URL override rather than a coverage signal — to be reworked
 # separately).
 # ------------------------------------------------------------------
-target_root=""
-norm="${path%/}"
-norm="${norm%\\}"
-case "$norm" in
-    [A-Za-z]:[\\/]*|/*)
-        # Absolute path (Windows drive root, or any POSIX/UNC root): find
-        # the git root OF THE TARGET (may be a different repo than the cwd
-        # one — that is the whole point of #54). `/*` matches every POSIX
-        # absolute path; the old `/[a-zA-Z]/*` alternative only matched
-        # MSYS single-letter drive roots and left /home/... /tmp/...
-        # targets cwd-anchored (#199).
-        probe="$norm"
-        [ -f "$probe" ] && probe="$(dirname "$probe")"
-        target_root=$(git -C "$probe" rev-parse --show-toplevel 2>/dev/null || true)
-        ;;
-    *)
-        # Empty or relative path: resolves against the cwd repo.
-        target_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-        ;;
-esac
+target_root="$(resolve_target_git_root "$path")"
 
 # Not inside any git repo (or git unusable) -> external target: grep is right.
 [ -z "$target_root" ] && exit 0
 
-codesearch_covers=false
-if target_registered "$target_root"; then
-    codesearch_covers=true
-elif [ -n "${CODESEARCH_SERVER:-}" ]; then
-    codesearch_covers=true
-fi
-
-[ "$codesearch_covers" = false ] && exit 0
+# Covered = the target's git root is registered with the serve hub
+# (repos.json), or CODESEARCH_SERVER opts a pure remote-serve setup in.
+target_registered "$target_root" || exit 0
 
 # ------------------------------------------------------------------
 # 3. Is the codesearch serve hub actually UP right now? (Liveness probe.)

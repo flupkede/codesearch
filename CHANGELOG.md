@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.3.15]
+
+### Added
+
+- **`edit-guard` — a fourth Claude Code guard hook: edits now require a codesearch consultation first.** On `Edit`/`Write`/`MultiEdit` against a file in a codesearch-registered repo, the hook denies the edit unless codesearch was consulted for that exact path within the last 5 minutes: `find_impact` for SCIP-backed languages (`.cs .ts .tsx .mts .cts`), `find(kind="usages")` for everything else. Markers are recorded by `edit-guard-post`, the first Claude Code `PostToolUse` hook in this repo: it fires on every `find_impact` call and every `find(kind="usages")` (kind check done script-side — matchers only see tool names), counts any outcome ("no results" and "no SCIP backend" included, so the guard can never wedge permanently), and prunes expired entries on write. The guard accepts ANY marker for the path within the window and fails open on unregistered repos, non-git paths and a crashed hook; missing/corrupt state counts as not consulted (deny on covered repos, allow everywhere else). Shared target-resolution/coverage helpers moved into `codesearch-common.sh/.ps1` (grep-guard sources them too; its PowerShell twin is thereby ported off the last `.codesearch.db`/Windows-only-path coverage signals, closing the #199 gap). The native installer writes the new scripts plus a `PostToolUse` registration, idempotent by exact command as before; the subagent preamble gained an EDIT RULE line. Hook self-tests: `bash integrations/claude-code/hooks/run-tests.sh` (todo #134).
+
 ## [1.3.14]
 
 ### Fixed

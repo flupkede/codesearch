@@ -26,7 +26,7 @@ parent's `AGENTS.md` or the MCP `initialize` instructions at all.
 
 ## The fix
 
-Two [Claude Code hooks](https://docs.claude.com/en/docs/claude-code/hooks)
+Four [Claude Code hooks](https://docs.claude.com/en/docs/claude-code/hooks)
 that make the preference *structural* instead of advisory:
 
 - **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks every `Grep`
@@ -65,9 +65,32 @@ that make the preference *structural* instead of advisory:
   and when to prefer it over Grep/Glob. This is the only way to reach
   subagents at all, since they don't inherit `AGENTS.md` or MCP instructions.
 
-Both hooks fail open: if they can't parse their input, or codesearch isn't
-running/indexed, they get out of the way and let Grep proceed untouched. They
-never block targets outside any git repo, or repos codesearch does not cover.
+- **`edit-guard`** — a `PreToolUse` hook on `Edit`/`Write`/`MultiEdit`.
+  Blocks an edit to a file in a codesearch-registered repo until codesearch
+  was consulted for that exact path within the last 5 minutes:
+  `mcp__codesearch__find_impact` for SCIP-backed languages
+  (`.cs .ts .tsx .mts .cts`), `mcp__codesearch__find(kind="usages")` for
+  everything else — making the caller-aware-editing protocol structural.
+  Coverage uses the same registration model as grep-guard (shared
+  `codesearch-common` helpers): the file's git root must be listed in
+  `~/.codesearch/repos.json` (or `CODESEARCH_SERVER` is set); unregistered
+  repos and non-git paths are never blocked.
+
+- **`edit-guard-post`** — a `PostToolUse` hook on
+  `mcp__codesearch__find_impact` and `mcp__codesearch__find`, recording the
+  "consulted" markers `edit-guard` reads into a state file
+  (`$TMPDIR/.codesearch-edit-guard-state.json` on bash,
+  `%TEMP%\.codesearch-edit-guard-state.json` on PowerShell). It fires on
+  every `find_impact` call and every `find(kind="usages")` (the kind check
+  is done script-side — matchers only see tool names). Any outcome counts:
+  "no results" and "no SCIP backend" still mark the path as consulted, so
+  the guard can never wedge permanently. PostToolUse hooks cannot block
+  anything; this one never emits a decision and always exits 0.
+
+All hooks fail open: if they can't parse their input, or codesearch isn't
+running/indexed, they get out of the way and let the tool call proceed
+untouched. They never block targets outside any git repo, or repos
+codesearch does not cover.
 
 ## Install
 
@@ -86,9 +109,11 @@ bash integrations/claude-code/install.sh --project
 ```
 
 The installer:
-1. copies the hook scripts into `<claude-dir>/hooks/codesearch/`
-2. merges two `PreToolUse` registrations into `<claude-dir>/settings.json`
-   (backing up the existing file first)
+1. copies the guard scripts, the PostToolUse companion and the shared
+   `codesearch-common` helpers into `<claude-dir>/hooks/codesearch/`
+2. merges the `PreToolUse` registrations (one per guard) and the
+   `PostToolUse` registration (the companion) into
+   `<claude-dir>/settings.json` (backing up the existing file first)
 3. is idempotent — re-running it skips hooks already registered and never
    duplicates or clobbers unrelated settings
 
@@ -96,9 +121,9 @@ Restart Claude Code (or start a new session) after installing.
 
 ## Manual install
 
-If you'd rather wire it up by hand, or already have a `PreToolUse.Grep` /
-`PreToolUse.Agent` hook and want to merge manually, add to
-`~/.claude/settings.json` (or `.claude/settings.json` for project scope):
+If you'd rather wire it up by hand, or already have hooks on these events and
+want to merge manually, add to `~/.claude/settings.json` (or
+`.claude/settings.json` for project scope):
 
 ```json
 {
@@ -115,6 +140,20 @@ If you'd rather wire it up by hand, or already have a `PreToolUse.Grep` /
         "hooks": [
           { "type": "command", "command": "pwsh -NoProfile -NonInteractive -File \"<path>/subagent-preamble.ps1\"" }
         ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "pwsh -NoProfile -NonInteractive -File \"<path>/edit-guard.ps1\"" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__codesearch__find_impact|mcp__codesearch__find",
+        "hooks": [
+          { "type": "command", "command": "pwsh -NoProfile -NonInteractive -File \"<path>/edit-guard-post.ps1\"" }
+        ]
       }
     ]
   }
@@ -123,11 +162,15 @@ If you'd rather wire it up by hand, or already have a `PreToolUse.Grep` /
 
 Use the `.sh` scripts with a `bash "<path>/..."` command instead on
 macOS/Linux. Point `<path>` at wherever you copy `hooks/*.ps1` / `hooks/*.sh`.
+The guard scripts source `codesearch-common.ps1` / `codesearch-common.sh`
+from their own directory, so that file must be copied alongside them.
 
 ## Uninstall
 
-Remove the two `PreToolUse` entries (matcher `Grep` and `Agent` whose command
-points at `hooks/codesearch/`) from `settings.json`, and delete
+Remove the guard entries (matchers `Grep`, `Agent`, `WebSearch|WebFetch` and
+`Edit|Write|MultiEdit` under `PreToolUse`, and
+`mcp__codesearch__find_impact|mcp__codesearch__find` under `PostToolUse`,
+whose commands point at `hooks/codesearch/`) from `settings.json`, and delete
 `<claude-dir>/hooks/codesearch/`.
 
 ## Caveats
@@ -168,10 +211,19 @@ points at `hooks/codesearch/`) from `settings.json`, and delete
   silently allowed everything.)
   If your setup connects to a remote `codesearch serve` instance with no
   local `repos.json` registration, set `CODESEARCH_SERVER` to opt back
-  into enforcement for that repo. Note: the PowerShell twin
-  (`grep-guard.ps1`) still uses the older `.codesearch.db` coverage
-  signal and Windows-only absolute-path detection; porting it to the
-  registration-based resolution is tracked in #199.
+  into enforcement for that repo. Both the bash and the PowerShell twin
+  now resolve coverage through the shared `codesearch-common` helpers,
+  so the two shells behave identically (the PowerShell twin used to lag
+  behind on the `.codesearch.db`/Windows-only-path signals — closed with
+  the edit-guard work, #199).
+- `edit-guard` is per-file, not per-repo: a marker for one file never
+  unblocks an edit to another file. The marker state lives in a temp-dir
+  JSON file (`$TMPDIR/.codesearch-edit-guard-state.json` /
+  `%TEMP%\.codesearch-edit-guard-state.json`), entries expire after
+  5 minutes and are pruned on write; missing or corrupt state counts as
+  "not consulted" (deny on covered repos, allow everywhere else). Like
+  the other guards it is per-machine, not per-repo: it only ever fires
+  on files whose git root is registered with the serve hub.
 - Both hooks are per-machine, not per-repo: install once at user scope and
   every project benefits, including ones not registered with the serve
   hub (the guard simply won't block Grep there, since coverage fails

@@ -20,15 +20,16 @@
 #   - the search target resolves to a git repo (its OWN root, not the cwd's —
 #     absolute paths into a different repo resolve against THAT repo, todo
 #     #54), AND
-#   - codesearch covers THAT repo (indexed .codesearch.db at its git root, or
-#     the CODESEARCH_SERVER opt-in for remote/hub-only setups), AND
+#   - codesearch covers THAT repo (its git root registered in the serve
+#     hub's repos.json, or the CODESEARCH_SERVER opt-in for remote/hub-only
+#     setups), AND
 #   - the codesearch serve hub answers its /healthz liveness probe (it's UP)
 #
 # Passes through (exit 0, no block) when:
 #   - the target is not inside any git repo (external path — grep is the
 #     right tool there)
-#   - codesearch does not cover the target's repo (no local index, no
-#     CODESEARCH_SERVER)
+#   - codesearch does not cover the target's repo (git root not registered
+#     in repos.json, no CODESEARCH_SERVER)
 #   - the codesearch serve hub does not answer /healthz — it's down, so grep
 #     is genuinely all you have
 #
@@ -41,6 +42,14 @@
 # Install: see ../README.md (or run ../install.ps1 to wire this up automatically).
 
 $ErrorActionPreference = 'Stop'
+
+# Shared target-resolution helpers live in codesearch-common.ps1 (shared
+# with edit-guard). Missing/broken helper file -> fail open, never block.
+try {
+    . (Join-Path $PSScriptRoot 'codesearch-common.ps1')
+} catch {
+    exit 0
+}
 
 try {
     $raw = [Console]::In.ReadToEnd()
@@ -63,50 +72,22 @@ $path  = if ($names -contains 'path') { [string]$inp.path } else { '' }
 # 1+2. Resolve the TARGET repo (the repo this Grep is aimed at) and check
 #      codesearch coverage THERE — never in the hook's cwd.
 #
-# History (#54): coverage used to be resolved from the hook's cwd. An
-# absolute-path Grep into a DIFFERENT indexed repo then failed the
-# startswith(cwd-repo-root) test, looked "external", and was allowed even
-# though its target repo was fully covered. The guard now follows the
-# target: empty/relative paths resolve against the cwd repo (they are
-# relative to it by definition), absolute paths resolve against the git
-# root of the path itself.
+# The resolution (absolute path -> the target's own git root, empty/
+# relative -> the cwd repo) lives in codesearch-common.ps1 and is shared
+# with edit-guard. History (#54, #199): see codesearch-common.sh.
 # ------------------------------------------------------------------
-$targetRoot = $null
-$normPath   = $path.TrimEnd('/\')
-$isAbsolute = $normPath -match '^([A-Za-z]:[\\/]|/[a-zA-Z]/|//)'
-
-if (-not $path -or $path -eq '.' -or $path -eq './' -or -not $isAbsolute) {
-    # Empty or relative path: resolves against the cwd repo.
-    try {
-        $gr = (& git rev-parse --show-toplevel 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $gr) { $targetRoot = $gr.Trim() }
-    } catch {}
-} else {
-    # Absolute path: find the git root OF THE TARGET (may be a different
-    # repo than the cwd one — that is the whole point of #54).
-    $probe = $normPath
-    if (Test-Path -LiteralPath $probe -PathType Leaf) {
-        $probe = Split-Path -Parent $probe
-    }
-    try {
-        $gr = (& git -C $probe rev-parse --show-toplevel 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $gr) { $targetRoot = $gr.Trim() }
-    } catch {}
-}
+$targetRoot = Resolve-TargetGitRoot $path
 
 # Not inside any git repo (or git unusable) -> external target: grep is right.
 if (-not $targetRoot) { exit 0 }
 
-# Coverage: a local .codesearch.db at the TARGET repo's root is the precise,
-# fast signal that THIS repo is indexed (a running serve hub alone is NOT —
-# it covers many repos and being alive says nothing about this one).
+# Coverage: the TARGET repo's git root is REGISTERED with the serve hub
+# (~/.codesearch/repos.json — the same list the hub itself resolves by),
+# matching the bash twin and edit-guard; a running serve hub alone is NOT a
+# signal (it covers many repos and being alive says nothing about this one).
 # CODESEARCH_SERVER stays the explicit opt-in for pure remote-serve setups.
-$covered = $false
-try {
-    if (Test-Path (Join-Path $targetRoot '.codesearch.db')) { $covered = $true }
-} catch {}
-if (-not $covered -and $env:CODESEARCH_SERVER) { $covered = $true }
-if (-not $covered) { exit 0 }
+# Fails open: missing/malformed repos.json counts as unregistered -> allow.
+if (-not (Test-CodesearchTargetRegistered $targetRoot)) { exit 0 }
 
 # ------------------------------------------------------------------
 # 3. Is the codesearch serve hub actually UP right now? (Liveness probe.)

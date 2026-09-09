@@ -7,9 +7,11 @@
 //! no dependency on the source tree at install time.
 //!
 //! Behaviour mirrors the shell installers:
-//!   1. Write the hook scripts into `<claude_dir>/hooks/codesearch/`.
-//!   2. Merge one PreToolUse registration per guard into `settings.json`,
-//!      keyed by the exact command string so re-running never duplicates.
+//!   1. Write the hook scripts (guards, the PostToolUse companion and the
+//!      shared helper libraries) into `<claude_dir>/hooks/codesearch/`.
+//!   2. Merge one PreToolUse registration per guard and one PostToolUse
+//!      registration per companion into `settings.json`, keyed by the exact
+//!      command string so re-running never duplicates.
 //!   3. Back up an existing `settings.json` before rewriting it.
 //!
 //! `<claude_dir>` is `~/.claude` (user scope) or `./.claude` (`--project`).
@@ -28,6 +30,16 @@ const PREAMBLE_PS1: &str =
     include_str!("../../integrations/claude-code/hooks/subagent-preamble.ps1");
 const WEB_GUARD_SH: &str = include_str!("../../integrations/claude-code/hooks/web-guard.sh");
 const WEB_GUARD_PS1: &str = include_str!("../../integrations/claude-code/hooks/web-guard.ps1");
+const EDIT_GUARD_SH: &str = include_str!("../../integrations/claude-code/hooks/edit-guard.sh");
+const EDIT_GUARD_PS1: &str = include_str!("../../integrations/claude-code/hooks/edit-guard.ps1");
+const EDIT_GUARD_POST_SH: &str =
+    include_str!("../../integrations/claude-code/hooks/edit-guard-post.sh");
+const EDIT_GUARD_POST_PS1: &str =
+    include_str!("../../integrations/claude-code/hooks/edit-guard-post.ps1");
+const CODESEARCH_COMMON_SH: &str =
+    include_str!("../../integrations/claude-code/hooks/codesearch-common.sh");
+const CODESEARCH_COMMON_PS1: &str =
+    include_str!("../../integrations/claude-code/hooks/codesearch-common.ps1");
 
 /// A PreToolUse guard hook to install: the tool matcher it fires on, the script
 /// basename, and the per-platform script files to write out.
@@ -44,6 +56,8 @@ struct GuardHook {
 /// - `Grep` → codesearch-first for internal code discovery.
 /// - `Agent` → inject a codesearch-first preamble into subagent prompts.
 /// - `WebSearch`/`WebFetch` → steer to remote doc mounts before the open web.
+/// - `Edit`/`Write`/`MultiEdit` → require a recent codesearch consultation
+///   (find_impact / find kind="usages") per file before edits.
 static GUARD_HOOKS: &[GuardHook] = &[
     GuardHook {
         matcher: "Grep",
@@ -70,6 +84,34 @@ static GUARD_HOOKS: &[GuardHook] = &[
             ("web-guard.ps1", WEB_GUARD_PS1),
         ],
     },
+    GuardHook {
+        matcher: "Edit|Write|MultiEdit",
+        stem: "edit-guard",
+        files: &[
+            ("edit-guard.sh", EDIT_GUARD_SH),
+            ("edit-guard.ps1", EDIT_GUARD_PS1),
+        ],
+    },
+];
+
+/// PostToolUse companion hooks. These can never block anything (Claude Code
+/// ignores decisions there); they only record state — `edit-guard-post`
+/// marks "codesearch consulted" per file path after qualifying MCP calls,
+/// which `edit-guard` honours on the next Edit/Write/MultiEdit.
+static POST_TOOL_USE_HOOKS: &[GuardHook] = &[GuardHook {
+    matcher: "mcp__codesearch__find_impact|mcp__codesearch__find",
+    stem: "edit-guard-post",
+    files: &[
+        ("edit-guard-post.sh", EDIT_GUARD_POST_SH),
+        ("edit-guard-post.ps1", EDIT_GUARD_POST_PS1),
+    ],
+}];
+
+/// Shared helper libraries sourced by the guard scripts at runtime; written
+/// once into the same hooks directory as the guards themselves.
+static COMMON_HOOK_FILES: &[(&str, &str)] = &[
+    ("codesearch-common.sh", CODESEARCH_COMMON_SH),
+    ("codesearch-common.ps1", CODESEARCH_COMMON_PS1),
 ];
 
 /// Resolve the `.claude` directory for the requested scope.
@@ -97,12 +139,17 @@ fn hook_command(hooks_dest: &Path, stem: &str) -> String {
     }
 }
 
-/// Ensure `settings.hooks.PreToolUse` contains a `{matcher, hooks:[…]}` entry
+/// Ensure `settings.hooks.<event>` contains a `{matcher, hooks:[…]}` entry
 /// for `command`. Idempotent: returns `Ok(false)` without modifying anything if
-/// an entry with this exact `command` already exists anywhere in `PreToolUse`.
-/// Returns an error if a pre-existing `hooks`/`PreToolUse` value has a shape
+/// an entry with this exact `command` already exists anywhere in `<event>`.
+/// Returns an error if a pre-existing `hooks`/`<event>` value has a shape
 /// incompatible with the expected object/array.
-fn add_matcher_hook(settings: &mut Value, matcher: &str, command: &str) -> Result<bool> {
+fn add_matcher_hook(
+    settings: &mut Value,
+    event: &str,
+    matcher: &str,
+    command: &str,
+) -> Result<bool> {
     let root = settings
         .as_object_mut()
         .context("settings.json root must be a JSON object")?;
@@ -111,13 +158,13 @@ fn add_matcher_hook(settings: &mut Value, matcher: &str, command: &str) -> Resul
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .context("settings.hooks must be a JSON object")?;
-    let pre = hooks
-        .entry("PreToolUse")
+    let list = hooks
+        .entry(event)
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .context("settings.hooks.PreToolUse must be a JSON array")?;
+        .context("settings.hooks.{event} must be a JSON array")?;
 
-    let already = pre.iter().any(|entry| {
+    let already = list.iter().any(|entry| {
         entry
             .get("hooks")
             .and_then(Value::as_array)
@@ -131,11 +178,26 @@ fn add_matcher_hook(settings: &mut Value, matcher: &str, command: &str) -> Resul
         return Ok(false);
     }
 
-    pre.push(json!({
+    list.push(json!({
         "matcher": matcher,
         "hooks": [ { "type": "command", "command": command } ]
     }));
     Ok(true)
+}
+
+/// Write one hook script (or shared library) into the hooks directory,
+/// executable on unix. Scripts are re-written verbatim on every install.
+fn write_hook_file(hooks_dest: &Path, name: &str, contents: &str) -> Result<()> {
+    let path = hooks_dest.join(name);
+    std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    if name.ends_with(".sh") {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms)?;
+    }
+    Ok(())
 }
 
 /// Load an existing `settings.json` (backing it up first) or start from `{}`.
@@ -163,36 +225,36 @@ pub fn run_claude_install(project: bool) -> Result<()> {
     std::fs::create_dir_all(&hooks_dest)
         .with_context(|| format!("creating {}", hooks_dest.display()))?;
 
-    // 1. Write the hook scripts.
-    for gh in GUARD_HOOKS {
+    // 1. Write the hook scripts (guards, PostToolUse companions, shared
+    //    helper libraries — all into the same directory).
+    for (name, contents) in COMMON_HOOK_FILES {
+        write_hook_file(&hooks_dest, name, contents)?;
+    }
+    for gh in GUARD_HOOKS.iter().chain(POST_TOOL_USE_HOOKS) {
         for (name, contents) in gh.files {
-            let path = hooks_dest.join(name);
-            std::fs::write(&path, contents)
-                .with_context(|| format!("writing {}", path.display()))?;
-            #[cfg(unix)]
-            if name.ends_with(".sh") {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&path)?.permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&path, perms)?;
-            }
+            write_hook_file(&hooks_dest, name, contents)?;
         }
     }
 
-    // 2. Merge the PreToolUse registrations into settings.json.
+    // 2. Merge the PreToolUse / PostToolUse registrations into settings.json.
     // (`claude_dir` already exists — creating `hooks_dest` above made it.)
     let settings_path = claude_dir.join("settings.json");
     let mut settings = load_or_init_settings(&settings_path)?;
 
-    for gh in GUARD_HOOKS {
-        let cmd = hook_command(&hooks_dest, gh.stem);
-        if add_matcher_hook(&mut settings, gh.matcher, &cmd)? {
-            eprintln!(
-                "{}",
-                format!("Registered {} hook -> {}", gh.matcher, cmd).green()
-            );
-        } else {
-            eprintln!("Already registered: {} (skipping)", gh.matcher);
+    for (event, hooks) in [
+        ("PreToolUse", GUARD_HOOKS),
+        ("PostToolUse", POST_TOOL_USE_HOOKS),
+    ] {
+        for gh in hooks {
+            let cmd = hook_command(&hooks_dest, gh.stem);
+            if add_matcher_hook(&mut settings, event, gh.matcher, &cmd)? {
+                eprintln!(
+                    "{}",
+                    format!("Registered {} {} hook -> {}", event, gh.matcher, cmd).green()
+                );
+            } else {
+                eprintln!("Already registered: {} {} (skipping)", event, gh.matcher);
+            }
         }
     }
 
@@ -217,7 +279,8 @@ mod tests {
     #[test]
     fn add_matcher_hook_registers_on_empty_settings() {
         let mut settings = json!({});
-        let added = add_matcher_hook(&mut settings, "Grep", "bash /x/grep-guard.sh").unwrap();
+        let added =
+            add_matcher_hook(&mut settings, "PreToolUse", "Grep", "bash /x/grep-guard.sh").unwrap();
         assert!(added, "first registration must add the hook");
         let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 1);
@@ -230,10 +293,39 @@ mod tests {
     fn add_matcher_hook_is_idempotent_by_command() {
         let mut settings = json!({});
         let cmd = "bash /x/grep-guard.sh";
-        assert!(add_matcher_hook(&mut settings, "Grep", cmd).unwrap());
+        assert!(add_matcher_hook(&mut settings, "PreToolUse", "Grep", cmd).unwrap());
         // Same command again -> no-op, no duplicate.
-        assert!(!add_matcher_hook(&mut settings, "Grep", cmd).unwrap());
+        assert!(!add_matcher_hook(&mut settings, "PreToolUse", "Grep", cmd).unwrap());
         assert_eq!(settings["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn post_tool_use_hook_is_idempotent_by_command() {
+        let mut settings = json!({});
+        let cmd = "bash /x/edit-guard-post.sh";
+        assert!(add_matcher_hook(
+            &mut settings,
+            "PostToolUse",
+            "mcp__codesearch__find_impact|mcp__codesearch__find",
+            cmd
+        )
+        .unwrap());
+        // Same command again -> no-op, no duplicate, and the entry stays in
+        // PostToolUse (never leaking into PreToolUse).
+        assert!(!add_matcher_hook(
+            &mut settings,
+            "PostToolUse",
+            "mcp__codesearch__find_impact|mcp__codesearch__find",
+            cmd
+        )
+        .unwrap());
+        let post = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        assert_eq!(
+            post[0]["matcher"],
+            "mcp__codesearch__find_impact|mcp__codesearch__find"
+        );
+        assert!(settings["hooks"].get("PreToolUse").is_none());
     }
 
     #[test]
@@ -246,7 +338,9 @@ mod tests {
                 ]
             }
         });
-        assert!(add_matcher_hook(&mut settings, "Grep", "bash /x/grep-guard.sh").unwrap());
+        assert!(
+            add_matcher_hook(&mut settings, "PreToolUse", "Grep", "bash /x/grep-guard.sh").unwrap()
+        );
         let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2, "existing Bash hook must survive");
         assert_eq!(settings["model"], "opus", "unrelated settings must survive");
@@ -255,29 +349,38 @@ mod tests {
     #[test]
     fn add_matcher_hook_rejects_bad_pretooluse_shape() {
         let mut settings = json!({ "hooks": { "PreToolUse": "not-an-array" } });
-        assert!(add_matcher_hook(&mut settings, "Grep", "cmd").is_err());
+        assert!(add_matcher_hook(&mut settings, "PreToolUse", "Grep", "cmd").is_err());
     }
 
     #[test]
     fn add_matcher_hook_rejects_non_object_hooks() {
         let mut settings = json!({ "hooks": "not-an-object" });
-        assert!(add_matcher_hook(&mut settings, "Grep", "cmd").is_err());
+        assert!(add_matcher_hook(&mut settings, "PreToolUse", "Grep", "cmd").is_err());
     }
 
     #[test]
     fn add_matcher_hook_rejects_non_object_root() {
         let mut settings = json!(["not", "an", "object"]);
-        assert!(add_matcher_hook(&mut settings, "Grep", "cmd").is_err());
+        assert!(add_matcher_hook(&mut settings, "PreToolUse", "Grep", "cmd").is_err());
     }
 
     #[test]
-    fn guard_hooks_cover_grep_agent_and_web() {
+    fn guard_hooks_cover_grep_agent_edit_and_web() {
         let matchers: Vec<&str> = GUARD_HOOKS.iter().map(|g| g.matcher).collect();
         assert!(matchers.contains(&"Grep"));
         assert!(matchers.contains(&"Agent"));
         assert!(matchers.contains(&"WebSearch|WebFetch"));
-        // Every guard ships both a .sh and a .ps1 with non-empty embedded bodies.
-        for g in GUARD_HOOKS {
+        assert!(matchers.contains(&"Edit|Write|MultiEdit"));
+        // The PostToolUse companion registers under its own event list.
+        let post: Vec<&str> = POST_TOOL_USE_HOOKS.iter().map(|g| g.matcher).collect();
+        assert!(post.contains(&"mcp__codesearch__find_impact|mcp__codesearch__find"));
+        // The shared helper libraries ship alongside the guards.
+        for (name, body) in COMMON_HOOK_FILES {
+            assert!(!body.is_empty(), "{name} embedded body is empty");
+        }
+        // Every guard and companion ships both a .sh and a .ps1 with
+        // non-empty embedded bodies.
+        for g in GUARD_HOOKS.iter().chain(POST_TOOL_USE_HOOKS) {
             assert_eq!(
                 g.files.len(),
                 2,
