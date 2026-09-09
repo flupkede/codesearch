@@ -48,7 +48,7 @@ struct BenchmarkResult {
 
 fn main() -> Result<()> {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║           DEMONGREP EMBEDDING MODEL BENCHMARK                ║");
+    println!("║           CODESEARCH EMBEDDING MODEL BENCHMARK               ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
