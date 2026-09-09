@@ -46,6 +46,11 @@ add project="<repo-alias>" (single repo) or group="<group>" (cross-repo). The
 error response lists the valid available_projects / available_groups — pick
 from that list; the alias may differ from the folder name.
 
+EDIT RULE: before editing code in a codesearch-registered repo, consult it
+for the file first — mcp__codesearch__find_impact (C#/TS) or
+mcp__codesearch__find(kind="usages") (other languages). The edit-guard hook
+blocks Edit/Write/MultiEdit on that file until you do (5-minute window).
+
 Fall back to Grep/Glob only after codesearch returns no useful results,
 or when the path is outside the current repo (codesearch covers internal
 paths only unless you're in multi-repo serve mode with an explicit group).

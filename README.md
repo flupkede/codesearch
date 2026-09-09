@@ -222,10 +222,11 @@ OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies acr
 
 **Claude Code specifically** tends to ignore this advice more than other clients — its MCP tool schemas are deferred (an extra `ToolSearch` call is needed before codesearch tools are even callable), while Grep/Glob are always fully loaded and zero-friction, and spawned subagents don't inherit `AGENTS.md` or the MCP `initialize` instructions at all.
 
-To make the preference **structural** instead of advisory, this repo ships three Claude Code `PreToolUse` hooks:
+To make the preference **structural** instead of advisory, this repo ships five Claude Code hooks (four `PreToolUse` guards plus one `PostToolUse` companion):
 
 - **`grep-guard`** — on `Grep`. Blocks a grep against an in-repo path when codesearch covers that repo (the target repo — resolved from the grep target's own git root — is registered with the serve hub in `~/.codesearch/repos.json`, or a `CODESEARCH_SERVER` env var is set for remote-serve setups), with a message telling the model how to load and call codesearch instead. Grep is auto-allowed **only when the serve hub is genuinely down**, established by a live probe of the unauthenticated `/healthz` endpoint (`CODESEARCH_SERVER` > `127.0.0.1:$CODESEARCH_SERVE_PORT` > `127.0.0.1:39725`); only a connection-level failure counts as down. A low-confidence or empty codesearch result is a *successful* call meaning "reformulate the query", so it does **not** open the escape hatch — the deny message steers to `find`/`explore`/a single clean term instead. Greps outside any registered repo are never blocked, and the hook fails open (never traps the model).
-- **`subagent-preamble`** — on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all.
+- **`edit-guard`** — on `Edit`/`Write`/`MultiEdit`. Blocks an edit to a file in a codesearch-registered repo until codesearch was consulted for that exact path within the last 5 minutes — `find_impact` for SCIP-backed languages (`.cs .ts .tsx .mts .cts`), `find(kind="usages")` for everything else — making the caller-aware-editing protocol structural. Its companion **`edit-guard-post`** (`PostToolUse`) records the markers on every `find_impact` call and every `find(kind="usages")`; any outcome counts ("no results" included), so the guard can never wedge. Unregistered repos, non-git paths and hook failures fail open.
+- **`subagent-preamble`** — on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all — including the edit-guard protocol above.
 - **`web-guard`** — on `WebSearch`/`WebFetch`. When you have remote documentation projects mounted (`codesearch remote mount`, e.g. `cloud/inriver`, `cloud/example-dam`), it blocks the first web call with guidance to search those indexed mounts first — often more precise and current than the open web. Same 5-minute retry-escape; when no mounts are configured it does nothing.
 
 Install (idempotent — user scope applies to every project; `--project` is this repo only):
@@ -437,7 +438,7 @@ The install target is resolved with `git rev-parse --git-path hooks`, so it hono
 
 ### Claude Code Guard Hooks
 
-`codesearch hooks claude install` (`--project` for repo scope) installs the `PreToolUse` guard hooks that steer agents to codesearch before `Grep`/`WebSearch`/`WebFetch`. See [Agent Guidance](#agent-guidance-making-agents-use-codesearch-not-grep) above for what each guard does.
+`codesearch hooks claude install` (`--project` for repo scope) installs the four `PreToolUse` guard hooks that steer agents to codesearch before `Grep`/`WebSearch`/`WebFetch`/`Edit`/`Write`/`MultiEdit`, plus the `PostToolUse` marker hook (`edit-guard-post`) that records the consultations `edit-guard` requires. See [Agent Guidance](#agent-guidance-making-agents-use-codesearch-not-grep) above for what each guard does.
 
 ### MCP Connection Modes
 
