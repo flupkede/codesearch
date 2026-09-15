@@ -770,7 +770,7 @@ async fn try_open_stores_creates_db_for_brand_new_repo() {
 
     let state = state_with_config(ReposConfig::default());
 
-    match state.try_open_stores("brandnew", &db_path, true, false) {
+    match state.try_open_stores("brandnew", &db_path, true, false, None) {
         Ok(OpenedStores::Write(_)) => {}
         Ok(OpenedStores::Readonly(_)) => {
             panic!("brand-new repo opened Readonly; expected Write")
@@ -849,6 +849,250 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
         db_path.exists(),
         "the .codesearch.db directory should have been created"
     );
+}
+
+/// `POST /repos` with no explicit `model` must create a brand-new index at the
+/// serve-wide default's dimension (`codesearch serve --model X`), not the
+/// built-in 384-dim default. This is the write-side counterpart of the per-repo
+/// query-model contract.
+#[tokio::test]
+async fn add_repo_handler_uses_serve_default_model_for_new_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("defaulted");
+    std::fs::create_dir(&repo_path).unwrap();
+
+    let state = Arc::new(
+        state_with_config(ReposConfig::default())
+            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+    );
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("defaulted".to_string()),
+            model: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+
+    let stores = state
+        .get_opened_stores("defaulted")
+        .expect("store must be open immediately after add");
+    let dims = stores
+        .vector_store
+        .try_read()
+        .unwrap()
+        .stats()
+        .unwrap()
+        .dimensions;
+    assert_eq!(
+        dims,
+        crate::embed::ModelType::EmbeddingGemma300MQ4.dimensions(),
+        "a new index must be created at the serve default model's dimension"
+    );
+}
+
+/// The serve-wide default must NOT override an index that already records its
+/// own model: re-adding a repo whose `.codesearch.db` is still on disk keeps the
+/// recorded model and dimension.
+#[tokio::test]
+async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("existing");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+
+    // A pre-existing index recording the 384-dim default model.
+    std::fs::create_dir_all(&db_path).unwrap();
+    let mut meta = serde_json::Map::new();
+    crate::embed::ModelType::AllMiniLML6V2Q.write_metadata_fields(&mut meta);
+    std::fs::write(
+        db_path.join("metadata.json"),
+        serde_json::to_string(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let state = Arc::new(
+        state_with_config(ReposConfig::default())
+            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+    );
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("existing".to_string()),
+            model: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+
+    let stores = state
+        .get_opened_stores("existing")
+        .expect("store must be open immediately after add");
+    let dims = stores
+        .vector_store
+        .try_read()
+        .unwrap()
+        .stats()
+        .unwrap()
+        .dimensions;
+    assert_eq!(
+        dims,
+        crate::embed::ModelType::AllMiniLML6V2Q.dimensions(),
+        "an existing index must keep its recorded model, not adopt the serve default"
+    );
+}
+
+/// Precedence contract for the model a `POST /repos` add indexes with.
+#[test]
+fn resolve_add_repo_model_precedence() {
+    use crate::embed::ModelType;
+    let gemma = ModelType::EmbeddingGemma300MQ4;
+    let mini = ModelType::AllMiniLML6V2Q;
+
+    // Explicit model always wins, even over a recorded model and a default.
+    assert_eq!(
+        resolve_add_repo_model(Some(gemma), Some(mini), Some(mini)),
+        Some(gemma)
+    );
+    // No explicit model, no recorded model → serve default applies (new index).
+    assert_eq!(resolve_add_repo_model(None, None, Some(gemma)), Some(gemma));
+    // No explicit model, recorded model present → serve default is ignored.
+    assert_eq!(resolve_add_repo_model(None, Some(mini), Some(gemma)), None);
+    // No explicit model, no recorded model, no default → no override.
+    assert_eq!(resolve_add_repo_model(None, None, None), None);
+    // Explicit model still wins when nothing else is set.
+    assert_eq!(resolve_add_repo_model(Some(mini), None, None), Some(mini));
+}
+
+/// The serve-wide default is the scope-free fallback model in serve mode (the
+/// unpinned status summary, a call with no routed alias). It is deliberately
+/// NOT the query fallback for a repo that records no model — see
+/// `unrecorded_index_is_queried_with_builtin_default_not_serve_default`.
+#[test]
+fn serve_default_model_is_service_fallback() {
+    use crate::embed::ModelType;
+    let state = std::sync::Arc::new(
+        ServeState::new(ReposConfig::default(), None)
+            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+    );
+    assert_eq!(state.default_model(), Some(ModelType::EmbeddingGemma300MQ4));
+
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+    assert_eq!(
+        svc.query_model(None),
+        ModelType::EmbeddingGemma300MQ4,
+        "serve must fall back to its default model, not the built-in default"
+    );
+}
+
+/// Without `--model`, `ServeState` reports no default and the service falls back
+/// to the built-in default.
+#[test]
+fn no_serve_default_keeps_builtin_fallback() {
+    use crate::embed::ModelType;
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+    assert_eq!(state.default_model(), None);
+
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+    assert_eq!(svc.query_model(None), ModelType::default());
+}
+
+/// A repo whose `metadata.json` records no model is queried with the BUILT-IN
+/// default, never the serve-wide `--model` default.
+///
+/// Regression guard for `serve --model X` silently overriding a legacy index:
+/// with a 768-dim serve default, a 384-dim legacy index failed every search with
+/// "Query embedding dimension mismatch: expected 384, got 768", and a
+/// same-dimension default would have compared incomparable vector spaces without
+/// erroring. The assumption must also reach the caller as a warning naming the
+/// repo, the assumed model and the re-index command.
+#[test]
+fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
+    use crate::embed::ModelType;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let repo_path = tmp.path().join("legacy");
+    std::fs::create_dir(&repo_path).unwrap();
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("legacy".to_string()))
+        .unwrap();
+    config.save_to(&config_file).unwrap();
+
+    let state = std::sync::Arc::new(
+        ServeState::new(config, Some(config_file))
+            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+    );
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    // No metadata.json yet: an unrecorded model. Serve default is gemma.
+    let resolution = svc.resolve_query_model(Some("legacy"));
+    assert_eq!(
+        resolution.model,
+        ModelType::default(),
+        "a repo that records no model must be queried with the built-in default, \
+         not the '{}' serve default",
+        ModelType::EmbeddingGemma300MQ4.short_name()
+    );
+    let warning = resolution
+        .assumed_warning
+        .expect("the assumed model must be surfaced to the caller");
+    assert!(
+        warning.contains("legacy"),
+        "warning must name the repo: {warning}"
+    );
+    assert!(
+        warning.contains(ModelType::default().short_name()),
+        "warning must name the assumed model: {warning}"
+    );
+    assert!(
+        warning.contains("--force"),
+        "warning must give the re-index command: {warning}"
+    );
+
+    // A recorded model is used as-is and must not warn.
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"model_short_name":"embeddinggemma-q4","dimensions":768}"#,
+    )
+    .unwrap();
+    let resolution = svc.resolve_query_model(Some("legacy"));
+    assert_eq!(resolution.model, ModelType::EmbeddingGemma300MQ4);
+    assert!(
+        resolution.assumed_warning.is_none(),
+        "a recorded model must not warn"
+    );
+}
+
+/// The unrecorded-model log warning fires once per alias, so a busy hub does not
+/// repeat the same line on every query. The caller-facing warning is separate
+/// and is not deduped.
+#[test]
+fn legacy_model_warning_is_logged_once_per_alias() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    assert!(state.mark_legacy_model_warned("a"));
+    assert!(!state.mark_legacy_model_warned("a"));
+    assert!(state.mark_legacy_model_warned("b"));
 }
 
 /// `persist_config` must write to the override path (and therefore be
@@ -2306,7 +2550,7 @@ async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
 
     // Serve opens the repo FOR REAL — a live LMDB env under db_path.
     let opened = state
-        .try_open_stores("heldenv", &db_path, true, false)
+        .try_open_stores("heldenv", &db_path, true, false, None)
         .expect("opening a real store for a brand-new repo must succeed");
     let OpenedStores::Write(stores) = opened else {
         panic!("brand-new repo must open Write, not Readonly");
@@ -2402,5 +2646,192 @@ fn evicting_idle_repo_clears_frozen_csharp_error_state() {
     assert!(
         !state.csharp_index_error.contains_key("frozen"),
         "eviction must clear the cached C# error message along with the status"
+    );
+}
+
+/// The model a serve query is embedded with is read from the routed repo's own
+/// index metadata — never assumed to be the hub-wide default.
+///
+/// Regression guard for the serve hub pinning `ModelType::default()` (384-dim
+/// MiniLM) for every query: on a hub whose indexes were rebuilt with
+/// EmbeddingGemma that failed with "Query embedding dimension mismatch:
+/// expected 768, got 384". Reintroducing the default pin makes the gemma cases
+/// below fail.
+#[test]
+fn model_for_alias_reads_the_index_metadata_model() {
+    let cases = [
+        (
+            "embeddinggemma-q4",
+            Some(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        ),
+        ("minilm-l6-q", Some(crate::embed::ModelType::AllMiniLML6V2Q)),
+        ("bge-base", Some(crate::embed::ModelType::BGEBaseENV15)),
+        // An unknown recorded name must not be silently coerced to the default:
+        // callers fall back explicitly, and the resolver reports "no answer".
+        ("not-a-real-model", None),
+    ];
+
+    for (model_short_name, expected) in cases {
+        let (_tmp, repo_path, state) = state_with_repo("repo");
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            format!(r#"{{"model_short_name":"{model_short_name}","dimensions":768}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.model_for_alias("repo"),
+            expected,
+            "metadata model_short_name '{model_short_name}' must drive the query model"
+        );
+    }
+}
+
+/// Missing metadata (unindexed / legacy index) yields `None`, so the caller's
+/// documented fallback to the default applies — and an unknown alias cannot
+/// borrow another repo's model.
+#[test]
+fn model_for_alias_is_none_without_index_metadata() {
+    let (_tmp, _repo_path, state) = state_with_repo("repo");
+    assert_eq!(state.model_for_alias("repo"), None);
+    assert_eq!(state.model_for_alias("not-registered"), None);
+}
+
+/// A single hub can hold indexes built with different models: each alias
+/// resolves independently, so a group fan-out embeds each store's query with
+/// that store's own model.
+#[test]
+fn model_for_alias_is_per_repo_not_hub_wide() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let mut config = ReposConfig::default();
+    for (alias, model) in [("legacy", "minilm-l6-q"), ("rebuilt", "embeddinggemma-q4")] {
+        let repo_path = tmp.path().join(alias);
+        std::fs::create_dir(&repo_path).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some(alias.to_string()))
+            .unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            format!(r#"{{"model_short_name":"{model}"}}"#),
+        )
+        .unwrap();
+    }
+    config.save_to(&config_file).unwrap();
+    let state = ServeState::new(config, Some(config_file));
+
+    assert_eq!(
+        state.model_for_alias("legacy"),
+        Some(crate::embed::ModelType::AllMiniLML6V2Q)
+    );
+    assert_eq!(
+        state.model_for_alias("rebuilt"),
+        Some(crate::embed::ModelType::EmbeddingGemma300MQ4)
+    );
+}
+
+/// The serve MCP service resolves the query model through the routed repo, not
+/// its own (default) field. This is the exact seam the hub got wrong: it is the
+/// service, not `ServeState`, that hands the model to the embedder.
+#[test]
+fn serve_service_uses_repo_model_not_default() {
+    let (_tmp, repo_path, state) = state_with_repo("gemma-repo");
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"model_short_name":"embeddinggemma-q4","dimensions":768}"#,
+    )
+    .unwrap();
+
+    let svc = crate::mcp::CodesearchService::new_for_serve(std::sync::Arc::new(state)).unwrap();
+
+    assert_eq!(
+        svc.query_model(Some("gemma-repo")),
+        crate::embed::ModelType::EmbeddingGemma300MQ4,
+        "serve must embed a repo's queries with the model that repo was indexed with"
+    );
+    // No alias (unscoped) or an unknown alias falls back to the service default.
+    assert_eq!(svc.query_model(None), crate::embed::ModelType::default());
+    assert_eq!(
+        svc.query_model(Some("not-registered")),
+        crate::embed::ModelType::default()
+    );
+}
+
+/// The grouped `status` model label must reflect the members' recorded models,
+/// not the service default: a same-model group names that model, a mixed-model
+/// hub says `mixed`. Regression guard for the status field reporting the
+/// hardcoded default (`minilm-l6-q`) for every repo.
+#[test]
+fn group_status_model_label_is_common_or_mixed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let mut config = ReposConfig::default();
+    for (alias, model) in [("legacy", "minilm-l6-q"), ("rebuilt", "embeddinggemma-q4")] {
+        let repo_path = tmp.path().join(alias);
+        std::fs::create_dir(&repo_path).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some(alias.to_string()))
+            .unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            format!(r#"{{"model_short_name":"{model}"}}"#),
+        )
+        .unwrap();
+    }
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    assert_eq!(
+        svc.group_model_label(&["legacy".to_string(), "rebuilt".to_string()]),
+        "mixed",
+        "a hub holding indexes built with different models must report 'mixed'"
+    );
+    assert_eq!(
+        svc.group_model_label(&["rebuilt".to_string()]),
+        "embeddinggemma-q4",
+        "a single-model group must name its base model"
+    );
+}
+
+/// A fresh repo added with a model override must open its store at that model's
+/// dimension, not the 384-dim default. Regression guard for `POST /repos` with
+/// `model=embeddinggemma-q4`: the store used to be created at 384 and the
+/// override applied only to metadata, so the reindex embedded 768-dim vectors
+/// into a 384-dim store and indexed nothing.
+#[tokio::test]
+async fn try_open_stores_honours_dimension_override_for_a_fresh_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("gemmarepo");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+    assert!(!db_path.exists(), "precondition: db dir must not exist yet");
+
+    let state = state_with_config(ReposConfig::default());
+
+    let stores = match state.try_open_stores("gemmarepo", &db_path, true, false, Some(768)) {
+        Ok(OpenedStores::Write(s)) => s,
+        Ok(OpenedStores::Readonly(_)) => panic!("expected Write, got Readonly"),
+        Err(e) => panic!("fresh open with a dimension override must succeed, got: {e}"),
+    };
+
+    let dims = stores
+        .vector_store
+        .read()
+        .await
+        .stats()
+        .expect("stats on a freshly created store")
+        .dimensions;
+    assert_eq!(
+        dims, 768,
+        "a repo added with --model embeddinggemma-q4 must open at 768 dims, not the 384 default"
     );
 }

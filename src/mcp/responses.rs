@@ -181,6 +181,7 @@ pub(crate) fn index_status_summary(
     total_repos: usize,
     failed_count: usize,
     total_chunks: usize,
+    all_indexed: bool,
 ) -> (String, String) {
     if total_repos > 0 && failed_count >= total_repos {
         (
@@ -196,6 +197,17 @@ pub(crate) fn index_status_summary(
                 "Index is being built across {total_repos} repo(s). Searches may fail until indexing completes."
             ),
         )
+    } else if !all_indexed {
+        // Chunks are in the stores but the HNSW vector index is not built yet
+        // (`VectorStore::search` refuses without it). Reporting "ready" here —
+        // the old behaviour, which keyed only off `total_chunks` — told an
+        // operator a rebuild was finished while every search still failed.
+        (
+            "building".to_string(),
+            format!(
+                "Chunks are indexed across {total_repos} repo(s) but the vector index is not built yet — searches may fail until indexing completes."
+            ),
+        )
     } else if failed_count > 0 {
         (
             "ready".to_string(),
@@ -208,6 +220,32 @@ pub(crate) fn index_status_summary(
         (
             "ready".to_string(),
             format!("Index is ready for searching across {total_repos} repo(s)."),
+        )
+    }
+}
+
+/// Status/message for a single routed store's index.
+///
+/// `indexed` (the HNSW graph is built and committed) is load-bearing: a store
+/// with chunks but no built graph is NOT searchable — `VectorStore::search`
+/// fails with "Index not built" — so it must not read as `ready`. During a
+/// rebuild there is a window where chunks are inserted but `build_index()` has
+/// not run yet, which is exactly when an operator asks "is the migration done?".
+pub(crate) fn single_index_status(total_chunks: usize, indexed: bool) -> (String, String) {
+    if total_chunks == 0 {
+        (
+            "building".to_string(),
+            "Index is being built in the background. Searches may fail until indexing completes. Please check back in a few minutes.".to_string(),
+        )
+    } else if !indexed {
+        (
+            "building".to_string(),
+            "Chunks are indexed but the vector index is not built yet — searches may fail until indexing completes. Please check back in a few minutes.".to_string(),
+        )
+    } else {
+        (
+            "ready".to_string(),
+            "Index is ready for searching.".to_string(),
         )
     }
 }

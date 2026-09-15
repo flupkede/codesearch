@@ -47,6 +47,58 @@ pub(crate) fn ensure_hnsw_index_if_needed(
     }
 }
 
+/// Dimensions recorded in an index's `metadata.json` (fallback: the default).
+///
+/// The vector store MUST be opened with the dimensions the index was built
+/// with. `codesearch stats` / `get_db_stats` used to pass a hardcoded 384, so
+/// they reported `Dimensions: 384` for every index — including 768-dim
+/// EmbeddingGemma ones — and opened those stores with the wrong dimension.
+fn recorded_dimensions(db_path: &Path) -> usize {
+    let from_metadata = std::fs::read_to_string(db_path.join("metadata.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|j| j.get("dimensions").and_then(|v| v.as_u64()))
+        .map(|d| d as usize);
+    from_metadata
+        .or_else(|| ModelType::from_index_metadata(db_path).map(|m| m.dimensions()))
+        .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS)
+}
+
+/// Resolve the embedding model for an indexing run.
+///
+/// On an existing index the model recorded in `metadata.json` wins: embedding
+/// with any other model (including the hardcoded default) either fails with a
+/// dimension mismatch or silently mixes vector spaces. An explicit `--model`
+/// that disagrees with the recorded model is rejected — the index must be
+/// rebuilt with `--force` to change models.
+///
+/// This mirrors `IndexManager::resolve_embed_model`, which the serve and
+/// watcher paths already use; the CLI `index` path used `model.unwrap_or_default()`
+/// and therefore downgraded any non-default index to 384-dim MiniLM.
+fn resolve_index_model(
+    db_path: &Path,
+    force: bool,
+    requested: Option<ModelType>,
+) -> Result<ModelType> {
+    // `--force` deletes the database (see `get_db_path_smart`), so there is no
+    // recorded model to honour; a non-existent/legacy index has none either.
+    if force || !db_path.join("metadata.json").exists() {
+        return Ok(requested.unwrap_or_default());
+    }
+    let (recorded, _dims) = IndexManager::resolve_embed_model(db_path)?;
+    match requested {
+        Some(req) if req != recorded => Err(anyhow::anyhow!(
+            "Model mismatch: {} was indexed with '{}', but --model '{}' was requested.\n\
+             To change models, rebuild the index: codesearch --model {} index <path> --force",
+            db_path.display(),
+            recorded.short_name(),
+            req.short_name(),
+            req.short_name()
+        )),
+        _ => Ok(recorded),
+    }
+}
+
 /// Update metadata.json with current chunk/file counts so that `status(projects)`
 /// can report accurate numbers without opening LMDB.
 /// Uses atomic read-modify-write (temp+rename) so a crash never leaves an empty file.
@@ -549,7 +601,11 @@ async fn index_with_options(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let (db_path, project_path) = get_db_path_smart(path, global, force)?;
-    let model_type = model.unwrap_or_default();
+    // Resolve the embedding model BEFORE touching the index: on an existing
+    // index the model recorded in metadata.json wins, and an explicit `--model`
+    // that disagrees is rejected (rebuild with --force). Defaulting here would
+    // embed 384-dim MiniLM vectors into a 768-dim index. See `resolve_index_model`.
+    let model_type = resolve_index_model(&db_path, force, model)?;
 
     // Macro to conditionally print
     macro_rules! log_print {
@@ -714,7 +770,7 @@ async fn index_with_options(
         if total_chunks_to_delete > 0 {
             log_print!("\n🔄 Deleting {} old chunks...", total_chunks_to_delete);
 
-            let mut store = VectorStore::new(&db_path, 384)?; // Will load dimensions from DB
+            let mut store = VectorStore::new(&db_path, model_type.dimensions())?;
             let mut fts_store = FtsStore::new_with_writer(&db_path)?;
 
             // Delete deleted files' metadata and chunks
@@ -1292,7 +1348,7 @@ pub async fn stats(path: Option<PathBuf>) -> Result<()> {
     println!("💾 Database: {}", db_path.display());
     println!("📂 Project: {}", project_path.display());
 
-    let store = VectorStore::new(&db_path, 384)?; // We'll need to store dimensions in metadata
+    let store = VectorStore::new(&db_path, recorded_dimensions(&db_path))?;
     let stats = store.stats()?;
 
     println!("\n{}", "Vector Store:".bright_green());
@@ -1367,7 +1423,7 @@ fn print_repo_stats(repo_path: &Path, db_path: &Path) -> Result<()> {
     println!("   📂 {}", repo_path.display());
 
     // Try to load stats
-    match VectorStore::new(db_path, 384) {
+    match VectorStore::new(db_path, recorded_dimensions(db_path)) {
         Ok(store) => match store.stats() {
             Ok(stats) => {
                 println!(
@@ -1813,7 +1869,7 @@ async fn get_db_stats(db_path: &Path) -> Result<DbStats> {
     }
 
     // Try to get stats from vector store
-    let store = VectorStore::new(db_path, 384)?;
+    let store = VectorStore::new(db_path, recorded_dimensions(db_path))?;
     let stats = store.stats()?;
 
     // Calculate database size
@@ -3273,5 +3329,114 @@ mod remove_order_tests {
             "the slow-but-successful outcome must be carried"
         );
         assert_global_config_unchanged(_canary);
+    }
+}
+
+/// Model resolution for the CLI `index` path: the model recorded in the index's
+/// `metadata.json` must win, so re-indexing a non-default index (e.g. rebuilt
+/// with EmbeddingGemma) does not silently downgrade it to 384-dim MiniLM.
+///
+/// Regression guard for `index_with_options` using `model.unwrap_or_default()`:
+/// with the defect reintroduced, `resolve_index_model` returns the default for
+/// the gemma case below and the test fails.
+#[cfg(test)]
+mod index_model_resolution_tests {
+    use super::*;
+
+    /// Write an index metadata.json recording `model` (as the indexer does).
+    fn write_metadata(db_path: &Path, model: ModelType) {
+        std::fs::create_dir_all(db_path).unwrap();
+        let mut obj = serde_json::Map::new();
+        model.write_metadata_fields(&mut obj);
+        std::fs::write(
+            db_path.join("metadata.json"),
+            serde_json::to_string(&obj).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recorded_dimensions_reads_metadata_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+        assert_eq!(recorded_dimensions(&db), 768);
+    }
+
+    #[test]
+    fn recorded_dimensions_falls_back_to_model_then_default() {
+        // Dimensions key absent, model known -> model's dimensions.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(
+            db.join("metadata.json"),
+            r#"{"model_short_name":"embeddinggemma-q4"}"#,
+        )
+        .unwrap();
+        assert_eq!(recorded_dimensions(&db), 768);
+
+        // No metadata at all -> default.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            recorded_dimensions(&dir.path().join(".codesearch.db")),
+            crate::constants::DEFAULT_EMBEDDING_DIMENSIONS
+        );
+    }
+
+    #[test]
+    fn resolve_index_model_prefers_recorded_model_on_existing_index() {
+        // The defect: a bare `codesearch index` on a gemma index picked the
+        // default (384-dim MiniLM). The recorded model must win.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+
+        assert_eq!(
+            resolve_index_model(&db, false, None).unwrap(),
+            ModelType::EmbeddingGemma300MQ4,
+            "an existing index's recorded model must be used, not the default"
+        );
+        // An explicit --model that agrees is accepted.
+        assert_eq!(
+            resolve_index_model(&db, false, Some(ModelType::EmbeddingGemma300MQ4)).unwrap(),
+            ModelType::EmbeddingGemma300MQ4
+        );
+    }
+
+    #[test]
+    fn resolve_index_model_rejects_disagreeing_override_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db");
+        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+
+        let err = resolve_index_model(&db, false, Some(ModelType::AllMiniLML6V2Q))
+            .expect_err("a --model that disagrees with the index must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Model mismatch") && msg.contains("embeddinggemma-q4"),
+            "error must name the recorded model and the mismatch, got: {msg}"
+        );
+
+        // --force deletes the DB, so the requested model is honoured.
+        assert_eq!(
+            resolve_index_model(&db, true, Some(ModelType::AllMiniLML6V2Q)).unwrap(),
+            ModelType::AllMiniLML6V2Q
+        );
+    }
+
+    #[test]
+    fn resolve_index_model_uses_requested_model_for_a_fresh_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".codesearch.db"); // does not exist
+
+        assert_eq!(
+            resolve_index_model(&db, false, Some(ModelType::EmbeddingGemma300MQ4)).unwrap(),
+            ModelType::EmbeddingGemma300MQ4
+        );
+        assert_eq!(
+            resolve_index_model(&db, false, None).unwrap(),
+            ModelType::default()
+        );
     }
 }
