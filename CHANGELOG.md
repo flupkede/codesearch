@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.3.23]
+
+### Security
+
+- **Dependency refresh: h2, rustls, quinn-proto, zerovec-derive, moka.** A semver-safe `cargo update` lifts 126 packages within their existing requirements, clearing five open advisories without code changes: h2 0.4.15→0.4.19 (Aikido 41883526), rustls 0.23.42→0.23.45 (RUSTSEC-2026-0285), quinn-proto 0.11.16→0.11.18 (Aikido 41883527), zerovec-derive 0.11.3→0.11.6 (Aikido 41883531) and moka 0.12.15→0.12.16 (Aikido 41297220). fastembed/ort are deliberately kept at 5.17.3/rc.12 — 5.17.4 hard-requires the unstable ort rc.13 API break, which moves in its own PR.
+
 ## [1.3.19]
 
 ### Changed
