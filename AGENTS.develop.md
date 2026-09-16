@@ -235,14 +235,14 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|---|
-| `chore/claude-hook-glob-and-docs` | make Claude Code hook promises match what is enforced |
-| `feat/web-guard-topic-scoped` | scope web-guard to the mounted products only |
-| `fix/web-guard-ps1-topic-scoping` | topic-scope `web-guard.ps1`, per-mount retry cache |
+| *(none)* | |
 
 ---
 
 ## Changelog highlights (recent)
 
+- **v1.3.37** — per-index embedding models end-to-end: serve queries, `POST /repos` and CLI index/stats/status honour the model each index records in its `metadata.json`; `serve --model` sets the default for newly created indexes; unrecorded indexes are queried with the built-in model plus a caller-facing warning; mid-rebuild indexes no longer report ready (PR #248)
+- **v1.3.23–v1.3.36** — dependency + platform wave: rmcp 3.3, fastembed 6.1 + ort rc.13, tantivy 0.26, axum 0.8, ratatui 0.30 + crossterm 0.29, thiserror 2, notify 8, tree-sitter 0.27, dirs/sha2/scip/sysinfo refresh + dependabot (weekly); clears the open Aikido/RUSTSEC advisories
 - **v1.3.19** — `find_impact` ambiguity envelope + `resolved_symbol`; partial-results `warnings`; C# symbol-key uniqueness (index v2.0)
 - **v1.3.16** — REST `/find-impact` endpoint
 - **v1.3.3** — federation hardening release
