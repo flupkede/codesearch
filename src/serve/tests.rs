@@ -2835,3 +2835,50 @@ async fn try_open_stores_honours_dimension_override_for_a_fresh_repo() {
         "a repo added with --model embeddinggemma-q4 must open at 768 dims, not the 384 default"
     );
 }
+
+#[test]
+fn is_lmdb_format_corruption_matches_known_lmdb_errors() {
+    let cases = [
+        (
+            "MDB_BAD_VALSIZE: Unsupported size of key/DB name/data, or wrong DUPFIXED size",
+            true,
+        ),
+        ("Symbol rebuild failed: heed -> MDB_BAD_VALSIZE", true),
+        ("storage error: wrong DUPFIXED size", true),
+        ("Unsupported size of key while opening vectordb", true),
+        ("scip-csharp failed with exit code 1", false),
+        ("MDB_NOTFOUND: No matching key/data pair found", false),
+        ("Task panicked: workspace load failed", false),
+        ("", false),
+    ];
+    for (msg, expected) in cases {
+        assert_eq!(
+            ServeState::is_lmdb_format_corruption(msg),
+            expected,
+            "unexpected classification for {msg:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn enqueue_format_recovery_dedupes_and_starts_single_worker() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    // Same alias three times must collapse to one queued entry. The recovery
+    // worker is spawned but (current-thread test runtime) does not execute
+    // until an await point, so the queue content is asserted deterministically.
+    state.enqueue_format_recovery("ghost-repo");
+    state.enqueue_format_recovery("ghost-repo");
+    state.enqueue_format_recovery("ghost-repo");
+    let len = state
+        .format_recovery_queue
+        .lock()
+        .expect("queue lock")
+        .len();
+    assert_eq!(len, 1, "duplicate enqueues must collapse to one entry");
+    assert!(
+        state
+            .format_recovery_worker_started
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the first enqueue must start the recovery worker"
+    );
+}

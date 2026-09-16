@@ -1060,7 +1060,7 @@ fn with_remote_stats(overlay: OverlayState, stats: RemoteStatsState) -> OverlayS
 /// Outcome of a TUI force-reindex launch — used to drive immediate footer
 /// feedback. Only describes whether the background task *started*; the actual
 /// indexing result is reported later via the status column / logs.
-enum ReindexLaunch {
+pub(crate) enum ReindexLaunch {
     /// Background reindex task spawned successfully.
     Started,
     /// A reindex was already running for this alias — request ignored.
@@ -1071,7 +1071,7 @@ enum ReindexLaunch {
 
 /// Spawn a background force reindex task for the given repo alias.
 /// Follows the same flow as the HTTP `reindex_handler`.
-fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
+pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
     // Guard against concurrent reindex
     if !state.begin_indexing(&alias) {
         tracing::warn!(

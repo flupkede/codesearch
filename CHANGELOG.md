@@ -44,6 +44,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Small majors batch: dirs 7, sha2 0.11, scip 0.10, sysinfo 0.39; dead `tower`/`tower-http` direct deps removed.** dirs/scip/sysinfo were drop-in. sha2 0.11's digest arrays no longer implement `LowerHex`, so the two hash-to-hex sites (`file_meta.rs`, `chunker/mod.rs`) hex-encode the digest bytes explicitly — output unchanged. `tower` and `tower-http` were declared as direct dependencies but never imported anywhere (CORS/trace middleware never wired in); removing them shrinks the direct dependency surface (both remain in the lock transitively via axum/reqwest/hf-hub, which is upstream's business).
 
+### Fixed
+
+- **Serve auto-recovers LMDB storage-format corruption with a sequential wipe + rebuild.** After the arroy 0.5→0.8 / heed 0.20→0.22 major upgrades, every repo whose on-disk database was written by the previous binary failed its symbol rebuild with `MDB_BAD_VALSIZE: Unsupported size of key/DB name/data, or wrong DUPFIXED size` (observed on all C# repos after deploy). When a symbol rebuild now fails with that error class, serve wipes the repo's DB directory — closing the LMDB envs first via the same eviction sequence `remove_repo` uses, with the same bounded retry for transient Windows lock holders — and force-reindexes it through the existing force-reindex machinery, whose store-open path recreates everything on the new formats. Recoveries are queued and processed strictly **one repo at a time**: each rebuild runs a full CPU-bound embed pass, so parallel recoveries would thrash the machine. Read-only repos are skipped with a pointer to the owning writer. This closes the gap the tantivy FTS graceful reset (above) already covered on the FTS side — the vector/symbol stores now self-heal the same upgrade boundary instead of staying red until an operator force-reindexes by hand.
+
 ## [1.3.19]
 
 ### Changed

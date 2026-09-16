@@ -230,6 +230,18 @@ pub(crate) struct ServeState {
     /// drop first. The token is stored alongside the handle so `remove_repo`
     /// can cancel regardless of the repo's `RepoState` variant.
     index_tasks: DashMap<String, (tokio::task::JoinHandle<()>, CancellationToken)>,
+    /// Aliases detected with LMDB storage-format corruption (e.g.
+    /// `MDB_BAD_VALSIZE` after a storage-layer major upgrade such as
+    /// arroy 0.5→0.8 / heed 0.20→0.22), queued for a wipe + full force
+    /// reindex. Processed strictly one at a time by the recovery worker —
+    /// each rebuild runs a full CPU-bound embed pass, so parallel
+    /// recoveries would thrash the machine. See
+    /// [`Self::enqueue_format_recovery`] / [`Self::recover_repo_format`].
+    format_recovery_queue: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// Guarantees at most one recovery worker is alive. A worker that finds
+    /// the queue empty flips this back to `false` under the queue lock, so an
+    /// enqueue racing the worker's exit re-spawns cleanly (no lost wake-up).
+    format_recovery_worker_started: std::sync::atomic::AtomicBool,
     /// Loaded repos config (alias → path).
     config: std::sync::RwLock<ReposConfig>,
     /// Last observed mtime of the repos config file.
@@ -364,6 +376,8 @@ impl ServeState {
             open_locks: DashMap::new(),
             fsw_tasks: DashMap::new(),
             index_tasks: DashMap::new(),
+            format_recovery_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            format_recovery_worker_started: std::sync::atomic::AtomicBool::new(false),
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
@@ -611,6 +625,182 @@ impl ServeState {
     /// indexing task finishes (success, error, or panic).
     fn end_indexing(&self, alias: &str) {
         self.active_reindexes.remove(alias);
+    }
+
+    /// True iff an error chain indicates LMDB storage-format corruption —
+    /// data written by an older storage-major (arroy/heed) that the current
+    /// one refuses to read — rather than a transient or unrelated failure.
+    fn is_lmdb_format_corruption(msg: &str) -> bool {
+        let m = msg.to_ascii_lowercase();
+        m.contains("mdb_bad_valsize")
+            || m.contains("unsupported size of key")
+            || m.contains("wrong dupfixed size")
+    }
+
+    /// Queue `alias` for a sequential wipe + force reindex after LMDB format
+    /// corruption was detected. Deduplicates; spawns the single recovery
+    /// worker on the first enqueue.
+    fn enqueue_format_recovery(self: &Arc<Self>, alias: &str) {
+        {
+            let mut queue = self
+                .format_recovery_queue
+                .lock()
+                .expect("format_recovery_queue lock poisoned");
+            if queue.iter().any(|a| a == alias) {
+                return;
+            }
+            queue.push_back(alias.to_string());
+        }
+        // Swap AFTER the push so the worker-exit path (which flips the flag
+        // back to `false` while still holding the queue lock) can never race
+        // us into a lost wake-up: either we observe `true` and the live
+        // worker picks up the fresh entry, or we flip `false→true` and spawn.
+        if !self
+            .format_recovery_worker_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let state = Arc::clone(self);
+            tokio::spawn(state.format_recovery_worker());
+        }
+    }
+
+    /// Pops queued aliases and recovers them ONE AT A TIME until the queue
+    /// runs dry, then exits (a later enqueue restarts a worker).
+    async fn format_recovery_worker(self: Arc<Self>) {
+        loop {
+            let alias = {
+                let mut queue = self
+                    .format_recovery_queue
+                    .lock()
+                    .expect("format_recovery_queue lock poisoned");
+                match queue.pop_front() {
+                    Some(a) => a,
+                    None => {
+                        // Flip the flag while still holding the queue lock so
+                        // a concurrent enqueue cannot interleave between the
+                        // empty pop and the flag reset (lost wake-up).
+                        self.format_recovery_worker_started
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
+                }
+            };
+            if let Err(e) = self.recover_repo_format(&alias).await {
+                tracing::error!("🔧 Format recovery failed for '{}': {}", alias, e);
+            }
+        }
+    }
+
+    /// Wipe + force reindex one repo whose on-disk storage was written by an
+    /// older storage-major. Mirrors `remove_repo`'s eviction sequence (stop
+    /// FSW → evict → await watcher/index shutdowns) but keeps the alias
+    /// registered; then deletes the DB directory (bounded retry for transient
+    /// Windows lock holders) and reuses the TUI force-reindex machinery — its
+    /// `try_open_stores` path recreates fresh stores when the directory is
+    /// gone, so the rebuild lands on the new arroy/heed formats.
+    async fn recover_repo_format(self: &Arc<Self>, alias: &str) -> Result<(), String> {
+        let project_path = {
+            let config = self
+                .config
+                .read()
+                .map_err(|_| "config lock poisoned".to_string())?;
+            if config.repo_read_only.get(alias) == Some(&true) {
+                return Err(format!(
+                    "'{}' is marked read-only; rebuild its index on the owning writer",
+                    alias
+                ));
+            }
+            config
+                .resolve(alias)
+                .ok_or_else(|| format!("unknown alias '{}'", alias))?
+        };
+        let db_path = project_path.join(DB_DIR_NAME);
+
+        // Evict in-memory holders so the LMDB env closes before the delete
+        // (Windows refuses to delete mmap'd files). Same order as remove_repo.
+        {
+            let _stores = self.stop_fsw(alias);
+        }
+        self.repos.remove(alias);
+        self.last_access.remove(alias);
+        self.await_fsw_shutdown(alias).await;
+        self.await_index_task(alias).await;
+
+        let deadline =
+            Instant::now() + Duration::from_secs(crate::constants::DB_DELETE_RETRY_BUDGET_SECS);
+        let mut backoff_ms = crate::constants::DB_DELETE_RETRY_INITIAL_MS;
+        loop {
+            match std::fs::remove_dir_all(&db_path) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound || !db_path.exists() => break,
+                Err(e) if Self::is_db_locked_error(&e) && Instant::now() < deadline => {
+                    tracing::debug!(
+                        "Format recovery: DB dir for '{}' still locked, retrying: {}",
+                        alias,
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(2_000);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "could not wipe {} after corruption: {}",
+                        db_path.display(),
+                        e
+                    ))
+                }
+            }
+        }
+        tracing::info!(
+            "🔧 Format recovery: wiped stale-format DB dir for '{}' — rebuilding",
+            alias
+        );
+
+        match tui::spawn_force_reindex(alias.to_string(), self) {
+            tui::ReindexLaunch::Started => {
+                // Sequential guarantee: wait until this alias stops indexing
+                // before the worker loop picks the next one. Poll — the
+                // active-reindexes entry can go stale (MAX_INDEXING_SECS) on
+                // very long rebuilds, so cap generously and surface a timeout
+                // rather than hanging the whole recovery queue.
+                let cap = self.indexing_timeout() * 8;
+                let started = Instant::now();
+                while self.is_indexing(alias) {
+                    if started.elapsed() >= cap {
+                        return Err(format!(
+                            "rebuild for '{}' exceeded the {}s recovery cap",
+                            alias,
+                            cap.as_secs()
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                tracing::info!("🔧 Format recovery: rebuild complete for '{}'", alias);
+                Ok(())
+            }
+            tui::ReindexLaunch::AlreadyRunning => {
+                // A rebuild is already in flight for this alias; wait it out.
+                // If it was a plain rebuild it may fail on the corrupt dir
+                // again — the next rebuild trigger re-detects and re-queues.
+                let cap = self.indexing_timeout() * 8;
+                let started = Instant::now();
+                while self.is_indexing(alias) {
+                    if started.elapsed() >= cap {
+                        return Err(format!(
+                            "in-flight rebuild for '{}' exceeded the {}s recovery cap",
+                            alias,
+                            cap.as_secs()
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Ok(())
+            }
+            tui::ReindexLaunch::Failed => Err(format!(
+                "could not start the recovery rebuild for '{}' (see log)",
+                alias
+            )),
+        }
     }
 
     /// Returns `true` if `alias` is currently (non-stale) indexing.
@@ -3670,14 +3860,29 @@ async fn trigger_symbol_rebuild(
             state.schedule_persist_repos_config();
         }
         Ok(Err(e)) => {
-            tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, e);
+            let msg = e.to_string();
             state.end_indexing(&alias_owned);
             state
                 .csharp_index_error
-                .insert(alias_owned.clone(), e.to_string());
-            state
-                .csharp_index_status
-                .insert(alias_owned, CSharpIndexStatus::Error);
+                .insert(alias_owned.clone(), msg.clone());
+            if ServeState::is_lmdb_format_corruption(&msg) {
+                tracing::warn!(
+                    "⚠️ LMDB storage-format corruption for '{}' (data written by an older \
+                     storage-major) — queueing sequential wipe + full rebuild",
+                    alias_owned
+                );
+                // Recovery owns the outcome from here: show in-progress rather
+                // than Error; it flips to Ready on success or Error on failure.
+                state
+                    .csharp_index_status
+                    .insert(alias_owned.clone(), CSharpIndexStatus::Indexing);
+                state.enqueue_format_recovery(&alias_owned);
+            } else {
+                tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
+                state
+                    .csharp_index_status
+                    .insert(alias_owned, CSharpIndexStatus::Error);
+            }
         }
         Err(e) => {
             tracing::error!(
