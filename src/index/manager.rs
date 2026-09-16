@@ -504,7 +504,7 @@ impl IndexManager {
     ///
     /// Fails fast if metadata is missing, names an unknown model, or records a
     /// dimension count that disagrees with the resolved model.
-    fn resolve_embed_model(db_path: &Path) -> Result<(ModelType, usize)> {
+    pub(crate) fn resolve_embed_model(db_path: &Path) -> Result<(ModelType, usize)> {
         let metadata_path = db_path.join("metadata.json");
         if !metadata_path.exists() {
             return Err(anyhow::anyhow!(
