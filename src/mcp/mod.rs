@@ -28,7 +28,7 @@ fn serve_url_from_env() -> String {
 }
 
 use crate::db_discovery::{find_best_database, load_repos_config};
-use crate::embed::{EmbeddingService, ModelType};
+use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::file::Language;
 use crate::fts::FtsStore;
 use crate::index::SharedStores;
@@ -41,7 +41,7 @@ use regex::Regex;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
     tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
 use std::collections::HashSet;
@@ -148,8 +148,10 @@ pub struct CodesearchService {
     project_path: PathBuf,
     model_type: ModelType,
     dimensions: usize,
-    // Lazily initialized on first search
-    embedding_service: Arc<Mutex<Option<EmbeddingService>>>,
+    // Lazily initialized on first search. A per-model pool: serve mode is
+    // multi-repo and each index records the model it was built with, so the
+    // query model is resolved per target repo (see `query_model`).
+    embedding_pool: Arc<EmbeddingServicePool>,
     // Shared stores for concurrent access (optional - only set when running with IndexManager)
     shared_stores: Option<Arc<SharedStores>>,
     // Serve-mode state (set when running inside `codesearch serve`)
@@ -192,6 +194,18 @@ impl Drop for CodesearchService {
             }
         }
     }
+}
+
+/// Outcome of resolving the embedding model for a query target.
+///
+/// See [`CodesearchService::resolve_query_model`].
+pub(crate) struct QueryModel {
+    /// The model the query must be embedded with.
+    pub model: ModelType,
+    /// A caller-facing warning, set when the target index records no model and
+    /// the built-in default was assumed. `None` when the model was recorded or
+    /// the query is scope-free.
+    pub assumed_warning: Option<String>,
 }
 
 // v1: supports prefix/suffix patterns with `*` and `**` only.
@@ -828,7 +842,7 @@ pub(crate) fn allow_vector_store_second_open(has_shared_stores: bool) -> bool {
 
 // === Tool Router Implementation ===
 
-#[tool_router]
+#[tool_router(allow_empty)] // ctors only; real tools merge in via merged_tool_router()
 impl CodesearchService {
     /// Create a new CodesearchService (standalone mode - opens its own VectorStore)
     #[allow(dead_code)] // Reserved for standalone MCP server mode
@@ -884,7 +898,9 @@ impl CodesearchService {
             project_path,
             model_type,
             dimensions,
-            embedding_service: Arc::new(Mutex::new(None)),
+            embedding_pool: Arc::new(EmbeddingServicePool::new(
+                crate::constants::get_global_models_cache_dir().ok(),
+            )),
             shared_stores,
             serve_state: None,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
@@ -898,13 +914,19 @@ impl CodesearchService {
     /// it routes requests to the repo identified by `project`/`group`.
     pub(crate) fn new_for_serve(serve_state: Arc<crate::serve::ServeState>) -> Result<Self> {
         let symbol_registry = serve_state.symbol_registry();
+        // Seed the service with the serve-wide default model (`serve --model`),
+        // the same value `POST /repos` stamps into a newly created index, so the
+        // scope-free status summary reports it. It is deliberately NOT the query
+        // fallback for a repo whose metadata records no model — that resolves to
+        // the built-in default, with a warning. See `resolve_query_model`.
+        let model_type = serve_state.default_model().unwrap_or_default();
         Ok(Self {
             tool_router: Self::merged_tool_router(),
             db_path: PathBuf::from("serve://multi-repo"),
             project_path: PathBuf::from("serve://multi-repo"),
-            model_type: ModelType::default(),
-            dimensions: crate::constants::DEFAULT_EMBEDDING_DIMENSIONS,
-            embedding_service: serve_state.embedding_service(),
+            model_type,
+            dimensions: model_type.dimensions(),
+            embedding_pool: serve_state.embedding_pool(),
             shared_stores: None,
             serve_state: Some(serve_state),
             symbol_registry,
@@ -923,17 +945,71 @@ impl CodesearchService {
         self.tracks_session = true;
     }
 
-    /// Get or initialize the embedding service
-    fn get_embedding_service(&self) -> Result<std::sync::MutexGuard<'_, Option<EmbeddingService>>> {
-        let mut guard = self.embedding_service.lock().unwrap();
-        if guard.is_none() {
-            let cache_dir = crate::constants::get_global_models_cache_dir()?;
-            *guard = Some(EmbeddingService::with_cache_dir(
-                self.model_type,
-                Some(&cache_dir),
-            )?);
+    /// Resolve the embedding model a query against `alias` must use.
+    ///
+    /// With a repo alias (`project=` / group member) the model is read from that
+    /// repo's index metadata — an index built with EmbeddingGemma must be
+    /// queried with EmbeddingGemma, not the 384-dim default. A repo whose
+    /// metadata records no model is queried with the built-in default, never the
+    /// serve-wide `--model` default (see [`Self::resolve_query_model`]). With no
+    /// alias this returns the service's own `model_type`: the local index
+    /// metadata in stdio mode, the serve default in serve mode (the scope-free
+    /// status summary). Prefer [`Self::resolve_query_model`] when the caller can
+    /// surface the unrecorded-model warning.
+    pub(crate) fn query_model(&self, alias: Option<&str>) -> ModelType {
+        self.resolve_query_model(alias).model
+    }
+
+    /// Resolve the query model together with a warning when it had to be assumed.
+    ///
+    /// The model a query is embedded with must match the model the target index
+    /// was built with. When `alias`'s metadata records no model the model is
+    /// unknowable, so this assumes the BUILT-IN default: that is both the
+    /// historical 384-dim behaviour and the value every other reader assumes for
+    /// metadata without a `model_short_name`. It deliberately does NOT assume the
+    /// serve-wide `--model` default: that flag selects the model for newly
+    /// created indexes, and using it here would break a working legacy repo the
+    /// moment an operator set it (a 384-dim index queried with a 768-dim model
+    /// fails, and a same-dimension model degrades rankings silently). The
+    /// returned warning names the repo, the assumption, and the re-index command.
+    pub(crate) fn resolve_query_model(&self, alias: Option<&str>) -> QueryModel {
+        if let (Some(state), Some(alias)) = (self.serve_state.as_ref(), alias) {
+            if let Some(model) = state.model_for_alias(alias) {
+                return QueryModel {
+                    model,
+                    assumed_warning: None,
+                };
+            }
+            let model = ModelType::default();
+            let warning = format!(
+                "repo '{alias}' records no embedding model; queried with the built-in default '{}' ({} dims). If this repo was indexed with a different model, re-index it: codesearch index --force --model <name>",
+                model.short_name(),
+                model.dimensions()
+            );
+            if state.mark_legacy_model_warned(alias) {
+                tracing::warn!("{}", warning);
+            }
+            return QueryModel {
+                model,
+                assumed_warning: Some(warning),
+            };
         }
-        Ok(guard)
+        QueryModel {
+            model: self.model_type,
+            assumed_warning: None,
+        }
+    }
+
+    /// Get (lazily initializing) the embedding service for `model`.
+    ///
+    /// The returned `Arc<Mutex<..>>` is per-model, so concurrent queries against
+    /// different models do not serialise on one global lock. Callers MUST pass
+    /// the model the target index was built with — see [`Self::query_model`].
+    pub(crate) fn embedding_service_for(
+        &self,
+        model: ModelType,
+    ) -> Result<Arc<Mutex<crate::embed::EmbeddingService>>> {
+        self.embedding_pool.get(model)
     }
 
     /// Return the current MCP mode as a string for diagnostics.
@@ -1247,8 +1323,11 @@ impl CodesearchService {
 
     /// Fan-out vector store read across multiple stores, merging results.
     ///
-    /// Runs `action` against each store and merges all results into a single vec,
-    /// deduplicating by (alias, chunk_id) (keeping highest score) and sorting by score descending.
+    /// Runs `action(alias, store)` against each store and merges all results into
+    /// a single vec, deduplicating by (alias, chunk_id) (keeping highest score)
+    /// and sorting by score descending. The `alias` is passed to the closure so
+    /// callers can select per-repo state — notably the query embedding for that
+    /// repo's own model (see `semantic_search_multi`).
     ///
     /// A per-store failure does NOT abort the fan-out — one broken repo should
     /// not blind a group query to the healthy ones — but it is reported back in
@@ -1261,7 +1340,7 @@ impl CodesearchService {
         aliases: &[String],
     ) -> Result<MultiReadOutcome<R>>
     where
-        F: FnMut(&VectorStore) -> anyhow::Result<Vec<R>>,
+        F: FnMut(&str, &VectorStore) -> anyhow::Result<Vec<R>>,
         R: Clone + HasChunkId + HasScore,
     {
         let mut failures: Vec<(String, String)> = Vec::new();
@@ -1272,7 +1351,7 @@ impl CodesearchService {
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
             let store = store_arc.vector_store.read().await;
-            match action(&store) {
+            match action(alias, &store) {
                 Ok(results) => {
                     for r in results {
                         let key = (alias.to_string(), r.chunk_id());
@@ -1494,7 +1573,7 @@ impl CodesearchService {
                     self.literal_search(Parameters(req)).await?
                 }
                 _ => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Unknown search mode '{}'. Use `semantic` or `literal`.",
                         mode
                     ))]));
@@ -1666,7 +1745,7 @@ impl CodesearchService {
         let (peer_name, remote_alias, chunk_id) = match parse_federated_chunk_ref(chunk_ref) {
             Some(parts) => parts,
             None => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Invalid chunk_ref '{}': expected '<peer>/<alias>:<chunk_id>'.",
                     chunk_ref
                 ))]));
@@ -1677,7 +1756,7 @@ impl CodesearchService {
             Some(p) => p.clone(),
             None => {
                 let known: Vec<String> = cfg.remotes.keys().cloned().collect();
-                return Ok(CallToolResult::success(vec![Content::text(format!(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Unknown remote peer '{}' in chunk_ref '{}'. Known remotes: {}",
                     peer_name,
                     chunk_ref,
@@ -1688,7 +1767,7 @@ impl CodesearchService {
         let client = match FederationClient::new() {
             Ok(c) => c,
             Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "federation disabled (http client error): {e}"
                 ))]));
             }
@@ -1703,11 +1782,11 @@ impl CodesearchService {
             .get_chunk(&peer, remote_alias, chunk_id, context_lines)
             .await
         {
-            Outcome::Ok(value) => Ok(CallToolResult::success(vec![Content::text(
+            Outcome::Ok(value) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 value.to_string(),
             )])),
             Outcome::Unreachable(reason) => {
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Could not fetch chunk from remote peer '{}': {}",
                     peer_name, reason
                 ))]))
@@ -1739,7 +1818,7 @@ impl CodesearchService {
             },
         };
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        CallToolResult::success(vec![Content::text(json)])
+        CallToolResult::success(vec![ContentBlock::text(json)])
     }
 }
 
@@ -1861,7 +1940,7 @@ type RestError = (StatusCode, AxumJson<serde_json::Value>);
 
 /// Unwrap a `CallToolResult` into the JSON a federation client wants.
 ///
-/// `CallToolResult` carries its payload as `Content::text(json_string)`. The
+/// `CallToolResult` carries its payload as `ContentBlock::text(json_string)`. The
 /// normal case for search/find/explore/get_chunk is a single text item whose
 /// value parses as JSON, so we parse it back and return the structured value
 /// (clients get clean objects instead of a JSON-in-string). When the tool set

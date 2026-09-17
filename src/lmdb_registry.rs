@@ -42,6 +42,11 @@ use crate::cache::safe_canonicalize;
 /// Because heed refuses to reopen the same path with different options, this
 /// must be applied at EVERY env-open site, not only the read-only one — a
 /// partial rollout would turn a working reopen into an intermittent failure.
+// heed 0.22 deprecates the NO_TLS flag in favour of the type-state
+// `EnvOpenOptions::read_txn_without_tls()`, but that changes `Env`'s generic
+// parameter across the whole registry and the txn Send semantics with it.
+// MDB_NOTLS itself is unchanged in LMDB — same flag, same behavior.
+#[allow(deprecated)]
 pub const BASE_ENV_FLAGS: heed::EnvFlags = heed::EnvFlags::NO_TLS;
 
 // ── Global registry ─────────────────────────────────────────────

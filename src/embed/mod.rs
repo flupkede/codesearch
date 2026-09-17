@@ -10,6 +10,7 @@ pub use cache::{
 pub use embedder::{FastEmbedder, ModelType};
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
 
@@ -298,6 +299,50 @@ impl Default for EmbeddingService {
     }
 }
 
+/// Lazily-created, per-model cache of [`EmbeddingService`]s.
+///
+/// Serve mode is multi-repo and different repos may be indexed with different
+/// embedding models (an older MiniLM index alongside a rebuilt EmbeddingGemma
+/// one), so a single shared service is wrong: the query must be embedded with
+/// the same model the target index was built with. The pool loads each model at
+/// most once per serve instance and reuses it across MCP sessions and REST
+/// handlers. Each model gets its own mutex, so queries against different models
+/// do not serialise on one global lock.
+#[derive(Default)]
+pub struct EmbeddingServicePool {
+    services: Mutex<HashMap<ModelType, Arc<Mutex<EmbeddingService>>>>,
+    cache_dir: Option<std::path::PathBuf>,
+}
+
+impl EmbeddingServicePool {
+    /// Create a pool. `cache_dir` overrides the ONNX model cache directory
+    /// (`None` = fastembed's configured cache, i.e. the global models dir).
+    pub fn new(cache_dir: Option<std::path::PathBuf>) -> Self {
+        Self {
+            services: Mutex::new(HashMap::new()),
+            cache_dir,
+        }
+    }
+
+    /// Return the service for `model`, loading its ONNX model on first use.
+    ///
+    /// The returned `Arc` is locked independently per model, so a caller can
+    /// hold it across an `embed_query` without blocking other models.
+    pub fn get(&self, model: ModelType) -> Result<Arc<Mutex<EmbeddingService>>> {
+        let mut guard = self
+            .services
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Embedding service pool mutex poisoned: {e}"))?;
+        if let Some(existing) = guard.get(&model) {
+            return Ok(existing.clone());
+        }
+        let service = EmbeddingService::with_cache_dir(model, self.cache_dir.as_deref())?;
+        let arc = Arc::new(Mutex::new(service));
+        guard.insert(model, arc.clone());
+        Ok(arc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +351,50 @@ mod tests {
     fn test_model_type_default() {
         let model = ModelType::default();
         assert_eq!(model.dimensions(), 384);
+    }
+
+    /// The index-metadata reader must invert `write_metadata_fields`, and must
+    /// report "no answer" (None) for unknown/missing names rather than silently
+    /// claiming the default — callers decide the fallback.
+    #[test]
+    fn test_model_type_round_trips_through_index_metadata() {
+        for model in [
+            ModelType::AllMiniLML6V2Q,
+            ModelType::EmbeddingGemma300MQ4,
+            ModelType::BGEBaseENV15,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut obj = serde_json::Map::new();
+            model.write_metadata_fields(&mut obj);
+            std::fs::write(
+                dir.path().join("metadata.json"),
+                serde_json::to_string(&obj).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                ModelType::from_index_metadata(dir.path()),
+                Some(model),
+                "reader must invert the writer for '{:?}'",
+                model
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            r#"{"model_short_name":"not-a-real-model"}"#,
+        )
+        .unwrap();
+        assert_eq!(ModelType::from_index_metadata(dir.path()), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("metadata.json"), "{}").unwrap();
+        assert_eq!(ModelType::from_index_metadata(dir.path()), None);
+
+        assert_eq!(
+            ModelType::from_index_metadata(std::path::Path::new("/nonexistent-db-dir")),
+            None
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! `mod.rs` (todo #105).
 
 use super::*;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 impl CodesearchService {
     pub(crate) async fn literal_search(
@@ -16,7 +16,7 @@ impl CodesearchService {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         let limit = request.limit.unwrap_or(20);
@@ -51,7 +51,7 @@ impl CodesearchService {
 
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
-                return Ok(CallToolResult::success(vec![Content::text(e)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(e)]));
             }
         }
 
@@ -194,7 +194,7 @@ impl CodesearchService {
                 {
                     Ok(items) => items,
                     Err(e) => {
-                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                             "Error scanning chunks: {e:#}"
                         ))]));
                     }
@@ -256,7 +256,7 @@ impl CodesearchService {
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                             "Error searching: {e:#}"
                         ))]));
                     }
@@ -405,7 +405,7 @@ impl CodesearchService {
                 {
                     Ok(items) => items,
                     Err(e) => {
-                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                             "Error resolving search results: {e:#}"
                         ))]));
                     }
@@ -494,6 +494,6 @@ impl CodesearchService {
             serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string())
         };
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
 }

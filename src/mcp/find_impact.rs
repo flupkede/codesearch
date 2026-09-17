@@ -3,7 +3,7 @@ use super::CodesearchService;
 use crate::symbols::SymbolReference;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router, ErrorData as McpError,
 };
 use std::path::{Path, PathBuf};
@@ -138,7 +138,7 @@ impl CodesearchService {
             .as_ref()
             .is_some_and(|s| !s.trim().is_empty());
         if !has_name && !has_position && !has_key {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "Must provide `symbol_name`, both `file` and `line`, or an exact `symbol_key`."
                     .to_string(),
             )]));
@@ -147,7 +147,7 @@ impl CodesearchService {
         // would let silent precedence decide the answer — the thing this
         // contract exists to remove. Reject instead.
         if has_key && (has_name || has_position) {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "`symbol_key` is mutually exclusive with `symbol_name` and `file`+`line`: pass only the explicit selection.".to_string(),
             )]));
         }
@@ -158,7 +158,7 @@ impl CodesearchService {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         // Determine project root and db_path for the symbol index
@@ -199,7 +199,7 @@ impl CodesearchService {
                 Some(i) => i,
                 None => {
                     let available = registry.available_languages();
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "No symbol indexer for language '{}'. Available languages: {:?}",
                         lang, available
                     ))]));
@@ -209,14 +209,14 @@ impl CodesearchService {
                 // No language given and none detectable from a file path.
                 let installed = registry.installed_languages();
                 if installed.is_empty() {
-                    return Ok(CallToolResult::success(vec![Content::text(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(
                         "No symbol indexers installed. Install the `scip-csharp` helper for C# support, or `scip-typescript` (via npx) for TypeScript support.".to_string(),
                     )]));
                 }
                 if installed.len() > 1 {
                     // Several helpers installed: answering from one silently is
                     // the same silent pick the ambiguity contract removes. Ask.
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Several symbol indexes are installed ({}). Pass `language` (e.g. \"csharp\") so the lookup cannot silently answer from the wrong one.",
                         installed.join(", ")
                     ))]));
@@ -244,7 +244,7 @@ impl CodesearchService {
                     crate::constants::SCIP_CSHARP_HELPER_ENV
                 ),
             };
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 serde_json::to_string(&error).unwrap_or_else(|_| error.error.clone()),
             )]));
         }
@@ -373,7 +373,7 @@ impl CodesearchService {
                 );
                 let json =
                     serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Ok(crate::symbols::KeyMatch::Ambiguous(candidates)) => {
                 let ambiguity = crate::symbols::SymbolAmbiguity {
@@ -384,7 +384,7 @@ impl CodesearchService {
                 };
                 let json = serde_json::to_string(&ambiguity)
                     .unwrap_or_else(|_| "{\"ambiguous\":true}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Ok(crate::symbols::KeyMatch::NotFound) if has_key => {
                 // An explicit key that misses is a loud failure, not an
@@ -402,14 +402,14 @@ impl CodesearchService {
                 };
                 let json =
                     serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Ok(crate::symbols::KeyMatch::NotFound) => {
                 // Preserve the historical contract for fuzzy queries: an
                 // unresolvable name/position answers empty references.
                 let impact = build_impact(Vec::new(), None, Vec::new());
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Ok(crate::symbols::KeyMatch::Resolved(canonical)) => canonical,
         };
@@ -439,7 +439,7 @@ impl CodesearchService {
                 };
                 let json =
                     serde_json::to_string(&busy).unwrap_or_else(|_| "{\"busy\":true}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Some(find_impact_tracker::TrackedStatus::Done(Ok(references))) => {
                 tracing::info!(
@@ -452,7 +452,7 @@ impl CodesearchService {
                 let warnings = indexer.lookup_warnings(&db_path, &canonical);
                 let impact = build_impact(references, Some(canonical.clone()), warnings);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             Some(find_impact_tracker::TrackedStatus::Done(Err(chain))) => {
                 // Same classification as a fresh failure: the tracked chain
@@ -463,7 +463,7 @@ impl CodesearchService {
                 );
                 let json =
                     serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
             None => {}
         }
@@ -508,7 +508,7 @@ impl CodesearchService {
                 let warnings = indexer.lookup_warnings(&db_path, &canonical);
                 let impact = build_impact(references, Some(canonical), warnings);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }
             ImpactLookupOutcome::Done(Err(e)) => {
                 find_impact_tracker::IMPACT_LOOKUP_TRACKER.remove(&tracker_key);
@@ -520,7 +520,7 @@ impl CodesearchService {
                 );
                 let json =
                     serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }
             ImpactLookupOutcome::Busy { state, waited_ms } => {
                 tracing::warn!(
@@ -541,7 +541,7 @@ impl CodesearchService {
                 };
                 let json =
                     serde_json::to_string(&busy).unwrap_or_else(|_| "{\"busy\":true}".to_string());
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }
         }
     }

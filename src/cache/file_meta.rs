@@ -343,7 +343,12 @@ impl FileMetaStore {
         let content = fs::read(path)?;
         let mut hasher = Sha256::new();
         hasher.update(&content);
-        Ok(format!("{:x}", hasher.finalize()))
+        // sha2 0.11: the digest array no longer impls LowerHex — hex-encode manually
+        Ok(hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
     }
 
     /// Get file modification time as unix timestamp

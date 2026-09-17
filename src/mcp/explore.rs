@@ -6,7 +6,7 @@
 use super::*;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router, ErrorData as McpError,
 };
 
@@ -40,7 +40,7 @@ impl CodesearchService {
                 let chunk_id = match request.target.parse::<u32>() {
                     Ok(id) => id,
                     Err(_) => {
-                        return Ok(CallToolResult::success(vec![Content::text(format!(
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                             "For similar mode, `target` must be a numeric chunk_id, got: '{}'",
                             request.target
                         ))]));
@@ -54,7 +54,7 @@ impl CodesearchService {
                 };
                 self.similar_chunks(Parameters(similar_req)).await
             }
-            _ => Ok(CallToolResult::success(vec![Content::text(format!(
+            _ => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Unknown explore kind '{}'. Use `outline` or `similar`.",
                 kind
             ))])),
@@ -138,12 +138,12 @@ impl CodesearchService {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         // Outline operates on a single repo — reject group fan-out
         if ctx.is_multi {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "Tool 'explore' operates on a single repo. Use 'project' instead of 'group'."
                     .to_string(),
             )]));
@@ -151,7 +151,7 @@ impl CodesearchService {
 
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
-                return Ok(CallToolResult::success(vec![Content::text(e)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(e)]));
             }
         }
 
@@ -177,7 +177,7 @@ impl CodesearchService {
         {
             Ok(v) => v,
             Err(e) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Error reading outline: {e:#}"
                 ))]));
             }

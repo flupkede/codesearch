@@ -1,6 +1,6 @@
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Implementation, ListToolsResult,
+        CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
@@ -425,7 +425,7 @@ impl ServerHandler for McpProxyService {
         &self,
         request: CallToolRequestParams,
         _cx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let _in_flight = InFlightGuard::new(&self.in_flight);
         let mut last_err: Option<String> = None;
         for attempt in 0..PROXY_MAX_RETRY_ATTEMPTS {
@@ -434,7 +434,7 @@ impl ServerHandler for McpProxyService {
                 Some(p) => match p.call_tool(request.clone()).await {
                     Ok(r) => {
                         self.mark_activity();
-                        return Ok(r);
+                        return Ok(r.into());
                     }
                     Err(e) => {
                         let msg = e.to_string();

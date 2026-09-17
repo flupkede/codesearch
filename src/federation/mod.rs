@@ -184,7 +184,7 @@ pub struct RemoteRepoStatus {
     pub tool_call_count: Option<u64>,
 }
 
-/// `GET /repos/:alias/info` payload — on-disk index stats for one repo on the
+/// `GET /repos/{alias}/info` payload — on-disk index stats for one repo on the
 /// peer. Only the fields the TUI mount-info overlay renders are typed; every
 /// field is optional/defaulted so an older/newer remote still parses.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -216,7 +216,7 @@ pub struct RemoteRepoAdded {
     pub message: Option<String>,
 }
 
-/// `DELETE /repos/:alias` success payload (HTTP 200).
+/// `DELETE /repos/{alias}` success payload (HTTP 200).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteRepoRemoved {
     #[serde(default)]
@@ -229,7 +229,7 @@ pub struct RemoteRepoRemoved {
     pub message: Option<String>,
 }
 
-/// `POST /repos/:alias/reindex` success payload (HTTP 202).
+/// `POST /repos/{alias}/reindex` success payload (HTTP 202).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RemoteReindexResult {
     #[serde(default)]
@@ -382,7 +382,7 @@ impl FederationClient {
         unreachable!("retry loop always returns on its final iteration")
     }
 
-    /// Fetch a single chunk from a remote peer's `/chunk/:id` endpoint.
+    /// Fetch a single chunk from a remote peer's `/chunk/{id}` endpoint.
     ///
     /// Scoping mirrors [`Self::search_project`]:
     /// - When `remote_alias` is `Some`, the lookup is scoped to that single
@@ -402,7 +402,7 @@ impl FederationClient {
     ) -> Outcome<serde_json::Value> {
         let mut url = Self::peer_url(
             peer,
-            &crate::constants::CHUNK_PATH.replace(":id", &chunk_id.to_string()),
+            &crate::constants::CHUNK_PATH.replace("{id", &chunk_id.to_string()),
         );
         // Scope the lookup: prefer a single-project scope (`project=<alias>`)
         // so the multi-repo peer can disambiguate the chunk_id; fall back to
@@ -476,7 +476,7 @@ impl FederationClient {
     }
 
     /// Shared request/response handling for the management endpoints
-    /// (`/status`, `/repos`, `/repos/:alias`, `/repos/:alias/reindex`).
+    /// (`/status`, `/repos`, `/repos/{alias}`, `/repos/{alias}/reindex`).
     ///
     /// Distinguishes three failure modes (see [`ManagementOutcome`]):
     /// transport failure → `Unreachable`; non-2xx → `HttpError` with the peer's
@@ -577,7 +577,7 @@ impl FederationClient {
         .await
     }
 
-    /// `DELETE /repos/:alias` — unregister a repo on the peer and delete its DB.
+    /// `DELETE /repos/{alias}` — unregister a repo on the peer and delete its DB.
     /// `alias` is the peer's repo alias (NOT a local path).
     pub async fn remove_repo(
         &self,
@@ -591,7 +591,7 @@ impl FederationClient {
             .await
     }
 
-    /// `GET /repos/:alias/info` — fetch on-disk index stats (chunks/files/db
+    /// `GET /repos/{alias}/info` — fetch on-disk index stats (chunks/files/db
     /// size/model) for one repo on the peer. `alias` is the peer's repo alias.
     pub async fn repo_info(
         &self,
@@ -608,7 +608,7 @@ impl FederationClient {
             .await
     }
 
-    /// `POST /repos/:alias/reindex[?force=true]` — trigger a background
+    /// `POST /repos/{alias}/reindex[?force=true]` — trigger a background
     /// incremental (or forced full) reindex of a repo on the peer.
     pub async fn reindex(
         &self,
@@ -866,7 +866,7 @@ mod tests {
         // `group`) for a namespaced lookup — the fix for `ambiguous_chunk_id`
         // on a multi-repo peer.
         let app = axum::Router::new().route(
-            "/chunk/:id",
+            "/chunk/{id}",
             axum::routing::get(
                 |axum::extract::Query(params): axum::extract::Query<
                     std::collections::HashMap<String, String>,
@@ -918,7 +918,7 @@ mod tests {
         // lookup must then fall back to the peer's group scope and NOT send a
         // `project` param — preserving pre-fix behaviour for old refs.
         let app = axum::Router::new().route(
-            "/chunk/:id",
+            "/chunk/{id}",
             axum::routing::get(
                 |axum::extract::Query(params): axum::extract::Query<
                     std::collections::HashMap<String, String>,
@@ -1041,7 +1041,7 @@ mod tests {
     async fn remove_repo_targets_alias_in_url() {
         // Echo the captured alias back to prove it landed in the DELETE path.
         let app = axum::Router::new().route(
-            "/repos/:alias",
+            "/repos/{alias}",
             axum::routing::delete(
                 |axum::extract::Path(alias): axum::extract::Path<String>| async move {
                     axum::Json(serde_json::json!({
@@ -1072,7 +1072,7 @@ mod tests {
     async fn reindex_posts_to_alias_reindex_path() {
         // Capture the alias from the path to prove the reindex URL was built.
         let app = axum::Router::new().route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(
                 |axum::extract::Path(alias): axum::extract::Path<String>| async move {
                     axum::Json(serde_json::json!({
@@ -1106,7 +1106,7 @@ mod tests {
     async fn reindex_with_force_appends_force_query() {
         // Capture the query string to prove ?force=true was forwarded.
         let app = axum::Router::new().route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(
                 |axum::extract::Query(params): axum::extract::Query<
                     std::collections::HashMap<String, String>,
@@ -1140,7 +1140,7 @@ mod tests {
         // An alias with a space must be percent-encoded on the wire and decoded
         // back by axum — proves the encoding round-trips through the HTTP layer.
         let app = axum::Router::new().route(
-            "/repos/:alias",
+            "/repos/{alias}",
             axum::routing::delete(
                 |axum::extract::Path(alias): axum::extract::Path<String>| async move {
                     axum::Json(serde_json::json!({
@@ -1219,7 +1219,7 @@ mod tests {
     // Transient-status retry (502/503/504 — scale-to-zero cold starts, todo #58)
     // =========================================================================
 
-    /// Helper: an axum route answering `/chunk/:id` that returns 503 (with a
+    /// Helper: an axum route answering `/chunk/{id}` that returns 503 (with a
     /// non-JSON body, like a real cold-starting gateway) for the first
     /// `fail_first` calls, then a valid 200 JSON chunk payload. Counts every
     /// hit so tests can assert exactly how many attempts were made.
@@ -1230,7 +1230,7 @@ mod tests {
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let hits_clone = hits.clone();
         let router = axum::Router::new().route(
-            "/chunk/:id",
+            "/chunk/{id}",
             axum::routing::get(move || {
                 let hits = hits_clone.clone();
                 async move {
@@ -1340,7 +1340,7 @@ mod tests {
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let hits_clone = hits.clone();
         let router = axum::Router::new().route(
-            "/chunk/:id",
+            "/chunk/{id}",
             axum::routing::get(move || {
                 let hits = hits_clone.clone();
                 async move {

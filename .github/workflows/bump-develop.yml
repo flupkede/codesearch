@@ -37,12 +37,8 @@ on:
     types: [closed]
     branches: [develop]
 
-permissions:
-  contents: write
-
-# Serialize concurrent merges so each one gets its own bump. cancel-in-progress:
-# false → a queued run waits, then re-reads a fresh develop (already carrying the
-# previous bump) before bumping again. So N rapid merges → N patch bumps.
+# Aikido 30640694: no workflow-level permissions; the single job below gets
+# exactly what it needs (contents:write for the bump push).
 concurrency:
   group: bump-develop
   cancel-in-progress: false
@@ -52,6 +48,8 @@ jobs:
     # Only when the PR was actually merged (closed-without-merge is a no-op).
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout develop
         # pin@v4
@@ -62,6 +60,9 @@ jobs:
           # the "block develop" ruleset may push to develop. See SETUP note above.
           # Passing `token:` also persists those creds so `git push` below works.
           token: ${{ secrets.CI_PAT }}
+          # Aikido 35039595: explicit intent — this job DOES push the bump commit,
+          # so credentials must persist (see "How do I fix it?" guidance).
+          persist-credentials: true
 
       - name: Compute next patch version
         id: ver

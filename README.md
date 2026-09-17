@@ -132,6 +132,21 @@ spaces are model-specific. Keep the same model selected for later indexing runs.
 Search rejects a `--model` value that differs from the indexed model and points
 to the required `--force` rebuild instead of mixing incompatible vector spaces.
 
+In **serve** mode the model is resolved **per repository**, from each index's own
+metadata, not from a hub-wide setting: a hub may hold indexes built with
+different models, and every query is embedded with the model of the repo it
+targets (mixed-model groups are fine). `codesearch serve --model <name>` sets a
+**default for newly created indexes**: a repo added without an explicit model
+(e.g. `codesearch index add` with no `--model`, delegated to serve) is indexed
+with it, and it is reported in `GET /status` as `default_model`. It never
+overrides an index that already records its own model — to change an existing
+repo's model, re-index that repo
+(`codesearch --model <name> index <path> --force`) and restart serve. A repo
+whose `metadata.json` records no model (a legacy index built before the
+recording contract) is queried with the built-in 384-dim default rather than the
+serve default, and the search response carries a warning naming the assumed model
+and the re-index command.
+
 ## MCP Configuration
 
 codesearch connects to AI agents via MCP. Two modes:

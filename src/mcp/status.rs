@@ -6,7 +6,7 @@
 use super::*;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router, ErrorData as McpError,
 };
 
@@ -25,11 +25,34 @@ impl CodesearchService {
         match kind.as_str() {
             "index" => self.index_status_impl(request.project, request.group).await,
             "projects" => self.list_projects().await,
-            _ => Ok(CallToolResult::success(vec![Content::text(format!(
+            _ => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Unknown status kind '{}'. Use `index` or `projects`.",
                 kind
             ))])),
         }
+    }
+
+    /// Model label for a grouped index-status response: the common model when
+    /// every member agrees, `"mixed"` when a hub holds indexes built with
+    /// different models.
+    ///
+    /// The status `model` field used to be the service's own model — the
+    /// hardcoded default in serve mode — so every repo read as `minilm-l6-q`
+    /// even when indexed with EmbeddingGemma. See the serve query-model fix.
+    pub(crate) fn group_model_label(&self, aliases: &[String]) -> String {
+        let mut common: Option<ModelType> = None;
+        for alias in aliases {
+            let model = self.query_model(Some(alias));
+            match common {
+                None => common = Some(model),
+                Some(prev) if prev != model => return "mixed".to_string(),
+                _ => {}
+            }
+        }
+        common
+            .unwrap_or_else(|| self.query_model(None))
+            .short_name()
+            .to_string()
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -92,14 +115,14 @@ impl CodesearchService {
                 };
 
                 let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         }
 
         // Resolve project/group routing — status is scope-free, allow unscoped fan-out
         let ctx = match self.resolve_routing(&project, &group, true, "status").await {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         if ctx.needs_local_db {
@@ -121,7 +144,7 @@ impl CodesearchService {
                     mode: self.mcp_mode(),
                 };
                 let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         }
 
@@ -132,6 +155,11 @@ impl CodesearchService {
             let mut max_chunk_id = 0u32;
             let mut dimensions = 0usize;
             let mut all_indexed = true;
+            // Separate from `all_indexed`: a store that FAILED to report stats
+            // must not make the summary claim "not built" (the failure already
+            // rides the `warnings` channel). This tracks only the graph state of
+            // stores that answered.
+            let mut all_built = true;
             let aliases = ctx.aliases();
             let mut stats_warnings: Vec<String> = Vec::new();
             let mut failed_count = 0usize;
@@ -150,6 +178,7 @@ impl CodesearchService {
                         }
                         if !stats.indexed {
                             all_indexed = false;
+                            all_built = false;
                         }
                     }
                     // `all_indexed = false` alone renders identically to "still
@@ -166,7 +195,7 @@ impl CodesearchService {
             }
 
             let (status, status_message) =
-                index_status_summary(sv.len(), failed_count, total_chunks);
+                index_status_summary(sv.len(), failed_count, total_chunks, all_built);
 
             let response = IndexStatusResponse {
                 indexed: all_indexed,
@@ -174,7 +203,7 @@ impl CodesearchService {
                 status_message,
                 total_chunks,
                 total_files,
-                model: self.model_type.short_name().to_string(),
+                model: self.group_model_label(ctx.aliases()),
                 dimensions,
                 max_chunk_id,
                 db_path: format!("({} repos)", sv.len()),
@@ -202,7 +231,10 @@ impl CodesearchService {
                     status_message: format!("{}", e),
                     total_chunks: 0,
                     total_files: 0,
-                    model: self.model_type.short_name().to_string(),
+                    model: self
+                        .query_model(ctx.project_alias.as_deref())
+                        .short_name()
+                        .to_string(),
                     dimensions: 0,
                     max_chunk_id: 0,
                     db_path: self.db_path.display().to_string(),
@@ -211,22 +243,13 @@ impl CodesearchService {
                     mode: self.mcp_mode(),
                 };
                 let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         };
 
-        // Determine status based on database state
-        let (status, status_message) = if stats.total_chunks == 0 {
-            (
-                "building".to_string(),
-                "Index is being built in the background. Searches may fail until indexing completes. Please check back in a few minutes.".to_string(),
-            )
-        } else {
-            (
-                "ready".to_string(),
-                "Index is ready for searching.".to_string(),
-            )
-        };
+        // Determine status based on database state. `stats.indexed` (the HNSW
+        // graph is built) is load-bearing — see `single_index_status`.
+        let (status, status_message) = single_index_status(stats.total_chunks, stats.indexed);
 
         let response = IndexStatusResponse {
             indexed: stats.indexed,
@@ -234,7 +257,10 @@ impl CodesearchService {
             status_message,
             total_chunks: stats.total_chunks,
             total_files: stats.total_files,
-            model: self.model_type.short_name().to_string(),
+            model: self
+                .query_model(ctx.project_alias.as_deref())
+                .short_name()
+                .to_string(),
             dimensions: stats.dimensions,
             max_chunk_id: stats.max_chunk_id,
             db_path: self.db_path.display().to_string(),
@@ -244,7 +270,7 @@ impl CodesearchService {
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     /// List all registered projects and groups. Called by `status(kind="projects")`.
@@ -426,6 +452,6 @@ impl CodesearchService {
         };
 
         let json = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }

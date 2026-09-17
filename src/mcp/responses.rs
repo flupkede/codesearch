@@ -2,7 +2,7 @@ use super::helpers::prefix_path_with_alias;
 use crate::embed::ModelType;
 use crate::index::SharedStores;
 use crate::vectordb::VectorStore;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::ErrorData as McpError;
 use std::path::Path;
 use std::sync::Arc;
@@ -181,6 +181,7 @@ pub(crate) fn index_status_summary(
     total_repos: usize,
     failed_count: usize,
     total_chunks: usize,
+    all_indexed: bool,
 ) -> (String, String) {
     if total_repos > 0 && failed_count >= total_repos {
         (
@@ -196,6 +197,17 @@ pub(crate) fn index_status_summary(
                 "Index is being built across {total_repos} repo(s). Searches may fail until indexing completes."
             ),
         )
+    } else if !all_indexed {
+        // Chunks are in the stores but the HNSW vector index is not built yet
+        // (`VectorStore::search` refuses without it). Reporting "ready" here —
+        // the old behaviour, which keyed only off `total_chunks` — told an
+        // operator a rebuild was finished while every search still failed.
+        (
+            "building".to_string(),
+            format!(
+                "Chunks are indexed across {total_repos} repo(s) but the vector index is not built yet — searches may fail until indexing completes."
+            ),
+        )
     } else if failed_count > 0 {
         (
             "ready".to_string(),
@@ -208,6 +220,32 @@ pub(crate) fn index_status_summary(
         (
             "ready".to_string(),
             format!("Index is ready for searching across {total_repos} repo(s)."),
+        )
+    }
+}
+
+/// Status/message for a single routed store's index.
+///
+/// `indexed` (the HNSW graph is built and committed) is load-bearing: a store
+/// with chunks but no built graph is NOT searchable — `VectorStore::search`
+/// fails with "Index not built" — so it must not read as `ready`. During a
+/// rebuild there is a window where chunks are inserted but `build_index()` has
+/// not run yet, which is exactly when an operator asks "is the migration done?".
+pub(crate) fn single_index_status(total_chunks: usize, indexed: bool) -> (String, String) {
+    if total_chunks == 0 {
+        (
+            "building".to_string(),
+            "Index is being built in the background. Searches may fail until indexing completes. Please check back in a few minutes.".to_string(),
+        )
+    } else if !indexed {
+        (
+            "building".to_string(),
+            "Chunks are indexed but the vector index is not built yet — searches may fail until indexing completes. Please check back in a few minutes.".to_string(),
+        )
+    } else {
+        (
+            "ready".to_string(),
+            "Index is ready for searching.".to_string(),
         )
     }
 }
@@ -333,13 +371,13 @@ pub(crate) fn respond_with_items_noted<T: serde::Serialize>(
             message.push(' ');
             message.push_str(note);
         }
-        return Ok(CallToolResult::success(vec![Content::text(
+        return Ok(CallToolResult::success(vec![ContentBlock::text(
             qualify_empty_result(message, warnings),
         )]));
     }
     if note.is_none() && warnings.is_empty() {
         let json = serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string());
-        return Ok(CallToolResult::success(vec![Content::text(json)]));
+        return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
     }
     let mut payload = serde_json::Map::new();
     payload.insert("results".to_string(), serde_json::json!(items));
@@ -349,7 +387,7 @@ pub(crate) fn respond_with_items_noted<T: serde::Serialize>(
     if !warnings.is_empty() {
         payload.insert("warnings".to_string(), serde_json::json!(warnings));
     }
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::Value::Object(payload).to_string(),
     )]))
 }
@@ -385,12 +423,14 @@ pub(crate) fn respond_with_object<T: serde::Serialize>(
         if let Ok(mut v) = serde_json::to_value(value) {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("warnings".to_string(), serde_json::json!(warnings));
-                return Ok(CallToolResult::success(vec![Content::text(v.to_string())]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    v.to_string(),
+                )]));
             }
         }
     }
     let json = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
 /// Build the `ambiguous_chunk_id` payload for `get_chunk`.

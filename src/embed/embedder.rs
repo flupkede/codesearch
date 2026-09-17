@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
 use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
-use ort::execution_providers::CPUExecutionProvider;
+use ort::ep::CPU;
 
 use crate::file::Language;
 
 /// Available embedding models
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ModelType {
     // === MiniLM Family ===
     /// All-MiniLM-L6-v2 - 384 dimensions, fast and efficient
@@ -242,6 +242,24 @@ impl ModelType {
         }
     }
 
+    /// Resolve the embedding model recorded in an index's `metadata.json`.
+    ///
+    /// The reader counterpart to [`Self::write_metadata_fields`]. Returns `None`
+    /// when the file is missing/unreadable, carries no `model_short_name`, or
+    /// names a model this build does not know — callers fall back to
+    /// [`ModelType::default`]. Every query path MUST resolve the model per
+    /// target index through here (instead of assuming the default): embedding a
+    /// query with any model other than the one the index was built with either
+    /// fails with a dimension mismatch or silently compares incomparable vector
+    /// spaces. Multi-repo serve mode is where this matters most, because one
+    /// hub can hold indexes built with different models.
+    pub fn from_index_metadata(db_path: &std::path::Path) -> Option<Self> {
+        let content = std::fs::read_to_string(db_path.join("metadata.json")).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let name = json.get("model_short_name").and_then(|v| v.as_str())?;
+        Self::parse(name)
+    }
+
     pub fn prepare_query(&self, text: &str) -> String {
         match self {
             Self::EmbeddingGemma300MQ4 => format!("task: search result | query: {text}"),
@@ -312,9 +330,7 @@ impl FastEmbedder {
 
         // Use CPU execution provider WITH arena allocator for speed.
         // Arena allocator provides fast memory reuse during inference.
-        let cpu_ep = CPUExecutionProvider::default()
-            .with_arena_allocator(true)
-            .build();
+        let cpu_ep = CPU::default().with_arena_allocator(true).build();
 
         let model = TextEmbedding::try_new(
             InitOptions::new(model_type.to_fastembed_model())

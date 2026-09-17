@@ -1,4 +1,5 @@
 use super::*;
+use serial_test::serial;
 use std::io::Write;
 
 #[test]
@@ -769,7 +770,7 @@ async fn try_open_stores_creates_db_for_brand_new_repo() {
 
     let state = state_with_config(ReposConfig::default());
 
-    match state.try_open_stores("brandnew", &db_path, true, false) {
+    match state.try_open_stores("brandnew", &db_path, true, false, None) {
         Ok(OpenedStores::Write(_)) => {}
         Ok(OpenedStores::Readonly(_)) => {
             panic!("brand-new repo opened Readonly; expected Write")
@@ -796,8 +797,15 @@ async fn try_open_stores_creates_db_for_brand_new_repo() {
 /// handler's synchronous pre-spawn state — no embedding model required, no
 /// race. `persist_config` honors the temp config override, so the real
 /// `~/.codesearch/repos.json` is never touched.
+///
+/// `#[serial]` + env reset: the handler reads `CODESEARCH_ALLOWED_ROOTS` via
+/// `validate_path_within_allowed_roots`, so this test must not run while the
+/// `allowed_roots_tests` below are mutating it (and must not inherit a stale
+/// value from ambient state).
+#[serial]
 #[tokio::test]
 async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("brandnew");
     std::fs::create_dir(&repo_path).unwrap();
@@ -841,6 +849,250 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
         db_path.exists(),
         "the .codesearch.db directory should have been created"
     );
+}
+
+/// `POST /repos` with no explicit `model` must create a brand-new index at the
+/// serve-wide default's dimension (`codesearch serve --model X`), not the
+/// built-in 384-dim default. This is the write-side counterpart of the per-repo
+/// query-model contract.
+#[tokio::test]
+async fn add_repo_handler_uses_serve_default_model_for_new_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("defaulted");
+    std::fs::create_dir(&repo_path).unwrap();
+
+    let state = Arc::new(
+        state_with_config(ReposConfig::default())
+            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+    );
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("defaulted".to_string()),
+            model: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+
+    let stores = state
+        .get_opened_stores("defaulted")
+        .expect("store must be open immediately after add");
+    let dims = stores
+        .vector_store
+        .try_read()
+        .unwrap()
+        .stats()
+        .unwrap()
+        .dimensions;
+    assert_eq!(
+        dims,
+        crate::embed::ModelType::EmbeddingGemma300MQ4.dimensions(),
+        "a new index must be created at the serve default model's dimension"
+    );
+}
+
+/// The serve-wide default must NOT override an index that already records its
+/// own model: re-adding a repo whose `.codesearch.db` is still on disk keeps the
+/// recorded model and dimension.
+#[tokio::test]
+async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("existing");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+
+    // A pre-existing index recording the 384-dim default model.
+    std::fs::create_dir_all(&db_path).unwrap();
+    let mut meta = serde_json::Map::new();
+    crate::embed::ModelType::AllMiniLML6V2Q.write_metadata_fields(&mut meta);
+    std::fs::write(
+        db_path.join("metadata.json"),
+        serde_json::to_string(&meta).unwrap(),
+    )
+    .unwrap();
+
+    let state = Arc::new(
+        state_with_config(ReposConfig::default())
+            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+    );
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("existing".to_string()),
+            model: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+
+    let stores = state
+        .get_opened_stores("existing")
+        .expect("store must be open immediately after add");
+    let dims = stores
+        .vector_store
+        .try_read()
+        .unwrap()
+        .stats()
+        .unwrap()
+        .dimensions;
+    assert_eq!(
+        dims,
+        crate::embed::ModelType::AllMiniLML6V2Q.dimensions(),
+        "an existing index must keep its recorded model, not adopt the serve default"
+    );
+}
+
+/// Precedence contract for the model a `POST /repos` add indexes with.
+#[test]
+fn resolve_add_repo_model_precedence() {
+    use crate::embed::ModelType;
+    let gemma = ModelType::EmbeddingGemma300MQ4;
+    let mini = ModelType::AllMiniLML6V2Q;
+
+    // Explicit model always wins, even over a recorded model and a default.
+    assert_eq!(
+        resolve_add_repo_model(Some(gemma), Some(mini), Some(mini)),
+        Some(gemma)
+    );
+    // No explicit model, no recorded model → serve default applies (new index).
+    assert_eq!(resolve_add_repo_model(None, None, Some(gemma)), Some(gemma));
+    // No explicit model, recorded model present → serve default is ignored.
+    assert_eq!(resolve_add_repo_model(None, Some(mini), Some(gemma)), None);
+    // No explicit model, no recorded model, no default → no override.
+    assert_eq!(resolve_add_repo_model(None, None, None), None);
+    // Explicit model still wins when nothing else is set.
+    assert_eq!(resolve_add_repo_model(Some(mini), None, None), Some(mini));
+}
+
+/// The serve-wide default is the scope-free fallback model in serve mode (the
+/// unpinned status summary, a call with no routed alias). It is deliberately
+/// NOT the query fallback for a repo that records no model — see
+/// `unrecorded_index_is_queried_with_builtin_default_not_serve_default`.
+#[test]
+fn serve_default_model_is_service_fallback() {
+    use crate::embed::ModelType;
+    let state = std::sync::Arc::new(
+        ServeState::new(ReposConfig::default(), None)
+            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+    );
+    assert_eq!(state.default_model(), Some(ModelType::EmbeddingGemma300MQ4));
+
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+    assert_eq!(
+        svc.query_model(None),
+        ModelType::EmbeddingGemma300MQ4,
+        "serve must fall back to its default model, not the built-in default"
+    );
+}
+
+/// Without `--model`, `ServeState` reports no default and the service falls back
+/// to the built-in default.
+#[test]
+fn no_serve_default_keeps_builtin_fallback() {
+    use crate::embed::ModelType;
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+    assert_eq!(state.default_model(), None);
+
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+    assert_eq!(svc.query_model(None), ModelType::default());
+}
+
+/// A repo whose `metadata.json` records no model is queried with the BUILT-IN
+/// default, never the serve-wide `--model` default.
+///
+/// Regression guard for `serve --model X` silently overriding a legacy index:
+/// with a 768-dim serve default, a 384-dim legacy index failed every search with
+/// "Query embedding dimension mismatch: expected 384, got 768", and a
+/// same-dimension default would have compared incomparable vector spaces without
+/// erroring. The assumption must also reach the caller as a warning naming the
+/// repo, the assumed model and the re-index command.
+#[test]
+fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
+    use crate::embed::ModelType;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let repo_path = tmp.path().join("legacy");
+    std::fs::create_dir(&repo_path).unwrap();
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("legacy".to_string()))
+        .unwrap();
+    config.save_to(&config_file).unwrap();
+
+    let state = std::sync::Arc::new(
+        ServeState::new(config, Some(config_file))
+            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+    );
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    // No metadata.json yet: an unrecorded model. Serve default is gemma.
+    let resolution = svc.resolve_query_model(Some("legacy"));
+    assert_eq!(
+        resolution.model,
+        ModelType::default(),
+        "a repo that records no model must be queried with the built-in default, \
+         not the '{}' serve default",
+        ModelType::EmbeddingGemma300MQ4.short_name()
+    );
+    let warning = resolution
+        .assumed_warning
+        .expect("the assumed model must be surfaced to the caller");
+    assert!(
+        warning.contains("legacy"),
+        "warning must name the repo: {warning}"
+    );
+    assert!(
+        warning.contains(ModelType::default().short_name()),
+        "warning must name the assumed model: {warning}"
+    );
+    assert!(
+        warning.contains("--force"),
+        "warning must give the re-index command: {warning}"
+    );
+
+    // A recorded model is used as-is and must not warn.
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"model_short_name":"embeddinggemma-q4","dimensions":768}"#,
+    )
+    .unwrap();
+    let resolution = svc.resolve_query_model(Some("legacy"));
+    assert_eq!(resolution.model, ModelType::EmbeddingGemma300MQ4);
+    assert!(
+        resolution.assumed_warning.is_none(),
+        "a recorded model must not warn"
+    );
+}
+
+/// The unrecorded-model log warning fires once per alias, so a busy hub does not
+/// repeat the same line on every query. The caller-facing warning is separate
+/// and is not deduped.
+#[test]
+fn legacy_model_warning_is_logged_once_per_alias() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    assert!(state.mark_legacy_model_warned("a"));
+    assert!(!state.mark_legacy_model_warned("a"));
+    assert!(state.mark_legacy_model_warned("b"));
 }
 
 /// `persist_config` must write to the override path (and therefore be
@@ -982,10 +1234,15 @@ fn config_reload_no_spurious_reload() {
     assert_eq!(after_second, after_first);
 }
 
-/// Verify that the /repos/:alias/reindex route is registered and reachable.
+/// Verify that the /repos/{alias}/reindex route is registered and reachable.
 /// This test starts a real axum server on a random port and sends a POST request.
+///
+/// `#[serial]` + env reset — same allowed-roots race guard as the add_repo
+/// handler test above.
+#[serial]
 #[tokio::test]
 async fn reindex_route_is_registered() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("myrepo");
     std::fs::create_dir(&repo_path).unwrap();
@@ -1006,7 +1263,7 @@ async fn reindex_route_is_registered() {
             axum::routing::get(health_handler),
         )
         .route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(reindex_handler),
         )
         .with_state(state);
@@ -1073,8 +1330,10 @@ async fn reindex_route_is_registered() {
 /// corpus index it only holds read-only. The handler returns 409 CONFLICT with
 /// `status: "read_only"` (see the read-only guard in `reindex_handler`,
 /// src/serve/mod.rs).
+#[serial]
 #[tokio::test]
 async fn reindex_refused_for_read_only_repo_even_with_force() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
     let (_tmp, _repo_path, state) = state_with_repo("readonlyrepo");
     // Mark the repo read-only in the live config (how a snapshot-restore sets it).
     state
@@ -1091,7 +1350,7 @@ async fn reindex_refused_for_read_only_repo_even_with_force() {
             axum::routing::get(health_handler),
         )
         .route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(reindex_handler),
         )
         .with_state(state);
@@ -1181,7 +1440,7 @@ async fn healthz_is_unauthenticated_on_network_bind() {
     );
 }
 
-/// Verify that the /repos/:alias/info and /repos/:alias/doctor routes are
+/// Verify that the /repos/{alias}/info and /repos/{alias}/doctor routes are
 /// registered and reachable. Starts a real axum server on a random port and
 /// asserts that an unknown alias yields our handler's 404 (not axum's 404).
 #[tokio::test]
@@ -1205,8 +1464,8 @@ async fn info_doctor_routes_registered() {
             crate::constants::HEALTH_PATH,
             axum::routing::get(health_handler),
         )
-        .route("/repos/:alias/info", axum::routing::get(info_handler))
-        .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
+        .route("/repos/{alias}/info", axum::routing::get(info_handler))
+        .route("/repos/{alias}/doctor", axum::routing::post(doctor_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1294,7 +1553,7 @@ async fn info_doctor_routes_registered() {
 }
 
 /// Verify that the federation REST endpoints (/search, /find, /explore,
-/// /chunk/:id) are registered and reachable. Each must dispatch to OUR
+/// /chunk/{id}) are registered and reachable. Each must dispatch to OUR
 /// handler (returning a JSON body) rather than axum's built-in empty 404.
 /// Starts a real axum server on a random port.
 #[tokio::test]
@@ -1497,7 +1756,7 @@ async fn concurrent_reindex_returns_conflict() {
 
     let app = axum::Router::new()
         .route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(reindex_handler),
         )
         .with_state(state);
@@ -1547,20 +1806,17 @@ async fn concurrent_reindex_returns_conflict() {
 
 /// Unit tests for `validate_path_within_allowed_roots`.
 ///
-/// These tests temporarily set/remove the `CODESEARCH_ALLOWED_ROOTS` env var.
-/// A static Mutex serializes env mutation to prevent races under parallel test execution.
+/// These tests mutate the `CODESEARCH_ALLOWED_ROOTS` env var. Per the
+/// AGENTS.md rule they are `#[serial]` and restore the var via `EnvRestore`:
+/// a private Mutex cannot protect against non-serial tests elsewhere in the
+/// process that READ the var through the real handlers (the add_repo
+/// handler test below), which is exactly the 403 flake this closed.
 #[cfg(test)]
 mod allowed_roots_tests {
     use super::*;
+    use crate::testing::EnvRestore;
+    use serial_test::serial;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    /// Global lock to serialize env var mutations across parallel test threads.
-    static ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
 
     /// Helper: create a unique temp dir per test, return its canonical path.
     fn temp_root(suffix: &str) -> PathBuf {
@@ -1569,57 +1825,49 @@ mod allowed_roots_tests {
         safe_canonicalize(&dir).unwrap()
     }
 
-    fn clear_env() {
-        std::env::remove_var(ALLOWED_ROOTS_ENV);
-    }
-
-    fn set_env(val: &str) {
-        std::env::set_var(ALLOWED_ROOTS_ENV, val);
-    }
-
+    #[serial]
     #[test]
     fn env_unset_allows_all() {
-        let _guard = lock();
-        clear_env();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let path = PathBuf::from("/some/random/path");
         assert!(validate_path_within_allowed_roots(&path).is_ok());
     }
 
+    #[serial]
     #[test]
     fn env_empty_allows_all() {
-        let _guard = lock();
-        set_env("");
+        let _env = EnvRestore::set(&[(ALLOWED_ROOTS_ENV, "")]);
         let path = PathBuf::from("/some/random/path");
         assert!(validate_path_within_allowed_roots(&path).is_ok());
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn path_within_root_is_allowed() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root = temp_root("within");
-        set_env(&root.display().to_string());
+        std::env::set_var(ALLOWED_ROOTS_ENV, root.display().to_string());
         let child = root.join("my-project");
         let _ = std::fs::create_dir_all(&child);
         let canonical_child = safe_canonicalize(&child).unwrap();
         assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn exact_root_match_is_allowed() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root = temp_root("exact");
-        set_env(&root.display().to_string());
+        std::env::set_var(ALLOWED_ROOTS_ENV, root.display().to_string());
         assert!(validate_path_within_allowed_roots(&root).is_ok());
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn path_outside_root_is_rejected() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root = temp_root("outside");
-        set_env(&root.display().to_string());
+        std::env::set_var(ALLOWED_ROOTS_ENV, root.display().to_string());
         // Construct a path guaranteed outside the temp root
         let outside = if cfg!(windows) {
             PathBuf::from("C:\\Windows\\System32")
@@ -1635,40 +1883,45 @@ mod allowed_roots_tests {
         let result = validate_path_within_allowed_roots(&outside);
         assert!(result.is_err(), "Expected rejection for path outside root");
         assert!(result.unwrap_err().contains("outside allowed roots"));
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn all_nonexistent_roots_rejects() {
-        let _guard = lock();
-        set_env("/nonexistent/path/abc;/also/nonexistent/xyz");
+        let _env = EnvRestore::set(&[(
+            ALLOWED_ROOTS_ENV,
+            "/nonexistent/path/abc;/also/nonexistent/xyz",
+        )]);
         let some_path = std::env::temp_dir();
         let canonical = safe_canonicalize(&some_path).unwrap();
         let result = validate_path_within_allowed_roots(&canonical);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No valid roots found"));
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn semicolons_with_empty_segments_works() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root = temp_root("semicolons");
-        set_env(&format!(";{};;", root.display()));
+        std::env::set_var(ALLOWED_ROOTS_ENV, format!(";{};;", root.display()));
         let child = root.join("project");
         let _ = std::fs::create_dir_all(&child);
         let canonical_child = safe_canonicalize(&child).unwrap();
         assert!(validate_path_within_allowed_roots(&canonical_child).is_ok());
-        clear_env();
     }
 
+    #[serial]
     #[test]
     fn multiple_roots_any_match() {
-        let _guard = lock();
+        let _env = EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
         let root1 = temp_root("multi1");
         let root2 = temp_root("multi2");
 
-        set_env(&format!("{};{}", root1.display(), root2.display()));
+        std::env::set_var(
+            ALLOWED_ROOTS_ENV,
+            format!("{};{}", root1.display(), root2.display()),
+        );
 
         // Path under root1
         let child1 = root1.join("project");
@@ -1681,8 +1934,6 @@ mod allowed_roots_tests {
         let _ = std::fs::create_dir_all(&child2);
         let canonical2 = safe_canonicalize(&child2).unwrap();
         assert!(validate_path_within_allowed_roots(&canonical2).is_ok());
-
-        clear_env();
     }
 }
 
@@ -2130,7 +2381,7 @@ async fn indexing_route_answers_json() {
 /// Shared envelope for the Layer-2 e2e tests below: pin the delegation env
 /// vars to a fresh temp repos.json, seed it via `seed`, spawn a REAL serve
 /// (the two routes the CLI `index rm` delegation touches: `GET /health` and
-/// the real `remove_repo_handler` at `DELETE /repos/:alias`) sharing that
+/// the real `remove_repo_handler` at `DELETE /repos/{alias}`) sharing that
 /// config, and wait (bounded, panicking on timeout) for it to accept.
 ///
 /// Every step here is trap-sensitive, which is why it is a helper and not
@@ -2181,7 +2432,7 @@ where
             crate::constants::HEALTH_PATH,
             axum::routing::get(health_handler),
         )
-        .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
+        .route("/repos/{alias}", axum::routing::delete(remove_repo_handler))
         .with_state(state.clone());
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -2205,7 +2456,7 @@ where
 
 /// The full Layer-2 acceptance path: a running serve instance holds the
 /// repo's registration; `remove_from_index` (the CLI code path) must
-/// DELEGATE to it (health probe → DELETE /repos/:alias), serve must stop
+/// DELEGATE to it (health probe → DELETE /repos/{alias}), serve must stop
 /// holders and delete the DB directory WITHOUT being stopped, repos.json
 /// must lose the entry, and a later query for the alias must be a clean
 /// "Unknown alias" (no zombie stores) — all without stopping serve.
@@ -2299,7 +2550,7 @@ async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
 
     // Serve opens the repo FOR REAL — a live LMDB env under db_path.
     let opened = state
-        .try_open_stores("heldenv", &db_path, true, false)
+        .try_open_stores("heldenv", &db_path, true, false, None)
         .expect("opening a real store for a brand-new repo must succeed");
     let OpenedStores::Write(stores) = opened else {
         panic!("brand-new repo must open Write, not Readonly");
@@ -2395,5 +2646,239 @@ fn evicting_idle_repo_clears_frozen_csharp_error_state() {
     assert!(
         !state.csharp_index_error.contains_key("frozen"),
         "eviction must clear the cached C# error message along with the status"
+    );
+}
+
+/// The model a serve query is embedded with is read from the routed repo's own
+/// index metadata — never assumed to be the hub-wide default.
+///
+/// Regression guard for the serve hub pinning `ModelType::default()` (384-dim
+/// MiniLM) for every query: on a hub whose indexes were rebuilt with
+/// EmbeddingGemma that failed with "Query embedding dimension mismatch:
+/// expected 768, got 384". Reintroducing the default pin makes the gemma cases
+/// below fail.
+#[test]
+fn model_for_alias_reads_the_index_metadata_model() {
+    let cases = [
+        (
+            "embeddinggemma-q4",
+            Some(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        ),
+        ("minilm-l6-q", Some(crate::embed::ModelType::AllMiniLML6V2Q)),
+        ("bge-base", Some(crate::embed::ModelType::BGEBaseENV15)),
+        // An unknown recorded name must not be silently coerced to the default:
+        // callers fall back explicitly, and the resolver reports "no answer".
+        ("not-a-real-model", None),
+    ];
+
+    for (model_short_name, expected) in cases {
+        let (_tmp, repo_path, state) = state_with_repo("repo");
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            format!(r#"{{"model_short_name":"{model_short_name}","dimensions":768}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.model_for_alias("repo"),
+            expected,
+            "metadata model_short_name '{model_short_name}' must drive the query model"
+        );
+    }
+}
+
+/// Missing metadata (unindexed / legacy index) yields `None`, so the caller's
+/// documented fallback to the default applies — and an unknown alias cannot
+/// borrow another repo's model.
+#[test]
+fn model_for_alias_is_none_without_index_metadata() {
+    let (_tmp, _repo_path, state) = state_with_repo("repo");
+    assert_eq!(state.model_for_alias("repo"), None);
+    assert_eq!(state.model_for_alias("not-registered"), None);
+}
+
+/// A single hub can hold indexes built with different models: each alias
+/// resolves independently, so a group fan-out embeds each store's query with
+/// that store's own model.
+#[test]
+fn model_for_alias_is_per_repo_not_hub_wide() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let mut config = ReposConfig::default();
+    for (alias, model) in [("legacy", "minilm-l6-q"), ("rebuilt", "embeddinggemma-q4")] {
+        let repo_path = tmp.path().join(alias);
+        std::fs::create_dir(&repo_path).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some(alias.to_string()))
+            .unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            format!(r#"{{"model_short_name":"{model}"}}"#),
+        )
+        .unwrap();
+    }
+    config.save_to(&config_file).unwrap();
+    let state = ServeState::new(config, Some(config_file));
+
+    assert_eq!(
+        state.model_for_alias("legacy"),
+        Some(crate::embed::ModelType::AllMiniLML6V2Q)
+    );
+    assert_eq!(
+        state.model_for_alias("rebuilt"),
+        Some(crate::embed::ModelType::EmbeddingGemma300MQ4)
+    );
+}
+
+/// The serve MCP service resolves the query model through the routed repo, not
+/// its own (default) field. This is the exact seam the hub got wrong: it is the
+/// service, not `ServeState`, that hands the model to the embedder.
+#[test]
+fn serve_service_uses_repo_model_not_default() {
+    let (_tmp, repo_path, state) = state_with_repo("gemma-repo");
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"model_short_name":"embeddinggemma-q4","dimensions":768}"#,
+    )
+    .unwrap();
+
+    let svc = crate::mcp::CodesearchService::new_for_serve(std::sync::Arc::new(state)).unwrap();
+
+    assert_eq!(
+        svc.query_model(Some("gemma-repo")),
+        crate::embed::ModelType::EmbeddingGemma300MQ4,
+        "serve must embed a repo's queries with the model that repo was indexed with"
+    );
+    // No alias (unscoped) or an unknown alias falls back to the service default.
+    assert_eq!(svc.query_model(None), crate::embed::ModelType::default());
+    assert_eq!(
+        svc.query_model(Some("not-registered")),
+        crate::embed::ModelType::default()
+    );
+}
+
+/// The grouped `status` model label must reflect the members' recorded models,
+/// not the service default: a same-model group names that model, a mixed-model
+/// hub says `mixed`. Regression guard for the status field reporting the
+/// hardcoded default (`minilm-l6-q`) for every repo.
+#[test]
+fn group_status_model_label_is_common_or_mixed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let mut config = ReposConfig::default();
+    for (alias, model) in [("legacy", "minilm-l6-q"), ("rebuilt", "embeddinggemma-q4")] {
+        let repo_path = tmp.path().join(alias);
+        std::fs::create_dir(&repo_path).unwrap();
+        config
+            .register_with_alias(repo_path.clone(), Some(alias.to_string()))
+            .unwrap();
+        let db_path = repo_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            format!(r#"{{"model_short_name":"{model}"}}"#),
+        )
+        .unwrap();
+    }
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    assert_eq!(
+        svc.group_model_label(&["legacy".to_string(), "rebuilt".to_string()]),
+        "mixed",
+        "a hub holding indexes built with different models must report 'mixed'"
+    );
+    assert_eq!(
+        svc.group_model_label(&["rebuilt".to_string()]),
+        "embeddinggemma-q4",
+        "a single-model group must name its base model"
+    );
+}
+
+/// A fresh repo added with a model override must open its store at that model's
+/// dimension, not the 384-dim default. Regression guard for `POST /repos` with
+/// `model=embeddinggemma-q4`: the store used to be created at 384 and the
+/// override applied only to metadata, so the reindex embedded 768-dim vectors
+/// into a 384-dim store and indexed nothing.
+#[tokio::test]
+async fn try_open_stores_honours_dimension_override_for_a_fresh_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("gemmarepo");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+    assert!(!db_path.exists(), "precondition: db dir must not exist yet");
+
+    let state = state_with_config(ReposConfig::default());
+
+    let stores = match state.try_open_stores("gemmarepo", &db_path, true, false, Some(768)) {
+        Ok(OpenedStores::Write(s)) => s,
+        Ok(OpenedStores::Readonly(_)) => panic!("expected Write, got Readonly"),
+        Err(e) => panic!("fresh open with a dimension override must succeed, got: {e}"),
+    };
+
+    let dims = stores
+        .vector_store
+        .read()
+        .await
+        .stats()
+        .expect("stats on a freshly created store")
+        .dimensions;
+    assert_eq!(
+        dims, 768,
+        "a repo added with --model embeddinggemma-q4 must open at 768 dims, not the 384 default"
+    );
+}
+
+#[test]
+fn is_lmdb_format_corruption_matches_known_lmdb_errors() {
+    let cases = [
+        (
+            "MDB_BAD_VALSIZE: Unsupported size of key/DB name/data, or wrong DUPFIXED size",
+            true,
+        ),
+        ("Symbol rebuild failed: heed -> MDB_BAD_VALSIZE", true),
+        ("storage error: wrong DUPFIXED size", true),
+        ("Unsupported size of key while opening vectordb", true),
+        ("scip-csharp failed with exit code 1", false),
+        ("MDB_NOTFOUND: No matching key/data pair found", false),
+        ("Task panicked: workspace load failed", false),
+        ("", false),
+    ];
+    for (msg, expected) in cases {
+        assert_eq!(
+            ServeState::is_lmdb_format_corruption(msg),
+            expected,
+            "unexpected classification for {msg:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn enqueue_format_recovery_dedupes_and_starts_single_worker() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    // Same alias three times must collapse to one queued entry. The recovery
+    // worker is spawned but (current-thread test runtime) does not execute
+    // until an await point, so the queue content is asserted deterministically.
+    state.enqueue_format_recovery("ghost-repo");
+    state.enqueue_format_recovery("ghost-repo");
+    state.enqueue_format_recovery("ghost-repo");
+    let len = state
+        .format_recovery_queue
+        .lock()
+        .expect("queue lock")
+        .len();
+    assert_eq!(len, 1, "duplicate enqueues must collapse to one entry");
+    assert!(
+        state
+            .format_recovery_worker_started
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the first enqueue must start the recovery worker"
     );
 }

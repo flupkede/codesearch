@@ -265,8 +265,8 @@ pub fn resolve_serve_host() -> String {
 }
 
 /// Environment variable to set the admin API key for management endpoints.
-/// When set, all management routes (`POST /repos`, `DELETE /repos/:alias`,
-/// `POST /repos/:alias/reindex`, `POST /reload`) require this key.
+/// When set, all management routes (`POST /repos`, `DELETE /repos/{alias}`,
+/// `POST /repos/{alias}/reindex`, `POST /reload`) require this key.
 /// When unset or empty, management routes are unauthenticated (backward compatible).
 /// The key is validated against `Authorization: Bearer <key>` or `X-API-Key: <key>` headers.
 pub const SERVE_API_KEY_ENV: &str = "CODESEARCH_SERVE_API_KEY";
@@ -387,8 +387,8 @@ pub const FIND_PATH: &str = "/find";
 pub const EXPLORE_PATH: &str = "/explore";
 
 /// REST get-chunk endpoint (HTTP mirror of the `get_chunk` MCP tool).
-/// GET `/chunk/:id?context_lines=&project=&group=`.
-pub const CHUNK_PATH: &str = "/chunk/:id";
+/// GET `/chunk/{id}?context_lines=&project=&group=`.
+pub const CHUNK_PATH: &str = "/chunk/{id}";
 
 /// REST find-impact endpoint (HTTP mirror of the `find_impact` MCP tool).
 /// POST a `FindImpactRequest` body; returns the tool's JSON payload
@@ -570,7 +570,7 @@ pub const DB_DELETE_RETRY_BACKOFF_CAP_MS: u64 = 2000;
 /// an actually-unlocked directory instead of burning attempts blind.
 pub const DB_DELETE_ENV_RELEASE_POLL_MS: u64 = 100;
 
-/// Unallocated margin (seconds) the CLI's delegated `DELETE /repos/:alias`
+/// Unallocated margin (seconds) the CLI's delegated `DELETE /repos/{alias}`
 /// request adds on top of serve's legitimate worst-case removal time —
 /// `DB_DELETE_RETRY_BUDGET_SECS` plus one `BG_TASK_COOPERATIVE_TIMEOUT_SECS`
 /// per cooperative join (FSW task + index task) — so the CLI receives

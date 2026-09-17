@@ -6,7 +6,7 @@
 use super::*;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router, ErrorData as McpError,
 };
 
@@ -69,7 +69,7 @@ impl CodesearchService {
                 };
                 self.find_dependents(Parameters(dep_req)).await
             }
-            _ => Ok(CallToolResult::success(vec![Content::text(format!(
+            _ => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Unknown find kind '{}'. Use `definition`, `usages`, `imports`, or `dependents`.",
                 kind
             ))])),
@@ -98,12 +98,12 @@ impl CodesearchService {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
-                return Ok(CallToolResult::success(vec![Content::text(e)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(e)]));
             }
         }
 
@@ -133,7 +133,7 @@ impl CodesearchService {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error searching: {e:#}"
                     ))]));
                 }
@@ -141,7 +141,7 @@ impl CodesearchService {
         };
 
         if fts_results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 qualify_empty_result(
                     format!(
                         "No definition found for '{}'. The symbol may not be indexed.",
@@ -249,7 +249,7 @@ impl CodesearchService {
             {
                 Ok(items) => items,
                 Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error opening database: {e:#}"
                     ))]));
                 }
@@ -298,12 +298,12 @@ impl CodesearchService {
         // Resolve project/group routing
         let ctx = match self.resolve_routing(&project, &group, false, "find").await {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
-                return Ok(CallToolResult::success(vec![Content::text(e)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(e)]));
             }
         }
 
@@ -332,7 +332,7 @@ impl CodesearchService {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error searching: {e:#}"
                     ))]));
                 }
@@ -340,7 +340,7 @@ impl CodesearchService {
         };
 
         if fts_results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 qualify_empty_result(
                     format!("No usages found for '{symbol}'. The symbol may not be indexed."),
                     &find_warnings,
@@ -422,7 +422,7 @@ impl CodesearchService {
             {
                 Ok(items) => items,
                 Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error opening database: {e:#}"
                     ))]));
                 }

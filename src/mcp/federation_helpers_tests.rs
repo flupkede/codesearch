@@ -4,7 +4,7 @@
 use super::{convert_remote_item, merge_ranked_lists, parse_search_items_from_call_result};
 use crate::federation::RemoteSearchItem;
 use crate::mcp::types::SearchResultItem;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 fn local_item(chunk_id: u32, score: f32) -> SearchResultItem {
     SearchResultItem {
@@ -146,7 +146,7 @@ fn parse_federated_chunk_ref_rejects_garbage() {
 // === parse_search_items_from_call_result (serve-delegation re-parse) ===
 
 fn call_result_with_json(json: &str) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(json.to_string())])
+    CallToolResult::success(vec![ContentBlock::text(json.to_string())])
 }
 
 #[test]

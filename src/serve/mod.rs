@@ -3,8 +3,8 @@
 //! Binds on `{host}:{port}` (default `127.0.0.1:39725`) and serves:
 //! - `GET /health` → JSON health check
 //! - `POST /repos` → register + index + warmup a new repo
-//! - `DELETE /repos/:alias` → stop FSW + evict + unregister + delete DB
-//! - `POST /repos/:alias/reindex` → trigger incremental or force reindex
+//! - `DELETE /repos/{alias}` → stop FSW + evict + unregister + delete DB
+//! - `POST /repos/{alias}/reindex` → trigger incremental or force reindex
 //! - MCP streamable HTTP at `/mcp` via rmcp tower service
 //!
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
@@ -230,6 +230,18 @@ pub(crate) struct ServeState {
     /// drop first. The token is stored alongside the handle so `remove_repo`
     /// can cancel regardless of the repo's `RepoState` variant.
     index_tasks: DashMap<String, (tokio::task::JoinHandle<()>, CancellationToken)>,
+    /// Aliases detected with LMDB storage-format corruption (e.g.
+    /// `MDB_BAD_VALSIZE` after a storage-layer major upgrade such as
+    /// arroy 0.5→0.8 / heed 0.20→0.22), queued for a wipe + full force
+    /// reindex. Processed strictly one at a time by the recovery worker —
+    /// each rebuild runs a full CPU-bound embed pass, so parallel
+    /// recoveries would thrash the machine. See
+    /// [`Self::enqueue_format_recovery`] / [`Self::recover_repo_format`].
+    format_recovery_queue: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// Guarantees at most one recovery worker is alive. A worker that finds
+    /// the queue empty flips this back to `false` under the queue lock, so an
+    /// enqueue racing the worker's exit re-spawns cleanly (no lost wake-up).
+    format_recovery_worker_started: std::sync::atomic::AtomicBool,
     /// Loaded repos config (alias → path).
     config: std::sync::RwLock<ReposConfig>,
     /// Last observed mtime of the repos config file.
@@ -269,12 +281,33 @@ pub(crate) struct ServeState {
     /// `find_impact` to reuse helper-detection cache instead of creating fresh
     /// instances per request.
     symbol_registry: Arc<SymbolIndexerRegistry>,
-    /// Shared embedding service — used by MCP sessions AND the REST handlers so
-    /// the ONNX embedding model is loaded ONCE per serve instance (lazily, on
-    /// the first semantic query) and reused across all requests. Without this,
-    /// per-request `CodesearchService` construction (REST handlers) would reload
-    /// the model on every call (~100ms–2s). Mirrors the `symbol_registry` pattern.
-    embedding_service: Arc<std::sync::Mutex<Option<crate::embed::EmbeddingService>>>,
+    /// Shared, per-model embedding-service pool — used by MCP sessions AND the
+    /// REST handlers so each ONNX embedding model is loaded ONCE per serve
+    /// instance (lazily, on the first semantic query) and reused across all
+    /// requests. Without this, per-request `CodesearchService` construction
+    /// (REST handlers) would reload the model on every call (~100ms–2s).
+    ///
+    /// A pool rather than a single service because serve is multi-repo and
+    /// indexes may be built with different models: every query must be embedded
+    /// with the model of the repo it targets. Mirrors the `symbol_registry`
+    /// pattern.
+    embedding_pool: Arc<crate::embed::EmbeddingServicePool>,
+    /// Serve-wide default embedding model for newly created indexes
+    /// (`codesearch serve --model <name>`), or `None` for the built-in default.
+    ///
+    /// This never overrides an index that already records its own model, and it
+    /// is deliberately NOT the query fallback for an index that records none:
+    /// a legacy index with no `model_short_name` is queried with the built-in
+    /// default and reported with a warning (see
+    /// `CodesearchService::resolve_query_model`). Applying this flag there would
+    /// break a working legacy repo the moment an operator set it. The default
+    /// applies only when `POST /repos` creates a brand-new index without an
+    /// explicit `model`, and to the scope-free status summary.
+    default_model: Option<crate::embed::ModelType>,
+    /// Aliases for which the unrecorded-model query warning has already been
+    /// emitted, so a long-running serve logs it once per repo instead of once
+    /// per query. See [`Self::mark_legacy_model_warned`].
+    legacy_model_warned: DashMap<String, ()>,
     /// Per-repo total tool call count.
     tool_call_counts: DashMap<String, AtomicU64>,
     /// Per-repo C# symbol index status (cached, updated on rebuild/detect).
@@ -343,6 +376,8 @@ impl ServeState {
             open_locks: DashMap::new(),
             fsw_tasks: DashMap::new(),
             index_tasks: DashMap::new(),
+            format_recovery_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            format_recovery_worker_started: std::sync::atomic::AtomicBool::new(false),
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
@@ -354,7 +389,11 @@ impl ServeState {
             total_sessions: AtomicU64::new(0),
             sysinfo_system: std::sync::Mutex::new(sys),
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
-            embedding_service: Arc::new(std::sync::Mutex::new(None)),
+            embedding_pool: Arc::new(crate::embed::EmbeddingServicePool::new(
+                crate::constants::get_global_models_cache_dir().ok(),
+            )),
+            default_model: None,
+            legacy_model_warned: DashMap::new(),
             tool_call_counts: DashMap::new(),
             csharp_index_status: Arc::new(DashMap::new()),
             csharp_index_error: Arc::new(DashMap::new()),
@@ -447,14 +486,56 @@ impl ServeState {
         Arc::clone(&self.symbol_registry)
     }
 
-    /// Return a clone of the shared embedding-service Arc.
-    /// Shared across MCP sessions AND REST handlers so the ONNX model is loaded
+    /// Return a clone of the shared, per-model embedding-service pool.
+    /// Shared across MCP sessions AND REST handlers so each ONNX model is loaded
     /// once per serve instance (lazily on first semantic query) instead of being
     /// reloaded per request/session.
-    pub(crate) fn embedding_service(
-        &self,
-    ) -> Arc<std::sync::Mutex<Option<crate::embed::EmbeddingService>>> {
-        Arc::clone(&self.embedding_service)
+    pub(crate) fn embedding_pool(&self) -> Arc<crate::embed::EmbeddingServicePool> {
+        Arc::clone(&self.embedding_pool)
+    }
+
+    /// Attach the serve-wide default embedding model (`codesearch serve --model`).
+    ///
+    /// Set once at startup, before the state is shared. `None` leaves the
+    /// built-in default in place.
+    pub(crate) fn with_default_model(mut self, model: Option<crate::embed::ModelType>) -> Self {
+        self.default_model = model;
+        self
+    }
+
+    /// The serve-wide default embedding model for newly created indexes, or
+    /// `None` for the built-in default. See [`Self::with_default_model`].
+    pub(crate) fn default_model(&self) -> Option<crate::embed::ModelType> {
+        self.default_model
+    }
+
+    /// Resolve the embedding model an alias's index was built with.
+    ///
+    /// Returns `None` when the alias is unknown or its index has no
+    /// `model_short_name` (unindexed / legacy), so callers can fall back to
+    /// [`crate::embed::ModelType::default`]. This is the read side of the
+    /// per-repo model contract: a query against `alias` MUST be embedded with
+    /// the model returned here, or the vector search fails with a dimension
+    /// mismatch (768-dim EmbeddingGemma index, 384-dim default query) or
+    /// silently compares incomparable vector spaces.
+    pub(crate) fn model_for_alias(&self, alias: &str) -> Option<crate::embed::ModelType> {
+        let cfg = self.config_snapshot();
+        let project_path = cfg.resolve(alias)?;
+        crate::embed::ModelType::from_index_metadata(&project_path.join(DB_DIR_NAME))
+    }
+
+    /// Record that `alias` was queried with the built-in default because its
+    /// index records no embedding model, returning `true` on the first call for
+    /// that alias.
+    ///
+    /// An unrecorded model is unknowable, so the fallback warning is logged once
+    /// per repo per serve lifetime rather than on every query — a busy hub would
+    /// otherwise flood the log with the same line. The caller-facing response
+    /// warning is not deduped: an agent should see the assumption on each answer.
+    pub(crate) fn mark_legacy_model_warned(&self, alias: &str) -> bool {
+        self.legacy_model_warned
+            .insert(alias.to_string(), ())
+            .is_none()
     }
 
     /// Return the instant when serve started, used to compute uptime.
@@ -544,6 +625,182 @@ impl ServeState {
     /// indexing task finishes (success, error, or panic).
     fn end_indexing(&self, alias: &str) {
         self.active_reindexes.remove(alias);
+    }
+
+    /// True iff an error chain indicates LMDB storage-format corruption —
+    /// data written by an older storage-major (arroy/heed) that the current
+    /// one refuses to read — rather than a transient or unrelated failure.
+    fn is_lmdb_format_corruption(msg: &str) -> bool {
+        let m = msg.to_ascii_lowercase();
+        m.contains("mdb_bad_valsize")
+            || m.contains("unsupported size of key")
+            || m.contains("wrong dupfixed size")
+    }
+
+    /// Queue `alias` for a sequential wipe + force reindex after LMDB format
+    /// corruption was detected. Deduplicates; spawns the single recovery
+    /// worker on the first enqueue.
+    fn enqueue_format_recovery(self: &Arc<Self>, alias: &str) {
+        {
+            let mut queue = self
+                .format_recovery_queue
+                .lock()
+                .expect("format_recovery_queue lock poisoned");
+            if queue.iter().any(|a| a == alias) {
+                return;
+            }
+            queue.push_back(alias.to_string());
+        }
+        // Swap AFTER the push so the worker-exit path (which flips the flag
+        // back to `false` while still holding the queue lock) can never race
+        // us into a lost wake-up: either we observe `true` and the live
+        // worker picks up the fresh entry, or we flip `false→true` and spawn.
+        if !self
+            .format_recovery_worker_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let state = Arc::clone(self);
+            tokio::spawn(state.format_recovery_worker());
+        }
+    }
+
+    /// Pops queued aliases and recovers them ONE AT A TIME until the queue
+    /// runs dry, then exits (a later enqueue restarts a worker).
+    async fn format_recovery_worker(self: Arc<Self>) {
+        loop {
+            let alias = {
+                let mut queue = self
+                    .format_recovery_queue
+                    .lock()
+                    .expect("format_recovery_queue lock poisoned");
+                match queue.pop_front() {
+                    Some(a) => a,
+                    None => {
+                        // Flip the flag while still holding the queue lock so
+                        // a concurrent enqueue cannot interleave between the
+                        // empty pop and the flag reset (lost wake-up).
+                        self.format_recovery_worker_started
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        return;
+                    }
+                }
+            };
+            if let Err(e) = self.recover_repo_format(&alias).await {
+                tracing::error!("🔧 Format recovery failed for '{}': {}", alias, e);
+            }
+        }
+    }
+
+    /// Wipe + force reindex one repo whose on-disk storage was written by an
+    /// older storage-major. Mirrors `remove_repo`'s eviction sequence (stop
+    /// FSW → evict → await watcher/index shutdowns) but keeps the alias
+    /// registered; then deletes the DB directory (bounded retry for transient
+    /// Windows lock holders) and reuses the TUI force-reindex machinery — its
+    /// `try_open_stores` path recreates fresh stores when the directory is
+    /// gone, so the rebuild lands on the new arroy/heed formats.
+    async fn recover_repo_format(self: &Arc<Self>, alias: &str) -> Result<(), String> {
+        let project_path = {
+            let config = self
+                .config
+                .read()
+                .map_err(|_| "config lock poisoned".to_string())?;
+            if config.repo_read_only.get(alias) == Some(&true) {
+                return Err(format!(
+                    "'{}' is marked read-only; rebuild its index on the owning writer",
+                    alias
+                ));
+            }
+            config
+                .resolve(alias)
+                .ok_or_else(|| format!("unknown alias '{}'", alias))?
+        };
+        let db_path = project_path.join(DB_DIR_NAME);
+
+        // Evict in-memory holders so the LMDB env closes before the delete
+        // (Windows refuses to delete mmap'd files). Same order as remove_repo.
+        {
+            let _stores = self.stop_fsw(alias);
+        }
+        self.repos.remove(alias);
+        self.last_access.remove(alias);
+        self.await_fsw_shutdown(alias).await;
+        self.await_index_task(alias).await;
+
+        let deadline =
+            Instant::now() + Duration::from_secs(crate::constants::DB_DELETE_RETRY_BUDGET_SECS);
+        let mut backoff_ms = crate::constants::DB_DELETE_RETRY_INITIAL_MS;
+        loop {
+            match std::fs::remove_dir_all(&db_path) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound || !db_path.exists() => break,
+                Err(e) if Self::is_db_locked_error(&e) && Instant::now() < deadline => {
+                    tracing::debug!(
+                        "Format recovery: DB dir for '{}' still locked, retrying: {}",
+                        alias,
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(2_000);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "could not wipe {} after corruption: {}",
+                        db_path.display(),
+                        e
+                    ))
+                }
+            }
+        }
+        tracing::info!(
+            "🔧 Format recovery: wiped stale-format DB dir for '{}' — rebuilding",
+            alias
+        );
+
+        match tui::spawn_force_reindex(alias.to_string(), self) {
+            tui::ReindexLaunch::Started => {
+                // Sequential guarantee: wait until this alias stops indexing
+                // before the worker loop picks the next one. Poll — the
+                // active-reindexes entry can go stale (MAX_INDEXING_SECS) on
+                // very long rebuilds, so cap generously and surface a timeout
+                // rather than hanging the whole recovery queue.
+                let cap = self.indexing_timeout() * 8;
+                let started = Instant::now();
+                while self.is_indexing(alias) {
+                    if started.elapsed() >= cap {
+                        return Err(format!(
+                            "rebuild for '{}' exceeded the {}s recovery cap",
+                            alias,
+                            cap.as_secs()
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                tracing::info!("🔧 Format recovery: rebuild complete for '{}'", alias);
+                Ok(())
+            }
+            tui::ReindexLaunch::AlreadyRunning => {
+                // A rebuild is already in flight for this alias; wait it out.
+                // If it was a plain rebuild it may fail on the corrupt dir
+                // again — the next rebuild trigger re-detects and re-queues.
+                let cap = self.indexing_timeout() * 8;
+                let started = Instant::now();
+                while self.is_indexing(alias) {
+                    if started.elapsed() >= cap {
+                        return Err(format!(
+                            "in-flight rebuild for '{}' exceeded the {}s recovery cap",
+                            alias,
+                            cap.as_secs()
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Ok(())
+            }
+            tui::ReindexLaunch::Failed => Err(format!(
+                "could not start the recovery rebuild for '{}' (see log)",
+                alias
+            )),
+        }
     }
 
     /// Returns `true` if `alias` is currently (non-stale) indexing.
@@ -1372,7 +1629,7 @@ impl ServeState {
 
     /// Remove a repo: stop FSW, evict from memory, unregister from config, delete DB.
     ///
-    /// This is the shared logic used by both the HTTP `DELETE /repos/:alias` handler
+    /// This is the shared logic used by both the HTTP `DELETE /repos/{alias}` handler
     /// and the TUI confirmation flow.
     pub(crate) async fn remove_repo(&self, alias: &str) -> Result<RepoRemovalOutcome> {
         // 1. Resolve project path from config
@@ -1995,7 +2252,7 @@ impl ServeState {
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly, None)? {
             OpenedStores::Readonly(stores) => {
                 // Already registered as Readonly by try_open_stores.
                 //
@@ -2197,7 +2454,7 @@ impl ServeState {
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly)? {
+        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly, None)? {
             OpenedStores::Readonly(s) => {
                 // Already registered as Readonly; touch and return.
                 self.touch_access(alias);
@@ -2443,12 +2700,20 @@ impl ServeState {
     ///
     /// `allow_create=false`: warmup / incremental reindex path — fails if DB is missing.
     /// `allow_create=true`:  force-reindex / add-repo path — creates fresh DB if missing.
+    ///
+    /// `dimension_override` forces the embeddings dimension (e.g. a model
+    /// override on `POST /repos`); `None` reads it from `metadata.json`. The
+    /// caller must have made the on-disk store consistent with the override
+    /// (a fresh DB, or one whose data will be cleared by the reindex) — opening
+    /// a store at a different dimension than its vectors were written with
+    /// yields a dimension mismatch on the first insert.
     fn try_open_stores(
         &self,
         alias: &str,
         db_path: &Path,
         allow_create: bool,
         force_readonly: bool,
+        dimension_override: Option<usize>,
     ) -> std::result::Result<OpenedStores, String> {
         if !db_path.exists() && !allow_create {
             let parent = db_path
@@ -2464,7 +2729,7 @@ impl ServeState {
             ));
         }
 
-        let dims = self.get_dimensions_for_path(db_path);
+        let dims = dimension_override.unwrap_or_else(|| self.get_dimensions_for_path(db_path));
 
         // Read-only requested via the per-repo `repo_read_only` config flag:
         // open readonly directly and never attempt a write open. This makes
@@ -3237,6 +3502,10 @@ async fn status_handler(
 
     let uptime_secs = state.started_at().elapsed().as_secs();
 
+    // Serve-wide default model for newly created indexes (`serve --model`).
+    // `null` means the built-in default.
+    let default_model = state.default_model().map(|m| m.short_name());
+
     // CPU usage — reuse shared System instance so cpu_usage() can compute delta
     let cpu = {
         use sysinfo::ProcessesToUpdate;
@@ -3247,6 +3516,7 @@ async fn status_handler(
                     "version": env!("CARGO_PKG_VERSION"),
                     "repos": repo_json,
                     "active_sessions": active_sessions,
+                    "default_model": default_model,
                     "cpu_percent": "—",
                     "uptime_secs": uptime_secs,
                 }));
@@ -3259,6 +3529,7 @@ async fn status_handler(
                     "version": env!("CARGO_PKG_VERSION"),
                     "repos": repo_json,
                     "active_sessions": active_sessions,
+                    "default_model": default_model,
                     "cpu_percent": "—",
                     "uptime_secs": uptime_secs,
                 }));
@@ -3291,6 +3562,7 @@ async fn status_handler(
         "version": env!("CARGO_PKG_VERSION"),
         "repos": repo_json,
         "active_sessions": active_sessions,
+        "default_model": default_model,
         "cpu_percent": cpu,
         "csharp_helper": csharp_helper,
         "ts_helper": ts_helper,
@@ -3588,14 +3860,29 @@ async fn trigger_symbol_rebuild(
             state.schedule_persist_repos_config();
         }
         Ok(Err(e)) => {
-            tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, e);
+            let msg = e.to_string();
             state.end_indexing(&alias_owned);
             state
                 .csharp_index_error
-                .insert(alias_owned.clone(), e.to_string());
-            state
-                .csharp_index_status
-                .insert(alias_owned, CSharpIndexStatus::Error);
+                .insert(alias_owned.clone(), msg.clone());
+            if ServeState::is_lmdb_format_corruption(&msg) {
+                tracing::warn!(
+                    "⚠️ LMDB storage-format corruption for '{}' (data written by an older \
+                     storage-major) — queueing sequential wipe + full rebuild",
+                    alias_owned
+                );
+                // Recovery owns the outcome from here: show in-progress rather
+                // than Error; it flips to Ready on success or Error on failure.
+                state
+                    .csharp_index_status
+                    .insert(alias_owned.clone(), CSharpIndexStatus::Indexing);
+                state.enqueue_format_recovery(&alias_owned);
+            } else {
+                tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
+                state
+                    .csharp_index_status
+                    .insert(alias_owned, CSharpIndexStatus::Error);
+            }
         }
         Err(e) => {
             tracing::error!(
@@ -3757,7 +4044,7 @@ async fn reindex_handler(
                 // FSW not running -- open existing or create fresh DB.
                 // allow_create=true so a force-reindex can recover a deleted DB.
                 let cancel = CancellationToken::new();
-                match state.try_open_stores(&alias, &db_path, true, false) {
+                match state.try_open_stores(&alias, &db_path, true, false, None) {
                     Ok(OpenedStores::Write(s)) => {
                         // Register as Write to block double-open races while we reindex.
                         state.repos.insert(
@@ -3969,6 +4256,29 @@ struct AddRepoRequest {
     model: Option<String>,
 }
 
+/// Decide the embedding model a `POST /repos` add should index with.
+///
+/// Precedence:
+/// 1. an explicit `model` in the request always wins (it forces a rebuild at
+///    that model's dimension, which is the documented `index add --model`
+///    behavior);
+/// 2. otherwise the serve-wide default (`codesearch serve --model`) applies
+///    **only when no model is recorded on disk** — i.e. this call is creating a
+///    brand-new index;
+/// 3. an index that already records its own model keeps it, exactly as if
+///    `--model` had not been passed.
+fn resolve_add_repo_model(
+    explicit: Option<crate::embed::ModelType>,
+    recorded: Option<crate::embed::ModelType>,
+    serve_default: Option<crate::embed::ModelType>,
+) -> Option<crate::embed::ModelType> {
+    explicit.or(if recorded.is_none() {
+        serve_default
+    } else {
+        None
+    })
+}
+
 /// Add-repo handler: POST /repos
 ///
 /// Registers a new repo in repos.json, opens the LMDB/Tantivy stores inline
@@ -4009,6 +4319,42 @@ async fn add_repo_handler(
             })),
         );
     }
+
+    // db_path is resolved before the model decision: whether a serve-wide
+    // default applies depends on whether the index already records a model.
+    let db_path = canonical_path.join(DB_DIR_NAME);
+
+    // Parse the optional model override BEFORE opening the store: a fresh index
+    // must be created at the override's dimension, not the 384-dim default.
+    // Previously the store was opened at the default (or the previous metadata's)
+    // dimension and the override was only applied to metadata afterwards, so the
+    // reindex embedded 768-dim vectors into a 384-dim store and indexed nothing.
+    let explicit_model: Option<crate::embed::ModelType> = match body.model.as_deref() {
+        Some(model_str) => match crate::embed::ModelType::parse(model_str) {
+            Some(mt) => Some(mt),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::response::Json(json!({
+                        "error": format!("Unknown model: '{}'. Use one of: {}", model_str, crate::embed::ModelType::valid_short_names()),
+                        "status": "error"
+                    })),
+                );
+            }
+        },
+        None => None,
+    };
+
+    // `codesearch serve --model X` sets the default for indexes created here.
+    // It applies only when no explicit `model` was given AND this POST is
+    // creating a brand-new index: an existing index keeps the model recorded in
+    // its `metadata.json`, exactly as if the flag had not been set. An explicit
+    // `model` still wins and rebuilds at that model's dimension.
+    let model_override = resolve_add_repo_model(
+        explicit_model,
+        crate::embed::ModelType::from_index_metadata(&db_path),
+        state.default_model(),
+    );
 
     // Register in repos.json
     let alias = {
@@ -4067,8 +4413,13 @@ async fn add_repo_handler(
     // This eliminates the LMDB double-open race that occurred when the old
     //  path opened its own LMDB handle, conflicting with
     //  calls from the serve's request handlers.
-    let db_path = canonical_path.join(DB_DIR_NAME);
-    let stores = match state.try_open_stores(&alias, &db_path, true, false) {
+    let stores = match state.try_open_stores(
+        &alias,
+        &db_path,
+        true,
+        false,
+        model_override.map(|m| m.dimensions()),
+    ) {
         Ok(OpenedStores::Write(s)) => s,
         Ok(OpenedStores::Readonly(_)) => {
             unreachable!(
@@ -4138,23 +4489,6 @@ async fn add_repo_handler(
             })),
         );
     }
-
-    // Parse optional model override from request body.
-    let model_override: Option<crate::embed::ModelType> = match body.model.as_deref() {
-        Some(model_str) => match crate::embed::ModelType::parse(model_str) {
-            Some(mt) => Some(mt),
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    axum::response::Json(json!({
-                        "error": format!("Unknown model: '{}'. Use one of: {}", model_str, crate::embed::ModelType::valid_short_names()),
-                        "status": "error"
-                    })),
-                );
-            }
-        },
-        None => None,
-    };
 
     // Spawn the heavy indexing work in the background.  Returns 202 immediately.
     let alias_bg = alias.clone();
@@ -4319,7 +4653,7 @@ pub(crate) struct RepoRemovalOutcome {
     pub db_delete_error: Option<String>,
 }
 
-/// Remove-repo handler: DELETE /repos/:alias
+/// Remove-repo handler: DELETE /repos/{alias}
 ///
 /// Stops the FSW, evicts the repo from memory, unregisters from repos.json,
 /// and deletes the database directory. Returns 200 on success (status is
@@ -4500,8 +4834,8 @@ fn request_has_valid_api_key(headers: &axum::http::HeaderMap, configured: &str) 
 ///
 /// When the env var is unset or empty, all requests pass through (backward compatible).
 ///
-/// Management endpoints are: `POST /repos`, `DELETE /repos/:alias`,
-/// `POST /repos/:alias/reindex`, `POST /reload`.
+/// Management endpoints are: `POST /repos`, `DELETE /repos/{alias}`,
+/// `POST /repos/{alias}/reindex`, `POST /reload`.
 /// All other routes (health, status, MCP) are always unauthenticated.
 ///
 /// Key comparison is constant-time (see `api_key_matches`).
@@ -4953,10 +5287,16 @@ fn keep_warm_foreign_target(ping_url: &str, self_host: &str) -> Option<String> {
     }
 }
 
+// `run_serve` is the single startup entry point, so its parameter list is the
+// serve CLI surface (bind host/port, registration, default model, TUI,
+// keep-warm, shutdown). Bundling them into a struct would only move the
+// plumbing; allow the wide signature instead.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
     host: Option<String>,
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
+    default_model: Option<crate::embed::ModelType>,
     no_tui: bool,
     keep_warm_url: Option<String>,
     idle_suspend_secs: Option<u64>,
@@ -5040,7 +5380,7 @@ pub async fn run_serve(
     // env > default); nothing else consumes it, so `ServeState` does not carry
     // it. In particular the embedded TUI must NOT derive a poll cadence from it
     // — it never polls a federated peer on a timer at all.
-    let serve_state = Arc::new(ServeState::new(config, None));
+    let serve_state = Arc::new(ServeState::new(config, None).with_default_model(default_model));
 
     // Construct the bind address from resolved host + port.
     // Using `format!` with `parse::<SocketAddr>()` handles both IPv4 and IPv6.
@@ -5073,6 +5413,20 @@ pub async fn run_serve(
     let repo_list = format!("{:?}", serve_state.aliases());
     info!("📋 Registered repos: {}", repo_list);
     eprintln!("📋 Registered repos: {}", repo_list);
+
+    // Report the serve-wide default model for newly created indexes, if set.
+    // Without this, `serve --model X` is a silent setting: the TUI/status show
+    // per-repo models, but nothing tells an operator what a new `POST /repos`
+    // (or a delegated `codesearch index add`) will use.
+    if let Some(model) = default_model {
+        let line = format!(
+            "🧠 Default model for new indexes: {} ({} dims)",
+            model.short_name(),
+            model.dimensions()
+        );
+        info!("{}", line);
+        eprintln!("{}", line);
+    }
 
     // ── Start HTTP server FIRST ──
     // Accept connections immediately so MCP clients don't time out.
@@ -5136,24 +5490,24 @@ pub async fn run_serve(
         // /remotes is a status-like read-only observability endpoint (lists the
         // configured federation peers). It is NOT in require_admin_auth's
         // `is_management` set, so it inherits exactly the same auth policy as
-        // /status, /repos/:alias/info and /repos/:alias/doctor: reachable
+        // /status, /repos/{alias}/info and /repos/{alias}/doctor: reachable
         // without the admin key on localhost, protected by
         // require_auth_for_network on network binds. See REMOTES_PATH doc.
         .route(REMOTES_PATH, axum::routing::get(remotes_handler))
         .route("/repos", axum::routing::post(add_repo_handler))
-        .route("/repos/:alias", axum::routing::delete(remove_repo_handler))
+        .route("/repos/{alias}", axum::routing::delete(remove_repo_handler))
         .route("/reload", axum::routing::post(reload_handler))
         .route(
-            "/repos/:alias/reindex",
+            "/repos/{alias}/reindex",
             axum::routing::post(reindex_handler),
         )
-        .route("/repos/:alias/info", axum::routing::get(info_handler))
+        .route("/repos/{alias}/info", axum::routing::get(info_handler))
         // /doctor is a POST but is intentionally read-only (diagnostics only, no
         // --fix path), so like /info and /status it is NOT in require_admin_auth's
         // management set — reachable without the admin key on localhost, and still
         // protected by require_auth_for_network on network binds. If doctor ever
         // gains a mutating mode, add it to `is_management` in require_admin_auth.
-        .route("/repos/:alias/doctor", axum::routing::post(doctor_handler))
+        .route("/repos/{alias}/doctor", axum::routing::post(doctor_handler))
         // REST endpoints — federation-friendly HTTP+JSON mirror of the read-only
         // MCP tools (search/find/explore/get_chunk). Lets a remote codesearch
         // serve be queried WITHOUT an MCP session. Same auth layers as /mcp &

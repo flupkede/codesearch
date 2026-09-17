@@ -3,7 +3,7 @@
 //! `mod.rs` (todo #105).
 
 use super::*;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 impl CodesearchService {
     pub(crate) fn normalize_symbol_query_path(&self, project_root: &Path, file: &Path) -> PathBuf {
@@ -26,12 +26,12 @@ impl CodesearchService {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
-                return Ok(CallToolResult::success(vec![Content::text(e)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(e)]));
             }
         }
 
@@ -116,7 +116,7 @@ impl CodesearchService {
             {
                 Ok(items) => items,
                 Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error reading imports: {e:#}"
                     ))]));
                 }
@@ -263,12 +263,12 @@ impl CodesearchService {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
-                return Ok(CallToolResult::success(vec![Content::text(e)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(e)]));
             }
         }
 
@@ -481,7 +481,7 @@ impl CodesearchService {
             {
                 Ok(items) => items,
                 Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error resolving dependents: {e:#}"
                     ))]));
                 }
@@ -510,12 +510,12 @@ impl CodesearchService {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
-                return Ok(CallToolResult::success(vec![Content::text(e)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(e)]));
             }
         }
 
@@ -555,7 +555,7 @@ impl CodesearchService {
             let embedding = match embedding {
                 Some(e) => e,
                 None => {
-                    return Ok(CallToolResult::success(vec![Content::text(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(
                         qualify_empty_result(
                             format!(
                                 "Embedding not found for chunk_id {} in any store.",
@@ -657,7 +657,7 @@ impl CodesearchService {
             {
                 Ok(items) => items,
                 Err(e) => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error finding similar chunks: {e:#}"
                     ))]));
                 }

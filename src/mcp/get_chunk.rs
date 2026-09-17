@@ -5,7 +5,7 @@
 use super::*;
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
+    model::{CallToolResult, ContentBlock},
     tool, tool_router, ErrorData as McpError,
 };
 
@@ -41,7 +41,7 @@ impl CodesearchService {
             if let Some(ref serve_state) = self.serve_state {
                 let config = serve_state.config_snapshot();
                 if config.repos.len() > 1 {
-                    return Ok(CallToolResult::success(vec![Content::text(
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(
                         self.format_scope_error(),
                     )]));
                 }
@@ -54,12 +54,12 @@ impl CodesearchService {
             .await
         {
             Ok(c) => c,
-            Err(e) => return Ok(CallToolResult::success(vec![Content::text(e)])),
+            Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
         };
 
         if ctx.needs_local_db {
             if let Err(e) = self.ensure_database_exists() {
-                return Ok(CallToolResult::success(vec![Content::text(e)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(e)]));
             }
         }
 
@@ -112,7 +112,7 @@ impl CodesearchService {
                 }
                 match candidates.len() {
                     0 => {
-                        return Ok(CallToolResult::success(vec![Content::text(
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(
                             qualify_empty_result(
                                 format!(
                                     "Chunk {} not found in any repository. Verify the \
@@ -156,7 +156,7 @@ impl CodesearchService {
                             &candidate_names,
                             &chunk_warnings,
                         );
-                        return Ok(CallToolResult::success(vec![Content::text(
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(
                             payload.to_string(),
                         )]));
                     }
@@ -210,7 +210,7 @@ impl CodesearchService {
         let mut chunk = match chunk {
             Some(c) => c,
             None => {
-                return Ok(CallToolResult::success(vec![Content::text(
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
                     qualify_empty_result(
                         format!(
                             "Chunk {} not found. Verify the chunk_id and index state.",

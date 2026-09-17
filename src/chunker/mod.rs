@@ -94,7 +94,12 @@ impl Chunk {
     pub fn compute_hash(content: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
+        // sha2 0.11: the digest array no longer impls LowerHex — hex-encode manually
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     }
 
     /// TEST METHOD: Estimate memory usage of this chunk in bytes

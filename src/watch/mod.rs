@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
+use notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -67,7 +67,7 @@ pub enum FileEvent {
 /// 3. Batched events for efficient processing
 pub struct FileWatcher {
     root: PathBuf,
-    debouncer: Option<Debouncer<RecommendedWatcher, FileIdMap>>,
+    debouncer: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
     receiver: Option<Receiver<DebounceEventResult>>,
     /// Compiled .gitignore matcher for the repo root (None if no .gitignore found).
     gitignore: Option<Gitignore>,
@@ -195,17 +195,12 @@ impl FileWatcher {
         self.receiver = Some(rx);
         self.debouncer = Some(debouncer);
 
-        // Start watching the root directory
+        // Start watching the root directory (Debouncer implements Watcher directly
+        // since notify-debouncer-full 0.7 and tracks file-ID cache roots itself)
         if let Some(ref mut debouncer) = self.debouncer {
             debouncer
-                .watcher()
                 .watch(&self.root, RecursiveMode::Recursive)
                 .map_err(|e| anyhow!("Failed to watch directory: {}", e))?;
-
-            // Also watch with the cache (for file ID tracking)
-            debouncer
-                .cache()
-                .add_root(&self.root, RecursiveMode::Recursive);
         }
 
         Ok(())
@@ -219,7 +214,7 @@ impl FileWatcher {
     /// Stop watching
     pub fn stop(&mut self) {
         if let Some(ref mut debouncer) = self.debouncer {
-            let _ = debouncer.watcher().unwatch(&self.root);
+            let _ = debouncer.unwatch(&self.root);
         }
         self.debouncer = None;
         self.receiver = None;
