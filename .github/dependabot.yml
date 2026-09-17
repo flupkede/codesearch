@@ -1,9 +1,12 @@
 # Weekly dependency refresh — replaces reactive minimum-fix patching.
 # Grouped so minor+patch ride one PR; majors stay individual for review.
+# target-branch: dependabot always opens (and rebases) PRs against develop —
+# without it the base resets to the repo default (master) on every rebase.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
@@ -15,6 +18,7 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
