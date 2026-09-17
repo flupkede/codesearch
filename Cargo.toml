@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -88,8 +88,8 @@ tracing-appender = "0.2"
 sha2 = "0.11"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-colored = "2.1"
-indicatif = "0.18"
+colored = "3.1"
+indicatif = "0.17"
 dirs = "7"
 num_cpus = "1.16"
 async-trait = "0.1"
@@ -114,10 +114,10 @@ sysinfo = { version = "0.39", default-features = true }
 libc = "0.2"
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.13"
 pretty_assertions = "1.4"
-serial_test = "4"
+serial_test = "3"
 
 # Benchmarks will be added later
 # [[bench]]
