@@ -50,6 +50,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Fixed
 
+- **Dependency batch: criterion 0.8, serial_test 4, indicatif 0.18, colored 3 (dependabot majors) + CI actions refresh.** The four cargo majors were drop-in for lib/bins; benches and dev-test surface absorbed the criterion 0.5→0.8 and serial_test 3→4 API moves. The five GitHub Actions bumps (upload-artifact v7, download-artifact v8, cache v6, setup-dotnet v6, action-gh-release v3) are the dependabot-proposed SHA pins. dependabot itself now targets develop permanently (`target-branch` in the default-branch config): its rebases used to reset the base to master, tripping the `check-source-branch` guard.
+
 - **Federated chunk fetch works again — URL residue and project-scope routing (todo #153).** Two independent defects: (1) the peer URL for a `chunk_ref` fetch was built by replacing `{id` without the closing brace, so the constructed path carried a stray `}` (`/chunk/2058%7D`) that real peers answered with 400 Bad Request — axum's `{id}` parameter happily swallowed the stray brace into the captured value, which is exactly why the mock-based tests never caught it; the replacement now covers the full `{id}` placeholder, pinned by a test whose route echoes back the exact path it was hit on. (2) `get_chunk` with `project=<peer>/<alias>` plus a plain `chunk_id` died in local routing with "Unknown alias" — mounted remote projects are now routed through the same federated fetch search uses (local aliases still win a name clash), so both `chunk_ref` and `project=`+`chunk_id` forms work against remote peers.
 
 ## [1.3.19]
