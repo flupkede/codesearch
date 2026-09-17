@@ -34,6 +34,28 @@ impl CodesearchService {
                 .await;
         }
 
+        // Federated mounts: `project=<peer>/<alias>` routes to the peer's own
+        // project, exactly like search's project-level federation — chunk_ids
+        // are peer-local, so the fetch reuses the chunk_ref path with a
+        // synthetic "<peer>/<alias>:<id>" ref. Local aliases ALWAYS win a name
+        // clash: only route remotely when the name is not a local project.
+        if let Some(proj) = request.project.as_deref() {
+            let cfg = self.federation_config();
+            if cfg.resolve(proj).is_none() {
+                if let Some(crate::db_discovery::repos::Target::RemoteProject {
+                    peer_name,
+                    peer: _,
+                    remote_alias,
+                }) = cfg.resolve_remote_project(proj)
+                {
+                    let chunk_ref = format!("{peer_name}/{remote_alias}:{}", request.chunk_id);
+                    return self
+                        .federated_get_chunk(&chunk_ref, request.context_lines)
+                        .await;
+                }
+            }
+        }
+
         // In multi-repo serve mode, require explicit project or group scope.
         // Unscoped get_chunk would fan-out over all repos, opening all DBs unnecessarily.
         // Consistent with search/find/explore which also require scope.
