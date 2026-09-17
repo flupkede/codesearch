@@ -114,7 +114,7 @@ sysinfo = { version = "0.39", default-features = true }
 libc = "0.2"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3.13"
 pretty_assertions = "1.4"
 serial_test = "3"
