@@ -126,14 +126,14 @@ jobs:
 
       - name: Upload kale artifact
         # pin@v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
       - name: Upload with-csharp artifact
         # pin@v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ matrix.artifact_csharp }}
           path: ${{ matrix.artifact_csharp }}
@@ -232,14 +232,14 @@ jobs:
 
       - name: Upload kale artifact
         # pin@v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: codesearch-macos-arm64.tar.gz
           path: codesearch-macos-arm64.tar.gz
 
       - name: Upload with-csharp artifact
         # pin@v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: codesearch-macos-arm64-with-csharp.tar.gz
           path: codesearch-macos-arm64-with-csharp.tar.gz
