@@ -30,6 +30,62 @@ fn rest_service_drop_does_not_touch_active_sessions() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn get_chunk_routes_mounted_remote_projects_through_federation() {
+    // todo #153: `get_chunk(project="<peer>/<alias>", chunk_id=…)` must route
+    // through the federated fetch exactly like search's project-level
+    // federation, instead of dying in local routing with "Unknown alias".
+    // The peer URL here is unreachable, so the correctly routed answer is the
+    // federation failure message — "Unknown alias" means the routing did not
+    // happen.
+    let mut config = ReposConfig::default();
+    config.remotes.insert(
+        "cloud".to_string(),
+        crate::db_discovery::repos::RemotePeer {
+            url: "http://127.0.0.1:1".to_string(),
+            api_key: "test-key".to_string(),
+            group: None,
+            timeout_secs: None,
+        },
+    );
+    config.remote_mounts.push("cloud/bynder".to_string());
+    // Hermetic config: persist to a temp file and pass the override, so
+    // `reload_if_changed` reads THIS config — not the developer's real
+    // ~/.codesearch/repos.json (which would leak real peers into the test).
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let _env =
+        crate::testing::EnvRestore::set(&[(crate::constants::REMOTE_PEER_RETRY_BACKOFF_ENV, "1")]);
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 2058,
+        chunk_ref: None,
+        context_lines: None,
+        project: Some("cloud/bynder".to_string()),
+        group: None,
+    };
+    let res = service
+        .get_chunk(rmcp::handler::server::wrapper::Parameters(req))
+        .await
+        .expect("handler must not error");
+    let text = match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    assert!(
+        text.contains("Could not fetch chunk from remote peer 'cloud'"),
+        "get_chunk must route mounted remote projects to the peer, got: {text}"
+    );
+    assert!(
+        !text.contains("Unknown alias"),
+        "a mounted remote project is not a local alias — routing failed: {text}"
+    );
+}
+
 #[test]
 fn tracked_session_drop_balances_active_sessions() {
     // A genuine MCP session increments on connect and the serve factory

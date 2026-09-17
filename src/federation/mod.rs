@@ -402,7 +402,7 @@ impl FederationClient {
     ) -> Outcome<serde_json::Value> {
         let mut url = Self::peer_url(
             peer,
-            &crate::constants::CHUNK_PATH.replace("{id", &chunk_id.to_string()),
+            &crate::constants::CHUNK_PATH.replace("{id}", &chunk_id.to_string()),
         );
         // Scope the lookup: prefer a single-project scope (`project=<alias>`)
         // so the multi-repo peer can disambiguate the chunk_id; fall back to
@@ -1282,6 +1282,51 @@ mod tests {
             hits.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "two cold-start 503s + one success = three attempts"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_chunk_requests_the_exact_chunk_path_without_placeholder_residue() {
+        // Regression (todo #153): the URL template is `/chunk/{id}`; a
+        // placeholder replacement that missed the closing brace produced
+        // `/chunk/2058%7D`. Axum's `{id}` param happily swallowed the stray
+        // `}` into the captured value, so mock-based route tests passed while
+        // real peers answered 400 Bad Request on the mangled id. The route
+        // below echoes back the EXACT path it was hit on, so any residue in
+        // the constructed URL fails the assertion.
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let seen_clone = seen.clone();
+        let router = axum::Router::new().route(
+            "/chunk/{id}",
+            axum::routing::get(move |uri: axum::http::Uri| {
+                let seen = seen_clone.clone();
+                async move {
+                    *seen.lock().await = uri.path().to_string();
+                    axum::Json(serde_json::json!({
+                        "chunk_id": 2058,
+                        "content": "ok",
+                        "path": "kb/x.md",
+                        "start_line": 1,
+                        "end_line": 2
+                    }))
+                }
+            }),
+        );
+        let addr = spawn_test_server(router).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .get_chunk(&peer(format!("http://{addr}")), Some("bynder"), 2058, None)
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Ok(_)),
+            "the peer must answer the clean path"
+        );
+        assert_eq!(
+            *seen.lock().await,
+            "/chunk/2058",
+            "the constructed URL must carry the bare chunk id — no placeholder residue"
         );
     }
 

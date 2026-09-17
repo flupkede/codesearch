@@ -14,7 +14,7 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.4.0] - 2026-09-17
+## [1.4.3] - 2026-09-17
 
 ### Security
 
@@ -47,6 +47,12 @@ finalized in place with a date — no renaming/migration step needed.
 ### Fixed
 
 - **Serve auto-recovers LMDB storage-format corruption with a sequential wipe + rebuild.** After the arroy 0.5→0.8 / heed 0.20→0.22 major upgrades, every repo whose on-disk database was written by the previous binary failed its symbol rebuild with `MDB_BAD_VALSIZE: Unsupported size of key/DB name/data, or wrong DUPFIXED size` (observed on all C# repos after deploy). When a symbol rebuild now fails with that error class, serve wipes the repo's DB directory — closing the LMDB envs first via the same eviction sequence `remove_repo` uses, with the same bounded retry for transient Windows lock holders — and force-reindexes it through the existing force-reindex machinery, whose store-open path recreates everything on the new formats. Recoveries are queued and processed strictly **one repo at a time**: each rebuild runs a full CPU-bound embed pass, so parallel recoveries would thrash the machine. Read-only repos are skipped with a pointer to the owning writer. This closes the gap the tantivy FTS graceful reset (above) already covered on the FTS side — the vector/symbol stores now self-heal the same upgrade boundary instead of staying red until an operator force-reindexes by hand.
+
+### Fixed
+
+- **Dependency batch: criterion 0.8, serial_test 4, indicatif 0.18, colored 3 (dependabot majors) + CI actions refresh.** The four cargo majors were drop-in for lib/bins; benches and dev-test surface absorbed the criterion 0.5→0.8 and serial_test 3→4 API moves. The five GitHub Actions bumps (upload-artifact v7, download-artifact v8, cache v6, setup-dotnet v6, action-gh-release v3) are the dependabot-proposed SHA pins. dependabot itself now targets develop permanently (`target-branch` in the default-branch config): its rebases used to reset the base to master, tripping the `check-source-branch` guard.
+
+- **Federated chunk fetch works again — URL residue and project-scope routing (todo #153).** Two independent defects: (1) the peer URL for a `chunk_ref` fetch was built by replacing `{id` without the closing brace, so the constructed path carried a stray `}` (`/chunk/2058%7D`) that real peers answered with 400 Bad Request — axum's `{id}` parameter happily swallowed the stray brace into the captured value, which is exactly why the mock-based tests never caught it; the replacement now covers the full `{id}` placeholder, pinned by a test whose route echoes back the exact path it was hit on. (2) `get_chunk` with `project=<peer>/<alias>` plus a plain `chunk_id` died in local routing with "Unknown alias" — mounted remote projects are now routed through the same federated fetch search uses (local aliases still win a name clash), so both `chunk_ref` and `project=`+`chunk_id` forms work against remote peers.
 
 ## [1.3.19]
 

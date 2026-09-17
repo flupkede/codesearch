@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.4.0"
+version = "1.4.3"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -88,7 +88,7 @@ tracing-appender = "0.2"
 sha2 = "0.11"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-colored = "2.1"
+colored = "3.1"
 indicatif = "0.17"
 dirs = "7"
 num_cpus = "1.16"
