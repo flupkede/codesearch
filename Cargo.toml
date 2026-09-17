@@ -117,7 +117,7 @@ libc = "0.2"
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3.13"
 pretty_assertions = "1.4"
-serial_test = "3"
+serial_test = "4"
 
 # Benchmarks will be added later
 # [[bench]]
