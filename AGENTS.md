@@ -264,3 +264,18 @@ with "Database is locked by another process".
    over an empty index. — done
 3. Idle eviction warns with the `lmdb_registry` holder list when the env is still open after evict. — done
 4. Regression tests + CHANGELOG (1.4.4). — done
+
+Follow-up on the same branch, from the log analysis of the incident itself (the wedge was a symptom;
+these two are what produced it):
+
+5. `MDB_BAD_VALSIZE` is no longer answered with a second wipe. The same five C# repos were wiped
+   twice on 2026-09-17; the second failure hit a DB created hours earlier by this binary, so it is a
+   write-side error (LMDB rejects an empty or >511-byte key), not an old storage major. One recovery
+   per alias per process, the raw error is logged, and every SCIP `put` names its table and key
+   size. — done
+6. The third MDB_MAP_FULL attempt logs its give-up (it returned in silence, which is why the wedged
+   insert left no trace), each retry is announced, and a failed attempt hands back its chunk ids. — done
+
+Open, not explained yet: why BOIN.Aprimo (16.9 MB of source, 41 311 chunks) needed >4 GB of LMDB
+while HUSQ.Aprimo (18 638 chunks) fits in 190 MB, and why the same repo indexed the same morning
+without a single resize. The 14 259-chunk batch 14 is the suspect.

@@ -237,6 +237,19 @@ fn deserialize_keys_v1(bytes: &[u8]) -> Result<Vec<String>> {
     bincode::deserialize(&bytes[1..]).with_context(|| "bincode deserialize keys failed")
 }
 
+/// Context for a SCIP LMDB write. A bare `MDB_BAD_VALSIZE` names neither the
+/// table nor the offending key, which is why the 2026-09 wipe loop ran blind:
+/// the key size (LMDB rejects 0 and >511 bytes) is the whole diagnosis.
+fn put_ctx(db_name: &str, key: &str, value_len: usize) -> String {
+    format!(
+        "LMDB put into '{}' failed — key {} byte(s), value {} byte(s), key: {:.160}",
+        db_name,
+        key.len(),
+        value_len,
+        key
+    )
+}
+
 // ── Ref-resolution warnings persistence ───────────────────────────
 
 /// Persist one canonical key's resolution warnings into `scip_ref_warnings`,
@@ -257,7 +270,8 @@ fn store_ref_warnings(
     } else {
         let bytes = serialize_keys_v1(warnings)
             .with_context(|| format!("Failed to serialize warnings for {canonical}"))?;
-        db.put(wtxn, canonical, &bytes)?;
+        db.put(wtxn, canonical, &bytes)
+            .with_context(|| put_ctx(SCIP_REF_WARNINGS_DB_NAME, canonical, bytes.len()))?;
     }
     Ok(())
 }
@@ -920,7 +934,9 @@ impl CSharpSymbolIndexer {
                 env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
             let cached_bytes = serialize_refs(&lazy_refs)
                 .with_context(|| format!("Failed to serialize refs for cache: {}", canonical))?;
-            ref_cache_db.put(&mut wtxn, canonical, &cached_bytes)?;
+            ref_cache_db
+                .put(&mut wtxn, canonical, &cached_bytes)
+                .with_context(|| put_ctx(SCIP_REF_CACHE_DB_NAME, canonical, cached_bytes.len()))?;
             // Same txn as the refs: cached-partial and its warnings are one
             // atomic fact. Empty warnings remove any stale entry.
             store_ref_warnings(&env, &mut wtxn, canonical, &lazy_warnings)?;
@@ -1240,7 +1256,9 @@ impl CSharpSymbolIndexer {
             // "resolved" so collect_uncached_symbol_keys() won't retry them forever.
             let bytes = serialize_refs(&refs)
                 .with_context(|| format!("Failed to serialize batch refs for {}", result.symbol))?;
-            ref_cache_db.put(&mut wtxn, result.symbol.as_str(), &bytes)?;
+            ref_cache_db
+                .put(&mut wtxn, result.symbol.as_str(), &bytes)
+                .with_context(|| put_ctx(SCIP_REF_CACHE_DB_NAME, &result.symbol, bytes.len()))?;
             // Same txn as the refs: cached-partial and its warnings are one
             // atomic fact. Empty warnings remove any stale entry.
             store_ref_warnings(&env, &mut wtxn, &result.symbol, &result.warnings)?;
@@ -1440,7 +1458,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                             let b = serialize_refs(&survivors).with_context(|| {
                                 format!("Failed to re-serialize survivors for {}", key)
                             })?;
-                            symbols_db.put(&mut wtxn, key.as_str(), &b)?;
+                            symbols_db
+                                .put(&mut wtxn, key.as_str(), &b)
+                                .with_context(|| put_ctx(SCIP_DB_NAME, key, b.len()))?;
                         }
                     }
                 }
@@ -1554,7 +1574,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             let value_bytes = serialize_refs(&stored)
                 .with_context(|| format!("Failed to serialize definitions for {}", symbol_name))?;
 
-            symbols_db.put(&mut wtxn, symbol_name.as_str(), &value_bytes)?;
+            symbols_db
+                .put(&mut wtxn, symbol_name.as_str(), &value_bytes)
+                .with_context(|| put_ctx(SCIP_DB_NAME, symbol_name, value_bytes.len()))?;
             total_defs += stored.len();
             total_symbols += 1;
         }
@@ -1582,7 +1604,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         for (key, keys) in &positions {
             let bytes = serialize_keys_v1(keys)
                 .with_context(|| format!("Failed to serialize position key: {}", key))?;
-            positions_db.put(&mut wtxn, key.as_str(), &bytes)?;
+            positions_db
+                .put(&mut wtxn, key.as_str(), &bytes)
+                .with_context(|| put_ctx(SCIP_POSITION_DB_NAME, key, bytes.len()))?;
         }
 
         tracing::debug!(
@@ -1616,7 +1640,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         for (key, keys) in &all_simple_names {
             let bytes = serialize_keys_v1(keys)
                 .with_context(|| format!("Failed to serialize simple name key: {}", key))?;
-            simple_names_db.put(&mut wtxn, key.as_str(), &bytes)?;
+            simple_names_db
+                .put(&mut wtxn, key.as_str(), &bytes)
+                .with_context(|| put_ctx(SCIP_SIMPLE_NAMES_DB_NAME, key, bytes.len()))?;
         }
 
         tracing::debug!(

@@ -238,6 +238,13 @@ pub(crate) struct ServeState {
     /// recoveries would thrash the machine. See
     /// [`Self::enqueue_format_recovery`] / [`Self::recover_repo_format`].
     format_recovery_queue: std::sync::Mutex<std::collections::VecDeque<String>>,
+    /// Aliases already wiped by format recovery in this process. A genuine
+    /// storage-major mismatch can only exist once per DB: after the wipe the
+    /// data is rewritten by the running binary. A second `MDB_BAD_VALSIZE` on
+    /// the same alias therefore means the error is written by *our* code, not
+    /// by an old format, and wiping again only restarts a multi-hour reindex
+    /// loop. See [`Self::recover_repo_format`].
+    format_recovery_done: DashMap<String, ()>,
     /// Guarantees at most one recovery worker is alive. A worker that finds
     /// the queue empty flips this back to `false` under the queue lock, so an
     /// enqueue racing the worker's exit re-spawns cleanly (no lost wake-up).
@@ -377,6 +384,7 @@ impl ServeState {
             fsw_tasks: DashMap::new(),
             index_tasks: DashMap::new(),
             format_recovery_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            format_recovery_done: DashMap::new(),
             format_recovery_worker_started: std::sync::atomic::AtomicBool::new(false),
             config: std::sync::RwLock::new(config),
             config_mtime: std::sync::RwLock::new(None),
@@ -640,14 +648,19 @@ impl ServeState {
     /// Queue `alias` for a sequential wipe + force reindex after LMDB format
     /// corruption was detected. Deduplicates; spawns the single recovery
     /// worker on the first enqueue.
-    fn enqueue_format_recovery(self: &Arc<Self>, alias: &str) {
+    /// Returns `false` when the wipe was refused because this process already
+    /// wiped `alias` once (see [`Self::format_recovery_done`]).
+    fn enqueue_format_recovery(self: &Arc<Self>, alias: &str) -> bool {
+        if self.format_recovery_done.contains_key(alias) {
+            return false;
+        }
         {
             let mut queue = self
                 .format_recovery_queue
                 .lock()
                 .expect("format_recovery_queue lock poisoned");
             if queue.iter().any(|a| a == alias) {
-                return;
+                return true;
             }
             queue.push_back(alias.to_string());
         }
@@ -662,6 +675,7 @@ impl ServeState {
             let state = Arc::clone(self);
             tokio::spawn(state.format_recovery_worker());
         }
+        true
     }
 
     /// Pops queued aliases and recovers them ONE AT A TIME until the queue
@@ -751,6 +765,9 @@ impl ServeState {
                 }
             }
         }
+        // Recorded at the wipe, not at a successful rebuild: the one thing a
+        // repeat must not do is wipe twice, whatever the rebuild's outcome.
+        self.format_recovery_done.insert(alias.to_string(), ());
         tracing::info!(
             "🔧 Format recovery: wiped stale-format DB dir for '{}' — rebuilding",
             alias
@@ -4004,23 +4021,42 @@ async fn trigger_symbol_rebuild(
             state.schedule_persist_repos_config();
         }
         Ok(Err(e)) => {
-            let msg = e.to_string();
+            // `{:#}` — the whole chain, not just the outermost context. The
+            // SCIP puts wrap their errors (table + key size), and plain `{}`
+            // would hide the `MDB_*` code the classifier below matches on.
+            let msg = format!("{e:#}");
             state.end_indexing(&alias_owned);
             state
                 .csharp_index_error
                 .insert(alias_owned.clone(), msg.clone());
-            if ServeState::is_lmdb_format_corruption(&msg) {
+            if ServeState::is_lmdb_format_corruption(&msg)
+                && state.enqueue_format_recovery(&alias_owned)
+            {
                 tracing::warn!(
-                    "⚠️ LMDB storage-format corruption for '{}' (data written by an older \
-                     storage-major) — queueing sequential wipe + full rebuild",
-                    alias_owned
+                    "⚠️ LMDB storage-format corruption for '{}' — queueing sequential wipe + \
+                     full rebuild. Raw error: {}",
+                    alias_owned,
+                    msg
                 );
                 // Recovery owns the outcome from here: show in-progress rather
                 // than Error; it flips to Ready on success or Error on failure.
                 state
                     .csharp_index_status
-                    .insert(alias_owned.clone(), CSharpIndexStatus::Indexing);
-                state.enqueue_format_recovery(&alias_owned);
+                    .insert(alias_owned, CSharpIndexStatus::Indexing);
+            } else if ServeState::is_lmdb_format_corruption(&msg) {
+                // A wipe already happened for this alias in this process, so the
+                // data was written by the running binary: the error is write-side
+                // (LMDB rejects an empty or >511-byte key), not an old format.
+                // Wiping again would only restart a multi-hour reindex loop.
+                tracing::error!(
+                    "❌ Symbol rebuild for '{}' hit an LMDB key/value-size error AFTER a format \
+                     wipe — refusing a second wipe, this is a bug in the writer: {}",
+                    alias_owned,
+                    msg
+                );
+                state
+                    .csharp_index_status
+                    .insert(alias_owned, CSharpIndexStatus::Error);
             } else {
                 tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
                 state

@@ -1233,12 +1233,14 @@ impl IndexManager {
                 }
             }
             Err(e) => {
+                // `{:#}` — the whole chain. Plain `{}` prints only the outermost
+                // context, which hides the LMDB error under its put context.
                 warn!(
-                    "⚠️ [{}] {} symbol rebuild failed: {}",
+                    "⚠️ [{}] {} symbol rebuild failed: {:#}",
                     repo_label, lang_label, e
                 );
                 if let Some(n) = notifier {
-                    n(SymbolRebuildSignal::Failed(e.to_string()));
+                    n(SymbolRebuildSignal::Failed(format!("{e:#}")));
                 }
             }
         }
@@ -1713,14 +1715,17 @@ impl IndexManager {
                                                 }
                                             }
                                             Err(e) => {
+                                                // `{:#}` for the same reason as the
+                                                // full-rebuild path: the put context
+                                                // would otherwise hide the MDB_* code.
                                                 warn!(
-                                                    "⚠️ [{}/{}] Symbol rebuild failed ({}): {}",
+                                                    "⚠️ [{}/{}] Symbol rebuild failed ({}): {:#}",
                                                     i + 1,
                                                     total_groups,
                                                     csproj_name,
                                                     e
                                                 );
-                                                last_error = Some(e.to_string());
+                                                last_error = Some(format!("{e:#}"));
                                             }
                                         }
                                     }
