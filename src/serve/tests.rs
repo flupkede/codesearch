@@ -2938,3 +2938,111 @@ async fn enqueue_format_recovery_dedupes_and_starts_single_worker() {
         "the first enqueue must start the recovery worker"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn stale_indexing_marker_cancels_the_leaked_index_task() {
+    // Regression: evicting the stale marker used to fix only what the TUI
+    // believed. The task itself kept running and kept its `Arc<SharedStores>`
+    // — so the LMDB env and `.writer.lock` stayed held and every later write
+    // failed with "Database is locked by another process" on a repo that
+    // logged as idle and closed.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Stand-in for the store handles the real task captures.
+    let stores = Arc::new(());
+    let stores_task = stores.clone();
+    let token = CancellationToken::new();
+    let task_token = token.clone();
+    let handle = tokio::spawn(async move {
+        task_token.cancelled().await;
+        drop(stores_task);
+    });
+    state
+        .index_tasks
+        .insert("leaky".to_string(), (handle, token.clone()));
+    state.active_reindexes.insert(
+        "leaky".to_string(),
+        Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("monotonic clock at least 2s old"),
+    );
+
+    assert!(
+        !state.is_indexing("leaky"),
+        "a marker older than the timeout must not read as indexing"
+    );
+    assert!(
+        token.is_cancelled(),
+        "the leaked task must be cancelled, not merely forgotten"
+    );
+
+    let (handle, _) = state
+        .index_tasks
+        .remove("leaky")
+        .expect("task entry kept")
+        .1;
+    handle.await.expect("cancelled task joins cleanly");
+    assert_eq!(
+        Arc::strong_count(&stores),
+        1,
+        "the leaked task must have released its store handle"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn fresh_indexing_marker_leaves_its_index_task_running() {
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    let token = CancellationToken::new();
+    let task_token = token.clone();
+    let handle = tokio::spawn(async move { task_token.cancelled().await });
+    state
+        .index_tasks
+        .insert("busy".to_string(), (handle, token.clone()));
+    state.begin_indexing("busy");
+
+    assert!(
+        state.is_indexing("busy"),
+        "a fresh marker still reads as indexing"
+    );
+    assert!(
+        !token.is_cancelled(),
+        "a live reindex must never be cancelled by the staleness check"
+    );
+    token.cancel();
+}
+
+#[tokio::test]
+async fn self_clean_keeps_the_db_dir_of_a_still_registered_repo() {
+    // Regression: the post-build guards reach their cleanup branch whenever
+    // their token is cancelled, and a cancelled token no longer means "the
+    // repo was removed" (idle eviction and the stale-marker cleanup both
+    // cancel one). Deleting on the token alone wiped a live repo's index.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = crate::cache::safe_canonicalize(tmp.path()).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("live".to_string()))
+        .unwrap();
+    let state = Arc::new(ServeState::new(config, None));
+
+    state.self_clean_if_unregistered("live", &db_path);
+    assert!(
+        db_path.exists(),
+        "a registered repo's DB dir must survive a cancelled task"
+    );
+
+    // Unregistered alias: the orphan cleanup still runs.
+    state.self_clean_if_unregistered("gone", &db_path);
+    assert!(
+        !db_path.exists(),
+        "an unregistered alias's orphaned DB dir must still be cleaned up"
+    );
+}

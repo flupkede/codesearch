@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.4.4]
+
+### Fixed
+
+- **A leaked indexing task no longer keeps a repo's LMDB env and writer lock open forever.** Evicting a stale `active_reindexes` marker only corrected what the TUI and the reindex guard believed — the background task behind it kept running and kept the `Arc<SharedStores>` it captured, so the env and `.writer.lock` stayed held for the process lifetime. The repo then logged as idle and "DB closed" while every write (`reindex`, format recovery, `POST /repos`) failed with "Database is locked by another process", indefinitely: observed on a repo left at 0 chunks for two days after a format-recovery rebuild wedged. The staleness check now cancels the task's token (cooperatively — the handle is still never aborted), format recovery reports a cancelled rebuild as a failure instead of logging "rebuild complete" over an empty index, and idle eviction warns with the holder list when the env is still open after the repo was evicted. The post-build self-cleanup that deletes an orphaned `.codesearch.db` now keys on the alias actually being gone from the config instead of on a cancelled token — a cancelled token no longer implies "repo removed", so the old rule would have wiped a live repo's index whenever a rebuild outlived its 30-minute marker.
+
 ## [1.4.3] - 2026-09-17
 
 ### Security

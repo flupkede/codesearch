@@ -775,6 +775,7 @@ impl ServeState {
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
+                self.confirm_rebuild_finished(alias)?;
                 tracing::info!("🔧 Format recovery: rebuild complete for '{}'", alias);
                 Ok(())
             }
@@ -794,6 +795,10 @@ impl ServeState {
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
+                // No completion check here: the in-flight rebuild is not ours,
+                // and a leftover `index_tasks` entry from an earlier cancelled
+                // task would make `confirm_rebuild_finished` report a healthy
+                // index as cancelled.
                 Ok(())
             }
             tui::ReindexLaunch::Failed => Err(format!(
@@ -801,6 +806,31 @@ impl ServeState {
                 alias
             )),
         }
+    }
+
+    /// Distinguish a rebuild that finished from one whose indexing marker was
+    /// merely evicted as stale.
+    ///
+    /// The recovery wait loop polls [`Self::is_indexing`], which self-heals a
+    /// leaked marker after [`MAX_INDEXING_SECS`] and (since the handle-leak
+    /// fix) cancels the task behind it. Both look identical to the loop, so
+    /// without this check a rebuild that was cancelled 28 minutes in still
+    /// logged "rebuild complete" and the repo stayed empty until someone
+    /// noticed. Reporting the failure lets the worker log it and leaves the
+    /// repo to be re-queued by the next corruption detection.
+    fn confirm_rebuild_finished(&self, alias: &str) -> Result<(), String> {
+        let cancelled = self
+            .index_tasks
+            .get(alias)
+            .is_some_and(|entry| entry.value().1.is_cancelled());
+        if cancelled {
+            return Err(format!(
+                "rebuild for '{}' was cancelled before it completed (stale indexing marker); \
+                 the index is left empty",
+                alias
+            ));
+        }
+        Ok(())
     }
 
     /// Returns `true` if `alias` is currently (non-stale) indexing.
@@ -831,10 +861,51 @@ impl ServeState {
                 alias,
                 max.as_secs()
             );
+            self.cancel_stale_index_task(alias);
             return false;
         }
         // Entry is either absent or still within the active window.
         self.active_reindexes.contains_key(alias)
+    }
+
+    /// Cancel the background index task still registered for `alias` after its
+    /// indexing marker was evicted as stale.
+    ///
+    /// Dropping the marker only fixes what the TUI and the reindex guard
+    /// *believe*; the task itself keeps running, and with it the
+    /// `Arc<SharedStores>` it captured — so the LMDB env and the
+    /// `.writer.lock` stay held for the process lifetime. Every later write
+    /// (reindex, format recovery, `POST /repos`) then fails with "Database is
+    /// locked by another process" even though the repo looks idle and closed.
+    /// Cancelling the task's token releases those handles at its next
+    /// cancellation point.
+    ///
+    /// Cooperative only: the handle is never aborted (see
+    /// [`Self::await_index_task`] — an abort would detach the blocking
+    /// `build_index` that owns its own store clone and drop the post-build
+    /// self-cleanup), and the entry stays registered so `remove_repo` can
+    /// still join it. A task that already finished is reaped here instead.
+    fn cancel_stale_index_task(&self, alias: &str) {
+        let finished = match self.index_tasks.get(alias) {
+            Some(entry) => {
+                let (handle, token) = entry.value();
+                if handle.is_finished() {
+                    true
+                } else {
+                    token.cancel();
+                    tracing::warn!(
+                        "🧹 Cancelled the leaked index task for '{}' — releasing its store \
+                         handles and writer lock",
+                        alias
+                    );
+                    false
+                }
+            }
+            None => return,
+        };
+        if finished {
+            self.index_tasks.remove(alias);
+        }
     }
 
     /// Returns the configured maximum indexing duration, honouring the
@@ -2075,6 +2146,36 @@ impl ServeState {
         }
     }
 
+    /// Self-clean a just-released DB directory, but ONLY when `alias` is
+    /// really gone from the config.
+    ///
+    /// The post-build guards reach their cleanup branch via
+    /// [`Self::is_alias_live`], which is false for two different reasons: the
+    /// repo was removed, or its token was cancelled while the repo stayed
+    /// registered (idle eviction cancels the FSW token; the stale-marker
+    /// cleanup cancels the index token). Deleting on the second reason wipes
+    /// the index of a live repo — the very symptom these paths exist to avoid
+    /// — so the registration check, not the token, decides.
+    fn self_clean_if_unregistered(&self, alias: &str, db_path: &std::path::Path) {
+        // Poisoned lock defaults to "registered": here the fallback decides
+        // whether to DELETE, so it must fail towards keeping the directory —
+        // unlike `is_alias_live`, whose `false` merely means "stop".
+        let registered = self
+            .config
+            .read()
+            .map(|c| c.resolve(alias).is_some())
+            .unwrap_or(true);
+        if registered {
+            tracing::info!(
+                "Task for '{}' was cancelled but the repo is still registered — keeping its DB \
+                 dir (handles released)",
+                alias
+            );
+            return;
+        }
+        Self::remove_orphaned_db_dir(alias, db_path);
+    }
+
     /// True iff `alias` is still registered in the config AND its indexing
     /// `CancellationToken` has not been cancelled.
     ///
@@ -2098,7 +2199,7 @@ impl ServeState {
     /// Creates a fresh IndexManager, performs an initial incremental refresh,
     /// then starts the continuous file watcher loop. Updates the RepoState with
     /// the new cancel token and IndexManager.
-    async fn restart_fsw(&self, alias: &str, stores: Arc<SharedStores>) {
+    async fn restart_fsw(self: &Arc<Self>, alias: &str, stores: Arc<SharedStores>) {
         // The caller already cancelled the previous FSW task via stop_fsw.
         // Await its exit so its Arc<SharedStores>/Arc<IndexManager> clones drop
         // before we spawn a new task against the same stores (and so the old
@@ -2139,6 +2240,7 @@ impl ServeState {
                 let token_for_task = token.clone();
                 let notifier = self.make_csharp_notifier(alias);
                 let indexing_cb = self.make_indexing_status_callback(alias);
+                let state_for_task = Arc::clone(self);
 
                 let fsw_handle = tokio::spawn(async move {
                     if let Err(e) = im_for_task.start_watching().await {
@@ -2167,7 +2269,7 @@ impl ServeState {
                         // on disk until a serve restart.
                         drop(im_for_task);
                         drop(stores_bg);
-                        ServeState::remove_orphaned_db_dir(&alias_bg, &db_path_bg);
+                        state_for_task.self_clean_if_unregistered(&alias_bg, &db_path_bg);
                         return;
                     }
 
@@ -2565,6 +2667,11 @@ impl ServeState {
                             // in `await_fsw_shutdown` actually holds.
                             drop(im_for_task);
                             drop(stores_for_task);
+                            // NOTE: this cold-open FSW task cannot reach the
+                            // config (`get_or_open_stores` takes `&self`), so
+                            // it keeps the token-only rule. Its token is the
+                            // FSW one, which the stale-marker cleanup never
+                            // cancels.
                             ServeState::remove_orphaned_db_dir(&alias_clone, &db_path_clone);
                             return;
                         }
@@ -3245,6 +3352,42 @@ impl ServeState {
             .unwrap_or_else(|| std::time::Duration::from_secs(REPO_IDLE_TIMEOUT_SECS))
     }
 
+    /// Warn when an evicted repo's LMDB env is still held in-process.
+    ///
+    /// Eviction logs "DB closed", but that only drops *our* map entry: any
+    /// other live holder — most often a leaked indexing task — keeps the env
+    /// and the `.writer.lock` open, and every later write then fails with
+    /// "Database is locked by another process" on a repo the log said was
+    /// closed. Naming the holders turns a two-day silent failure into one
+    /// warning line.
+    ///
+    /// Gated on a still-running index task: the reaper only evicts repos that
+    /// are not indexing, so a live task here means its marker was already
+    /// evicted as stale — the leak signature. Without that gate the warning
+    /// would fire on every eviction, because a just-cancelled FSW drains
+    /// asynchronously and still holds the env for a moment.
+    fn warn_if_still_held(&self, alias: &str) {
+        let leaked_task = self
+            .index_tasks
+            .get(alias)
+            .is_some_and(|entry| !entry.value().0.is_finished());
+        if !leaked_task {
+            return;
+        }
+        let Some(project_path) = self.config.read().ok().and_then(|c| c.resolve(alias)) else {
+            return;
+        };
+        let holders = crate::lmdb_registry::open_holders_under(&project_path.join(DB_DIR_NAME));
+        if !holders.is_empty() {
+            tracing::warn!(
+                "⚠️ Evicted '{}' but its LMDB env is still open in-process ({}) — writes will \
+                 fail with \"locked by another process\" until the holder drops",
+                alias,
+                holders.join(", ")
+            );
+        }
+    }
+
     /// Evict all repos that have been idle longer than the timeout.
     ///
     /// Closes DB handles, stops FSW, and releases memory. The repo will be
@@ -3304,6 +3447,7 @@ impl ServeState {
                     cancel_token.cancel();
                     self.last_access.remove(alias);
                     info!("🕐 Evicted idle repo '{}' (FSW stopped, DB closed)", alias);
+                    self.warn_if_still_held(alias);
                 }
                 Some((_, RepoState::Warm { .. } | RepoState::Readonly { .. })) => {
                     self.last_access.remove(alias);
@@ -4144,7 +4288,7 @@ async fn reindex_handler(
                     g_alias
                 );
                 drop(stores);
-                ServeState::remove_orphaned_db_dir(&g_alias, &db_path);
+                g_state.self_clean_if_unregistered(&g_alias, &db_path);
                 g_state.end_indexing(&g_alias);
                 return;
             }
@@ -4218,7 +4362,7 @@ async fn reindex_handler(
                     g_alias
                 );
                 drop(stores);
-                ServeState::remove_orphaned_db_dir(&g_alias, &db_path);
+                g_state.self_clean_if_unregistered(&g_alias, &db_path);
                 g_state.end_indexing(&g_alias);
                 return;
             }
@@ -4601,7 +4745,7 @@ async fn add_repo_handler(
                 alias_bg
             );
             drop(stores);
-            ServeState::remove_orphaned_db_dir(&alias_bg, &db_path);
+            state_bg.self_clean_if_unregistered(&alias_bg, &db_path);
             state_bg.end_indexing(&alias_bg);
             return;
         }
