@@ -276,6 +276,12 @@ these two are what produced it):
 6. The third MDB_MAP_FULL attempt logs its give-up (it returned in silence, which is why the wedged
    insert left no trace), each retry is announced, and a failed attempt hands back its chunk ids. — done
 
+7. Root cause found, thanks to step 5's logging: the SCIP keys are too long for LMDB. Real C#
+   signatures with fully qualified parameter types reach 912 bytes against a 511-byte limit, which
+   is what produced every `MDB_BAD_VALSIZE`. heed's `longer-keys` feature raises the limit to the
+   page-derived ~1980 bytes, and a key still over it is skipped with a counted warning instead of
+   failing the rebuild. — done
+
 Open, not explained yet: why BOIN.Aprimo (16.9 MB of source, 41 311 chunks) needed >4 GB of LMDB
 while HUSQ.Aprimo (18 638 chunks) fits in 190 MB, and why the same repo indexed the same morning
 without a single resize. The 14 259-chunk batch 14 is the suspect.

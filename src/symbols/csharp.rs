@@ -928,7 +928,9 @@ impl CSharpSymbolIndexer {
             };
 
         // ── Write phase — cache the resolved references ────────────
-        {
+        // Over the LMDB key limit: answer from the live resolution and skip the
+        // cache write, rather than failing a lookup that already succeeded.
+        if canonical.len() <= env.max_key_size() {
             let mut wtxn = env.write_txn()?;
             let ref_cache_db: Database<Str, Bytes> =
                 env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
@@ -1252,6 +1254,11 @@ impl CSharpSymbolIndexer {
                 })
                 .collect();
 
+            // Over the LMDB key limit: skip rather than fail the batch, same
+            // rule as the rebuild's write loop.
+            if result.symbol.len() > env.max_key_size() {
+                continue;
+            }
             // Cache even if empty — symbols with 0 references must be marked as
             // "resolved" so collect_uncached_symbol_keys() won't retry them forever.
             let bytes = serialize_refs(&refs)
@@ -1535,7 +1542,26 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let mut total_defs = 0usize;
         let mut total_symbols = 0usize;
 
+        let max_key = env.max_key_size();
+        let mut oversized_keys = 0usize;
+
         for (symbol_name, references) in index.iter() {
+            // One pathological signature must never fail the whole rebuild:
+            // LMDB refuses a key above the page-derived limit, and that error
+            // used to read as storage-format corruption and wipe the index.
+            if symbol_name.len() > max_key {
+                oversized_keys += 1;
+                if oversized_keys == 1 {
+                    tracing::warn!(
+                        "⚠️ Skipping symbol(s) whose SCIP key exceeds this LMDB build's {}-byte \
+                         key limit — first: {} byte(s), {:.160}",
+                        max_key,
+                        symbol_name.len(),
+                        symbol_name
+                    );
+                }
+                continue;
+            }
             let new_stored: Vec<StoredReference> = references
                 .iter()
                 .map(|r| StoredReference {
@@ -1586,8 +1612,22 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // Maps each definition occurrence to the symbols defined at that position.
         // For incremental rebuilds, old position entries for affected files were
         // already deleted above; here we only write new ones.
+        if oversized_keys > 0 {
+            tracing::warn!(
+                "⚠️ {} symbol(s) skipped: SCIP key over the {}-byte LMDB limit. \
+                 find_impact cannot resolve those; every other symbol is indexed.",
+                oversized_keys,
+                max_key
+            );
+        }
+
         let mut positions: HashMap<String, Vec<String>> = HashMap::new();
         for (symbol_name, references) in index.iter() {
+            // Skipped above: a position entry pointing at an unwritten symbol
+            // would only produce lookup misses.
+            if symbol_name.len() > max_key {
+                continue;
+            }
             for r in references.iter().filter(|r| r.kind == "definition") {
                 let pos_key = format!(
                     "{}:{}",
@@ -1976,6 +2016,32 @@ mod tests {
             "UnrelatedName",
             "csharp App . FieldDefinition#Validate()."
         ));
+    }
+
+    /// C# SCIP keys carry fully qualified parameter types and reach 900+ bytes
+    /// (observed: 912). LMDB's stock 511-byte limit rejected those with
+    /// MDB_BAD_VALSIZE, which failed the whole rebuild and read as storage
+    /// corruption. This pins heed's `longer-keys` feature in Cargo.toml: drop
+    /// it and the incident returns.
+    #[test]
+    fn the_lmdb_key_limit_is_large_enough_for_fully_qualified_csharp_symbols() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = crate::symbols::get_shared_scip_env(&dir.path().join("db")).unwrap();
+        let max_key = env.max_key_size();
+        assert!(
+            max_key >= 1024,
+            "expected a page-derived key limit (heed feature `longer-keys`), got {max_key} bytes"
+        );
+
+        let long_key = "a".repeat(1000);
+        let mut wtxn = env.write_txn().unwrap();
+        let db: Database<Str, Bytes> = env
+            .open_database(&wtxn, Some(SCIP_DB_NAME))
+            .unwrap()
+            .unwrap();
+        db.put(&mut wtxn, long_key.as_str(), b"v".as_slice())
+            .expect("a 1000-byte key must be writable");
+        wtxn.commit().unwrap();
     }
 
     // ── has_index key-format gate (B4) ────────────────────────────────
