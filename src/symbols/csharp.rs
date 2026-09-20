@@ -1731,6 +1731,17 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         wtxn.commit()?;
 
+        // A rebuild changes on-disk source; a resident Roslyn workspace for
+        // this solution (if any) was loaded before that change and would
+        // silently keep answering find_refs from stale content otherwise —
+        // this pool has no other tie to repo state. Evict unconditionally
+        // (full or incremental): the next find_refs respawns fresh. The
+        // full-rebuild branch above already clears `ref_cache_db`; an
+        // incremental rebuild does not, so a symbol already cached before
+        // this change can still replay a stale answer on a cache hit —
+        // known residual gap, tracked separately (todo #168).
+        crate::symbols::resident::WORKSPACE_POOL.evict(&solution);
+
         let duration_ms = start.elapsed().as_millis() as u64;
 
         tracing::info!(

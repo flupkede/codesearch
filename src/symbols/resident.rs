@@ -277,6 +277,12 @@ pub(crate) struct WorkspacePool {
     /// not both pay the minutes-long workspace load. Different repos spawn
     /// in parallel. Entries are never removed (bounded by repo count).
     spawn_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    /// Bumped by `evict` for a solution, even with no resident entry to
+    /// remove — the only signal a spawn-in-progress can check itself
+    /// against, since `evict` must never take the per-key spawn lock (that
+    /// would block a rebuild for the full minutes-long load). Never removed
+    /// (bounded by repo count, same as `spawn_locks`).
+    generations: Mutex<HashMap<PathBuf, u64>>,
     max_resident: usize,
     idle: Duration,
     heap_cap: u64,
@@ -294,11 +300,21 @@ impl WorkspacePool {
         Self {
             entries: Mutex::new(HashMap::new()),
             spawn_locks: Mutex::new(HashMap::new()),
+            generations: Mutex::new(HashMap::new()),
             max_resident,
             idle,
             heap_cap,
             spawn_fn,
         }
+    }
+
+    fn current_generation(&self, solution: &Path) -> u64 {
+        *self
+            .generations
+            .lock()
+            .expect("generations poisoned")
+            .get(solution)
+            .unwrap_or(&0)
     }
 
     /// Resolve references for `symbol` via the resident workspace for
@@ -331,6 +347,12 @@ impl WorkspacePool {
             return outcome;
         }
 
+        // Snapshot BEFORE the spawn: if `evict` bumps this generation while
+        // we're mid-spawn (a rebuild landing during the minutes-long load),
+        // the workspace we're about to install is already stale — caught
+        // below without `evict` ever needing to block on `key_lock`.
+        let gen_before_spawn = self.current_generation(solution);
+
         // Spawn OUTSIDE the pool lock — it takes minutes and must not block
         // lookups on other repos (admission still happens under the lock).
         self.enforce_admission();
@@ -357,6 +379,17 @@ impl WorkspacePool {
                 drop(client); // Drop impl kills our redundant child
                 let outcome = c.find_refs(symbol);
                 self.release_parts(&inf, &d, &c);
+                return outcome;
+            }
+            // A rebuild evicted this solution while we were spawning: our
+            // workspace already predates it. Answer this one caller from it
+            // (it already paid the load cost) but do not install it as
+            // resident — installing it would resurrect exactly the stale
+            // answer `evict` was called to prevent.
+            if self.current_generation(solution) != gen_before_spawn {
+                drop(entries);
+                let outcome = client.find_refs(symbol);
+                client.kill();
                 return outcome;
             }
             entries.insert(
@@ -419,6 +452,44 @@ impl WorkspacePool {
             c.kill(); // OS call — outside the pool lock
         }
         resident
+    }
+
+    /// Drop the resident workspace for `solution`, if any, so the next
+    /// `find_refs` respawns against current on-disk source instead of
+    /// answering from a compilation loaded before the latest change. A
+    /// symbol rebuild refreshes the definitions layer (LMDB) but never
+    /// touches this pool on its own — without this call a resident
+    /// workspace can silently outlive the commit it was loaded for, up to
+    /// the full idle TTL, with no warning surfaced to the caller.
+    ///
+    /// Also bumps this solution's generation counter unconditionally, even
+    /// when nothing is resident to remove: a spawn already in flight for
+    /// this solution has no entry yet, but `find_refs` checks the counter
+    /// right before installing its result, so that spawn's answer is used
+    /// once and discarded instead of being resurrected as resident.
+    pub(crate) fn evict(&self, solution: &Path) {
+        let victim = {
+            let mut entries = self.entries.lock().expect("workspace pool poisoned");
+            let result = match entries.remove(solution) {
+                Some(e) if e.in_flight.load(Ordering::SeqCst) == 0 => Some(e.client),
+                Some(e) => {
+                    // In flight: same deferred-kill discipline as LRU eviction.
+                    e.doomed.store(true, Ordering::SeqCst);
+                    None
+                }
+                None => None,
+            };
+            *self
+                .generations
+                .lock()
+                .expect("generations poisoned")
+                .entry(solution.to_path_buf())
+                .or_insert(0) += 1;
+            result
+        };
+        if let Some(v) = victim {
+            v.kill();
+        }
     }
 
     /// Evict as many residents as needed to admit a new workspace — LRU
