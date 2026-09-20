@@ -285,3 +285,14 @@ these two are what produced it):
 Open, not explained yet: why BOIN.Aprimo (16.9 MB of source, 41 311 chunks) needed >4 GB of LMDB
 while HUSQ.Aprimo (18 638 chunks) fits in 190 MB, and why the same repo indexed the same morning
 without a single resize. The 14 259-chunk batch 14 is the suspect.
+
+8. Todo #168 (BAYR.Aprimo end-to-end test, todo #165): the resident Roslyn workspace pool (todo
+   #115) is keyed only by solution path and reused across `find_refs` calls with no tie to repo
+   changes — a symbol rebuild refreshed `index_head_sha` while the resident workspace still answered
+   from source loaded before the change, so a newly extracted method's call site went missing with
+   no warning. `WorkspacePool::evict` now runs at the end of every rebuild (full or incremental); a
+   per-solution generation counter closes the window where a spawn already in flight would otherwise
+   still install stale. — done. Residual, not fixed here: an incremental rebuild does not clear
+   `scip_ref_cache`, so a symbol already cached before the change can still replay a stale cached
+   answer on a cache hit (full rebuilds already clear that table) — narrowing invalidation to the
+   affected symbols is unscoped follow-up.
