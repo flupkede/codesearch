@@ -2916,15 +2916,37 @@ fn is_lmdb_format_corruption_matches_known_lmdb_errors() {
     }
 }
 
+/// The SCIP puts wrap their failures in a `put_ctx` context. `anyhow`'s plain
+/// `{}` prints ONLY the outermost context, so stringifying a rebuild error
+/// that way hides the `MDB_*` code from the classifier — and with it both the
+/// recovery and the refuse-a-second-wipe branch. Rebuild errors must therefore
+/// be rendered with `{:#}` (the whole chain).
+#[test]
+fn a_contextualised_lmdb_error_still_classifies_as_format_corruption() {
+    let err = anyhow::anyhow!(
+        "MDB_BAD_VALSIZE: Unsupported size of key/DB name/data, or wrong DUPFIXED size"
+    )
+    .context("LMDB put into 'scip_symbols' failed — key 0 byte(s), value 12 byte(s), key: ");
+
+    assert!(
+        !ServeState::is_lmdb_format_corruption(&format!("{err}")),
+        "precondition: plain Display hides the LMDB code — that is the trap"
+    );
+    assert!(
+        ServeState::is_lmdb_format_corruption(&format!("{err:#}")),
+        "the alternate formatter must expose the whole chain to the classifier"
+    );
+}
+
 #[tokio::test]
 async fn enqueue_format_recovery_dedupes_and_starts_single_worker() {
     let state = Arc::new(ServeState::new(ReposConfig::default(), None));
     // Same alias three times must collapse to one queued entry. The recovery
     // worker is spawned but (current-thread test runtime) does not execute
     // until an await point, so the queue content is asserted deterministically.
-    state.enqueue_format_recovery("ghost-repo");
-    state.enqueue_format_recovery("ghost-repo");
-    state.enqueue_format_recovery("ghost-repo");
+    assert!(state.enqueue_format_recovery("ghost-repo"));
+    assert!(state.enqueue_format_recovery("ghost-repo"));
+    assert!(state.enqueue_format_recovery("ghost-repo"));
     let len = state
         .format_recovery_queue
         .lock()
@@ -2936,5 +2958,148 @@ async fn enqueue_format_recovery_dedupes_and_starts_single_worker() {
             .format_recovery_worker_started
             .load(std::sync::atomic::Ordering::Acquire),
         "the first enqueue must start the recovery worker"
+    );
+}
+
+/// A DB this process already wiped cannot hold old-format data, so a second
+/// `MDB_BAD_VALSIZE` for that alias is a write-side bug. Re-wiping it cost
+/// ~20 minutes of reindex per repo per occurrence (incident 2026-09-17).
+#[tokio::test]
+async fn a_second_format_recovery_for_the_same_alias_is_refused() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    assert!(state.enqueue_format_recovery("ghost-repo"));
+    // Drain the queue the way the worker does, then mark the wipe as done.
+    state
+        .format_recovery_queue
+        .lock()
+        .expect("queue lock")
+        .clear();
+    state
+        .format_recovery_done
+        .insert("ghost-repo".to_string(), ());
+
+    assert!(
+        !state.enqueue_format_recovery("ghost-repo"),
+        "a second wipe for an already-wiped alias must be refused"
+    );
+    assert!(
+        state
+            .format_recovery_queue
+            .lock()
+            .expect("queue lock")
+            .is_empty(),
+        "the refused alias must not be queued"
+    );
+    assert!(
+        state.enqueue_format_recovery("other-repo"),
+        "the refusal must be per alias, not global"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_indexing_marker_cancels_the_leaked_index_task() {
+    // Regression: evicting the stale marker used to fix only what the TUI
+    // believed. The task itself kept running and kept its `Arc<SharedStores>`
+    // — so the LMDB env and `.writer.lock` stayed held and every later write
+    // failed with "Database is locked by another process" on a repo that
+    // logged as idle and closed.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Stand-in for the store handles the real task captures.
+    let stores = Arc::new(());
+    let stores_task = stores.clone();
+    let token = CancellationToken::new();
+    let task_token = token.clone();
+    let handle = tokio::spawn(async move {
+        task_token.cancelled().await;
+        drop(stores_task);
+    });
+    state
+        .index_tasks
+        .insert("leaky".to_string(), (handle, token.clone()));
+    state.active_reindexes.insert(
+        "leaky".to_string(),
+        Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("monotonic clock at least 2s old"),
+    );
+
+    assert!(
+        !state.is_indexing("leaky"),
+        "a marker older than the timeout must not read as indexing"
+    );
+    assert!(
+        token.is_cancelled(),
+        "the leaked task must be cancelled, not merely forgotten"
+    );
+
+    let (handle, _) = state
+        .index_tasks
+        .remove("leaky")
+        .expect("task entry kept")
+        .1;
+    handle.await.expect("cancelled task joins cleanly");
+    assert_eq!(
+        Arc::strong_count(&stores),
+        1,
+        "the leaked task must have released its store handle"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn fresh_indexing_marker_leaves_its_index_task_running() {
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    let token = CancellationToken::new();
+    let task_token = token.clone();
+    let handle = tokio::spawn(async move { task_token.cancelled().await });
+    state
+        .index_tasks
+        .insert("busy".to_string(), (handle, token.clone()));
+    state.begin_indexing("busy");
+
+    assert!(
+        state.is_indexing("busy"),
+        "a fresh marker still reads as indexing"
+    );
+    assert!(
+        !token.is_cancelled(),
+        "a live reindex must never be cancelled by the staleness check"
+    );
+    token.cancel();
+}
+
+#[tokio::test]
+async fn self_clean_keeps_the_db_dir_of_a_still_registered_repo() {
+    // Regression: the post-build guards reach their cleanup branch whenever
+    // their token is cancelled, and a cancelled token no longer means "the
+    // repo was removed" (idle eviction and the stale-marker cleanup both
+    // cancel one). Deleting on the token alone wiped a live repo's index.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = crate::cache::safe_canonicalize(tmp.path()).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("live".to_string()))
+        .unwrap();
+    let state = Arc::new(ServeState::new(config, None));
+
+    state.self_clean_if_unregistered("live", &db_path);
+    assert!(
+        db_path.exists(),
+        "a registered repo's DB dir must survive a cancelled task"
+    );
+
+    // Unregistered alias: the orphan cleanup still runs.
+    state.self_clean_if_unregistered("gone", &db_path);
+    assert!(
+        !db_path.exists(),
+        "an unregistered alias's orphaned DB dir must still be cleaned up"
     );
 }
