@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Read the persisted LMDB map size from metadata.json in the database directory.
 /// Returns DEFAULT_LMDB_MAP_SIZE_MB if no persisted value is found.
@@ -673,6 +673,10 @@ impl VectorStore {
         // active.  Our caller holds &mut self and just got MDB_MAP_FULL on an
         // insert — any write transaction that triggered the error has already
         // been dropped by the caller before invoking the retry logic.
+        // The `&mut self` covers this store only: LMDB requires no *process*
+        // transaction to be live, which holds because every reader of this
+        // path goes through the same `RwLock<VectorStore>` (shared env via
+        // `lmdb_registry`) and is therefore excluded by our write lock.
         unsafe {
             self.env.resize(new_size_bytes)?;
         }
@@ -772,7 +776,15 @@ impl VectorStore {
             match &result {
                 Ok(_) => return result,
                 Err(e) => {
-                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                    if !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+                    if attempts >= max_attempts {
+                        error!(
+                            "❌ MDB_MAP_FULL persists in build_index() after {} attempt(s) at \
+                             {}MB — giving up: {}",
+                            attempts, self.map_size_mb, e
+                        );
                         return result;
                     }
 
@@ -783,6 +795,12 @@ impl VectorStore {
                             new_size, attempts, max_attempts
                         );
                         self.resize_environment(new_size)?;
+                        warn!(
+                            "↻ Retrying build_index() at {}MB (attempt {}/{})",
+                            self.map_size_mb,
+                            attempts + 1,
+                            max_attempts
+                        );
                     } else {
                         warn!(
                             "MDB_MAP_FULL error in build_index(), already at max size {}MB \
@@ -963,20 +981,39 @@ impl VectorStore {
             match &result {
                 Ok(_) => return result,
                 Err(e) => {
-                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                    if !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+                    if attempts >= max_attempts {
+                        error!(
+                            "❌ MDB_MAP_FULL persists in delete_chunks() after {} attempt(s) at \
+                             {}MB while deleting {} chunk(s) — giving up: {}",
+                            attempts,
+                            self.map_size_mb,
+                            chunk_ids.len(),
+                            e
+                        );
                         return result;
                     }
 
                     // Double map size and retry
                     let new_size = self.map_size_mb * 2;
                     if new_size <= max_lmdb_map_size_mb() {
-                        warn!("MDB_MAP_FULL error in delete_chunks(), resizing to {}MB (attempt {}/{})",
-                              new_size, attempts, max_attempts);
+                        warn!("MDB_MAP_FULL error in delete_chunks() deleting {} chunk(s), resizing to {}MB (attempt {}/{})",
+                              chunk_ids.len(), new_size, attempts, max_attempts);
                         self.resize_environment(new_size)?;
-                    } else {
                         warn!(
-                            "MDB_MAP_FULL error, already at max size {}MB \
-                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                            "↻ Retrying delete of {} chunk(s) at {}MB (attempt {}/{})",
+                            chunk_ids.len(),
+                            self.map_size_mb,
+                            attempts + 1,
+                            max_attempts
+                        );
+                    } else {
+                        error!(
+                            "❌ MDB_MAP_FULL deleting {} chunk(s), already at the max map size \
+                             {}MB (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                            chunk_ids.len(),
                             self.map_size_mb
                         );
                         return result;
@@ -1029,25 +1066,51 @@ impl VectorStore {
         loop {
             attempts += 1;
 
+            // The aborted attempt committed nothing, so the ids it consumed
+            // were never assigned: hand them back instead of letting every
+            // retry push the id space (and arroy's item range) further out.
+            let id_before = self.next_id;
             let result = self.insert_chunks_with_ids_impl(&chunks);
 
             match &result {
                 Ok(_) => return result,
                 Err(e) => {
-                    if attempts >= max_attempts || !self.is_map_full_error(e.as_ref()) {
+                    self.next_id = id_before;
+                    if !self.is_map_full_error(e.as_ref()) {
+                        return result;
+                    }
+                    if attempts >= max_attempts {
+                        // Previously this returned in silence, which is how a
+                        // wedged final attempt looked identical to a crash.
+                        tracing::error!(
+                            "❌ MDB_MAP_FULL persists after {} attempt(s) at {}MB while inserting \
+                             {} chunk(s) — giving up: {}",
+                            attempts,
+                            self.map_size_mb,
+                            chunks.len(),
+                            e
+                        );
                         return result;
                     }
 
                     // Double map size and retry
                     let new_size = self.map_size_mb * 2;
                     if new_size <= max_lmdb_map_size_mb() {
-                        warn!("MDB_MAP_FULL error in insert_chunks_with_ids(), resizing to {}MB (attempt {}/{})",
-                              new_size, attempts, max_attempts);
+                        warn!("MDB_MAP_FULL error in insert_chunks_with_ids() inserting {} chunk(s), resizing to {}MB (attempt {}/{})",
+                              chunks.len(), new_size, attempts, max_attempts);
                         self.resize_environment(new_size)?;
-                    } else {
                         warn!(
-                            "MDB_MAP_FULL error, already at max size {}MB \
-                             (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                            "↻ Retrying insert of {} chunk(s) at {}MB (attempt {}/{})",
+                            chunks.len(),
+                            self.map_size_mb,
+                            attempts + 1,
+                            max_attempts
+                        );
+                    } else {
+                        error!(
+                            "❌ MDB_MAP_FULL inserting {} chunk(s), already at the max map size \
+                             {}MB (set CODESEARCH_MAX_LMDB_MAP_SIZE_MB to raise this cap)",
+                            chunks.len(),
                             self.map_size_mb
                         );
                         return result;
@@ -1330,6 +1393,46 @@ mod tests {
     use crate::chunker::{Chunk, ChunkKind};
     use crate::embed::EmbeddedChunk;
     use tempfile::tempdir;
+
+    /// A failed insert must leave the id counter where it was: the transaction
+    /// aborted, so those ids were never handed out. Under the MDB_MAP_FULL
+    /// retry this compounded — every attempt burned another `chunks.len()` ids
+    /// and pushed arroy's item range further out on a database that already
+    /// could not take the data. Provoked here with a dimension mismatch,
+    /// which fails the same `_impl` mid-loop without a 512MB fixture.
+    #[test]
+    fn a_failed_insert_hands_back_the_ids_it_consumed() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("ids.db");
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+
+        store
+            .insert_chunks_with_ids(vec![drift_chunk("src/a.rs", "fn a() {}", 0)])
+            .expect("baseline insert");
+        let before = store.next_id;
+
+        let bad = vec![
+            drift_chunk("src/b.rs", "fn b() {}", 1),
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn c() {}".to_string(),
+                    2,
+                    2,
+                    ChunkKind::Other,
+                    "src/c.rs".to_string(),
+                ),
+                vec![1.0, 0.0], // wrong dimension: fails after the first chunk
+            ),
+        ];
+        store
+            .insert_chunks_with_ids(bad)
+            .expect_err("dimension mismatch must fail the insert");
+
+        assert_eq!(
+            store.next_id, before,
+            "ids consumed by the aborted attempt must be handed back"
+        );
+    }
 
     #[test]
     fn test_vector_store_creation() {

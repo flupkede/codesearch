@@ -1203,7 +1203,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
                 alias_bg
             );
             drop(stores);
-            ServeState::remove_orphaned_db_dir(&alias_bg, &db_path);
+            state_bg.self_clean_if_unregistered(&alias_bg, &db_path);
             state_bg.end_indexing(&alias_bg);
             return;
         }
