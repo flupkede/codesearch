@@ -1411,6 +1411,18 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 affected_files
             );
 
+            // A cache HIT short-circuits find_refs entirely (no helper call,
+            // no fresh resolution — see find_refs_for_canonical_key), so an
+            // entry cached before this change would keep replaying its old
+            // answer forever even with the resident workspace now evicted
+            // fresh below. Which existing symbols gained/lost a reference
+            // FROM inside the affected files is exactly what Roslyn is
+            // needed to answer — not knowable from the file list alone — so
+            // there is no cheaper correct scope than the whole cache. It is
+            // a pure derived artifact (rebuilt lazily, one helper call per
+            // symbol on next lookup): safe to drop, unlike scip_symbols.
+            ref_cache_db.clear(&mut wtxn)?;
+
             // Step 1: Collect stale symbol keys from the position index (reverse map
             // file:line → [symbol_keys]). This tells us exactly which scip_symbols
             // entries to inspect for affected-file definitions.
@@ -1479,61 +1491,17 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 purge_count
             );
 
-            // Selective ref cache invalidation:
-            //
-            // Pass 1 — definition-site: purge cached refs for symbols whose *definition*
-            // is in an affected file. (Original logic — symbols in `stale_symbol_keys`.)
-            //
-            // Pass 2 — reference-site: also purge any cache entry that has a *reference*
-            // in an affected file, even if the symbol's definition lives elsewhere.
-            // Without this pass, moving/deleting call sites leaves stale `start_line` /
-            // `end_line` values in the cache until the next full rebuild.
-            let mut cache_invalidated = 0usize;
-
-            // Pass 1
-            for stale_key in &stale_symbol_keys {
-                if ref_cache_db.delete(&mut wtxn, stale_key.as_str())? {
-                    cache_invalidated += 1;
-                }
-            }
-
-            // Pass 2 — scan all cached entries for reference-site staleness
-            {
-                let mut ref_site_stale_keys: Vec<String> = Vec::new();
-                let cache_iter = ref_cache_db.iter(&wtxn)?;
-                for result in cache_iter {
-                    let (key, val) = result?;
-                    // Skip entries already invalidated by Pass 1
-                    if stale_symbol_keys.contains(key) {
-                        continue;
-                    }
-                    if let Ok(refs) = deserialize_refs(val) {
-                        let has_stale_ref = refs.iter().any(|r| {
-                            affected_files.contains(&r.file.to_string_lossy().replace('\\', "/"))
-                        });
-                        if has_stale_ref {
-                            ref_site_stale_keys.push(key.to_string());
-                        }
-                    }
-                }
-                for key in &ref_site_stale_keys {
-                    if ref_cache_db.delete(&mut wtxn, key.as_str())? {
-                        cache_invalidated += 1;
-                    }
-                }
-                if !ref_site_stale_keys.is_empty() {
-                    tracing::debug!(
-                        "Incremental: reference-site invalidated {} additional cache entries",
-                        ref_site_stale_keys.len()
-                    );
-                }
-            }
-
-            tracing::debug!(
-                "Incremental: invalidated {} ref cache entries total ({} definition-site + reference-site scan)",
-                cache_invalidated,
-                stale_symbol_keys.len()
-            );
+            // The old selective invalidation here (definition-site + a
+            // reference-site scan of cached entries) only ever purged a
+            // symbol whose EXISTING cached reference list already pointed
+            // at an affected file. It could never catch the opposite case —
+            // an unrelated, already-cached symbol gaining a brand-new
+            // reference FROM the changed file — because that requires
+            // knowing what the changed file's new content refers to, not
+            // what the old cache already recorded. `ref_cache_db.clear()`
+            // above (unconditional, whole-table) closes that gap and
+            // strictly subsumes this scheme, so the selective passes are
+            // gone rather than left as dead code beside it.
 
             // symbols_db and simple_names_db are merged below, not cleared here.
         }
@@ -1735,11 +1703,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // this solution (if any) was loaded before that change and would
         // silently keep answering find_refs from stale content otherwise —
         // this pool has no other tie to repo state. Evict unconditionally
-        // (full or incremental): the next find_refs respawns fresh. The
-        // full-rebuild branch above already clears `ref_cache_db`; an
-        // incremental rebuild does not, so a symbol already cached before
-        // this change can still replay a stale answer on a cache hit —
-        // known residual gap, tracked separately (todo #168).
+        // (full or incremental): the next find_refs respawns fresh. Both
+        // branches above now also clear `ref_cache_db`, so a cache hit can
+        // never replay an answer resolved before this rebuild either.
         crate::symbols::resident::WORKSPACE_POOL.evict(&solution);
 
         let duration_ms = start.elapsed().as_millis() as u64;
