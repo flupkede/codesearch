@@ -292,7 +292,8 @@ without a single resize. The 14 259-chunk batch 14 is the suspect.
    from source loaded before the change, so a newly extracted method's call site went missing with
    no warning. `WorkspacePool::evict` now runs at the end of every rebuild (full or incremental); a
    per-solution generation counter closes the window where a spawn already in flight would otherwise
-   still install stale. — done. Residual, not fixed here: an incremental rebuild does not clear
-   `scip_ref_cache`, so a symbol already cached before the change can still replay a stale cached
-   answer on a cache hit (full rebuilds already clear that table) — narrowing invalidation to the
-   affected symbols is unscoped follow-up.
+   still install stale. `scip_ref_cache` is now also cleared in full on every incremental rebuild,
+   not just full rebuilds — the old selective (definition-site + reference-site) invalidation could
+   never catch an already-cached symbol gaining a brand-new reference FROM the changed file, since
+   that requires reading the changed file's new content, not the old cache; removed as dead code
+   once the blanket clear subsumed it. — done, no residual gap.
