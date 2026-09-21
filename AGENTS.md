@@ -253,7 +253,7 @@ Older entries: see `CHANGELOG.md`.
 
 ## Plan — fix/stale-indexing-marker-handle-leak
 
-Repo `BOIN.Aprimo` sat at 0 chunks for two days: a format-recovery rebuild wedged, `is_indexing`
+A customer repo sat at 0 chunks for two days: a format-recovery rebuild wedged, `is_indexing`
 evicted its stale marker, the reaper evicted the repo ("DB closed"), yet the task kept running and
 kept the `Arc<SharedStores>` — so `.writer.lock` and the LMDB env stayed held and every write failed
 with "Database is locked by another process".
@@ -282,11 +282,11 @@ these two are what produced it):
    page-derived ~1980 bytes, and a key still over it is skipped with a counted warning instead of
    failing the rebuild. — done
 
-Open, not explained yet: why BOIN.Aprimo (16.9 MB of source, 41 311 chunks) needed >4 GB of LMDB
-while HUSQ.Aprimo (18 638 chunks) fits in 190 MB, and why the same repo indexed the same morning
+Open, not explained yet: why the customer repo (16.9 MB of source, 41 311 chunks) needed >4 GB of LMDB
+while another repo (18 638 chunks) fits in 190 MB, and why the same repo indexed the same morning
 without a single resize. The 14 259-chunk batch 14 is the suspect.
 
-8. Todo #168 (BAYR.Aprimo end-to-end test, todo #165): the resident Roslyn workspace pool (todo
+8. Todo #168 (end-to-end test, todo #165): the resident Roslyn workspace pool (todo
    #115) is keyed only by solution path and reused across `find_refs` calls with no tie to repo
    changes — a symbol rebuild refreshed `index_head_sha` while the resident workspace still answered
    from source loaded before the change, so a newly extracted method's call site went missing with
