@@ -237,6 +237,19 @@ fn deserialize_keys_v1(bytes: &[u8]) -> Result<Vec<String>> {
     bincode::deserialize(&bytes[1..]).with_context(|| "bincode deserialize keys failed")
 }
 
+/// Context for a SCIP LMDB write. A bare `MDB_BAD_VALSIZE` names neither the
+/// table nor the offending key, which is why the 2026-09 wipe loop ran blind:
+/// the key size (LMDB rejects 0 and >511 bytes) is the whole diagnosis.
+fn put_ctx(db_name: &str, key: &str, value_len: usize) -> String {
+    format!(
+        "LMDB put into '{}' failed — key {} byte(s), value {} byte(s), key: {:.160}",
+        db_name,
+        key.len(),
+        value_len,
+        key
+    )
+}
+
 // ── Ref-resolution warnings persistence ───────────────────────────
 
 /// Persist one canonical key's resolution warnings into `scip_ref_warnings`,
@@ -257,7 +270,8 @@ fn store_ref_warnings(
     } else {
         let bytes = serialize_keys_v1(warnings)
             .with_context(|| format!("Failed to serialize warnings for {canonical}"))?;
-        db.put(wtxn, canonical, &bytes)?;
+        db.put(wtxn, canonical, &bytes)
+            .with_context(|| put_ctx(SCIP_REF_WARNINGS_DB_NAME, canonical, bytes.len()))?;
     }
     Ok(())
 }
@@ -914,13 +928,17 @@ impl CSharpSymbolIndexer {
             };
 
         // ── Write phase — cache the resolved references ────────────
-        {
+        // Over the LMDB key limit: answer from the live resolution and skip the
+        // cache write, rather than failing a lookup that already succeeded.
+        if canonical.len() <= env.max_key_size() {
             let mut wtxn = env.write_txn()?;
             let ref_cache_db: Database<Str, Bytes> =
                 env.create_database(&mut wtxn, Some(SCIP_REF_CACHE_DB_NAME))?;
             let cached_bytes = serialize_refs(&lazy_refs)
                 .with_context(|| format!("Failed to serialize refs for cache: {}", canonical))?;
-            ref_cache_db.put(&mut wtxn, canonical, &cached_bytes)?;
+            ref_cache_db
+                .put(&mut wtxn, canonical, &cached_bytes)
+                .with_context(|| put_ctx(SCIP_REF_CACHE_DB_NAME, canonical, cached_bytes.len()))?;
             // Same txn as the refs: cached-partial and its warnings are one
             // atomic fact. Empty warnings remove any stale entry.
             store_ref_warnings(&env, &mut wtxn, canonical, &lazy_warnings)?;
@@ -1236,11 +1254,18 @@ impl CSharpSymbolIndexer {
                 })
                 .collect();
 
+            // Over the LMDB key limit: skip rather than fail the batch, same
+            // rule as the rebuild's write loop.
+            if result.symbol.len() > env.max_key_size() {
+                continue;
+            }
             // Cache even if empty — symbols with 0 references must be marked as
             // "resolved" so collect_uncached_symbol_keys() won't retry them forever.
             let bytes = serialize_refs(&refs)
                 .with_context(|| format!("Failed to serialize batch refs for {}", result.symbol))?;
-            ref_cache_db.put(&mut wtxn, result.symbol.as_str(), &bytes)?;
+            ref_cache_db
+                .put(&mut wtxn, result.symbol.as_str(), &bytes)
+                .with_context(|| put_ctx(SCIP_REF_CACHE_DB_NAME, &result.symbol, bytes.len()))?;
             // Same txn as the refs: cached-partial and its warnings are one
             // atomic fact. Empty warnings remove any stale entry.
             store_ref_warnings(&env, &mut wtxn, &result.symbol, &result.warnings)?;
@@ -1386,6 +1411,18 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 affected_files
             );
 
+            // A cache HIT short-circuits find_refs entirely (no helper call,
+            // no fresh resolution — see find_refs_for_canonical_key), so an
+            // entry cached before this change would keep replaying its old
+            // answer forever even with the resident workspace now evicted
+            // fresh below. Which existing symbols gained/lost a reference
+            // FROM inside the affected files is exactly what Roslyn is
+            // needed to answer — not knowable from the file list alone — so
+            // there is no cheaper correct scope than the whole cache. It is
+            // a pure derived artifact (rebuilt lazily, one helper call per
+            // symbol on next lookup): safe to drop, unlike scip_symbols.
+            ref_cache_db.clear(&mut wtxn)?;
+
             // Step 1: Collect stale symbol keys from the position index (reverse map
             // file:line → [symbol_keys]). This tells us exactly which scip_symbols
             // entries to inspect for affected-file definitions.
@@ -1440,7 +1477,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                             let b = serialize_refs(&survivors).with_context(|| {
                                 format!("Failed to re-serialize survivors for {}", key)
                             })?;
-                            symbols_db.put(&mut wtxn, key.as_str(), &b)?;
+                            symbols_db
+                                .put(&mut wtxn, key.as_str(), &b)
+                                .with_context(|| put_ctx(SCIP_DB_NAME, key, b.len()))?;
                         }
                     }
                 }
@@ -1452,61 +1491,17 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 purge_count
             );
 
-            // Selective ref cache invalidation:
-            //
-            // Pass 1 — definition-site: purge cached refs for symbols whose *definition*
-            // is in an affected file. (Original logic — symbols in `stale_symbol_keys`.)
-            //
-            // Pass 2 — reference-site: also purge any cache entry that has a *reference*
-            // in an affected file, even if the symbol's definition lives elsewhere.
-            // Without this pass, moving/deleting call sites leaves stale `start_line` /
-            // `end_line` values in the cache until the next full rebuild.
-            let mut cache_invalidated = 0usize;
-
-            // Pass 1
-            for stale_key in &stale_symbol_keys {
-                if ref_cache_db.delete(&mut wtxn, stale_key.as_str())? {
-                    cache_invalidated += 1;
-                }
-            }
-
-            // Pass 2 — scan all cached entries for reference-site staleness
-            {
-                let mut ref_site_stale_keys: Vec<String> = Vec::new();
-                let cache_iter = ref_cache_db.iter(&wtxn)?;
-                for result in cache_iter {
-                    let (key, val) = result?;
-                    // Skip entries already invalidated by Pass 1
-                    if stale_symbol_keys.contains(key) {
-                        continue;
-                    }
-                    if let Ok(refs) = deserialize_refs(val) {
-                        let has_stale_ref = refs.iter().any(|r| {
-                            affected_files.contains(&r.file.to_string_lossy().replace('\\', "/"))
-                        });
-                        if has_stale_ref {
-                            ref_site_stale_keys.push(key.to_string());
-                        }
-                    }
-                }
-                for key in &ref_site_stale_keys {
-                    if ref_cache_db.delete(&mut wtxn, key.as_str())? {
-                        cache_invalidated += 1;
-                    }
-                }
-                if !ref_site_stale_keys.is_empty() {
-                    tracing::debug!(
-                        "Incremental: reference-site invalidated {} additional cache entries",
-                        ref_site_stale_keys.len()
-                    );
-                }
-            }
-
-            tracing::debug!(
-                "Incremental: invalidated {} ref cache entries total ({} definition-site + reference-site scan)",
-                cache_invalidated,
-                stale_symbol_keys.len()
-            );
+            // The old selective invalidation here (definition-site + a
+            // reference-site scan of cached entries) only ever purged a
+            // symbol whose EXISTING cached reference list already pointed
+            // at an affected file. It could never catch the opposite case —
+            // an unrelated, already-cached symbol gaining a brand-new
+            // reference FROM the changed file — because that requires
+            // knowing what the changed file's new content refers to, not
+            // what the old cache already recorded. `ref_cache_db.clear()`
+            // above (unconditional, whole-table) closes that gap and
+            // strictly subsumes this scheme, so the selective passes are
+            // gone rather than left as dead code beside it.
 
             // symbols_db and simple_names_db are merged below, not cleared here.
         }
@@ -1515,7 +1510,26 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let mut total_defs = 0usize;
         let mut total_symbols = 0usize;
 
+        let max_key = env.max_key_size();
+        let mut oversized_keys = 0usize;
+
         for (symbol_name, references) in index.iter() {
+            // One pathological signature must never fail the whole rebuild:
+            // LMDB refuses a key above the page-derived limit, and that error
+            // used to read as storage-format corruption and wipe the index.
+            if symbol_name.len() > max_key {
+                oversized_keys += 1;
+                if oversized_keys == 1 {
+                    tracing::warn!(
+                        "⚠️ Skipping symbol(s) whose SCIP key exceeds this LMDB build's {}-byte \
+                         key limit — first: {} byte(s), {:.160}",
+                        max_key,
+                        symbol_name.len(),
+                        symbol_name
+                    );
+                }
+                continue;
+            }
             let new_stored: Vec<StoredReference> = references
                 .iter()
                 .map(|r| StoredReference {
@@ -1554,7 +1568,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             let value_bytes = serialize_refs(&stored)
                 .with_context(|| format!("Failed to serialize definitions for {}", symbol_name))?;
 
-            symbols_db.put(&mut wtxn, symbol_name.as_str(), &value_bytes)?;
+            symbols_db
+                .put(&mut wtxn, symbol_name.as_str(), &value_bytes)
+                .with_context(|| put_ctx(SCIP_DB_NAME, symbol_name, value_bytes.len()))?;
             total_defs += stored.len();
             total_symbols += 1;
         }
@@ -1564,8 +1580,22 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // Maps each definition occurrence to the symbols defined at that position.
         // For incremental rebuilds, old position entries for affected files were
         // already deleted above; here we only write new ones.
+        if oversized_keys > 0 {
+            tracing::warn!(
+                "⚠️ {} symbol(s) skipped: SCIP key over the {}-byte LMDB limit. \
+                 find_impact cannot resolve those; every other symbol is indexed.",
+                oversized_keys,
+                max_key
+            );
+        }
+
         let mut positions: HashMap<String, Vec<String>> = HashMap::new();
         for (symbol_name, references) in index.iter() {
+            // Skipped above: a position entry pointing at an unwritten symbol
+            // would only produce lookup misses.
+            if symbol_name.len() > max_key {
+                continue;
+            }
             for r in references.iter().filter(|r| r.kind == "definition") {
                 let pos_key = format!(
                     "{}:{}",
@@ -1582,7 +1612,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         for (key, keys) in &positions {
             let bytes = serialize_keys_v1(keys)
                 .with_context(|| format!("Failed to serialize position key: {}", key))?;
-            positions_db.put(&mut wtxn, key.as_str(), &bytes)?;
+            positions_db
+                .put(&mut wtxn, key.as_str(), &bytes)
+                .with_context(|| put_ctx(SCIP_POSITION_DB_NAME, key, bytes.len()))?;
         }
 
         tracing::debug!(
@@ -1616,7 +1648,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         for (key, keys) in &all_simple_names {
             let bytes = serialize_keys_v1(keys)
                 .with_context(|| format!("Failed to serialize simple name key: {}", key))?;
-            simple_names_db.put(&mut wtxn, key.as_str(), &bytes)?;
+            simple_names_db
+                .put(&mut wtxn, key.as_str(), &bytes)
+                .with_context(|| put_ctx(SCIP_SIMPLE_NAMES_DB_NAME, key, bytes.len()))?;
         }
 
         tracing::debug!(
@@ -1664,6 +1698,15 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         )?;
 
         wtxn.commit()?;
+
+        // A rebuild changes on-disk source; a resident Roslyn workspace for
+        // this solution (if any) was loaded before that change and would
+        // silently keep answering find_refs from stale content otherwise —
+        // this pool has no other tie to repo state. Evict unconditionally
+        // (full or incremental): the next find_refs respawns fresh. Both
+        // branches above now also clear `ref_cache_db`, so a cache hit can
+        // never replay an answer resolved before this rebuild either.
+        crate::symbols::resident::WORKSPACE_POOL.evict(&solution);
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -1950,6 +1993,32 @@ mod tests {
             "UnrelatedName",
             "csharp App . FieldDefinition#Validate()."
         ));
+    }
+
+    /// C# SCIP keys carry fully qualified parameter types and reach 900+ bytes
+    /// (observed: 912). LMDB's stock 511-byte limit rejected those with
+    /// MDB_BAD_VALSIZE, which failed the whole rebuild and read as storage
+    /// corruption. This pins heed's `longer-keys` feature in Cargo.toml: drop
+    /// it and the incident returns.
+    #[test]
+    fn the_lmdb_key_limit_is_large_enough_for_fully_qualified_csharp_symbols() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = crate::symbols::get_shared_scip_env(&dir.path().join("db")).unwrap();
+        let max_key = env.max_key_size();
+        assert!(
+            max_key >= 1024,
+            "expected a page-derived key limit (heed feature `longer-keys`), got {max_key} bytes"
+        );
+
+        let long_key = "a".repeat(1000);
+        let mut wtxn = env.write_txn().unwrap();
+        let db: Database<Str, Bytes> = env
+            .open_database(&wtxn, Some(SCIP_DB_NAME))
+            .unwrap()
+            .unwrap();
+        db.put(&mut wtxn, long_key.as_str(), b"v".as_slice())
+            .expect("a 1000-byte key must be writable");
+        wtxn.commit().unwrap();
     }
 
     // ── has_index key-format gate (B4) ────────────────────────────────

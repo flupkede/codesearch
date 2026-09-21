@@ -461,3 +461,97 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
         "Expected 1 definition at Calculator.cs:8"
     );
 }
+
+/// Regression for todo #168: an incremental rebuild must clear
+/// `scip_ref_cache` in full, not just for symbols the OLD selective scheme
+/// could see. That scheme only purged a cache entry whose ALREADY-CACHED
+/// reference list pointed at an affected file — it could never catch an
+/// unrelated, already-cached symbol (defined elsewhere, no prior reference
+/// into the changed file) gaining a brand-new reference FROM the changed
+/// file, since that requires reading the changed file's new content, not
+/// the old cache. This test deliberately caches `Program.Main` — defined in
+/// `App/Main.cs`, untouched by the incremental rebuild below, with no
+/// existing reference into `Library/Calculator.cs` — so the old scheme
+/// would leave it cached; only a whole-table clear catches it.
+#[test]
+#[cfg_attr(not(feature = "csharp_helper_integration"), ignore)]
+fn test_incremental_rebuild_clears_the_reference_cache() {
+    let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("helpers/csharp/tests/Fixtures/SmallSolution");
+    let helper = std::env::var("CODESEARCH_SCIP_CSHARP")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("helpers/csharp/bin/Release/net10.0/scip-csharp");
+            if candidate.exists() {
+                Ok(candidate)
+            } else {
+                Err(())
+            }
+        })
+        .expect("scip-csharp helper not found");
+    std::env::set_var("CODESEARCH_SCIP_CSHARP", &helper);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path();
+    let indexer = CSharpSymbolIndexer::new();
+
+    indexer
+        .rebuild(&fixture_root, db_path, RebuildScope::Full)
+        .expect("full rebuild failed");
+
+    // Resolve dynamically rather than hardcode the canonical key format.
+    let main_key = match indexer
+        .resolve_query(db_path, &ImpactQuery::Name("Main".into()))
+        .expect("resolving 'Main' failed")
+    {
+        KeyMatch::Resolved(k) => k,
+        other => panic!("expected 'Main' to resolve unambiguously, got {other:?}"),
+    };
+    assert!(
+        main_key.contains("App") && main_key.contains("Program"),
+        "expected Program.Main from App/Main.cs, got {main_key}"
+    );
+
+    // First lookup is always a cache miss (nothing cached yet) — it must
+    // populate scip_ref_cache as a side effect.
+    indexer
+        .find_references_for_key(db_path, &main_key)
+        .expect("find_references_for_key failed (pre-incremental)");
+    let uncached_after_first_lookup = indexer
+        .collect_uncached_symbol_keys(db_path)
+        .expect("collect_uncached_symbol_keys failed");
+    assert!(
+        !uncached_after_first_lookup.contains(&main_key),
+        "Program.Main must be cached after its first lookup"
+    );
+
+    // Incremental rebuild scoped to a DIFFERENT file (Calculator.cs) —
+    // Main.cs, and Program.Main's defining project, are not touched.
+    let changed_file = fixture_root.join("Library").join("Calculator.cs");
+    indexer
+        .rebuild(
+            &fixture_root,
+            db_path,
+            RebuildScope::Files {
+                changed: vec![changed_file],
+                deleted: vec![],
+            },
+        )
+        .expect("incremental rebuild failed");
+
+    // The fix: the incremental rebuild must clear the WHOLE cache, so
+    // Program.Main — untouched by the old selective invalidation, since
+    // neither its definition nor its cached refs point at Calculator.cs —
+    // is uncached again too.
+    let uncached_after_incremental = indexer
+        .collect_uncached_symbol_keys(db_path)
+        .expect("collect_uncached_symbol_keys failed");
+    assert!(
+        uncached_after_incremental.contains(&main_key),
+        "an incremental rebuild must clear scip_ref_cache in full — Program.Main's \
+         pre-change cache entry must not survive an unrelated file's rebuild, \
+         got uncached list: {:?}",
+        uncached_after_incremental
+    );
+}
