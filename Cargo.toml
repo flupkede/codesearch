@@ -28,7 +28,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # ML & Embeddings
-fastembed = "6.1"
+fastembed = "7.0"
 ort = { version = "2.0.0-rc.10", features = ["download-binaries", "copy-dylibs"] }
 ndarray = "0.17"
 hf-hub = "1.0"
