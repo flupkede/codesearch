@@ -6,11 +6,15 @@
 [![GitHub release](https://img.shields.io/github/v/release/flupkede/codesearch?include_prereleases)](https://github.com/flupkede/codesearch/releases)
 [![GitHub stars](https://img.shields.io/github/stars/flupkede/codesearch?style=social)](https://github.com/flupkede/codesearch/stargazers)
 
+![codesearch demo](docs/demo.gif)
+
 **Multi-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid retrieval, symbol navigation, and cross-repository orchestration. Fully local, fully offline, no GPU, no Docker.**
 
 codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) deep codebase understanding through 5 unified MCP tools. Index once, search semantically across multiple repositories simultaneously.
 
 ## Why codesearch?
+
+Grep finds text. Your agent needs meaning — and before a refactor it must know who calls `X`. codesearch gives your agent both: semantic search that understands code, and symbol-level impact analysis that maps call sites before you rename anything.
 
 - **Multi-repo serve mode**: Fan-out queries across repository groups with cross-repo RRF ranking
 - **Hybrid retrieval**: Vector embeddings + BM25 full-text search fused with Reciprocal Rank Fusion
