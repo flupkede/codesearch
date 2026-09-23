@@ -75,6 +75,28 @@ git push origin v1.0.X
 
 CI (`release.yml`) builds binaries and creates a GitHub Release with auto-generated notes from PR titles.
 
+### 4. Merge master back into develop (immediately after the tag)
+
+```bash
+git checkout develop && git pull
+git merge origin/master -m "chore: merge master (v1.0.X) back into develop"
+git push origin develop
+```
+
+A squash release commit's only parent is master's *previous* tip, so master and
+develop share no history after it and `merge-base` falls back to the last
+pre-squash ancestor. The next release PR is then three-way merged against a tree
+many releases old: every file added since looks independently added on both
+sides, which git auto-resolves only while the two blobs stay byte-identical. So
+the release PR merges cleanly for releases on end, then reports phantom
+conflicts the first time one of those files is edited (v1.4.4, `resident.rs`).
+
+Run it while master's and develop's trees are still identical, when the merge is
+a guaranteed no-op recording nothing but the ancestry — defer it and you inherit
+the very conflicts it prevents. Pushing to develop needs the owner's ruleset
+bypass; going through a PR works too but also fires `bump-develop.yml`, so the
+patch number skips one.
+
 ## Rules
 
 - **Version scheme `Major.Minor.Patch`** (semver):
@@ -90,4 +112,6 @@ CI (`release.yml`) builds binaries and creates a GitHub Release with auto-genera
   release is tagged.
 - **Merge style:** feature→`develop` = **merge commit** (`--merge`); `develop`→`master`
   release PR = **squash** (one commit per release on master)
+- **Merge back after every tag** — `master` → `develop` (step 4), or the next
+  release PR is diffed against a merge base from several releases ago
 - **Tag format**: `v1.0.X` on master HEAD

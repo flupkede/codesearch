@@ -41,7 +41,7 @@ use regex::Regex;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
 use std::collections::HashSet;
@@ -2076,7 +2076,7 @@ impl CodesearchService {
 
 #[tool_handler(router = Self::merged_tool_router())]
 impl ServerHandler for CodesearchService {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let db_exists = self.db_path.exists();
         let mode = if self.serve_state.is_some() {
             "serve hub (direct)"
@@ -2084,7 +2084,7 @@ impl ServerHandler for CodesearchService {
             "self-contained (stdio)"
         };
 
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("codesearch", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 INSTRUCTIONS_TEMPLATE

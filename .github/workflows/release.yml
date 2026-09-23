@@ -38,7 +38,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       # pin@v4
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           # Pin ref so workflow_dispatch builds the tagged commit (inputs.version),
           # not the default branch (master-tip) — otherwise binaries get labeled
@@ -143,7 +143,7 @@ jobs:
     runs-on: macos-latest
     steps:
       # pin@v4
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           # Pin ref so workflow_dispatch builds the tagged commit (inputs.version),
           # not the default branch (master-tip) — otherwise binaries get labeled
