@@ -14,6 +14,16 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.4.9] - 2026-09-23
+
+### Changed
+
+- **fastembed 6.1.0 → 7.0.1.** Major bump of the embedding backend. Upstream renamed the `InitOptions` type alias to `TextInitOptions`; `embed/embedder.rs` migrates to the new name. No behavior change: same model set, same `FASTEMBED_CACHE_DIR` handling, the CPU execution provider still uses the arena allocator.
+
+- **rmcp 3.3.0 → 3.4.0.** MCP SDK minor bump. The deprecated `ServerInfo` alias is now `ServerConfig`; renamed in the serve hub (`mcp/mod.rs`) and the stdio proxy (`mcp/proxy.rs`). Handshake, session semantics and tool responses are unchanged.
+
+- **CI actions refreshed: actions/checkout 4.3.1 → 7.0.1, github/codeql-action 3 → 4.** Workflow-only; no product code touched.
+
 ## [1.4.4]
 
 ### Fixed
@@ -301,6 +311,7 @@ finalized in place with a date — no renaming/migration step needed.
 ## [1.0.72] - 2026-05-01
 - Initial multi-repo release: multi-repo `serve` (HTTP/SSE, per-project/group routing, RRF cross-repo search), stdio MCP proxy with client-side auto-reconnect, tree-sitter chunking (9 langs), persistent SHA-256 embedding cache, repository groups, re-tuned RRF, and LMDB resize crash fix (#30, `MDB_MAP_FULL`).
 
+[1.4.9]: https://github.com/flupkede/codesearch/compare/v1.4.4...v1.4.9
 [1.0.171]: https://github.com/flupkede/codesearch/compare/v1.0.162...v1.0.171
 [1.0.162]: https://github.com/flupkede/codesearch/compare/v1.0.160...v1.0.162
 [1.0.160]: https://github.com/flupkede/codesearch/compare/v1.0.156...v1.0.160
