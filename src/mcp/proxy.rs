@@ -1,7 +1,7 @@
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        PaginatedRequestParams, ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
@@ -350,8 +350,8 @@ pub(crate) fn is_idle(
 }
 
 impl ServerHandler for McpProxyService {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("codesearch", env!("CARGO_PKG_VERSION"))
                     .with_title("codesearch (serve proxy)"),
