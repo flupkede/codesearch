@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use fastembed::{EmbeddingModel as FastEmbedModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel as FastEmbedModel, TextEmbedding, TextInitOptions};
 use ort::ep::CPU;
 
 use crate::file::Language;
@@ -333,7 +333,7 @@ impl FastEmbedder {
         let cpu_ep = CPU::default().with_arena_allocator(true).build();
 
         let model = TextEmbedding::try_new(
-            InitOptions::new(model_type.to_fastembed_model())
+            TextInitOptions::new(model_type.to_fastembed_model())
                 .with_show_download_progress(false)
                 .with_execution_providers(vec![cpu_ep]),
         )
