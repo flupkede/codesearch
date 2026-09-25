@@ -403,6 +403,9 @@ pub struct VectorStore {
 /// Key in the "meta" database holding the highest chunk id ever assigned.
 const META_KEY_ID_HWM: &str = "id_hwm";
 
+/// Chunks per write transaction in [`VectorStore::rewrite_chunk_paths`].
+const PATH_REWRITE_BATCH: usize = 1000;
+
 /// Derive `next_id` so ids are NEVER reused across reopens.
 ///
 /// Takes the max of (highest live key + 1) and (persisted high-water mark + 1):
@@ -965,6 +968,57 @@ impl VectorStore {
         Ok(file_chunks)
     }
 
+    /// Rewrite the stored `path` of chunks in place — metadata only, vectors
+    /// untouched. Returns the rewritten records so the caller can mirror the
+    /// new path into the FTS index. Missing ids are skipped.
+    ///
+    /// Batched: one transaction over every chunk of a large index would need
+    /// copy-on-write space for the whole chunks table at once.
+    pub fn rewrite_chunk_paths(
+        &mut self,
+        updates: &[(u32, String)],
+    ) -> Result<Vec<(u32, ChunkMetadata)>> {
+        let mut rewritten = Vec::with_capacity(updates.len());
+        for batch in updates.chunks(PATH_REWRITE_BATCH) {
+            let done = match self.rewrite_chunk_paths_batch(batch) {
+                Err(e) if self.is_map_full_error(e.as_ref()) => {
+                    let new_size = self.map_size_mb * 2;
+                    warn!(
+                        "MDB_MAP_FULL rewriting {} chunk path(s), resizing to {}MB",
+                        batch.len(),
+                        new_size
+                    );
+                    self.resize_environment(new_size)?;
+                    self.rewrite_chunk_paths_batch(batch)?
+                }
+                other => other?,
+            };
+            rewritten.extend(done);
+        }
+        Ok(rewritten)
+    }
+
+    fn rewrite_chunk_paths_batch(
+        &mut self,
+        batch: &[(u32, String)],
+    ) -> Result<Vec<(u32, ChunkMetadata)>> {
+        let mut wtxn = self.env.write_txn()?;
+        let mut rewritten = Vec::with_capacity(batch.len());
+        for (id, path) in batch {
+            let Some(mut meta) = self.chunks.get(&wtxn, id)? else {
+                continue;
+            };
+            if meta.path == *path {
+                continue;
+            }
+            meta.path = path.clone();
+            self.chunks.put(&mut wtxn, id, &meta)?;
+            rewritten.push((*id, meta));
+        }
+        wtxn.commit()?;
+        Ok(rewritten)
+    }
+
     /// Delete chunks by their IDs
     ///
     /// Returns the number of chunks deleted
@@ -1073,7 +1127,18 @@ impl VectorStore {
             let result = self.insert_chunks_with_ids_impl(&chunks);
 
             match &result {
-                Ok(_) => return result,
+                Ok(_) => {
+                    if attempts > 1 {
+                        tracing::info!(
+                            "✅ Insert of {} chunk(s) succeeded on attempt {}/{} at {}MB",
+                            chunks.len(),
+                            attempts,
+                            max_attempts,
+                            self.map_size_mb
+                        );
+                    }
+                    return result;
+                }
                 Err(e) => {
                     self.next_id = id_before;
                     if !self.is_map_full_error(e.as_ref()) {

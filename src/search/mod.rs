@@ -1106,6 +1106,13 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
     // Load file metadata store
     let mut file_meta =
         FileMetaStore::load_or_create(db_path, model_type.short_name(), model_type.dimensions())?;
+    if !file_meta.is_empty() {
+        let mut vs = VectorStore::new(db_path, model_type.dimensions())?;
+        let mut fts = FtsStore::new_with_writer(db_path)?;
+        if crate::index::repair_legacy_index(project_path, &mut file_meta, &mut vs, &mut fts)? {
+            file_meta.save(db_path)?;
+        }
+    }
 
     // Walk the file system
     let walker = FileWalker::new(project_path.to_path_buf());

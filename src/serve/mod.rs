@@ -422,6 +422,25 @@ impl ServeState {
             .clone()
     }
 
+    /// [`Self::open_lock`] acquired with a deadline, for query paths: a cold
+    /// open or warmup that holds it for long must surface as an error, never as
+    /// a request that hangs until the client gives up.
+    async fn acquire_open_lock_bounded(
+        &self,
+        alias: &str,
+    ) -> std::result::Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        let wait = Duration::from_secs(crate::constants::REPO_OPEN_WAIT_SECS);
+        tokio::time::timeout(wait, self.open_lock(alias).lock_owned())
+            .await
+            .map_err(|_| {
+                format!(
+                    "Repository '{}' is still being opened (waited {}s) — retry shortly",
+                    alias,
+                    wait.as_secs()
+                )
+            })
+    }
+
     /// Fast-path lookup: `Some(result)` when `alias` already has opened stores
     /// in the cache, `None` when a cold open is needed. Shared by the pre-lock
     /// fast path and the re-check after the single-flight acquire — identical
@@ -861,7 +880,7 @@ impl ServeState {
     /// The eviction uses the atomic `remove_if` primitive so that a concurrent
     /// `begin_indexing` that inserts a fresh timestamp between the staleness
     /// check and the removal cannot be wrongly evicted.
-    fn is_indexing(&self, alias: &str) -> bool {
+    pub(crate) fn is_indexing(&self, alias: &str) -> bool {
         let max = self.indexing_timeout();
         // Atomically evict a stale entry. `remove_if` holds the shard's write
         // lock for the predicate check + removal, so a racing `begin_indexing`
@@ -2348,7 +2367,7 @@ impl ServeState {
         // twice, or the loser trips the LMDB double-open guard and the repo
         // wedges as an incurable Conflicted (todo #131).
         let open_lock = self.open_lock(alias);
-        let _open_guard = open_lock.lock().await;
+        let open_guard = open_lock.lock().await;
         if let Some(entry) = self.repos.get(alias) {
             match entry.value() {
                 RepoState::Write { .. } | RepoState::Warm { .. } | RepoState::Readonly { .. } => {
@@ -2453,34 +2472,49 @@ impl ServeState {
             }
         }
 
-        let stores_arc = stores;
-
-        // Warmup runs at startup (pre-warm), never in response to a user action,
-        // so it is given a fresh token that is never cancelled — the refresh runs
-        // to completion. A real user-initiated cancel routes through the
-        // RepoState::Write token owned by the live task instead.
-        let pool = self.embedding_pool();
-        if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
-            &path,
-            &db_path,
-            &stores_arc,
-            &CancellationToken::new(),
-            Some(&pool),
-        )
-        .await
-        {
-            tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
-        }
-
-        // Store as Warm — FSW will be started lazily on first query.
-        self.repos
-            .insert(alias.to_string(), RepoState::Warm { stores: stores_arc });
-
+        // Register as Warm BEFORE the refresh and release the single-flight
+        // lock: a refresh of a large repo takes minutes, and queries must be
+        // answered from the existing data meanwhile instead of queueing on
+        // `open_lock`. FSW is started lazily on first query.
+        self.repos.insert(
+            alias.to_string(),
+            RepoState::Warm {
+                stores: Arc::clone(&stores),
+            },
+        );
         // Start the idle timer at warmup. A real query will reset it via
         // touch_access; without this, repos that are warmed but never queried
         // would never appear in `last_access` and therefore never be evicted
         // by `evict_idle_repos`, holding LMDB envs and embedder state forever.
         self.touch_access(alias);
+        drop(open_guard);
+
+        // Tracked like any reindex: status reports "indexing", the reaper
+        // leaves the repo alone, and a concurrent reindex is not doubled.
+        if !self.begin_indexing(alias) {
+            info!(
+                "Warmup '{}': another indexing run is active, skipping refresh",
+                alias
+            );
+            return Ok(());
+        }
+        // Warmup runs at startup (pre-warm), never in response to a user action,
+        // so it is given a fresh token that is never cancelled — the refresh runs
+        // to completion. A real user-initiated cancel routes through the
+        // RepoState::Write token owned by the live task instead.
+        let pool = self.embedding_pool();
+        let refreshed = IndexManager::perform_incremental_refresh_with_stores(
+            &path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+            Some(&pool),
+        )
+        .await;
+        self.end_indexing(alias);
+        if let Err(e) = refreshed {
+            tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
+        }
         Ok(())
     }
 
@@ -2555,8 +2589,7 @@ impl ServeState {
         // opens both reach try_open_stores; the second trips the LMDB
         // double-open guard and caches Conflicted — incurable while the first
         // opener holds its env (todo #131).
-        let open_lock = self.open_lock(alias);
-        let _open_guard = open_lock.lock().await;
+        let _open_guard = self.acquire_open_lock_bounded(alias).await?;
         if let Some(result) = self.try_cached_stores(alias, touch) {
             return result;
         }
@@ -2950,6 +2983,14 @@ impl ServeState {
             },
             None => None,
         }
+    }
+
+    /// True when this process itself keeps `alias`'s DB busy: an indexing run,
+    /// or an LMDB env still held by an evicted-but-referenced `SharedStores`
+    /// (e.g. an in-flight handler). A file-lock probe cannot tell that apart
+    /// from another process, so status must ask this first.
+    pub(crate) fn is_held_in_process(&self, alias: &str, db_path: &Path) -> bool {
+        self.is_indexing(alias) || !crate::lmdb_registry::open_holders_under(db_path).is_empty()
     }
 
     /// Get the SharedStores for an already-opened repo (no DB open).

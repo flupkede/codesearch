@@ -25,6 +25,9 @@ pub use manager::{
 mod build_log;
 pub use build_log::BuildLog;
 
+mod key_migration;
+pub(crate) use key_migration::repair_legacy_index;
+
 /// Ensure the HNSW vector index is built if it was never built in a previous
 /// (possibly cancelled) run.
 ///
@@ -739,6 +742,19 @@ async fn index_with_options(
                 drop(fts);
             } else {
                 drop(vs);
+            }
+        }
+
+        if !file_meta_store.is_empty() {
+            let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
+            let mut fts = FtsStore::new_with_writer(&db_path)?;
+            if key_migration::repair_legacy_index(
+                &project_path,
+                file_meta_store,
+                &mut vs,
+                &mut fts,
+            )? {
+                file_meta_store.save(&db_path)?;
             }
         }
 

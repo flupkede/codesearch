@@ -441,6 +441,50 @@ impl FileMetaStore {
         self.files.remove(&path_str)
     }
 
+    /// Re-key entries still filed under an absolute path inside `project_root`
+    /// (the pre-relative-key format) to their project-relative storage key.
+    ///
+    /// Without this every legacy entry misses its lookup: the file is seen as
+    /// new and re-embedded, while the absolute entry — which
+    /// `find_deleted_files` resolves to an existing file — survives forever
+    /// together with its now-duplicate chunks. An absolute entry whose relative
+    /// key is already tracked is dropped (its chunks are orphans).
+    pub fn relativize_legacy_keys(&mut self, project_root: &Path) -> LegacyKeyMigration {
+        let legacy: Vec<(String, String)> = self
+            .files
+            .keys()
+            .filter(|key| Path::new(key.as_str()).has_root())
+            .filter_map(|key| {
+                let rel = storage_key(Path::new(key), project_root);
+                (rel != *key).then(|| (key.clone(), rel))
+            })
+            .collect();
+
+        let mut migration = LegacyKeyMigration::default();
+        for (key, rel) in legacy {
+            let Some(meta) = self.files.remove(&key) else {
+                continue;
+            };
+            if self.files.contains_key(&rel) {
+                migration.superseded += 1;
+                continue;
+            }
+            migration
+                .rekeyed
+                .push((rel.clone(), meta.chunk_ids.clone()));
+            self.files.insert(rel, meta);
+        }
+        migration
+    }
+
+    /// Every chunk id referenced by a tracked file.
+    pub fn tracked_chunk_ids(&self) -> std::collections::HashSet<u32> {
+        self.files
+            .values()
+            .flat_map(|m| m.chunk_ids.iter().copied())
+            .collect()
+    }
+
     /// Get all tracked files
     #[allow(dead_code)] // Reserved for file listing feature
     pub fn tracked_files(&self) -> impl Iterator<Item = &String> {
@@ -493,6 +537,22 @@ impl FileMetaStore {
                 .unwrap()
                 .as_secs(),
         );
+    }
+}
+
+/// Outcome of [`FileMetaStore::relativize_legacy_keys`].
+#[derive(Debug, Default)]
+pub struct LegacyKeyMigration {
+    /// `(relative key, chunk ids)` of every re-keyed entry — their chunks
+    /// still carry the absolute path.
+    pub rekeyed: Vec<(String, Vec<u32>)>,
+    /// Absolute entries dropped because the relative key was already tracked.
+    pub superseded: usize,
+}
+
+impl LegacyKeyMigration {
+    pub fn is_empty(&self) -> bool {
+        self.rekeyed.is_empty() && self.superseded == 0
     }
 }
 

@@ -3103,3 +3103,28 @@ async fn self_clean_keeps_the_db_dir_of_a_still_registered_repo() {
         "an unregistered alias's orphaned DB dir must still be cleaned up"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn own_lmdb_holder_and_indexing_count_as_held_in_process() {
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = crate::cache::safe_canonicalize(tmp.path())
+        .unwrap()
+        .join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    assert!(!state.is_held_in_process("own", &db_path));
+    let store = crate::vectordb::VectorStore::new(&db_path, 4).unwrap();
+    assert!(
+        state.is_held_in_process("own", &db_path),
+        "an env this process holds must never read as an external lock"
+    );
+    drop(store);
+    assert!(!state.is_held_in_process("own", &db_path));
+
+    state.begin_indexing("own");
+    assert!(state.is_held_in_process("own", &db_path));
+    state.end_indexing("own");
+}

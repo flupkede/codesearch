@@ -650,6 +650,16 @@ impl IndexManager {
             }
         }
 
+        if super::key_migration::repair_legacy_index_shared(
+            codebase_path,
+            &mut file_meta_store,
+            stores,
+        )
+        .await?
+        {
+            file_meta_store.save(db_path)?;
+        }
+
         // Walk files.
         //
         // `FileWalker::walk()` is synchronous and I/O-heavy (recursive directory
@@ -2124,6 +2134,15 @@ impl IndexManager {
 
             let mut file_meta_store =
                 FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
+            if super::key_migration::repair_legacy_index_shared(
+                codebase_path,
+                &mut file_meta_store,
+                stores,
+            )
+            .await?
+            {
+                file_meta_store.save(db_path)?;
+            }
 
             // Find files that need re-indexing (new or content changed)
             let mut files_to_reindex: Vec<PathBuf> = Vec::new();
@@ -3305,6 +3324,78 @@ mod tests {
                 .any(|k| std::path::Path::new(k).is_absolute()),
             "No stored key may be absolute, keys: {:?}",
             reloaded.tracked_files().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_incremental_refresh_migrates_legacy_absolute_keys() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let file = codebase_path.join("lib.rs");
+        std::fs::write(&file, "pub fn lib_fn() {}").unwrap();
+        let absolute = file.to_string_lossy().to_string();
+
+        let stores = create_test_stores(&db_path, 4).await;
+        let chunk = |path: &str| {
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "pub fn lib_fn() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )
+        };
+        let (legacy_id, duplicate_id) = {
+            let mut vs = stores.vector_store.write().await;
+            let ids = vs
+                .insert_chunks_with_ids(vec![chunk(&absolute), chunk("lib.rs")])
+                .unwrap();
+            vs.build_index().unwrap();
+            (ids[0], ids[1])
+        };
+
+        // Pre-2c13826 layout: the file is tracked under its absolute path.
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta
+            .update_file(&file, &absolute, vec![legacy_id])
+            .unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        IndexManager::perform_incremental_refresh_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("refresh over a legacy index must succeed");
+
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        assert!(reloaded.is_tracked("lib.rs"));
+        assert!(!reloaded.is_tracked(&absolute));
+        assert_eq!(
+            reloaded.tracked_chunk_ids(),
+            std::collections::HashSet::from([legacy_id]),
+            "an unchanged file must keep its chunks, not be re-embedded"
+        );
+
+        let vs = stores.vector_store.read().await;
+        assert_eq!(vs.get_chunk(legacy_id).unwrap().unwrap().path, "lib.rs");
+        assert!(
+            vs.get_chunk(duplicate_id).unwrap().is_none(),
+            "the untracked duplicate chunk must be swept"
         );
     }
 }

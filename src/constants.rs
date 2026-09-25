@@ -404,6 +404,11 @@ pub const REPO_IDLE_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
 /// How often the idle-reaper background task checks for repos to evict.
 pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 
+/// Longest a query waits for another task's cold open of the same repo.
+/// Kept well under the MCP client's request timeout so the caller gets a
+/// "retry shortly" error instead of a cancelled request whose handler lingers.
+pub const REPO_OPEN_WAIT_SECS: u64 = 20;
+
 /// Environment variable to override the repo idle timeout.
 pub const REPO_IDLE_TIMEOUT_ENV: &str = "CODESEARCH_REPO_IDLE_TIMEOUT_SECS";
 
