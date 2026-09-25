@@ -2244,8 +2244,9 @@ impl ServeState {
             }
         };
         let db_path = path.join(DB_DIR_NAME);
+        let pool = self.embedding_pool();
 
-        match IndexManager::new_without_refresh(&path, stores.clone()).await {
+        match IndexManager::new_without_refresh(&path, stores.clone(), Some(pool.clone())).await {
             Ok(im) => {
                 let im_arc = Arc::new(im);
                 let token = CancellationToken::new();
@@ -2269,6 +2270,7 @@ impl ServeState {
                         &db_path_bg,
                         &stores_bg,
                         &token_for_task,
+                        Some(&pool),
                     )
                     .await
                     {
@@ -2457,11 +2459,13 @@ impl ServeState {
         // so it is given a fresh token that is never cancelled — the refresh runs
         // to completion. A real user-initiated cancel routes through the
         // RepoState::Write token owned by the live task instead.
+        let pool = self.embedding_pool();
         if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
             &path,
             &db_path,
             &stores_arc,
             &CancellationToken::new(),
+            Some(&pool),
         )
         .await
         {
@@ -2642,7 +2646,10 @@ impl ServeState {
         // On failure, still store as Write — searches keep working, live updates disabled.
         let (index_manager_opt, cancel_token) = {
             let alias_clone = alias.to_string();
-            match IndexManager::new_without_refresh(&path, stores_arc.clone()).await {
+            let pool = self.embedding_pool();
+            match IndexManager::new_without_refresh(&path, stores_arc.clone(), Some(pool.clone()))
+                .await
+            {
                 Ok(im) => {
                     let im_arc = Arc::new(im);
                     let token = CancellationToken::new();
@@ -2666,6 +2673,7 @@ impl ServeState {
                             &db_path_clone,
                             &stores_for_task,
                             &token_for_task,
+                            Some(&pool),
                         )
                         .await
                         {
@@ -2750,6 +2758,7 @@ impl ServeState {
 
         let cancel_token = CancellationToken::new();
         let token_for_task = cancel_token.clone();
+        let pool_bg = self.embedding_pool();
 
         // Fire-and-forget: create IndexManager + start FSW in background.
         // We don't block the first query — the repo is already searchable from the Warm state.
@@ -2758,7 +2767,9 @@ impl ServeState {
                 return;
             }
 
-            match IndexManager::new_without_refresh(&path_bg, stores_bg.clone()).await {
+            match IndexManager::new_without_refresh(&path_bg, stores_bg.clone(), Some(pool_bg))
+                .await
+            {
                 Ok(im) => {
                     let im_arc = Arc::new(im);
                     let im_for_task = im_arc.clone();
@@ -4282,12 +4293,14 @@ async fn reindex_handler(
             );
 
             // 2. Clear data and reindex
+            let pool = g_state.embedding_pool();
             match IndexManager::force_reindex_with_stores(
                 &project_path,
                 &db_path,
                 &stores,
                 None,
                 &reindex_token_task,
+                Some(&pool),
             )
             .await
             {
@@ -4370,11 +4383,13 @@ async fn reindex_handler(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
                 alias_bg
             );
+            let pool = g_state.embedding_pool();
             match IndexManager::perform_incremental_refresh_with_stores(
                 &project_path,
                 &db_path,
                 &stores,
                 &reindex_token_task,
+                Some(&pool),
             )
             .await
             {
@@ -4688,12 +4703,14 @@ async fn add_repo_handler(
             project_path.display()
         );
 
+        let pool = state_bg.embedding_pool();
         match IndexManager::force_reindex_with_stores(
             &project_path,
             &db_path,
             &stores,
             model_override,
             &token_for_task,
+            Some(&pool),
         )
         .await
         {

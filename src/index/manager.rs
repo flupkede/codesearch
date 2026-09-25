@@ -20,7 +20,7 @@ use crate::constants::{
     DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
     SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS, WRITER_LOCK_FILE,
 };
-use crate::embed::ModelType;
+use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::fts::FtsStore;
 use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
@@ -297,6 +297,9 @@ pub struct IndexManager {
     git_head_watcher: Option<GitHeadWatcher>,
     /// Shared stores for concurrent access
     stores: Arc<SharedStores>,
+    /// Serve-wide embedding-service pool (`None` outside serve — CLI/standalone
+    /// MCP run in their own process where direct construction is correct).
+    embedding_pool: Option<Arc<EmbeddingServicePool>>,
     /// Per-language symbol indexer registry (C# etc.)
     symbol_registry: Arc<SymbolIndexerRegistry>,
 }
@@ -309,6 +312,24 @@ fn is_ts_extension(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()),
         Some("ts") | Some("tsx") | Some("mts") | Some("cts")
     )
+}
+
+/// Where an embed pass gets its `EmbeddingService`: the serve-wide pool
+/// (which already holds the persistent cache's LMDB env open) or a fresh
+/// service (CLI / standalone MCP, own process).
+enum EmbeddingSource {
+    Pool(Arc<EmbeddingServicePool>),
+    Fresh,
+}
+
+/// Decide the embed source from the optional pool. Pure seam so the
+/// `Some`/`None` arm choice shared by both embed call sites is unit-testable
+/// without loading a model.
+fn embed_service_choice(pool: Option<&Arc<EmbeddingServicePool>>) -> EmbeddingSource {
+    match pool {
+        Some(p) => EmbeddingSource::Pool(Arc::clone(p)),
+        None => EmbeddingSource::Fresh,
+    }
 }
 
 impl IndexManager {
@@ -394,6 +415,7 @@ impl IndexManager {
             watcher,
             git_head_watcher: Some(git_head_watcher),
             stores,
+            embedding_pool: None,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
@@ -445,9 +467,13 @@ impl IndexManager {
     /// # Arguments
     /// * `codebase_path` - Path to the codebase to index
     /// * `stores` - Shared stores for concurrent access (created by caller)
+    /// * `embedding_pool` - Serve-wide embedding-service pool; `Some` in serve
+    ///   (reuses the process-shared persistent cache), `None` in standalone
+    ///   processes (direct construction — no pool to conflict with).
     pub async fn new_without_refresh<P: AsRef<Path>>(
         codebase_path: P,
         stores: Arc<SharedStores>,
+        embedding_pool: Option<Arc<EmbeddingServicePool>>,
     ) -> Result<Self> {
         let path_buf = codebase_path.as_ref().to_path_buf();
         let db_path = path_buf.join(DB_DIR_NAME);
@@ -490,6 +516,7 @@ impl IndexManager {
             watcher,
             git_head_watcher: Some(git_head_watcher),
             stores,
+            embedding_pool,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
@@ -548,11 +575,18 @@ impl IndexManager {
     ///
     /// This checks for changed/deleted files since last index and updates
     /// the index accordingly. Uses the shared stores to avoid lock conflicts.
+    ///
+    /// `embedding_pool` — when `Some`, embeddings are produced by the serve
+    /// pool's service so the process-shared persistent cache is reused; a
+    /// fresh `EmbeddingService` in the serve process would be refused by the
+    /// process-global LMDB registry (the pool already holds the cache open)
+    /// and silently degrade to cache-less re-embedding.
     pub async fn perform_incremental_refresh_with_stores(
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
         cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::SemanticChunker;
@@ -770,6 +804,7 @@ impl IndexManager {
                 // DURING the (long, core-saturating) embed pass is observed
                 // per-file, not only once the whole batch returns.
                 let batch_cancel = cancel_token.clone();
+                let embed_source = embed_service_choice(embedding_pool);
                 let embedded_chunks = tokio::task::spawn_blocking(
                     move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
                         let mut chunker = SemanticChunker::new(100, 2000, 10);
@@ -800,17 +835,39 @@ impl IndexManager {
                             return Ok(Vec::new());
                         }
 
-                        let mut embedding_service = EmbeddingService::with_cache_dir(
-                            embed_model,
-                            Some(cache_dir_for_batch.as_path()),
-                        )?;
                         // NOTE: embed_chunks runs a single ONNX inference over
                         // the whole batch atomically, so it is not interruptible
                         // mid-call. Worst-case cancel latency is bounded to one
                         // batch's embed (INCREMENTAL_REFRESH_BATCH_SIZE=200
                         // files); the per-file check above bounds the read/chunk
                         // phase that precedes it.
-                        embedding_service.embed_chunks(all_chunks)
+                        match embed_source {
+                            // Serve process: the pool already holds the
+                            // persistent cache's LMDB env open — a fresh
+                            // EmbeddingService here is refused by the
+                            // process-global registry and would re-embed
+                            // everything without cache.
+                            EmbeddingSource::Pool(pool) => {
+                                let service = pool.get(embed_model)?;
+                                // Recover from poisoning: a panicked embed
+                                // service still yields a valid guard (the
+                                // batch's embed_chunks result is what carries
+                                // correctness); a poison here must not
+                                // hard-fail every later batch for the
+                                // process lifetime.
+                                let mut guard = service
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                guard.embed_chunks(all_chunks)
+                            }
+                            EmbeddingSource::Fresh => {
+                                let mut embedding_service = EmbeddingService::with_cache_dir(
+                                    embed_model,
+                                    Some(cache_dir_for_batch.as_path()),
+                                )?;
+                                embedding_service.embed_chunks(all_chunks)
+                            }
+                        }
                     },
                 )
                 .await
@@ -977,6 +1034,7 @@ impl IndexManager {
         stores: &SharedStores,
         model_override: Option<ModelType>,
         cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use anyhow::Context;
@@ -1094,8 +1152,14 @@ impl IndexManager {
         info!("✅ Stores cleared, metadata preserved. Starting full reindex...");
 
         // ── Step 5: Reindex — all files treated as "changed" since metadata is empty ──
-        Self::perform_incremental_refresh_with_stores(codebase_path, db_path, stores, cancel_token)
-            .await
+        Self::perform_incremental_refresh_with_stores(
+            codebase_path,
+            db_path,
+            stores,
+            cancel_token,
+            embedding_pool,
+        )
+        .await
     }
 
     /// Start the file system watcher (begin collecting events) without starting the processing loop.
@@ -1294,6 +1358,7 @@ impl IndexManager {
         let stores = self.stores.clone();
         let git_head_watcher = self.git_head_watcher.clone();
         let symbol_registry = self.symbol_registry.clone();
+        let embedding_pool = self.embedding_pool.clone();
         let indexing_cb = indexing_status_cb.clone();
 
         info!("🚀 Starting background file watcher...");
@@ -1382,6 +1447,7 @@ impl IndexManager {
                                 &db_path,
                                 &stores,
                                 &cancel_token,
+                                embedding_pool.as_ref(),
                             )
                             .await
                             {
@@ -1554,6 +1620,7 @@ impl IndexManager {
                         to_index,
                         to_remove,
                         &cancel_token,
+                        embedding_pool.as_ref(),
                     )
                     .await
                     {
@@ -1858,6 +1925,7 @@ impl IndexManager {
         files_to_index: Vec<PathBuf>,
         files_to_remove: Vec<PathBuf>,
         cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
         use crate::output::set_quiet;
 
@@ -1961,7 +2029,9 @@ impl IndexManager {
         Self::ensure_indexing_active(cancel_token)?;
         for file_path in &files_to_index {
             debug!("📄 Indexing: {}", file_path.display());
-            if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
+            if let Err(e) =
+                Self::index_single_file(codebase_path, file_path, stores, embedding_pool).await
+            {
                 warn!("⚠️  Failed to index {}: {}", file_path.display(), e);
             }
         }
@@ -2013,6 +2083,7 @@ impl IndexManager {
         db_path: &Path,
         stores: &SharedStores,
         cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::file::FileWalker;
@@ -2193,7 +2264,9 @@ impl IndexManager {
             Self::ensure_indexing_active(cancel_token)?;
             let reindex_count = files_to_reindex.len();
             for file_path in &files_to_reindex {
-                if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
+                if let Err(e) =
+                    Self::index_single_file(codebase_path, file_path, stores, embedding_pool).await
+                {
                     warn!("⚠️  Failed to re-index {}: {}", file_path.display(), e);
                 }
             }
@@ -2291,6 +2364,7 @@ impl IndexManager {
         codebase_path: &Path,
         file_path: &Path,
         stores: &SharedStores,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::{Chunker, SemanticChunker};
@@ -2344,11 +2418,25 @@ impl IndexManager {
         let (embed_model, dimensions) = Self::resolve_embed_model(&db_path)?;
         let model_name = embed_model.short_name();
 
-        // Generate embeddings
-        let cache_dir = crate::constants::get_global_models_cache_dir()?;
-        let mut embedding_service =
-            EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
-        let embedded_chunks = embedding_service.embed_chunks(chunks)?;
+        // Generate embeddings. Reuse the serve pool's service when available:
+        // the pool already holds the persistent cache's LMDB env open, so a
+        // fresh EmbeddingService here is refused by the process-global
+        // registry and would degrade this path to cache-less re-embedding.
+        let embedded_chunks = match embed_service_choice(embedding_pool) {
+            EmbeddingSource::Pool(pool) => {
+                let service = pool.get(embed_model)?;
+                let mut guard = service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.embed_chunks(chunks)?
+            }
+            EmbeddingSource::Fresh => {
+                let cache_dir = crate::constants::get_global_models_cache_dir()?;
+                let mut embedding_service =
+                    EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
+                embedding_service.embed_chunks(chunks)?
+            }
+        };
 
         // ── Delete stale chunks for this file BEFORE inserting new ones ──
         // When a file is re-indexed (e.g. after a content change), the old
@@ -2541,6 +2629,20 @@ mod tests {
             .expect("db dir must be deletable after SharedStores drops (no leaked LMDB handles)");
     }
 
+    /// The pool arm must be taken exactly when a pool is present, carrying
+    /// that same pool; `None` must select a fresh service. Pins the arm
+    /// selection both embed call sites share — no model is loaded here
+    /// (`EmbeddingServicePool::new` is a plain constructor).
+    #[test]
+    fn embed_service_choice_selects_pool_when_present_and_fresh_when_none() {
+        let pool = Arc::new(EmbeddingServicePool::new(None));
+        match embed_service_choice(Some(&pool)) {
+            EmbeddingSource::Pool(p) => assert!(Arc::ptr_eq(&p, &pool)),
+            EmbeddingSource::Fresh => panic!("Some(pool) must select Pool, got Fresh"),
+        }
+        assert!(matches!(embed_service_choice(None), EmbeddingSource::Fresh));
+    }
+
     /// Helper: create metadata.json in db_path with given dimensions
     fn create_metadata_json(db_path: &Path, dimensions: usize) {
         let metadata = serde_json::json!({
@@ -2623,6 +2725,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -2667,6 +2770,7 @@ mod tests {
             &db_path,
             &stores,
             &token,
+            None,
         )
         .await;
 
@@ -2717,6 +2821,7 @@ mod tests {
                 &stores,
                 None,
                 &task_token,
+                None,
             )
             .await
         });
@@ -2793,6 +2898,7 @@ mod tests {
             &stores,
             None,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("force reindex on empty codebase should succeed");
@@ -2859,6 +2965,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -2926,6 +3033,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -2970,6 +3078,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -3021,6 +3130,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -3080,6 +3190,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -3124,6 +3235,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -3171,6 +3283,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 

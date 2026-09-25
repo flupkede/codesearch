@@ -805,7 +805,7 @@ pub async fn run_mcp_server_with_options(
         // Create IndexManager with shared stores (skip initial refresh - do in background)
         tracing::info!("🔍 Initializing index manager...");
         let index_manager =
-            IndexManager::new_without_refresh(&project_path, shared_stores.clone()).await?;
+            IndexManager::new_without_refresh(&project_path, shared_stores.clone(), None).await?;
 
         // Background: refresh FIRST, then file watcher (sequential, not concurrent)
         // Both write to SharedStores, so they must not run concurrently
@@ -828,6 +828,7 @@ pub async fn run_mcp_server_with_options(
                 &db_path_clone,
                 &shared_stores_clone,
                 &bg_cancel_token,
+                None,
             )
             .await
             {

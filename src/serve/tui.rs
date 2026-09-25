@@ -1152,6 +1152,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
 
     let alias_bg = alias.clone();
     let state_bg = state.clone();
+    let pool = state.embedding_pool();
     // Fresh cancellation token for this reindex task, registered in
     // `index_tasks` so `remove_repo` can cancel + await it (BUG1).
     let reindex_token = CancellationToken::new();
@@ -1168,6 +1169,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
             &stores,
             None,
             &reindex_token_task,
+            Some(&pool),
         )
         .await
         {
