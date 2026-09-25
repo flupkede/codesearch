@@ -14,7 +14,7 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.4.10]
+## [1.4.10] - 2026-09-26
 
 ### Changed
 
@@ -29,6 +29,7 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Incremental refresh reuses the serve hub's embedding pool (todo #135).** The refresh path constructed its own fastembed pool alongside the serve pool, doubling model memory per repo and re-initialising ONNX on every refresh; it now shares the serve pool. Single-serve runs are unchanged.
 - **`current_git_head` no longer leaks caller `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_OBJECT_DIRECTORY` into the queried repo.** A `codesearch index` invocation from inside a git hook (QC gate) inherits the hook's git environment and answered with the HOOK's repo state instead of the target project's, producing wrong head SHAs and spurious rebuild decisions; the four variables are stripped before `git rev-parse`.
+- **`prefix_path_with_alias` no longer mis-detects absolute paths on Linux.** It used `Path::has_root()`, which only recognizes a Windows drive-letter path (`C:/...`) as rooted when the binary itself runs on Windows; on the Linux CI runner an out-of-root Windows path was treated as relative and wrongly alias-prefixed. Replaced with a platform-independent textual check.
 
 ## [1.4.9] - 2026-09-23
 
