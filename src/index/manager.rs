@@ -631,7 +631,8 @@ impl IndexManager {
         let mut unchanged_count = 0;
 
         for file in &files {
-            let (needs_reindex, _old_chunk_ids) = file_meta_store.check_file(&file.path)?;
+            let key = crate::cache::storage_key(&file.path, codebase_path);
+            let (needs_reindex, _old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
             if needs_reindex {
                 changed_files.push(file.clone());
                 debug!("📝 File changed: {}", file.path.display());
@@ -641,7 +642,7 @@ impl IndexManager {
         }
 
         // Find deleted files
-        let deleted_files = file_meta_store.find_deleted_files();
+        let deleted_files = file_meta_store.find_deleted_files(codebase_path);
 
         info!(
             "   Unchanged: {}, Changed: {}, Deleted: {}",
@@ -688,12 +689,13 @@ impl IndexManager {
                     }
                 }
             }
-            file_meta_store.remove_file(Path::new(file_path));
+            file_meta_store.remove_file(file_path);
         }
 
         // Delete old chunks for changed files
         for file in &changed_files {
-            let (_, old_chunk_ids) = file_meta_store.check_file(&file.path)?;
+            let key = crate::cache::storage_key(&file.path, codebase_path);
+            let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
             if !old_chunk_ids.is_empty() {
                 debug!(
                     "🔄 Deleting {} old chunks for: {}",
@@ -763,6 +765,7 @@ impl IndexManager {
                 // are not needed on the async side and may not be `Send`.
                 let files_for_embed = file_batch.to_vec();
                 let cache_dir_for_batch = cache_dir.clone();
+                let root_for_batch = codebase_path.to_path_buf();
                 // Clone the token into the blocking closure so a cancel arriving
                 // DURING the (long, core-saturating) embed pass is observed
                 // per-file, not only once the whole batch returns.
@@ -783,8 +786,13 @@ impl IndexManager {
                                 Ok(c) => c,
                                 Err(_) => continue,
                             };
-                            let chunks =
-                                chunker.chunk_semantic(file.language, &file.path, &content)?;
+                            // Chunk under the project-relative storage key so
+                            // chunk metadata stays machine-portable.
+                            let rel = std::path::PathBuf::from(crate::cache::storage_key(
+                                &file.path,
+                                &root_for_batch,
+                            ));
+                            let chunks = chunker.chunk_semantic(file.language, &rel, &content)?;
                             all_chunks.extend(chunks);
                         }
 
@@ -869,14 +877,14 @@ impl IndexManager {
                     }
 
                     for file in file_batch {
-                        let path_str = normalize_path(&file.path);
+                        let path_str = crate::cache::storage_key(&file.path, codebase_path);
                         if let Some(ids) = chunks_by_file.get(&path_str) {
-                            file_meta_store.update_file(&file.path, ids.clone())?;
+                            file_meta_store.update_file(&file.path, &path_str, ids.clone())?;
                         } else {
                             // File was processed but produced 0 chunks (e.g. minified JS,
                             // empty file). Track it with empty chunk list so it is not
                             // re-processed on every run and doctor doesn't flag it.
-                            file_meta_store.update_file(&file.path, vec![])?;
+                            file_meta_store.update_file(&file.path, &path_str, vec![])?;
                         }
                     }
 
@@ -886,7 +894,8 @@ impl IndexManager {
                     // them so they are not flagged as unindexed on every
                     // subsequent run.
                     for file in file_batch {
-                        file_meta_store.update_file(&file.path, vec![])?;
+                        let key = crate::cache::storage_key(&file.path, codebase_path);
+                        file_meta_store.update_file(&file.path, &key, vec![])?;
                     }
                 }
             }
@@ -2050,7 +2059,9 @@ impl IndexManager {
             let mut chunks_to_delete: Vec<u32> = Vec::new();
 
             for file_info in &files {
-                let (needs_reindex, old_chunk_ids) = file_meta_store.check_file(&file_info.path)?;
+                let key = crate::cache::storage_key(&file_info.path, codebase_path);
+                let (needs_reindex, old_chunk_ids) =
+                    file_meta_store.check_file(&file_info.path, &key)?;
                 if needs_reindex {
                     chunks_to_delete.extend(old_chunk_ids);
                     files_to_reindex.push(file_info.path.clone());
@@ -2058,7 +2069,7 @@ impl IndexManager {
             }
 
             // Find files that were deleted (tracked in metadata but not on disk)
-            let deleted_files = file_meta_store.find_deleted_files();
+            let deleted_files = file_meta_store.find_deleted_files(codebase_path);
 
             if files_to_reindex.is_empty() && deleted_files.is_empty() {
                 info!("✅ Branch refresh: index is up to date, no changes needed");
@@ -2095,7 +2106,7 @@ impl IndexManager {
             // Remove deleted files from FileMetaStore
             let mut deleted_count = deleted_files.len();
             for (file_path, _chunk_ids) in &deleted_files {
-                file_meta_store.remove_file(std::path::Path::new(file_path));
+                file_meta_store.remove_file(file_path);
             }
 
             // Save metadata after deletions (before re-indexing, since
@@ -2126,7 +2137,9 @@ impl IndexManager {
                 let mut orphan_file_count = 0usize;
 
                 for (vs_path, chunk_ids) in &vs_file_chunks {
-                    if !std::path::Path::new(vs_path).exists() {
+                    // Stored chunk paths are project-relative; resolve against
+                    // the codebase root for the on-disk existence check.
+                    if !codebase_path.join(vs_path).exists() {
                         orphan_chunk_ids.extend(chunk_ids);
                         orphan_file_count += 1;
                     }
@@ -2233,6 +2246,8 @@ impl IndexManager {
             false,
             false,
             None,
+            false,
+            None,
             CancellationToken::new(),
         )
         .await?;
@@ -2305,9 +2320,11 @@ impl IndexManager {
             }
         };
 
-        // Chunk the file
+        // Chunk the file under its project-relative storage key so chunk
+        // metadata stays machine-portable.
         let chunker = SemanticChunker::new(100, 4000, 2);
-        let chunks = chunker.chunk_file(file_path, &content)?;
+        let rel_key = crate::cache::storage_key(file_path, codebase_path);
+        let chunks = chunker.chunk_file(std::path::Path::new(&rel_key), &content)?;
 
         if chunks.is_empty() {
             debug!("No chunks created for file: {}", file_path.display());
@@ -2342,7 +2359,7 @@ impl IndexManager {
         {
             let mut file_meta_store =
                 FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
-            if let Some(old_meta) = file_meta_store.remove_file(file_path) {
+            if let Some(old_meta) = file_meta_store.remove_file(&rel_key) {
                 let old_ids = old_meta.chunk_ids;
                 if !old_ids.is_empty() {
                     debug!(
@@ -2398,7 +2415,7 @@ impl IndexManager {
 
         // Update file metadata (separate store, not shared)
         let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
-        file_meta_store.update_file(file_path, chunk_ids)?;
+        file_meta_store.update_file(file_path, &rel_key, chunk_ids)?;
         file_meta_store.save(&db_path)?;
 
         info!(
@@ -2413,7 +2430,7 @@ impl IndexManager {
     /// Remove a file from the index using shared stores (for FSW delete events).
     /// This version uses the shared stores to avoid LMDB conflicts.
     async fn remove_file_from_index_with_stores(
-        _codebase_path: &Path,
+        codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
         file_path: &Path,
@@ -2438,7 +2455,8 @@ impl IndexManager {
 
         // Get chunk IDs from file metadata directly (not check_file which reads from disk)
         // The file is already deleted, so we can't read mtime/size/hash
-        let meta = file_meta_store.remove_file(file_path);
+        let key = crate::cache::storage_key(file_path, codebase_path);
+        let meta = file_meta_store.remove_file(&key);
         let chunk_ids = match meta {
             Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
             Some(_) => {
@@ -2810,14 +2828,16 @@ mod tests {
 
         // Track the ghost file in FileMetaStore
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&ghost_file, vec![100, 101]).unwrap();
+        file_meta
+            .update_file(&ghost_file, "ghost.rs", vec![100, 101])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Now delete the ghost file from disk — simulates branch switch
         std::fs::remove_file(&ghost_file).unwrap();
 
         // Verify precondition: ghost file IS tracked but NOT on disk
-        let deleted_before = file_meta.find_deleted_files();
+        let deleted_before = file_meta.find_deleted_files(&codebase_path);
         assert_eq!(
             deleted_before.len(),
             1,
@@ -2846,7 +2866,7 @@ mod tests {
 
         // Verify: reload FileMetaStore and confirm ghost entry is gone
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted_after = reloaded.find_deleted_files();
+        let deleted_after = reloaded.find_deleted_files(&codebase_path);
         assert!(
             deleted_after.is_empty(),
             "Ghost file should have been removed from FileMetaStore after refresh, found: {:?}",
@@ -2875,9 +2895,15 @@ mod tests {
 
         // Track all ghost files
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&ghost1, vec![10, 11]).unwrap();
-        file_meta.update_file(&ghost2, vec![20, 21, 22]).unwrap();
-        file_meta.update_file(&ghost3, vec![30]).unwrap();
+        file_meta
+            .update_file(&ghost1, "ghost1.rs", vec![10, 11])
+            .unwrap();
+        file_meta
+            .update_file(&ghost2, "ghost2.rs", vec![20, 21, 22])
+            .unwrap();
+        file_meta
+            .update_file(&ghost3, "ghost3.rs", vec![30])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Delete all ghost files
@@ -2886,7 +2912,7 @@ mod tests {
         std::fs::remove_file(&ghost3).unwrap();
 
         // Verify precondition
-        let deleted_before = file_meta.find_deleted_files();
+        let deleted_before = file_meta.find_deleted_files(&codebase_path);
         assert_eq!(
             deleted_before.len(),
             3,
@@ -2907,7 +2933,7 @@ mod tests {
 
         // All ghost entries should be removed
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted_after = reloaded.find_deleted_files();
+        let deleted_after = reloaded.find_deleted_files(&codebase_path);
         assert!(
             deleted_after.is_empty(),
             "All 3 ghost files should be removed, found: {:?}",
@@ -2932,7 +2958,9 @@ mod tests {
 
         // Track it in FileMetaStore (update_file reads mtime/size/hash)
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&real_file, vec![1, 2]).unwrap();
+        file_meta
+            .update_file(&real_file, "main.rs", vec![1, 2])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         let stores = create_test_stores(&db_path, 4).await;
@@ -2949,7 +2977,7 @@ mod tests {
 
         // Verify: real file entry should still be in FileMetaStore
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted = reloaded.find_deleted_files();
+        let deleted = reloaded.find_deleted_files(&codebase_path);
         assert!(
             deleted.is_empty(),
             "Real file should NOT be removed from FileMetaStore"
@@ -2975,8 +3003,12 @@ mod tests {
 
         // Track both files
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&real_file, vec![1, 2]).unwrap();
-        file_meta.update_file(&ghost_file, vec![3, 4, 5]).unwrap();
+        file_meta
+            .update_file(&real_file, "real.rs", vec![1, 2])
+            .unwrap();
+        file_meta
+            .update_file(&ghost_file, "ghost.rs", vec![3, 4, 5])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Delete ghost file — simulates branch switch removing it
@@ -2996,7 +3028,7 @@ mod tests {
 
         // Verify: ghost is removed, real is preserved
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted = reloaded.find_deleted_files();
+        let deleted = reloaded.find_deleted_files(&codebase_path);
         assert!(
             deleted.is_empty(),
             "Ghost entry should be removed, real should remain. Found deleted: {:?}",
@@ -3004,7 +3036,7 @@ mod tests {
         );
 
         // Verify the real file is still tracked by checking it doesn't need reindex
-        let (needs_reindex, _chunk_ids) = reloaded.check_file(&real_file).unwrap();
+        let (needs_reindex, _chunk_ids) = reloaded.check_file(&real_file, "real.rs").unwrap();
         assert!(
             !needs_reindex,
             "Real file should still be tracked and up-to-date in FileMetaStore"
@@ -3029,8 +3061,12 @@ mod tests {
         std::fs::write(&file2, "pub fn util_fn() {}").unwrap();
 
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&file1, vec![1, 2, 3]).unwrap();
-        file_meta.update_file(&file2, vec![4, 5]).unwrap();
+        file_meta
+            .update_file(&file1, "lib.rs", vec![1, 2, 3])
+            .unwrap();
+        file_meta
+            .update_file(&file2, "util.rs", vec![4, 5])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Delete ALL files — simulates switching to a branch with no source
@@ -3051,7 +3087,7 @@ mod tests {
 
         // All entries should be cleaned
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted = reloaded.find_deleted_files();
+        let deleted = reloaded.find_deleted_files(&codebase_path);
         assert!(deleted.is_empty(), "All stale entries should be removed");
     }
 
@@ -3078,7 +3114,7 @@ mod tests {
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
         // update_file hashes current on-disk content, so a subsequent check_file
         // on the unmodified file returns needs_reindex = false.
-        file_meta.update_file(&file, vec![1]).unwrap();
+        file_meta.update_file(&file, "lib.rs", vec![1]).unwrap();
         file_meta.save(&db_path).unwrap();
 
         let stores = create_test_stores(&db_path, 4).await;
@@ -3100,8 +3136,62 @@ mod tests {
         // The tracked file must still be tracked and not flagged as deleted.
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
         assert!(
-            reloaded.find_deleted_files().is_empty(),
+            reloaded.find_deleted_files(&codebase_path).is_empty(),
             "No files should be flagged deleted on an up-to-date refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_incremental_refresh_round_trips_relative_keys() {
+        // Chunk/file-meta paths are stored RELATIVE to the project root so the
+        // built DB is portable across machines. A file tracked under its
+        // relative storage key must be seen as UNCHANGED (not re-indexed, not
+        // deleted) by a refresh pass that re-walks the same codebase.
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        create_metadata_json(&db_path, 4);
+
+        let file = codebase_path.join("lib.rs");
+        std::fs::write(&file, "pub fn lib_fn() {}").unwrap();
+
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        let key = crate::cache::storage_key(&file, &codebase_path);
+        assert_eq!(key, "lib.rs", "storage key must be project-relative");
+        file_meta.update_file(&file, &key, vec![1]).unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let result = IndexManager::perform_incremental_refresh_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Second pass over unchanged files must succeed: {:?}",
+            result
+        );
+
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        assert!(
+            reloaded.is_tracked("lib.rs"),
+            "Relative key must survive the refresh round-trip, keys: {:?}",
+            reloaded.tracked_files().collect::<Vec<_>>()
+        );
+        assert!(
+            !reloaded
+                .tracked_files()
+                .any(|k| std::path::Path::new(k).is_absolute()),
+            "No stored key may be absolute, keys: {:?}",
+            reloaded.tracked_files().collect::<Vec<_>>()
         );
     }
 }

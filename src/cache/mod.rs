@@ -2,7 +2,7 @@ mod file_meta;
 
 pub use file_meta::{
     normalize_filter_path, normalize_path, normalize_path_str, normalize_user_path,
-    path_matches_filter, safe_canonicalize, strip_unc_prefix, FileMetaStore,
+    path_matches_filter, safe_canonicalize, storage_key, strip_unc_prefix, FileMetaStore,
 };
 
 use moka::sync::Cache;

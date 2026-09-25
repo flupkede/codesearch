@@ -1121,7 +1121,8 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
 
     // Check for changed files
     for file in &files {
-        let (needs_reindex, old_chunk_ids) = file_meta.check_file(&file.path)?;
+        let key = crate::cache::storage_key(&file.path, project_path);
+        let (needs_reindex, old_chunk_ids) = file_meta.check_file(&file.path, &key)?;
 
         if !needs_reindex {
             continue;
@@ -1144,28 +1145,29 @@ fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
             Err(_) => continue,
         };
 
-        let chunks = chunker.chunk_semantic(file.language, &file.path, &source_code)?;
+        let rel = std::path::PathBuf::from(key.clone());
+        let chunks = chunker.chunk_semantic(file.language, &rel, &source_code)?;
 
         if chunks.is_empty() {
-            file_meta.update_file(&file.path, vec![])?;
+            file_meta.update_file(&file.path, &key, vec![])?;
             continue;
         }
 
         // Embed and insert
         let embedded_chunks = embedding_service.embed_chunks(chunks)?;
         let chunk_ids = store.insert_chunks_with_ids(embedded_chunks)?;
-        file_meta.update_file(&file.path, chunk_ids)?;
+        file_meta.update_file(&file.path, &key, chunk_ids)?;
     }
 
     // Check for deleted files
-    let deleted_files = file_meta.find_deleted_files();
+    let deleted_files = file_meta.find_deleted_files(project_path);
     for (path, chunk_ids) in &deleted_files {
         changes += 1;
         println!("  🗑️  {} (deleted)", sanitize_for_terminal(path));
         if !chunk_ids.is_empty() {
             store.delete_chunks(chunk_ids)?;
         }
-        file_meta.remove_file(std::path::Path::new(path));
+        file_meta.remove_file(path);
     }
 
     // Rebuild index if changes were made

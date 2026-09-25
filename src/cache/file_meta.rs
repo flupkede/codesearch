@@ -201,6 +201,18 @@ pub fn normalize_path_relative(path: &str, project_root_normalized: &str) -> Str
     }
 }
 
+/// Canonical storage key for a file: its path **relative to the project root**,
+/// normalized (UNC stripped, forward slashes on Windows). Already-relative
+/// inputs and paths outside `project_root` fall back to the normalized input.
+///
+/// Chunk metadata and `FileMetaStore` entries are keyed by this relative form
+/// so a built database directory is machine-portable (snapshot tarballs move
+/// the DB between hosts where the absolute build path does not exist).
+pub fn storage_key(path: &Path, project_root: &Path) -> String {
+    let root_normalized = normalize_path(project_root);
+    normalize_path_relative(&normalize_path(path), &root_normalized)
+}
+
 /// Check whether a path matches a normalized filter prefix.
 ///
 /// `project_root_normalized` should be pre-normalized with `normalize_path_str`.
@@ -249,7 +261,7 @@ pub struct FileMeta {
 /// 3. Stores chunk count for statistics
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileMetaStore {
-    /// Map of absolute file path -> metadata
+    /// Map of project-relative file path (storage key) -> metadata
     files: HashMap<String, FileMeta>,
     /// Model used for indexing (invalidate if model changes)
     pub model_name: String,
@@ -358,17 +370,21 @@ impl FileMetaStore {
         Ok(mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs())
     }
 
-    /// Check if a file needs re-indexing
     /// Check whether a path is already tracked (regardless of chunk count).
     /// Used by doctor to distinguish "never indexed" from "indexed but unchunkable".
-    pub fn is_tracked(&self, path: &Path) -> bool {
-        let path_str = normalize_path(path);
+    ///
+    /// `key` is the project-relative storage key (see [`storage_key`]).
+    pub fn is_tracked(&self, key: &str) -> bool {
+        let path_str = normalize_path_str(key);
         self.files.contains_key(&path_str)
     }
 
     /// Returns: (needs_reindex, existing_chunk_ids_to_delete)
-    pub fn check_file(&self, path: &Path) -> Result<(bool, Vec<u32>)> {
-        let path_str = normalize_path(path);
+    ///
+    /// `path` is the absolute path used for filesystem stats (mtime/size/hash);
+    /// `key` is the project-relative storage key the metadata is filed under.
+    pub fn check_file(&self, path: &Path, key: &str) -> Result<(bool, Vec<u32>)> {
+        let path_str = normalize_path_str(key);
 
         // Get current file stats
         let current_mtime = Self::get_mtime(path)?;
@@ -395,9 +411,12 @@ impl FileMetaStore {
         }
     }
 
-    /// Update metadata for a file after indexing
-    pub fn update_file(&mut self, path: &Path, chunk_ids: Vec<u32>) -> Result<()> {
-        let path_str = normalize_path(path);
+    /// Update metadata for a file after indexing.
+    ///
+    /// `path` is the absolute path used for filesystem stats; `key` is the
+    /// project-relative storage key the metadata is filed under.
+    pub fn update_file(&mut self, path: &Path, key: &str, chunk_ids: Vec<u32>) -> Result<()> {
+        let path_str = normalize_path_str(key);
         let hash = Self::compute_hash(path)?;
         let mtime = Self::get_mtime(path)?;
         let size = fs::metadata(path)?.len();
@@ -416,9 +435,9 @@ impl FileMetaStore {
         Ok(())
     }
 
-    /// Mark a file as deleted
-    pub fn remove_file(&mut self, path: &Path) -> Option<FileMeta> {
-        let path_str = normalize_path(path);
+    /// Mark a file as deleted. `key` is the project-relative storage key.
+    pub fn remove_file(&mut self, key: &str) -> Option<FileMeta> {
+        let path_str = normalize_path_str(key);
         self.files.remove(&path_str)
     }
 
@@ -433,11 +452,14 @@ impl FileMetaStore {
         self.files.is_empty()
     }
 
-    /// Find files that were deleted (exist in store but not on disk)
-    pub fn find_deleted_files(&self) -> Vec<(String, Vec<u32>)> {
+    /// Find files that were deleted (exist in store but not on disk).
+    ///
+    /// `project_root` resolves relative keys back onto disk for the
+    /// existence check — keys are project-relative so the store is portable.
+    pub fn find_deleted_files(&self, project_root: &Path) -> Vec<(String, Vec<u32>)> {
         self.files
             .iter()
-            .filter(|(path, _)| !Path::new(path).exists())
+            .filter(|(path, _)| !project_root.join(path).exists())
             .map(|(path, meta)| (path.clone(), meta.chunk_ids.clone()))
             .collect()
     }

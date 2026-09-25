@@ -354,22 +354,24 @@ fn test_file_meta_store() {
     fs::write(&test_file, "hello world").unwrap();
 
     // Check new file
-    let (needs_reindex, old_chunks) = store.check_file(&test_file).unwrap();
+    let (needs_reindex, old_chunks) = store.check_file(&test_file, "test.txt").unwrap();
     assert!(needs_reindex);
     assert!(old_chunks.is_empty());
 
     // Update metadata
-    store.update_file(&test_file, vec![1, 2, 3]).unwrap();
+    store
+        .update_file(&test_file, "test.txt", vec![1, 2, 3])
+        .unwrap();
 
     // Check again - should not need reindex
-    let (needs_reindex, _) = store.check_file(&test_file).unwrap();
+    let (needs_reindex, _) = store.check_file(&test_file, "test.txt").unwrap();
     assert!(!needs_reindex);
 
     // Modify file
     fs::write(&test_file, "hello world modified").unwrap();
 
     // Now should need reindex
-    let (needs_reindex, old_chunks) = store.check_file(&test_file).unwrap();
+    let (needs_reindex, old_chunks) = store.check_file(&test_file, "test.txt").unwrap();
     assert!(needs_reindex);
     assert_eq!(old_chunks, vec![1, 2, 3]);
 
@@ -377,6 +379,26 @@ fn test_file_meta_store() {
     store.save(db_path).unwrap();
     let loaded = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
     assert_eq!(loaded.files.len(), 1);
+    assert!(loaded.is_tracked("test.txt"));
+}
+
+#[test]
+fn test_storage_key_relative_and_portable() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let file = root.join("src").join("main.rs");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(&file, "fn main() {}").unwrap();
+
+    let key = storage_key(&file, root);
+    assert_eq!(key, "src/main.rs");
+    // Already-relative input round-trips unchanged
+    assert_eq!(storage_key(Path::new("src/main.rs"), root), "src/main.rs");
+    // Path outside the root falls back to the normalized absolute form
+    let outside = storage_key(Path::new("C:/elsewhere/x.rs"), root);
+    assert!(outside.ends_with("elsewhere/x.rs"));
+    // Root itself yields an empty-ish key without panicking
+    let _ = storage_key(root, root);
 }
 
 // =========================================================================
