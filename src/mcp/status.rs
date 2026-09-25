@@ -171,9 +171,18 @@ impl CodesearchService {
             let mut failed_count = 0usize;
 
             for (i, store_arc) in sv.iter().enumerate() {
-                let store = store_arc.vector_store.read().await;
-                match store.stats() {
-                    Ok(stats) => {
+                // Never wait on the store lock: an indexing run holds it for
+                // whole batches and build_index() for minutes, and status must
+                // answer immediately — the same contract as list_projects. A
+                // busy store is attributed to THIS store, never skipped
+                // silently.
+                let stats_result = store_arc
+                    .vector_store
+                    .try_read()
+                    .ok()
+                    .map(|store| store.stats());
+                match stats_result {
+                    Some(Ok(stats)) => {
                         total_chunks += stats.total_chunks;
                         total_files += stats.total_files;
                         if stats.max_chunk_id > max_chunk_id {
@@ -192,10 +201,24 @@ impl CodesearchService {
                     // store is down". This is the tool whose job is reporting index
                     // health, so it must not stay silent on the one signal that
                     // matters here: bind the error, carry it, never `Err(_)`.
-                    Err(ref e) => {
+                    Some(Err(ref e)) => {
                         all_indexed = false;
                         failed_count += 1;
                         note_store_failure(&mut stats_warnings, aliases, i, "stats", e);
+                    }
+                    None => {
+                        all_indexed = false;
+                        failed_count += 1;
+                        let alias = aliases.get(i).map(|s| s.as_str()).unwrap_or("unknown");
+                        push_store_warning(
+                            &mut stats_warnings,
+                            &store_warning(
+                                alias,
+                                "stats",
+                                "store lock busy (an indexing run holds it); live stats \
+                                 unavailable",
+                            ),
+                        );
                     }
                 }
             }
