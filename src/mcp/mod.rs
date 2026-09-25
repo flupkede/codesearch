@@ -27,6 +27,37 @@ fn serve_url_from_env() -> String {
     format!("http://{}:{}", host, port)
 }
 
+/// Configured vector-store lock wait for MCP handlers.
+fn store_lock_wait() -> std::time::Duration {
+    std::env::var(crate::constants::STORE_LOCK_WAIT_SECS_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(crate::constants::STORE_LOCK_WAIT_SECS))
+}
+
+/// Acquire the vector-store read lock with a bounded wait.
+///
+/// A handler queued on this lock keeps its `Arc<SharedStores>` — and with it
+/// the repo's LMDB env and `.writer.lock` — alive for the whole wait, and a
+/// cancelled rmcp request does not reliably drop its handler future. An
+/// unbounded wait therefore pinned stores open long after the client gave
+/// up; the bound turns that into a retryable "store busy" error and lets
+/// eviction proceed.
+pub(crate) async fn bounded_vector_read(
+    lock: &tokio::sync::RwLock<VectorStore>,
+) -> Result<tokio::sync::RwLockReadGuard<'_, VectorStore>> {
+    let wait = store_lock_wait();
+    tokio::time::timeout(wait, lock.read()).await.map_err(|_| {
+        anyhow::anyhow!(
+            "vector store still busy after {}s (an indexing run holds the write \
+                 lock) — retry shortly",
+            wait.as_secs()
+        )
+    })
+}
+
 use crate::db_discovery::{find_best_database, load_repos_config};
 use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::file::Language;
@@ -1263,13 +1294,13 @@ impl CodesearchService {
     {
         // Priority 1: explicit store override (from project/group routing)
         if let Some(stores) = store_override {
-            let store = stores.vector_store.read().await;
+            let store = bounded_vector_read(&stores.vector_store).await?;
             return action(&store).context("Error reading from project-routed vector store");
         }
 
         // Priority 2: shared stores (set during IndexManager init)
         if let Some(ref stores) = self.shared_stores {
-            let store = stores.vector_store.read().await;
+            let store = bounded_vector_read(&stores.vector_store).await?;
             match action(&store) {
                 Ok(result) => return Ok(result),
                 Err(shared_err) => {
@@ -1350,7 +1381,13 @@ impl CodesearchService {
 
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let store = store_arc.vector_store.read().await;
+            let store = match bounded_vector_read(&store_arc.vector_store).await {
+                Ok(store) => store,
+                Err(e) => {
+                    failures.push((alias.to_string(), format!("{e:#}")));
+                    continue;
+                }
+            };
             match action(alias, &store) {
                 Ok(results) => {
                     for r in results {

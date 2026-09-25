@@ -518,6 +518,22 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
 
+/// How long an MCP handler may wait for the vector-store read lock before
+/// giving up with a "store busy" error.
+///
+/// A handler queued on this lock keeps its `Arc<SharedStores>` — and with it
+/// the repo's LMDB env and `.writer.lock` — alive for the whole wait, and a
+/// cancelled rmcp request does not reliably drop its handler future. An
+/// unbounded wait therefore pinned stores open long after the client gave
+/// up, blocking idle eviction and writer-lock recovery. The bound also turns
+/// a wait behind a long `build_index()` into a retryable error instead of a
+/// hang. Generous by design: it must outlast any legitimate reader queue
+/// behind a single batch or graph build, not the whole warmup.
+pub const STORE_LOCK_WAIT_SECS: u64 = 300;
+
+/// Environment variable overriding [`STORE_LOCK_WAIT_SECS`].
+pub const STORE_LOCK_WAIT_SECS_ENV: &str = "CODESEARCH_STORE_LOCK_WAIT_SECS";
+
 /// Total number of attempts (initial request + retries) the federation client
 /// makes against a remote peer that answers with a transient HTTP status
 /// (502/503/504). Federated peers commonly run on scale-to-zero hosts (Azure

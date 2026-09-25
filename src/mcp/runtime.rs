@@ -116,7 +116,7 @@ pub(crate) async fn require_prebuilt_index_ready(
     db_path: &Path,
 ) -> Result<()> {
     let (total_chunks, vector_indexed) = {
-        let vector_store = stores.vector_store.read().await;
+        let vector_store = crate::mcp::bounded_vector_read(&stores.vector_store).await?;
         vector_store
             .index_health()
             .context("Failed to inspect prebuilt vector index")?
