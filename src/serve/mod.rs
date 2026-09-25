@@ -2532,6 +2532,13 @@ impl ServeState {
             }
         }
 
+        // Begin the indexing marker BEFORE registering as Warm: FSW's gate
+        // (`!touch || self.is_indexing(alias)`) is checked by a concurrent
+        // query the instant the repo appears in `self.repos`, so the marker
+        // must already be visible or FSW can start and race warmup's
+        // unsaved file_meta.
+        let warmup_marker_acquired = self.begin_indexing(alias, IndexingOwner::Warmup);
+
         // Register as Warm BEFORE the refresh and release the single-flight
         // lock: a refresh of a large repo takes minutes, and queries must be
         // answered from the existing data meanwhile instead of queueing on
@@ -2551,7 +2558,7 @@ impl ServeState {
 
         // Tracked like any reindex: status reports "indexing", the reaper
         // leaves the repo alone, and a concurrent reindex is not doubled.
-        if !self.begin_indexing(alias, IndexingOwner::Warmup) {
+        if !warmup_marker_acquired {
             info!(
                 "Warmup '{}': another indexing run is active, skipping refresh",
                 alias
