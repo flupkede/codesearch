@@ -2346,11 +2346,11 @@ fn freshness_for_path_reports_indexing_state() {
 
     // Mid-reindex (the exact state a branch-switch full refresh puts the
     // repo in — make_indexing_status_callback inserts around it).
-    state.begin_indexing("fresh");
+    state.begin_indexing("fresh", IndexingOwner::Watcher);
     let (_, indexing) = state.freshness_for_path(&target.to_string_lossy());
     assert!(indexing, "begin_indexing must surface as indexing=true");
 
-    state.end_indexing("fresh");
+    state.end_indexing("fresh", IndexingOwner::Watcher);
     let (_, indexing) = state.freshness_for_path(&target.to_string_lossy());
     assert!(!indexing);
 
@@ -3021,9 +3021,13 @@ async fn stale_indexing_marker_cancels_the_leaked_index_task() {
         .insert("leaky".to_string(), (handle, token.clone()));
     state.active_reindexes.insert(
         "leaky".to_string(),
-        Instant::now()
-            .checked_sub(Duration::from_secs(2))
-            .expect("monotonic clock at least 2s old"),
+        std::iter::once((
+            IndexingOwner::Reindex,
+            Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("monotonic clock at least 2s old"),
+        ))
+        .collect(),
     );
 
     assert!(
@@ -3060,7 +3064,7 @@ async fn fresh_indexing_marker_leaves_its_index_task_running() {
     state
         .index_tasks
         .insert("busy".to_string(), (handle, token.clone()));
-    state.begin_indexing("busy");
+    state.begin_indexing("busy", IndexingOwner::Reindex);
 
     assert!(
         state.is_indexing("busy"),
@@ -3124,9 +3128,9 @@ async fn own_lmdb_holder_and_indexing_count_as_held_in_process() {
     drop(store);
     assert!(!state.is_held_in_process("own", &db_path));
 
-    state.begin_indexing("own");
+    state.begin_indexing("own", IndexingOwner::Reindex);
     assert!(state.is_held_in_process("own", &db_path));
-    state.end_indexing("own");
+    state.end_indexing("own", IndexingOwner::Reindex);
 }
 
 #[tokio::test]
@@ -3147,7 +3151,7 @@ async fn warm_query_does_not_start_fsw_while_warmup_indexes() {
     state
         .repos
         .insert("warming".to_string(), RepoState::Warm { stores });
-    state.begin_indexing("warming");
+    state.begin_indexing("warming", IndexingOwner::Warmup);
 
     let result = state.try_cached_stores("warming", true);
     assert!(
@@ -3161,7 +3165,7 @@ async fn warm_query_does_not_start_fsw_while_warmup_indexes() {
         ),
         "a query during warmup indexing must not transition Warm to Write"
     );
-    state.end_indexing("warming");
+    state.end_indexing("warming", IndexingOwner::Warmup);
     state.repos.remove("warming");
 }
 
@@ -3177,7 +3181,7 @@ async fn indexing_marker_heartbeat_survives_past_max() {
     let state = Arc::new(ServeState::new(ReposConfig::default(), None));
 
     // Control: without renewal the marker expires at the threshold.
-    state.begin_indexing("ctrl");
+    state.begin_indexing("ctrl", IndexingOwner::Warmup);
     tokio::time::sleep(Duration::from_millis(2100)).await;
     assert!(
         !state.is_indexing("ctrl"),
@@ -3185,17 +3189,101 @@ async fn indexing_marker_heartbeat_survives_past_max() {
     );
 
     // Heartbeat: renewal inside the window keeps the marker alive past max.
-    state.begin_indexing("hb");
+    state.begin_indexing("hb", IndexingOwner::Warmup);
     tokio::time::sleep(Duration::from_millis(1000)).await;
-    state.renew_indexing("hb");
+    state.renew_indexing("hb", IndexingOwner::Warmup);
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert!(
         state.is_indexing("hb"),
         "a heartbeat-renewed marker must stay alive past the threshold"
     );
-    state.end_indexing("hb");
+    state.end_indexing("hb", IndexingOwner::Warmup);
     assert!(
         !state.is_indexing("hb"),
         "end_indexing must clear the marker"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn fsw_callback_end_cannot_clear_a_concurrent_reindex_marker() {
+    // Regression: the FSW completion callback cleared the whole alias entry
+    // with a plain bool, so a watcher refresh finishing mid-run erased a
+    // concurrent force reindex's marker — the reaper could then evict the
+    // repo while the reindex still held its stores. Markers are owner-scoped
+    // now: the watcher ends only its own.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    assert!(state.begin_indexing("race", IndexingOwner::Reindex));
+    let cb = state.make_indexing_status_callback("race");
+    cb(true);
+    assert!(
+        state.is_indexing("race"),
+        "watcher marker stacks on reindex's"
+    );
+    cb(false);
+    assert!(
+        state.is_indexing("race"),
+        "the watcher's completion must NOT clear the reindex marker"
+    );
+    state.end_indexing("race", IndexingOwner::Reindex);
+    assert!(!state.is_indexing("race"));
+}
+
+#[tokio::test]
+#[serial]
+async fn begin_indexing_rejects_while_any_owner_marker_is_fresh() {
+    // The exclusivity guard must survive owner-scoping: a force reindex is
+    // still rejected while warmup (or any other owner) is indexing, and
+    // allowed again once that marker ends.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    assert!(state.begin_indexing("excl", IndexingOwner::Warmup));
+    assert!(
+        !state.begin_indexing("excl", IndexingOwner::Reindex),
+        "a fresh marker from another owner must reject a concurrent reindex"
+    );
+    state.end_indexing("excl", IndexingOwner::Warmup);
+    assert!(
+        state.begin_indexing("excl", IndexingOwner::Reindex),
+        "ending the warmup marker must let the reindex proceed"
+    );
+    state.end_indexing("excl", IndexingOwner::Reindex);
+    assert!(!state.is_indexing("excl"));
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_eviction_is_scoped_to_the_stale_owner() {
+    // A stale marker from a leaked task must not block (or cancel for) an
+    // owner whose marker is still fresh — and an eviction must not touch
+    // other owners' markers.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Fresh warmup marker; a stale reindex marker from a leaked task.
+    state.begin_indexing("scoped", IndexingOwner::Warmup);
+    let stale = Instant::now()
+        .checked_sub(Duration::from_secs(2))
+        .expect("monotonic clock at least 2s old");
+    state
+        .active_reindexes
+        .entry("scoped".to_string())
+        .or_default()
+        .insert(IndexingOwner::Reindex, stale);
+
+    assert!(
+        state.is_indexing("scoped"),
+        "the fresh warmup marker must survive the stale owner's eviction"
+    );
+
+    // Once warmup's marker ages out too, everything is evicted.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(!state.is_indexing("scoped"));
+    assert!(
+        !state.active_reindexes.contains_key("scoped"),
+        "an empty owner map must be removed, not left behind"
     );
 }
