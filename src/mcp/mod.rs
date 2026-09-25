@@ -58,6 +58,22 @@ pub(crate) async fn bounded_vector_read(
     })
 }
 
+/// Acquire the FTS-store read lock with a bounded wait — the same rationale
+/// as `bounded_vector_read`, mirrored for the other lock a live indexing
+/// batch holds for its duration.
+pub(crate) async fn bounded_fts_read(
+    lock: &tokio::sync::RwLock<FtsStore>,
+) -> Result<tokio::sync::RwLockReadGuard<'_, FtsStore>> {
+    let wait = store_lock_wait();
+    tokio::time::timeout(wait, lock.read()).await.map_err(|_| {
+        anyhow::anyhow!(
+            "full-text store still busy after {}s (an indexing run holds the write \
+                 lock) — retry shortly",
+            wait.as_secs()
+        )
+    })
+}
+
 use crate::db_discovery::{find_best_database, load_repos_config};
 use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::file::Language;
@@ -1337,13 +1353,13 @@ impl CodesearchService {
     {
         // Priority 1: explicit store override (from project/group routing)
         if let Some(stores) = store_override {
-            let fts = stores.fts_store.read().await;
+            let fts = bounded_fts_read(&stores.fts_store).await?;
             return action(&fts);
         }
 
         // Priority 2: shared stores
         if let Some(ref stores) = self.shared_stores {
-            let fts = stores.fts_store.read().await;
+            let fts = bounded_fts_read(&stores.fts_store).await?;
             return action(&fts);
         }
 
@@ -1457,7 +1473,13 @@ impl CodesearchService {
 
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let fts = store_arc.fts_store.read().await;
+            let fts = match bounded_fts_read(&store_arc.fts_store).await {
+                Ok(fts) => fts,
+                Err(e) => {
+                    failures.push((alias.to_string(), format!("{e:#}")));
+                    continue;
+                }
+            };
             match action(&fts) {
                 Ok(results) => {
                     for r in results {

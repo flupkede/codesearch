@@ -122,7 +122,7 @@ pub(crate) async fn require_prebuilt_index_ready(
             .context("Failed to inspect prebuilt vector index")?
     };
     let fts_documents = {
-        let fts_store = stores.fts_store.read().await;
+        let fts_store = crate::mcp::bounded_fts_read(&stores.fts_store).await?;
         fts_store
             .stats()
             .context("Failed to inspect prebuilt full-text index")?
