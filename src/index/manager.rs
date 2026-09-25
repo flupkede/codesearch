@@ -74,7 +74,7 @@ pub type IndexingStatusCallback = Arc<dyn Fn(bool) + Send + Sync>;
 
 /// Heartbeat fired by long indexing loops (once per batch, plus before each
 /// slow phase) so the caller can renew its indexing marker before
-/// `MAX_INDEXING_SECS` expires. BOIN-scale warmups run well past 30 minutes;
+/// `MAX_INDEXING_SECS` expires. Large repos' warmups run well past 30 minutes;
 /// without renewal the stale-marker eviction drops the marker mid-refresh and
 /// the reaper/FSW can then race the live refresh (todo #131 shape).
 pub type IndexingHeartbeat = Arc<dyn Fn() + Send + Sync>;

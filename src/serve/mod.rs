@@ -2570,7 +2570,7 @@ impl ServeState {
         // to completion. A real user-initiated cancel routes through the
         // RepoState::Write token owned by the live task instead.
         let pool = self.embedding_pool();
-        // BOIN-scale warmups run past MAX_INDEXING_SECS; the per-batch heartbeat
+        // Large-repo warmups run past MAX_INDEXING_SECS; the per-batch heartbeat
         // keeps the marker alive so the reaper and FSW keep honouring it.
         let heartbeat: IndexingHeartbeat = {
             let state = Arc::clone(self);

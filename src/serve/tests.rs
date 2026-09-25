@@ -3172,7 +3172,7 @@ async fn warm_query_does_not_start_fsw_while_warmup_indexes() {
 #[tokio::test]
 #[serial]
 async fn indexing_marker_heartbeat_survives_past_max() {
-    // Regression: a BOIN-scale warmup runs longer than MAX_INDEXING_SECS, so
+    // Regression: a large-repo warmup runs longer than MAX_INDEXING_SECS, so
     // the lazy stale-marker eviction dropped its marker mid-refresh and the
     // reaper could evict the repo while the refresh still held its stores.
     // The per-batch heartbeat must keep the marker alive for as long as the
