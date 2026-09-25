@@ -34,12 +34,12 @@ case "$tool" in
     *) exit 0 ;;
 esac
 
-# find_impact names its target via `file`/`path`; find uses `path`. Accept
-# any of them — FIRST NON-EMPTY (jq's `//` treats "" as truthy, so the
-# empties are filtered explicitly; the ps1 twin does the same) — so both
-# tools attribute to the same key.
+# find_impact names its target via `file`/`path`; find(kind="usages") uses
+# `symbol`. Accept any of them — FIRST NON-EMPTY (jq's `//` treats "" as
+# truthy, so the empties are filtered explicitly; the ps1 twin does the
+# same) — so both tools attribute to the same key.
 p=$(echo "$raw" | jq -r '
-    [ .tool_input.file, .tool_input.path, .tool_input.file_path ]
+    [ .tool_input.file, .tool_input.path, .tool_input.file_path, .tool_input.symbol ]
     | map(select(. != null and . != ""))
     | .[0] // empty
 ' 2>/dev/null | jq_str)
