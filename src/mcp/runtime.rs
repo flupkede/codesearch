@@ -829,6 +829,7 @@ pub async fn run_mcp_server_with_options(
                 &shared_stores_clone,
                 &bg_cancel_token,
                 None,
+                None,
             )
             .await
             {

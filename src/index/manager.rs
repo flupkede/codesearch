@@ -72,6 +72,13 @@ pub type CSharpRebuildNotifier = Arc<dyn Fn(SymbolRebuildSignal) + Send + Sync>;
 /// during file-watcher-triggered refreshes (branch changes, batch flushes).
 pub type IndexingStatusCallback = Arc<dyn Fn(bool) + Send + Sync>;
 
+/// Heartbeat fired by long indexing loops (once per batch, plus before each
+/// slow phase) so the caller can renew its indexing marker before
+/// `MAX_INDEXING_SECS` expires. BOIN-scale warmups run well past 30 minutes;
+/// without renewal the stale-marker eviction drops the marker mid-refresh and
+/// the reaper/FSW can then race the live refresh (todo #131 shape).
+pub type IndexingHeartbeat = Arc<dyn Fn() + Send + Sync>;
+
 /// Batch flush timeout in milliseconds.
 /// Events are batched and flushed when:
 /// 1. No new events for this duration, OR
@@ -581,12 +588,18 @@ impl IndexManager {
     /// fresh `EmbeddingService` in the serve process would be refused by the
     /// process-global LMDB registry (the pool already holds the cache open)
     /// and silently degrade to cache-less re-embedding.
+    ///
+    /// `heartbeat` — when `Some`, fired once at start, before each slow phase,
+    /// and once per batch. Callers tracking an `active_reindexes` marker pass
+    /// a closure that renews it; without renewal a refresh running past
+    /// `MAX_INDEXING_SECS` loses the marker and races the reaper/FSW.
     pub async fn perform_incremental_refresh_with_stores(
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
         cancel_token: &CancellationToken,
         embedding_pool: Option<&Arc<EmbeddingServicePool>>,
+        heartbeat: Option<&IndexingHeartbeat>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::SemanticChunker;
@@ -599,6 +612,9 @@ impl IndexManager {
         // Bail out before reading/deriving anything if a cancellation already
         // arrived (e.g. remove_repo ran while this task was scheduled).
         Self::ensure_indexing_active(cancel_token)?;
+        if let Some(hb) = heartbeat {
+            hb();
+        }
 
         // Read model name + dims (lenient) for the FileMetaStore. The strict,
         // fail-fast embedding-model resolution happens lazily below, only when
@@ -705,6 +721,9 @@ impl IndexManager {
         // destructive store mutation below (stale-chunk deletion), so a
         // half-cleaned index is never left behind by a removed repo.
         Self::ensure_indexing_active(cancel_token)?;
+        if let Some(hb) = heartbeat {
+            hb();
+        }
 
         // There is work to do. Resolve the embedding model NOW — before any
         // destructive store mutation below — so that a corrupt index (unknown
@@ -800,6 +819,12 @@ impl IndexManager {
             for (batch_idx, file_batch) in changed_files.chunks(batch_size).enumerate() {
                 // Abort between batches if the repo was removed mid-index.
                 Self::ensure_indexing_active(cancel_token)?;
+                // A batch of a large delta can run for minutes — renew the
+                // caller's indexing marker so it survives past the stale
+                // threshold while real progress is being made.
+                if let Some(hb) = heartbeat {
+                    hb();
+                }
 
                 // Read + chunk + embed is synchronous, CPU/I/O-heavy work
                 // (file reads, tree-sitter parsing, fastembed/ONNX inference that
@@ -1168,6 +1193,7 @@ impl IndexManager {
             stores,
             cancel_token,
             embedding_pool,
+            None,
         )
         .await
     }
@@ -2790,6 +2816,7 @@ mod tests {
             &stores,
             &token,
             None,
+            None,
         )
         .await;
 
@@ -3249,12 +3276,24 @@ mod tests {
 
         let stores = create_test_stores(&db_path, 4).await;
 
+        // The heartbeat must be threaded through and invoked. Only the
+        // start-of-refresh beat is reachable here: a batch with changed files
+        // needs a real embedder, which no unit test spins up.
+        let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat: IndexingHeartbeat = {
+            let beats = Arc::clone(&beats);
+            Arc::new(move || {
+                beats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
         let result = IndexManager::perform_incremental_refresh_with_stores(
             &codebase_path,
             &db_path,
             &stores,
             &CancellationToken::new(),
             None,
+            Some(&heartbeat),
         )
         .await;
 
@@ -3262,6 +3301,10 @@ mod tests {
             result.is_ok(),
             "Up-to-date incremental refresh should succeed: {:?}",
             result
+        );
+        assert!(
+            beats.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "heartbeat must fire at least once per refresh"
         );
 
         // The tracked file must still be tracked and not flagged as deleted.
@@ -3302,6 +3345,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
             None,
         )
         .await;
@@ -3437,6 +3481,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
             None,
         )
         .await

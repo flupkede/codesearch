@@ -45,7 +45,8 @@ use crate::constants::{
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
-    CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
+    CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback, SharedStores,
+    SymbolRebuildSignal,
 };
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
@@ -655,6 +656,17 @@ impl ServeState {
     /// indexing task finishes (success, error, or panic).
     fn end_indexing(&self, alias: &str) {
         self.active_reindexes.remove(alias);
+    }
+
+    /// Renew the indexing marker for `alias` — the per-batch heartbeat a long
+    /// refresh uses to stay alive past the stale-marker threshold
+    /// (`is_indexing` would otherwise evict it mid-run and let the reaper and
+    /// FSW race the live refresh). Upsert on purpose: if the marker was
+    /// already evicted by a race, re-inserting still protects the remainder
+    /// of the refresh.
+    fn renew_indexing(&self, alias: &str) {
+        self.active_reindexes
+            .insert(alias.to_string(), Instant::now());
     }
 
     /// True iff an error chain indicates LMDB storage-format corruption —
@@ -2293,6 +2305,7 @@ impl ServeState {
                         &stores_bg,
                         &token_for_task,
                         Some(&pool),
+                        None,
                     )
                     .await
                     {
@@ -2506,12 +2519,20 @@ impl ServeState {
         // to completion. A real user-initiated cancel routes through the
         // RepoState::Write token owned by the live task instead.
         let pool = self.embedding_pool();
+        // BOIN-scale warmups run past MAX_INDEXING_SECS; the per-batch heartbeat
+        // keeps the marker alive so the reaper and FSW keep honouring it.
+        let heartbeat: IndexingHeartbeat = {
+            let state = Arc::clone(self);
+            let alias_hb = alias.to_string();
+            Arc::new(move || state.renew_indexing(&alias_hb))
+        };
         let refreshed = IndexManager::perform_incremental_refresh_with_stores(
             &path,
             &db_path,
             &stores,
             &CancellationToken::new(),
             Some(&pool),
+            Some(&heartbeat),
         )
         .await;
         self.end_indexing(alias);
@@ -2710,6 +2731,7 @@ impl ServeState {
                             &stores_for_task,
                             &token_for_task,
                             Some(&pool),
+                            None,
                         )
                         .await
                         {
@@ -4434,6 +4456,7 @@ async fn reindex_handler(
                 &stores,
                 &reindex_token_task,
                 Some(&pool),
+                None,
             )
             .await
             {

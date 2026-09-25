@@ -3164,3 +3164,38 @@ async fn warm_query_does_not_start_fsw_while_warmup_indexes() {
     state.end_indexing("warming");
     state.repos.remove("warming");
 }
+
+#[tokio::test]
+#[serial]
+async fn indexing_marker_heartbeat_survives_past_max() {
+    // Regression: a BOIN-scale warmup runs longer than MAX_INDEXING_SECS, so
+    // the lazy stale-marker eviction dropped its marker mid-refresh and the
+    // reaper could evict the repo while the refresh still held its stores.
+    // The per-batch heartbeat must keep the marker alive for as long as the
+    // refresh is making progress.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "2")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Control: without renewal the marker expires at the threshold.
+    state.begin_indexing("ctrl");
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert!(
+        !state.is_indexing("ctrl"),
+        "an unrenewed marker must expire at the threshold"
+    );
+
+    // Heartbeat: renewal inside the window keeps the marker alive past max.
+    state.begin_indexing("hb");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    state.renew_indexing("hb");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        state.is_indexing("hb"),
+        "a heartbeat-renewed marker must stay alive past the threshold"
+    );
+    state.end_indexing("hb");
+    assert!(
+        !state.is_indexing("hb"),
+        "end_indexing must clear the marker"
+    );
+}
