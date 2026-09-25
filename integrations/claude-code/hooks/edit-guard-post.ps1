@@ -37,7 +37,7 @@ switch ($tool) {
 }
 
 $p = $null
-foreach ($field in @('file', 'path', 'file_path')) {
+foreach ($field in @('file', 'path', 'file_path', 'symbol')) {
     if ($inp -and @($inp.PSObject.Properties.Name) -contains $field) {
         $candidate = [string]$inp.$field
         if (-not [string]::IsNullOrEmpty($candidate)) { $p = $candidate; break }

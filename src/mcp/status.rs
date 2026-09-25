@@ -10,6 +10,12 @@ use rmcp::{
     tool, tool_router, ErrorData as McpError,
 };
 
+const LOCK_STATUS_INDEXING: &str = "indexing";
+const LOCK_STATUS_BUSY: &str = "busy";
+const LOCK_STATUS_HELD_IN_PROCESS: &str = "held-in-process";
+const LOCK_STATUS_LOCKED_EXTERNALLY: &str = "locked-externally";
+const LOCK_STATUS_AVAILABLE: &str = "available";
+
 #[tool_router(router = status_router, vis = "pub(crate)")]
 impl CodesearchService {
     /// Unified status tool — dispatches based on `kind`.
@@ -165,9 +171,18 @@ impl CodesearchService {
             let mut failed_count = 0usize;
 
             for (i, store_arc) in sv.iter().enumerate() {
-                let store = store_arc.vector_store.read().await;
-                match store.stats() {
-                    Ok(stats) => {
+                // Never wait on the store lock: an indexing run holds it for
+                // whole batches and build_index() for minutes, and status must
+                // answer immediately — the same contract as list_projects. A
+                // busy store is attributed to THIS store, never skipped
+                // silently.
+                let stats_result = store_arc
+                    .vector_store
+                    .try_read()
+                    .ok()
+                    .map(|store| store.stats());
+                match stats_result {
+                    Some(Ok(stats)) => {
                         total_chunks += stats.total_chunks;
                         total_files += stats.total_files;
                         if stats.max_chunk_id > max_chunk_id {
@@ -186,10 +201,24 @@ impl CodesearchService {
                     // store is down". This is the tool whose job is reporting index
                     // health, so it must not stay silent on the one signal that
                     // matters here: bind the error, carry it, never `Err(_)`.
-                    Err(ref e) => {
+                    Some(Err(ref e)) => {
                         all_indexed = false;
                         failed_count += 1;
                         note_store_failure(&mut stats_warnings, aliases, i, "stats", e);
+                    }
+                    None => {
+                        all_indexed = false;
+                        failed_count += 1;
+                        let alias = aliases.get(i).map(|s| s.as_str()).unwrap_or("unknown");
+                        push_store_warning(
+                            &mut stats_warnings,
+                            &store_warning(
+                                alias,
+                                "stats",
+                                "store lock busy (an indexing run holds it); live stats \
+                                 unavailable",
+                            ),
+                        );
                     }
                 }
             }
@@ -323,11 +352,13 @@ impl CodesearchService {
                     // For repos already opened in DashMap, use the live SharedStores for stats
                     // WITHOUT opening a new VectorStore connection.
                     // For unopened repos, just report metadata — do NOT open the DB.
-                    if let Some(stores) = serve_state.get_opened_stores(alias) {
-                        let stats_result = {
-                            let vs = stores.vector_store.read().await;
-                            vs.stats()
-                        };
+                    let opened = serve_state.get_opened_stores(alias);
+                    // Never wait on the store lock: an indexing run holds it for
+                    // whole batches, and status must answer immediately.
+                    let stats_result = opened.as_ref().and_then(|stores| {
+                        stores.vector_store.try_read().ok().map(|vs| vs.stats())
+                    });
+                    if let Some(stats_result) = stats_result {
                         // `0 chunks` alone reads exactly like "not indexed yet" — the
                         // repo may in fact be full and simply failing to answer (the
                         // read-only-incident shape this branch exists for). Attribute
@@ -352,14 +383,29 @@ impl CodesearchService {
                             error,
                         )
                     } else {
-                        // Repo NOT opened — read persisted stats from metadata.json
+                        // Not opened, or its store is busy — persisted stats from
+                        // metadata.json; do NOT open the DB. Our own holders are
+                        // checked before the file-lock probe, which cannot tell
+                        // this process apart from another one.
                         let (md_chunks, md_files) = read_metadata_stats(&db_path);
-                        let lock_status = if crate::index::is_database_locked(&db_path) {
-                            "locked-externally".to_string()
+                        let lock_status = if serve_state.is_indexing(alias) {
+                            LOCK_STATUS_INDEXING
+                        } else if opened.is_some() {
+                            LOCK_STATUS_BUSY
+                        } else if serve_state.is_held_in_process(alias, &db_path) {
+                            LOCK_STATUS_HELD_IN_PROCESS
+                        } else if crate::index::is_database_locked(&db_path) {
+                            LOCK_STATUS_LOCKED_EXTERNALLY
                         } else {
-                            "available".to_string()
+                            LOCK_STATUS_AVAILABLE
                         };
-                        (md_chunks, md_files, model_name, lock_status, None)
+                        (
+                            md_chunks,
+                            md_files,
+                            model_name,
+                            lock_status.to_string(),
+                            None,
+                        )
                     }
                 } else {
                     (0, 0, "not indexed".to_string(), "unknown".to_string(), None)
