@@ -107,7 +107,13 @@ impl CodesearchService {
                 let mut candidates: Vec<(&Arc<SharedStores>, String)> = Vec::new();
                 let aliases = ctx.aliases();
                 for (i, store_arc) in sv.iter().enumerate() {
-                    let store = store_arc.vector_store.read().await;
+                    let store = match bounded_vector_read(&store_arc.vector_store).await {
+                        Ok(store) => store,
+                        Err(e) => {
+                            note_store_failure(&mut chunk_warnings, aliases, i, "chunk lookup", &e);
+                            continue;
+                        }
+                    };
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(_)) => {
                             // A store that HAS the chunk stays a candidate even if
@@ -153,16 +159,26 @@ impl CodesearchService {
                             serve_state.record_tool_call(alias, "get_chunk");
                             serve_state.touch_access(alias);
                         }
-                        let store = store_arc.vector_store.read().await;
-                        match store.get_chunk(request.chunk_id) {
-                            Ok(c) => c,
-                            Err(ref e) => {
+                        let store = match bounded_vector_read(&store_arc.vector_store).await {
+                            Ok(store) => Some(store),
+                            Err(e) => {
                                 push_store_warning(
                                     &mut chunk_warnings,
                                     &store_warning(alias, "chunk lookup", &format!("{e:#}")),
                                 );
                                 None
                             }
+                        };
+                        match store.as_ref().map(|s| s.get_chunk(request.chunk_id)) {
+                            Some(Ok(c)) => c,
+                            Some(Err(ref e)) => {
+                                push_store_warning(
+                                    &mut chunk_warnings,
+                                    &store_warning(alias, "chunk lookup", &format!("{e:#}")),
+                                );
+                                None
+                            }
+                            None => None,
                         }
                     }
                     _ => {
@@ -188,7 +204,13 @@ impl CodesearchService {
                 let aliases = ctx.aliases();
                 let mut found = None;
                 for (i, store_arc) in sv.iter().enumerate() {
-                    let store = store_arc.vector_store.read().await;
+                    let store = match bounded_vector_read(&store_arc.vector_store).await {
+                        Ok(store) => store,
+                        Err(e) => {
+                            note_store_failure(&mut chunk_warnings, aliases, i, "chunk lookup", &e);
+                            continue;
+                        }
+                    };
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(c)) => {
                             found = Some(c);

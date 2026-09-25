@@ -26,6 +26,14 @@ pub enum IndexCommands {
         #[arg(long)]
         model: Option<String>,
 
+        /// Build locally even if a serve instance is running
+        #[arg(long)]
+        local: bool,
+
+        /// Write a clean build log to this path (default: <db>/.codesearch.db/build.log when stdout is not a TTY)
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+
         /// Register the repo on a remote peer (name from `codesearch remote list`).
         /// When set, <path> is a path on the remote's filesystem.
         #[arg(long)]
@@ -370,6 +378,10 @@ pub enum Commands {
         /// Also rebuild symbol index (C# via scip-csharp) after text reindex
         #[arg(long)]
         symbols: bool,
+
+        /// Write a clean build log to this path (default: <db>/.codesearch.db/build.log when stdout is not a TTY)
+        #[arg(long)]
+        log_file: Option<PathBuf>,
 
         // Backward-compat flags (predate subcommands)
         /// Add a repository to the index (creates local or global index)
@@ -1059,6 +1071,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             remove,
             keep_config,
             list,
+            log_file,
         } => {
             // Subcommand path (preferred)
             if let Some(cmd) = command {
@@ -1067,6 +1080,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         path: add_path,
                         global,
                         model,
+                        local,
+                        log_file: add_log_file,
                         remote,
                     } => {
                         if let Some(peer_name) = &remote {
@@ -1087,8 +1102,15 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                             if let Some(mt) = mt {
                                 warn_if_heavier_model(mt);
                             }
-                            crate::index::add_to_index(add_path, global, mt, cancel_token.clone())
-                                .await
+                            crate::index::add_to_index(
+                                add_path,
+                                global,
+                                local,
+                                add_log_file,
+                                mt,
+                                cancel_token.clone(),
+                            )
+                            .await
                         }
                     }
                     IndexCommands::Remove {
@@ -1152,6 +1174,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     crate::index::add_to_index(
                         effective_path,
                         global,
+                        false,
+                        log_file,
                         model_type,
                         cancel_token.clone(),
                     )
@@ -1190,6 +1214,8 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         force,
                         false,
                         model_type,
+                        false,
+                        log_file,
                         cancel_token.clone(),
                     )
                     .await

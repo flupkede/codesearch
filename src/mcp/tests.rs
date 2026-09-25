@@ -544,6 +544,41 @@ fn test_stdio_mode_paths_not_prefixed() {
     assert_eq!(result, "src/main.rs");
 }
 
+// === relative stored paths (portable snapshots) ===
+
+#[test]
+fn test_relative_path_with_alias() {
+    // Chunk paths are stored project-relative; serve must yield "<alias>/<rel>"
+    let result = super::prefix_path_with_alias("src/main.rs", Some("myrepo"), "C:/repo");
+    assert_eq!(result, "myrepo/src/main.rs");
+}
+
+#[test]
+fn test_relative_path_without_alias() {
+    let result = super::prefix_path_with_alias("src/main.rs", None, "C:/repo");
+    assert_eq!(result, "src/main.rs");
+}
+
+#[test]
+fn test_relative_path_empty_alias() {
+    let result = super::prefix_path_with_alias("docs/guide.md", Some(""), "/data/vendor");
+    assert_eq!(result, "docs/guide.md");
+}
+
+#[test]
+fn test_normalize_tool_path_relativizes_absolute() {
+    let root = std::path::Path::new("/tmp/proj");
+    let result = super::normalize_tool_path("/tmp/proj/src/main.rs", root);
+    assert_eq!(result, "src/main.rs");
+}
+
+#[test]
+fn test_normalize_tool_path_relative_stays_relative() {
+    let root = std::path::Path::new("/tmp/proj");
+    let result = super::normalize_tool_path("src/main.rs", root);
+    assert_eq!(result, "src/main.rs");
+}
+
 #[test]
 fn test_dedup_key_includes_alias() {
     // Two stores each returning chunk_id=1, different content.

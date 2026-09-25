@@ -20,7 +20,7 @@ use crate::constants::{
     DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
     SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS, WRITER_LOCK_FILE,
 };
-use crate::embed::ModelType;
+use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::fts::FtsStore;
 use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
@@ -71,6 +71,13 @@ pub type CSharpRebuildNotifier = Arc<dyn Fn(SymbolRebuildSignal) + Send + Sync>;
 /// The serve layer uses this to update `active_reindexes` so the TUI shows "Indexing"
 /// during file-watcher-triggered refreshes (branch changes, batch flushes).
 pub type IndexingStatusCallback = Arc<dyn Fn(bool) + Send + Sync>;
+
+/// Heartbeat fired by long indexing loops (once per batch, plus before each
+/// slow phase) so the caller can renew its indexing marker before
+/// `MAX_INDEXING_SECS` expires. Large repos' warmups run well past 30 minutes;
+/// without renewal the stale-marker eviction drops the marker mid-refresh and
+/// the reaper/FSW can then race the live refresh (todo #131 shape).
+pub type IndexingHeartbeat = Arc<dyn Fn() + Send + Sync>;
 
 /// Batch flush timeout in milliseconds.
 /// Events are batched and flushed when:
@@ -297,6 +304,9 @@ pub struct IndexManager {
     git_head_watcher: Option<GitHeadWatcher>,
     /// Shared stores for concurrent access
     stores: Arc<SharedStores>,
+    /// Serve-wide embedding-service pool (`None` outside serve — CLI/standalone
+    /// MCP run in their own process where direct construction is correct).
+    embedding_pool: Option<Arc<EmbeddingServicePool>>,
     /// Per-language symbol indexer registry (C# etc.)
     symbol_registry: Arc<SymbolIndexerRegistry>,
 }
@@ -309,6 +319,24 @@ fn is_ts_extension(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()),
         Some("ts") | Some("tsx") | Some("mts") | Some("cts")
     )
+}
+
+/// Where an embed pass gets its `EmbeddingService`: the serve-wide pool
+/// (which already holds the persistent cache's LMDB env open) or a fresh
+/// service (CLI / standalone MCP, own process).
+enum EmbeddingSource {
+    Pool(Arc<EmbeddingServicePool>),
+    Fresh,
+}
+
+/// Decide the embed source from the optional pool. Pure seam so the
+/// `Some`/`None` arm choice shared by both embed call sites is unit-testable
+/// without loading a model.
+fn embed_service_choice(pool: Option<&Arc<EmbeddingServicePool>>) -> EmbeddingSource {
+    match pool {
+        Some(p) => EmbeddingSource::Pool(Arc::clone(p)),
+        None => EmbeddingSource::Fresh,
+    }
 }
 
 impl IndexManager {
@@ -394,6 +422,7 @@ impl IndexManager {
             watcher,
             git_head_watcher: Some(git_head_watcher),
             stores,
+            embedding_pool: None,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
@@ -445,9 +474,13 @@ impl IndexManager {
     /// # Arguments
     /// * `codebase_path` - Path to the codebase to index
     /// * `stores` - Shared stores for concurrent access (created by caller)
+    /// * `embedding_pool` - Serve-wide embedding-service pool; `Some` in serve
+    ///   (reuses the process-shared persistent cache), `None` in standalone
+    ///   processes (direct construction — no pool to conflict with).
     pub async fn new_without_refresh<P: AsRef<Path>>(
         codebase_path: P,
         stores: Arc<SharedStores>,
+        embedding_pool: Option<Arc<EmbeddingServicePool>>,
     ) -> Result<Self> {
         let path_buf = codebase_path.as_ref().to_path_buf();
         let db_path = path_buf.join(DB_DIR_NAME);
@@ -490,6 +523,7 @@ impl IndexManager {
             watcher,
             git_head_watcher: Some(git_head_watcher),
             stores,
+            embedding_pool,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
         })
     }
@@ -548,11 +582,24 @@ impl IndexManager {
     ///
     /// This checks for changed/deleted files since last index and updates
     /// the index accordingly. Uses the shared stores to avoid lock conflicts.
+    ///
+    /// `embedding_pool` — when `Some`, embeddings are produced by the serve
+    /// pool's service so the process-shared persistent cache is reused; a
+    /// fresh `EmbeddingService` in the serve process would be refused by the
+    /// process-global LMDB registry (the pool already holds the cache open)
+    /// and silently degrade to cache-less re-embedding.
+    ///
+    /// `heartbeat` — when `Some`, fired once at start, before each slow phase,
+    /// and once per batch. Callers tracking an `active_reindexes` marker pass
+    /// a closure that renews it; without renewal a refresh running past
+    /// `MAX_INDEXING_SECS` loses the marker and races the reaper/FSW.
     pub async fn perform_incremental_refresh_with_stores(
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
         cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
+        heartbeat: Option<&IndexingHeartbeat>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::SemanticChunker;
@@ -565,6 +612,9 @@ impl IndexManager {
         // Bail out before reading/deriving anything if a cancellation already
         // arrived (e.g. remove_repo ran while this task was scheduled).
         Self::ensure_indexing_active(cancel_token)?;
+        if let Some(hb) = heartbeat {
+            hb();
+        }
 
         // Read model name + dims (lenient) for the FileMetaStore. The strict,
         // fail-fast embedding-model resolution happens lazily below, only when
@@ -616,6 +666,16 @@ impl IndexManager {
             }
         }
 
+        if super::key_migration::repair_legacy_index_shared(
+            codebase_path,
+            &mut file_meta_store,
+            stores,
+        )
+        .await?
+        {
+            file_meta_store.save(db_path)?;
+        }
+
         // Walk files.
         //
         // `FileWalker::walk()` is synchronous and I/O-heavy (recursive directory
@@ -631,7 +691,8 @@ impl IndexManager {
         let mut unchanged_count = 0;
 
         for file in &files {
-            let (needs_reindex, _old_chunk_ids) = file_meta_store.check_file(&file.path)?;
+            let key = crate::cache::storage_key(&file.path, codebase_path);
+            let (needs_reindex, _old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
             if needs_reindex {
                 changed_files.push(file.clone());
                 debug!("📝 File changed: {}", file.path.display());
@@ -641,7 +702,7 @@ impl IndexManager {
         }
 
         // Find deleted files
-        let deleted_files = file_meta_store.find_deleted_files();
+        let deleted_files = file_meta_store.find_deleted_files(codebase_path);
 
         info!(
             "   Unchanged: {}, Changed: {}, Deleted: {}",
@@ -660,6 +721,9 @@ impl IndexManager {
         // destructive store mutation below (stale-chunk deletion), so a
         // half-cleaned index is never left behind by a removed repo.
         Self::ensure_indexing_active(cancel_token)?;
+        if let Some(hb) = heartbeat {
+            hb();
+        }
 
         // There is work to do. Resolve the embedding model NOW — before any
         // destructive store mutation below — so that a corrupt index (unknown
@@ -688,12 +752,13 @@ impl IndexManager {
                     }
                 }
             }
-            file_meta_store.remove_file(Path::new(file_path));
+            file_meta_store.remove_file(file_path);
         }
 
         // Delete old chunks for changed files
         for file in &changed_files {
-            let (_, old_chunk_ids) = file_meta_store.check_file(&file.path)?;
+            let key = crate::cache::storage_key(&file.path, codebase_path);
+            let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
             if !old_chunk_ids.is_empty() {
                 debug!(
                     "🔄 Deleting {} old chunks for: {}",
@@ -754,6 +819,12 @@ impl IndexManager {
             for (batch_idx, file_batch) in changed_files.chunks(batch_size).enumerate() {
                 // Abort between batches if the repo was removed mid-index.
                 Self::ensure_indexing_active(cancel_token)?;
+                // A batch of a large delta can run for minutes — renew the
+                // caller's indexing marker so it survives past the stale
+                // threshold while real progress is being made.
+                if let Some(hb) = heartbeat {
+                    hb();
+                }
 
                 // Read + chunk + embed is synchronous, CPU/I/O-heavy work
                 // (file reads, tree-sitter parsing, fastembed/ONNX inference that
@@ -763,10 +834,12 @@ impl IndexManager {
                 // are not needed on the async side and may not be `Send`.
                 let files_for_embed = file_batch.to_vec();
                 let cache_dir_for_batch = cache_dir.clone();
+                let root_for_batch = codebase_path.to_path_buf();
                 // Clone the token into the blocking closure so a cancel arriving
                 // DURING the (long, core-saturating) embed pass is observed
                 // per-file, not only once the whole batch returns.
                 let batch_cancel = cancel_token.clone();
+                let embed_source = embed_service_choice(embedding_pool);
                 let embedded_chunks = tokio::task::spawn_blocking(
                     move || -> Result<Vec<crate::embed::EmbeddedChunk>> {
                         let mut chunker = SemanticChunker::new(100, 2000, 10);
@@ -783,8 +856,13 @@ impl IndexManager {
                                 Ok(c) => c,
                                 Err(_) => continue,
                             };
-                            let chunks =
-                                chunker.chunk_semantic(file.language, &file.path, &content)?;
+                            // Chunk under the project-relative storage key so
+                            // chunk metadata stays machine-portable.
+                            let rel = std::path::PathBuf::from(crate::cache::storage_key(
+                                &file.path,
+                                &root_for_batch,
+                            ));
+                            let chunks = chunker.chunk_semantic(file.language, &rel, &content)?;
                             all_chunks.extend(chunks);
                         }
 
@@ -792,17 +870,39 @@ impl IndexManager {
                             return Ok(Vec::new());
                         }
 
-                        let mut embedding_service = EmbeddingService::with_cache_dir(
-                            embed_model,
-                            Some(cache_dir_for_batch.as_path()),
-                        )?;
                         // NOTE: embed_chunks runs a single ONNX inference over
                         // the whole batch atomically, so it is not interruptible
                         // mid-call. Worst-case cancel latency is bounded to one
                         // batch's embed (INCREMENTAL_REFRESH_BATCH_SIZE=200
                         // files); the per-file check above bounds the read/chunk
                         // phase that precedes it.
-                        embedding_service.embed_chunks(all_chunks)
+                        match embed_source {
+                            // Serve process: the pool already holds the
+                            // persistent cache's LMDB env open — a fresh
+                            // EmbeddingService here is refused by the
+                            // process-global registry and would re-embed
+                            // everything without cache.
+                            EmbeddingSource::Pool(pool) => {
+                                let service = pool.get(embed_model)?;
+                                // Recover from poisoning: a panicked embed
+                                // service still yields a valid guard (the
+                                // batch's embed_chunks result is what carries
+                                // correctness); a poison here must not
+                                // hard-fail every later batch for the
+                                // process lifetime.
+                                let mut guard = service
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                guard.embed_chunks(all_chunks)
+                            }
+                            EmbeddingSource::Fresh => {
+                                let mut embedding_service = EmbeddingService::with_cache_dir(
+                                    embed_model,
+                                    Some(cache_dir_for_batch.as_path()),
+                                )?;
+                                embedding_service.embed_chunks(all_chunks)
+                            }
+                        }
                     },
                 )
                 .await
@@ -869,14 +969,14 @@ impl IndexManager {
                     }
 
                     for file in file_batch {
-                        let path_str = normalize_path(&file.path);
+                        let path_str = crate::cache::storage_key(&file.path, codebase_path);
                         if let Some(ids) = chunks_by_file.get(&path_str) {
-                            file_meta_store.update_file(&file.path, ids.clone())?;
+                            file_meta_store.update_file(&file.path, &path_str, ids.clone())?;
                         } else {
                             // File was processed but produced 0 chunks (e.g. minified JS,
                             // empty file). Track it with empty chunk list so it is not
                             // re-processed on every run and doctor doesn't flag it.
-                            file_meta_store.update_file(&file.path, vec![])?;
+                            file_meta_store.update_file(&file.path, &path_str, vec![])?;
                         }
                     }
 
@@ -886,7 +986,8 @@ impl IndexManager {
                     // them so they are not flagged as unindexed on every
                     // subsequent run.
                     for file in file_batch {
-                        file_meta_store.update_file(&file.path, vec![])?;
+                        let key = crate::cache::storage_key(&file.path, codebase_path);
+                        file_meta_store.update_file(&file.path, &key, vec![])?;
                     }
                 }
             }
@@ -968,6 +1069,7 @@ impl IndexManager {
         stores: &SharedStores,
         model_override: Option<ModelType>,
         cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use anyhow::Context;
@@ -1085,8 +1187,15 @@ impl IndexManager {
         info!("✅ Stores cleared, metadata preserved. Starting full reindex...");
 
         // ── Step 5: Reindex — all files treated as "changed" since metadata is empty ──
-        Self::perform_incremental_refresh_with_stores(codebase_path, db_path, stores, cancel_token)
-            .await
+        Self::perform_incremental_refresh_with_stores(
+            codebase_path,
+            db_path,
+            stores,
+            cancel_token,
+            embedding_pool,
+            None,
+        )
+        .await
     }
 
     /// Start the file system watcher (begin collecting events) without starting the processing loop.
@@ -1285,6 +1394,7 @@ impl IndexManager {
         let stores = self.stores.clone();
         let git_head_watcher = self.git_head_watcher.clone();
         let symbol_registry = self.symbol_registry.clone();
+        let embedding_pool = self.embedding_pool.clone();
         let indexing_cb = indexing_status_cb.clone();
 
         info!("🚀 Starting background file watcher...");
@@ -1373,6 +1483,7 @@ impl IndexManager {
                                 &db_path,
                                 &stores,
                                 &cancel_token,
+                                embedding_pool.as_ref(),
                             )
                             .await
                             {
@@ -1545,6 +1656,7 @@ impl IndexManager {
                         to_index,
                         to_remove,
                         &cancel_token,
+                        embedding_pool.as_ref(),
                     )
                     .await
                     {
@@ -1849,6 +1961,7 @@ impl IndexManager {
         files_to_index: Vec<PathBuf>,
         files_to_remove: Vec<PathBuf>,
         cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
         use crate::output::set_quiet;
 
@@ -1952,7 +2065,9 @@ impl IndexManager {
         Self::ensure_indexing_active(cancel_token)?;
         for file_path in &files_to_index {
             debug!("📄 Indexing: {}", file_path.display());
-            if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
+            if let Err(e) =
+                Self::index_single_file(codebase_path, file_path, stores, embedding_pool).await
+            {
                 warn!("⚠️  Failed to index {}: {}", file_path.display(), e);
             }
         }
@@ -2004,6 +2119,7 @@ impl IndexManager {
         db_path: &Path,
         stores: &SharedStores,
         cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::file::FileWalker;
@@ -2044,13 +2160,24 @@ impl IndexManager {
 
             let mut file_meta_store =
                 FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
+            if super::key_migration::repair_legacy_index_shared(
+                codebase_path,
+                &mut file_meta_store,
+                stores,
+            )
+            .await?
+            {
+                file_meta_store.save(db_path)?;
+            }
 
             // Find files that need re-indexing (new or content changed)
             let mut files_to_reindex: Vec<PathBuf> = Vec::new();
             let mut chunks_to_delete: Vec<u32> = Vec::new();
 
             for file_info in &files {
-                let (needs_reindex, old_chunk_ids) = file_meta_store.check_file(&file_info.path)?;
+                let key = crate::cache::storage_key(&file_info.path, codebase_path);
+                let (needs_reindex, old_chunk_ids) =
+                    file_meta_store.check_file(&file_info.path, &key)?;
                 if needs_reindex {
                     chunks_to_delete.extend(old_chunk_ids);
                     files_to_reindex.push(file_info.path.clone());
@@ -2058,7 +2185,7 @@ impl IndexManager {
             }
 
             // Find files that were deleted (tracked in metadata but not on disk)
-            let deleted_files = file_meta_store.find_deleted_files();
+            let deleted_files = file_meta_store.find_deleted_files(codebase_path);
 
             if files_to_reindex.is_empty() && deleted_files.is_empty() {
                 info!("✅ Branch refresh: index is up to date, no changes needed");
@@ -2095,7 +2222,7 @@ impl IndexManager {
             // Remove deleted files from FileMetaStore
             let mut deleted_count = deleted_files.len();
             for (file_path, _chunk_ids) in &deleted_files {
-                file_meta_store.remove_file(std::path::Path::new(file_path));
+                file_meta_store.remove_file(file_path);
             }
 
             // Save metadata after deletions (before re-indexing, since
@@ -2126,7 +2253,9 @@ impl IndexManager {
                 let mut orphan_file_count = 0usize;
 
                 for (vs_path, chunk_ids) in &vs_file_chunks {
-                    if !std::path::Path::new(vs_path).exists() {
+                    // Stored chunk paths are project-relative; resolve against
+                    // the codebase root for the on-disk existence check.
+                    if !codebase_path.join(vs_path).exists() {
                         orphan_chunk_ids.extend(chunk_ids);
                         orphan_file_count += 1;
                     }
@@ -2180,7 +2309,9 @@ impl IndexManager {
             Self::ensure_indexing_active(cancel_token)?;
             let reindex_count = files_to_reindex.len();
             for file_path in &files_to_reindex {
-                if let Err(e) = Self::index_single_file(codebase_path, file_path, stores).await {
+                if let Err(e) =
+                    Self::index_single_file(codebase_path, file_path, stores, embedding_pool).await
+                {
                     warn!("⚠️  Failed to re-index {}: {}", file_path.display(), e);
                 }
             }
@@ -2233,6 +2364,8 @@ impl IndexManager {
             false,
             false,
             None,
+            false,
+            None,
             CancellationToken::new(),
         )
         .await?;
@@ -2276,6 +2409,7 @@ impl IndexManager {
         codebase_path: &Path,
         file_path: &Path,
         stores: &SharedStores,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
         use crate::chunker::{Chunker, SemanticChunker};
@@ -2305,9 +2439,11 @@ impl IndexManager {
             }
         };
 
-        // Chunk the file
+        // Chunk the file under its project-relative storage key so chunk
+        // metadata stays machine-portable.
         let chunker = SemanticChunker::new(100, 4000, 2);
-        let chunks = chunker.chunk_file(file_path, &content)?;
+        let rel_key = crate::cache::storage_key(file_path, codebase_path);
+        let chunks = chunker.chunk_file(std::path::Path::new(&rel_key), &content)?;
 
         if chunks.is_empty() {
             debug!("No chunks created for file: {}", file_path.display());
@@ -2327,11 +2463,25 @@ impl IndexManager {
         let (embed_model, dimensions) = Self::resolve_embed_model(&db_path)?;
         let model_name = embed_model.short_name();
 
-        // Generate embeddings
-        let cache_dir = crate::constants::get_global_models_cache_dir()?;
-        let mut embedding_service =
-            EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
-        let embedded_chunks = embedding_service.embed_chunks(chunks)?;
+        // Generate embeddings. Reuse the serve pool's service when available:
+        // the pool already holds the persistent cache's LMDB env open, so a
+        // fresh EmbeddingService here is refused by the process-global
+        // registry and would degrade this path to cache-less re-embedding.
+        let embedded_chunks = match embed_service_choice(embedding_pool) {
+            EmbeddingSource::Pool(pool) => {
+                let service = pool.get(embed_model)?;
+                let mut guard = service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.embed_chunks(chunks)?
+            }
+            EmbeddingSource::Fresh => {
+                let cache_dir = crate::constants::get_global_models_cache_dir()?;
+                let mut embedding_service =
+                    EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
+                embedding_service.embed_chunks(chunks)?
+            }
+        };
 
         // ── Delete stale chunks for this file BEFORE inserting new ones ──
         // When a file is re-indexed (e.g. after a content change), the old
@@ -2342,7 +2492,7 @@ impl IndexManager {
         {
             let mut file_meta_store =
                 FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
-            if let Some(old_meta) = file_meta_store.remove_file(file_path) {
+            if let Some(old_meta) = file_meta_store.remove_file(&rel_key) {
                 let old_ids = old_meta.chunk_ids;
                 if !old_ids.is_empty() {
                     debug!(
@@ -2398,7 +2548,7 @@ impl IndexManager {
 
         // Update file metadata (separate store, not shared)
         let mut file_meta_store = FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
-        file_meta_store.update_file(file_path, chunk_ids)?;
+        file_meta_store.update_file(file_path, &rel_key, chunk_ids)?;
         file_meta_store.save(&db_path)?;
 
         info!(
@@ -2413,7 +2563,7 @@ impl IndexManager {
     /// Remove a file from the index using shared stores (for FSW delete events).
     /// This version uses the shared stores to avoid LMDB conflicts.
     async fn remove_file_from_index_with_stores(
-        _codebase_path: &Path,
+        codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
         file_path: &Path,
@@ -2438,7 +2588,8 @@ impl IndexManager {
 
         // Get chunk IDs from file metadata directly (not check_file which reads from disk)
         // The file is already deleted, so we can't read mtime/size/hash
-        let meta = file_meta_store.remove_file(file_path);
+        let key = crate::cache::storage_key(file_path, codebase_path);
+        let meta = file_meta_store.remove_file(&key);
         let chunk_ids = match meta {
             Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
             Some(_) => {
@@ -2523,6 +2674,20 @@ mod tests {
             .expect("db dir must be deletable after SharedStores drops (no leaked LMDB handles)");
     }
 
+    /// The pool arm must be taken exactly when a pool is present, carrying
+    /// that same pool; `None` must select a fresh service. Pins the arm
+    /// selection both embed call sites share — no model is loaded here
+    /// (`EmbeddingServicePool::new` is a plain constructor).
+    #[test]
+    fn embed_service_choice_selects_pool_when_present_and_fresh_when_none() {
+        let pool = Arc::new(EmbeddingServicePool::new(None));
+        match embed_service_choice(Some(&pool)) {
+            EmbeddingSource::Pool(p) => assert!(Arc::ptr_eq(&p, &pool)),
+            EmbeddingSource::Fresh => panic!("Some(pool) must select Pool, got Fresh"),
+        }
+        assert!(matches!(embed_service_choice(None), EmbeddingSource::Fresh));
+    }
+
     /// Helper: create metadata.json in db_path with given dimensions
     fn create_metadata_json(db_path: &Path, dimensions: usize) {
         let metadata = serde_json::json!({
@@ -2605,6 +2770,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -2649,6 +2815,8 @@ mod tests {
             &db_path,
             &stores,
             &token,
+            None,
+            None,
         )
         .await;
 
@@ -2699,6 +2867,7 @@ mod tests {
                 &stores,
                 None,
                 &task_token,
+                None,
             )
             .await
         });
@@ -2775,6 +2944,7 @@ mod tests {
             &stores,
             None,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("force reindex on empty codebase should succeed");
@@ -2810,14 +2980,16 @@ mod tests {
 
         // Track the ghost file in FileMetaStore
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&ghost_file, vec![100, 101]).unwrap();
+        file_meta
+            .update_file(&ghost_file, "ghost.rs", vec![100, 101])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Now delete the ghost file from disk — simulates branch switch
         std::fs::remove_file(&ghost_file).unwrap();
 
         // Verify precondition: ghost file IS tracked but NOT on disk
-        let deleted_before = file_meta.find_deleted_files();
+        let deleted_before = file_meta.find_deleted_files(&codebase_path);
         assert_eq!(
             deleted_before.len(),
             1,
@@ -2839,6 +3011,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -2846,7 +3019,7 @@ mod tests {
 
         // Verify: reload FileMetaStore and confirm ghost entry is gone
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted_after = reloaded.find_deleted_files();
+        let deleted_after = reloaded.find_deleted_files(&codebase_path);
         assert!(
             deleted_after.is_empty(),
             "Ghost file should have been removed from FileMetaStore after refresh, found: {:?}",
@@ -2875,9 +3048,15 @@ mod tests {
 
         // Track all ghost files
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&ghost1, vec![10, 11]).unwrap();
-        file_meta.update_file(&ghost2, vec![20, 21, 22]).unwrap();
-        file_meta.update_file(&ghost3, vec![30]).unwrap();
+        file_meta
+            .update_file(&ghost1, "ghost1.rs", vec![10, 11])
+            .unwrap();
+        file_meta
+            .update_file(&ghost2, "ghost2.rs", vec![20, 21, 22])
+            .unwrap();
+        file_meta
+            .update_file(&ghost3, "ghost3.rs", vec![30])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Delete all ghost files
@@ -2886,7 +3065,7 @@ mod tests {
         std::fs::remove_file(&ghost3).unwrap();
 
         // Verify precondition
-        let deleted_before = file_meta.find_deleted_files();
+        let deleted_before = file_meta.find_deleted_files(&codebase_path);
         assert_eq!(
             deleted_before.len(),
             3,
@@ -2900,6 +3079,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -2907,7 +3087,7 @@ mod tests {
 
         // All ghost entries should be removed
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted_after = reloaded.find_deleted_files();
+        let deleted_after = reloaded.find_deleted_files(&codebase_path);
         assert!(
             deleted_after.is_empty(),
             "All 3 ghost files should be removed, found: {:?}",
@@ -2932,7 +3112,9 @@ mod tests {
 
         // Track it in FileMetaStore (update_file reads mtime/size/hash)
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&real_file, vec![1, 2]).unwrap();
+        file_meta
+            .update_file(&real_file, "main.rs", vec![1, 2])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         let stores = create_test_stores(&db_path, 4).await;
@@ -2942,6 +3124,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -2949,7 +3132,7 @@ mod tests {
 
         // Verify: real file entry should still be in FileMetaStore
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted = reloaded.find_deleted_files();
+        let deleted = reloaded.find_deleted_files(&codebase_path);
         assert!(
             deleted.is_empty(),
             "Real file should NOT be removed from FileMetaStore"
@@ -2975,8 +3158,12 @@ mod tests {
 
         // Track both files
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&real_file, vec![1, 2]).unwrap();
-        file_meta.update_file(&ghost_file, vec![3, 4, 5]).unwrap();
+        file_meta
+            .update_file(&real_file, "real.rs", vec![1, 2])
+            .unwrap();
+        file_meta
+            .update_file(&ghost_file, "ghost.rs", vec![3, 4, 5])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Delete ghost file — simulates branch switch removing it
@@ -2989,6 +3176,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -2996,7 +3184,7 @@ mod tests {
 
         // Verify: ghost is removed, real is preserved
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted = reloaded.find_deleted_files();
+        let deleted = reloaded.find_deleted_files(&codebase_path);
         assert!(
             deleted.is_empty(),
             "Ghost entry should be removed, real should remain. Found deleted: {:?}",
@@ -3004,7 +3192,7 @@ mod tests {
         );
 
         // Verify the real file is still tracked by checking it doesn't need reindex
-        let (needs_reindex, _chunk_ids) = reloaded.check_file(&real_file).unwrap();
+        let (needs_reindex, _chunk_ids) = reloaded.check_file(&real_file, "real.rs").unwrap();
         assert!(
             !needs_reindex,
             "Real file should still be tracked and up-to-date in FileMetaStore"
@@ -3029,8 +3217,12 @@ mod tests {
         std::fs::write(&file2, "pub fn util_fn() {}").unwrap();
 
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
-        file_meta.update_file(&file1, vec![1, 2, 3]).unwrap();
-        file_meta.update_file(&file2, vec![4, 5]).unwrap();
+        file_meta
+            .update_file(&file1, "lib.rs", vec![1, 2, 3])
+            .unwrap();
+        file_meta
+            .update_file(&file2, "util.rs", vec![4, 5])
+            .unwrap();
         file_meta.save(&db_path).unwrap();
 
         // Delete ALL files — simulates switching to a branch with no source
@@ -3044,6 +3236,7 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -3051,7 +3244,7 @@ mod tests {
 
         // All entries should be cleaned
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
-        let deleted = reloaded.find_deleted_files();
+        let deleted = reloaded.find_deleted_files(&codebase_path);
         assert!(deleted.is_empty(), "All stale entries should be removed");
     }
 
@@ -3078,7 +3271,71 @@ mod tests {
         let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
         // update_file hashes current on-disk content, so a subsequent check_file
         // on the unmodified file returns needs_reindex = false.
-        file_meta.update_file(&file, vec![1]).unwrap();
+        file_meta.update_file(&file, "lib.rs", vec![1]).unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+
+        // The heartbeat must be threaded through and invoked. Only the
+        // start-of-refresh beat is reachable here: a batch with changed files
+        // needs a real embedder, which no unit test spins up.
+        let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat: IndexingHeartbeat = {
+            let beats = Arc::clone(&beats);
+            Arc::new(move || {
+                beats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        let result = IndexManager::perform_incremental_refresh_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+            None,
+            Some(&heartbeat),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Up-to-date incremental refresh should succeed: {:?}",
+            result
+        );
+        assert!(
+            beats.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "heartbeat must fire at least once per refresh"
+        );
+
+        // The tracked file must still be tracked and not flagged as deleted.
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        assert!(
+            reloaded.find_deleted_files(&codebase_path).is_empty(),
+            "No files should be flagged deleted on an up-to-date refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_incremental_refresh_round_trips_relative_keys() {
+        // Chunk/file-meta paths are stored RELATIVE to the project root so the
+        // built DB is portable across machines. A file tracked under its
+        // relative storage key must be seen as UNCHANGED (not re-indexed, not
+        // deleted) by a refresh pass that re-walks the same codebase.
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        create_metadata_json(&db_path, 4);
+
+        let file = codebase_path.join("lib.rs");
+        std::fs::write(&file, "pub fn lib_fn() {}").unwrap();
+
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        let key = crate::cache::storage_key(&file, &codebase_path);
+        assert_eq!(key, "lib.rs", "storage key must be project-relative");
+        file_meta.update_file(&file, &key, vec![1]).unwrap();
         file_meta.save(&db_path).unwrap();
 
         let stores = create_test_stores(&db_path, 4).await;
@@ -3088,20 +3345,162 @@ mod tests {
             &db_path,
             &stores,
             &CancellationToken::new(),
+            None,
+            None,
         )
         .await;
 
         assert!(
             result.is_ok(),
-            "Up-to-date incremental refresh should succeed: {:?}",
+            "Second pass over unchanged files must succeed: {:?}",
             result
         );
 
-        // The tracked file must still be tracked and not flagged as deleted.
         let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
         assert!(
-            reloaded.find_deleted_files().is_empty(),
-            "No files should be flagged deleted on an up-to-date refresh"
+            reloaded.is_tracked("lib.rs"),
+            "Relative key must survive the refresh round-trip, keys: {:?}",
+            reloaded.tracked_files().collect::<Vec<_>>()
+        );
+        assert!(
+            !reloaded
+                .tracked_files()
+                .any(|k| std::path::Path::new(k).is_absolute()),
+            "No stored key may be absolute, keys: {:?}",
+            reloaded.tracked_files().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_repair_never_sweeps_without_a_migration() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+        let file = codebase_path.join("lib.rs");
+        std::fs::write(&file, "pub fn lib_fn() {}").unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+        let ids = {
+            let mut vs = stores.vector_store.write().await;
+            let chunk = |path: &str| {
+                EmbeddedChunk::new(
+                    Chunk::new(
+                        "fn f() {}".to_string(),
+                        0,
+                        1,
+                        ChunkKind::Function,
+                        path.to_string(),
+                    ),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )
+            };
+            vs.insert_chunks_with_ids(vec![chunk("lib.rs"), chunk("new.rs")])
+                .unwrap()
+        };
+        // ids[1] stands for a chunk a concurrent refresh inserted but whose
+        // file meta it has not saved yet.
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta
+            .update_file(&file, "lib.rs", vec![ids[0]])
+            .unwrap();
+
+        let changed = super::super::key_migration::repair_legacy_index_shared(
+            &codebase_path,
+            &mut file_meta,
+            &stores,
+        )
+        .await
+        .unwrap();
+
+        assert!(!changed);
+        assert!(
+            stores
+                .vector_store
+                .read()
+                .await
+                .get_chunk(ids[1])
+                .unwrap()
+                .is_some(),
+            "an untracked chunk must survive when no legacy key was migrated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_incremental_refresh_migrates_legacy_absolute_keys() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let file = codebase_path.join("lib.rs");
+        std::fs::write(&file, "pub fn lib_fn() {}").unwrap();
+        let absolute = file.to_string_lossy().to_string();
+
+        let stores = create_test_stores(&db_path, 4).await;
+        let chunk = |path: &str| {
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "pub fn lib_fn() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )
+        };
+        let (legacy_id, duplicate_id) = {
+            let mut vs = stores.vector_store.write().await;
+            let ids = vs
+                .insert_chunks_with_ids(vec![chunk(&absolute), chunk("lib.rs")])
+                .unwrap();
+            vs.build_index().unwrap();
+            (ids[0], ids[1])
+        };
+
+        // Pre-2c13826 layout: the file is tracked under its absolute path.
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta
+            .update_file(&file, &absolute, vec![legacy_id])
+            .unwrap();
+        file_meta.save(&db_path).unwrap();
+
+        IndexManager::perform_incremental_refresh_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("refresh over a legacy index must succeed");
+
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        assert!(reloaded.is_tracked("lib.rs"));
+        assert!(!reloaded.is_tracked(&absolute));
+        assert_eq!(
+            reloaded.tracked_chunk_ids(),
+            std::collections::HashSet::from([legacy_id]),
+            "an unchanged file must keep its chunks, not be re-embedded"
+        );
+
+        let vs = stores.vector_store.read().await;
+        assert_eq!(vs.get_chunk(legacy_id).unwrap().unwrap().path, "lib.rs");
+        assert!(
+            vs.get_chunk(duplicate_id).unwrap().is_none(),
+            "the untracked duplicate chunk must be swept"
         );
     }
 }

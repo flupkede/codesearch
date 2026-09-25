@@ -116,13 +116,13 @@ pub(crate) async fn require_prebuilt_index_ready(
     db_path: &Path,
 ) -> Result<()> {
     let (total_chunks, vector_indexed) = {
-        let vector_store = stores.vector_store.read().await;
+        let vector_store = crate::mcp::bounded_vector_read(&stores.vector_store).await?;
         vector_store
             .index_health()
             .context("Failed to inspect prebuilt vector index")?
     };
     let fts_documents = {
-        let fts_store = stores.fts_store.read().await;
+        let fts_store = crate::mcp::bounded_fts_read(&stores.fts_store).await?;
         fts_store
             .stats()
             .context("Failed to inspect prebuilt full-text index")?
@@ -805,7 +805,7 @@ pub async fn run_mcp_server_with_options(
         // Create IndexManager with shared stores (skip initial refresh - do in background)
         tracing::info!("🔍 Initializing index manager...");
         let index_manager =
-            IndexManager::new_without_refresh(&project_path, shared_stores.clone()).await?;
+            IndexManager::new_without_refresh(&project_path, shared_stores.clone(), None).await?;
 
         // Background: refresh FIRST, then file watcher (sequential, not concurrent)
         // Both write to SharedStores, so they must not run concurrently
@@ -828,6 +828,8 @@ pub async fn run_mcp_server_with_options(
                 &db_path_clone,
                 &shared_stores_clone,
                 &bg_cancel_token,
+                None,
+                None,
             )
             .await
             {

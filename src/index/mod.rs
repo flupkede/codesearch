@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::cache::{normalize_path, safe_canonicalize, FileMetaStore};
+use crate::cache::{normalize_path, safe_canonicalize, storage_key, FileMetaStore};
 use crate::chunker::SemanticChunker;
 use crate::db_discovery::{find_best_database, is_registered_repository, register_repository};
 use crate::embed::{EmbeddingService, ModelType};
@@ -18,9 +18,15 @@ use crate::vectordb::{merge_metadata_atomic, VectorStore};
 // Index manager module
 mod manager;
 pub use manager::{
-    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores,
-    SymbolRebuildSignal,
+    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingHeartbeat,
+    IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
 };
+
+mod build_log;
+pub use build_log::BuildLog;
+
+mod key_migration;
+pub(crate) use key_migration::repair_legacy_index;
 
 /// Ensure the HNSW vector index is built if it was never built in a previous
 /// (possibly cancelled) run.
@@ -505,17 +511,20 @@ fn get_global_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
 /// * `global` - Create global index instead of local
 /// * `model` - Override embedding model
 /// * `quiet` - Suppress verbose output (for server/MCP mode)
+#[allow(clippy::too_many_arguments)]
 pub async fn index(
     path: Option<PathBuf>,
     dry_run: bool,
     force: bool,
     global: bool,
     model: Option<ModelType>,
+    local: bool,
+    log_file: Option<PathBuf>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     // Always try to delegate to a running serve instance via HTTP.
     // This avoids file-lock conflicts between CLI and serve holding the same LMDB.
-    if !dry_run {
+    if !dry_run && !local {
         // Try to delegate; if serve is unresponsive (warming up), wait and retry.
         let delegate_result = serve_delegate_with_warmup_wait(|| {
             let path = path.clone();
@@ -566,7 +575,17 @@ pub async fn index(
             }
         }
     }
-    index_with_options(path, dry_run, force, global, model, false, cancel_token).await
+    index_with_options(
+        path,
+        dry_run,
+        force,
+        global,
+        model,
+        false,
+        log_file,
+        cancel_token,
+    )
+    .await
 }
 
 /// Index a repository with quiet mode option (for server/MCP use)
@@ -587,10 +606,11 @@ pub async fn index_quiet_with_model(
     model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    index_with_options(path, false, force, global, model, true, cancel_token).await
+    index_with_options(path, false, force, global, model, true, None, cancel_token).await
 }
 
 /// Internal index function with all options
+#[allow(clippy::too_many_arguments)]
 async fn index_with_options(
     path: Option<PathBuf>,
     dry_run: bool,
@@ -598,6 +618,7 @@ async fn index_with_options(
     global: bool,
     model: Option<ModelType>,
     quiet: bool,
+    log_file: Option<PathBuf>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let (db_path, project_path) = get_db_path_smart(path, global, force)?;
@@ -607,13 +628,33 @@ async fn index_with_options(
     // embed 384-dim MiniLM vectors into a 768-dim index. See `resolve_index_model`.
     let model_type = resolve_index_model(&db_path, force, model)?;
 
+    // Clean build log: written next to the DB when stdout is redirected
+    // (progress-bar redraws mangle piped output), or to --log-file always.
+    let build_log = match BuildLog::open(&project_path, log_file.as_deref()) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            tracing::warn!("could not open build log: {}", e);
+            None
+        }
+    };
+
     // Macro to conditionally print
     macro_rules! log_print {
-        ($($arg:tt)*) => {
+        ($($arg:tt)*) => {{
+            let msg = format!($($arg)*);
             if !quiet {
-                println!($($arg)*);
+                println!("{}", msg);
             }
-        };
+            if let Some(log) = &build_log {
+                log.line(&msg);
+            }
+        }};
+    }
+
+    if let (Some(l), false) = (&build_log, quiet) {
+        if let Some(p) = l.path() {
+            log_print!("📝 Build log: {}", p.display());
+        }
     }
 
     log_print!("{}", "🚀 Codesearch Indexer".bright_cyan().bold());
@@ -704,12 +745,26 @@ async fn index_with_options(
             }
         }
 
+        if !file_meta_store.is_empty() {
+            let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
+            let mut fts = FtsStore::new_with_writer(&db_path)?;
+            if key_migration::repair_legacy_index(
+                &project_path,
+                file_meta_store,
+                &mut vs,
+                &mut fts,
+            )? {
+                file_meta_store.save(&db_path)?;
+            }
+        }
+
         // Find changed and deleted files
         let mut changed_files = Vec::new();
         let mut unchanged_files = 0;
 
         for file in &files {
-            let (needs_reindex, _old_chunk_ids) = file_meta_store.check_file(&file.path)?;
+            let key = storage_key(&file.path, &project_path);
+            let (needs_reindex, _old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
 
             if needs_reindex {
                 changed_files.push(file.clone());
@@ -721,7 +776,7 @@ async fn index_with_options(
         }
 
         // Find deleted files (in metadata but not on disk)
-        let deleted_files = file_meta_store.find_deleted_files();
+        let deleted_files = file_meta_store.find_deleted_files(&project_path);
 
         for (file_path, _chunk_ids) in &deleted_files {
             debug!("🗑️  File deleted from disk: {}", file_path);
@@ -763,7 +818,8 @@ async fn index_with_options(
             total_chunks_to_delete += chunk_ids.len() as u32;
         }
         for file in &changed_files {
-            let (_, chunk_ids) = file_meta_store.check_file(&file.path)?;
+            let key = storage_key(&file.path, &project_path);
+            let (_, chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
             total_chunks_to_delete += chunk_ids.len() as u32;
         }
 
@@ -787,12 +843,13 @@ async fn index_with_options(
                         fts_store.delete_chunk(*chunk_id)?;
                     }
                 }
-                file_meta_store.remove_file(Path::new(&file_path));
+                file_meta_store.remove_file(file_path.as_str());
             }
 
             // Delete changed files' old chunks
             for file in &changed_files {
-                let (_, old_chunk_ids) = file_meta_store.check_file(&file.path)?;
+                let key = storage_key(&file.path, &project_path);
+                let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
                 if !old_chunk_ids.is_empty() {
                     let file_path_str = file.path.to_string_lossy().to_string();
                     info!(
@@ -928,7 +985,10 @@ async fn index_with_options(
         };
 
         // Phase 2a: Chunk this file only (memory efficient!)
-        let chunks = chunker.chunk_semantic(file.language, &file.path, &source_code)?;
+        // The path stored in chunk metadata is project-relative so the built
+        // database stays machine-portable (snapshot tarballs move the DB dir).
+        let rel_path = PathBuf::from(storage_key(&file.path, &project_path));
+        let chunks = chunker.chunk_semantic(file.language, &rel_path, &source_code)?;
         let chunk_count = chunks.len();
         debug!(
             "   Created {} chunks for {}",
@@ -941,7 +1001,7 @@ async fn index_with_options(
             // A file with 0 chunks (e.g. minified JS, empty file) is "processed
             // but unchunkable" — record it with an empty chunk list so check_file()
             // returns (unchanged) on future runs and doctor doesn't flag it.
-            let path_str = file.path.to_string_lossy().to_string();
+            let path_str = storage_key(&file.path, &project_path);
             file_chunks.insert(path_str, vec![]);
             pb.inc(1);
             continue;
@@ -999,7 +1059,7 @@ async fn index_with_options(
         }
 
         // Track chunk IDs per file for metadata (only paths and IDs, not chunk content)
-        let file_path = file.path.to_string_lossy().to_string();
+        let file_path = storage_key(&file.path, &project_path);
         file_chunks.insert(file_path, chunk_ids.clone());
 
         total_chunks += chunk_count;
@@ -1075,7 +1135,9 @@ async fn index_with_options(
             let save_result = if is_incremental {
                 let mut meta = file_meta_store.take().unwrap();
                 for (file_path, chunk_ids) in file_chunks {
-                    if let Err(e) = meta.update_file(Path::new(&file_path), chunk_ids) {
+                    if let Err(e) =
+                        meta.update_file(&project_path.join(&file_path), &file_path, chunk_ids)
+                    {
                         log_print!(
                             "{}   file-meta update warning for '{}': {}",
                             "⚠️ ".yellow(),
@@ -1091,7 +1153,9 @@ async fn index_with_options(
                     model_type.dimensions(),
                 );
                 for (file_path, chunk_ids) in file_chunks {
-                    if let Err(e) = meta.update_file(Path::new(&file_path), chunk_ids) {
+                    if let Err(e) =
+                        meta.update_file(&project_path.join(&file_path), &file_path, chunk_ids)
+                    {
                         log_print!(
                             "{}   file-meta update warning for '{}': {}",
                             "⚠️ ".yellow(),
@@ -1171,7 +1235,7 @@ async fn index_with_options(
                 let mut store = file_meta_store.take().unwrap();
                 let file_count = file_chunks.len();
                 for (file_path, chunk_ids) in file_chunks {
-                    store.update_file(Path::new(&file_path), chunk_ids)?;
+                    store.update_file(&project_path.join(&file_path), &file_path, chunk_ids)?;
                 }
                 store.save(&db_path)?;
                 log_print!(
@@ -1184,7 +1248,7 @@ async fn index_with_options(
                     model_type.dimensions(),
                 );
                 for (file_path, chunk_ids) in file_chunks {
-                    store.update_file(Path::new(&file_path), chunk_ids)?;
+                    store.update_file(&project_path.join(&file_path), &file_path, chunk_ids)?;
                 }
                 store.save(&db_path)?;
             }
@@ -1230,7 +1294,7 @@ async fn index_with_options(
 
         // Update FileMetaStore with new/changed files (unchanged files are already preserved)
         for (file_path, chunk_ids) in file_chunks {
-            file_meta_store.update_file(Path::new(&file_path), chunk_ids)?;
+            file_meta_store.update_file(&project_path.join(&file_path), &file_path, chunk_ids)?;
         }
 
         // Save FileMetaStore (includes both unchanged + updated files)
@@ -1247,7 +1311,7 @@ async fn index_with_options(
 
         // Update FileMetaStore
         for (file_path, chunk_ids) in file_chunks {
-            file_meta_store.update_file(Path::new(&file_path), chunk_ids)?;
+            file_meta_store.update_file(&project_path.join(&file_path), &file_path, chunk_ids)?;
         }
 
         // Save FileMetaStore
@@ -1481,6 +1545,8 @@ pub async fn prune_index() -> Result<()> {
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
+    local: bool,
+    log_file: Option<PathBuf>,
     model: Option<ModelType>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
@@ -1493,13 +1559,22 @@ pub async fn add_to_index(
 
     // Try delegating to a running serve instance first.
     // Serve handles: register in repos.json + create index + warmup.
-    let add_delegate = serve_delegate_with_warmup_wait(|| {
-        let path = path.clone();
-        // Alias is always derived from the directory name; the CLI no longer
-        // lets the user set it. Pass None so serve derives it consistently.
-        async move { try_delegate_add_to_serve(&path, &None, global, &model).await }
-    })
-    .await;
+    // `--local` short-circuits the delegation attempt entirely.
+    let add_delegate = if local {
+        println!(
+            "{}",
+            "🏠 --local: building in-process (serve delegation skipped).".cyan()
+        );
+        Err(DelegateError::ServeDown)
+    } else {
+        serve_delegate_with_warmup_wait(|| {
+            let path = path.clone();
+            // Alias is always derived from the directory name; the CLI no longer
+            // lets the user set it. Pass None so serve derives it consistently.
+            async move { try_delegate_add_to_serve(&path, &None, global, &model).await }
+        })
+        .await
+    };
 
     match add_delegate {
         Ok((assigned_alias, _)) => {
@@ -1618,6 +1693,8 @@ pub async fn add_to_index(
             false,
             true,
             model,
+            local,
+            log_file,
             cancel_token.clone(),
         )
         .await?;
@@ -1631,6 +1708,8 @@ pub async fn add_to_index(
             false,
             false,
             model,
+            local,
+            log_file,
             cancel_token,
         )
         .await?;

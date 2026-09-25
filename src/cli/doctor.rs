@@ -306,7 +306,7 @@ fn check_file_integrity(db_path: &Path, project_path: &Path) -> CheckResult {
     };
 
     // Stale files: in index but deleted from disk
-    let stale_files = store.find_deleted_files();
+    let stale_files = store.find_deleted_files(project_path);
     let stale_count = stale_files.len();
 
     // Walk disk to find all indexable files (uses the real FileWalker)
@@ -327,14 +327,15 @@ fn check_file_integrity(db_path: &Path, project_path: &Path) -> CheckResult {
     let mut unindexed = 0;
 
     for file in &files {
-        match store.check_file(&file.path) {
+        let key = crate::cache::storage_key(&file.path, project_path);
+        match store.check_file(&file.path, &key) {
             Ok((needs_reindex, old_ids)) => {
                 if needs_reindex && old_ids.is_empty() {
                     // check_file returns (true, []) for two cases:
                     //   1. File has NO entry in the store → genuinely unindexed
                     //   2. File IS tracked but produced 0 chunks (minified JS, empty file, etc.)
                     // Distinguish them with is_tracked() — case 2 is not an error.
-                    if store.is_tracked(&file.path) {
+                    if store.is_tracked(&key) {
                         // Unchunkable file — tracked with 0 chunks, not a problem
                         up_to_date += 1;
                     } else {
@@ -1085,7 +1086,9 @@ mod tests {
         fs::write(&test_file, "fn stale() {}").unwrap();
 
         let mut store = FileMetaStore::new("minilm-l6-q".to_string(), 384);
-        store.update_file(&test_file, vec![1, 2, 3]).unwrap();
+        store
+            .update_file(&test_file, "will_be_deleted.rs", vec![1, 2, 3])
+            .unwrap();
         store.save(&db_dir).unwrap();
 
         // Now delete the file — it becomes stale

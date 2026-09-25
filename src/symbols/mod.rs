@@ -153,6 +153,13 @@ pub(crate) fn current_git_head(repo_root: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_root)
+        // Repo discovery must key off repo_root alone: a caller running under
+        // git (e.g. a push hook) exports GIT_DIR/GIT_WORK_TREE, which would
+        // otherwise override discovery and report the WRONG repo's HEAD.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
         .output()
         .ok()?;
     if !output.status.success() {

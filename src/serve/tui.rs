@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use super::tui_common::{
     self, KeyAction, OverlayKeyAction, OverlayState, RemoteIndexStats, RemoteStatsState, RepoRow,
 };
-use super::ServeState;
+use super::{IndexingOwner, ServeState};
 use crate::cli::doctor;
 use crate::constants::{DB_DIR_NAME, LANG_CSHARP, LANG_TYPESCRIPT};
 use crate::index::IndexManager;
@@ -1073,7 +1073,7 @@ pub(crate) enum ReindexLaunch {
 /// Follows the same flow as the HTTP `reindex_handler`.
 pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
     // Guard against concurrent reindex
-    if !state.begin_indexing(&alias) {
+    if !state.begin_indexing(&alias, IndexingOwner::Reindex) {
         tracing::warn!(
             "Force reindex already in progress for '{}', skipping TUI request",
             alias
@@ -1085,7 +1085,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Config lock poisoned: {}", e);
-            state.end_indexing(&alias);
+            state.end_indexing(&alias, IndexingOwner::Reindex);
             return ReindexLaunch::Failed;
         }
     };
@@ -1093,7 +1093,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
         Some(p) => p,
         None => {
             tracing::error!("Cannot resolve alias '{}' for force reindex", alias);
-            state.end_indexing(&alias);
+            state.end_indexing(&alias, IndexingOwner::Reindex);
             return ReindexLaunch::Failed;
         }
     };
@@ -1107,7 +1107,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
              owned by another writer",
             alias
         );
-        state.end_indexing(&alias);
+        state.end_indexing(&alias, IndexingOwner::Reindex);
         return ReindexLaunch::Failed;
     }
     drop(config); // release read lock
@@ -1138,12 +1138,12 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
                         "Repo {} opened read-only; cannot force-reindex from TUI",
                         alias
                     );
-                    state.end_indexing(&alias);
+                    state.end_indexing(&alias, IndexingOwner::Reindex);
                     return ReindexLaunch::Failed;
                 }
                 Err(e) => {
                     tracing::error!("Cannot open stores for '{}': {}", alias, e);
-                    state.end_indexing(&alias);
+                    state.end_indexing(&alias, IndexingOwner::Reindex);
                     return ReindexLaunch::Failed;
                 }
             }
@@ -1152,6 +1152,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
 
     let alias_bg = alias.clone();
     let state_bg = state.clone();
+    let pool = state.embedding_pool();
     // Fresh cancellation token for this reindex task, registered in
     // `index_tasks` so `remove_repo` can cancel + await it (BUG1).
     let reindex_token = CancellationToken::new();
@@ -1168,6 +1169,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
             &stores,
             None,
             &reindex_token_task,
+            Some(&pool),
         )
         .await
         {
@@ -1181,7 +1183,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
                     // the FSW, which would resurrect the removed alias with a
                     // fresh, uncancellable task.
                     tracing::info!("TUI: Reindex cancelled for '{}': {}", alias_bg, e);
-                    state_bg.end_indexing(&alias_bg);
+                    state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
                     return;
                 }
                 tracing::error!("TUI: Force reindex failed for '{}': {}", alias_bg, e);
@@ -1204,7 +1206,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
             );
             drop(stores);
             state_bg.self_clean_if_unregistered(&alias_bg, &db_path);
-            state_bg.end_indexing(&alias_bg);
+            state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
             return;
         }
 
@@ -1212,7 +1214,7 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
         state_bg.restart_fsw(&alias_bg, stores).await;
 
         // Remove guard
-        state_bg.end_indexing(&alias_bg);
+        state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
     });
     state.index_tasks.insert(alias, (handle, reindex_token));
 

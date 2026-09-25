@@ -86,7 +86,10 @@ impl CodesearchService {
                 // Multi-store scan
                 let mut items: Vec<LiteralSearchResultItem> = Vec::new();
                 for store_arc in sv {
-                    let store = store_arc.vector_store.read().await;
+                    let store = match bounded_vector_read(&store_arc.vector_store).await {
+                        Ok(store) => store,
+                        Err(_) => continue,
+                    };
                     let all_chunks = match store.iter_all_chunks() {
                         Ok(chunks) => chunks,
                         Err(_) => continue,
@@ -270,7 +273,19 @@ impl CodesearchService {
                 'outer: for fts_result in &fts_results {
                     let sa = ctx.store_aliases.as_ref().unwrap();
                     for (idx, store_arc) in sv.iter().enumerate() {
-                        let store = store_arc.vector_store.read().await;
+                        let store = match bounded_vector_read(&store_arc.vector_store).await {
+                            Ok(store) => store,
+                            Err(e) => {
+                                note_store_failure(
+                                    &mut literal_warnings,
+                                    sa,
+                                    idx,
+                                    "chunk lookup",
+                                    &e,
+                                );
+                                continue;
+                            }
+                        };
                         let looked_up = store.get_chunk(fts_result.chunk_id);
                         if let Err(ref e) = looked_up {
                             note_store_failure(&mut literal_warnings, sa, idx, "chunk lookup", e);

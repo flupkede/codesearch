@@ -38,6 +38,11 @@ impl HasScore for crate::fts::FtsResult {
 
 // === Simple Glob Matcher ===
 
+/// Resolve a tool path for store lookups to its canonical form: normalized and
+/// relative to the project root. Chunk paths are stored relative to the root,
+/// so `chunks_for_file` needles must be relative too. Absolute inputs under
+/// the root are relativized; absolute inputs outside the root and unresolvable
+/// relative inputs fall back to the normalized input.
 pub(crate) fn normalize_tool_path(path: &str, project_root: &Path) -> String {
     let p = Path::new(path);
     let resolved = if p.is_absolute() {
@@ -45,7 +50,7 @@ pub(crate) fn normalize_tool_path(path: &str, project_root: &Path) -> String {
     } else {
         project_root.join(p)
     };
-    crate::cache::normalize_path_str(resolved.to_string_lossy().as_ref())
+    crate::cache::storage_key(&resolved, project_root)
 }
 
 /// Strip a project-alias prefix from a tool path.
@@ -65,9 +70,32 @@ pub(crate) fn strip_alias_prefix(path: &str, alias: Option<&String>) -> String {
     }
 }
 
+/// Is `path` absolute under either path convention (Unix `/...` or Windows
+/// `C:/...` / `C:\...`), regardless of the platform this binary runs on.
+///
+/// `Path::has_root()` is platform-scoped: on Linux it does not recognize a
+/// Windows drive-letter path as rooted, so a CI run on a Linux runner sees
+/// `"C:/other/src/main.rs"` as relative and wrongly alias-prefixes it. Test
+/// data and stored paths cross platforms (a Windows client's paths get
+/// tested on a Linux CI runner), so absoluteness must be checked textually.
+fn is_portable_absolute(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    let b = path.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\')
+}
+
 /// Prefix a result path with its repo alias for group queries, normalizing
 /// Windows backslashes to forward slashes in the process. When `alias` is
 /// None or empty, the path is still normalized (useful for stdio mode).
+///
+/// Chunk paths are stored project-relative, so a path that is neither under
+/// `project_root` nor absolute is treated as already-relative: it just gets
+/// the alias prepended (or is returned unchanged when there is no alias).
 pub(crate) fn prefix_path_with_alias(
     path: &str,
     alias: Option<&str>,
@@ -77,14 +105,16 @@ pub(crate) fn prefix_path_with_alias(
     let normalized_root = crate::cache::normalize_path_str(project_root)
         .trim_end_matches('/')
         .to_string();
-    match normalized.strip_prefix(&normalized_root) {
-        Some(rest) => {
-            let relative = rest.trim_start_matches('/');
-            match alias {
-                Some(a) if !a.is_empty() => format!("{}/{}", a, relative),
-                _ => relative.to_string(),
-            }
-        }
+    let relative = match normalized.strip_prefix(&normalized_root) {
+        Some(rest) => Some(rest.trim_start_matches('/')),
+        None if !is_portable_absolute(&normalized) => Some(normalized.as_str()),
+        None => None,
+    };
+    match relative {
+        Some(relative) => match alias {
+            Some(a) if !a.is_empty() => format!("{}/{}", a, relative),
+            _ => relative.to_string(),
+        },
         None => normalized,
     }
 }

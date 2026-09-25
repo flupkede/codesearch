@@ -45,7 +45,8 @@ use crate::constants::{
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
-    CSharpRebuildNotifier, IndexManager, IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
+    CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback, SharedStores,
+    SymbolRebuildSignal,
 };
 use crate::mcp::types::HealthResponse;
 use crate::symbols::{csharp, RebuildScope, SymbolIndexerRegistry};
@@ -180,6 +181,23 @@ pub(crate) enum OpenedStores {
     Readonly(Arc<SharedStores>),
 }
 
+/// Which flow holds an indexing marker in [`ServeState::active_reindexes`].
+///
+/// Owners make marker completion scoped: the file-watcher callback ends the
+/// [`IndexingOwner::Watcher`] marker only, so it can never erase a concurrent
+/// reindex's or warmup's marker (the plain-bool callback bug).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum IndexingOwner {
+    /// Background warmup refresh (`warmup_repo`).
+    Warmup,
+    /// File-watcher-triggered refresh batches (`make_indexing_status_callback`).
+    Watcher,
+    /// User-initiated reindex (HTTP handler, TUI, force reindex).
+    Reindex,
+    /// Watcher-triggered SCIP symbol rebuild (`trigger_symbol_rebuild`).
+    Symbol,
+}
+
 /// Shared state for the serve mode.
 pub(crate) struct ServeState {
     /// Repo alias → opened stores (or conflicted marker).
@@ -255,9 +273,11 @@ pub(crate) struct ServeState {
     config_mtime: std::sync::RwLock<Option<std::time::SystemTime>>,
     /// Optional override for the repos config path (used in tests to avoid env vars).
     config_path_override: Option<PathBuf>,
-    /// Aliases currently being reindexed — prevents concurrent force reindex
-    /// on the same repo. The value is the `Instant` the entry was inserted so
-    /// that stale (leaked) entries can be detected and self-healed; see
+    /// Aliases currently being indexed, per owner. Owners exist so one flow's
+    /// completion marker cannot erase another's: the file-watcher callback
+    /// used to clear the whole entry with a plain bool, wiping a concurrent
+    /// force reindex's marker mid-run. The `Instant` is the last heartbeat so
+    /// stale (leaked) entries can be detected and self-healed; see
     /// [`Self::begin_indexing`] / [`Self::is_indexing`] and
     /// [`MAX_INDEXING_SECS`].
     ///
@@ -265,7 +285,7 @@ pub(crate) struct ServeState {
     /// capture a cheap clone that **shares** the underlying map (a bare
     /// `DashMap::clone()` is a deep copy and would silently disconnect the
     /// file-watcher callback from this field).
-    active_reindexes: Arc<DashMap<String, Instant>>,
+    active_reindexes: Arc<DashMap<String, std::collections::HashMap<IndexingOwner, Instant>>>,
     /// Per-repo change count since serve started (incremented by index/reindex operations).
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
@@ -422,6 +442,25 @@ impl ServeState {
             .clone()
     }
 
+    /// [`Self::open_lock`] acquired with a deadline, for query paths: a cold
+    /// open or warmup that holds it for long must surface as an error, never as
+    /// a request that hangs until the client gives up.
+    async fn acquire_open_lock_bounded(
+        &self,
+        alias: &str,
+    ) -> std::result::Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        let wait = Duration::from_secs(crate::constants::REPO_OPEN_WAIT_SECS);
+        tokio::time::timeout(wait, self.open_lock(alias).lock_owned())
+            .await
+            .map_err(|_| {
+                format!(
+                    "Repository '{}' is still being opened (waited {}s) — retry shortly",
+                    alias,
+                    wait.as_secs()
+                )
+            })
+    }
+
     /// Fast-path lookup: `Some(result)` when `alias` already has opened stores
     /// in the cache, `None` when a cold open is needed. Shared by the pre-lock
     /// fast path and the re-check after the single-flight acquire — identical
@@ -442,7 +481,10 @@ impl ServeState {
                 // Fan-out/candidate-detection callers pass touch=false and must not
                 // trigger Warm → Write or start FSW.
                 let stores = stores.clone();
-                if !touch {
+                // While warmup's refresh runs, the FSW must not start: its own
+                // refresh would race warmup's unsaved file meta, and its
+                // indexing callback would clear warmup's marker.
+                if !touch || self.is_indexing(alias) {
                     return Some(Ok(stores));
                 }
                 drop(entry); // release DashMap read guard before mutation
@@ -585,54 +627,77 @@ impl ServeState {
     ///
     /// The callback captures a clone of `active_reindexes` so it can be sent
     /// into the file-watcher background task. The watcher calls this closure to
-    /// insert/remove the alias around every reindex — branch-change refresh,
-    /// text-batch flush, and symbol rebuild — making "Indexing" visible in the
-    /// TUI status column.
+    /// add/remove the [`IndexingOwner::Watcher`] marker around every refresh —
+    /// branch-change refresh, text-batch flush, and symbol rebuild — making
+    /// "Indexing" visible in the TUI status column. Owner-scoped on purpose:
+    /// the completion half must not erase another flow's marker.
     fn make_indexing_status_callback(&self, alias: &str) -> IndexingStatusCallback {
         let reindexes = self.active_reindexes.clone();
         let alias_key = alias.to_string();
         Arc::new(move |active: bool| {
             if active {
-                reindexes.insert(alias_key.clone(), Instant::now());
+                reindexes
+                    .entry(alias_key.clone())
+                    .or_default()
+                    .insert(IndexingOwner::Watcher, Instant::now());
             } else {
-                reindexes.remove(&alias_key);
+                if let Some(mut owners) = reindexes.get_mut(&alias_key) {
+                    owners.remove(&IndexingOwner::Watcher);
+                }
+                // Atomic empty-cleanup (see end_indexing): a concurrent
+                // begin_indexing insert must never be erased by this remove.
+                reindexes.remove_if(&alias_key, |_, m| m.is_empty());
             }
         })
     }
 
-    /// Mark `alias` as actively indexing, returning `true` if the caller may
-    /// proceed. Returns `false` only when a **non-stale** entry already exists
-    /// (i.e. another reindex is genuinely in progress) — in that case the
-    /// caller should return HTTP 409. Stale entries are silently overwritten
-    /// with a fresh timestamp.
+    /// Mark `alias` as actively indexing for `owner`, returning `true` if the
+    /// caller may proceed. Returns `false` when **any** owner holds a
+    /// non-stale marker (i.e. another indexing run is genuinely in progress) —
+    /// in that case the caller should return HTTP 409. Stale markers from
+    /// leaked/crashed tasks are silently dropped first.
     ///
     /// This is the guard used by `reindex_handler`, `add_repo_handler`, and
     /// `spawn_force_reindex` to reject concurrent reindexes.
-    fn begin_indexing(&self, alias: &str) -> bool {
+    fn begin_indexing(&self, alias: &str, owner: IndexingOwner) -> bool {
         let now = Instant::now();
         let max = self.indexing_timeout();
-        match self.active_reindexes.entry(alias.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                if now.duration_since(*e.get()) < max {
-                    // Genuinely in progress — reject.
-                    false
-                } else {
-                    // Stale entry from a leaked/crashed task — overwrite.
-                    *e.get_mut() = now;
-                    true
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(e) => {
-                e.insert(now);
-                true
-            }
+        let mut owners = self.active_reindexes.entry(alias.to_string()).or_default();
+        owners.retain(|_, ts| now.duration_since(*ts) < max);
+        if owners.is_empty() {
+            owners.insert(owner, now);
+            true
+        } else {
+            // Genuinely in progress — reject.
+            false
         }
     }
 
-    /// Remove the indexing marker for `alias`. Called when a background
-    /// indexing task finishes (success, error, or panic).
-    fn end_indexing(&self, alias: &str) {
-        self.active_reindexes.remove(alias);
+    /// Remove `owner`'s indexing marker for `alias`. Called when that flow's
+    /// background task finishes (success, error, or panic). Other owners'
+    /// markers are untouched — the file-watcher's completion must not end a
+    /// concurrent reindex's marker.
+    fn end_indexing(&self, alias: &str, owner: IndexingOwner) {
+        if let Some(mut owners) = self.active_reindexes.get_mut(alias) {
+            owners.remove(&owner);
+        }
+        // Atomic empty-cleanup: the `remove_if` predicate+removal holds the
+        // shard lock, so a `begin_indexing` that inserts a fresh marker
+        // between the inner removal and this call keeps its marker.
+        self.active_reindexes.remove_if(alias, |_, m| m.is_empty());
+    }
+
+    /// Renew `owner`'s indexing marker for `alias` — the per-batch heartbeat a
+    /// long refresh uses to stay alive past the stale-marker threshold
+    /// (`is_indexing` would otherwise evict it mid-run and let the reaper and
+    /// FSW race the live refresh). Upsert on purpose: if the marker was
+    /// already evicted by a race, re-inserting still protects the remainder
+    /// of the refresh.
+    fn renew_indexing(&self, alias: &str, owner: IndexingOwner) {
+        self.active_reindexes
+            .entry(alias.to_string())
+            .or_default()
+            .insert(owner, Instant::now());
     }
 
     /// True iff an error chain indicates LMDB storage-format corruption —
@@ -850,39 +915,52 @@ impl ServeState {
         Ok(())
     }
 
-    /// Returns `true` if `alias` is currently (non-stale) indexing.
+    /// Returns `true` if `alias` is currently (non-stale) indexing for any
+    /// owner.
     ///
-    /// Stale entries — those older than [`MAX_INDEXING_SECS`] — are lazily
+    /// Stale markers — those older than [`MAX_INDEXING_SECS`] — are lazily
     /// evicted here. This is the self-healing mechanism: even if a
     /// fire-and-forget background task panics or is cancelled between
-    /// `begin_indexing` and `end_indexing`, the entry eventually expires and
+    /// `begin_indexing` and `end_indexing`, its marker eventually expires and
     /// the TUI returns to the correct state without a server restart.
     ///
-    /// The eviction uses the atomic `remove_if` primitive so that a concurrent
-    /// `begin_indexing` that inserts a fresh timestamp between the staleness
-    /// check and the removal cannot be wrongly evicted.
-    fn is_indexing(&self, alias: &str) -> bool {
+    /// Eviction runs under the shard's write lock (`get_mut` + `retain`), so a
+    /// concurrent `begin_indexing`/`renew_indexing` that refreshed a marker in
+    /// the meantime is never wrongly evicted: its timestamp is fresh when the
+    /// predicate runs, or its insert lands before/after the atomic
+    /// `remove_if` empty-cleanup (which holds the same shard lock across
+    /// predicate + removal).
+    pub(crate) fn is_indexing(&self, alias: &str) -> bool {
         let max = self.indexing_timeout();
-        // Atomically evict a stale entry. `remove_if` holds the shard's write
-        // lock for the predicate check + removal, so a racing `begin_indexing`
-        // that refreshed the timestamp in the meantime will cause the predicate
-        // to return false and the entry to be kept.
-        if self
-            .active_reindexes
-            .remove_if(alias, |_, ts| ts.elapsed() >= max)
-            .is_some()
-        {
+        let mut evicted: Vec<IndexingOwner> = Vec::new();
+        let mut any_left = false;
+        if let Some(mut owners) = self.active_reindexes.get_mut(alias) {
+            let now = Instant::now();
+            owners.retain(|owner, ts| {
+                let fresh = now.duration_since(*ts) < max;
+                if !fresh {
+                    evicted.push(*owner);
+                }
+                fresh
+            });
+            any_left = !owners.is_empty();
+        }
+        if !any_left {
+            // Atomic empty-cleanup (see end_indexing): a begin_indexing that
+            // raced this eviction keeps its fresh marker.
+            self.active_reindexes.remove_if(alias, |_, m| m.is_empty());
+        }
+        if !evicted.is_empty() {
             tracing::warn!(
-                "🧹 Evicted stale indexing marker for '{}' (older than {}s) — \
-                 likely a leaked/crashed background task",
+                "🧹 Evicted stale indexing marker(s) for '{}' (older than {}s, owners \
+                 {:?}) — likely a leaked/crashed background task",
                 alias,
-                max.as_secs()
+                max.as_secs(),
+                evicted
             );
             self.cancel_stale_index_task(alias);
-            return false;
         }
-        // Entry is either absent or still within the active window.
-        self.active_reindexes.contains_key(alias)
+        any_left
     }
 
     /// Cancel the background index task still registered for `alias` after its
@@ -2244,8 +2322,9 @@ impl ServeState {
             }
         };
         let db_path = path.join(DB_DIR_NAME);
+        let pool = self.embedding_pool();
 
-        match IndexManager::new_without_refresh(&path, stores.clone()).await {
+        match IndexManager::new_without_refresh(&path, stores.clone(), Some(pool.clone())).await {
             Ok(im) => {
                 let im_arc = Arc::new(im);
                 let token = CancellationToken::new();
@@ -2269,6 +2348,8 @@ impl ServeState {
                         &db_path_bg,
                         &stores_bg,
                         &token_for_task,
+                        Some(&pool),
+                        None,
                     )
                     .await
                     {
@@ -2346,7 +2427,7 @@ impl ServeState {
         // twice, or the loser trips the LMDB double-open guard and the repo
         // wedges as an incurable Conflicted (todo #131).
         let open_lock = self.open_lock(alias);
-        let _open_guard = open_lock.lock().await;
+        let open_guard = open_lock.lock().await;
         if let Some(entry) = self.repos.get(alias) {
             match entry.value() {
                 RepoState::Write { .. } | RepoState::Warm { .. } | RepoState::Readonly { .. } => {
@@ -2451,32 +2532,64 @@ impl ServeState {
             }
         }
 
-        let stores_arc = stores;
+        // Begin the indexing marker BEFORE registering as Warm: FSW's gate
+        // (`!touch || self.is_indexing(alias)`) is checked by a concurrent
+        // query the instant the repo appears in `self.repos`, so the marker
+        // must already be visible or FSW can start and race warmup's
+        // unsaved file_meta.
+        let warmup_marker_acquired = self.begin_indexing(alias, IndexingOwner::Warmup);
 
-        // Warmup runs at startup (pre-warm), never in response to a user action,
-        // so it is given a fresh token that is never cancelled — the refresh runs
-        // to completion. A real user-initiated cancel routes through the
-        // RepoState::Write token owned by the live task instead.
-        if let Err(e) = IndexManager::perform_incremental_refresh_with_stores(
-            &path,
-            &db_path,
-            &stores_arc,
-            &CancellationToken::new(),
-        )
-        .await
-        {
-            tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
-        }
-
-        // Store as Warm — FSW will be started lazily on first query.
-        self.repos
-            .insert(alias.to_string(), RepoState::Warm { stores: stores_arc });
-
+        // Register as Warm BEFORE the refresh and release the single-flight
+        // lock: a refresh of a large repo takes minutes, and queries must be
+        // answered from the existing data meanwhile instead of queueing on
+        // `open_lock`. FSW is started lazily on first query.
+        self.repos.insert(
+            alias.to_string(),
+            RepoState::Warm {
+                stores: Arc::clone(&stores),
+            },
+        );
         // Start the idle timer at warmup. A real query will reset it via
         // touch_access; without this, repos that are warmed but never queried
         // would never appear in `last_access` and therefore never be evicted
         // by `evict_idle_repos`, holding LMDB envs and embedder state forever.
         self.touch_access(alias);
+        drop(open_guard);
+
+        // Tracked like any reindex: status reports "indexing", the reaper
+        // leaves the repo alone, and a concurrent reindex is not doubled.
+        if !warmup_marker_acquired {
+            info!(
+                "Warmup '{}': another indexing run is active, skipping refresh",
+                alias
+            );
+            return Ok(());
+        }
+        // Warmup runs at startup (pre-warm), never in response to a user action,
+        // so it is given a fresh token that is never cancelled — the refresh runs
+        // to completion. A real user-initiated cancel routes through the
+        // RepoState::Write token owned by the live task instead.
+        let pool = self.embedding_pool();
+        // Large-repo warmups run past MAX_INDEXING_SECS; the per-batch heartbeat
+        // keeps the marker alive so the reaper and FSW keep honouring it.
+        let heartbeat: IndexingHeartbeat = {
+            let state = Arc::clone(self);
+            let alias_hb = alias.to_string();
+            Arc::new(move || state.renew_indexing(&alias_hb, IndexingOwner::Warmup))
+        };
+        let refreshed = IndexManager::perform_incremental_refresh_with_stores(
+            &path,
+            &db_path,
+            &stores,
+            &CancellationToken::new(),
+            Some(&pool),
+            Some(&heartbeat),
+        )
+        .await;
+        self.end_indexing(alias, IndexingOwner::Warmup);
+        if let Err(e) = refreshed {
+            tracing::warn!("Warmup '{}': incremental refresh failed: {}", alias, e);
+        }
         Ok(())
     }
 
@@ -2551,8 +2664,7 @@ impl ServeState {
         // opens both reach try_open_stores; the second trips the LMDB
         // double-open guard and caches Conflicted — incurable while the first
         // opener holds its env (todo #131).
-        let open_lock = self.open_lock(alias);
-        let _open_guard = open_lock.lock().await;
+        let _open_guard = self.acquire_open_lock_bounded(alias).await?;
         if let Some(result) = self.try_cached_stores(alias, touch) {
             return result;
         }
@@ -2642,7 +2754,10 @@ impl ServeState {
         // On failure, still store as Write — searches keep working, live updates disabled.
         let (index_manager_opt, cancel_token) = {
             let alias_clone = alias.to_string();
-            match IndexManager::new_without_refresh(&path, stores_arc.clone()).await {
+            let pool = self.embedding_pool();
+            match IndexManager::new_without_refresh(&path, stores_arc.clone(), Some(pool.clone()))
+                .await
+            {
                 Ok(im) => {
                     let im_arc = Arc::new(im);
                     let token = CancellationToken::new();
@@ -2666,6 +2781,8 @@ impl ServeState {
                             &db_path_clone,
                             &stores_for_task,
                             &token_for_task,
+                            Some(&pool),
+                            None,
                         )
                         .await
                         {
@@ -2750,6 +2867,7 @@ impl ServeState {
 
         let cancel_token = CancellationToken::new();
         let token_for_task = cancel_token.clone();
+        let pool_bg = self.embedding_pool();
 
         // Fire-and-forget: create IndexManager + start FSW in background.
         // We don't block the first query — the repo is already searchable from the Warm state.
@@ -2758,7 +2876,9 @@ impl ServeState {
                 return;
             }
 
-            match IndexManager::new_without_refresh(&path_bg, stores_bg.clone()).await {
+            match IndexManager::new_without_refresh(&path_bg, stores_bg.clone(), Some(pool_bg))
+                .await
+            {
                 Ok(im) => {
                     let im_arc = Arc::new(im);
                     let im_for_task = im_arc.clone();
@@ -2939,6 +3059,14 @@ impl ServeState {
             },
             None => None,
         }
+    }
+
+    /// True when this process itself keeps `alias`'s DB busy: an indexing run,
+    /// or an LMDB env still held by an evicted-but-referenced `SharedStores`
+    /// (e.g. an in-flight handler). A file-lock probe cannot tell that apart
+    /// from another process, so status must ask this first.
+    pub(crate) fn is_held_in_process(&self, alias: &str, db_path: &Path) -> bool {
+        self.is_indexing(alias) || !crate::lmdb_registry::open_holders_under(db_path).is_empty()
     }
 
     /// Get the SharedStores for an already-opened repo (no DB open).
@@ -3978,14 +4106,11 @@ async fn trigger_symbol_rebuild(
     // Mark as actively indexing so the TUI status column shows "Indexing"
     // (not just the C# indicator). This mirrors what reindex_handler does.
     //
-    // Known benign race: if the FSW-SCIP rebuild path (indexing_cb) fires for
-    // the same alias simultaneously, both paths insert into active_reindexes.
-    // Because the map key is the alias, there is no data corruption.
-    // However, whichever path finishes first will call remove(), which may
-    // briefly flip the TUI back to Warm/Open while the other path is still
-    // running. This is a cosmetic flash only — no state is corrupted.
-    // (Stale entries from a crashed task self-heal via `is_indexing`.)
-    state.begin_indexing(alias);
+    // Owner-scoped markers: if the FSW-SCIP rebuild path (indexing_cb) fires
+    // for the same alias simultaneously, each path ends only its own marker,
+    // so neither can flip the TUI back to Warm/Open while the other still
+    // runs. (Stale entries from a crashed task self-heal via `is_indexing`.)
+    state.begin_indexing(alias, IndexingOwner::Symbol);
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
     let alias_owned = alias.to_string();
@@ -4009,7 +4134,7 @@ async fn trigger_symbol_rebuild(
                 summary.references_stored,
                 summary.duration_ms
             );
-            state.end_indexing(&alias_owned);
+            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             state
                 .csharp_index_status
                 .insert(alias_owned.clone(), CSharpIndexStatus::Ready);
@@ -4025,7 +4150,7 @@ async fn trigger_symbol_rebuild(
             // SCIP puts wrap their errors (table + key size), and plain `{}`
             // would hide the `MDB_*` code the classifier below matches on.
             let msg = format!("{e:#}");
-            state.end_indexing(&alias_owned);
+            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             state
                 .csharp_index_error
                 .insert(alias_owned.clone(), msg.clone());
@@ -4070,7 +4195,7 @@ async fn trigger_symbol_rebuild(
                 alias_owned,
                 e
             );
-            state.end_indexing(&alias_owned);
+            state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             state
                 .csharp_index_error
                 .insert(alias_owned.clone(), format!("Task panicked: {}", e));
@@ -4195,7 +4320,7 @@ async fn reindex_handler(
     let alias_bg = alias.clone();
 
     // Concurrent reindex guard — reject if this alias is already being reindexed
-    if !state.begin_indexing(&alias_bg) {
+    if !state.begin_indexing(&alias_bg, IndexingOwner::Reindex) {
         return (
             StatusCode::CONFLICT,
             axum::response::Json(json!({
@@ -4240,7 +4365,7 @@ async fn reindex_handler(
                     }
                     Ok(OpenedStores::Readonly(_)) => {
                         // Cannot force-reindex against a readonly store.
-                        state.end_indexing(&guard_alias);
+                        state.end_indexing(&guard_alias, IndexingOwner::Reindex);
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             axum::response::Json(json!({
@@ -4253,7 +4378,7 @@ async fn reindex_handler(
                         );
                     }
                     Err(e) => {
-                        state.end_indexing(&guard_alias);
+                        state.end_indexing(&guard_alias, IndexingOwner::Reindex);
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             axum::response::Json(json!({
@@ -4282,12 +4407,14 @@ async fn reindex_handler(
             );
 
             // 2. Clear data and reindex
+            let pool = g_state.embedding_pool();
             match IndexManager::force_reindex_with_stores(
                 &project_path,
                 &db_path,
                 &stores,
                 None,
                 &reindex_token_task,
+                Some(&pool),
             )
             .await
             {
@@ -4302,7 +4429,7 @@ async fn reindex_handler(
                         // would resurrect the removed alias with a fresh,
                         // uncancellable task.
                         tracing::info!("Reindex cancelled for '{}': {}", alias_bg, e);
-                        g_state.end_indexing(&g_alias);
+                        g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
                         return;
                     }
                     tracing::error!("Force reindex failed for '{}': {}", alias_bg, e);
@@ -4325,7 +4452,7 @@ async fn reindex_handler(
                 );
                 drop(stores);
                 g_state.self_clean_if_unregistered(&g_alias, &db_path);
-                g_state.end_indexing(&g_alias);
+                g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
                 return;
             }
 
@@ -4337,7 +4464,7 @@ async fn reindex_handler(
                 trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
             }
 
-            g_state.end_indexing(&g_alias);
+            g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
         state
             .index_tasks
@@ -4347,7 +4474,7 @@ async fn reindex_handler(
         let stores = match state.get_or_open_stores(&alias, true).await {
             Ok(s) => s,
             Err(e) => {
-                state.end_indexing(&guard_alias);
+                state.end_indexing(&guard_alias, IndexingOwner::Reindex);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     axum::response::Json(json!({
@@ -4370,11 +4497,14 @@ async fn reindex_handler(
                 "🔄 Incremental reindex triggered for '{}' via HTTP API",
                 alias_bg
             );
+            let pool = g_state.embedding_pool();
             match IndexManager::perform_incremental_refresh_with_stores(
                 &project_path,
                 &db_path,
                 &stores,
                 &reindex_token_task,
+                Some(&pool),
+                None,
             )
             .await
             {
@@ -4399,7 +4529,7 @@ async fn reindex_handler(
                 );
                 drop(stores);
                 g_state.self_clean_if_unregistered(&g_alias, &db_path);
-                g_state.end_indexing(&g_alias);
+                g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
                 return;
             }
 
@@ -4408,7 +4538,7 @@ async fn reindex_handler(
                 trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
             }
 
-            g_state.end_indexing(&g_alias);
+            g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
         state
             .index_tasks
@@ -4642,7 +4772,7 @@ async fn add_repo_handler(
     state.touch_access(&alias);
 
     // Guard against concurrent reindex for the same alias.
-    if !state.begin_indexing(&alias) {
+    if !state.begin_indexing(&alias, IndexingOwner::Reindex) {
         // Another reindex for this alias is already in progress.
         // We must undo *all* side-effects created so far:
         //   1. Cancel the token and remove from repos (releases the LMDB handle).
@@ -4688,12 +4818,14 @@ async fn add_repo_handler(
             project_path.display()
         );
 
+        let pool = state_bg.embedding_pool();
         match IndexManager::force_reindex_with_stores(
             &project_path,
             &db_path,
             &stores,
             model_override,
             &token_for_task,
+            Some(&pool),
         )
         .await
         {
@@ -4711,13 +4843,13 @@ async fn add_repo_handler(
                     // destructive cleanup (repos.remove/unregister) here, just
                     // release the indexing guard and let remove_repo finish.
                     tracing::info!("Indexing cancelled for '{}': {}", alias_bg, e);
-                    state_bg.end_indexing(&alias_bg);
+                    state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
                     return;
                 }
                 tracing::error!("Index creation failed for '{}': {}", alias_bg, e);
                 // Clean up: remove from repos and config
                 state_bg.repos.remove(&alias_bg);
-                state_bg.end_indexing(&alias_bg);
+                state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
                 if let Ok(mut config) = state_bg.config.write() {
                     config.unregister_alias(&alias_bg);
                     if let Err(e) = state_bg.persist_config(&config) {
@@ -4741,7 +4873,7 @@ async fn add_repo_handler(
                 "Skipping build_index for '{}': repo removed or cancelled mid-index",
                 alias_bg
             );
-            state_bg.end_indexing(&alias_bg);
+            state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
             return;
         }
 
@@ -4782,14 +4914,14 @@ async fn add_repo_handler(
             );
             drop(stores);
             state_bg.self_clean_if_unregistered(&alias_bg, &db_path);
-            state_bg.end_indexing(&alias_bg);
+            state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
             return;
         }
 
         // Start FSW and transition to proper Write state with IndexManager
         state_bg.restart_fsw(&alias_bg, stores).await;
 
-        state_bg.end_indexing(&alias_bg);
+        state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
         tracing::info!("Repo '{}' fully indexed and ready", alias_bg);
     });
 
