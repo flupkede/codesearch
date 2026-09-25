@@ -70,6 +70,25 @@ pub(crate) fn strip_alias_prefix(path: &str, alias: Option<&String>) -> String {
     }
 }
 
+/// Is `path` absolute under either path convention (Unix `/...` or Windows
+/// `C:/...` / `C:\...`), regardless of the platform this binary runs on.
+///
+/// `Path::has_root()` is platform-scoped: on Linux it does not recognize a
+/// Windows drive-letter path as rooted, so a CI run on a Linux runner sees
+/// `"C:/other/src/main.rs"` as relative and wrongly alias-prefixes it. Test
+/// data and stored paths cross platforms (a Windows client's paths get
+/// tested on a Linux CI runner), so absoluteness must be checked textually.
+fn is_portable_absolute(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    let b = path.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\')
+}
+
 /// Prefix a result path with its repo alias for group queries, normalizing
 /// Windows backslashes to forward slashes in the process. When `alias` is
 /// None or empty, the path is still normalized (useful for stdio mode).
@@ -88,7 +107,7 @@ pub(crate) fn prefix_path_with_alias(
         .to_string();
     let relative = match normalized.strip_prefix(&normalized_root) {
         Some(rest) => Some(rest.trim_start_matches('/')),
-        None if !Path::new(&normalized).has_root() => Some(normalized.as_str()),
+        None if !is_portable_absolute(&normalized) => Some(normalized.as_str()),
         None => None,
     };
     match relative {
