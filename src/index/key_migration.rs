@@ -14,7 +14,7 @@ use tracing::info;
 use super::SharedStores;
 use crate::cache::FileMetaStore;
 use crate::fts::FtsStore;
-use crate::vectordb::{ChunkMetadata, VectorStore};
+use crate::vectordb::{ChunkMetadata, VectorStore, PATH_REWRITE_BATCH};
 
 /// In-process variant for callers that own both stores exclusively (CLI).
 /// Returns `true` when `file_meta` changed and must be saved by the caller.
@@ -33,35 +33,49 @@ pub(crate) fn repair_legacy_index(
         migration.superseded,
     );
 
+    if migration.is_empty() {
+        return Ok(false);
+    }
     let untracked = untracked_chunk_ids(file_meta, vector_store)?;
     if !untracked.is_empty() {
         delete_from_vector_store(vector_store, &untracked)?;
         delete_from_fts(fts_store, &untracked)?;
         log_sweep(untracked.len());
     }
-    Ok(!migration.is_empty())
+    Ok(true)
 }
 
-/// Shared-stores variant. Each phase takes ONE store lock on the blocking
+/// Shared-stores variant. Each step takes ONE store lock on the blocking
 /// pool, never both at once, so it cannot deadlock against a reader that
-/// holds the other lock.
+/// holds the other lock; path rewrites lock per batch so queries interleave.
+///
+/// The orphan sweep runs only after an actual migration: without one, a
+/// chunk missing from `file_meta` may belong to a concurrent refresh that
+/// inserted it but has not saved its metadata yet.
 pub(crate) async fn repair_legacy_index_shared(
     project_root: &Path,
     file_meta: &mut FileMetaStore,
     stores: &SharedStores,
 ) -> Result<bool> {
     let migration = file_meta.relativize_legacy_keys(project_root);
+    if migration.is_empty() {
+        return Ok(false);
+    }
 
-    let rekeyed = migration.rekeyed.clone();
-    let rewritten = on_store(&stores.vector_store, move |vs| {
-        rewrite_vector_paths(vs, &rekeyed)
-    })
-    .await?;
-    let rewritten_count = rewritten.len();
-    on_store(&stores.fts_store, move |fts| {
-        mirror_paths_into_fts(fts, &rewritten)
-    })
-    .await?;
+    let updates = path_updates(&migration.rekeyed);
+    let mut rewritten_count = 0;
+    for batch in updates.chunks(PATH_REWRITE_BATCH) {
+        let batch = batch.to_vec();
+        let rewritten = on_store(&stores.vector_store, move |vs| {
+            vs.rewrite_chunk_paths(&batch)
+        })
+        .await?;
+        rewritten_count += rewritten.len();
+        on_store(&stores.fts_store, move |fts| {
+            mirror_paths_into_fts(fts, &rewritten)
+        })
+        .await?;
+    }
     log_migration(
         migration.rekeyed.len(),
         rewritten_count,
@@ -69,27 +83,26 @@ pub(crate) async fn repair_legacy_index_shared(
     );
 
     let tracked = file_meta.tracked_chunk_ids();
-    let meta_empty = file_meta.is_empty();
-    let untracked = on_store(&stores.vector_store, move |vs| {
-        if meta_empty {
-            return Ok(Vec::new());
-        }
-        let untracked = untracked_among(vs, &tracked)?;
-        if !untracked.is_empty() {
-            delete_from_vector_store(vs, &untracked)?;
-        }
-        Ok(untracked)
+    let vector_store = Arc::clone(&stores.vector_store);
+    let untracked = tokio::task::spawn_blocking(move || {
+        untracked_among(&vector_store.blocking_read(), &tracked)
     })
-    .await?;
+    .await
+    .map_err(|e| anyhow!("legacy index repair task panicked: {}", e))??;
     if !untracked.is_empty() {
         let count = untracked.len();
+        let ids = untracked.clone();
+        on_store(&stores.vector_store, move |vs| {
+            delete_from_vector_store(vs, &ids)
+        })
+        .await?;
         on_store(&stores.fts_store, move |fts| {
             delete_from_fts(fts, &untracked)
         })
         .await?;
         log_sweep(count);
     }
-    Ok(!migration.is_empty())
+    Ok(true)
 }
 
 async fn on_store<S, T, F>(store: &Arc<tokio::sync::RwLock<S>>, f: F) -> Result<T>
@@ -111,11 +124,14 @@ fn rewrite_vector_paths(
     if rekeyed.is_empty() {
         return Ok(Vec::new());
     }
-    let updates: Vec<(u32, String)> = rekeyed
+    vector_store.rewrite_chunk_paths(&path_updates(rekeyed))
+}
+
+fn path_updates(rekeyed: &[(String, Vec<u32>)]) -> Vec<(u32, String)> {
+    rekeyed
         .iter()
         .flat_map(|(key, ids)| ids.iter().map(move |id| (*id, key.clone())))
-        .collect();
-    vector_store.rewrite_chunk_paths(&updates)
+        .collect()
 }
 
 fn mirror_paths_into_fts(

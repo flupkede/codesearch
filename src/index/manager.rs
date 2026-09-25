@@ -3328,6 +3328,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_repair_never_sweeps_without_a_migration() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+        let file = codebase_path.join("lib.rs");
+        std::fs::write(&file, "pub fn lib_fn() {}").unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+        let ids = {
+            let mut vs = stores.vector_store.write().await;
+            let chunk = |path: &str| {
+                EmbeddedChunk::new(
+                    Chunk::new(
+                        "fn f() {}".to_string(),
+                        0,
+                        1,
+                        ChunkKind::Function,
+                        path.to_string(),
+                    ),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )
+            };
+            vs.insert_chunks_with_ids(vec![chunk("lib.rs"), chunk("new.rs")])
+                .unwrap()
+        };
+        // ids[1] stands for a chunk a concurrent refresh inserted but whose
+        // file meta it has not saved yet.
+        let mut file_meta = FileMetaStore::new("test-model".to_string(), 4);
+        file_meta
+            .update_file(&file, "lib.rs", vec![ids[0]])
+            .unwrap();
+
+        let changed = super::super::key_migration::repair_legacy_index_shared(
+            &codebase_path,
+            &mut file_meta,
+            &stores,
+        )
+        .await
+        .unwrap();
+
+        assert!(!changed);
+        assert!(
+            stores
+                .vector_store
+                .read()
+                .await
+                .get_chunk(ids[1])
+                .unwrap()
+                .is_some(),
+            "an untracked chunk must survive when no legacy key was migrated"
+        );
+    }
+
+    #[tokio::test]
     async fn test_incremental_refresh_migrates_legacy_absolute_keys() {
         use crate::chunker::{Chunk, ChunkKind};
         use crate::embed::EmbeddedChunk;

@@ -444,13 +444,10 @@ impl FtsStore {
 
     /// Commit pending changes with retry logic for Windows file locking.
     ///
-    /// If the writer was killed (background merge panic), it is recreated.
-    /// Data since the last successful commit will be lost in that case, but
-    /// indexing can continue rather than aborting entirely.
-    ///
-    /// Any other failure while flushing the workers discards the writer and
-    /// returns an error: its pending documents are gone, and the caller must
-    /// learn that instead of seeing a commit that silently indexed nothing.
+    /// A killed writer (background merge panic) is recreated so the store stays
+    /// usable; any other flush failure discards it. Both return an error: the
+    /// pending documents are gone, and the caller must learn that instead of
+    /// seeing a commit that silently indexed nothing.
     pub fn commit(&mut self) -> Result<()> {
         if self.writer.is_none() {
             return Ok(());
@@ -486,12 +483,6 @@ impl FtsStore {
             last_error = error_str.clone();
 
             if Self::is_writer_killed(&error_str) {
-                tracing::debug!(
-                    "FTS writer was killed during commit (attempt {}/{}). \
-                     Recreating writer. Data since last commit may be lost.",
-                    attempt + 1,
-                    max_retries
-                );
                 self.writer = None;
                 self.ensure_writer()?;
                 // After recreating, the pending data is gone, so commit
@@ -503,7 +494,13 @@ impl FtsStore {
                 if let Err(e) = self.reader.reload() {
                     tracing::debug!("Reader reload warning: {}", e);
                 }
-                return Ok(());
+                // The store stays usable, but the caller must not record the
+                // dropped documents as indexed.
+                return Err(anyhow!(
+                    "FTS writer was killed during commit: {}. A fresh writer was created; \
+                     uncommitted FTS changes are lost and must be re-indexed",
+                    error_str
+                ));
             }
 
             if !Self::is_transient_commit_error(&error_str) {

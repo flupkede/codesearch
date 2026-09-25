@@ -404,7 +404,7 @@ pub struct VectorStore {
 const META_KEY_ID_HWM: &str = "id_hwm";
 
 /// Chunks per write transaction in [`VectorStore::rewrite_chunk_paths`].
-const PATH_REWRITE_BATCH: usize = 1000;
+pub const PATH_REWRITE_BATCH: usize = 1000;
 
 /// Derive `next_id` so ids are NEVER reused across reopens.
 ///
@@ -969,8 +969,9 @@ impl VectorStore {
     }
 
     /// Rewrite the stored `path` of chunks in place — metadata only, vectors
-    /// untouched. Returns the rewritten records so the caller can mirror the
-    /// new path into the FTS index. Missing ids are skipped.
+    /// untouched. Returns every found record, already-rewritten ones included,
+    /// so a caller retrying after a failed FTS mirror still mirrors them all.
+    /// Missing ids are skipped.
     ///
     /// Batched: one transaction over every chunk of a large index would need
     /// copy-on-write space for the whole chunks table at once.
@@ -1008,11 +1009,10 @@ impl VectorStore {
             let Some(mut meta) = self.chunks.get(&wtxn, id)? else {
                 continue;
             };
-            if meta.path == *path {
-                continue;
+            if meta.path != *path {
+                meta.path = path.clone();
+                self.chunks.put(&mut wtxn, id, &meta)?;
             }
-            meta.path = path.clone();
-            self.chunks.put(&mut wtxn, id, &meta)?;
             rewritten.push((*id, meta));
         }
         wtxn.commit()?;

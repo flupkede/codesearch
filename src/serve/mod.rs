@@ -461,7 +461,10 @@ impl ServeState {
                 // Fan-out/candidate-detection callers pass touch=false and must not
                 // trigger Warm → Write or start FSW.
                 let stores = stores.clone();
-                if !touch {
+                // While warmup's refresh runs, the FSW must not start: its own
+                // refresh would race warmup's unsaved file meta, and its
+                // indexing callback would clear warmup's marker.
+                if !touch || self.is_indexing(alias) {
                     return Some(Ok(stores));
                 }
                 drop(entry); // release DashMap read guard before mutation

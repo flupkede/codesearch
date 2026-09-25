@@ -3128,3 +3128,39 @@ async fn own_lmdb_holder_and_indexing_count_as_held_in_process() {
     assert!(state.is_held_in_process("own", &db_path));
     state.end_indexing("own");
 }
+
+#[tokio::test]
+#[serial]
+async fn warm_query_does_not_start_fsw_while_warmup_indexes() {
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = crate::cache::safe_canonicalize(tmp.path())
+        .unwrap()
+        .join(DB_DIR_NAME);
+    let OpenedStores::Write(stores) = state
+        .try_open_stores("warming", &db_path, true, false, None)
+        .expect("open must succeed")
+    else {
+        panic!("brand-new repo must open Write");
+    };
+    state
+        .repos
+        .insert("warming".to_string(), RepoState::Warm { stores });
+    state.begin_indexing("warming");
+
+    let result = state.try_cached_stores("warming", true);
+    assert!(
+        matches!(result, Some(Ok(_))),
+        "queries must be answered from Warm"
+    );
+    assert!(
+        matches!(
+            state.repos.get("warming").unwrap().value(),
+            RepoState::Warm { .. }
+        ),
+        "a query during warmup indexing must not transition Warm to Write"
+    );
+    state.end_indexing("warming");
+    state.repos.remove("warming");
+}
