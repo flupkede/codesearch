@@ -14,6 +14,22 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.4.10]
+
+### Changed
+
+- **⚠️ MIGRATION — chunk paths are stored project-relative; every existing index re-embeds ONCE on first refresh with this binary.** Chunk metadata, tantivy documents and the file-meta store now key files by their path relative to the codebase root instead of the absolute path, making a built database portable across machines and mount points (the cloud snapshot only worked before because build path and serve path happened to be identical). Consequence, by design: an existing database's absolute-path entries no longer match the new relative keys, so the first incremental refresh sees every file as changed and re-chunks + re-embeds the whole corpus one time (expect a full-reindex-length CPU/embedding burst per repo; orphaned absolute-path entries are cleaned as deleted). After that one pass, incremental behaviour is identical to before — refreshes are again change-only. **Tooling impact:** paths RETURNED by search results, `stats` and the TUI change from absolute to `<alias>/<relative>`; paths SUPPLIED to tools still accept both forms — absolute needles are relativised internally (`normalize_tool_path`), so feeding a returned relative path or an old absolute path back into `chunks_for_file`/`get_chunk` keeps working. The SCIP/symbol index uses its own separate key space and is untouched.
+
+### Added
+
+- **`codesearch index add --local` — build in-process, never delegating to a running serve.** Deliberate local builds (snapshot assembly, CI, offline tooling) previously either raced the serve delegation or had to fake a dead port; `--local` skips delegation explicitly. Pair it with `CODESEARCH_REPOS_CONFIG` (existing override, honours load AND save) to keep build registrations out of a developer's live `~/.codesearch/repos.json` entirely — the docs-harvester's `index-local` pipeline does exactly that for strict hub separation.
+- **Non-TTY index runs write a clean `build.log`.** When stdout is not a terminal (CI, piped runs), phase lines are also written ANSI-free to `<project>/.codesearch.db/build.log`; `--log-file` forces a location on any run.
+
+### Fixed
+
+- **Incremental refresh reuses the serve hub's embedding pool (todo #135).** The refresh path constructed its own fastembed pool alongside the serve pool, doubling model memory per repo and re-initialising ONNX on every refresh; it now shares the serve pool. Single-serve runs are unchanged.
+- **`current_git_head` no longer leaks caller `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_OBJECT_DIRECTORY` into the queried repo.** A `codesearch index` invocation from inside a git hook (QC gate) inherits the hook's git environment and answered with the HOOK's repo state instead of the target project's, producing wrong head SHAs and spurious rebuild decisions; the four variables are stripped before `git rev-parse`.
+
 ## [1.4.9] - 2026-09-23
 
 ### Changed
