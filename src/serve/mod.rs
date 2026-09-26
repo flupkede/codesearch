@@ -79,7 +79,7 @@ pub(crate) enum RepoStateLabel {
     Open,
     Warm,
     Readonly,
-    Closed,
+    Idle,
     Indexing,
     Error,
     NoIndex,
@@ -116,7 +116,7 @@ impl RepoStateLabel {
             Self::Open => "Open".green().bold(),
             Self::Warm => "Warm".yellow(),
             Self::Readonly => "Readonly".cyan(),
-            Self::Closed => "Closed".dimmed(),
+            Self::Idle => "Idle".dimmed(),
             Self::Indexing => "Indexing".magenta().bold(),
             Self::Error => "Error".red().bold(),
             Self::NoIndex => "No Index".dimmed(),
@@ -2046,7 +2046,7 @@ impl ServeState {
         self.clear_csharp_index_state(alias);
         if self.repos.remove(alias).is_some() {
             tracing::info!(
-                "Closed repo '{}' (dropped stores, released LMDB handles)",
+                "Idled repo '{}' (stores dropped, LMDB released; auto-reopens on next query)",
                 alias
             );
         }
@@ -3254,7 +3254,7 @@ impl ServeState {
                         if !db_exists {
                             RepoStateLabel::NoIndex
                         } else {
-                            RepoStateLabel::Closed
+                            RepoStateLabel::Idle
                         }
                     }
                 }
@@ -3414,7 +3414,7 @@ impl ServeState {
                 RepoStateLabel::Open => "Open",
                 RepoStateLabel::Warm => "Warm",
                 RepoStateLabel::Readonly => "Readonly",
-                RepoStateLabel::Closed => "Closed",
+                RepoStateLabel::Idle => "Idle",
                 RepoStateLabel::Indexing => "Indexing",
                 RepoStateLabel::Error => "Error",
                 RepoStateLabel::NoIndex => "No Index",
@@ -3459,9 +3459,9 @@ impl ServeState {
             .iter()
             .filter(|(_, r)| matches!(r.status, RepoStateLabel::Warm))
             .count();
-        let closed_count = repos
+        let idle_count = repos
             .iter()
-            .filter(|(_, r)| matches!(r.status, RepoStateLabel::Closed | RepoStateLabel::NoIndex))
+            .filter(|(_, r)| matches!(r.status, RepoStateLabel::Idle | RepoStateLabel::NoIndex))
             .count();
 
         eprintln!();
@@ -3473,8 +3473,8 @@ impl ServeState {
             format!("{}", open_count).green(),
             "Warm:".dimmed(),
             format!("{}", warm_count).yellow(),
-            "Closed:".dimmed(),
-            format!("{}", closed_count).dimmed(),
+            "Idle:".dimmed(),
+            format!("{}", idle_count).dimmed(),
         );
         eprintln!(
             "  {} {}   {} {}",
@@ -3753,7 +3753,7 @@ async fn status_handler(
                 RepoStateLabel::Open => "open",
                 RepoStateLabel::Warm => "warm",
                 RepoStateLabel::Readonly => "readonly",
-                RepoStateLabel::Closed => "closed",
+                RepoStateLabel::Idle => "idle",
                 RepoStateLabel::Indexing => "indexing",
                 RepoStateLabel::Error => "error",
                 RepoStateLabel::NoIndex => "no_index",

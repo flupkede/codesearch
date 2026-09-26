@@ -52,7 +52,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone)]
 pub struct RepoRow {
     pub alias: String,
-    /// Human-readable status: "open", "warm", "readonly", "closed", "indexing", "error", "no_index"
+    /// Human-readable status: "open", "warm", "readonly", "idle", "indexing", "error", "no_index"
     pub status: String,
     /// C# index status: "none", "ready", "indexing", "error" (empty also treated as none)
     pub csharp_index: String,
@@ -1197,7 +1197,9 @@ fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
                 }
             }
         }
-        "closed" => Cell::from("○ closed     ".to_string()).style(Style::default().fg(Color::Gray)),
+        "idle" | "closed" => {
+            Cell::from("○ idle       ".to_string()).style(Style::default().fg(Color::Gray))
+        }
         "error" => Cell::from("✗ error      ".to_string())
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         "no_index" => {
@@ -1246,7 +1248,7 @@ fn detail_status_style(status: &str, csharp: &str) -> (String, Color) {
             _ => ("Warm".to_string(), Color::Yellow),
         },
         "readonly" => ("Readonly".to_string(), Color::Cyan),
-        "closed" => ("Closed".to_string(), Color::Gray),
+        "idle" | "closed" => ("Idle".to_string(), Color::Gray),
         "indexing" => match csharp {
             "indexing" => (
                 "Index C#…".to_string(),

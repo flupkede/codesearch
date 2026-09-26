@@ -170,7 +170,7 @@ pub struct RemoteRepoStatus {
     #[serde(default)]
     pub alias: String,
     /// Repo lifecycle state reported by the server
-    /// (`open`/`warm`/`readonly`/`closed`/`indexing`/`error`/`no_index`).
+    /// (`open`/`warm`/`readonly`/`idle`/`indexing`/`error`/`no_index`; older peers may send `closed`).
     #[serde(default)]
     pub status: String,
     /// `write`/`read`/`-`.

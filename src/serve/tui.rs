@@ -435,7 +435,7 @@ fn map_repo_rows(
                 super::RepoStateLabel::Open => "open",
                 super::RepoStateLabel::Warm => "warm",
                 super::RepoStateLabel::Readonly => "readonly",
-                super::RepoStateLabel::Closed => "closed",
+                super::RepoStateLabel::Idle => "idle",
                 super::RepoStateLabel::Indexing => "indexing",
                 super::RepoStateLabel::Error => "error",
                 super::RepoStateLabel::NoIndex => "no_index",

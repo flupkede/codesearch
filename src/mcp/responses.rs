@@ -224,6 +224,42 @@ pub(crate) fn index_status_summary(
     }
 }
 
+/// Decide `indexed`/`status`/`status_message` for the aggregated serve-mode
+/// hub response (no project/group): pure arithmetic over lightweight repo
+/// state counts.
+///
+/// An `Idle` repo still has its index on disk (the missing-index case is
+/// `NoIndex`) — it is searchable; the first query just reopens the evicted
+/// stores. Reporting `indexed: false` for an all-idle hub made small-model
+/// clients conclude "no index" and fall back to grep, so idle counts as
+/// indexed and the message says so explicitly.
+pub(crate) fn aggregate_serve_index_status(
+    repo_count: usize,
+    group_count: usize,
+    open: usize,
+    warm: usize,
+    idle: usize,
+) -> (bool, String, String) {
+    let indexed_repos = open + warm + idle;
+    let status = if indexed_repos > 0 {
+        "ready".to_string()
+    } else if repo_count > 0 {
+        "no_index".to_string()
+    } else {
+        "no_repos".to_string()
+    };
+    let status_message = if indexed_repos > 0 {
+        format!(
+            "{repo_count} repo(s) registered, {group_count} group(s). Indexed and searchable: {indexed_repos}. Open: {open}, Warm: {warm}, Idle: {idle} (idle = index on disk, stores auto-reopen on first query)."
+        )
+    } else {
+        format!(
+            "{repo_count} repo(s) registered, {group_count} group(s). No index built yet — run 'codesearch index' per repo. Open: {open}, Warm: {warm}."
+        )
+    };
+    (indexed_repos > 0, status, status_message)
+}
+
 /// Status/message for a single routed store's index.
 ///
 /// `indexed` (the HNSW graph is built and committed) is load-bearing: a store

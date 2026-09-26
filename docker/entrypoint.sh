@@ -303,7 +303,7 @@ wait_healthz() {
 #     the same LMDB env and fails with HTTP 500 "locked by another codesearch
 #     process" (observed). So we let the warmup own the refresh and simply wait for
 #     the repo to reach a ready ("warm") state. During warmup /status reports the
-#     repo as "closed"; it flips to "warm" only after the refresh completes, which is
+#     repo as "idle"; it flips to "warm" only after the refresh completes, which is
 #     exactly the signal wait_repo_ready() blocks on — note that warmup never reports
 #     "indexing", so the alias-specific status check is the ONLY signal here.
 #     /reindex?force=true is also unused (returns 500 in this deployment).
@@ -672,7 +672,7 @@ repo_status() {
 #
 #   2. Phase-1 STARTUP WARMUP — the path that actually runs for every vendor
 #      restored from a snapshot ("already registered") — never sets "indexing".
-#      A warming repo is simply absent from the state map and reports "closed",
+#      A warming repo is simply absent from the state map and reports "idle",
 #      flipping to "warm" only once the warmup has built AND committed its HNSW
 #      graph. Waiting on signal 1 alone therefore returned after the initial 5s
 #      sleep for every already-registered vendor ("build settled after ~5s" for

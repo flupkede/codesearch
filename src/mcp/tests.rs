@@ -2125,6 +2125,40 @@ fn index_status_summary_reports_error_when_every_store_failed() {
     assert!(message.contains("warnings"), "got: {message}");
 }
 
+// === aggregated serve-mode hub status (no project/group) ==============
+//
+// The all-idle case is the one that drove the fix: an idle repo has its
+// index on disk (only the in-memory stores were evicted), so reporting
+// `indexed: false` made small-model clients conclude "no index" and fall
+// back to grep.
+
+#[test]
+fn aggregate_serve_index_status_counts_idle_repos_as_indexed() {
+    let (indexed, status, message) = super::aggregate_serve_index_status(26, 1, 0, 0, 26);
+    assert!(indexed, "an all-idle hub is still searchable");
+    assert_eq!(status, "ready");
+    assert!(
+        message.contains("Indexed and searchable: 26") && message.contains("Idle: 26"),
+        "got: {message}"
+    );
+}
+
+#[test]
+fn aggregate_serve_index_status_reports_no_index_when_nothing_is_on_disk() {
+    let (indexed, status, message) = super::aggregate_serve_index_status(3, 1, 0, 0, 0);
+    assert!(!indexed);
+    assert_eq!(status, "no_index");
+    assert!(message.contains("No index built yet"), "got: {message}");
+}
+
+#[test]
+fn aggregate_serve_index_status_reports_no_repos_on_an_empty_hub() {
+    let (indexed, status, message) = super::aggregate_serve_index_status(0, 0, 0, 0, 0);
+    assert!(!indexed);
+    assert_eq!(status, "no_repos");
+    assert!(message.contains("0 repo(s)"), "got: {message}");
+}
+
 #[test]
 fn repo_stats_from_result_carries_counts_and_no_error_on_success() {
     let stats = crate::vectordb::StoreStats {

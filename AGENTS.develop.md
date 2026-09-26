@@ -102,7 +102,7 @@ or per-group.
 - `Warm` — DB open, vector index ready, no FSW. State after background warmup or fan-out open.
 - `Write` — Warm + file system watcher running. Transitions from Warm on first explicit project query.
 - `Readonly` — Another process holds the write lock.
-- `Closed` — Evicted by idle reaper after `REPO_IDLE_TIMEOUT_SECS` (30 min default) of inactivity.
+- `Idle` (status string was `Closed`) — Evicted by idle reaper after `REPO_IDLE_TIMEOUT_SECS` (30 min default) of inactivity; index stays on disk, stores auto-reopen on the next query.
 
 **Idle reaper** runs every `REAPER_INTERVAL_SECS` (5 min). Evicts repos not queried within timeout.
 All opens update `last_access` so the reaper can track every open.

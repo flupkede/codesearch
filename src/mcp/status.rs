@@ -87,26 +87,23 @@ impl CodesearchService {
                     .iter()
                     .filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Warm))
                     .count();
-                let closed_count = statuses
+                let idle_count = statuses
                     .iter()
-                    .filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Closed))
+                    .filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Idle))
                     .count();
-
-                let status = if open_count + warm_count > 0 {
-                    "ready".to_string()
-                } else if repo_count > 0 {
-                    "idle".to_string()
-                } else {
-                    "no_repos".to_string()
-                };
-
-                let status_message = format!(
-                    "{} repo(s) registered, {} group(s). Open: {}, Warm: {}, Closed: {}.",
-                    repo_count, group_count, open_count, warm_count, closed_count
+                // Counting logic lives in `aggregate_serve_index_status`
+                // (responses.rs): idle repos still have their index on disk
+                // and are searchable, so they count as indexed.
+                let (indexed, status, status_message) = aggregate_serve_index_status(
+                    repo_count,
+                    group_count,
+                    open_count,
+                    warm_count,
+                    idle_count,
                 );
 
                 let response = IndexStatusResponse {
-                    indexed: open_count + warm_count > 0,
+                    indexed,
                     status,
                     status_message,
                     total_chunks: 0, // Not available without opening DBs
