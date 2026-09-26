@@ -1111,74 +1111,102 @@ pub fn render_centered_modal_with_border_color(
 // ---------------------------------------------------------------------------
 
 fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
+    let (text, style) = status_cell_spec(status, csharp);
+    Cell::from(text).style(style)
+}
+
+/// Pure (text, style) decision behind `status_cell`, kept separate so tests can
+/// assert on it (0.30 `Cell::style` is a setter, not a getter).
+fn status_cell_spec(status: &str, csharp: &str) -> (String, Style) {
     let bright = pulse_bright();
     match status {
         "open" => match csharp {
-            "ready" => Cell::from("✓ ready C#·  ".to_string()).style(
+            "ready" => (
+                "✓ ready C#·  ".to_string(),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
             "indexing" => {
                 if bright {
-                    Cell::from("⟳ idx C#…    ".to_string()).style(
+                    (
+                        "⟳ idx C#…    ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    Cell::from("⟳ idx C#…    ".to_string())
-                        .style(Style::default().fg(Color::DarkGray))
+                    (
+                        "⟳ idx C#…    ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )
                 }
             }
-            "error" => Cell::from("✓ ready C#!  ".to_string())
-                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            _ => Cell::from("✓ ready      ".to_string()).style(
+            "error" => (
+                "✓ ready C#!  ".to_string(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            _ => (
+                "✓ ready      ".to_string(),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
         },
         "warm" => match csharp {
-            "ready" => {
-                Cell::from("◐ warm C#·   ".to_string()).style(Style::default().fg(Color::Yellow))
-            }
+            "ready" => (
+                "◐ warm C#·   ".to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
             "indexing" => {
                 if bright {
-                    Cell::from("⟳ idx C#…    ".to_string()).style(
+                    (
+                        "⟳ idx C#…    ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    Cell::from("⟳ idx C#…    ".to_string())
-                        .style(Style::default().fg(Color::DarkGray))
+                    (
+                        "⟳ idx C#…    ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )
                 }
             }
-            "error" => {
-                Cell::from("◐ warm C#!   ".to_string()).style(Style::default().fg(Color::Yellow))
-            }
-            _ => Cell::from("◐ warm       ".to_string()).style(Style::default().fg(Color::Yellow)),
+            "error" => (
+                "◐ warm C#!   ".to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            _ => (
+                "◐ warm       ".to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
         },
-        "readonly" => {
-            Cell::from("◑ ro         ".to_string()).style(Style::default().fg(Color::Cyan))
-        }
+        "readonly" => (
+            "◑ ro         ".to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
         "indexing" => {
             if bright {
                 match csharp {
-                    "ready" => Cell::from("⟳ idx… C#·   ".to_string()).style(
+                    "ready" => (
+                        "⟳ idx… C#·   ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    "indexing" => Cell::from("⟳ idx… C#…   ".to_string()).style(
+                    "indexing" => (
+                        "⟳ idx… C#…   ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    "error" => Cell::from("⟳ idx… C#!   ".to_string())
-                        .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                    _ => Cell::from("⟳ idx…       ".to_string()).style(
+                    "error" => (
+                        "⟳ idx… C#!   ".to_string(),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    _ => (
+                        "⟳ idx…       ".to_string(),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -1186,26 +1214,38 @@ fn status_cell(status: &str, csharp: &str) -> Cell<'static> {
                 }
             } else {
                 match csharp {
-                    "ready" => Cell::from("⟳ idx… C#·   ".to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
-                    "indexing" => Cell::from("⟳ idx… C#…   ".to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
-                    "error" => Cell::from("⟳ idx… C#!   ".to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
-                    _ => Cell::from("⟳ idx…       ".to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
+                    "ready" => (
+                        "⟳ idx… C#·   ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    "indexing" => (
+                        "⟳ idx… C#…   ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    "error" => (
+                        "⟳ idx… C#!   ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    _ => (
+                        "⟳ idx…       ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 }
             }
         }
-        "idle" | "closed" => {
-            Cell::from("○ idle       ".to_string()).style(Style::default().fg(Color::Gray))
-        }
-        "error" => Cell::from("✗ error      ".to_string())
-            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        "no_index" => {
-            Cell::from("— no idx     ".to_string()).style(Style::default().fg(Color::Gray))
-        }
-        _ => Cell::from(format!("{:<14}", status)).style(Style::default().fg(Color::White)),
+        "idle" | "closed" => (
+            "○ idle       ".to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+        "error" => (
+            "✗ error      ".to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        "no_index" => (
+            "— no idx     ".to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+        _ => (format!("{:<14}", status), Style::default().fg(Color::White)),
     }
 }
 
@@ -1287,4 +1327,47 @@ pub fn restore_terminal(
     crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_cell_renders_idle_and_legacy_closed_as_gray() {
+        let expected = (
+            "○ idle       ".to_string(),
+            Style::default().fg(Color::Gray),
+        );
+        assert_eq!(status_cell_spec("idle", "ready"), expected);
+        assert_eq!(status_cell_spec("closed", ""), expected);
+    }
+
+    #[test]
+    fn detail_status_style_maps_idle_and_legacy_closed_to_idle_label() {
+        assert_eq!(
+            detail_status_style("idle", ""),
+            ("Idle".to_string(), Color::Gray)
+        );
+        assert_eq!(
+            detail_status_style("closed", ""),
+            ("Idle".to_string(), Color::Gray)
+        );
+    }
+
+    #[test]
+    fn unknown_status_falls_back_without_idle_treatment() {
+        assert_ne!(
+            status_cell_spec("future_state", "").1,
+            Style::default().fg(Color::Gray)
+        );
+        assert_eq!(
+            status_cell_spec("future_state", "").0,
+            "future_state  ".to_string()
+        );
+        assert_eq!(
+            detail_status_style("future_state", ""),
+            ("future_state".to_string(), Color::White)
+        );
+    }
 }
