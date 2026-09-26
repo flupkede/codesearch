@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.4.11]
+
+### Changed
+
+- **Repo state `Closed` renamed to `Idle`; the aggregated hub status now reports `indexed: true` + `status: "ready"` as soon as any repo has an index on disk.** After the idle reaper evicted a repo's stores (30 min inactivity by default), the repo reported state `Closed`, and when ALL repos were evicted the hub-level `index_status` answered `indexed: false` / `idle` — which small-model MCP clients read as "index unavailable" and fell back to raw grep, even though every index was intact on disk and the next query would reopen it (first query slightly slower). The state is now `Idle` (wire string `"idle"`; a peer still sending legacy `"closed"` renders identically), and the aggregated status distinguishes three cases: any on-disk index → `indexed: true`, `"ready"`, message naming Open/Warm/Idle counts with the auto-reopen hint; repos registered but nothing on disk → `no_index`; no repos registered → `no_repos`. Per-project statuses, reaper timing and behavior are unchanged.
+
 ## [1.4.10] - 2026-09-26
 
 ### Changed
