@@ -3314,3 +3314,540 @@ async fn stale_eviction_is_scoped_to_the_stale_owner() {
         "an empty owner map must be removed, not left behind"
     );
 }
+
+// ── Always-on symbol indexes (features/always-on-symbol-indexes) ──────────
+
+/// The per-(alias, language) claim must reject a second fresh claim, accept
+/// one per language independently, become claimable after release, and take
+/// over a claim older than the indexing timeout (leaked by a crashed task).
+#[test]
+fn symbol_rebuild_claim_rejects_fresh_and_takes_over_stale() {
+    let state = ServeState::new(ReposConfig::default(), None);
+
+    assert!(
+        state.begin_symbol_rebuild("repo", "csharp"),
+        "first claim must succeed"
+    );
+    assert!(
+        !state.begin_symbol_rebuild("repo", "csharp"),
+        "a second fresh claim must be rejected"
+    );
+    assert!(
+        state.begin_symbol_rebuild("repo", "typescript"),
+        "a different language must claim independently"
+    );
+
+    state.end_symbol_rebuild("repo", "csharp");
+    assert!(
+        state.begin_symbol_rebuild("repo", "csharp"),
+        "a released slot must be claimable again"
+    );
+
+    // Stale takeover: a claim past the indexing timeout is taken over.
+    let max = state.indexing_timeout();
+    state.symbol_rebuild_in_flight.insert(
+        "csharp:stale".to_string(),
+        std::time::Instant::now() - max - std::time::Duration::from_secs(1),
+    );
+    assert!(
+        state.begin_symbol_rebuild("stale", "csharp"),
+        "a stale claim must be taken over"
+    );
+}
+
+/// The generic gate must answer NotApplicable for a repo without the
+/// language's entrypoint (no tsconfig.json) — deterministically, before the
+/// machine-dependent helper check — and route C# through its dedicated
+/// evaluator (.sln check → NoSolutionFile).
+#[test]
+fn evaluate_symbol_rebuild_gates_applicability_before_availability() {
+    // `evaluate_symbol_rebuild` takes `self: &Arc<Self>` (it may be forwarded
+    // to spawn_blocking by callers), so the probe state lives in an Arc.
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join(DB_DIR_NAME);
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild("typescript", "x", tmp.path(), &db),
+        RebuildDecision::NotApplicable,
+        "a repo without tsconfig.json is not applicable, helper or not"
+    );
+    assert_eq!(
+        state.evaluate_symbol_rebuild("csharp", "x", tmp.path(), &db),
+        RebuildDecision::NoSolutionFile,
+        "C# must keep its dedicated .sln-first evaluator"
+    );
+}
+
+/// The find_impact self-heal must no-op quietly for an unknown alias (remote
+/// mounts, typos) and for a registered repo the language does not apply to —
+/// no claim taken, no C# status touched, no panic.
+#[tokio::test]
+async fn heal_missing_symbol_index_noops_outside_its_remit() {
+    // Unknown alias.
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+    heal_missing_symbol_index(&state, "ghost", "csharp").await;
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "unknown alias must not take a claim"
+    );
+
+    // Registered alias, non-applicable language (no .sln / tsconfig.json).
+    let (_tmp, _path, bare) = state_with_repo("plainrepo");
+    let state = std::sync::Arc::new(bare);
+    heal_missing_symbol_index(&state, "plainrepo", "csharp").await;
+    heal_missing_symbol_index(&state, "plainrepo", "typescript").await;
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "non-applicable repo must not take a claim"
+    );
+    assert!(
+        !state.csharp_index_status.contains_key("plainrepo"),
+        "non-applicable repo must not flip the C# indicator"
+    );
+}
+
+/// `maybe_rebuild_symbols` on a repo no language applies to must neither
+/// panic nor leave claims behind — with and without force (the force path
+/// skips the gate but trigger_symbol_rebuild still skips non-applicable
+/// repos before claiming).
+#[tokio::test]
+async fn maybe_rebuild_symbols_skips_non_applicable_repo_under_force() {
+    let (_tmp, _path, bare) = state_with_repo("plainrepo2");
+    let state = std::sync::Arc::new(bare);
+    let path = state.config.read().unwrap().resolve("plainrepo2").unwrap();
+    let db = path.join(DB_DIR_NAME);
+    maybe_rebuild_symbols("plainrepo2", &path, &db, &state, true).await;
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "force must not claim a slot for a non-applicable repo"
+    );
+}
+
+/// A dummy `scip-csharp` helper at the env-override path: available for
+/// detection, fails on execution — which flips the C# status to Error while
+/// proving a rebuild was actually attempted. The helper file lives in
+/// `root`, which the caller keeps alive via its TempDir.
+fn dummy_csharp_helper(root: &std::path::Path) -> crate::testing::EnvRestore {
+    let helper = root.join(if cfg!(windows) {
+        "scip-csharp.exe"
+    } else {
+        "scip-csharp"
+    });
+    std::fs::write(&helper, b"dummy").expect("dummy helper file");
+    crate::testing::EnvRestore::set(&[(
+        crate::constants::SCIP_CSHARP_HELPER_ENV,
+        helper.to_string_lossy().as_ref(),
+    )])
+}
+
+/// Phase-2 composition wiring: a registered repo whose language applies and
+/// whose index is missing must flow gate → queue → trigger end-to-end. The
+/// dummy helper makes the rebuild FAIL, observable as C# status Error once
+/// `run_phase_2_symbols` completes — None would mean the candidate was never
+/// queued (the composition gap this test pins).
+#[tokio::test]
+#[serial]
+async fn run_phase_2_symbols_wires_candidate_through_to_trigger() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("phase2repo");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    state.run_phase_2_symbols().await;
+
+    assert_eq!(
+        state
+            .csharp_index_status
+            .get("phase2repo")
+            .map(|e| *e.value()),
+        Some(CSharpIndexStatus::Error),
+        "the missing C# index must be queued and the rebuild attempted \
+         (dummy helper → Error); None means never queued"
+    );
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "the claim must be released after the failed rebuild"
+    );
+}
+
+/// A successful rebuild WITHOUT survived failures is Ready with the error
+/// cleared; one WITH survived workspace failures is Partial (red `C#⚠` in
+/// the TUI) with a bounded detail line for the info panel — capped at the
+/// first three entries so the detail row stays readable.
+#[test]
+fn csharp_success_outcome_partial_when_warnings_survived() {
+    assert_eq!(
+        csharp_success_outcome(&[]),
+        (CSharpIndexStatus::Ready, None),
+        "a clean rebuild must read Ready with no error detail"
+    );
+
+    let degraded = [
+        "summary".to_string(),
+        "A.csproj: failure one".to_string(),
+        "B.csproj: failure two".to_string(),
+        "C.csproj: failure three".to_string(),
+        "D.csproj: failure four".to_string(),
+    ];
+    let (status, detail) = csharp_success_outcome(&degraded);
+    assert_eq!(status, CSharpIndexStatus::Partial);
+    let detail = detail.expect("partial carries detail");
+    assert!(
+        detail.contains("summary") && detail.contains("B.csproj"),
+        "detail joins the leading entries, got: {detail}"
+    );
+    assert!(
+        !detail.contains("D.csproj"),
+        "detail is capped at three entries, got: {detail}"
+    );
+}
+
+/// The watcher notifier must apply the SAME status contract as
+/// trigger_symbol_rebuild's success arm: Succeeded-with-warnings → Partial
+/// (red C#⚠) with bounded detail — never green — and a clean Succeeded →
+/// Ready with the detail cleared. Reverting the arm to insert(Ready) ships
+/// the round-1 defect (green indicator on a degraded index) with a green
+/// suite.
+#[test]
+fn csharp_notifier_partial_on_succeeded_with_warnings() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    let notifier = state.make_csharp_notifier("wrepo");
+
+    notifier(SymbolRebuildSignal::Started);
+    assert_eq!(
+        state.csharp_index_status.get("wrepo").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Indexing)
+    );
+
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: vec![
+            "summary".to_string(),
+            "A.csproj: boom".to_string(),
+            "B.csproj: boom2".to_string(),
+            "C.csproj: boom3".to_string(),
+        ],
+    });
+    assert_eq!(
+        state.csharp_index_status.get("wrepo").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Partial),
+        "a degraded watcher rebuild must render Partial, never green"
+    );
+    let detail = state
+        .csharp_index_error
+        .get("wrepo")
+        .map(|e| e.value().clone())
+        .expect("detail stored");
+    assert!(detail.contains("summary") && !detail.contains("C.csproj"));
+
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: Vec::new(),
+    });
+    assert_eq!(
+        state.csharp_index_status.get("wrepo").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Ready)
+    );
+    assert!(
+        !state.csharp_index_error.contains_key("wrepo"),
+        "a clean rebuild must clear the detail"
+    );
+}
+
+/// `repo_statuses_lightweight()` must carry the Partial status AND its
+/// detail message — that pair is what renders the red `C#⚠` and the info
+/// panel's failure line.
+#[test]
+fn repo_statuses_lightweight_carries_partial_with_detail() {
+    let (_tmp, _path, bare) = state_with_repo("partialrepo");
+    let state = std::sync::Arc::new(bare);
+    state
+        .csharp_index_status
+        .insert("partialrepo".to_string(), CSharpIndexStatus::Partial);
+    state.csharp_index_error.insert(
+        "partialrepo".to_string(),
+        "summary | A.csproj: failure one".to_string(),
+    );
+
+    let statuses = state.repo_statuses_lightweight();
+    let (_, info) = statuses
+        .iter()
+        .find(|(alias, _)| alias == "partialrepo")
+        .expect("partialrepo row");
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Partial);
+    assert_eq!(
+        info.csharp_error.as_deref(),
+        Some("summary | A.csproj: failure one"),
+        "the detail message must ride on the status row"
+    );
+}
+
+/// The serve-tui `i` overlay reads the DURABLE warnings from the on-disk
+/// meta (survives a restart, unlike the in-memory status) and prefixes them
+/// with the language. A repo whose meta carries no warnings yields none.
+#[test]
+fn build_info_overlay_reads_symbol_warnings_from_meta() {
+    use crate::serve::tui::build_info_overlay;
+
+    let (_tmp, repo_path, bare) = state_with_repo("inforepo");
+    let db = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(
+        db.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    // Seed the meta the way a degraded rebuild does (see the roundtrip test
+    // in csharp_tests for the read side).
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap();
+    meta.put(
+        &mut wtxn,
+        crate::constants::SCIP_INDEX_WARNINGS_KEY,
+        r#"["summary","A.csproj: failure one"]"#,
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    let statuses = state.repo_statuses_lightweight();
+    let idx = statuses
+        .iter()
+        .position(|(alias, _)| alias == "inforepo")
+        .expect("inforepo row");
+    let overlay = build_info_overlay(idx, &statuses, &state).expect("overlay");
+    match overlay {
+        crate::serve::tui_common::OverlayState::Info {
+            symbol_warnings, ..
+        } => {
+            assert!(
+                symbol_warnings.len() == 2 && symbol_warnings[0].starts_with("[csharp] summary"),
+                "warnings must be language-prefixed from meta, got: {symbol_warnings:?}"
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
+/// The serve-mode find_impact self-heal spawn must reach
+/// `trigger_symbol_rebuild` for a registered, applicable repo: after the
+/// warned empty answer, the C# status eventually flips to Error (dummy
+/// helper) in the serve state the heal captured.
+#[tokio::test]
+#[serial]
+async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("healrepo");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+    // The routing layer requires an existing index dir before it will open
+    // the repo (seed like the find_impact fixtures do).
+    let db = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(
+        db.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let state = std::sync::Arc::new(bare);
+
+    let request = crate::mcp::types::FindImpactRequest {
+        symbol_name: Some("ResolveLinkedActivityAsync".to_string()),
+        file: None,
+        line: None,
+        symbol_key: None,
+        language: Some("csharp".to_string()),
+        project: Some("healrepo".to_string()),
+        group: None,
+    };
+    // The REST mirror builds its own serve-mode service from the state —
+    // the same path the MCP tool takes for a project-scoped query.
+    let v = crate::mcp::rest_find_impact_handler(
+        axum::extract::State(state.clone()),
+        axum::Json(request),
+    )
+    .await
+    .expect("rest mirror result")
+    .0;
+    let out = v.to_string();
+    assert!(
+        v["warnings"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty() && w[0].as_str().is_some_and(|s| s.contains("UNKNOWN"))),
+        "the never-built index answer must carry the UNKNOWN warning, got: {out}"
+    );
+
+    // The detached heal task runs the rebuild (dummy helper → Error).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if state
+            .csharp_index_status
+            .get("healrepo")
+            .map(|e| *e.value())
+            == Some(CSharpIndexStatus::Error)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the self-heal never flipped the C# status — spawn branch not wired"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+// ── Rebuild gate: builder-version stamp + degraded retry ─────────────────
+
+/// Seeds the SCIP meta for `db` exactly like `rebuild` stamps it (rebuild
+/// timestamp + key format), plus the caller's extra key/values — so gate
+/// tests can shape a fresh, stale or degraded index without the helper.
+fn seed_scip_meta(db: &std::path::Path, extra: &[(&str, &str)]) {
+    let env = crate::symbols::get_shared_scip_env(db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap()
+        .unwrap();
+    meta.put(&mut wtxn, crate::constants::SCIP_REBUILD_TIMESTAMP_KEY, "0")
+        .unwrap();
+    meta.put(
+        &mut wtxn,
+        crate::constants::SCIP_KEY_FORMAT_KEY,
+        crate::constants::SCIP_KEY_FORMAT,
+    )
+    .unwrap();
+    for (key, value) in extra {
+        meta.put(&mut wtxn, *key, *value).unwrap();
+    }
+    wtxn.commit().unwrap();
+}
+
+/// Shared arrangement: applicable repo (`.sln`), dummy helper, seeded SCIP
+/// meta, config timestamps showing a fresh build (last_scip ≥ last_changed)
+/// so ONLY the builder-version / degraded-retry checks can move the gate.
+/// The helper-env guard and both tempdirs are returned so they outlive the
+/// fixture.
+#[allow(clippy::type_complexity)]
+fn gate_fixture(
+    alias: &str,
+    meta_extra: &[(&str, &str)],
+) -> (
+    crate::testing::EnvRestore,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::sync::Arc<ServeState>,
+) {
+    let helper_root = tempfile::tempdir().unwrap();
+    let env_guard = dummy_csharp_helper(helper_root.path());
+    let (tmp, repo_path, bare) = state_with_repo(alias);
+    std::fs::write(repo_path.join("test.sln"), b"Solution File").unwrap();
+    let db = repo_path.join(DB_DIR_NAME);
+    seed_scip_meta(&db, meta_extra);
+    let state = std::sync::Arc::new(bare);
+    let now = ServeState::now_unix_secs();
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.touch_last_changed(alias, now - 100);
+        cfg.touch_last_scip(alias, now);
+    }
+    (env_guard, helper_root, tmp, repo_path, state)
+}
+
+/// An index this binary never produced (no builder stamp — anything built
+/// before the stamp existed) must read as stale: a deployed binary rebuilds
+/// the indexes it inherited itself at startup, never waits for a manual
+/// command. This is the DRM-24427_Versioning defect class.
+#[test]
+#[serial]
+fn evaluate_rebuilds_an_index_from_an_older_binary() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture("oldbinary", &[]);
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild(
+            "csharp",
+            "oldbinary",
+            &repo_path,
+            &repo_path.join(DB_DIR_NAME)
+        ),
+        RebuildDecision::ChangedSinceLastBuild,
+        "absent builder stamp must read as stale"
+    );
+}
+
+/// A degraded index (warnings in meta, current builder version) rebuilds
+/// exactly once per serve process: the second evaluation is Fresh (no loop
+/// while the environment stays broken); a fresh process gets a fresh set.
+#[test]
+#[serial]
+fn evaluate_retries_a_degraded_index_once_per_process() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
+        "degraded",
+        &[(
+            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )],
+    );
+    let db = repo_path.join(DB_DIR_NAME);
+    // Re-seed WITH warnings (the fixture seeded only the version stamp).
+    seed_scip_meta(
+        &db,
+        &[(
+            crate::constants::SCIP_INDEX_WARNINGS_KEY,
+            r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
+        )],
+    );
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild("csharp", "degraded", &repo_path, &db),
+        RebuildDecision::ChangedSinceLastBuild,
+        "a degraded index must get its one automatic retry"
+    );
+    assert_eq!(
+        state.evaluate_symbol_rebuild("csharp", "degraded", &repo_path, &db),
+        RebuildDecision::Fresh,
+        "the retry must not loop within one serve process"
+    );
+}
+
+/// A clean index with the current builder stamp and fresh timestamps stays
+/// Fresh — the gate must not churn indexes that are actually fine.
+#[test]
+#[serial]
+fn evaluate_stays_fresh_when_index_is_current_and_clean() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
+        "cleanidx",
+        &[(
+            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )],
+    );
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild(
+            "csharp",
+            "cleanidx",
+            &repo_path,
+            &repo_path.join(DB_DIR_NAME)
+        ),
+        RebuildDecision::Fresh,
+        "current + clean + fresh timestamps must not rebuild"
+    );
+    assert!(
+        !state.degraded_rebuild_attempted.contains("cleanidx"),
+        "a clean index must not consume the degraded retry"
+    );
+}

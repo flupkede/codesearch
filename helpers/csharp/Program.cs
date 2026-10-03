@@ -309,18 +309,7 @@ public static class Program
     /// </summary>
     private static MSBuildWorkspace CreateTolerantWorkspace()
     {
-        var properties = new Dictionary<string, string>
-        {
-            // Tell Roslyn to skip projects it cannot load instead of crashing.
-            { "BuildingInsideVisualStudio", "true" },
-            // Design-time build: prevents auto-generated files in obj/ (e.g.
-            // .AssemblyAttributes.cs, .AssemblyInfo.cs) from being included as
-            // explicit Compile items. Without this, SDK-style projects produce
-            // duplicate Compile items (auto-include + obj/ generated), which
-            // causes MSBuildWorkspace to fail loading the project.
-            { "DesignTimeBuild", "true" },
-            { "SkipCompilerExecution", "true" },
-        };
+        var properties = WorkspaceLoad.GlobalProperties();
 
         // If MSBUILD_EXE_PATH is set, pass it to the workspace so the BuildHost
         // uses the same MSBuild we registered via MSBuildLocator (typically the .NET SDK).

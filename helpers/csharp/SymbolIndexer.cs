@@ -48,6 +48,10 @@ public sealed class SymbolIndexer
         Console.Error.WriteLine($"Compiling {totalProjects} project(s)...");
 
         var compileSw = System.Diagnostics.Stopwatch.StartNew();
+        // (error count, summary line) per erroring project — emitted after
+        // the loop, loudest first, so the warnings-channel cap can never
+        // crowd out the worst project: that is the one the user needs named.
+        var erroringProjects = new List<(int Count, string Line)>();
         for (int i = 0; i < totalProjects; i++)
         {
             var project = projectList[i];
@@ -59,17 +63,31 @@ public sealed class SymbolIndexer
                 continue;
             }
 
-            // Report diagnostics but don't abort
+            // Report diagnostics but don't abort. A single broken reference
+            // resolution cascades into tens of thousands of errors per
+            // project (CS0518 "System.Object not defined" turns every type
+            // use into CS0246) — that is ONE root cause, not N problems, so
+            // the warnings channel carries ONE aggregated line per project
+            // (count + dominant code + first specimen). Symbols below are
+            // still collected: a Roslyn compilation with errors yields a
+            // complete symbol tree — the same reason IntelliSense works
+            // while the build is red.
             var diagnostics = compilation.GetDiagnostics()
-                .Where(d => d.Severity == DiagnosticSeverity.Error);
-            foreach (var diag in diagnostics)
+                .Where(d => d.Severity == DiagnosticSeverity.Error)
+                .ToList();
+            if (diagnostics.Count > 0)
             {
-                Console.Error.WriteLine($"[WARN] Compilation error in {project.Name}: {diag}");
+                erroringProjects.Add((diagnostics.Count,
+                    WarningLineFor(project.Name, diagnostics)));
             }
 
             CollectSymbols(compilation.GlobalNamespace, symbolMap);
         }
         compileSw.Stop();
+        foreach (var (_, line) in erroringProjects.OrderByDescending(e => e.Count))
+        {
+            Console.Error.WriteLine(line);
+        }
         Console.Error.WriteLine($"Compiled {totalProjects} project(s) in {compileSw.Elapsed.TotalSeconds:F1}s");
         Console.Error.WriteLine($"Collected {symbolMap.Count} project-internal symbols — building definition index...");
 
@@ -129,6 +147,32 @@ public sealed class SymbolIndexer
 
         return index;
     }
+
+    /// One-line aggregation of a project's compilation errors for the
+    /// index-level warnings channel: count, dominant error code, first
+    /// specimen (capped — the full diagnostic can run very long). Wrapped
+    /// with the [WARN] marker the Rust capture keys on by
+    /// <see cref="WarningLineFor"/>. One broken reference resolution
+    /// cascades into tens of thousands of diagnostics; the channel must
+    /// carry the root cause, not the cascade.
+    /// </summary>
+    internal static string CompilationErrorSummaryLine(
+        string project, IReadOnlyList<Diagnostic> errors)
+    {
+        var byCode = errors.GroupBy(d => d.Id)
+            .OrderByDescending(g => g.Count()).ToList();
+        var first = errors[0].ToString();
+        if (first.Length > 160) first = first[..160] + "…";
+        return
+            $"Compilation errors in {project}: {errors.Count} error(s) — dominant " +
+            $"{byCode[0].Key} x{byCode[0].Count()}; first: {first}";
+    }
+
+    /// The channel-emittable form. The `[WARN] ` prefix is LOAD-BEARING:
+    /// the Rust capture (`is_helper_warning_line`) keys on it, so a dropped
+    /// prefix does not flood the channel — it silently empties it.
+    internal static string WarningLineFor(string project, IReadOnlyList<Diagnostic> errors) =>
+        "[WARN] " + CompilationErrorSummaryLine(project, errors);
 
     internal static void CollectSymbols(INamespaceSymbol ns, Dictionary<ISymbol, string> map)
     {

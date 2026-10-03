@@ -444,6 +444,7 @@ fn map_repo_rows(
 
             let csharp_str = match info.csharp_index {
                 super::CSharpIndexStatus::Ready => "ready",
+                super::CSharpIndexStatus::Partial => "partial",
                 super::CSharpIndexStatus::Indexing => "indexing",
                 super::CSharpIndexStatus::Error => "error",
                 super::CSharpIndexStatus::None => "none",
@@ -452,6 +453,7 @@ fn map_repo_rows(
 
             let ts_str = match info.typescript_index {
                 super::CSharpIndexStatus::Ready => "ready",
+                super::CSharpIndexStatus::Partial => "partial",
                 super::CSharpIndexStatus::Indexing => "indexing",
                 super::CSharpIndexStatus::Error => "error",
                 super::CSharpIndexStatus::None => "none",
@@ -737,7 +739,8 @@ fn cpu_usage_str(sys_system: &mut Option<sysinfo::System>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Build an `OverlayState::Info` by gathering live stats from SharedStores or metadata.
-fn build_info_overlay(
+/// pub(crate) so the serve test module can pin the symbol-warnings wiring.
+pub(crate) fn build_info_overlay(
     idx: usize,
     repos: &[(String, super::RepoStatusInfo)],
     state: &Arc<ServeState>,
@@ -808,6 +811,10 @@ fn build_info_overlay(
     // DB size on disk
     let db_size_human = dir_size_human(&db_path);
 
+    // Durable symbol-index warnings, read fresh from the on-disk meta
+    // (shared with the REST info surface so the two cannot drift).
+    let symbol_warnings = state.collect_symbol_warnings(&db_path);
+
     Some(OverlayState::Info {
         alias: alias.clone(),
         path: db_path.display().to_string(),
@@ -819,6 +826,7 @@ fn build_info_overlay(
         dims,
         lock,
         index_age,
+        symbol_warnings,
     })
 }
 

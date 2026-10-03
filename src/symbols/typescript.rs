@@ -611,6 +611,7 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
             symbols_indexed: total_symbols,
             references_stored: total_refs,
             duration_ms,
+            index_warnings: Vec::new(),
         })
     }
 

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.CodeAnalysis;
 using Xunit;
 using ScipCsharp;
 
@@ -213,5 +214,59 @@ public class ScipModelTests
 
         // Verify indented output (has newlines)
         Assert.Contains('\n', json);
+    }
+
+    /// <summary>
+    /// A broken reference resolution cascades into tens of thousands of
+    /// compilation errors per project (one missing assembly → every type use
+    /// errors). The warnings channel must carry ONE aggregated line per
+    /// project — count + dominant code + first specimen — not the cascade.
+    /// </summary>
+    [Fact]
+    public void CompilationErrorSummary_AggregatesCascadePerProject()
+    {
+        static Diagnostic Err(string id, string message)
+        {
+            var descriptor = new DiagnosticDescriptor(
+                id, title: message, messageFormat: message, category: "Test",
+                DiagnosticSeverity.Error, isEnabledByDefault: true);
+            return Diagnostic.Create(descriptor, Location.None);
+        }
+
+        var errors = new List<Diagnostic>
+        {
+            Err("CS0518", "Predefined type 'System.Object' is not defined or referenced"),
+            Err("CS0518", "Predefined type 'System.Object' is not defined or referenced"),
+            Err("CS0246", "The type or namespace name 'Dam' could not be found"),
+        };
+
+        var line = SymbolIndexer.CompilationErrorSummaryLine("Acme.Catalog", errors);
+
+        Assert.StartsWith("Compilation errors in Acme.Catalog:", line);
+        Assert.Contains("3 error(s)", line);
+        Assert.Contains("dominant CS0518 x2", line);
+        Assert.Contains("first:", line);
+
+        // The channel-emittable form carries the [WARN] marker the Rust
+        // capture keys on — a dropped prefix would silently EMPTY the
+        // index-warnings channel instead of flooding it.
+        var warning = SymbolIndexer.WarningLineFor("Acme.Catalog", errors);
+        Assert.StartsWith("[WARN] Compilation errors in", warning);
+    }
+
+    /// The specimen is capped: a full Roslyn diagnostic string can run
+    /// hundreds of chars, and the warnings channel caps the whole list.
+    [Fact]
+    public void CompilationErrorSummary_CapsTheSpecimen()
+    {
+        var descriptor = new DiagnosticDescriptor(
+            "CS0001", title: new string('x', 400), messageFormat: new string('x', 400),
+            category: "Test", DiagnosticSeverity.Error, isEnabledByDefault: true);
+        var err = Diagnostic.Create(descriptor, Location.None);
+
+        var line = SymbolIndexer.CompilationErrorSummaryLine("Proj", [err]);
+
+        Assert.True(line.Length < 300, $"summary must be capped, got {line.Length} chars");
+        Assert.Contains("…", line);
     }
 }

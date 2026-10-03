@@ -93,6 +93,16 @@ fn dedupe_references(
     out
 }
 
+/// Caller-facing warning for a find_impact answer against a project whose
+/// symbol index was never built. The empty reference list such an answer
+/// carries means UNKNOWN — stamping this on the payload is what keeps it from
+/// passing for "no callers" while the self-heal rebuild runs.
+pub(crate) fn missing_index_warning(lang: &str) -> String {
+    format!(
+        "No {lang} symbol index exists for this project — an empty reference list means UNKNOWN, not 'no references'. A background rebuild was started; retry this call once it completes."
+    )
+}
+
 #[tool_router(router = find_impact_router, vis = "pub(crate)")]
 impl CodesearchService {
     /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
@@ -249,6 +259,36 @@ impl CodesearchService {
             )]));
         }
 
+        // Self-heal + honesty: a project whose symbol index was never built
+        // answers EVERY query with NotFound/empty references — visually
+        // identical to "no callers", the exact trap that reads as "safe to
+        // remove" when it is not. Start a background rebuild (serve mode
+        // only) whenever the definitions index is absent; the *warning*
+        // below rides only on answers that actually come back empty
+        // (NotFound / resolution failure) — a successful resolution proves
+        // usable data exists and keeps its payload to the persisted
+        // warnings channel. Drift (index_head_sha vs current) is
+        // deliberately NOT healed — reindexing on every branch switch would
+        // thrash (see `SymbolIndexer::index_head_sha`).
+        let index_missing = !indexer.has_index(&db_path);
+        let heal_warning: Vec<String> = if index_missing {
+            vec![missing_index_warning(indexer.language())]
+        } else {
+            Vec::new()
+        };
+        if index_missing {
+            if let (Some(ref serve_state), Some(ref alias)) =
+                (&self.serve_state, &ctx.project_alias)
+            {
+                let st = std::sync::Arc::clone(serve_state);
+                let alias_heal = alias.clone();
+                let lang_heal = indexer.language().to_string();
+                tokio::spawn(async move {
+                    crate::serve::heal_missing_symbol_index(&st, &alias_heal, &lang_heal).await;
+                });
+            }
+        }
+
         // Perform the lookup under an internal wall-clock budget.
         //
         // `find_references_for_key` may invoke `scip-csharp find-refs` on a cache miss
@@ -341,6 +381,10 @@ impl CodesearchService {
         // helper invocation — as a typed candidates answer; the server never
         // silently picks among the query's matches (the old behaviour took
         // the shortest fuzzy candidate and answered about the wrong symbol).
+        // The same read pass collects the index-level rebuild warnings: a
+        // partially loaded solution produces an index whose reference lists
+        // are incomplete EVEN WHEN the lookup succeeds, and that honesty
+        // rides on every answer from this index.
         let registry_for_resolve = self.symbol_registry.clone();
         let language_for_resolve = language_for_lookup.clone();
         let db_path_for_resolve = db_path.clone();
@@ -354,7 +398,9 @@ impl CodesearchService {
                         language_for_resolve
                     )
                 })?;
-            indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)
+            let resolution = indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)?;
+            let index_warnings = indexer.index_warnings(&db_path_for_resolve);
+            Ok((resolution, index_warnings))
         })
         .await
         {
@@ -364,13 +410,33 @@ impl CodesearchService {
             // (classified stale/failed by the index age) instead of `?`.
             Err(e) => Err(anyhow::anyhow!("symbol resolve task failed: {e:#}")),
         };
+        // Both are read from the SAME env/txn pass above; on a JoinError the
+        // warnings are unknown and the failure path below speaks for itself.
+        let (resolution, index_warnings) = match resolution {
+            Ok((resolution, index_warnings)) => (Ok(resolution), index_warnings),
+            Err(e) => (Err(e), Vec::new()),
+        };
+        // Warnings assembled per answer path: persisted per-symbol warnings
+        // (set at the lookup sites) + index-level rebuild warnings. The
+        // missing-index self-heal warning does NOT belong here — a successful
+        // resolution proves usable data exists (see the NotFound arm, the
+        // only payload that carries it).
+        let answer_warnings = |mut persisted: Vec<String>| -> Vec<String> {
+            persisted.extend(index_warnings.iter().cloned());
+            persisted
+        };
 
         let canonical = match resolution {
             Err(e) => {
-                let failure = crate::symbols::SymbolLookupFailure::classify(
+                let mut failure = crate::symbols::SymbolLookupFailure::classify(
                     format!("{e:#}"),
                     indexer.index_age(&db_path),
                 );
+                if index_missing {
+                    failure.hint_for_agent.push_str(
+                        " A background rebuild of the missing index was started — retry this call once it completes.",
+                    );
+                }
                 let json =
                     serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
@@ -406,8 +472,12 @@ impl CodesearchService {
             }
             Ok(crate::symbols::KeyMatch::NotFound) => {
                 // Preserve the historical contract for fuzzy queries: an
-                // unresolvable name/position answers empty references.
-                let impact = build_impact(Vec::new(), None, Vec::new());
+                // unresolvable name/position answers empty references. With
+                // a missing index that answer also carries the self-heal
+                // warning — empty must not pass for "no callers".
+                let mut warnings = answer_warnings(Vec::new());
+                warnings.extend(heal_warning.iter().cloned());
+                let impact = build_impact(Vec::new(), None, warnings);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
@@ -450,7 +520,11 @@ impl CodesearchService {
                 // The warm retry must carry the same honesty as a fresh
                 // answer: read the persisted warnings for this key.
                 let warnings = indexer.lookup_warnings(&db_path, &canonical);
-                let impact = build_impact(references, Some(canonical.clone()), warnings);
+                let impact = build_impact(
+                    references,
+                    Some(canonical.clone()),
+                    answer_warnings(warnings),
+                );
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
@@ -506,7 +580,7 @@ impl CodesearchService {
                 // Surface what the lookup survived: a partial answer must
                 // say so in its own payload, not only in a log line.
                 let warnings = indexer.lookup_warnings(&db_path, &canonical);
-                let impact = build_impact(references, Some(canonical), warnings);
+                let impact = build_impact(references, Some(canonical), answer_warnings(warnings));
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }

@@ -61,6 +61,70 @@ pub(crate) fn is_helper_warning_line(line: &str) -> bool {
     line.contains("[WARN]") || line.contains("[Failure]")
 }
 
+/// Normalize one warning-severity helper stderr line into a concise,
+/// index-level completeness warning entry. MSBuild project-load failures
+/// (the class that silently strips cross-project references from the index)
+/// collapse to `<project-file>: <message>`; anything else passes through
+/// trimmed. `None` for non-warning lines.
+pub(crate) fn normalize_index_warning_line(line: &str) -> Option<String> {
+    if !is_helper_warning_line(line) {
+        return None;
+    }
+    // "[WARN] Workspace error: [Failure] Msbuild failed when processing the
+    // file '<path>' with message: <msg>" → "<file_name>: <msg>"
+    if let Some((_, rest)) = line.split_once("Msbuild failed when processing the file '") {
+        if let Some((path, tail)) = rest.split_once('\'') {
+            let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            let msg = tail
+                .split_once("with message: ")
+                .map(|(_, m)| m)
+                .unwrap_or(tail)
+                .trim();
+            let msg: String = msg.chars().take(160).collect();
+            return Some(format!("{file}: {msg}"));
+        }
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(220).collect())
+}
+
+/// Collapse the raw warning lines of one helper run into the capped,
+/// deduplicated list persisted as `index_warnings` meta. Order-preserving
+/// dedup because MSBuild repeats the same failure per project and per
+/// pass; capped because the list rides on every find_impact answer.
+pub(crate) fn summarize_index_warnings(lines: &[String], cap: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = lines
+        .iter()
+        .filter_map(|l| normalize_index_warning_line(l))
+        .filter(|w| seen.insert(w.clone()))
+        .collect();
+    if out.len() > cap {
+        let dropped = out.len() - cap;
+        out.truncate(cap);
+        out.push(format!("… and {dropped} more distinct warning(s)"));
+    }
+    out
+}
+
+/// The stored form of the summarized warnings: a stand-alone summary entry
+/// leads, because the list rides on every find_impact answer AND the TUI
+/// info panel and must be understandable alone.
+pub(crate) fn index_warnings_stored(entries: &[String]) -> Vec<String> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut stored = vec![format!(
+        "The symbol index was built while the C# workspace reported {} distinct failure(s) — cross-project references may be missing from every answer. Fix the underlying build problem (often a dotnet restore) and reindex.",
+        entries.len()
+    )];
+    stored.extend(entries.iter().cloned());
+    stored
+}
+
 /// Route one scip-csharp stderr line into tracing at the right severity.
 /// This is the ONLY sanctioned path for helper stderr: spawn helpers with
 /// `Stdio::piped()` and drain through here — never `Stdio::inherit()`,
@@ -131,6 +195,16 @@ const META_HEAD_SHA: &str = crate::constants::SCIP_HEAD_SHA_KEY;
 /// Key in the meta database recording the key-format generation the index was
 /// built with (see [`crate::constants::SCIP_KEY_FORMAT`]).
 const META_KEY_FORMAT: &str = crate::constants::SCIP_KEY_FORMAT_KEY;
+
+/// Key in the meta database holding the JSON array of index-level
+/// completeness warnings from the last rebuild (see
+/// [`summarize_index_warnings`]).
+const META_INDEX_WARNINGS: &str = crate::constants::SCIP_INDEX_WARNINGS_KEY;
+const META_BUILDER_VERSION: &str = crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY;
+
+/// How many distinct index-level warnings are persisted (and thus surfaced
+/// per find_impact answer) before the list is capped with an overflow note.
+const INDEX_WARNINGS_CAP: usize = 10;
 
 /// Key in the meta database storing the count of indexed symbols.
 #[allow(dead_code)]
@@ -297,23 +371,36 @@ fn read_ref_warnings(env: &TrackedEnv, rtxn: &heed::RoTxn<'_>, canonical: &str) 
 /// - `"csharp App . FieldDefinition#Validate()."` → `"Validate"`
 /// - `"csharp SmallSolution.Library . Calculator#Add(int, int)."` → `"Add"`
 /// - `"csharp . . . Namespace.TopLevel"` → `"TopLevel"`
-fn extract_simple_name(scip_symbol: &str) -> String {
-    // Strip trailing suffix chars: "Validate()." → "Validate", "MyService#" → "MyService"
-    let cleaned = scip_symbol
-        .trim_end_matches('.')
-        .trim_end_matches("()")
-        .trim_end_matches('#');
-    // Take last non-empty segment after '#' or '.'
-    let last_segment = cleaned
-        .rsplit(['#', '.'])
-        .find(|s| !s.trim().is_empty())
-        .unwrap_or(cleaned)
-        .trim();
-    // Strip method parameters (e.g. "Add(int, int)" → "Add")
-    last_segment
+///
+/// Parameter lists are stripped BEFORE segmenting: key format 2.0 writes
+/// fully-qualified parameter types (`SaveBatchAsync(int, System.Collections
+/// .Generic.IReadOnlyList<global::…>)`), and splitting on `.` first would
+/// land inside the parameters — the "Activity, int)" fragments that left
+/// every parameterized method unresolvable by fuzzy name.
+pub(crate) fn extract_simple_name(scip_symbol: &str) -> String {
+    // Method/field segment: after the last '#' (types without '#' keep the
+    // whole string — their name is the last '.'-segment below; a bare
+    // trailing '#' falls back to the pre-# text).
+    let after_hash = scip_symbol.rsplit('#').next().unwrap_or(scip_symbol);
+    let base = if after_hash.trim().is_empty() {
+        scip_symbol
+    } else {
+        after_hash
+    };
+    // Strip parameters FIRST, then the generic-arity marker: keys group all
+    // overloads and arities under one queryable name.
+    let name = base
         .split('(')
         .next()
-        .unwrap_or(last_segment)
+        .unwrap_or(base)
+        .split('`')
+        .next()
+        .unwrap_or(base);
+    let cleaned = name.trim().trim_end_matches('.').trim_end_matches('#');
+    cleaned
+        .rsplit('.')
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or(cleaned)
         .trim()
         .to_string()
 }
@@ -363,6 +450,41 @@ impl CSharpSymbolIndexer {
         let mut lock = self.helper_path.lock().unwrap();
         *lock = Some(resolved.clone()); // cache both Some and None
         resolved
+    }
+
+    /// Writes the rebuild bookkeeping shared by every scope (full and
+    /// incremental): key-format stamp, index warnings (written or cleared)
+    /// and the builder-version stamp. Called from `rebuild`'s meta txn, so
+    /// meta always describes the newest build. `pub(crate)` so the producer
+    /// test drives the exact write the pipeline runs — a fake helper cannot
+    /// execute on Windows, where the validated filename must be a real PE.
+    pub(crate) fn write_rebuild_meta(
+        meta_db: &Database<Str, Str>,
+        wtxn: &mut heed::RwTxn,
+        index_warnings: &[String],
+    ) -> Result<()> {
+        // Unconditional: has_index refuses an index whose key-format stamp is
+        // absent or stale, so a key-format change forces exactly one rebuild.
+        meta_db.put(wtxn, META_KEY_FORMAT, crate::constants::SCIP_KEY_FORMAT)?;
+        // Index-level completeness warnings from this run — written or
+        // cleared on EVERY rebuild (full or incremental) so meta always
+        // describes the newest build.
+        let stored_warnings = index_warnings_stored(index_warnings);
+        if stored_warnings.is_empty() {
+            meta_db.delete(wtxn, META_INDEX_WARNINGS)?;
+        } else {
+            let json = serde_json::to_string(&stored_warnings).unwrap_or_else(|_| "[]".to_string());
+            meta_db.put(wtxn, META_INDEX_WARNINGS, json.as_str())?;
+        }
+        // Stamp the producing build: the rebuild gate treats an index from
+        // another (or an unknown) build as stale, so a deployed binary
+        // rebuilds the indexes it inherited itself at startup.
+        meta_db.put(
+            wtxn,
+            META_BUILDER_VERSION,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )?;
+        Ok(())
     }
 
     fn resolve_helper_path(&self) -> Option<PathBuf> {
@@ -518,13 +640,20 @@ impl CSharpSymbolIndexer {
     // ── Helper invocation ──────────────────────────────────────────
 
     /// Invoke `scip-csharp index` and stream stderr to tracing.
+    ///
+    /// Returns the raw warning-severity stderr lines of the run — the input
+    /// to [`summarize_index_warnings`]. A helper that survives MSBuild
+    /// project-load failures exits 0 with a syntactically valid but
+    /// semantically partial index (definitions without cross-project
+    /// references); those failures land HERE so the rebuild can persist them
+    /// as index-level warnings instead of them living only in the log.
     fn invoke_index_helper(
         &self,
         helper: &Path,
         solution: &Path,
         output_path: &Path,
         project_filter: Option<&Path>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let solution_short = solution
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -549,11 +678,17 @@ impl CSharpSymbolIndexer {
             .spawn()
             .with_context(|| format!("Failed to execute scip-csharp at {}", helper.display()))?;
 
+        let captured_warnings: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let stderr_handle = child.stderr.take().map(|stderr| {
             let label = solution_short.clone();
+            let sink = std::sync::Arc::clone(&captured_warnings);
             thread::spawn(move || {
                 drain_pipe_to_tracing(stderr, |line| {
                     if !line.is_empty() {
+                        if is_helper_warning_line(line) {
+                            sink.lock().map(|mut v| v.push(line.to_string())).ok();
+                        }
                         emit_helper_stderr_line("scip-csharp", &label, line);
                     }
                 });
@@ -591,7 +726,13 @@ impl CSharpSymbolIndexer {
             // Don't bail — partial output is acceptable per AGENTS.md spec
         }
 
-        Ok(())
+        // A poisoned lock still holds every line pushed before the panic —
+        // recover rather than drop honesty signals on the floor.
+        let raw = match captured_warnings.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        Ok(raw)
     }
 
     /// Invoke `scip-csharp find-refs` for a single symbol and return its
@@ -1350,8 +1491,11 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         ));
         let _output_guard = TempFileGuard(output_path.clone());
 
-        // Invoke helper with stderr streaming
-        self.invoke_index_helper(&helper, &solution, &output_path, project.as_deref())?;
+        // Invoke helper with stderr streaming; warning-severity lines become
+        // the index-level completeness warnings persisted below.
+        let raw_index_warnings =
+            self.invoke_index_helper(&helper, &solution, &output_path, project.as_deref())?;
+        let index_warnings = summarize_index_warnings(&raw_index_warnings, INDEX_WARNINGS_CAP);
 
         // Parse the JSON output
         let index_data = std::fs::read(&output_path)
@@ -1689,13 +1833,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         if let Some(sha) = super::current_git_head(repo_path) {
             meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
         }
-        // Unconditional: has_index refuses an index whose key-format stamp is
-        // absent or stale, so a key-format change forces exactly one rebuild.
-        meta_db.put(
-            &mut wtxn,
-            META_KEY_FORMAT,
-            crate::constants::SCIP_KEY_FORMAT,
-        )?;
+        Self::write_rebuild_meta(&meta_db, &mut wtxn, &index_warnings)?;
 
         wtxn.commit()?;
 
@@ -1722,6 +1860,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             symbols_indexed: total_symbols,
             references_stored: total_defs, // definitions only; refs resolved lazily
             duration_ms,
+            index_warnings: index_warnings_stored(&index_warnings),
         })
     }
 
@@ -1844,6 +1983,57 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let sha = meta_db.get(&rtxn, META_HEAD_SHA).ok().flatten()?;
         let sha = sha.trim().to_string();
         (!sha.is_empty()).then_some(sha)
+    }
+
+    /// Index-level completeness warnings from the last rebuild — the
+    /// workspace/MSBuild failures the helper survived. Non-empty means
+    /// reference lists from this index may be incomplete even when a
+    /// lookup succeeds (observed live: a worktree whose NuGet restore was
+    /// broken indexed every definition but zero cross-project references,
+    /// and every find_impact answer passed as clean). Plain LMDB read;
+    /// unreadable or absent metadata reads as clean (never blocks an answer).
+    fn index_warnings(&self, db_path: &Path) -> Vec<String> {
+        let env = match self.open_scip_env(db_path) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
+            Ok(Some(db)) => db,
+            _ => return Vec::new(),
+        };
+        let json = match meta_db.get(&rtxn, META_INDEX_WARNINGS) {
+            Ok(Some(s)) => s,
+            _ => return Vec::new(),
+        };
+        serde_json::from_str(json).unwrap_or_default()
+    }
+
+    /// Which codesearch build produced this index — `None` when the stamp is
+    /// absent (pre-stamp index) or the meta is unreadable. The rebuild gate
+    /// compares against [`crate::constants::INDEX_BUILDER_VERSION`] and
+    /// rebuilds on mismatch: this binary never produced that index.
+    fn index_builder_version(&self, db_path: &Path) -> Option<String> {
+        let env = match self.open_scip_env(db_path) {
+            Ok(e) => e,
+            Err(_) => return None,
+        };
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
+            Ok(Some(db)) => db,
+            _ => return None,
+        };
+        meta_db
+            .get(&rtxn, META_BUILDER_VERSION)
+            .ok()
+            .flatten()
+            .map(|s| s.to_string())
     }
 
     /// Whether a SCIP index exists AND was built with the current key format.

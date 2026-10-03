@@ -28,6 +28,7 @@
     <Compile Include="..\ScipModels.cs" Link="ScipModels.cs" />
     <Compile Include="..\OutputWriter.cs" Link="OutputWriter.cs" />
     <Compile Include="..\SymbolIndexer.cs" Link="SymbolIndexer.cs" />
+    <Compile Include="..\WorkspaceLoad.cs" Link="WorkspaceLoad.cs" />
   </ItemGroup>
 
   <!-- Exclude fixture source files from compilation -->

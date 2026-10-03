@@ -42,6 +42,14 @@ consumed by the serve replica). There is no shared filesystem or database betwee
   environment, a storage account, and container app/job resources.
 - The `codesearch` container image published to a registry the platform can pull from.
 
+> ⚠️ **Build locally, not via `az acr build`, on a Basic/Standard-SKU registry.** The
+> builder stage compiles the release binary, then downloads and warms up the embedding
+> model before tarring it — memory/disk-heavy on top of the compile. ACR's default build
+> agent (Basic/Standard SKU; Agent Pools with bigger VMs need Premium) reliably fails at
+> the `COPY --from=builder /models.tar.gz` step with `failed to create image: failed to
+> get layer sha256:...: layer does not exist`, after a ~25 min compile — confirmed twice,
+> not a one-off. Build with local Docker Desktop and `docker push` to the registry instead.
+
 ## Provisioning (generic)
 
 Replace every `<...>` placeholder with your own values.

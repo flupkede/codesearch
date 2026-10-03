@@ -48,8 +48,12 @@ use super::Result;
 pub enum SymbolRebuildSignal {
     /// A rebuild is about to run (helper available and project applies).
     Started,
-    /// Rebuild finished successfully.
-    Succeeded,
+    /// Rebuild finished successfully. Carries the index-level warnings the
+    /// rebuild survived (empty = clean) so the serve layer can render a
+    /// degraded index red instead of green — the watcher path is the common
+    /// path during active development, and a green indicator on an index
+    /// with missing cross-project references reads as "safe".
+    Succeeded { index_warnings: Vec<String> },
     /// Rebuild failed with the given message.
     Failed(String),
 }
@@ -1437,7 +1441,9 @@ impl IndexManager {
                     summary.duration_ms
                 );
                 if let Some(n) = notifier {
-                    n(SymbolRebuildSignal::Succeeded);
+                    n(SymbolRebuildSignal::Succeeded {
+                        index_warnings: summary.index_warnings.clone(),
+                    });
                 }
             }
             Err(e) => {
@@ -1885,6 +1891,11 @@ impl IndexManager {
                                     // cleaned up from LMDB regardless of origin project.
                                     let total_groups = groups.len();
                                     let mut last_error: Option<String> = None;
+                                    // Index-level warnings survived by any
+                                    // group's rebuild — deduped across groups
+                                    // (MSBuild repeats per project).
+                                    let mut index_warnings: Vec<String> = Vec::new();
+                                    let mut seen_warnings = std::collections::HashSet::new();
                                     for (i, (csproj, files)) in groups.into_iter().enumerate() {
                                         let csproj_name = csproj
                                             .file_name()
@@ -1905,6 +1916,11 @@ impl IndexManager {
                                         };
                                         match indexer.rebuild(&rp, &dp, scope) {
                                             Ok(summary) => {
+                                                for w in &summary.index_warnings {
+                                                    if seen_warnings.insert(w.clone()) {
+                                                        index_warnings.push(w.clone());
+                                                    }
+                                                }
                                                 if summary.symbols_indexed == 0 {
                                                     warn!(
                                                         "⚠️ [{}/{}] Symbol rebuild returned 0 symbols for '{}' — \
@@ -1943,7 +1959,9 @@ impl IndexManager {
                                     // Notify serve layer about overall outcome
                                     if let Some(ref n) = notifier {
                                         match last_error {
-                                            None => n(SymbolRebuildSignal::Succeeded),
+                                            None => {
+                                                n(SymbolRebuildSignal::Succeeded { index_warnings })
+                                            }
                                             Some(msg) => n(SymbolRebuildSignal::Failed(msg)),
                                         }
                                     }

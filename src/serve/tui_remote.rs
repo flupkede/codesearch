@@ -358,6 +358,7 @@ async fn run_remote_tui_loop(
                                                 dims: info.dims,
                                                 lock: info.lock,
                                                 index_age: info.index_age,
+                                                symbol_warnings: info.symbol_warnings,
                                             },
                                             Err(e) => OverlayState::Doctor {
                                                 alias,
@@ -503,6 +504,10 @@ struct InfoResponse {
     dims: usize,
     lock: String,
     index_age: String,
+    /// Index-level symbol warnings from the peer's on-disk meta. `default` for
+    /// the same older-serve compatibility as `path`.
+    #[serde(default)]
+    symbol_warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
