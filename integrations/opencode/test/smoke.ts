@@ -321,6 +321,17 @@ async function main(): Promise<void> {
   await one.app.hooks.context[0](duplicate)
   assert.equal(duplicate.system.length, 0, "the same user message never injects twice")
 
+  // ast-grep routing is gated on the request's tool map: absent tools stay
+  // silent, exposed tools get one routing line.
+  assert.doesNotMatch(injected, /ast[-_]grep/, "no ast-grep mention without ast-grep tools")
+  const withAstGrep = userMessage("s1-ast", "ag1", "Migrate the call sites")
+  withAstGrep.tools.ast_grep_search = {}
+  withAstGrep.tools.ast_grep_edit = {}
+  await one.app.hooks.context[0](withAstGrep)
+  const astGrepGuidance = withAstGrep.system.map((p: Loose) => p.text).join("\n")
+  assert.match(astGrepGuidance, /ast_grep_search/, "guidance names ast-grep tools when the host exposes them")
+  assert.match(astGrepGuidance, /ast_grep_edit/, "guidance names the rewrite tool too")
+
   // Zero-hit rescue turns an empty grep into codesearch hits.
   const rescueEvent: Loose = {
     tool: "grep",
@@ -425,6 +436,25 @@ async function main(): Promise<void> {
   }
   assert.match(threw, /codesearch/, "block mode denies grep once the hub is reachable")
   assert.match(threw, /project "my-service"/, "denial names the project scope to use")
+  assert.doesNotMatch(threw, /ast[-_]grep/, "denial omits ast-grep when the session never exposed it")
+
+  // The same denial names ast-grep once the session's tool map has it.
+  const astBlocked = await setupPlugin("/work/my-service")
+  const astContext = userMessage("s6", "agb1", "Migrate the call sites")
+  astContext.tools.ast_grep_search = {}
+  astContext.tools.ast_grep_edit = {}
+  await astBlocked.app.hooks.context[0](astContext)
+  let astThrew = ""
+  for (let i = 0; i < 30 && !astThrew; i++) {
+    try {
+      await astBlocked.app.toolHooks["execute.before"][0]({ tool: "grep", input: { pattern: "x" }, sessionID: "s6" })
+    } catch (err) {
+      astThrew = String(err)
+    }
+    if (!astThrew) await new Promise((r) => setTimeout(r, 100))
+  }
+  assert.match(astThrew, /ast_grep_search/, "denial names ast-grep tools when the host exposes them")
+  await astBlocked.cleanup()
 
   const uncovered = await setupPlugin("/work/unregistered")
   await uncovered.app.toolHooks["execute.before"][0]({ tool: "grep", input: {}, sessionID: "s4" })

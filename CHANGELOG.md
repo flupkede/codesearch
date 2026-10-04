@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.2]
+
+### Changed
+
+- **OpenCode plugin: syntax-shaped queries are routed to ast-grep tools, but only when the host exposes them.** codesearch matches text, not code structure, so the injected guidance now adds one routing line (and the block-mode denial one alternative line) pointing at ast-grep tools such as `ast_grep_search`/`ast_grep_edit` — gated per request on the assembled tool map, so environments without an ast-grep integration see unchanged guidance and no one is pointed at tools they do not have. Unit and smoke coverage pin both the mention and its absence.
+
 ## [1.5.1] - 2026-10-04
 
 ### Added
