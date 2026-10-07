@@ -486,9 +486,168 @@ impl Default for FastEmbedder {
     }
 }
 
+// ─── Persisted default model (setup → serve) ─────────────────────────────────
+//
+// `codesearch setup --model X` downloads X but used to record the choice
+// nowhere, so serve started without its own `--model` flag silently fell
+// back to the built-in default for every NEW index — the pilot operator had
+// to re-type `--model embeddinggemma-q4` on every serve launch. The helpers
+// below persist the setup choice under `<codesearch_home>` and let serve
+// adopt it automatically.
+
+/// Path of the persisted default-model choice.
+fn default_model_file() -> Result<std::path::PathBuf> {
+    Ok(crate::constants::codesearch_home()?.join(crate::constants::DEFAULT_MODEL_FILE))
+}
+
+/// Persist `model` as the default for new indexes (called by `codesearch setup`).
+///
+/// tmp+fsync+rename so a crash mid-write can never leave a torn choice file
+/// (same discipline as the other codesearch-owned JSON files).
+pub fn save_default_model(model: ModelType) -> Result<()> {
+    use std::io::Write;
+
+    let path = default_model_file()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".new");
+    let tmp_path = std::path::PathBuf::from(tmp);
+    let data = format!("{{\"model\":\"{}\"}}", model.short_name());
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(data.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
+/// Read the default model persisted by `codesearch setup`.
+///
+/// `None` when no choice was recorded or the file names an unknown model —
+/// serve then keeps its built-in fallback default for new indexes instead of
+/// failing to start over a config file it can revive by re-running setup.
+pub fn load_default_model() -> Option<ModelType> {
+    let path = default_model_file().ok()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let short_name = parsed.get("model")?.as_str()?;
+    match ModelType::parse(short_name) {
+        Some(model) => Some(model),
+        None => {
+            tracing::warn!(
+                "Persisted default model '{}' is not known to this build; ignoring it",
+                short_name
+            );
+            None
+        }
+    }
+}
+
+/// Whether `model`'s ONNX files are already present in the global models cache.
+///
+/// Resolves fastembed's own model table (`model_code`, `model_file`,
+/// `additional_files`) and probes the hf-hub cache layout fastembed downloads
+/// into (`models--<org>--<repo>/snapshots/<rev>/…`) instead of duplicating repo
+/// ids here. Purely a filesystem probe — never touches the network, so serve
+/// can warn about a missing download before warmup starts one mid-flight.
+pub fn is_model_in_cache(model: ModelType) -> bool {
+    let cache_dir = match crate::constants::get_global_models_cache_dir() {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    let fe_model = model.to_fastembed_model();
+    let info = match <FastEmbedModel as fastembed::ModelTrait>::get_model_info(&fe_model) {
+        Some(info) => info,
+        None => return false,
+    };
+    let slug = format!("models--{}", info.model_code.replace('/', "--"));
+    let snapshots_dir = cache_dir.join(slug).join("snapshots");
+    let Ok(revisions) = std::fs::read_dir(&snapshots_dir) else {
+        return false;
+    };
+    for revision in revisions.flatten() {
+        let snapshot = revision.path();
+        if !snapshot.join(&info.model_file).exists() {
+            continue;
+        }
+        if info.additional_files.iter().all(|f| snapshot.join(f).exists()) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn default_model_choice_round_trips_and_degrades_on_unknown_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::CODESEARCH_HOME_ENV,
+            tmp.path().to_str().unwrap(),
+        )]);
+
+        assert_eq!(load_default_model(), None, "no choice recorded yet");
+
+        save_default_model(ModelType::EmbeddingGemma300MQ4).unwrap();
+        assert_eq!(
+            load_default_model(),
+            Some(ModelType::EmbeddingGemma300MQ4),
+            "the setup choice must survive across processes"
+        );
+
+        // A file naming an unknown model (e.g. written by a newer/older build)
+        // must degrade to None instead of poisoning serve startup.
+        std::fs::write(
+            tmp.path().join(crate::constants::DEFAULT_MODEL_FILE),
+            "{\"model\":\"not-a-model\"}",
+        )
+        .unwrap();
+        assert_eq!(load_default_model(), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn is_model_in_cache_matches_hf_hub_download_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::CODESEARCH_HOME_ENV,
+            tmp.path().to_str().unwrap(),
+        )]);
+
+        // Empty models cache → nothing cached (cache dir gets created, but no
+        // model directories inside).
+        assert!(!is_model_in_cache(ModelType::EmbeddingGemma300MQ4));
+
+        // Reproduce the exact hf-hub layout fastembed downloads into (verified
+        // against a live cache with a manually-installed snapshot):
+        // models--onnx-community--embeddinggemma-300m-ONNX/snapshots/<rev>/onnx/…
+        let model_dir = tmp
+            .path()
+            .join("models")
+            .join("models--onnx-community--embeddinggemma-300m-ONNX");
+        let snapshot = model_dir.join("snapshots").join("manual");
+        std::fs::create_dir_all(snapshot.join("onnx")).unwrap();
+        std::fs::write(snapshot.join("onnx/model_q4.onnx"), "x").unwrap();
+        std::fs::write(snapshot.join("onnx/model_q4.onnx_data"), "x").unwrap();
+        assert!(is_model_in_cache(ModelType::EmbeddingGemma300MQ4));
+
+        // A half-downloaded model (additional file missing) must not report
+        // cached — the pool would hit the network on first use otherwise.
+        std::fs::remove_file(snapshot.join("onnx/model_q4.onnx_data")).unwrap();
+        assert!(!is_model_in_cache(ModelType::EmbeddingGemma300MQ4));
+    }
 
     #[test]
     fn test_model_type_dimensions() {

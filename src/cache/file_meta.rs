@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::constants::FILE_META_DB_NAME;
+use crate::vectordb::{
+    is_transient_rename_error, RENAME_RETRY_ATTEMPTS, RENAME_RETRY_DELAY_MS,
+};
 
 // ─── CANONICAL PATH POLICY ────────────────────────────────────────────────────
 //
@@ -288,40 +291,152 @@ impl FileMetaStore {
         }
     }
 
-    /// Load from database directory, or create new if doesn't exist
+    /// Load from database directory, or create new if doesn't exist.
+    ///
+    /// A torn or unreadable main file (unclean serve shutdown mid-`save`;
+    /// see [`Self::save`]) falls back to the one-generation `.bak` instead of
+    /// failing hard. Only when no generation parses do we degrade to an empty
+    /// store — callers' B1 guard then deliberately clears the vector/FTS
+    /// stores and re-indexes from scratch. A hard error here used to be worse:
+    /// the corrupt file never self-heals, so warmup skipped the repo on every
+    /// start until someone deleted the file by hand (pilot incident,
+    /// payment-identification: 323/323 files re-embedded after an unclean
+    /// shutdown).
     pub fn load_or_create(db_path: &Path, model_name: &str, dimensions: usize) -> Result<Self> {
         let meta_path = db_path.join(Self::FILENAME);
 
-        if meta_path.exists() {
-            let content = fs::read_to_string(&meta_path)?;
-            let mut store: FileMetaStore = serde_json::from_str(&content)
-                .map_err(|e| anyhow!("Failed to parse file metadata: {}", e))?;
-
-            // Check if model changed - if so, invalidate everything
-            if store.model_name != model_name || store.dimensions != dimensions {
-                println!(
-                    "⚠️  Model changed ({} -> {}), full re-index required",
-                    store.model_name, model_name
-                );
-                store = Self::new(model_name.to_string(), dimensions);
+        let mut store = if meta_path.exists() {
+            match Self::read_store_file(&meta_path) {
+                Ok(store) => Some(store),
+                Err(main_err) => {
+                    let bak_path = Self::backup_path(&meta_path);
+                    match Self::read_store_file(&bak_path) {
+                        Ok(bak) => {
+                            tracing::warn!(
+                                "file metadata {} is corrupt ({}); recovered the previous \
+                                 generation from {}",
+                                meta_path.display(),
+                                main_err,
+                                bak_path.display()
+                            );
+                            Some(bak)
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "file metadata {} is corrupt ({}) with no recoverable backup; \
+                                 starting with an empty store, full re-index will follow",
+                                meta_path.display(),
+                                main_err
+                            );
+                            None
+                        }
+                    }
+                }
             }
-
-            // Migrate stored paths to normalized format (strip UNC prefix, forward slashes).
-            // Existing stores may have Windows backslash paths or \\?\ prefixed paths.
-            store.migrate_paths();
-
-            Ok(store)
         } else {
-            Ok(Self::new(model_name.to_string(), dimensions))
+            None
         }
+        .unwrap_or_else(|| Self::new(model_name.to_string(), dimensions));
+
+        // Check if model changed - if so, invalidate everything
+        if store.model_name != model_name || store.dimensions != dimensions {
+            println!(
+                "⚠️  Model changed ({} -> {}), full re-index required",
+                store.model_name, model_name
+            );
+            store = Self::new(model_name.to_string(), dimensions);
+        }
+
+        // Migrate stored paths to normalized format (strip UNC prefix, forward slashes).
+        // Existing stores may have Windows backslash paths or \\?\ prefixed paths.
+        store.migrate_paths();
+
+        Ok(store)
     }
 
-    /// Save to database directory
+    /// Read and parse a store file (the main generation or its `.bak`).
+    fn read_store_file(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)?;
+        serde_json::from_str(&content).map_err(|e| anyhow!("Failed to parse file metadata: {}", e))
+    }
+
+    /// Sibling path of the one-generation crash-recovery backup for this
+    /// store's file (see [`Self::save`]).
+    fn backup_path(meta_path: &Path) -> PathBuf {
+        let mut bak = meta_path.as_os_str().to_os_string();
+        bak.push(".bak");
+        PathBuf::from(bak)
+    }
+
+    /// Save to database directory.
+    ///
+    /// Crash-atomic write, hardened after a pilot incident: plain `fs::write`
+    /// is truncate-then-write, so a serve killed mid-save — and the FSW
+    /// update path saves after *every* indexed file, making the window wide —
+    /// left a zero-byte or torn `file_meta.json`. On the next start that
+    /// either failed warmup outright (the corrupt file never self-heals) or
+    /// forced a deliberate full wipe, re-embedding an entire unchanged repo
+    /// (payment-identification: 323/323 files).
+    ///
+    /// Mirrors `ReposConfig::save_to`: keep one `.bak` generation
+    /// (best-effort — a failed copy never blocks saving fresh state), write a
+    /// unique temp sibling, fsync it, then rename into place with a bounded
+    /// retry for transient handle races. The temp name embeds pid + counter
+    /// because the refresh task and the FSW update path may save the same
+    /// repo concurrently and must not share one temp file.
     pub fn save(&self, db_path: &Path) -> Result<()> {
+        use std::io::Write;
+
         let meta_path = db_path.join(Self::FILENAME);
-        let content = serde_json::to_string_pretty(self)?;
-        fs::write(meta_path, content)?;
-        Ok(())
+
+        // (1) One-generation backup, best-effort.
+        if meta_path.exists() {
+            let _ = fs::copy(&meta_path, Self::backup_path(&meta_path));
+        }
+
+        // (2) Atomic replace: temp file + rename over the target.
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = db_path.join(format!(
+            "{}.{}.{}.tmp",
+            Self::FILENAME,
+            std::process::id(),
+            seq
+        ));
+
+        let data = serde_json::to_string_pretty(self)?;
+        let write_result = (|| -> std::io::Result<()> {
+            let mut f = fs::File::create(&tmp_path)?;
+            f.write_all(data.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+
+        for attempt in 0..RENAME_RETRY_ATTEMPTS {
+            match fs::rename(&tmp_path, &meta_path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if is_transient_rename_error(&e) && attempt + 1 < RENAME_RETRY_ATTEMPTS {
+                        tracing::warn!(
+                            "file metadata rename to {} hit a transient error (attempt {}/{}): {}",
+                            meta_path.display(),
+                            attempt + 1,
+                            RENAME_RETRY_ATTEMPTS,
+                            e
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(RENAME_RETRY_DELAY_MS));
+                        continue;
+                    }
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(e.into());
+                }
+            }
+        }
+        unreachable!("retry loop always returns")
     }
 
     /// Migrate stored paths to normalized format.

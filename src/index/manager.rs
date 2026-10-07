@@ -280,7 +280,12 @@ impl SharedStores {
         }
 
         let vector_store = VectorStore::new(db_path, dimensions)?;
-        let fts_store = FtsStore::new_with_writer(db_path)?;
+        // The FTS writer stays lazy on purpose: creating it eagerly parks
+        // tantivy's writer-pipeline threads (workers + segment updater + merge
+        // pool) for as long as serve holds the store — with one store per warm
+        // repo that was thousands of resident threads on a large pool. It
+        // materializes on the first actual write (FtsStore::ensure_writer).
+        let fts_store = FtsStore::new(db_path)?;
 
         info!("📦 SharedStores created in read-write mode");
 
@@ -300,7 +305,10 @@ impl SharedStores {
     /// File watching is not supported in readonly mode.
     pub fn new_readonly(db_path: &Path, dimensions: usize) -> Result<Self> {
         let vector_store = VectorStore::open_readonly(db_path, dimensions)?;
-        let fts_store = FtsStore::new(db_path)?; // Read-only without writer
+        // The OnCommitWithDelay watcher is deliberate here: by construction
+        // another process holds the writer lock and may commit at any time,
+        // and this reader must pick those commits up without a reopen.
+        let fts_store = FtsStore::new_readonly(db_path)?;
 
         info!("📦 SharedStores created in readonly mode");
 
@@ -2913,6 +2921,40 @@ mod tests {
             db_path.join(WRITER_LOCK_FILE).exists(),
             "writer lock file should have been created"
         );
+    }
+
+    /// `SharedStores::new` must keep the FTS writer lazy: an eager tantivy
+    /// writer parked its pipeline threads (workers + segment updater + merge
+    /// pool) for every warm repo for as long as serve held the store — a
+    /// 500-repo pool was observed with ~4 500 resident OS threads. The
+    /// writer must materialize only on the first actual write, and the
+    /// Manual-policy reader must see our own commit without any watcher.
+    #[tokio::test]
+    async fn shared_stores_new_keeps_fts_writer_lazy_until_first_write() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join(DB_DIR_NAME);
+        let stores = SharedStores::new(&db_path, 384).unwrap();
+        let tantivy_lock = db_path.join("fts").join(".tantivy-writer.lock");
+        assert!(
+            !tantivy_lock.exists(),
+            "SharedStores::new must not materialize the tantivy writer"
+        );
+
+        {
+            let mut fts = stores.fts_store.write().await;
+            fts.add_chunk(7, "shared lazy writer probe", "probe.rs", None, "block")
+                .unwrap();
+            fts.commit().unwrap();
+        }
+
+        assert!(
+            tantivy_lock.exists(),
+            "first FTS write must materialize the writer and its lockfile"
+        );
+        let fts = stores.fts_store.read().await;
+        let hits = fts.search("shared lazy", 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk_id, 7);
     }
 
     #[test]

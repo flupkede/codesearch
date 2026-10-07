@@ -101,18 +101,34 @@ impl CodesearchService {
         // Look up chunk — multi-store: smart candidate detection for chunk_id collision.
         // chunk_ids are local per database, not globally unique. When no project is specified
         // and multiple stores are active, scan all stores to find which ones have this chunk_id.
+        //
+        // The store that answers becomes `owner_alias` so the context read below
+        // can resolve the project-relative stored path against the OWNING
+        // repo's root (`ctx.alias_roots`) — the serve process's own
+        // project_path is not any repo's root, so joining there always failed
+        // and group-scoped answers never carried surrounding lines.
+        // `stored_path_raw` is published only by the unique-owner group arm,
+        // which prefixes chunk.path inside itself before returning.
+        let mut owner_alias: Option<String> = None;
+        let mut stored_path_raw: Option<String> = None;
         let chunk = if let Some(ref sv) = ctx.stores_vec {
             if sv.len() > 1 && request.project.is_none() {
                 // Smart candidate detection: find which stores actually contain this chunk_id
                 let mut candidates: Vec<(&Arc<SharedStores>, String)> = Vec::new();
                 let aliases = ctx.aliases();
                 for (i, store_arc) in sv.iter().enumerate() {
-                    let store = match bounded_vector_read(&store_arc.vector_store).await {
-                        Ok(store) => store,
-                        Err(e) => {
-                            note_store_failure(&mut chunk_warnings, aliases, i, "chunk lookup", &e);
-                            continue;
-                        }
+                    // Try-lock, never wait: this loop scans EVERY repo in the
+                    // group, so bounded waits summed to N×300 s while a single
+                    // indexing run held them — the same interactive wedge the
+                    // search fan-outs killed.
+                    let Some(store) = try_vector_read_or_note(
+                        &store_arc.vector_store,
+                        aliases,
+                        i,
+                        &mut chunk_warnings,
+                        "chunk lookup",
+                    ) else {
+                        continue;
                     };
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(_)) => {
@@ -159,18 +175,43 @@ impl CodesearchService {
                             serve_state.record_tool_call(alias, "get_chunk");
                             serve_state.touch_access(alias);
                         }
-                        let store = match bounded_vector_read(&store_arc.vector_store).await {
+                        // Try-lock like the scan above: the store answered the
+                        // scan moments ago; waiting here reintroduces the very
+                        // wedge the scan just removed whenever indexing took
+                        // the lock in between.
+                        let store = match store_arc.vector_store.try_read() {
                             Ok(store) => Some(store),
-                            Err(e) => {
+                            Err(_) => {
                                 push_store_warning(
                                     &mut chunk_warnings,
-                                    &store_warning(alias, "chunk lookup", &format!("{e:#}")),
+                                    &store_warning(
+                                        alias,
+                                        "chunk lookup",
+                                        "store busy: active indexing holds the write lock — \
+                                         repo skipped in this fan-out, retry shortly",
+                                    ),
                                 );
                                 None
                             }
                         };
+                        // The owning alias is known here — prefix with it
+                        // directly. `prefix_result_path` infers the alias by
+                        // path-root matching, which never matches a
+                        // project-relative stored path, so the group-scoped
+                        // answer used to ship unprefixed.
+                        let root = ctx
+                            .alias_roots
+                            .get(alias)
+                            .map(String::as_str)
+                            .unwrap_or("");
                         match store.as_ref().map(|s| s.get_chunk(request.chunk_id)) {
-                            Some(Ok(c)) => c,
+                            Some(Ok(Some(mut c))) => {
+                                owner_alias = Some(alias.clone());
+                                stored_path_raw = Some(c.path.clone());
+                                c.path = prefix_path_with_alias(&c.path, Some(alias), root);
+                                Some(c)
+                            }
+                            Some(Ok(None)) => None,
                             Some(Err(ref e)) => {
                                 push_store_warning(
                                     &mut chunk_warnings,
@@ -213,6 +254,7 @@ impl CodesearchService {
                     };
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(c)) => {
+                            owner_alias = aliases.get(i).cloned();
                             found = Some(c);
                             break;
                         }
@@ -236,7 +278,10 @@ impl CodesearchService {
                 )
                 .await
             {
-                Ok(c) => c,
+                Ok(c) => {
+                    owner_alias = ctx.project_alias.clone();
+                    c
+                }
                 Err(e) => {
                     push_store_warning(
                         &mut chunk_warnings,
@@ -266,6 +311,14 @@ impl CodesearchService {
             }
         };
 
+        // The ORIGINAL project-relative stored path for the context read
+        // below, captured before display prefixing rewrites chunk.path. The
+        // group's unique-owner arm already rewrote its chunk's path inside
+        // itself, so it publishes the pre-prefix copy via `stored_path_raw`.
+        let stored_path = stored_path_raw
+            .take()
+            .unwrap_or_else(|| chunk.path.clone());
+
         // Prefix path with alias for multi-repo identification
         chunk.path = ctx.prefix_result_path(&chunk.path);
 
@@ -274,9 +327,19 @@ impl CodesearchService {
         let mut note = None;
 
         if context_lines > 0 {
-            // Resolve relative chunk paths against project root (not process CWD).
+            // Resolve relative chunk paths against the OWNING repo's root —
+            // chunk paths are project-relative, and in serve mode the service's
+            // own project_path is not that repo's root, so the old join never
+            // found the file. Stdio single-repo mode has no alias roots and
+            // keeps the historical project_path join.
             let source_path = if Path::new(&chunk.path).is_absolute() {
                 PathBuf::from(&chunk.path)
+            } else if let Some(root) = owner_alias
+                .as_deref()
+                .and_then(|alias| ctx.alias_roots.get(alias))
+                .filter(|root| !root.is_empty())
+            {
+                Path::new(root).join(stored_path.trim_start_matches('/'))
             } else {
                 self.project_path.join(&chunk.path)
             };
@@ -308,8 +371,8 @@ impl CodesearchService {
         let response = GetChunkResponse {
             chunk_id: request.chunk_id,
             path: chunk.path,
-            start_line: chunk.start_line,
-            end_line: chunk.end_line,
+            start_line: chunk.start_line + 1,
+            end_line: chunk.end_line + 1,
             kind: chunk.kind,
             signature: chunk.signature,
             content: chunk.content,

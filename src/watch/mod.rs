@@ -674,14 +674,24 @@ mod tests {
         Ok(())
     }
 
-    /// Build a `FileWatcher` with the home directory pointed at an empty
-    /// temporary directory, so the developer's real
-    /// `~/.codesearch/.codesearchignore` cannot leak into the assertions.
+    /// Build a `FileWatcher` with the home directory AND `CODESEARCH_HOME`
+    /// pointed at empty temporary directories, so the developer's real global
+    /// `.codesearchignore` (from either root) cannot leak into the assertions.
     /// CI has no such file, which is why the ambient dependency went unnoticed.
     fn watcher_with_isolated_home(root: PathBuf) -> FileWatcher {
-        let home = tempdir().unwrap();
-        let home = home.path().to_string_lossy().into_owned();
-        let _guard = EnvRestore::set(&[("HOME", &home), ("USERPROFILE", &home)]);
+        let scratch = tempdir().unwrap();
+        let bare_home = scratch.path().join("bare-home");
+        let cs_home = scratch.path().join("cs-home");
+        fs::create_dir_all(&bare_home).unwrap();
+        fs::create_dir_all(&cs_home).unwrap();
+        let _guard = EnvRestore::set(&[
+            (
+                crate::constants::CODESEARCH_HOME_ENV,
+                cs_home.to_str().unwrap(),
+            ),
+            ("HOME", bare_home.to_str().unwrap()),
+            ("USERPROFILE", bare_home.to_str().unwrap()),
+        ]);
         FileWatcher::new(root)
     }
 

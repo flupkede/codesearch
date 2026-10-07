@@ -1,4 +1,4 @@
-use super::helpers::prefix_path_with_alias;
+use super::helpers::{prefix_path_with_alias, SourcedResult};
 use crate::embed::ModelType;
 use crate::index::SharedStores;
 use crate::vectordb::VectorStore;
@@ -155,8 +155,11 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
 /// investigation chasing an indexing problem that did not exist.
 #[must_use]
 pub(crate) struct MultiReadOutcome<R> {
-    /// Merged, deduplicated, score-sorted results from the stores that worked.
-    pub(crate) results: Vec<R>,
+    /// Merged, deduplicated, score-sorted results from the stores that worked,
+    /// each tagged with its origin repo. Chunk ids are store-local counters, so
+    /// the tag — not the id — is what downstream resolution must key on; see
+    /// [`crate::mcp::SourcedResult`].
+    pub(crate) results: Vec<SourcedResult<R>>,
     /// `(alias, full error chain)` for every store that failed. Empty on a
     /// clean run.
     pub(crate) failures: Vec<(String, String)>,
@@ -565,7 +568,11 @@ impl<R> MultiReadOutcome<R> {
     /// Deliberately the only ergonomic way to get at `results`: reaching for
     /// the field directly and dropping `failures` is `unwrap_or_default()`
     /// under a new name, and that is the bug this whole type exists to stop.
-    pub(crate) fn into_results(self, warnings: &mut Vec<String>, what: &str) -> Vec<R> {
+    pub(crate) fn into_results(
+        self,
+        warnings: &mut Vec<String>,
+        what: &str,
+    ) -> Vec<SourcedResult<R>> {
         for (alias, err) in &self.failures {
             push_store_warning(warnings, &store_warning(alias, what, err));
         }
@@ -645,5 +652,21 @@ impl MultiStoreContext {
             );
         }
         crate::cache::normalize_path_str(path)
+    }
+
+    /// Prefix a chunk path with its KNOWN source alias (group fan-out results).
+    ///
+    /// `prefix_result_path` infers the alias by matching the path against every
+    /// repo root — which never matches a project-relative stored path, so group
+    /// results silently shipped unprefixed. A fan-out result already carries
+    /// its origin alias, so no inference is needed here: strip the root when
+    /// the path is absolute, treat it as repo-relative otherwise.
+    pub(crate) fn prefix_sourced_path(&self, alias: &str, path: &str) -> String {
+        let root = self
+            .alias_roots
+            .get(alias)
+            .map(String::as_str)
+            .unwrap_or("");
+        prefix_path_with_alias(path, Some(alias), root)
     }
 }

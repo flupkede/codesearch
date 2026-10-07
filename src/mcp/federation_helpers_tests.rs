@@ -1,7 +1,10 @@
 //! Unit tests for the federation merge/parse/convert helpers. The
 //! FederationClient HTTP layer + resolve_group_targets are covered
 //! separately (federation/mod.rs and db_discovery/repos.rs respectively).
-use super::{convert_remote_item, merge_ranked_lists, parse_search_items_from_call_result};
+use super::{
+    convert_remote_item, merge_ranked_lists, parse_note_from_call_result,
+    parse_search_items_from_call_result,
+};
 use crate::federation::RemoteSearchItem;
 use crate::mcp::types::SearchResultItem;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -141,6 +144,31 @@ fn parse_federated_chunk_ref_id_after_last_colon() {
 fn parse_federated_chunk_ref_rejects_garbage() {
     assert!(super::parse_federated_chunk_ref("no-colon-here").is_none());
     assert!(super::parse_federated_chunk_ref("cloud:notanumber").is_none());
+}
+
+// === parse_note_from_call_result (leg refusal relay) ===================
+
+#[test]
+fn parse_note_extracts_a_leg_refusal_and_ignores_noteless_payloads() {
+    // The semantic refusal shape: results emptied by min_score, note naming
+    // the threshold. A federated leg answering this must not read as
+    // "no hits there" — the note is the difference.
+    let refusal = serde_json::json!({
+        "results": [],
+        "note": "2 candidate hit(s) found but all scored below min_score 0.800; \
+                 refusing instead of returning the nearest neighbours."
+    })
+    .to_string();
+    let note = parse_note_from_call_result(&call_result_with_json(&refusal));
+    let note = note.expect("refusal note must be extracted");
+    assert!(note.contains("min_score 0.800"), "got: {note}");
+
+    // A normal answer carries no note — and an empty-string note (a peer
+    // that echoes the field unconditionally) must not surface as one.
+    let plain = serde_json::json!({ "results": [{ "path": "a.rs", "score": 0.9 }] }).to_string();
+    assert!(parse_note_from_call_result(&call_result_with_json(&plain)).is_none());
+    let blank = serde_json::json!({ "results": [], "note": "" }).to_string();
+    assert!(parse_note_from_call_result(&call_result_with_json(&blank)).is_none());
 }
 
 // === parse_search_items_from_call_result (serve-delegation re-parse) ===

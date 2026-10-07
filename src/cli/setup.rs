@@ -46,10 +46,20 @@ pub async fn run(model: Option<String>) -> Result<()> {
         ));
     }
 
+    // Record the choice so serve picks it up automatically on future
+    // launches — without this the operator had to re-type `serve --model X`
+    // every time (setup used to download and then silently forget).
+    crate::embed::save_default_model(model_type)?;
+
     println!(
         "✅ Setup complete! Model '{}' ({dimensions} dims) ready at {}",
         model_type.short_name(),
         cache_dir.display()
+    );
+    println!(
+        "🧠 Default model for new indexes persisted: {}. `codesearch serve` now uses it \
+         automatically (override per-run with --model).",
+        model_type.short_name()
     );
     Ok(())
 }

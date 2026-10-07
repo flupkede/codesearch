@@ -7,8 +7,9 @@ pub use cache::{
     CacheStats, CachedBatchEmbedder, PersistentCacheStats, PersistentEmbeddingCache, QueryCache,
     QueryCacheStats,
 };
-pub use embedder::{FastEmbedder, ModelType};
-
+pub use embedder::{
+    is_model_in_cache, load_default_model, save_default_model, FastEmbedder, ModelType,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::env;
@@ -311,6 +312,11 @@ impl Default for EmbeddingService {
 #[derive(Default)]
 pub struct EmbeddingServicePool {
     services: Mutex<HashMap<ModelType, Arc<Mutex<EmbeddingService>>>>,
+    /// Per-model init locks. The `services` map lock is only ever held for a
+    /// lookup — loading a model runs under the per-model init lock, so a slow
+    /// (or wedged) load of one model cannot block lookups or loads of any
+    /// other model.
+    init_locks: Mutex<HashMap<ModelType, Arc<Mutex<()>>>>,
     cache_dir: Option<std::path::PathBuf>,
 }
 
@@ -320,8 +326,16 @@ impl EmbeddingServicePool {
     pub fn new(cache_dir: Option<std::path::PathBuf>) -> Self {
         Self {
             services: Mutex::new(HashMap::new()),
+            init_locks: Mutex::new(HashMap::new()),
             cache_dir,
         }
+    }
+
+    /// Return the service for `model` if it is already loaded, without ever
+    /// triggering a load. Search handlers use this to guarantee that a query
+    /// never turns into a network fetch of model files.
+    pub fn get_if_cached(&self, model: ModelType) -> Option<Arc<Mutex<EmbeddingService>>> {
+        self.services.lock().ok()?.get(&model).cloned()
     }
 
     /// Return the service for `model`, loading its ONNX model on first use.
@@ -329,17 +343,67 @@ impl EmbeddingServicePool {
     /// The returned `Arc` is locked independently per model, so a caller can
     /// hold it across an `embed_query` without blocking other models.
     pub fn get(&self, model: ModelType) -> Result<Arc<Mutex<EmbeddingService>>> {
+        if let Some(existing) = self.get_if_cached(model) {
+            return Ok(existing);
+        }
+        let init_lock = {
+            let mut guard = self
+                .init_locks
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Embedding service pool mutex poisoned: {e}"))?;
+            guard.entry(model).or_default().clone()
+        };
+        // Held across the load: same-model callers wait here instead of
+        // racing into duplicate loads. They block their own thread only —
+        // no map lock and no other model is involved.
+        let _init = init_lock
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Embedding model init mutex poisoned: {e}"))?;
+        // Someone may have finished the load while we waited on the init lock.
+        if let Some(existing) = self.get_if_cached(model) {
+            return Ok(existing);
+        }
+        let service = self.load_bounded(model)?;
+        let arc = Arc::new(Mutex::new(service));
         let mut guard = self
             .services
             .lock()
             .map_err(|e| anyhow::anyhow!("Embedding service pool mutex poisoned: {e}"))?;
-        if let Some(existing) = guard.get(&model) {
-            return Ok(existing.clone());
-        }
-        let service = EmbeddingService::with_cache_dir(model, self.cache_dir.as_deref())?;
-        let arc = Arc::new(Mutex::new(service));
         guard.insert(model, arc.clone());
         Ok(arc)
+    }
+
+    /// Load `model` off the async critical path, bounded in time.
+    ///
+    /// `EmbeddingService::with_cache_dir` resolves files through hf-hub; on a
+    /// cold cache that is a network download which can stall indefinitely on
+    /// networks that black-hole the model host. Running it on a dedicated
+    /// thread behind `recv_timeout` bounds the damage: callers get a
+    /// fail-fast error pointing at `codesearch setup` instead of hanging.
+    /// On timeout the loader thread is deliberately leaked — there is no safe
+    /// way to kill a thread mid-download — but it holds no pool locks, so it
+    /// can only waste its own resources until the underlying fetch gives up.
+    fn load_bounded(&self, model: ModelType) -> Result<EmbeddingService> {
+        let timeout_secs = std::env::var(crate::constants::MODEL_LOAD_TIMEOUT_SECS_ENV)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(crate::constants::MODEL_LOAD_TIMEOUT_SECS);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cache_dir = self.cache_dir.clone();
+        std::thread::spawn(move || {
+            // The receiver may already be gone on timeout — nothing to do.
+            let _ = tx.send(EmbeddingService::with_cache_dir(model, cache_dir.as_deref()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+            Ok(Ok(service)) => Ok(service),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(anyhow::anyhow!(
+                "embedding model '{model:?}' did not initialise within {timeout_secs}s — likely a \
+                 blocked network fetch of an uncached model; pre-populate the \
+                 model cache via `codesearch setup` and retry"
+            )),
+        }
     }
 
     /// Embed `chunks`, releasing the service lock between ONNX mini-batches.
@@ -433,6 +497,59 @@ mod tests {
             .embed_chunks_yielding(ModelType::default(), Vec::new(), std::time::Duration::ZERO)
             .expect("empty embed must succeed");
         assert!(out.is_empty());
+    }
+
+    /// `get_if_cached` is the search-path gate: it must answer "not loaded"
+    /// without ever triggering a load. A lookup that could initialise a
+    /// model would be useless as a "can I embed without a download?"
+    /// preflight — the whole point is that search never fetches.
+    #[test]
+    fn get_if_cached_reports_fresh_pool_as_unloaded() {
+        let pool = EmbeddingServicePool::new(None);
+        assert!(pool.get_if_cached(ModelType::default()).is_none());
+        assert!(pool.get_if_cached(ModelType::EmbeddingGemma300MQ4).is_none());
+    }
+
+    #[test]
+    #[ignore] // Requires EmbeddingGemma300MQ4 in the local models cache
+    fn get_publishes_the_service_to_get_if_cached() {
+        let pool = EmbeddingServicePool::new(Some(test_cache_dir()));
+        let model = ModelType::EmbeddingGemma300MQ4;
+        assert!(
+            pool.get_if_cached(model).is_none(),
+            "fresh pool must report unloaded"
+        );
+        pool.get(model).expect("model load");
+        assert!(
+            pool.get_if_cached(model).is_some(),
+            "get must publish the loaded service for later no-load lookups"
+        );
+    }
+
+    /// Double-checked init: threads racing `get()` on the same model must all
+    /// receive THE SAME service instance — a duplicate load would mean two
+    /// ONNX runtimes for one model (double memory) and `Arc::ptr_eq` is the
+    /// directly observable contract.
+    #[test]
+    #[ignore] // Requires EmbeddingGemma300MQ4 in the local models cache
+    fn concurrent_get_returns_one_shared_service_per_model() {
+        let pool = std::sync::Arc::new(EmbeddingServicePool::new(Some(test_cache_dir())));
+        let model = ModelType::EmbeddingGemma300MQ4;
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let pool = pool.clone();
+            handles.push(std::thread::spawn(move || {
+                pool.get(model).expect("model load")
+            }));
+        }
+        let first = handles.remove(0).join().expect("loader thread");
+        for handle in handles {
+            let service = handle.join().expect("loader thread");
+            assert!(
+                Arc::ptr_eq(&first, &service),
+                "concurrent get() must share one service instance per model"
+            );
+        }
     }
 
     /// The index-metadata reader must invert `write_metadata_fields`, and must

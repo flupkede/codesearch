@@ -103,6 +103,20 @@ pub(crate) fn parse_search_items_from_call_result(
     }
 }
 
+/// Extract an explicit refusal `note` from a rendered search payload (a
+/// leg emptied by `min_score` explains itself in the note). The federated
+/// response surfaces it as a warning so a leg's honest refusal never reads
+/// as "no hits there".
+pub(crate) fn parse_note_from_call_result(result: &CallToolResult) -> Option<String> {
+    let text = extract_call_tool_text(result);
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("note")
+        .and_then(|n| n.as_str())
+        .map(str::to_string)
+        .filter(|n| !n.is_empty())
+}
+
 /// Convert a remote search hit into a local `SearchResultItem`, tagging it with
 /// its origin (`source`) and a project-namespaced `chunk_ref` for later
 /// retrieval.

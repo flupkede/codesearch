@@ -80,25 +80,31 @@ impl CodesearchService {
         if let Some(ref sv) = ctx.stores_vec {
             let aliases = ctx.aliases();
             let mut all_items: Vec<FileOutlineItem> = Vec::new();
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            // Dedup keys on (store, id): chunk ids are per-repo counters and
+            // collide across the fan-out, so a bare-id set would drop a later
+            // repo's outline entries.
+            let mut seen_ids: std::collections::HashSet<(usize, u32)> =
+                std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(warnings, aliases, store_idx, "outline scan", &e);
-                        continue;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    store_idx,
+                    warnings,
+                    "outline scan",
+                ) else {
+                    continue;
                 };
                 match store.chunks_for_file(normalized) {
                     Ok(metas) => {
                         for c in metas {
-                            if seen_ids.insert(c.id) {
+                            if seen_ids.insert((store_idx, c.id)) {
                                 all_items.push(FileOutlineItem {
                                     chunk_id: c.id,
                                     kind: c.kind,
                                     signature: c.signature,
-                                    start_line: c.start_line,
-                                    end_line: c.end_line,
+                                    start_line: c.start_line + 1,
+                                    end_line: c.end_line + 1,
                                 });
                             }
                         }
@@ -121,8 +127,8 @@ impl CodesearchService {
                             chunk_id: c.id,
                             kind: c.kind,
                             signature: c.signature,
-                            start_line: c.start_line,
-                            end_line: c.end_line,
+                            start_line: c.start_line + 1,
+                            end_line: c.end_line + 1,
                         })
                         .collect();
                     out.sort_by_key(|i| i.start_line);

@@ -41,6 +41,13 @@ pub const CONFIG_DIR_NAME: &str = ".codesearch";
 /// Name of the file metadata database
 pub const FILE_META_DB_NAME: &str = "file_meta.json";
 
+/// Name of the persisted default-model choice in `<codesearch_home>/`.
+///
+/// Written by `codesearch setup`, adopted by `codesearch serve` when its own
+/// `--model` flag is absent — so an operator's setup choice survives across
+/// serve launches instead of being silently dropped.
+pub const DEFAULT_MODEL_FILE: &str = "default_model.json";
+
 /// Subdirectory name for embedding models within the global config dir
 const MODELS_SUBDIR: &str = "models";
 
@@ -440,6 +447,13 @@ pub const FIND_IMPACT_PATH: &str = "/find-impact";
 /// Override with `CODESEARCH_REPO_IDLE_TIMEOUT_SECS`.
 pub const REPO_IDLE_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
 
+/// Idle MCP session reap bound (rmcp `LocalSessionManager` keep_alive).
+/// A wedged session keeps its socket and its FIFO-serialized worker alive
+/// indefinitely; 30 minutes is far beyond any human pause in local
+/// interactive use, yet guarantees a stuck session eventually goes away
+/// without a serve restart.
+pub const MCP_IDLE_SESSION_SECS: u64 = 30 * 60; // 30 minutes
+
 /// How often the idle-reaper background task checks for repos to evict.
 pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 
@@ -575,6 +589,21 @@ pub const STORE_LOCK_WAIT_SECS: u64 = 300;
 
 /// Environment variable overriding [`STORE_LOCK_WAIT_SECS`].
 pub const STORE_LOCK_WAIT_SECS_ENV: &str = "CODESEARCH_STORE_LOCK_WAIT_SECS";
+
+/// How long a lazy embedding-model load may take before it is abandoned
+/// with an actionable error.
+///
+/// `EmbeddingService::with_cache_dir` resolves model files through hf-hub,
+/// which on a cold cache means a network download. On networks that
+/// black-hole the model host this fetch never completes — and never errors —
+/// so an unbounded load wedges every caller stuck on the model's init lock
+/// (observed as a whole-night serve stall). The bound turns that into a
+/// fail-fast error pointing at `codesearch setup`; generous enough to let a
+/// legitimate first-time download through.
+pub const MODEL_LOAD_TIMEOUT_SECS: u64 = 600;
+
+/// Environment variable overriding [`MODEL_LOAD_TIMEOUT_SECS`].
+pub const MODEL_LOAD_TIMEOUT_SECS_ENV: &str = "CODESEARCH_MODEL_LOAD_TIMEOUT_SECS";
 
 /// Total number of attempts (initial request + retries) the federation client
 /// makes against a remote peer that answers with a transient HTTP status

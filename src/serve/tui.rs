@@ -59,12 +59,35 @@ pub async fn run_tui(
 
     // Run main loop. Errors (e.g. from terminal.draw) propagate up
     // and are caught below to ensure restoration.
+    let session_probe = Arc::clone(&state);
     let result = run_tui_loop(&mut terminal, state, cancel_token, &serve_url).await;
 
     // Always restore terminal, even on error
     tui_common::restore_terminal(&mut terminal)?;
 
-    result
+    // After `q` the serve keeps draining open MCP sessions for up to ~3 s before
+    // force-exiting — from the terminal this pause looks like a hang, so say so.
+    let user_quit = result.as_ref().is_ok_and(|quit| *quit);
+    if user_quit {
+        println!("{}", shutdown_drain_notice(session_probe.active_session_count()));
+    }
+
+    result.map(|_| ())
+}
+
+/// The post-`q` shutdown notice. Extracted so its contract is pinned by a
+/// test: name the bounded wait (~3 s), count the draining sessions, and say
+/// the process exits by itself — the notice exists precisely to stop the
+/// reflex second Ctrl-C that hard-kills serve mid-drain once raw mode is off.
+pub(crate) fn shutdown_drain_notice(active_sessions: u64) -> String {
+    if active_sessions == 0 {
+        "🛑 Shutting down…".to_string()
+    } else {
+        format!(
+            "🛑 Shutting down: waiting up to ~3 s for {active_sessions} open MCP session(s) to \
+             drain, then exiting by itself — no Ctrl-C needed."
+        )
+    }
 }
 
 async fn run_tui_loop(
@@ -72,10 +95,11 @@ async fn run_tui_loop(
     state: Arc<ServeState>,
     cancel_token: CancellationToken,
     serve_url: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     // TUI-local state
     let mut table_state = ratatui::widgets::TableState::default();
     table_state.select(Some(0));
+    let mut user_quit = false;
     let tick_interval = Duration::from_millis(500);
     let poll_timeout = Duration::from_millis(100);
 
@@ -404,6 +428,7 @@ async fn run_tui_loop(
 
         if should_quit {
             // User pressed q — signal shutdown to the whole serve process
+            user_quit = true;
             cancel_token.cancel();
             break;
         }
@@ -415,7 +440,7 @@ async fn run_tui_loop(
         tokio::time::sleep(tick_interval).await;
     }
 
-    Ok(())
+    Ok(user_quit)
 }
 
 // ---------------------------------------------------------------------------

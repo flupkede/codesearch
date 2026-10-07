@@ -247,11 +247,38 @@ impl FileWalker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::EnvRestore;
+    use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
 
+    /// Pin every location the walker can find a global `.codesearchignore`
+    /// (CODESEARCH_HOME and its HOME/USERPROFILE fallback) to fresh empty
+    /// directories, so a developer's real global ignore list cannot prune the
+    /// test fixtures — CI has no such file, which is how the ambient dependency
+    /// went unnoticed (the pilot's global list starts with `*.bin`, which
+    /// silently killed test_skip_binary_files on the dev machine).
+    fn isolated_global_ignore_env() -> (TempDir, EnvRestore) {
+        let scratch = TempDir::new().unwrap();
+        let cs_home = scratch.path().join("cs-home");
+        let bare_home = scratch.path().join("bare-home");
+        fs::create_dir_all(&cs_home).unwrap();
+        fs::create_dir_all(&bare_home).unwrap();
+        let env = EnvRestore::set(&[
+            (
+                crate::constants::CODESEARCH_HOME_ENV,
+                cs_home.to_str().unwrap(),
+            ),
+            ("HOME", bare_home.to_str().unwrap()),
+            ("USERPROFILE", bare_home.to_str().unwrap()),
+        ]);
+        (scratch, env)
+    }
+
     #[test]
+    #[serial]
     fn test_file_walker_basic() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
 
         // Create some test files
@@ -267,7 +294,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_skip_binary_files() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
 
         // Create text file
@@ -286,7 +315,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_language_detection() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
 
         fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
@@ -303,7 +334,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_excluded_directories() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
 
         // Create file in excluded directory
@@ -326,7 +359,9 @@ mod tests {
     /// (.yaml/.json) are indexable on their own, so without the name match the
     /// walker would index every churn commit of a generated lock file.
     #[test]
+    #[serial]
     fn test_excluded_lock_files() {
+        let _isolation = isolated_global_ignore_env();
         let dir = TempDir::new().unwrap();
 
         fs::write(dir.path().join("pnpm-lock.yaml"), "lockVersion: '9.0'").unwrap();
@@ -346,7 +381,9 @@ mod tests {
     /// in `filter_entry` would let every internal file be indexed.
     /// Covers Aikido group 30641794.
     #[test]
+    #[serial]
     fn test_rejects_excluded_named_root() {
+        let _isolation = isolated_global_ignore_env();
         let parent = TempDir::new().unwrap();
         let git_root = parent.path().join(".git");
         fs::create_dir(&git_root).unwrap();

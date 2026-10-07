@@ -935,8 +935,8 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             .iter()
             .map(|r| JsonResult {
                 path: r.path.clone(),
-                start_line: r.start_line,
-                end_line: r.end_line,
+                start_line: r.start_line + 1,
+                end_line: r.end_line + 1,
                 kind: r.kind.clone(),
                 content: if compact {
                     None
@@ -1276,8 +1276,8 @@ fn print_result(
     // Show location and kind
     let location = format!(
         "   Lines {}-{} • {}",
-        result.start_line,
-        result.end_line,
+        result.start_line + 1,
+        result.end_line + 1,
         sanitize_for_terminal(&result.kind)
     );
     println!("{}", location.dimmed());

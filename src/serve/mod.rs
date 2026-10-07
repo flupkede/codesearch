@@ -39,9 +39,9 @@ use crate::constants::{
     CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
     DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH,
     FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT,
-    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS,
-    REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH,
-    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, MCP_IDLE_SESSION_SECS,
+    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV,
+    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
@@ -1553,25 +1553,7 @@ impl ServeState {
                     continue;
                 }
 
-                let cfg = match state.config.read() {
-                    Ok(c) => c.clone(),
-                    Err(e) => {
-                        tracing::warn!("repos persist skipped: config lock poisoned: {}", e);
-                        state.persist_deadline_unix_ms.store(0, Ordering::Relaxed);
-                        continue;
-                    }
-                };
-                // Route through persist_config so the override path is honored
-                // (keeps the metadata-persist worker hermetic in tests; identical
-                // to cfg.save() in production where the override is None).
-                let state_persist = state.clone();
-                let save_res =
-                    tokio::task::spawn_blocking(move || state_persist.persist_config(&cfg)).await;
-                match save_res {
-                    Ok(Ok(())) => tracing::debug!("repos.json metadata persisted"),
-                    Ok(Err(e)) => tracing::warn!("repos persist failed: {}", e),
-                    Err(e) => tracing::warn!("repos persist task join failed: {}", e),
-                }
+                state.run_persist_pass().await;
 
                 state.persist_deadline_unix_ms.store(0, Ordering::Relaxed);
                 state.persist_worker_started.store(false, Ordering::Release);
@@ -1589,6 +1571,66 @@ impl ServeState {
                 break;
             }
         });
+    }
+
+    /// One debounced-write pass over the in-memory repos config.
+    ///
+    /// The snapshot clone and the file write deliberately happen WITHOUT the
+    /// config lock (the write is blocking I/O), so a registration landing in
+    /// between exists only in memory while the stale snapshot lands on disk —
+    /// a lost update. `persist_config` adopting its own mtime already keeps
+    /// readers from clobbering memory with that stale file; this pass then
+    /// re-verifies memory against the persisted snapshot and rewrites until
+    /// they agree, so the disk converges too. Bounded: under a continuous
+    /// stream of mutations it gives up after a few passes and the next
+    /// scheduled pass picks up whatever remained.
+    async fn run_persist_pass(self: &Arc<Self>) {
+        const MAX_DIVERGENT_PASSES: usize = 5;
+        for attempt in 1..=MAX_DIVERGENT_PASSES {
+            let cfg = match self.config.read() {
+                Ok(c) => c.clone(),
+                Err(e) => {
+                    tracing::warn!("repos persist skipped: config lock poisoned: {}", e);
+                    return;
+                }
+            };
+            // Route through persist_config so the override path is honored
+            // (keeps the metadata-persist worker hermetic in tests; identical
+            // to cfg.save() in production where the override is None).
+            let state_pass = self.clone();
+            // Clone for the blocking write: `cfg` itself stays here for the
+            // post-write divergence check below.
+            let snapshot = cfg.clone();
+            let save_res =
+                tokio::task::spawn_blocking(move || state_pass.persist_config(&snapshot)).await;
+            match save_res {
+                Ok(Ok(())) => tracing::debug!("repos.json metadata persisted"),
+                Ok(Err(e)) => {
+                    tracing::warn!("repos persist failed: {}", e);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("repos persist task join failed: {}", e);
+                    return;
+                }
+            }
+            let diverged = match self.config.read() {
+                Ok(current) => *current != cfg,
+                // A poisoned lock says nothing about divergence; don't spin.
+                Err(_) => false,
+            };
+            if !diverged {
+                return;
+            }
+            tracing::warn!(
+                "repos.json diverged from memory during persist (pass {attempt}); rewriting"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tracing::warn!(
+            "repos persist gave up after {MAX_DIVERGENT_PASSES} divergent passes; \
+             the next scheduled pass will rewrite"
+        );
     }
 
     /// Reconcile registered repo paths against the filesystem before warmup.
@@ -2207,6 +2249,10 @@ impl ServeState {
         // report honestly.
         let mut db_deleted = !db_path.exists();
         let mut db_delete_error: Option<String> = None;
+        // True when the DB dir's cleanup is owned by the still-running index
+        // task's post-build guard (or the sweeper) — the dir must stay in
+        // place for them, so step 4b must not quarantine it either.
+        let mut delete_deferred = false;
         if db_path.exists() && !index_task_exited {
             // The index task is still alive (typically parked in the
             // uninterruptible `build_index`). Deleting the directory out from
@@ -2224,6 +2270,7 @@ impl ServeState {
                 alias
             );
             db_delete_error = Some("index task still running; DB cleanup deferred".to_string());
+            delete_deferred = true;
         } else if db_path.exists() {
             // Deadline-bounded exponential-backoff retry. We ONLY retry on
             // lock-class errors (sharing/lock violation or access-denied on
@@ -2333,11 +2380,53 @@ impl ServeState {
             }
         }
 
+        // 4b. Quarantine fallback. If the retry budget expired with the
+        // directory still on disk (an external holder: another process, an AV
+        // scanner), leaving it in place silently resurrects a "valid" index on
+        // the next registration — metadata.json model stamps and stale chunk
+        // stores read as ready, fan-out then serves an empty or stale store,
+        // and re-registration against that mismatched legacy data ends in
+        // arroy EINVAL (the pilot's false-ready repos and its os-error-22
+        // wave). Renaming achieves DELETE's semantic goal atomically on unix:
+        // existing holders keep their open file descriptors until they exit,
+        // while a fresh registration sees no db dir at all and builds from
+        // scratch. The quarantined sibling stays for manual cleanup, same
+        // convention as the .codesearch.db.bak-* directories. Deferred
+        // cleanups (live index task) are excluded — their post-build guard
+        // owns the dir.
+        let mut db_quarantined: Option<PathBuf> = None;
+        if !db_deleted && !delete_deferred {
+            let sibling = db_path.with_file_name(format!(
+                "{}.removed-{}",
+                DB_DIR_NAME,
+                Self::now_unix_millis()
+            ));
+            match std::fs::rename(&db_path, &sibling) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "Database dir for '{}' survived the delete budget; quarantined to {} \
+                         (safe to delete manually)",
+                        alias,
+                        sibling.display()
+                    );
+                    db_quarantined = Some(sibling);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to quarantine database dir for '{}' (kept in place): {}",
+                        alias,
+                        e
+                    );
+                }
+            }
+        }
+
         Ok(RepoRemovalOutcome {
             project_path,
             db_path,
             db_deleted,
             db_delete_error,
+            db_quarantined,
         })
     }
 
@@ -3486,9 +3575,28 @@ impl ServeState {
     /// assert on persistence without touching the user's real config.
     pub(crate) fn persist_config(&self, config: &ReposConfig) -> anyhow::Result<()> {
         match self.config_path_override.as_ref() {
-            Some(path) => config.save_to(path),
-            None => config.save(),
+            Some(path) => config.save_to(path)?,
+            None => config.save()?,
+        };
+        // Adopt this write's mtime so reload_if_changed never mistakes our own
+        // persist for an external edit of repos.json. Before this, every
+        // debounced or handler write left the stored mtime stale, the next
+        // reader (warmup / aliases / info / group resolve) reloaded the file we
+        // ourselves had just written, and registrations that had landed in
+        // memory after that snapshot were silently dropped — the pilot's
+        // "ghost loss" of freshly registered aliases.
+        let written_path = match self.config_path_override.as_ref() {
+            Some(p) => Some(p.clone()),
+            None => ReposConfig::path().ok(),
+        };
+        if let Some(path) = written_path {
+            if let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) {
+                if let Ok(mut guard) = self.config_mtime.write() {
+                    *guard = Some(mtime);
+                }
+            }
         }
+        Ok(())
     }
 
     /// Resolve a group name to its constituent aliases.
@@ -5571,6 +5679,12 @@ pub(crate) struct RepoRemovalOutcome {
     /// The last error from `remove_dir_all`. `Some` exactly when
     /// `db_deleted == false`; `None` once a delete succeeds.
     pub db_delete_error: Option<String>,
+    /// When the DB dir survived the delete budget it was renamed out of the
+    /// way (`<DB_DIR_NAME>.removed-<unix_ms>` sibling) so a fresh
+    /// registration builds from scratch instead of adopting the stale index.
+    /// `None` when the dir was deleted, never existed, or its cleanup is
+    /// deferred to a live index task's post-build guard.
+    pub db_quarantined: Option<PathBuf>,
 }
 
 /// Remove-repo handler: DELETE /repos/{alias}
@@ -5601,6 +5715,17 @@ async fn remove_repo_handler(
                     "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
                         .to_string(),
                 )
+            } else if let Some(quarantine) = &outcome.db_quarantined {
+                (
+                    "removed_db_quarantined",
+                    format!(
+                        "Repo removed: FSW stopped, evicted from memory, unregistered; \
+                         DB dir survived the delete budget and was quarantined to {} \
+                         (a fresh registration builds from scratch; delete it manually \
+                         when convenient)",
+                        quarantine.display()
+                    ),
+                )
             } else {
                 (
                     "removed_db_locked",
@@ -5623,6 +5748,7 @@ async fn remove_repo_handler(
                     "path": outcome.project_path,
                     "db_deleted": outcome.db_deleted,
                     "db_delete_error": outcome.db_delete_error,
+                    "db_quarantined": outcome.db_quarantined,
                     "message": message,
                 })),
             )
@@ -6207,6 +6333,64 @@ fn keep_warm_foreign_target(ping_url: &str, self_host: &str) -> Option<String> {
     }
 }
 
+// rmcp session manager bounded to reap idle MCP sessions. Extracted so the
+// reap contract is pinned by a test instead of only by the CHANGELOG claim:
+// `keep_alive = None` assumed TCP liveness would collect wedged sessions,
+// but a stuck request keeps its socket and its FIFO-serialized worker alive
+// indefinitely (observed active_sessions=4 with a single client).
+pub(crate) fn session_manager_with_idle_reap() -> LocalSessionManager {
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive =
+        Some(std::time::Duration::from_secs(MCP_IDLE_SESSION_SECS));
+    manager
+}
+
+// Best-effort startup sweep of quarantined DB remnants. remove_repo's
+// delete-budget fallback renames a surviving db dir aside as
+// `<DB_DIR_NAME>.removed-<unix_ms>` "for manual cleanup" — and manual is
+// exactly what never happened, so every budget-expired delete leaked a
+// full stale index copy forever. By startup the external holders that
+// forced the rename (AV scanner, another process) have exited with the
+// previous session, so the tombstone has no readers left to protect:
+// serve deletes the remnants on its way up. Failures warn and never
+// block startup — a remnant that still cannot be removed just waits for
+// the next restart.
+pub(crate) fn sweep_quarantined_db_remnants(repo_paths: &[PathBuf]) {
+    let prefix = format!("{DB_DIR_NAME}.removed-");
+    for repo_path in repo_paths {
+        let entries = match std::fs::read_dir(repo_path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    "quarantine sweep: failed to list {}: {}",
+                    repo_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let remnant = entry.path();
+            match std::fs::remove_dir_all(&remnant) {
+                Ok(()) => info!(
+                    "🧹 swept quarantined db remnant at startup: {}",
+                    remnant.display()
+                ),
+                Err(e) => warn!(
+                    "quarantine sweep: could not remove {} (will retry next startup): {}",
+                    remnant.display(),
+                    e
+                ),
+            }
+        }
+    }
+}
+
 // `run_serve` is the single startup entry point, so its parameter list is the
 // serve CLI surface (bind host/port, registration, default model, TUI,
 // keep-warm, shutdown). Bundling them into a struct would only move the
@@ -6295,6 +6479,91 @@ pub async fn run_serve(
     // supervisor default wedges accept(2) silently (EMFILE).
     #[cfg(unix)]
     raise_fd_limit(config.repos.len());
+
+    // Hook self-heal: upgrade codesearch-managed post-checkout blocks that
+    // were written by an OLDER binary (the pilot's 515 hooks kept the pre-fix
+    // `pwd`/serve_url bodies because nothing regenerated them — re-running
+    // `hooks git install` per repo by hand does not scale). Background and
+    // best-effort: only OUR block region is rewritten, a repo with no hook or
+    // a foreign hook is never touched, and failures never block startup.
+    let hook_repo_paths: Vec<PathBuf> = config.repos.values().cloned().collect();
+    tokio::spawn(async move {
+        let refreshed = tokio::task::spawn_blocking(move || {
+            let mut upgraded = 0usize;
+            let mut up_to_date = 0usize;
+            for repo_path in &hook_repo_paths {
+                match crate::cli::refresh_codesearch_post_checkout_hook(repo_path) {
+                    crate::cli::HookRefreshOutcome::Upgraded => upgraded += 1,
+                    crate::cli::HookRefreshOutcome::UpToDate => up_to_date += 1,
+                    crate::cli::HookRefreshOutcome::NotInstalled
+                    | crate::cli::HookRefreshOutcome::Foreign => {}
+                    crate::cli::HookRefreshOutcome::Failed(e) => warn!(
+                        "post-checkout hook refresh failed for {}: {}",
+                        repo_path.display(),
+                        e
+                    ),
+                }
+            }
+            (upgraded, up_to_date)
+        })
+        .await;
+        if let Ok((upgraded, up_to_date)) = refreshed {
+            if upgraded > 0 {
+                info!(
+                    "🪝 post-checkout hooks: {upgraded} upgraded to this binary, \
+                     {up_to_date} already up to date"
+                );
+            }
+        }
+    });
+
+    // Startup sweep of quarantined DB remnants — the `.removed-*` siblings
+    // remove_repo's delete-budget fallback leaves "for manual cleanup". Run
+    // on its own blocking task: never blocks the listener, and a leftover
+    // holder just means the remnant waits for the next restart.
+    let sweep_repo_paths: Vec<PathBuf> = config.repos.values().cloned().collect();
+    tokio::task::spawn_blocking(move || sweep_quarantined_db_remnants(&sweep_repo_paths));
+
+    // The explicit `--model` flag wins; otherwise adopt the choice persisted
+    // by `codesearch setup`. Without this bridge the pilot operator had to
+    // re-type `--model embeddinggemma-q4` on every serve launch: setup
+    // downloaded the model and then silently forgot the choice, so a bare
+    // `codesearch serve` built every NEW index with the built-in default.
+    let default_model = match default_model {
+        Some(flag) => Some(flag),
+        None => {
+            let persisted = crate::embed::load_default_model();
+            if let Some(model) = persisted {
+                let line = format!(
+                    "🧠 Default model from `codesearch setup`: {} ({} dims)",
+                    model.short_name(),
+                    model.dimensions()
+                );
+                info!("{}", line);
+                eprintln!("{}", line);
+                Some(model)
+            } else {
+                None
+            }
+        }
+    };
+
+    // Pre-flight cache check for the effective default of new indexes. A
+    // missing model previously surfaced only mid-warmup as N parallel index
+    // jobs all hitting the network at once; warn up front with the fix hint
+    // instead (the operator may be behind a proxy where HF is unreachable).
+    let effective_default = default_model.unwrap_or_default();
+    if !crate::embed::is_model_in_cache(effective_default) {
+        let line = format!(
+            "⚠️  Default embedding model '{}' is not in the models cache; the first \
+             index/query will download it from the network. Run `codesearch setup --model {}` \
+             to pre-download it.",
+            effective_default.short_name(),
+            effective_default.short_name(),
+        );
+        warn!("{}", line);
+        eprintln!("{}", line);
+    }
 
     // The idle-suspend window is resolved by the keep-warm task alone (flag >
     // env > default); nothing else consumes it, so `ServeState` does not carry
@@ -6386,12 +6655,15 @@ pub async fn run_serve(
             Ok(svc)
         };
 
-    // Build session manager without keep_alive timeout. The default rmcp timeout
-    // (5 min) kills idle sessions too aggressively for a local long-running serve.
-    // We run single-user local, so abandoned sessions cost nothing — let TCP
-    // liveness determine when a session is truly dead.
-    let mut session_manager = LocalSessionManager::default();
-    session_manager.session_config.keep_alive = None;
+    // Bound idle MCP session lifetime. The previous "no keep-alive" stance
+    // assumed TCP liveness would reap dead clients, but a wedged session
+    // (a request the client already gave up on) keeps its socket and its
+    // session worker alive indefinitely — observed as active_sessions=4 with
+    // a single client, each leaked session pinning an rmcp worker task.
+    // 30 minutes is far beyond any human pause in local interactive use,
+    // yet guarantees a stuck session — and its FIFO-serialized request
+    // queue — eventually goes away without a serve restart.
+    let session_manager = session_manager_with_idle_reap();
     let session_manager = Arc::new(session_manager);
 
     // Configure the rmcp Streamable HTTP server's DNS-rebinding defence

@@ -74,6 +74,84 @@ pub(crate) async fn bounded_fts_read(
     })
 }
 
+/// Try-lock a vector store for an INTERACTIVE multi-repo fan-out, skipping
+/// and reporting a busy repo instead of waiting for it.
+///
+/// Every interactive multi-store handler (find, graph, explore, get_chunk,
+/// the literal metadata lookups) runs on an agent's request path: waits sum
+/// per busy store — N repos held by an indexing run meant N×300 s — the
+/// exact interactive wedge the search fan-outs already killed with try_read.
+/// Single-store paths (`with_*_store_read_for`, project-scoped queries) keep
+/// the bounded wait by design: one repo, no summation.
+///
+/// Returns `None` after appending the same "store busy" warning the search
+/// fan-outs emit, so every skipped repo is named in the response.
+pub(crate) fn try_vector_read_or_note<'a>(
+    lock: &'a tokio::sync::RwLock<VectorStore>,
+    aliases: &[String],
+    idx: usize,
+    warnings: &mut Vec<String>,
+    what: &str,
+) -> Option<tokio::sync::RwLockReadGuard<'a, VectorStore>> {
+    match lock.try_read() {
+        Ok(store) => Some(store),
+        Err(_) => {
+            note_store_failure(
+                warnings,
+                aliases,
+                idx,
+                what,
+                &anyhow::anyhow!(
+                    "store busy: active indexing holds the write lock — \
+                     repo skipped in this fan-out, retry shortly"
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Warning for a group whose answering repos embed with more than one model.
+///
+/// Cosine distance is only meaningful inside a single model's vector space,
+/// yet the group merge ranks hits from different models side by side as if
+/// one scale sorted them. Extracted so the contract — fire only when the
+/// models are genuinely mixed, name every distinct model, explain that each
+/// score is within-repo relevance only — is testable without standing up
+/// two on-disk embedding models.
+pub(crate) fn mixed_model_group_warning<I: IntoIterator<Item = ModelType>>(
+    models: I,
+) -> Option<String> {
+    let distinct: std::collections::HashSet<ModelType> = models.into_iter().collect();
+    if distinct.len() < 2 {
+        return None;
+    }
+    let mut names: Vec<&str> = distinct.iter().map(|m| m.short_name()).collect();
+    names.sort_unstable();
+    Some(format!(
+        "group mixes {} embedding models ({}) — scores are NOT comparable \
+         across repos; read each hit's score as within-repo relevance only",
+        names.len(),
+        names.join(", ")
+    ))
+}
+
+/// Intern a (repo, chunk_id) pair to a unique synthetic id for the group
+/// RRF fusion call.
+///
+/// The pure fusion functions key on a single bare u32, but chunk ids are
+/// per-repo counters and collide across a group — two repos' chunk id 0
+/// fused into ONE entry. Every (alias, id) pair maps to its own synthetic
+/// id; the fused ids map straight back through the same table. Extracted
+/// so the collision contract is unit-testable without standing up stores.
+pub(crate) fn intern_group_chunk_id(
+    map: &mut std::collections::HashMap<(String, u32), u32>,
+    key: (String, u32),
+) -> u32 {
+    let next = map.len() as u32;
+    *map.entry(key).or_insert(next)
+}
+
 use crate::db_discovery::{find_best_database, load_repos_config};
 use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::file::Language;
@@ -275,6 +353,32 @@ fn merge_exact_into_fts(
             fts_results[existing_idx].score = fts_results[existing_idx].score.max(r.score);
         } else {
             positions.insert(r.chunk_id, fts_results.len());
+            fts_results.push(r);
+        }
+    }
+}
+
+/// Group-fan-out sibling of [`merge_exact_into_fts`]: merge exact-identifier
+/// hits into the lexical result set, deduplicating by `(alias, chunk_id)` —
+/// a bare chunk_id is store-local and collides across repos, so keying on it
+/// alone would fold one repo's chunk into another's entry.
+fn merge_exact_into_fts_multi(
+    fts_results: &mut Vec<SourcedResult<crate::fts::FtsResult>>,
+    exact: Vec<SourcedResult<crate::fts::FtsResult>>,
+) {
+    let mut positions: std::collections::HashMap<(String, u32), usize> = fts_results
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| ((r.alias.clone(), r.result.chunk_id), idx))
+        .collect();
+
+    for r in exact {
+        let key = (r.alias.clone(), r.result.chunk_id);
+        if let Some(&existing_idx) = positions.get(&key) {
+            let existing = &mut fts_results[existing_idx];
+            existing.result.score = existing.result.score.max(r.result.score);
+        } else {
+            positions.insert(key, fts_results.len());
             fts_results.push(r);
         }
     }
@@ -869,7 +973,9 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
         if let Some((kind, imported)) = parsed {
             items.push(ImportItem {
                 imported,
-                line: start_line + offset,
+                // `start_line` is the chunk's 0-based first line and `offset`
+                // is 0-based within it; the response emits 1-based lines.
+                line: start_line + offset + 1,
                 kind,
             });
         }
@@ -1047,16 +1153,34 @@ impl CodesearchService {
         }
     }
 
-    /// Get (lazily initializing) the embedding service for `model`.
+    /// Resolve the embedding service for a SEARCH query — or `None` when the
+    /// model cannot be used without a network fetch.
     ///
-    /// The returned `Arc<Mutex<..>>` is per-model, so concurrent queries against
-    /// different models do not serialise on one global lock. Callers MUST pass
-    /// the model the target index was built with — see [`Self::query_model`].
-    pub(crate) fn embedding_service_for(
+    /// Search is interactive: a cold-cache model resolves through hf-hub, and
+    /// on networks that black-hole the model host that fetch never completes
+    /// and never errors — the whole-night serve stall. So search accepts only
+    /// a model that is already loaded or whose files are provably on disk
+    /// ([`crate::embed::is_model_in_cache`], a pure fs probe). Downloading
+    /// stays on the indexing path (`codesearch index`, `codesearch setup`),
+    /// where it belongs to a background task with progress, not to a query.
+    pub(crate) async fn embedding_service_for_query(
         &self,
         model: ModelType,
-    ) -> Result<Arc<Mutex<crate::embed::EmbeddingService>>> {
-        self.embedding_pool.get(model)
+    ) -> Result<Option<Arc<Mutex<crate::embed::EmbeddingService>>>> {
+        if let Some(service) = self.embedding_pool.get_if_cached(model) {
+            return Ok(Some(service));
+        }
+        if !crate::embed::is_model_in_cache(model) {
+            return Ok(None);
+        }
+        // Files are on disk, so this load cannot become a network fetch. It
+        // is still ONNX init work (hundreds of MB mapped) — keep it off the
+        // async worker; the pool bounds it by MODEL_LOAD_TIMEOUT_SECS.
+        let pool = self.embedding_pool.clone();
+        match tokio::task::spawn_blocking(move || pool.get(model)).await {
+            Ok(result) => result.map(Some),
+            Err(e) => Err(anyhow::anyhow!("embedding model load task failed: {e}")),
+        }
     }
 
     /// Return the current MCP mode as a string for diagnostics.
@@ -1391,16 +1515,28 @@ impl CodesearchService {
         R: Clone + HasChunkId + HasScore,
     {
         let mut failures: Vec<(String, String)> = Vec::new();
-        let mut all_results: Vec<R> = Vec::new();
+        let mut all_results: Vec<SourcedResult<R>> = Vec::new();
         let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
             std::collections::HashMap::new();
 
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let store = match bounded_vector_read(&store_arc.vector_store).await {
+            // Try-lock, never wait: a multi-repo fan-out is an interactive
+            // query, and waiting for one busy repo's write lock would stall
+            // every other repo's result behind it (waits sum up per busy
+            // store, up to the full bounded wait each). A store held by a
+            // running indexing batch is skipped and reported instead; the
+            // same request against that single repo alone still waits, via
+            // the bounded single-store helpers.
+            let store = match store_arc.vector_store.try_read() {
                 Ok(store) => store,
-                Err(e) => {
-                    failures.push((alias.to_string(), format!("{e:#}")));
+                Err(_) => {
+                    failures.push((
+                        alias.to_string(),
+                        "store busy: active indexing holds the write lock — \
+                         repo skipped in this fan-out, retry shortly"
+                            .to_string(),
+                    ));
                     continue;
                 }
             };
@@ -1410,12 +1546,15 @@ impl CodesearchService {
                         let key = (alias.to_string(), r.chunk_id());
                         if let Some(&existing_idx) = seen_ids.get(&key) {
                             // Keep the one with higher score
-                            if r.score() > all_results[existing_idx].score() {
-                                all_results[existing_idx] = r;
+                            if r.score() > all_results[existing_idx].result.score() {
+                                all_results[existing_idx].result = r;
                             }
                         } else {
                             seen_ids.insert(key, all_results.len());
-                            all_results.push(r);
+                            // The tag is load-bearing: chunk ids repeat across
+                            // repos, so a bare id cannot address the chunk that
+                            // produced this hit at resolution time.
+                            all_results.push(SourcedResult::new(alias.to_string(), r));
                         }
                     }
                 }
@@ -1436,8 +1575,9 @@ impl CodesearchService {
 
         // Sort by score descending
         all_results.sort_by(|a, b| {
-            b.score()
-                .partial_cmp(&a.score())
+            b.result
+                .score()
+                .partial_cmp(&a.result.score())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -1467,16 +1607,24 @@ impl CodesearchService {
         R: Clone + HasChunkId + HasScore,
     {
         let mut failures: Vec<(String, String)> = Vec::new();
-        let mut all_results: Vec<R> = Vec::new();
+        let mut all_results: Vec<SourcedResult<R>> = Vec::new();
         let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
             std::collections::HashMap::new();
 
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let fts = match bounded_fts_read(&store_arc.fts_store).await {
+            // Try-lock, never wait — same rationale as the vector fan-out:
+            // a busy repo is skipped and reported, not allowed to stall the
+            // whole group's literal results.
+            let fts = match store_arc.fts_store.try_read() {
                 Ok(fts) => fts,
-                Err(e) => {
-                    failures.push((alias.to_string(), format!("{e:#}")));
+                Err(_) => {
+                    failures.push((
+                        alias.to_string(),
+                        "store busy: active indexing holds the write lock — \
+                         repo skipped in this fan-out, retry shortly"
+                            .to_string(),
+                    ));
                     continue;
                 }
             };
@@ -1485,12 +1633,14 @@ impl CodesearchService {
                     for r in results {
                         let key = (alias.to_string(), r.chunk_id());
                         if let Some(&existing_idx) = seen_ids.get(&key) {
-                            if r.score() > all_results[existing_idx].score() {
-                                all_results[existing_idx] = r;
+                            if r.score() > all_results[existing_idx].result.score() {
+                                all_results[existing_idx].result = r;
                             }
                         } else {
                             seen_ids.insert(key, all_results.len());
-                            all_results.push(r);
+                            // Same contract as the vector fan-out: the tag, not
+                            // the bare id, is what identifies the chunk later.
+                            all_results.push(SourcedResult::new(alias.to_string(), r));
                         }
                     }
                 }
@@ -1509,8 +1659,9 @@ impl CodesearchService {
 
         // Sort by score descending
         all_results.sort_by(|a, b| {
-            b.score()
-                .partial_cmp(&a.score())
+            b.result
+                .score()
+                .partial_cmp(&a.result.score())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -1564,6 +1715,7 @@ impl CodesearchService {
             "mode": mode,
             "compact": request.compact,
             "semantic_mode": request.semantic_mode,
+            "min_score": request.min_score,
             "regex": request.regex,
             "phrase": request.phrase,
             "file_glob": request.file_glob,
@@ -1603,6 +1755,10 @@ impl CodesearchService {
         //    repos. Skip entirely when the group has no local repos.
         let (locals, _) = cfg.split_group_targets(&group);
         let mut local_items: Vec<SearchResultItem> = Vec::new();
+        // Refusal notes from legs that answered empty by their own threshold
+        // (min_score): merged into the response warnings, so an honest refusal
+        // never reads as "no hits there".
+        let mut leg_notes: Vec<String> = Vec::new();
         if !locals.is_empty() {
             let local_result = match mode.as_str() {
                 "semantic" => {
@@ -1614,6 +1770,7 @@ impl CodesearchService {
                         mode: request.semantic_mode.clone(),
                         project: None,
                         group: Some(group.clone()),
+                        min_score: request.min_score,
                     };
                     self.semantic_search(Parameters(req)).await?
                 }
@@ -1639,6 +1796,9 @@ impl CodesearchService {
                 }
             };
             local_items = parse_search_items_from_call_result(&local_result, &mode);
+            if let Some(note) = parse_note_from_call_result(&local_result) {
+                leg_notes.push(format!("local group: {note}"));
+            }
             retain_by_filter_path(&mut local_items, request.filter_path.as_deref());
         }
 
@@ -1685,13 +1845,19 @@ impl CodesearchService {
         let mut all_lists: Vec<Vec<SearchResultItem>> = vec![local_items];
         while let Some(res) = join.join_next().await {
             match res {
-                Ok((peer_name, remote_alias, Outcome::Ok(items))) => {
-                    let mut converted: Vec<SearchResultItem> = items
+                Ok((peer_name, remote_alias, Outcome::Ok(reply))) => {
+                    let mut converted: Vec<SearchResultItem> = reply
+                        .items
                         .into_iter()
                         .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
                         .collect();
                     retain_by_filter_path(&mut converted, request.filter_path.as_deref());
                     all_lists.push(converted);
+                    if let Some(note) = reply.note {
+                        warnings.push(format!(
+                            "remote project '{peer_name}/{remote_alias}': {note}"
+                        ));
+                    }
                 }
                 Ok((peer_name, remote_alias, Outcome::Unreachable(reason))) => {
                     warnings.push(format!(
@@ -1705,7 +1871,9 @@ impl CodesearchService {
             }
         }
 
-        // 4) RRF-interleave the disjoint ranked lists and render.
+        // 4) RRF-interleave the disjoint ranked lists and render. Leg refusal
+        //    notes ride along as warnings, after the per-store failures.
+        warnings.extend(leg_notes);
         let merged = merge_ranked_lists(all_lists, DEFAULT_RRF_K, limit);
         Ok(self.build_federated_response(merged, warnings))
     }
@@ -1768,13 +1936,22 @@ impl CodesearchService {
 
         let outcome = client.search_project(&peer, body, &remote_alias).await;
         let (mut items, warnings) = match outcome {
-            Outcome::Ok(items) => (
-                items
-                    .into_iter()
-                    .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
-                    .collect::<Vec<_>>(),
-                Vec::new(),
-            ),
+            Outcome::Ok(reply) => {
+                let mut peer_warnings = Vec::new();
+                if let Some(note) = reply.note {
+                    peer_warnings.push(format!(
+                        "remote project '{peer_name}/{remote_alias}': {note}"
+                    ));
+                }
+                (
+                    reply
+                        .items
+                        .into_iter()
+                        .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
+                        .collect::<Vec<_>>(),
+                    peer_warnings,
+                )
+            }
             Outcome::Unreachable(reason) => (
                 Vec::new(),
                 vec![format!(
@@ -1870,6 +2047,7 @@ impl CodesearchService {
             low_confidence: if items.is_empty() { Some(true) } else { None },
             results: items,
             suggested_tool: None,
+            note: None,
             warnings: if warnings.is_empty() {
                 None
             } else {

@@ -578,6 +578,8 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_HOME` | Relocate the entire global root (`repos.json`, models cache, logs, `serve_url`, global ignore/extension files) away from `~/.codesearch`. Must be an absolute path; unset = `~/.codesearch`. Per-file overrides like `CODESEARCH_REPOS_CONFIG` still win |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
+| `CODESEARCH_STORE_LOCK_WAIT_SECS` | Bounded wait for a store's write lock before a single-project query reports the store busy (default: 300). Multi-repo fan-outs never wait — they skip the busy repo with a warning |
+| `CODESEARCH_MODEL_LOAD_TIMEOUT_SECS` | Bound on a cold-cache embedding-model load (default: 600). On expiry the loader fails fast with a hint to pre-populate the cache via `codesearch setup`; search itself only uses models already loaded or provably on disk |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
 | `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` | Hard cap (MB) for LMDB auto-resize on `MDB_MAP_FULL`, applied to both the vector store and the persistent embedding cache (default: 16384 = 16GB; clamped to at least 1024). Raise this for very large corpora (millions of chunks) that legitimately exceed the default cap — see #189. |
 | `CODESEARCH_BATCH_SIZE` | Embedding batch size |

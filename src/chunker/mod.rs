@@ -24,10 +24,11 @@ pub struct Chunk {
     /// The actual content of the chunk
     pub content: String,
 
-    /// Starting line number (0-indexed)
+    /// Starting line number (0-indexed; responses convert to 1-based editor
+    /// lines at the emit boundary)
     pub start_line: usize,
 
-    /// Ending line number (0-indexed)
+    /// Ending line number (0-indexed; converted to 1-based on emit)
     pub end_line: usize,
 
     /// Type of chunk

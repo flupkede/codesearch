@@ -288,12 +288,20 @@ fn unregister_path_matches_msys_posix_form() {
 /// On Unix, `/c/Users/...` is a legitimate absolute path (not an MSYS-ism),
 /// so `register()` must store it verbatim. This guards against the Windows
 /// fix accidentally rewriting paths on the wrong platform.
+///
+/// The input is pre-canonicalized because register()'s contract is to store
+/// the canonical form, and on macOS the tempdir lives behind a symlink
+/// (`TMPDIR=/var/folders/...` → `/private/var/folders/...`): comparing the
+/// stored value against the RAW path would test the OS's symlinked-TMP quirk,
+/// not register(). On a canonical input `safe_canonicalize` is idempotent, so
+/// any byte difference left is a genuine rewrite.
 #[test]
 #[cfg(not(windows))]
 fn register_leaves_unix_path_untouched() {
     let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("propagate-tmp-repo");
-    std::fs::create_dir(&repo).unwrap();
+    let raw_repo = tmp.path().join("propagate-tmp-repo");
+    std::fs::create_dir(&raw_repo).unwrap();
+    let repo = safe_canonicalize(&raw_repo).unwrap();
     let path_str = repo.to_string_lossy().to_string();
 
     let mut cfg = ReposConfig::default();

@@ -9,7 +9,7 @@ use tracing::{debug, info};
 
 use crate::cache::{normalize_path, safe_canonicalize, storage_key, FileMetaStore};
 use crate::chunker::SemanticChunker;
-use crate::db_discovery::{find_best_database, is_registered_repository, register_repository};
+use crate::db_discovery::find_best_database;
 use crate::embed::{EmbeddingService, ModelType};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
@@ -466,35 +466,87 @@ fn find_project_root(start_path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Get the global database path for a given directory
-/// Uses ~/.codesearch.dbs/<project_name>/ for storage
-fn get_global_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
-    use dirs::home_dir;
+/// Root of the `--global` store area.
+///
+/// Honours `CODESEARCH_HOME` like every other global artifact (repos.json,
+/// models cache, serve logs); the historic hardcoded `~/.codesearch.dbs`
+/// wins when it already exists so indexes written by older binaries stay
+/// reachable. Before this the root ignored the relocation knob entirely and
+/// leaked stores into `$HOME` on machines that keep codesearch artifacts
+/// elsewhere (the pilot's machine runs everything under `CODESEARCH_HOME`).
+fn global_dbs_root() -> Result<PathBuf> {
+    if let Some(home) = dirs::home_dir() {
+        let legacy = home.join(".codesearch.dbs");
+        if legacy.exists() {
+            return Ok(legacy);
+        }
+    }
+    Ok(crate::constants::codesearch_home()?.join("dbs"))
+}
 
-    let project_path = path.unwrap_or_else(|| PathBuf::from("."));
-    let canonical_path = safe_canonicalize(&project_path)?;
+/// Per-project directory name inside [`global_dbs_root`].
+///
+/// Bare `file_name()` collides: two same-named projects at different paths
+/// would silently share ONE store (and one model stamp), corrupting each
+/// other's index. The slug keeps the readable name and appends a short digest
+/// of the full canonical path so same-named projects stay distinct.
+fn global_store_slug(canonical_path: &Path) -> String {
+    use sha2::{Digest, Sha256};
 
-    // Create a unique name for the project based on its path
-    // Use the directory name as the project identifier
-    let project_name = canonical_path
+    let name = canonical_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
+    let digest = Sha256::digest(canonical_path.to_string_lossy().as_bytes());
+    let suffix: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{name}-{suffix}")
+}
 
-    // Create global database directory
-    let home = home_dir().ok_or_else(|| anyhow::anyhow!("No home directory found"))?;
-    let global_db_dir = home.join(".codesearch.dbs").join(project_name);
-    let db_path = global_db_dir.join(".codesearch.db");
+/// Directory holding the `--global` store for a canonical project path.
+///
+/// Tries the historic `<file_name>` layout first so indexes from older
+/// binaries keep resolving; new projects get the collision-proof slug.
+fn global_db_dir_for(canonical_path: &Path) -> Result<PathBuf> {
+    let root = global_dbs_root()?;
+    let legacy_name = canonical_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    let legacy = root.join(legacy_name);
+    if legacy.join(crate::constants::DB_DIR_NAME).exists() {
+        return Ok(legacy);
+    }
+    Ok(root.join(global_store_slug(canonical_path)))
+}
 
-    // Register this repository in the global tracking
-    register_repository(&canonical_path)?;
+/// Whether a `--global` store exists for a canonical project path.
+fn has_global_store(canonical_path: &Path) -> bool {
+    global_db_dir_for(canonical_path)
+        .map(|dir| dir.join(crate::constants::DB_DIR_NAME).exists())
+        .unwrap_or(false)
+}
+
+/// Get the global database path for a given directory.
+///
+/// Lives under [`global_dbs_root`] (CODESEARCH_HOME-aware with a legacy
+/// `~/.codesearch.dbs` fallback), one directory per project. Deliberately does
+/// NOT register the repository: global indexes are documented as "not
+/// auto-registered", and the old registration actively harmed serve —
+/// discovery looks for the store at `<project>/.codesearch.db`, never finds
+/// the out-of-tree one, and a running serve then builds a SECOND, empty local
+/// store for the registered alias while the global index sits unused.
+fn get_global_db_path(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
+    let project_path = path.unwrap_or_else(|| PathBuf::from("."));
+    let canonical_path = safe_canonicalize(&project_path)?;
+
+    let db_path = global_db_dir_for(&canonical_path)?.join(".codesearch.db");
 
     println!(
         "{}",
         format!(
             "🌍 Using global database: {}\n   (project: {})",
             db_path.display(),
-            project_name
+            canonical_path.display()
         )
         .dimmed()
     );
@@ -1664,7 +1716,9 @@ pub async fn add_to_index(
     let local_db = canonical_path.join(".codesearch.db");
     let has_local = local_db.exists();
 
-    let has_global = is_registered_repository(&canonical_path)?;
+    // Real existence check of the out-of-tree `--global` store (see
+    // remove_from_index for why the repos.json registration is not it).
+    let has_global = has_global_store(&canonical_path);
 
     // Conflict checks
     if global && has_local {
@@ -1820,9 +1874,15 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
     let local_db = canonical_path.join(".codesearch.db");
     let has_local = local_db.exists();
 
-    let has_global = is_registered_repository(&canonical_path)?;
+    // Real existence check of the out-of-tree `--global` store — the old
+    // `is_registered_repository` here conflated the repos.json registration
+    // with a global store and then printed "Global index removed!" without
+    // deleting any files. Registration is tracked separately below so a
+    // stale repos.json entry can still be cleaned up without any store.
+    let has_global = has_global_store(&canonical_path);
+    let registered = crate::db_discovery::is_registered_repository(&canonical_path)?;
 
-    if !has_local && !has_global {
+    if !has_local && !has_global && !registered {
         println!("\n{}", "⚠️  No index found for this project.".yellow());
         return Ok(());
     }
@@ -1880,11 +1940,25 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
         println!("{}", "ℹ️ Config entry preserved.".cyan());
     }
 
-    // `!keep_config` matters: with --keep-config the entry is deliberately
-    // left in repos.json, so claiming the global index was removed would
-    // contradict the "Config entry preserved." line printed just above and
-    // send the caller looking for a cleanup that never happened.
-    if !has_local && has_global && !keep_config {
+    // The `--global` store lives out-of-tree; delete its files too. The old
+    // code only printed "Global index removed!" after the unregister — the
+    // actual store survived on disk, and once registration stopped implying a
+    // global store the message became pure fiction.
+    if has_global && !keep_config {
+        if let Ok(global_dir) = global_db_dir_for(&canonical_path) {
+            let global_db = global_dir.join(".codesearch.db");
+            if global_db.exists() {
+                println!("\n{}", "Removing global index...".cyan());
+                if let Err(e) = fs::remove_dir_all(&global_db) {
+                    eprintln!(
+                        "{}",
+                        "⚠️ Global store files may be locked by a running codesearch serve."
+                            .yellow()
+                    );
+                    return Err(anyhow::anyhow!("Failed to remove global index: {}", e));
+                }
+            }
+        }
         println!("{}", "✅ Global index removed!".green());
     }
 
@@ -3408,6 +3482,122 @@ mod remove_order_tests {
             "the slow-but-successful outcome must be carried"
         );
         assert_global_config_unchanged(_canary);
+    }
+
+    // --- --global store root: CODESEARCH_HOME-aware, collision-proof slugs ----
+
+    /// `index --global` must keep every artifact under the relocatable
+    /// codesearch root and must not map two same-named projects onto ONE
+    /// store (the bare `file_name()` layout did both).
+    #[test]
+    #[serial]
+    fn global_db_path_honours_codesearch_home_and_slug_is_collision_proof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cs_home = tmp.path().join("cs-home");
+        std::fs::create_dir_all(&cs_home).unwrap();
+        // A separate $HOME with no legacy `.codesearch.dbs` keeps the test
+        // hermetic on machines that happen to have the old layout at home.
+        let bare_home = tmp.path().join("bare-home");
+        std::fs::create_dir_all(&bare_home).unwrap();
+        let repos_cfg = tmp.path().join("repos.json");
+        let _env = EnvRestore::set(&[
+            (
+                crate::constants::CODESEARCH_HOME_ENV,
+                cs_home.to_str().unwrap(),
+            ),
+            ("HOME", bare_home.to_str().unwrap()),
+            (
+                crate::constants::REPOS_CONFIG_ENV,
+                repos_cfg.to_str().unwrap(),
+            ),
+        ]);
+
+        std::fs::create_dir_all(tmp.path().join("a").join("foo")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("b").join("foo")).unwrap();
+        let foo_a = crate::cache::safe_canonicalize(&tmp.path().join("a").join("foo"))
+            .expect("project dir must exist");
+        let foo_b = crate::cache::safe_canonicalize(&tmp.path().join("b").join("foo"))
+            .expect("project dir must exist");
+
+        let (db_a, proj_a) = super::get_global_db_path(Some(foo_a.clone())).unwrap();
+        let (db_b, _) = super::get_global_db_path(Some(foo_b.clone())).unwrap();
+
+        assert_eq!(proj_a, foo_a, "project path round-trips canonicalized");
+        assert_ne!(
+            db_a, db_b,
+            "same-named projects must not share one global store"
+        );
+        for db in [&db_a, &db_b] {
+            assert!(
+                db.starts_with(cs_home.join("dbs")),
+                "global stores must live under CODESEARCH_HOME/dbs, got {}",
+                db.display()
+            );
+        }
+        let slug = db_a
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            slug.starts_with("foo-") && slug.len() > "foo-".len(),
+            "slug must keep the readable name plus a path digest: {slug}"
+        );
+
+        // No auto-registration side effect: a running serve would otherwise
+        // resolve the alias to <project>/.codesearch.db and build an empty
+        // LOCAL store while the out-of-tree global one sits unused.
+        assert!(
+            !repos_cfg.exists(),
+            "get_global_db_path must not register the repo in repos.json"
+        );
+
+        // Existence-based detection: only the project whose store was
+        // materialized reports a global index.
+        std::fs::create_dir_all(&db_a).unwrap();
+        assert!(super::has_global_store(&foo_a));
+        assert!(!super::has_global_store(&foo_b));
+    }
+
+    /// Stores written by older binaries into the hardcoded `~/.codesearch.dbs`
+    /// keep resolving after the fix — the legacy layout wins when present.
+    #[test]
+    #[serial]
+    fn global_db_path_prefers_legacy_home_layout_when_it_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = tmp.path().join("old-home");
+        let legacy_root = old_home.join(".codesearch.dbs");
+        let proj = tmp.path().join("proj").join("foo");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(legacy_root.join("foo").join(".codesearch.db")).unwrap();
+        let cs_home = tmp.path().join("cs-home");
+        std::fs::create_dir_all(&cs_home).unwrap();
+        let _env = EnvRestore::set(&[
+            ("HOME", old_home.to_str().unwrap()),
+            (
+                crate::constants::CODESEARCH_HOME_ENV,
+                cs_home.to_str().unwrap(),
+            ),
+            (
+                crate::constants::REPOS_CONFIG_ENV,
+                tmp.path().join("repos.json").to_str().unwrap(),
+            ),
+        ]);
+
+        let canonical = crate::cache::safe_canonicalize(&proj).unwrap();
+        let (db, _) = super::get_global_db_path(Some(canonical)).unwrap();
+        assert!(
+            db.starts_with(&legacy_root),
+            "an existing legacy store must keep resolving from ~/.codesearch.dbs, got {}",
+            db.display()
+        );
+        assert_eq!(
+            db.parent().unwrap().file_name().unwrap(),
+            "foo",
+            "legacy layout uses the bare project name"
+        );
     }
 }
 

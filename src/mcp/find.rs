@@ -131,7 +131,15 @@ impl CodesearchService {
                 )
                 .await
             {
-                Ok(r) => r,
+                // Single store: the tag is still written for uniformity (the
+                // resolution block below reads it in both modes); the routed
+                // project alias is the honest origin when one exists.
+                Ok(r) => {
+                    let alias = ctx.project_alias.clone().unwrap_or_else(|| "local".to_string());
+                    r.into_iter()
+                        .map(|hit| SourcedResult::new(alias.clone(), hit))
+                        .collect()
+                }
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error searching: {e:#}"
@@ -155,39 +163,34 @@ impl CodesearchService {
         // Resolve chunk metadata and filter by definition kinds
         let requested_kind = request.kind.clone();
         let mut items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
+            // Group fan-out: resolve each hit ONLY in its origin store. Chunk
+            // ids are per-repo counters, so probing every store for a bare id
+            // misattributes on collision: the first repo holding that id won
+            // the hit, true definitions were filtered out as "wrong kind"
+            // (they resolved to the OTHER repo's chunk), and unrelated
+            // content rode the stolen score.
             let aliases = ctx.aliases();
             let mut items: Vec<ReferenceItem> = Vec::new();
-            'outer: for fts_result in &fts_results {
-                for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let store = match bounded_vector_read(&store_arc.vector_store).await {
-                        Ok(store) => store,
-                        Err(e) => {
-                            note_store_failure(
-                                &mut find_warnings,
-                                aliases,
-                                store_idx,
-                                "chunk lookup",
-                                &e,
-                            );
-                            continue;
-                        }
-                    };
-                    let looked_up = store.get_chunk(fts_result.chunk_id);
-                    if let Err(ref e) = looked_up {
-                        // `Ok(None)` = chunk not in this store (normal during
-                        // fan-out); `Err` = broken store. Skipping the `Err`
-                        // silently made a dead store look like "symbol not
-                        // found" — carry it in the warnings channel instead.
-                        note_store_failure(
-                            &mut find_warnings,
-                            aliases,
-                            store_idx,
-                            "chunk lookup",
-                            e,
-                        );
-                    }
-                    if let Ok(Some(chunk)) = looked_up {
-                        // Skip non-definition kinds — try next FTS result, not next store
+            'outer: for fts_hit in &fts_results {
+                let Some(origin_idx) = aliases.iter().position(|a| *a == fts_hit.alias) else {
+                    // The fan-out only emits aliases from this same vec; a
+                    // miss means routing changed under our feet. Skip the hit
+                    // rather than guess where it came from.
+                    continue 'outer;
+                };
+                let store_arc = &sv[origin_idx];
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    origin_idx,
+                    &mut find_warnings,
+                    "chunk lookup",
+                ) else {
+                    continue 'outer;
+                };
+                match store.get_chunk(fts_hit.result.chunk_id) {
+                    Ok(Some(chunk)) => {
+                        // Skip non-definition kinds — try next FTS result
                         if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
                             continue 'outer;
                         }
@@ -197,22 +200,29 @@ impl CodesearchService {
                             }
                         }
                         items.push(ReferenceItem {
-                            chunk_id: fts_result.chunk_id,
-                            path: chunk.path,
-                            line: chunk.start_line,
+                            chunk_id: fts_hit.result.chunk_id,
+                            path: ctx.prefix_sourced_path(&fts_hit.alias, &chunk.path),
+                            line: chunk.start_line + 1,
                             kind: chunk.kind,
                             signature: chunk.signature,
-                            score: fts_result.score,
+                            score: fts_hit.result.score,
                         });
                         if items.len() >= limit {
                             break 'outer;
                         }
-                        break; // Found in this store — move to next FTS result
+                    }
+                    Ok(None) => continue 'outer, // not held anywhere — skip
+                    Err(ref e) => {
+                        note_store_failure(
+                            &mut find_warnings,
+                            aliases,
+                            origin_idx,
+                            "chunk lookup",
+                            e,
+                        );
+                        continue 'outer;
                     }
                 }
-                // If we get here, the chunk was Ok(None) in every store (not
-                // held anywhere — skip it) or its lookups failed (noted in
-                // find_warnings above).
             }
             items
         } else {
@@ -225,9 +235,9 @@ impl CodesearchService {
                         // missing chunk — `Ok(None)` alone is a true miss.
                         let resolved: anyhow::Result<Vec<_>> = fts_results
                             .iter()
-                            .map(|fts_result| {
-                                let chunk = store.get_chunk(fts_result.chunk_id)?;
-                                Ok((chunk, fts_result.chunk_id, fts_result.score))
+                            .map(|fts_hit| {
+                                let chunk = store.get_chunk(fts_hit.result.chunk_id)?;
+                                Ok((chunk, fts_hit.result.chunk_id, fts_hit.result.score))
                             })
                             .collect();
                         let items = resolved?
@@ -245,7 +255,7 @@ impl CodesearchService {
                                 Some(ReferenceItem {
                                     chunk_id,
                                     path: chunk.path,
-                                    line: chunk.start_line,
+                                    line: chunk.start_line + 1,
                                     kind: chunk.kind,
                                     signature: chunk.signature,
                                     score,
@@ -268,9 +278,13 @@ impl CodesearchService {
             }
         };
 
-        // Prefix paths with alias for multi-repo identification
-        for item in &mut items {
-            item.path = ctx.prefix_result_path(&item.path);
+        // Prefix paths with the routing alias. Group items were already
+        // attributed to their origin repo at resolution time; re-prefixing
+        // here would double the alias onto those paths.
+        if ctx.stores_vec.is_none() {
+            for item in &mut items {
+                item.path = ctx.prefix_result_path(&item.path);
+            }
         }
 
         respond_with_items(&items, &find_warnings, || {
@@ -342,7 +356,14 @@ impl CodesearchService {
                 )
                 .await
             {
-                Ok(r) => r,
+                // Single store — tagged for uniformity with the resolution
+                // block below (see find_definition).
+                Ok(r) => {
+                    let alias = ctx.project_alias.clone().unwrap_or_else(|| "local".to_string());
+                    r.into_iter()
+                        .map(|hit| SourcedResult::new(alias.clone(), hit))
+                        .collect()
+                }
                 Err(e) => {
                     return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error searching: {e:#}"
@@ -364,45 +385,48 @@ impl CodesearchService {
         let mut items: Vec<ReferenceItem> = if let Some(ref sv) = ctx.stores_vec {
             let aliases = ctx.aliases();
             let mut items: Vec<ReferenceItem> = Vec::new();
-            for fts_result in &fts_results {
-                for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let store = match bounded_vector_read(&store_arc.vector_store).await {
-                        Ok(store) => store,
-                        Err(e) => {
-                            note_store_failure(
-                                &mut find_warnings,
-                                aliases,
-                                store_idx,
-                                "chunk lookup",
-                                &e,
-                            );
-                            continue;
+            // Same rule as find_definition: resolve ONLY in the origin store —
+            // probing all stores for a bare chunk id misattributes on the
+            // cross-repo id collisions.
+            for fts_hit in &fts_results {
+                let Some(origin_idx) = aliases.iter().position(|a| *a == fts_hit.alias) else {
+                    continue;
+                };
+                let store_arc = &sv[origin_idx];
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    origin_idx,
+                    &mut find_warnings,
+                    "chunk lookup",
+                ) else {
+                    continue;
+                };
+                match store.get_chunk(fts_hit.result.chunk_id) {
+                    Ok(Some(chunk)) => {
+                        if !is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
+                            items.push(ReferenceItem {
+                                chunk_id: fts_hit.result.chunk_id,
+                                path: ctx.prefix_sourced_path(&fts_hit.alias, &chunk.path),
+                                line: chunk.start_line + 1,
+                                kind: chunk.kind,
+                                signature: chunk.signature,
+                                score: fts_hit.result.score,
+                            });
                         }
-                    };
-                    let looked_up = store.get_chunk(fts_result.chunk_id);
-                    if let Err(ref e) = looked_up {
+                    }
+                    Ok(None) => continue, // not held anywhere — skip
+                    Err(ref e) => {
                         // Same rule as find_definition: `Err` is a broken
                         // store, not "no usages" — carry it in the channel.
                         note_store_failure(
                             &mut find_warnings,
                             aliases,
-                            store_idx,
+                            origin_idx,
                             "chunk lookup",
                             e,
                         );
-                    }
-                    if let Ok(Some(chunk)) = looked_up {
-                        if !is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
-                            items.push(ReferenceItem {
-                                chunk_id: fts_result.chunk_id,
-                                path: chunk.path,
-                                line: chunk.start_line,
-                                kind: chunk.kind,
-                                signature: chunk.signature,
-                                score: fts_result.score,
-                            });
-                        }
-                        break;
+                        continue;
                     }
                 }
             }
@@ -416,9 +440,9 @@ impl CodesearchService {
                         // chunk or a miss — `Ok(None)` alone is a true miss.
                         let resolved: anyhow::Result<Vec<_>> = fts_results
                             .iter()
-                            .map(|fts_result| {
-                                let chunk = store.get_chunk(fts_result.chunk_id)?;
-                                Ok((chunk, fts_result.chunk_id, fts_result.score))
+                            .map(|fts_hit| {
+                                let chunk = store.get_chunk(fts_hit.result.chunk_id)?;
+                                Ok((chunk, fts_hit.result.chunk_id, fts_hit.result.score))
                             })
                             .collect();
                         let items = resolved?
@@ -431,7 +455,7 @@ impl CodesearchService {
                                 Some(ReferenceItem {
                                     chunk_id,
                                     path: chunk.path,
-                                    line: chunk.start_line,
+                                    line: chunk.start_line + 1,
                                     kind: chunk.kind,
                                     signature: chunk.signature,
                                     score,
@@ -453,9 +477,13 @@ impl CodesearchService {
             }
         };
 
-        // Prefix paths with alias for multi-repo identification
-        for item in &mut items {
-            item.path = ctx.prefix_result_path(&item.path);
+        // Prefix paths with the routing alias. Group items were already
+        // attributed to their origin repo at resolution time; re-prefixing
+        // here would double the alias onto those paths.
+        if ctx.stores_vec.is_none() {
+            for item in &mut items {
+                item.path = ctx.prefix_result_path(&item.path);
+            }
         }
 
         // Lexical FTS ranks docs, comments and code by the same text score,

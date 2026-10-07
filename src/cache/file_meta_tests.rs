@@ -541,3 +541,102 @@ fn test_path_matches_filter_matches_exact_directory_name() {
     let filter = normalize_filter_path("src");
     assert!(path_matches_filter("/repo/src/main.rs", &filter, &root));
 }
+
+// =========================================================================
+// Crash-recovery tests — the pilot incident behind the hardening:
+// a serve killed mid-`save` left a torn `file_meta.json` and the next
+// warmup either skipped the repo forever (hard parse error) or fell into
+// the deliberate full-wipe path, re-embedding an entire unchanged repo
+// (payment-identification: 323/323 files). `save` now writes tmp+fsync+
+// rename with one `.bak` generation, and `load_or_create` recovers from
+// that backup instead of failing or silently losing all incremental state.
+// =========================================================================
+
+#[test]
+fn torn_main_file_recovers_from_backup_generation() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+    let f1 = dir.path().join("a.txt");
+    fs::write(&f1, "one").unwrap();
+
+    // Generation 1: only `a.txt` tracked.
+    let mut g1 = FileMetaStore::new("test-model".to_string(), 384);
+    g1.update_file(&f1, "a.txt", vec![1]).unwrap();
+    g1.save(db_path).unwrap();
+
+    // Generation 2 adds a second file; its save moves gen 1 into `.bak`.
+    let f2 = dir.path().join("b.txt");
+    fs::write(&f2, "two").unwrap();
+    let mut g2 = FileMetaStore::new("test-model".to_string(), 384);
+    g2.update_file(&f1, "a.txt", vec![1]).unwrap();
+    g2.update_file(&f2, "b.txt", vec![2, 3]).unwrap();
+    g2.save(db_path).unwrap();
+
+    // Simulate the crash: a truncated write replaces the main file while
+    // the `.bak` generation survives untouched.
+    fs::write(db_path.join(FILE_META_DB_NAME), "{\"files\": {").unwrap();
+
+    let recovered = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
+    assert!(
+        recovered.is_tracked("a.txt"),
+        "gen-1 entry must survive via the .bak generation"
+    );
+    assert!(
+        !recovered.is_tracked("b.txt"),
+        "recovery yields the previous generation, not the torn one"
+    );
+}
+
+#[test]
+fn corrupt_metadata_without_backup_degrades_to_empty_store_instead_of_error() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+    // Torn file with no `.bak` (e.g. written by a pre-hardening binary).
+    fs::write(db_path.join(FILE_META_DB_NAME), "not json at all").unwrap();
+
+    // Previously this was a hard error: warmup skipped the repo on every
+    // start because the corrupt file never self-heals. Now it degrades to
+    // an empty store so the B1 guard can re-index deliberately.
+    let store = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
+    assert!(store.is_empty());
+    assert_eq!(store.model_name, "test-model");
+    assert_eq!(store.dimensions, 384);
+}
+
+#[test]
+fn save_is_atomic_and_keeps_one_backup_generation() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+    let f1 = dir.path().join("a.txt");
+    fs::write(&f1, "one").unwrap();
+
+    let mut g1 = FileMetaStore::new("test-model".to_string(), 384);
+    g1.update_file(&f1, "a.txt", vec![1]).unwrap();
+    g1.save(db_path).unwrap();
+
+    let mut g2 = FileMetaStore::new("test-model".to_string(), 384);
+    g2.update_file(&f1, "a.txt", vec![1, 7]).unwrap();
+    g2.save(db_path).unwrap();
+
+    // No temp litter from the tmp+rename dance.
+    let leftovers: Vec<String> = fs::read_dir(db_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp") || name.ends_with(".new"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+
+    // Main file holds the fresh generation; `.bak` holds the previous one.
+    assert!(db_path.join(FILE_META_DB_NAME).exists());
+    let bak_content =
+        fs::read_to_string(db_path.join(format!("{FILE_META_DB_NAME}.bak"))).unwrap();
+    let bak_store: FileMetaStore = serde_json::from_str(&bak_content).unwrap();
+    assert_eq!(bak_store.tracked_chunk_ids(), [1].iter().copied().collect());
+    let main_content = fs::read_to_string(db_path.join(FILE_META_DB_NAME)).unwrap();
+    let main_store: FileMetaStore = serde_json::from_str(&main_content).unwrap();
+    assert_eq!(
+        main_store.tracked_chunk_ids(),
+        [1, 7].iter().copied().collect()
+    );
+}

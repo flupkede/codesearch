@@ -13,7 +13,7 @@ use crate::constants::REPOS_CONFIG_FILE;
 /// (the leading `@` marks it as a remote reference rather than a local alias).
 /// Queries against such a group fan out to each remote peer over HTTP(S) and
 /// the results are merged with the local results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RemotePeer {
     /// Base URL of the remote serve instance, e.g. `https://codesearch.example.com`.
     #[serde(alias = "base_url")]
@@ -74,7 +74,7 @@ pub fn remote_project_name(peer_name: &str, remote_alias: &str) -> String {
     format!("{peer_name}{REMOTE_PROJECT_SEPARATOR}{remote_alias}")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ReposConfig {
     pub repos: HashMap<String, PathBuf>,
     #[serde(default)]

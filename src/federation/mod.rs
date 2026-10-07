@@ -108,6 +108,21 @@ struct RemoteSearchResponse {
     /// Set by the REST layer when the remote tool returned an MCP error.
     #[serde(default)]
     _mcp_is_error: Option<bool>,
+    /// Response-level refusal note from the peer (e.g. every candidate fell
+    /// below its `min_score`). Must be relayed to the caller — an honest
+    /// refusal silently dropped reads as "no hits on that peer".
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// A peer's answer to a federated search: the ranked hits plus the
+/// response-level `note` a refusing peer attached. The query path used to
+/// return bare items, dropping that note, so a leg refusing by min_score
+/// was indistinguishable from a leg with no matches.
+#[derive(Debug, Default)]
+pub struct SearchReply {
+    pub items: Vec<RemoteSearchItem>,
+    pub note: Option<String>,
 }
 
 /// The outcome of a single remote fan-out call.
@@ -298,7 +313,7 @@ impl FederationClient {
         peer: &RemotePeer,
         mut body: serde_json::Value,
         remote_alias: &str,
-    ) -> Outcome<Vec<RemoteSearchItem>> {
+    ) -> Outcome<SearchReply> {
         if let Some(obj) = body.as_object_mut() {
             obj.insert(
                 "project".into(),
@@ -322,7 +337,7 @@ impl FederationClient {
         &self,
         peer: &RemotePeer,
         body: serde_json::Value,
-    ) -> Outcome<Vec<RemoteSearchItem>> {
+    ) -> Outcome<SearchReply> {
         let url = Self::peer_url(peer, crate::constants::SEARCH_PATH);
         let attempts = crate::constants::REMOTE_PEER_RETRY_ATTEMPTS.max(1);
         for attempt in 0..attempts {
@@ -360,7 +375,10 @@ impl FederationClient {
                         Ok(parsed)
                             if status.is_success() && !parsed._mcp_is_error.unwrap_or(false) =>
                         {
-                            return Outcome::Ok(parsed.results)
+                            return Outcome::Ok(SearchReply {
+                                items: parsed.results,
+                                note: parsed.note.filter(|n| !n.is_empty()),
+                            })
                         }
                         Ok(parsed) => {
                             // Tool-level error on the remote (e.g. scope_required).
@@ -798,10 +816,45 @@ mod tests {
             )
             .await;
         match outcome {
-            Outcome::Ok(items) => {
-                assert_eq!(items.len(), 1);
-                assert_eq!(items[0].chunk_id, Some(7));
-                assert_eq!(items[0].path, "kb/doc.md");
+            Outcome::Ok(reply) => {
+                assert_eq!(reply.items.len(), 1);
+                assert_eq!(reply.items[0].chunk_id, Some(7));
+                assert_eq!(reply.items[0].path, "kb/doc.md");
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_relays_a_peer_refusal_note() {
+        // A peer refusing by min_score answers with an explicit note and no
+        // results; dropping the note made the honest refusal read as "no
+        // hits on that peer". The reply must carry it through.
+        let app = axum::Router::new().route(
+            crate::constants::SEARCH_PATH,
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "results": [],
+                    "note": "2 candidate hit(s) found but all scored below min_score 0.800; \
+                             refusing instead of returning the nearest neighbours."
+                }))
+            }),
+        );
+        let addr = spawn_test_server(app).await;
+
+        let client = FederationClient::new().unwrap();
+        let outcome = client
+            .search_project(
+                &peer(format!("http://{addr}")),
+                serde_json::json!({"query": "x", "min_score": 0.8}),
+                "kb",
+            )
+            .await;
+        match outcome {
+            Outcome::Ok(reply) => {
+                assert!(reply.items.is_empty());
+                let note = reply.note.expect("refusal note must be relayed");
+                assert!(note.contains("min_score 0.800"), "got: {note}");
             }
             other => panic!("expected Ok, got {:?}", other),
         }
@@ -1451,7 +1504,7 @@ mod tests {
             )
             .await;
         match outcome {
-            Outcome::Ok(items) => assert_eq!(items.len(), 1),
+            Outcome::Ok(reply) => assert_eq!(reply.items.len(), 1),
             other => panic!("expected Ok after retry, got {other:?}"),
         }
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);

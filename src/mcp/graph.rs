@@ -53,23 +53,23 @@ impl CodesearchService {
         let mut import_warnings: Vec<String> = Vec::new();
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
-            // Multi-store group fan-out: collect import items from all stores
+            // Multi-store group fan-out: collect import items from all stores.
+            // Dedup keys on (store, id): chunk ids are per-repo counters and
+            // collide across repos, so a bare-id set would drop a later repo's
+            // imports wholesale.
             let import_aliases = ctx.aliases();
             let mut all_items: Vec<ImportItem> = Vec::new();
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut seen_ids: std::collections::HashSet<(usize, u32)> =
+                std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(
-                            &mut import_warnings,
-                            import_aliases,
-                            store_idx,
-                            "chunk lookup",
-                            &e,
-                        );
-                        continue;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    import_aliases,
+                    store_idx,
+                    &mut import_warnings,
+                    "chunk lookup",
+                ) else {
+                    continue;
                 };
                 match store.chunks_for_file(&normalized) {
                     Ok(metas) => {
@@ -77,7 +77,7 @@ impl CodesearchService {
                             if !is_import_kind(&meta.kind) {
                                 continue;
                             }
-                            if seen_ids.insert(meta.id) {
+                            if seen_ids.insert((store_idx, meta.id)) {
                                 match store.get_chunk(meta.id) {
                                     Ok(Some(chunk)) => all_items.extend(parse_import_lines(
                                         &chunk.content,
@@ -141,8 +141,11 @@ impl CodesearchService {
             // Limitation: this only finds chunks containing these literal words;
             // language-specific import forms that lack these keywords will be missed.
             let fallback_limit = 40usize;
-            let mut all_hits: Vec<(u32, f32)> = Vec::new();
-            let mut seen_fts_ids: HashSet<u32> = HashSet::new();
+            // Origin-tagged FTS hits (dedup key includes the repo: ids collide
+            // across stores).
+            let mut all_hits: Vec<SourcedResult<crate::fts::FtsResult>> = Vec::new();
+            let mut seen_fts_ids: std::collections::HashSet<(String, u32)> =
+                std::collections::HashSet::new();
 
             if let Some(ref sv) = ctx.stores_vec {
                 let import_aliases = ctx.aliases();
@@ -158,50 +161,51 @@ impl CodesearchService {
                         .unwrap_or_default()
                         .into_results(&mut import_warnings, "imports search");
                     for h in hits {
-                        if seen_fts_ids.insert(h.chunk_id) {
-                            all_hits.push((h.chunk_id, h.score));
+                        if seen_fts_ids.insert((h.alias.clone(), h.result.chunk_id)) {
+                            all_hits.push(h);
                         }
                     }
                 }
 
-                // Resolve FTS hits via vector stores
+                // Resolve each FTS hit in its ORIGIN store — probing every
+                // store for a bare chunk id answers from the wrong repo on the
+                // cross-repo id collisions.
                 let mut resolved: Vec<ImportItem> = Vec::new();
-                for (chunk_id, _) in &all_hits {
-                    for (store_idx, store_arc) in sv.iter().enumerate() {
-                        let store = match bounded_vector_read(&store_arc.vector_store).await {
-                            Ok(store) => store,
-                            Err(e) => {
-                                note_store_failure(
-                                    &mut import_warnings,
-                                    import_aliases,
-                                    store_idx,
-                                    "chunk lookup",
-                                    &e,
-                                );
-                                continue;
+                for hit in &all_hits {
+                    let Some(origin_idx) =
+                        import_aliases.iter().position(|a| *a == hit.alias)
+                    else {
+                        continue;
+                    };
+                    let store_arc = &sv[origin_idx];
+                    let Some(store) = try_vector_read_or_note(
+                        &store_arc.vector_store,
+                        import_aliases,
+                        origin_idx,
+                        &mut import_warnings,
+                        "chunk lookup",
+                    ) else {
+                        continue;
+                    };
+                    match store.get_chunk(hit.result.chunk_id) {
+                        Ok(Some(chunk)) => {
+                            if crate::cache::normalize_path_str(&chunk.path) == normalized {
+                                resolved.extend(parse_import_lines(
+                                    &chunk.content,
+                                    chunk.start_line,
+                                ));
                             }
-                        };
-                        match store.get_chunk(*chunk_id) {
-                            Ok(Some(chunk)) => {
-                                if crate::cache::normalize_path_str(&chunk.path) == normalized {
-                                    resolved.extend(parse_import_lines(
-                                        &chunk.content,
-                                        chunk.start_line,
-                                    ));
-                                }
-                                break;
-                            }
-                            Ok(None) => continue,
-                            Err(ref e) => {
-                                note_store_failure(
-                                    &mut import_warnings,
-                                    import_aliases,
-                                    store_idx,
-                                    "chunk lookup",
-                                    e,
-                                );
-                                continue;
-                            }
+                        }
+                        Ok(None) => continue,
+                        Err(ref e) => {
+                            note_store_failure(
+                                &mut import_warnings,
+                                import_aliases,
+                                origin_idx,
+                                "chunk lookup",
+                                e,
+                            );
+                            continue;
                         }
                     }
                 }
@@ -229,9 +233,12 @@ impl CodesearchService {
                             Vec::new()
                         }
                     };
+                    // Single store: tag with the routed alias for uniformity;
+                    // resolution below runs in this same store.
+                    let own_alias = ctx.project_alias.clone().unwrap_or_default();
                     for h in hits {
-                        if seen_fts_ids.insert(h.chunk_id) {
-                            all_hits.push((h.chunk_id, h.score));
+                        if seen_fts_ids.insert((own_alias.clone(), h.chunk_id)) {
+                            all_hits.push(SourcedResult::new(own_alias.clone(), h));
                         }
                     }
                 }
@@ -240,8 +247,8 @@ impl CodesearchService {
                     .with_vector_store_read_for(
                         |store| {
                             let mut out = Vec::new();
-                            for (chunk_id, _) in &all_hits {
-                                if let Some(chunk) = store.get_chunk(*chunk_id)? {
+                            for hit in &all_hits {
+                                if let Some(chunk) = store.get_chunk(hit.result.chunk_id)? {
                                     if crate::cache::normalize_path_str(&chunk.path) == normalized {
                                         out.extend(parse_import_lines(
                                             &chunk.content,
@@ -358,11 +365,17 @@ impl CodesearchService {
                 exact_hits
             }
         } else {
-            // Single-store FTS search
-            let alias = ctx.project_alias.as_deref().unwrap_or("unknown");
+            // Single-store FTS search — tagged for uniformity with the
+            // resolution block below.
             let mut run = |r: anyhow::Result<Vec<crate::fts::FtsResult>>| match r {
-                Ok(hits) => hits,
+                Ok(hits) => {
+                    let alias = ctx.project_alias.clone().unwrap_or_else(|| "local".to_string());
+                    hits.into_iter()
+                        .map(|hit| SourcedResult::new(alias.clone(), hit))
+                        .collect()
+                }
                 Err(e) => {
+                    let alias = ctx.project_alias.as_deref().unwrap_or("unknown");
                     push_store_warning(
                         &mut dep_warnings,
                         &store_warning(alias, "dependents search", &format!("{e:#}")),
@@ -390,73 +403,69 @@ impl CodesearchService {
         };
 
         let mut items = if let Some(ref sv) = ctx.stores_vec {
-            // Multi-store: resolve chunks across all stores
+            // Multi-store: resolve each hit in its ORIGIN store only — a bare
+            // chunk id collides across repos and "first store that answers"
+            // steals the hit (see SourcedResult).
             let dep_aliases = ctx.aliases();
             let mut seen_paths = HashSet::new();
             let mut out = Vec::new();
+            let term_lower = search_term.to_lowercase();
             for f in &fts_results {
-                for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let store = match bounded_vector_read(&store_arc.vector_store).await {
-                        Ok(store) => store,
-                        Err(e) => {
-                            note_store_failure(
-                                &mut dep_warnings,
-                                dep_aliases,
-                                store_idx,
-                                "chunk lookup",
-                                &e,
-                            );
+                let Some(origin_idx) = dep_aliases.iter().position(|a| *a == f.alias) else {
+                    continue;
+                };
+                let store_arc = &sv[origin_idx];
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    dep_aliases,
+                    origin_idx,
+                    &mut dep_warnings,
+                    "chunk lookup",
+                ) else {
+                    continue;
+                };
+                match store.get_chunk(f.result.chunk_id) {
+                    Ok(Some(chunk)) => {
+                        if !is_import_kind(&chunk.kind) {
+                            continue; // try next FTS result
+                        }
+
+                        let norm = crate::cache::normalize_path_str(&chunk.path);
+                        if !seen_paths.insert(norm) {
                             continue;
                         }
-                    };
-                    match store.get_chunk(f.chunk_id) {
-                        Ok(Some(chunk)) => {
-                            if !is_import_kind(&chunk.kind) {
-                                break; // try next FTS result
-                            }
 
-                            let norm = crate::cache::normalize_path_str(&chunk.path);
-                            if !seen_paths.insert(norm) {
-                                break;
-                            }
+                        // Extract the specific import line(s) that mention the
+                        // module name, rather than returning the entire chunk content.
+                        let import_statement =
+                            if chunk.content.to_lowercase().contains(&term_lower) {
+                                chunk
+                                    .content
+                                    .lines()
+                                    .find(|l| l.to_lowercase().contains(&term_lower))
+                                    .unwrap_or("")
+                                    .to_string()
+                            } else {
+                                chunk.signature.filter(|s| !s.is_empty()).unwrap_or(
+                                    chunk.content.lines().next().unwrap_or("").to_string(),
+                                )
+                            };
 
-                            let term_lower = search_term.to_lowercase();
-                            let import_statement =
-                                if chunk.content.to_lowercase().contains(&term_lower) {
-                                    chunk
-                                        .content
-                                        .lines()
-                                        .find(|l| l.to_lowercase().contains(&term_lower))
-                                        .unwrap_or("")
-                                        .to_string()
-                                } else {
-                                    chunk.signature.filter(|s| !s.is_empty()).unwrap_or(
-                                        chunk.content.lines().next().unwrap_or("").to_string(),
-                                    )
-                                };
-
-                            out.push(DependentItem {
-                                path: chunk.path,
-                                line: chunk.start_line,
-                                import_statement,
-                            });
-
-                            break; // found in this store, move to next FTS result
-                        }
-                        Ok(None) => {} // try next store
-                        // One broken store says nothing about the others; a
-                        // `break` here silently drops a chunk that lives in a
-                        // healthy store later in the list.
-                        Err(ref e) => {
-                            note_store_failure(
-                                &mut dep_warnings,
-                                dep_aliases,
-                                store_idx,
-                                "chunk lookup",
-                                e,
-                            );
-                            continue;
-                        }
+                        out.push(DependentItem {
+                            path: ctx.prefix_sourced_path(&f.alias, &chunk.path),
+                            line: chunk.start_line + 1,
+                            import_statement,
+                        });
+                    }
+                    Ok(None) => {} // not held anywhere — skip
+                    Err(ref e) => {
+                        note_store_failure(
+                            &mut dep_warnings,
+                            dep_aliases,
+                            origin_idx,
+                            "chunk lookup",
+                            e,
+                        );
                     }
                 }
                 if out.len() >= limit {
@@ -472,7 +481,7 @@ impl CodesearchService {
                         let mut out = Vec::new();
                         let term_lower = search_term.to_lowercase();
                         for f in &fts_results {
-                            if let Some(chunk) = store.get_chunk(f.chunk_id)? {
+                            if let Some(chunk) = store.get_chunk(f.result.chunk_id)? {
                                 if !is_import_kind(&chunk.kind) {
                                     continue;
                                 }
@@ -500,7 +509,7 @@ impl CodesearchService {
 
                                 out.push(DependentItem {
                                     path: chunk.path,
-                                    line: chunk.start_line,
+                                    line: chunk.start_line + 1,
                                     import_statement,
                                 });
 
@@ -524,9 +533,12 @@ impl CodesearchService {
             }
         };
 
-        // Prefix paths with alias for multi-repo identification
-        for item in &mut items {
-            item.path = ctx.prefix_result_path(&item.path);
+        // Prefix paths with the routing alias; group items were already
+        // attributed to their origin repo at resolution time.
+        if ctx.stores_vec.is_none() {
+            for item in &mut items {
+                item.path = ctx.prefix_result_path(&item.path);
+            }
         }
 
         items.sort_by(|a, b| a.path.cmp(&b.path));
@@ -563,29 +575,26 @@ impl CodesearchService {
         let mut similar_warnings: Vec<String> = Vec::new();
 
         let mut results = if let Some(ref sv) = ctx.stores_vec {
-            // Multi-store: find the embedding in whichever store has it,
-            // then search across all stores for similar chunks.
+            // Multi-store: chunk ids are per-repo counters, so the source
+            // embedding cannot be resolved by "first store that answers this
+            // id" — that silently picks the WRONG repo's chunk on collision.
+            // Same contract as get_chunk: exactly one holder auto-routes;
+            // several holders are an ambiguity the caller must resolve with
+            // `project=`.
             let aliases = ctx.aliases();
-            let mut embedding: Option<Vec<f32>> = None;
+            let mut candidates: Vec<(usize, Vec<f32>)> = Vec::new();
             for (i, store_arc) in sv.iter().enumerate() {
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(
-                            &mut similar_warnings,
-                            aliases,
-                            i,
-                            "embedding lookup",
-                            &e,
-                        );
-                        continue;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    i,
+                    &mut similar_warnings,
+                    "embedding lookup",
+                ) else {
+                    continue;
                 };
                 match store.get_embedding(request.chunk_id) {
-                    Ok(Some(emb)) => {
-                        embedding = Some(emb);
-                        break;
-                    }
+                    Ok(Some(emb)) => candidates.push((i, emb)),
                     Ok(None) => continue,
                     Err(ref e) => {
                         note_store_failure(
@@ -600,9 +609,8 @@ impl CodesearchService {
                 }
             }
 
-            let embedding = match embedding {
-                Some(e) => e,
-                None => {
+            let embedding = match candidates.len() {
+                0 => {
                     return Ok(CallToolResult::success(vec![ContentBlock::text(
                         qualify_empty_result(
                             format!(
@@ -613,29 +621,57 @@ impl CodesearchService {
                         ),
                     )]));
                 }
+                1 => candidates.pop().expect("len == 1 checked").1,
+                _ => {
+                    let holder_names: Vec<&str> = candidates
+                        .iter()
+                        .map(|(i, _)| {
+                            aliases
+                                .get(*i)
+                                .map(String::as_str)
+                                .unwrap_or("unnamed store")
+                        })
+                        .collect();
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "Ambiguous chunk_id {}: found in {} repositories ({}). \
+                         Pass `project=` to pick one.",
+                        request.chunk_id,
+                        holder_names.len(),
+                        holder_names.join(", ")
+                    ))]));
+                }
             };
 
-            // Search across all stores with the found embedding
+            // Search across all stores with the found embedding. Dedup keys on
+            // (store, id): a bare id collides across repos and would drop a
+            // whole repo's neighbours whenever another repo reused the id.
             let mut all_results: Vec<SearchResultItem> = Vec::new();
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut seen_ids: HashSet<(usize, u32)> =
+                HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(&mut similar_warnings, aliases, store_idx, "search", &e);
-                        continue;
-                    }
+                let alias = aliases
+                    .get(store_idx)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    store_idx,
+                    &mut similar_warnings,
+                    "search",
+                ) else {
+                    continue;
                 };
                 match store.search(&embedding, limit + 1) {
                     Ok(mut neighbors) => {
                         neighbors.retain(|r| r.id != request.chunk_id);
                         for r in neighbors {
-                            if seen_ids.insert(r.id) {
+                            if seen_ids.insert((store_idx, r.id)) {
                                 all_results.push(SearchResultItem {
                                     chunk_id: Some(r.id),
-                                    path: r.path,
-                                    start_line: r.start_line,
-                                    end_line: r.end_line,
+                                    path: ctx.prefix_sourced_path(alias, &r.path),
+                                    start_line: r.start_line + 1,
+                                    end_line: r.end_line + 1,
                                     kind: r.kind,
                                     score: r.score,
                                     signature: r.signature,
@@ -691,8 +727,8 @@ impl CodesearchService {
                             .map(|r| SearchResultItem {
                                 chunk_id: Some(r.id),
                                 path: r.path,
-                                start_line: r.start_line,
-                                end_line: r.end_line,
+                                start_line: r.start_line + 1,
+                                end_line: r.end_line + 1,
                                 kind: r.kind,
                                 score: r.score,
                                 signature: r.signature,
@@ -718,9 +754,12 @@ impl CodesearchService {
             }
         };
 
-        // Prefix paths with alias for multi-repo identification
-        for item in &mut results {
-            item.path = ctx.prefix_result_path(&item.path);
+        // Prefix paths with the routing alias; group items were already
+        // attributed to their origin repo at resolution time.
+        if ctx.stores_vec.is_none() {
+            for item in &mut results {
+                item.path = ctx.prefix_result_path(&item.path);
+            }
         }
 
         // Every exit carries the channel: the earlier read sat in an

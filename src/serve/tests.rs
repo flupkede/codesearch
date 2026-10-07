@@ -114,6 +114,53 @@ async fn get_chunk_routes_mounted_remote_projects_through_federation() {
 }
 
 #[test]
+fn idle_mcp_sessions_are_bounded_to_reap_after_30_minutes() {
+    // The idle-reap fix is exactly this configuration: keep_alive=None
+    // assumed TCP liveness would collect wedged sessions, but a stuck
+    // request keeps its socket and its FIFO-serialized worker alive
+    // indefinitely (observed active_sessions=4 with a single client).
+    // The bound must stay a plain half hour — far beyond any human pause in
+    // local interactive use, yet a guarantee the session eventually goes
+    // away without a serve restart.
+    let manager = crate::serve::session_manager_with_idle_reap();
+    assert_eq!(
+        manager.session_config.keep_alive,
+        Some(std::time::Duration::from_secs(crate::constants::MCP_IDLE_SESSION_SECS)),
+        "the reap bound must be configured on the rmcp session manager"
+    );
+    assert_eq!(
+        crate::constants::MCP_IDLE_SESSION_SECS,
+        30 * 60,
+        "the reap bound must stay at thirty minutes"
+    );
+}
+
+#[test]
+fn shutdown_drain_notice_bounds_the_pause_and_forbids_the_reflex_ctrl_c() {
+    // The notice exists because the ~3 s drain after `q` reads as a hang
+    // from the restored terminal, and the reflex second Ctrl-C hard-kills
+    // serve mid-drain (raw mode is already off, so it IS delivered). Every
+    // element matters: the bounded wait, the session count, and the
+    // explicit "exits by itself".
+    let quiet = crate::serve::tui::shutdown_drain_notice(0);
+    assert_eq!(quiet, "🛑 Shutting down…", "no sessions — no drain to explain");
+
+    let draining = crate::serve::tui::shutdown_drain_notice(4);
+    assert!(
+        draining.contains("4 open MCP session(s)"),
+        "the count of draining sessions must be named, got: {draining}"
+    );
+    assert!(
+        draining.contains("~3 s"),
+        "the visibly bounded wait is the whole point, got: {draining}"
+    );
+    assert!(
+        draining.contains("exiting by itself"),
+        "the user must be told NOT to intervene, got: {draining}"
+    );
+}
+
+#[test]
 fn tracked_session_drop_balances_active_sessions() {
     // A genuine MCP session increments on connect and the serve factory
     // marks it tracked, so Drop decrements and the counter returns to 0.
@@ -262,6 +309,115 @@ async fn remove_repo_reports_db_locked_when_delete_fails() {
         outcome.db_delete_error.is_some(),
         "a delete error reason must be present on failure"
     );
+}
+
+#[tokio::test]
+async fn remove_repo_quarantines_db_dir_when_delete_budget_expires() {
+    // When the delete budget expires (external holder: another process, an
+    // AV scanner), the directory used to stay in place as a "valid" index —
+    // the next registration adopted its stale metadata and chunk stores as a
+    // false readiness, and re-registration against that legacy data ended in
+    // arroy EINVAL (the pilot's bare-stamp repos). The quarantine rename
+    // makes a fresh registration build from scratch; the quarantined sibling
+    // stays for manual cleanup, same convention as .codesearch.db.bak-*.
+    let (_tmp, repo_path, state) = state_with_repo("ghostrepo");
+    // db_path is a FILE: remove_dir_all fails every retry with a non-lock
+    // error, deterministically exhausting the budget branch on every OS.
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::write(&db_path, "not a directory").unwrap();
+
+    let outcome = state
+        .remove_repo("ghostrepo")
+        .await
+        .expect("remove_repo returns Ok(outcome); delete failure is non-fatal");
+
+    assert!(!outcome.db_deleted);
+    let quarantine = outcome
+        .db_quarantined
+        .expect("a surviving db path must be quarantined, not left in place");
+    assert!(!db_path.exists(), "the original db path must be gone");
+    assert!(quarantine.exists(), "the quarantined sibling must exist");
+    assert!(
+        quarantine
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".codesearch.db.removed-"),
+        "quarantine follows the <DB_DIR_NAME>.removed-* convention: {}",
+        quarantine.display()
+    );
+}
+
+#[tokio::test]
+async fn delete_repo_http_mapping_reports_a_quarantined_db_honestly() {
+    // The DELETE /repos/{alias} payload must not read "removed" when the DB
+    // dir survived the delete budget: the caller (an operator or an agent
+    // driving /repos) decides whether the disk still holds a stale index by
+    // `status` and `db_quarantined`. The quarantine outcome itself is pinned
+    // by remove_repo_quarantines_db_dir_when_delete_budget_expires; this
+    // pins its HTTP mapping.
+    let (_tmp, repo_path, state) = state_with_repo("qmap");
+    let state = Arc::new(state);
+    // A FILE as the db path: remove_dir_all fails every retry with a
+    // non-lock error, deterministically exhausting the budget into the
+    // quarantine branch on every OS.
+    std::fs::write(repo_path.join(DB_DIR_NAME), "not a directory").unwrap();
+
+    let (status, body) =
+        crate::serve::remove_repo_handler(axum::extract::Path("qmap".to_string()), axum::extract::State(state))
+            .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK, "got body: {body:?}");
+    assert_eq!(
+        body["status"], "removed_db_quarantined",
+        "the status must name the honest outcome, got: {body:?}"
+    );
+    assert_eq!(
+        body["db_deleted"], false,
+        "a quarantined dir was NOT deleted, got: {body:?}"
+    );
+    let quarantine = body["db_quarantined"]
+        .as_str()
+        .expect("db_quarantined must be a string path")
+        .to_string();
+    assert!(
+        quarantine.contains(&format!("{DB_DIR_NAME}.removed-")),
+        "the payload must point at the quarantined sibling, got: {quarantine}"
+    );
+}
+
+#[test]
+fn sweep_removes_quarantine_remnants_and_leaves_everything_else() {
+    // The quarantine rename leaves the survivor "for manual cleanup", and
+    // manual cleanup never happens — every budget-expired delete leaked a
+    // full stale index copy forever. The startup sweep is the cleanup:
+    // by serve start the previous session's external holders are gone, so
+    // the tombstone has no readers left to protect.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let remnant = repo.join(format!("{DB_DIR_NAME}.removed-1700000000000"));
+    std::fs::create_dir_all(&remnant).unwrap();
+    std::fs::write(remnant.join("metadata.json"), "{}").unwrap();
+    let live_db = repo.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&live_db).unwrap();
+    // Similar name, different prefix family — must not be touched.
+    let other = repo.join("notes.removed-manual");
+    std::fs::create_dir_all(&other).unwrap();
+
+    crate::serve::sweep_quarantined_db_remnants(std::slice::from_ref(&repo));
+
+    assert!(
+        !remnant.exists(),
+        "the .codesearch.db.removed-* sibling must be swept"
+    );
+    assert!(live_db.exists(), "the live db dir must stay untouched");
+    assert!(other.exists(), "unrelated .removed names must not be touched");
+
+    // A repo path that cannot be listed warns but does not panic.
+    let missing = tmp.path().join("gone");
+    crate::serve::sweep_quarantined_db_remnants(&[missing]);
 }
 
 #[test]
@@ -3035,6 +3191,87 @@ async fn a_second_format_recovery_for_the_same_alias_is_refused() {
     );
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn format_recovery_refuses_to_wipe_while_an_index_task_is_alive() {
+    // recover_repo_format's safety guard: wiping the DB dir from under a
+    // live indexing task can wedge the task while it holds the store handles
+    // and the process-wide job permit. The refusal branch ("did not stop
+    // within the cooperative budget; refusing to wipe") was pinned nowhere.
+    let (_tmp, repo_path, state) = state_with_repo("liverun");
+    let state = Arc::new(state);
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+    // A task with no cancellation point: it ignores the token the way a real
+    // build_index parked inside its synchronous arroy pass does. The sleep is
+    // virtual — with paused time the 5 s cooperative budget expires the
+    // instant the timeout is awaited.
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    });
+    state.index_tasks.insert(
+        "liverun".to_string(),
+        IndexTask {
+            handle,
+            token,
+            db_path: db_path.clone(),
+            started_at: Instant::now(),
+        },
+    );
+
+    let result = state.recover_repo_format("liverun").await;
+
+    let err = result.expect_err("a live indexing task must block the wipe");
+    assert!(
+        err.contains("refusing to wipe"),
+        "the refusal must say what it refused, got: {err}"
+    );
+    assert!(
+        db_path.exists(),
+        "the DB dir must survive a refused format-recovery wipe"
+    );
+    assert!(
+        !state.format_recovery_done.contains_key("liverun"),
+        "a refused wipe must not tombstone the alias"
+    );
+
+    // Cleanup: the parked task must not outlive the test. await_index_task
+    // put it back into the map ("keeping it tracked"), so abort from there.
+    if let Some((_, task)) = state.index_tasks.remove("liverun") {
+        task.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn format_recovery_permanent_delete_failure_surfaces_and_stays_retryable() {
+    // A non-lock delete failure (here: the db path is a regular file) must
+    // NOT burn the lock-class retry budget, must surface as an explicit
+    // error, and — because format_recovery_done records at the WIPE, not at
+    // the rebuild — the alias stays eligible for another attempt instead of
+    // entering the one-wipe-per-process tombstone on a wipe that never
+    // happened.
+    let (_tmp, repo_path, state) = state_with_repo("filerun");
+    let state = Arc::new(state);
+    let db_path = repo_path.join(DB_DIR_NAME);
+    // A FILE: remove_dir_all fails immediately with a non-lock error on
+    // every OS, deterministically taking the permanent-failure branch.
+    std::fs::write(&db_path, "not a directory").unwrap();
+
+    let result = state.recover_repo_format("filerun").await;
+    let err = result.expect_err("a permanent delete failure must surface");
+    assert!(
+        err.contains("could not wipe"),
+        "the error must name the failed wipe, got: {err}"
+    );
+    assert!(
+        state.enqueue_format_recovery("filerun"),
+        "a wipe that never happened must not tombstone the alias — the next \
+         corruption detection has to be able to retry once the holder is gone"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn await_index_task_cancels_and_releases_the_task_handles() {
@@ -4177,4 +4414,834 @@ async fn sweeper_reasserts_cancellation_for_a_removed_live_task() {
             entry.value().handle.abort();
         }
     }
+}
+
+// === Group fan-out chunk-id collision (misattribution) =================
+//
+// Chunk ids are per-repo counters, so every repo in a group holds chunk id 0.
+// The group tools used to resolve a bare id by probing every store and taking
+// the first answer — the alphabetically-first repo won the hit, the true
+// definition was filtered out as "wrong kind", and unrelated content rode the
+// stolen score. These fixtures seed BOTH repos' only chunk at id 0 so any
+// resolution that ignores the origin repo fails deterministically.
+
+/// Seed `<root>/.codesearch.db` with one chunk (id 0) whose content mentions
+/// the search term, then release the writer handle so ServeState can open it.
+async fn seed_collision_repo(
+    root: &std::path::Path,
+    rel_path: &str,
+    kind: crate::chunker::ChunkKind,
+    signature: Option<&str>,
+    content: &str,
+) {
+    let db_path = root.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        let mut chunk = crate::chunker::Chunk::new(
+            content.to_string(),
+            0,
+            4,
+            kind,
+            rel_path.to_string(),
+        );
+        chunk.signature = signature.map(str::to_string);
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![0.25, 0.75],
+        )])
+        .expect("insert chunk");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(0, content, rel_path, signature, &format!("{:?}", kind))
+            .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+}
+
+/// Two-repo uvz-shaped fixture where both repos hold exactly one chunk at the
+/// SAME id 0: `accounting-operations` (alphabetically first — the thief before
+/// the fix) has a prose comment mentioning the symbol, `bankruptcy` holds the
+/// real Java interface definition.
+async fn colliding_group_fixture() -> (tempfile::TempDir, crate::mcp::CodesearchService) {
+    let (tmp, _state, service) = colliding_group_fixture_with_state().await;
+    (tmp, service)
+}
+
+/// Same fixture, keeping the `ServeState` handle so tests can reach the very
+/// `SharedStores` instances routing opens (`get_opened_stores`) and hold
+/// their vector write guards — a fresh `SharedStores::new` would build other
+/// RwLocks and the held guard would gate nothing.
+async fn colliding_group_fixture_with_state()
+-> (tempfile::TempDir, std::sync::Arc<ServeState>, crate::mcp::CodesearchService) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("accounting-operations");
+    let root_b = tmp.path().join("bankruptcy");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    seed_collision_repo(
+        &root_a,
+        "src/hooks/useBankruptcyFolder.ts",
+        crate::chunker::ChunkKind::Comment,
+        None,
+        "// TODO migrate this hook to BankruptcyFolderService from the bankruptcy service",
+    )
+    .await;
+    seed_collision_repo(
+        &root_b,
+        "src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        crate::chunker::ChunkKind::Interface,
+        Some("public interface BankruptcyFolderService"),
+        "public interface BankruptcyFolderService { BankruptcyFolder folderFor(String inn); }",
+    )
+    .await;
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root_a.clone(), Some("accounting-operations".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(root_b.clone(), Some("bankruptcy".to_string()))
+        .unwrap();
+    config.groups.insert(
+        "uvz".to_string(),
+        vec![
+            "accounting-operations".to_string(),
+            "bankruptcy".to_string(),
+        ],
+    );
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state.clone()).unwrap();
+    (tmp, state, service)
+}
+
+fn tool_text(res: &rmcp::model::CallToolResult) -> String {
+    match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn group_find_definition_attributes_hit_to_origin_repo_on_id_collision() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, service) = colliding_group_fixture().await;
+
+    let request = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .find(Parameters(request))
+        .await
+        .expect("group find must succeed");
+    let text = tool_text(&res);
+
+    // Before the fix this was the empty-result arm ("No definition found"):
+    // both hits resolved in accounting-operations' comment chunk, failed the
+    // DEFINITION_KINDS filter, and the true interface never surfaced.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a bare result array, got: {text}"));
+    assert_eq!(items.len(), 1, "exactly the interface definition, got: {text}");
+    assert_eq!(
+        items[0]["path"],
+        "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        "the hit must carry its origin repo's alias prefix: {text}"
+    );
+    assert_eq!(items[0]["kind"], "Interface", "got: {text}");
+    assert_eq!(
+        items[0]["line"], 1,
+        "responses must emit 1-based editor lines (chunk starts at 0-based line 0): {text}"
+    );
+}
+
+/// Group-scoped get_chunk must read surrounding lines from the OWNING repo's
+/// root. Stored chunk paths are project-relative, and the old context read
+/// joined them onto the serve process's own project_path after alias
+/// prefixing — a path that never exists — so every group answer came back
+/// with the "source file not readable" note and zero context. Here chunk id 5
+/// lives only in accounting-operations (bankruptcy holds just id 0), so the
+/// smart-candidate detection routes to the unique owner.
+#[tokio::test]
+async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("accounting-operations");
+    let root_b = tmp.path().join("bankruptcy");
+    std::fs::create_dir_all(root_a.join("src/service")).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    // The real source file the context read has to find.
+    std::fs::write(
+        root_a.join("src/service/TargetService.java"),
+        "line one\nline two\nTARGET LINE THREE\nTARGET LINE FOUR\nTARGET LINE FIVE\nline six\nline seven\nline eight\n",
+    )
+    .unwrap();
+
+    // Repo A: five filler chunks (ids 0..=4) then the target at id 5,
+    // spanning 0-based lines [2, 4] of the file above.
+    let db_a = root_a.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_a).unwrap();
+    std::fs::write(
+        db_a.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_a, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        for i in 0..5u32 {
+            vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+                crate::chunker::Chunk::new(
+                    format!("filler {i}"),
+                    0,
+                    0,
+                    crate::chunker::ChunkKind::Comment,
+                    "src/Filler.java".to_string(),
+                ),
+                vec![0.25, 0.75],
+            )])
+            .expect("insert filler");
+        }
+        let mut target = crate::chunker::Chunk::new(
+            "TARGET LINE THREE\nTARGET LINE FOUR\nTARGET LINE FIVE".to_string(),
+            2,
+            4,
+            crate::chunker::ChunkKind::Function,
+            "src/service/TargetService.java".to_string(),
+        );
+        target.signature = Some("fn target()".to_string());
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(target, vec![0.5, 0.5])])
+            .expect("insert target");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(
+            5,
+            "target",
+            "src/service/TargetService.java",
+            Some("fn target()"),
+            "Function",
+        )
+        .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+
+    // Repo B holds only id 0, so chunk id 5 is unique to repo A.
+    seed_collision_repo(
+        &root_b,
+        "src/B.java",
+        crate::chunker::ChunkKind::Comment,
+        None,
+        "// b",
+    )
+    .await;
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root_a.clone(), Some("accounting-operations".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(root_b.clone(), Some("bankruptcy".to_string()))
+        .unwrap();
+    config.groups.insert(
+        "uvz".to_string(),
+        vec![
+            "accounting-operations".to_string(),
+            "bankruptcy".to_string(),
+        ],
+    );
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 5,
+        chunk_ref: None,
+        context_lines: Some(2),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("group get_chunk must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+
+    assert_eq!(
+        parsed["path"], "accounting-operations/src/service/TargetService.java",
+        "got: {text}"
+    );
+    assert_eq!(
+        parsed["context_before"], "line one\nline two",
+        "context above must come from the owning repo's real file: {text}"
+    );
+    assert_eq!(
+        parsed["context_after"], "TARGET LINE FIVE\nline six",
+        "context below must come from the owning repo's real file: {text}"
+    );
+    assert!(
+        parsed.get("note").is_none(),
+        "the context read resolved — no fallback note expected, got: {text}"
+    );
+}
+
+// ═══ Interactive fan-outs skip busy stores instead of queueing behind the
+// write lock (review cluster B). The priming call opens the group's stores
+// so `get_opened_stores` hands back the SAME SharedStores the handlers
+// resolve; holding its vector write guard then reproduces an active indexing
+// run. A regression to bounded waits wedges each test on the 300 s lock
+// timeout instead of returning the skip-with-warning answer asserted here.
+
+#[tokio::test]
+async fn group_find_skips_a_write_locked_store_instead_of_waiting() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, state, service) = colliding_group_fixture_with_state().await;
+
+    // Prime routing so the group's stores are opened and lockable.
+    let prime = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    service
+        .find(Parameters(prime))
+        .await
+        .expect("priming find must succeed");
+
+    let alpha = state
+        .get_opened_stores("accounting-operations")
+        .expect("priming call must open accounting-operations");
+    let _guard = alpha.vector_store.write().await;
+
+    let request = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .find(Parameters(request))
+        .await
+        .expect("group find must succeed without waiting on the locked store");
+    let text = tool_text(&res);
+
+    // The healthy repo still answers; the busy one is named in `warnings`,
+    // not silently folded into a plausible-looking short result list.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed
+        .as_object()
+        .and_then(|o| o.get("results"))
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("expected a {{results, warnings}} object, got: {text}"));
+    assert_eq!(
+        items.len(),
+        1,
+        "only the bankruptcy definition must be reported, got: {text}"
+    );
+    assert_eq!(
+        items[0]["path"],
+        "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        "got: {text}"
+    );
+    assert!(
+        text.contains("store busy") && text.contains("accounting-operations"),
+        "the skipped repo must be named with a store-busy warning, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn group_get_chunk_skips_a_write_locked_candidate_repo() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, state, service) = colliding_group_fixture_with_state().await;
+
+    // Prime routing so the group's stores are opened and lockable.
+    let prime = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    service
+        .find(Parameters(prime))
+        .await
+        .expect("priming find must succeed");
+
+    let alpha = state
+        .get_opened_stores("accounting-operations")
+        .expect("priming call must open accounting-operations");
+    let _guard = alpha.vector_store.write().await;
+
+    // Both repos hold id 0; with accounting-operations locked, the candidate
+    // scan must skip it (not wait) and auto-route to bankruptcy alone.
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 0,
+        chunk_ref: None,
+        context_lines: None,
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("group get_chunk must succeed without waiting on the locked store");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+
+    assert_eq!(
+        parsed["path"],
+        "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        "the only answering candidate must own the answer, got: {text}"
+    );
+    assert!(
+        text.contains("store busy") && text.contains("accounting-operations"),
+        "the skipped candidate must be named with a store-busy warning, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn group_similar_skips_a_write_locked_store_instead_of_waiting() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, state, service) = colliding_group_fixture_with_state().await;
+
+    // Prime routing so the group's stores are opened and lockable; the
+    // unprimed answer would be an id-0 ambiguity report, which is fine —
+    // only the side effect (stores opened) matters here.
+    let prime = crate::mcp::types::ExploreRequest {
+        kind: Some("similar".to_string()),
+        target: "0".to_string(),
+        limit: Some(5),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    service
+        .explore(Parameters(prime))
+        .await
+        .expect("priming explore must succeed");
+
+    let alpha = state
+        .get_opened_stores("accounting-operations")
+        .expect("priming call must open accounting-operations");
+    let _guard = alpha.vector_store.write().await;
+
+    // Covers BOTH converted fan-out sites of similar_chunks in one call:
+    // the embedding lookup and the neighbour search both try-lock alpha.
+    let req = crate::mcp::types::SimilarChunksRequest {
+        chunk_id: 0,
+        limit: Some(5),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .similar_chunks(Parameters(req))
+        .await
+        .expect("group similar must succeed without waiting on the locked store");
+    let text = tool_text(&res);
+
+    // The embedding resolves against bankruptcy alone (unique holder), and
+    // its neighbour set is just the source chunk itself — filtered out — so
+    // the answer is the empty message PLUS the store-busy warnings naming
+    // the skipped repo.
+    assert!(
+        text.contains("No similar chunks found for chunk_id 0"),
+        "expected the empty-result answer from the sole answering repo, got: {text}"
+    );
+    assert!(
+        text.contains("store busy") && text.contains("accounting-operations"),
+        "the skipped repo must be named with a store-busy warning, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn group_literal_search_attributes_each_hit_to_its_origin_repo() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, service) = colliding_group_fixture().await;
+
+    let request = crate::mcp::types::LiteralSearchRequest {
+        query: "BankruptcyFolderService".to_string(),
+        regex: None,
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .literal_search(Parameters(request))
+        .await
+        .expect("group literal search must succeed");
+    let text = tool_text(&res);
+
+    // Before the fix BOTH hits resolved against accounting-operations' chunk
+    // (first store answering id 0): two identical hook paths, the Java file's
+    // content lost. After the fix each hit resolves in its own repo and every
+    // path carries its origin alias.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a results array, got: {text}"))
+        .clone();
+    assert_eq!(items.len(), 2, "both repos must answer, got: {text}");
+
+    let mut paths: Vec<String> = items
+        .iter()
+        .map(|i| i["path"].as_str().unwrap_or_default().to_string())
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            "accounting-operations/src/hooks/useBankruptcyFolder.ts".to_string(),
+            "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java"
+                .to_string(),
+        ],
+        "each hit must keep its own repo's path and alias prefix: {text}"
+    );
+
+    // Snippet attribution: the prefixed java hit must be the interface content,
+    // not the accounting comment that stole it before the fix.
+    let java = items
+        .iter()
+        .find(|i| i["path"].as_str().unwrap_or("").starts_with("bankruptcy/"))
+        .expect("java hit present");
+    assert!(
+        java["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("public interface BankruptcyFolderService"),
+        "the bankruptcy hit must carry bankruptcy's own content: {text}"
+    );
+}
+
+/// Exact-AND literal search returns silence for multi-word queries whose
+/// relevant chunks hold only MOST of the terms. The relaxed fallback must
+/// surface those partial hits (>=60% significant-term coverage, >=2 terms)
+/// instead of an empty answer, flag `relaxed_fallback` and explain itself
+/// in the note — while single-identifier queries keep their honest refusal.
+#[tokio::test]
+async fn group_literal_search_relaxed_fallback_covers_partial_term_hits() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("partial");
+    std::fs::create_dir_all(&root).unwrap();
+    {
+        let db_path = root.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+        )
+        .unwrap();
+        let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+        {
+            let mut vs = stores.vector_store.write().await;
+            let rich = crate::chunker::Chunk::new(
+                "create package documents quickly".to_string(),
+                0,
+                3,
+                crate::chunker::ChunkKind::Comment,
+                "docs/create.md".to_string(),
+            );
+            let poor = crate::chunker::Chunk::new(
+                "package".to_string(),
+                0,
+                1,
+                crate::chunker::ChunkKind::Comment,
+                "docs/other.md".to_string(),
+            );
+            vs.insert_chunks(vec![
+                crate::embed::EmbeddedChunk::new(rich, vec![0.25, 0.75]),
+                crate::embed::EmbeddedChunk::new(poor, vec![0.5, 0.5]),
+            ])
+            .expect("insert chunks");
+            vs.build_index().expect("build index");
+        }
+        {
+            let mut fts = stores.fts_store.write().await;
+            fts.add_chunk(
+                0,
+                "create package documents quickly",
+                "docs/create.md",
+                None,
+                "Comment",
+            )
+            .expect("fts doc");
+            fts.add_chunk(1, "package", "docs/other.md", None, "Comment")
+                .expect("fts doc");
+            fts.commit().expect("fts commit");
+        }
+        drop(stores);
+    }
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root.clone(), Some("partial".to_string()))
+        .unwrap();
+    config.groups.insert("solo".to_string(), vec!["partial".to_string()]);
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    // Four significant terms; no chunk holds all four, so exact AND is empty.
+    // The rich chunk covers 3/4 (>=60%), the poor one 1/4 (<2 terms).
+    let request = crate::mcp::types::LiteralSearchRequest {
+        query: "create package documents signature".to_string(),
+        regex: None,
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: Some("solo".to_string()),
+    };
+    let res = service
+        .literal_search(Parameters(request))
+        .await
+        .expect("relaxed literal search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("expected a results array, got: {text}"));
+    assert_eq!(
+        items.len(),
+        1,
+        "only the >=60%-coverage chunk survives the relaxed gate: {text}"
+    );
+    assert_eq!(items[0]["path"], "partial/docs/create.md", "got: {text}");
+    assert_eq!(
+        items[0]["start_line"], 1,
+        "responses must emit 1-based editor lines (chunk starts at 0-based line 0): {text}"
+    );
+    assert_eq!(
+        parsed["relaxed_fallback"],
+        serde_json::json!(true),
+        "the fallback must be visible to the caller: {text}"
+    );
+    assert!(
+        parsed["note"].as_str().unwrap_or_default().contains("relaxed"),
+        "the note must explain the mode: {text}"
+    );
+
+    // A single-identifier query never relaxes: the empty exact answer stays
+    // an honest refusal, not a wall of partial matches.
+    let request = crate::mcp::types::LiteralSearchRequest {
+        query: "QzMissingUvzBusinessSymbol99Xy".to_string(),
+        regex: None,
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: Some("solo".to_string()),
+    };
+    let res = service
+        .literal_search(Parameters(request))
+        .await
+        .expect("refusal literal search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        parsed["results"].as_array().map(Vec::is_empty).unwrap_or(true),
+        "an unknown identifier must stay empty: {text}"
+    );
+    assert!(
+        parsed.get("relaxed_fallback").is_none(),
+        "single-term queries must not trigger the fallback: {text}"
+    );
+}
+
+/// `min_score` lets a caller turn the nearest-neighbour firehose into an
+/// honest refusal: hits below the threshold are dropped and the empty
+/// answer explains itself in `note`, instead of presenting irrelevant
+/// neighbours as if they were matches. Lexical mode rides the same
+/// `build_semantic_response` funnel as the embedding-backed modes, so it
+/// exercises the threshold without needing a real embedding model.
+#[tokio::test]
+async fn group_semantic_search_min_score_refuses_instead_of_returning_noise() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, service) = colliding_group_fixture().await;
+
+    let make_request = |min_score: Option<f32>| crate::mcp::types::SearchRequest {
+        query: "BankruptcyFolderService".to_string(),
+        mode: None,
+        compact: None,
+        semantic_mode: Some("lexical".to_string()),
+        filter_path: None,
+        min_score,
+        regex: None,
+        phrase: None,
+        file_glob: None,
+        language: None,
+        format: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+
+    // An unreachable threshold must refuse with an explanation, not return
+    // the (weakly scored) candidates it found.
+    let res = service
+        .search(Parameters(make_request(Some(10_000.0))))
+        .await
+        .expect("min_score search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        parsed["results"].as_array().map(Vec::is_empty).unwrap_or(false),
+        "an unreachable threshold must yield an explicit refusal: {text}"
+    );
+    assert_eq!(
+        parsed["low_confidence"],
+        serde_json::json!(true),
+        "a refusal is a low-confidence outcome: {text}"
+    );
+    assert!(
+        parsed["note"].as_str().unwrap_or_default().contains("min_score"),
+        "the refusal must name the threshold so the caller can retune it: {text}"
+    );
+
+    // Without the threshold the same query must still answer with hits:
+    // `min_score` adds a refusal path, never a silent filter.
+    let res = service
+        .search(Parameters(make_request(None)))
+        .await
+        .expect("unfiltered search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        !parsed["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the same query without a threshold must return its hits: {text}"
+    );
+}
+
+/// Regression for the pilot's "ghost loss" of freshly registered aliases.
+///
+/// The debounced persist clones its snapshot and writes the file WITHOUT the
+/// config lock, so a registration landing in that window used to exist only
+/// in memory while the stale snapshot hit disk. Every reader-side
+/// `reload_if_changed` (warmup / aliases / info / group resolve) then saw the
+/// fresh mtime, trusted "the file changed", and swapped the stale disk copy
+/// into memory — silently dropping the registration (alias 404s in /info, its
+/// build ending with "repo removed or cancelled mid-index").
+///
+/// Two guards fix it: `persist_config` adopts its own write's mtime so an
+/// internal persist never masquerades as an external edit, and
+/// `run_persist_pass` re-verifies memory against the snapshot and rewrites
+/// until disk converges.
+#[tokio::test]
+async fn own_persist_never_clobbers_a_racing_registration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("alpha-repo");
+    let root_b = tmp.path().join("beta-repo");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root_a.clone(), Some("alpha".to_string()))
+        .unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    // Warm the mtime cache exactly as production does after its first reader
+    // passes (ServeState starts with a None mtime; this reload adopts it).
+    let _ = state.aliases();
+
+    // The debounce worker clones its snapshot...
+    let stale = state.config.read().unwrap().clone();
+
+    // ...and a registration lands + persists while the worker is mid-write.
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.register_with_alias(root_b.clone(), Some("beta".to_string()))
+            .unwrap();
+    }
+    let current = state.config.read().unwrap().clone();
+    state.persist_config(&current).unwrap();
+
+    // The worker's stale snapshot finally hits the file — on disk, beta is gone.
+    state.persist_config(&stale).unwrap();
+    let disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        !disk.repos.contains_key("beta"),
+        "fixture premise: the stale snapshot must have won the disk race"
+    );
+
+    // Before the fix this reader-side reload saw the fresh mtime and clobbered
+    // the in-memory registration with the disk copy.
+    let aliases = state.aliases();
+    assert!(
+        aliases.iter().any(|a| a == "beta"),
+        "the in-memory registration must survive the worker's stale write"
+    );
+    assert!(
+        state.config_snapshot().repos.contains_key("beta"),
+        "beta must still resolve from the live config"
+    );
+
+    // The divergence check converges disk back to memory.
+    state.run_persist_pass().await;
+    let disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        disk.repos.contains_key("beta"),
+        "run_persist_pass must rewrite the racing registration to disk"
+    );
 }

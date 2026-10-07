@@ -40,6 +40,15 @@ pub struct SearchRequest {
     /// Only return results from files under this path prefix (semantic mode).
     pub filter_path: Option<String>,
 
+    /// Drop semantic hits scoring below this threshold (semantic mode only).
+    /// When nothing survives, the answer is an explicit refusal — an empty
+    /// `results` array plus a `note` explaining the threshold — instead of
+    /// the nearest neighbours posing as matches. Scores are mode-specific:
+    /// cosine similarity under `semantic_mode="semantic"` (0.0-1.0), RRF
+    /// points under `"auto"`/`"hybrid"`/`"lexical"` (rarely above 0.2), so
+    /// calibrate per mode before reusing a value.
+    pub min_score: Option<f32>,
+
     // ── Literal-mode options (ignored in semantic mode) ──
     /// Treat `query` as a regex pattern (literal mode only).
     pub regex: Option<bool>,
@@ -196,6 +205,8 @@ pub struct SemanticSearchRequest {
     pub project: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub min_score: Option<f32>,
 }
 
 /// Internal params for literal search (used by `search` tool dispatch).
@@ -391,8 +402,14 @@ pub struct LiteralSearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_promoted_to_regex: Option<bool>,
 
-    /// Actionable note for the LLM caller (present iff auto_promoted_to_regex
-    /// or low_confidence is set).
+    /// True when the exact AND pass matched nothing and these results come
+    /// from the relaxed OR fallback: every kept hit covers >=60% of the
+    /// query's significant (non-stopword) terms, at least two of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relaxed_fallback: Option<bool>,
+
+    /// Actionable note for the LLM caller (present iff auto_promoted_to_regex,
+    /// relaxed_fallback or low_confidence is set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 
@@ -420,6 +437,11 @@ pub struct SemanticSearchResponse {
     pub low_confidence: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_tool: Option<String>,
+    /// Explains an outcome the caller must not mistake for "no match in the
+    /// index": e.g. candidate hits existed but all fell below `min_score`
+    /// and were refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// Federation health warnings — populated when one or more remote peers in
     /// the queried group were unreachable. The query still returns (degraded)
     /// local + remaining-remote results; these warnings explain the gap so an
