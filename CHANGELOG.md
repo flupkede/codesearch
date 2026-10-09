@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.3]
+
+### Fixed
+
+- **Blazor/Razor projects no longer produce false "Compilation errors" index warnings.** The workspace load never ran source generators, so Razor components' generated partial halves were missing and every code-behind use of an `@code` member collapsed into CS0103/CS0115 cascades while `dotnet build` stayed clean. `scip-csharp` now drives the project's source generators itself (with a tolerant loader for analyzers built against a newer Roslyn than the pinned one) and indexes the generated output compilation; a failed generator pipeline falls back to the plain compilation and downgrades the resulting diagnostics to INFO notes instead of warnings. The index-warning lead entry no longer asserts a user-fixable build problem — it distinguishes real breaks from tool-side gaps — and error specimens are truncated at word boundaries instead of mid-identifier.
+
 ## [1.5.2] - 2026-10-05
 
 ### Fixed
