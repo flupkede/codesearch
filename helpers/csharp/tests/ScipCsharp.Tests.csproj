@@ -17,6 +17,19 @@
          (MSBuildWorkspace), which only resolves with the Workspaces.MSBuild
          assembly on the reference set. -->
     <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.13.0" />
+    <!-- MSBuildWorkspace needs the C# language services (CSharp.Workspaces)
+         to map .csproj files to the C# language; without it OpenProjectAsync
+         fails with "the language 'C#' is not supported". -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.13.0" />
+    <!-- GeneratorSupportTests registers the real .NET SDK MSBuild so the
+         Blazor fixture loads with its Razor generator references intact. -->
+    <PackageReference Include="Microsoft.Build.Locator" Version="1.9.1" />
+    <!-- Same transitive-CVE suppressions as scip-csharp.csproj (never-used
+         DownloadFile task surface). -->
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-h4j7-5rxr-p4wc" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-w3q9-fxm7-j8fq" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-37gx-xxp4-5rgx" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-w3x6-4m5h-cxqf" />
   </ItemGroup>
 
   <!--
@@ -28,6 +41,7 @@
     <Compile Include="..\ScipModels.cs" Link="ScipModels.cs" />
     <Compile Include="..\OutputWriter.cs" Link="OutputWriter.cs" />
     <Compile Include="..\SymbolIndexer.cs" Link="SymbolIndexer.cs" />
+    <Compile Include="..\GeneratorSupport.cs" Link="GeneratorSupport.cs" />
     <Compile Include="..\WorkspaceLoad.cs" Link="WorkspaceLoad.cs" />
     <Compile Include="..\WorkspaceNoise.cs" Link="WorkspaceNoise.cs" />
     <Compile Include="..\RestorePolicy.cs" Link="RestorePolicy.cs" />

@@ -103,7 +103,10 @@ public sealed class ReferenceResolver
         Console.Error.WriteLine("find-refs: building symbol map from solution...");
         foreach (var project in solution.Projects)
         {
-            var compilation = await project.GetCompilationAsync().ConfigureAwait(false);
+            // Same generator run as indexing: without it, Razor-generated
+            // component types are missing from the map and every reference
+            // inside them resolves to nothing.
+            var (compilation, _) = await GeneratorSupport.GetCompilationWithGeneratorsAsync(project).ConfigureAwait(false);
             if (compilation is null)
             {
                 Console.Error.WriteLine($"[WARN] find-refs: could not compile {project.Name}");
