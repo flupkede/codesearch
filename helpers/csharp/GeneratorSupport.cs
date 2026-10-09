@@ -30,6 +30,10 @@ public static class GeneratorSupport
 {
     // Recovery is expensive (ALC load + reflection per analyzer); the resulting
     // generator instances are stateless and reusable across projects and drivers.
+    // The cache is process-static and each entry loads an isCollectible:false
+    // ALC: in the resident workspace pool distinct analyzer paths accumulate
+    // across evictions and never unload — bounded in practice (tens of paths),
+    // but remember this origin when debugging serve memory.
     private static readonly ConcurrentDictionary<string, ISourceGenerator[]> RecoveryCache =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -211,7 +215,12 @@ internal sealed class DictOptions : AnalyzerConfigOptions
 }
 
 /// <summary>Parses MSBuild editorconfig documents (is_global section plus
-/// [path] sections) into per-path options for source generators.</summary>
+/// [path] sections) into per-path options for source generators.
+/// Limitation: sections match EXACT paths only (forward-slash normalized,
+/// case-insensitive) — that is what MSBuild's GeneratedMSBuildEditorConfig
+/// writes, and the Blazor fixture pins that case end-to-end. Glob-style
+/// sections ([*.razor], [**/Components/**]) are silently unmatched, so
+/// generator options scoped by glob are ignored.</summary>
 internal sealed class EditorConfigOptions
 {
     private readonly Dictionary<string, DictOptions> byPath = new(StringComparer.OrdinalIgnoreCase);

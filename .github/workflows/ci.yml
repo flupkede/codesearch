@@ -111,6 +111,17 @@ jobs:
         if: steps.changed.outputs.relevant == 'true'
         with:
           dotnet-version: '10.0.x'
+      # The xunit suite (models, key format, workspace/restore policy and the
+      # Blazor generator integration pin) must run in CI: until now only the
+      # cargo integration tests ran here, so a helper regression the xunit
+      # suite pins stayed green all the way to develop. Runs BEFORE the
+      # expensive publish + cargo cycle so a helper failure fails fast.
+      # NO MSBuild flags on dotnet test — the test SDK answers "Zero tests
+      # ran" (exit 5) with them, a false negative that survives a clean
+      # rebuild (repo convention).
+      - name: Run scip-csharp xunit suite
+        if: steps.changed.outputs.relevant == 'true'
+        run: dotnet test helpers/csharp/tests/ScipCsharp.Tests.csproj
       - name: Build scip-csharp helper (self-contained single-file)
         if: steps.changed.outputs.relevant == 'true'
         run: |
