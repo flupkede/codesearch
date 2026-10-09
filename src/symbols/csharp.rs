@@ -61,6 +61,25 @@ pub(crate) fn is_helper_warning_line(line: &str) -> bool {
     line.contains("[WARN]") || line.contains("[Failure]")
 }
 
+/// Cap a line at `max` chars, cutting at the last whitespace inside the
+/// budget when there is one: a mid-word cut makes compilation-error
+/// specimens (the quoted CS0103 name) unreadable. A single token longer
+/// than the budget still takes the hard cap.
+fn cap_at_whitespace_boundary(line: &str, max: usize) -> String {
+    let cut = line
+        .char_indices()
+        .nth(max)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
+    if cut == line.len() {
+        return line.to_string();
+    }
+    match line[..cut].rfind(char::is_whitespace) {
+        Some(pos) => line[..pos].to_string(),
+        None => line[..cut].to_string(),
+    }
+}
+
 /// Normalize one warning-severity helper stderr line into a concise,
 /// index-level completeness warning entry. MSBuild project-load failures
 /// (the class that silently strips cross-project references from the index)
@@ -88,7 +107,7 @@ pub(crate) fn normalize_index_warning_line(line: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(trimmed.chars().take(220).collect())
+    Some(cap_at_whitespace_boundary(trimmed, 220))
 }
 
 /// Collapse the raw warning lines of one helper run into the capped,
@@ -118,7 +137,7 @@ pub(crate) fn index_warnings_stored(entries: &[String]) -> Vec<String> {
         return Vec::new();
     }
     let mut stored = vec![format!(
-        "The symbol index was built while the C# workspace reported {} distinct failure(s) — cross-project references may be missing from every answer. Fix the underlying build problem (often a dotnet restore) and reindex.",
+        "The symbol index was built while the C# workspace reported {} distinct failure(s) — cross-project references may be missing from every answer. Failures `dotnet build` also reports are real and fixable in the repo (often a missing dotnet restore); failures only scip-csharp reports are tool-side — please report them and reindex.",
         entries.len()
     )];
     stored.extend(entries.iter().cloned());

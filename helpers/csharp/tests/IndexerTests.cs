@@ -269,4 +269,26 @@ public class ScipModelTests
         Assert.True(line.Length < 300, $"summary must be capped, got {line.Length} chars");
         Assert.Contains("…", line);
     }
+
+    /// The hard 160-char cut landed mid-identifier (inside the quoted CS0103
+    /// name), producing unusable specimens. The cut must move to the last
+    /// whitespace inside the budget instead.
+    [Fact]
+    public void CompilationErrorSummary_TruncatesAtWhitespaceBoundary()
+    {
+        var filler = string.Join(" ", Enumerable.Range(0, 20).Select(i => $"w{i}"));
+        // 'The name ' starts at index 60; the quoted identifier spans
+        // [70, 270) — the old hard cap at 160 cut inside it.
+        var message = filler + " The name '" + new string('n', 200) + "' does not exist in the current context";
+        var descriptor = new DiagnosticDescriptor(
+            "CS0103", title: message, messageFormat: message,
+            category: "Test", DiagnosticSeverity.Error, isEnabledByDefault: true);
+        var err = Diagnostic.Create(descriptor, Location.None);
+
+        var line = SymbolIndexer.CompilationErrorSummaryLine("Proj", [err]);
+
+        Assert.EndsWith("The name…", line);
+        Assert.DoesNotContain("nnnnnnnnnn…", line);
+        Assert.True(line.Length < 300, $"summary must stay capped, got {line.Length} chars");
+    }
 }

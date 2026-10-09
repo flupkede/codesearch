@@ -173,6 +173,40 @@ fn summarize_index_warnings_normalizes_dedupes_and_skips_noise() {
     assert!(msg.chars().count() <= 160, "message must be capped");
 }
 
+/// The passthrough cap must cut at whitespace, never mid-word: a hard
+/// 220-char cut landed inside the quoted CS0103 specimen name at the tail
+/// edge of the line even after the helper trimmed its own specimen.
+#[test]
+fn normalize_passthrough_caps_at_whitespace_boundary() {
+    let prefix = "[WARN] Compilation errors in Very.Long.Project.Name.Catalog: 12 error(s) — dominant CS0103 x10; first: C:\\src\\Cat\\ViewModels\\CustomerAccountViewModel.cs(42,17): error CS0103: The name '";
+    let identifier = "CustomerOrderViewModelFactoryProviderCache";
+    let line = format!("{prefix}{identifier}' does not exist in the current context");
+    assert!(
+        line.chars().count() > 220,
+        "test setup: line must exceed the cap"
+    );
+
+    let out = super::csharp::normalize_index_warning_line(&line).expect("warning line");
+
+    assert!(
+        out.chars().count() <= 220,
+        "cap must hold, got {}",
+        out.chars().count()
+    );
+    assert_ne!(
+        out.chars().count(),
+        220,
+        "a whitespace boundary exists before the cap — cut there, not at the hard cap"
+    );
+    // `out` is a byte-prefix of `line` (the cut lands on a char boundary),
+    // so this checks the cut position in the original line directly.
+    assert!(
+        line[out.len()..].starts_with(' '),
+        "cut must land on the original line's whitespace boundary, tail: ...{}",
+        &line[out.len().saturating_sub(40)..]
+    );
+}
+
 /// The cap kicks in with an explicit overflow entry — the list rides on
 /// every find_impact answer and must stay bounded.
 #[test]

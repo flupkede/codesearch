@@ -969,7 +969,7 @@ async fn index_level_rebuild_warnings_ride_on_resolved_and_empty_answers() {
     let db = project.path().join(".codesearch.db");
     let (_warned_key, clean_key) = populate_warnings_fixture(&db);
     let index_warnings = vec![
-        "The symbol index was built while the C# workspace reported 2 distinct failure(s) — cross-project references may be missing from every answer. Fix the underlying build problem (often a dotnet restore) and reindex."
+        "The symbol index was built while the C# workspace reported 2 distinct failure(s) — cross-project references may be missing from every answer. Failures `dotnet build` also reports are real and fixable in the repo (often a missing dotnet restore); failures only scip-csharp reports are tool-side — please report them and reindex."
             .to_string(),
         "App.Dam.csproj: depends on Analyzer.X (>= 1.2.3) but it was not found".to_string(),
     ];

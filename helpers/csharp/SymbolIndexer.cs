@@ -168,7 +168,16 @@ public sealed class SymbolIndexer
         var byCode = errors.GroupBy(d => d.Id)
             .OrderByDescending(g => g.Count()).ToList();
         var first = errors[0].ToString();
-        if (first.Length > 160) first = first[..160] + "…";
+        const int MaxSpecimenChars = 160;
+        if (first.Length > MaxSpecimenChars)
+        {
+            // Cut at the last whitespace inside the budget: a hard cut lands
+            // mid-identifier (e.g. inside the quoted CS0103 name) and makes
+            // the specimen useless for pinpointing the symbol. A single token
+            // longer than the budget still takes the hard cap.
+            var cut = first.LastIndexOf(' ', MaxSpecimenChars);
+            first = (cut > 0 ? first[..cut] : first[..MaxSpecimenChars]) + "…";
+        }
         return
             $"Compilation errors in {project}: {errors.Count} error(s) — dominant " +
             $"{byCode[0].Key} x{byCode[0].Count()}; first: {first}";
