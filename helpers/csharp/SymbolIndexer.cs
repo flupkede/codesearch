@@ -56,7 +56,8 @@ public sealed class SymbolIndexer
         {
             var project = projectList[i];
             Console.Error.WriteLine($"  [{i + 1}/{totalProjects}] Compiling: {project.Name}");
-            var compilation = await project.GetCompilationAsync().ConfigureAwait(false);
+            var (compilation, generatorOutcome) =
+                await GeneratorSupport.GetCompilationWithGeneratorsAsync(project).ConfigureAwait(false);
             if (compilation is null)
             {
                 Console.Error.WriteLine($"[WARN] Could not compile project: {project.Name}");
@@ -77,8 +78,13 @@ public sealed class SymbolIndexer
                 .ToList();
             if (diagnostics.Count > 0)
             {
+                // A failed generator run is a tool-side gap the user cannot
+                // fix, so its leftover errors (the CS0103/CS0115 Razor
+                // cascades) are downgraded to [INFO] — they must not land in
+                // the index warnings as a "fix your build" claim.
+                var marker = generatorOutcome == GeneratorRunOutcome.Failed ? "[INFO] " : "[WARN] ";
                 erroringProjects.Add((diagnostics.Count,
-                    WarningLineFor(project.Name, diagnostics)));
+                    WarningLineFor(project.Name, diagnostics, marker)));
             }
 
             CollectSymbols(compilation.GlobalNamespace, symbolMap);
@@ -162,7 +168,16 @@ public sealed class SymbolIndexer
         var byCode = errors.GroupBy(d => d.Id)
             .OrderByDescending(g => g.Count()).ToList();
         var first = errors[0].ToString();
-        if (first.Length > 160) first = first[..160] + "…";
+        const int MaxSpecimenChars = 160;
+        if (first.Length > MaxSpecimenChars)
+        {
+            // Cut at the last whitespace inside the budget: a hard cut lands
+            // mid-identifier (e.g. inside the quoted CS0103 name) and makes
+            // the specimen useless for pinpointing the symbol. A single token
+            // longer than the budget still takes the hard cap.
+            var cut = first.LastIndexOf(' ', MaxSpecimenChars);
+            first = (cut > 0 ? first[..cut] : first[..MaxSpecimenChars]) + "…";
+        }
         return
             $"Compilation errors in {project}: {errors.Count} error(s) — dominant " +
             $"{byCode[0].Key} x{byCode[0].Count()}; first: {first}";
@@ -170,9 +185,16 @@ public sealed class SymbolIndexer
 
     /// The channel-emittable form. The `[WARN] ` prefix is LOAD-BEARING:
     /// the Rust capture (`is_helper_warning_line`) keys on it, so a dropped
-    /// prefix does not flood the channel — it silently empties it.
+    /// prefix does not flood the channel — it silently empties it. The
+    /// `[INFO] ` variant is for tool-side gaps (generator pipeline failed)
+    /// that must NOT enter the warnings channel.
+    /// </summary>
     internal static string WarningLineFor(string project, IReadOnlyList<Diagnostic> errors) =>
         "[WARN] " + CompilationErrorSummaryLine(project, errors);
+
+    internal static string WarningLineFor(
+        string project, IReadOnlyList<Diagnostic> errors, string marker) =>
+        marker + CompilationErrorSummaryLine(project, errors);
 
     internal static void CollectSymbols(INamespaceSymbol ns, Dictionary<ISymbol, string> map)
     {

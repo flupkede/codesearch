@@ -236,7 +236,7 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|---|
-| *(none)* | |
+| `fix/224-scip-csharp-razor-compile` | scip-csharp: run source generators (Razor) before symbol collection — kills false CS0103/CS0115 index warnings on Blazor projects (issue #224) |
 
 ---
 
