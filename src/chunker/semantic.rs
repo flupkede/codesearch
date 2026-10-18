@@ -246,11 +246,13 @@ impl SemanticChunker {
     }
 
     /// Build a Markdown chunk from a byte range, or None if it is blank.
+    /// `start_row` is the 0-based tree-sitter row of the range start; the
+    /// chunk surfaces it as a 1-based editor line.
     fn md_chunk(
         source: &[u8],
         start_byte: usize,
         end_byte: usize,
-        start_line: usize,
+        start_row: usize,
         context: &[String],
         path_str: &str,
     ) -> Option<Chunk> {
@@ -261,8 +263,8 @@ impl SemanticChunker {
         let line_count = text.lines().count().max(1);
         let mut chunk = Chunk::new(
             text.to_string(),
-            start_line,
-            start_line + line_count,
+            start_row + 1,
+            start_row + line_count,
             ChunkKind::Block,
             path_str.to_string(),
         );
@@ -300,10 +302,11 @@ impl SemanticChunker {
         let total_lines = source_lines.len();
 
         for chunk in chunks.iter_mut() {
-            // Extract context_prev (N lines before start_line)
-            if chunk.start_line > 0 && self.context_lines > 0 {
-                let prev_start = chunk.start_line.saturating_sub(self.context_lines);
-                let prev_end = chunk.start_line;
+            // Extract context_prev (N lines before start_line). Chunk lines
+            // are 1-based; the slice needs the 0-based row before the chunk.
+            if chunk.start_line > 1 && self.context_lines > 0 {
+                let prev_end = chunk.start_line - 1;
+                let prev_start = prev_end.saturating_sub(self.context_lines);
                 if prev_start < prev_end && prev_end <= total_lines {
                     let prev_lines = &source_lines[prev_start..prev_end];
                     let prev_content = prev_lines.join("\n");
@@ -420,7 +423,10 @@ impl SemanticChunker {
 
                 let mut chunk = Chunk::new(
                     content,
-                    node.start_position().row,
+                    // Chunks surface 1-based editor lines (same convention
+                    // as the SCIP position index and find_impact position
+                    // queries); tree-sitter rows are 0-based.
+                    node.start_position().row + 1,
                     node.end_position().row + 1, // tree-sitter uses 0-based, we use line count
                     kind,
                     path_str,
@@ -464,7 +470,8 @@ impl SemanticChunker {
 
             if !chunk_lines.is_empty() {
                 let content = chunk_lines.join("\n");
-                let mut chunk = Chunk::new(content, i, end, ChunkKind::Block, path_str.clone());
+                // i is a 0-based line index; chunks surface 1-based lines.
+                let mut chunk = Chunk::new(content, i + 1, end, ChunkKind::Block, path_str.clone());
                 chunk.context = context.clone();
                 chunks.push(chunk);
             }
@@ -699,7 +706,10 @@ impl<'a> GapTracker<'a> {
                     if !gap_content.trim().is_empty() {
                         let kind = Self::classify_gap(&gap_content);
                         let line_count = i - start;
-                        let mut chunk = Chunk::new(gap_content, start, i, kind, path_str.clone());
+                        // start/i are 0-based slice bounds; chunks surface
+                        // 1-based lines (i is the 1-based inclusive end).
+                        let mut chunk =
+                            Chunk::new(gap_content, start + 1, i, kind, path_str.clone());
                         chunk.context = context.clone();
                         chunk.signature = Some(Self::gap_signature(kind, line_count));
                         gaps.push(chunk);
@@ -718,8 +728,13 @@ impl<'a> GapTracker<'a> {
             if !gap_content.trim().is_empty() {
                 let kind = Self::classify_gap(&gap_content);
                 let line_count = self.lines.len() - start;
-                let mut chunk =
-                    Chunk::new(gap_content, start, self.lines.len(), kind, path_str.clone());
+                let mut chunk = Chunk::new(
+                    gap_content,
+                    start + 1,
+                    self.lines.len(),
+                    kind,
+                    path_str.clone(),
+                );
                 chunk.context = context.clone();
                 chunk.signature = Some(Self::gap_signature(kind, line_count));
                 gaps.push(chunk);
@@ -1075,15 +1090,33 @@ mixin Walker {
         // Mark lines 1-2 as covered
         tracker.mark_covered(1, 2);
 
-        // Should have gaps: [0], [3-4]
+        // Should have gaps: [0], [3-4] — surfaces as 1-based editor lines.
         let path = Path::new("test.txt");
         let gaps = tracker.extract_gaps(path);
 
         assert_eq!(gaps.len(), 2, "Should have 2 gaps");
-        assert_eq!(gaps[0].start_line, 0);
+        assert_eq!(gaps[0].start_line, 1);
         assert_eq!(gaps[0].end_line, 1);
-        assert_eq!(gaps[1].start_line, 3);
+        assert_eq!(gaps[1].start_line, 4);
         assert_eq!(gaps[1].end_line, 5);
+    }
+
+    /// Definition chunks surface 1-based editor lines — the same convention
+    /// as the find_impact position index. The pre-fix 0-based leak made
+    /// agents query find_impact with lines that could never resolve.
+    #[test]
+    fn definition_chunks_report_one_based_lines() {
+        let mut chunker = SemanticChunker::new(100, 2000, 0);
+        let content = "// leading comment\nvoid hello() {\n  print('hi');\n}\n";
+        let chunks = chunker
+            .chunk_semantic(Language::Dart, Path::new("a.dart"), content)
+            .unwrap();
+        let hello = chunks
+            .iter()
+            .find(|c| c.content.contains("void hello"))
+            .expect("hello chunk");
+        assert_eq!(hello.start_line, 2, "1-based line of the declaration");
+        assert_eq!(hello.end_line, 4, "1-based inclusive end");
     }
 
     #[test]
@@ -1194,6 +1227,72 @@ main "$@"
         assert!(
             all_content.contains("main"),
             "Chunks should contain main function"
+        );
+    }
+
+    #[test]
+    fn test_chunk_php_fallback() {
+        // PHP has a tree-sitter grammar but no extractor, so it falls back
+        // to fallback_chunk (sliding window) like Shell does.
+        let mut chunker = SemanticChunker::new(100, 2000, 10);
+
+        let php_source = r#"<?php
+
+namespace App\Services;
+
+class OrderService
+{
+    public function createOrder(array $items): int
+    {
+        return count($items);
+    }
+
+    public function cancelOrder(int $orderId): bool
+    {
+        return $orderId > 0;
+    }
+}
+
+function formatPrice(float $amount): string
+{
+    return number_format($amount, 2);
+}
+"#;
+
+        let path = Path::new("Service.php");
+
+        // Verify language detection
+        assert_eq!(
+            crate::file::Language::from_path(path),
+            crate::file::Language::Php,
+            ".php files should be detected as PHP language"
+        );
+
+        let chunks = chunker
+            .chunk_semantic(crate::file::Language::Php, path, php_source)
+            .unwrap();
+
+        // Should produce chunks (via fallback)
+        assert!(
+            !chunks.is_empty(),
+            "PHP files should produce chunks via fallback, got 0"
+        );
+
+        // All chunks should be Block kind (fallback chunking)
+        assert!(
+            chunks.iter().all(|c| c.kind == ChunkKind::Block),
+            "Fallback chunks should all be Block kind"
+        );
+
+        // Chunks should cover the PHP content
+        let all_content: String = chunks.iter().map(|c| c.content.as_str()).collect();
+        assert!(
+            all_content.contains("createOrder"),
+            "Chunks should contain createOrder method"
+        );
+        assert!(
+            all_content.contains("cancelOrder"),
+            "Chunks should contain cancelOrder method"
         );
     }
 

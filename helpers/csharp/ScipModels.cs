@@ -8,11 +8,16 @@ public sealed class ScipIndex
     public ScipMetadata Metadata { get; init; } = new();
     public List<ScipDocument> Documents { get; init; } = [];
     public List<ScipSymbolInfo> ExternalSymbols { get; init; } = [];
+    /// <summary>
+    /// Every reference to an emitted definition key. Null on a
+    /// `--filter-project` run, where the reference pass is skipped.
+    /// </summary>
+    public List<ScipReferenceRecord>? References { get; set; }
 }
 
 public sealed class ScipMetadata
 {
-    public string Version { get; init; } = "2.0";
+    public string Version { get; init; } = "2.1";
     public string ToolInfo { get; init; } = "scip-csharp";
 }
 
@@ -29,6 +34,15 @@ public sealed class ScipOccurrence
     public string Symbol { get; init; } = "";
     public int SymbolRoles { get; init; }
     public string Kind { get; init; } = ""; // "definition" or "reference"
+}
+
+public sealed class ScipReferenceRecord
+{
+    public string Symbol { get; init; } = "";
+    public string File { get; init; } = "";
+    public int StartLine { get; init; }
+    public int EndLine { get; init; }
+    public string Kind { get; init; } = "reference";
 }
 
 public sealed class ScipSymbolInfo

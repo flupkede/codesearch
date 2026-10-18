@@ -29,8 +29,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(run());
+    // Blocking tasks in a restore wait poll this flag (csharp.rs); setting it
+    // before teardown lets them return instead of being joined for minutes.
+    constants::SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    runtime.shutdown_timeout(std::time::Duration::from_secs(
+        constants::RUNTIME_SHUTDOWN_GRACE_SECS,
+    ));
+    result
+}
+
+async fn run() -> Result<()> {
     // Parse CLI to get loglevel (need this before tracing init)
     let args: Vec<String> = std::env::args().collect();
     let is_quiet = args.iter().any(|a| a == "-q" || a == "--quiet");

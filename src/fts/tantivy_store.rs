@@ -6,16 +6,25 @@
 //! Always use `FtsStore::new()` which opens in R/W mode. This ensures only one
 //! connection type exists, avoiding Windows file locking issues between readers
 //! and writers. The writer is lazy-initialized on first write operation.
+//!
+//! # Thread footprint
+//! `new`/`new_with_writer` readers use `ReloadPolicy::Manual`: this process owns
+//! every commit and [`FtsStore::commit`] reloads the reader right after
+//! publishing, so no resident `meta.json` poller thread is kept. `new_readonly`
+//! keeps the default `OnCommitWithDelay` watcher (polling ~2x/s) because its
+//! commits may come from other processes.
 
 use anyhow::{anyhow, Result};
 use std::path::Path;
 use tantivy::{
     collector::TopDocs,
     directory::MmapDirectory,
+    indexer::IndexWriterOptions,
     merge_policy::NoMergePolicy,
     query::QueryParser,
     schema::{Field, NumericOptions, Schema, Value, STORED, STRING, TEXT},
-    DocAddress, Index, IndexReader, IndexSettings, IndexWriter, TantivyDocument, Term,
+    DocAddress, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument,
+    Term,
 };
 
 use crate::chunker::ChunkKind;
@@ -28,6 +37,10 @@ pub struct FtsResult {
     /// BM25 score from Tantivy
     pub score: f32,
 }
+
+/// Shared prefix of every commit-failure message `FtsStore::commit` returns;
+/// scopes the transient-error classifier to commit failures.
+const FTS_COMMIT_FAILED_CONTEXT: &str = "FTS commit failed";
 
 enum CommitAttempt {
     Committed,
@@ -111,7 +124,28 @@ impl FtsStore {
     ///
     /// Opens in a mode that supports both reading and writing.
     /// Writer is lazy-initialized on first write operation.
+    ///
+    /// The reader uses `ReloadPolicy::Manual`: this store owns its commits and
+    /// [`FtsStore::commit`] reloads the reader right after publishing them, so
+    /// no resident watcher thread is kept. Do not use this constructor for an
+    /// index written by another process — those commits would never become
+    /// visible here; use [`FtsStore::new_readonly`] instead.
     pub fn new(db_path: &Path) -> Result<Self> {
+        Self::with_reload_policy(db_path, ReloadPolicy::Manual)
+    }
+
+    /// Open an FTS index whose commits may be made by OTHER processes.
+    ///
+    /// This is the FTS-store analogue of
+    /// [`crate::index::SharedStores::new_readonly`]: the reader keeps
+    /// tantivy's `OnCommitWithDelay` policy, spending one resident poller
+    /// thread (~2 wakeups/s) so that foreign commits become visible without
+    /// reopening the store.
+    pub fn new_readonly(db_path: &Path) -> Result<Self> {
+        Self::with_reload_policy(db_path, ReloadPolicy::OnCommitWithDelay)
+    }
+
+    fn with_reload_policy(db_path: &Path, reload_policy: ReloadPolicy) -> Result<Self> {
         let fts_path = db_path.join("fts");
         std::fs::create_dir_all(&fts_path)?;
 
@@ -122,7 +156,10 @@ impl FtsStore {
         let index = Self::open_or_create_index_with_retry(&fts_path, &schema)?;
 
         // Create reader for searching
-        let reader = index.reader()?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(reload_policy)
+            .try_into()?;
 
         Ok(Self {
             index,
@@ -145,7 +182,6 @@ impl FtsStore {
     #[cfg(test)]
     pub fn new_in_memory() -> Result<Self> {
         use tantivy::directory::RamDirectory;
-        use tantivy::ReloadPolicy;
 
         let (schema, chunk_id_field, content_field, path_field, signature_field, kind_field) =
             Self::build_schema();
@@ -271,10 +307,18 @@ impl FtsStore {
                 std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
             }
 
-            // 50MB writer heap (tantivy default).
+            // 50MB writer heap (tantivy default) but a fixed single worker and a
+            // single merge thread instead of tantivy's derived defaults. A plain
+            // `writer(50MB)` sizes its worker pool from the CPU count (then shrinks
+            // it to heap/15MB ≈ 3 workers on this budget) and unconditionally
+            // spawns a 4-thread merge pool — ~8 parked OS threads per open writer.
+            // With one writer per warm repo, a serve pool of 500 repos held ~4500
+            // resident threads. FTS work is negligible next to embedding, so one
+            // worker is plenty; with NoMergePolicy merges are never scheduled, so
+            // more than one merge thread would only ever idle.
             //
-            // CRITICAL: Set NoMergePolicy to prevent tantivy from spawning background
-            // merge threads. On Windows, these threads encounter I/O errors (antivirus
+            // CRITICAL: Set NoMergePolicy to prevent tantivy from running background
+            // merges. On Windows, these threads encounter I/O errors (antivirus
             // interference, file locking on mmap'd segment files) which panic the merge
             // thread and kill the IndexWriter — causing the intermittent
             // "An index writer was killed" error (~1/5 indexing runs).
@@ -282,7 +326,12 @@ impl FtsStore {
             // With NoMergePolicy, all segment management is explicit: we accumulate
             // segments during indexing and they're consolidated at commit points.
             // This trades slightly more segments for 100% reliability.
-            match index.writer(50_000_000) {
+            let options = IndexWriterOptions::builder()
+                .num_worker_threads(1)
+                .num_merge_threads(1)
+                .memory_budget_per_thread(50_000_000)
+                .build();
+            match index.writer_with_options(options) {
                 Ok(writer) => {
                     writer.set_merge_policy(Box::new(NoMergePolicy));
                     return Ok(writer);
@@ -418,6 +467,23 @@ impl FtsStore {
         error.contains("Access is denied")
             || error.contains("PermissionDenied")
             || error.contains("IoError")
+    }
+
+    /// Whether this failure is the transient Windows new-segment race: an
+    /// indexer (Defender / Search) holds the freshly created segment file
+    /// while tantivy opens it for the commit write (os error 5/32/33).
+    /// Only a failure of THIS class justifies redoing the whole indexing
+    /// pass — a commit retry on the same writer is never safe (a
+    /// half-joined pipeline must not be recommitted, see `commit_once`).
+    ///
+    /// Scoped to `commit()` failures (`FTS_COMMIT_FAILED_CONTEXT`): the same
+    /// OS errors from a store open, or a killed writer, are not this race.
+    pub fn is_transient_fts_commit_error(error: &str) -> bool {
+        error.contains(FTS_COMMIT_FAILED_CONTEXT)
+            && (error.contains("Access is denied")
+                || error.contains("os error 5")
+                || error.contains("os error 32")
+                || error.contains("os error 33"))
     }
 
     /// One commit attempt, split so a failure in `prepare_commit` is told
@@ -574,6 +640,41 @@ impl FtsStore {
         self.collect_fts_results(top_docs)
     }
 
+    /// Disjunction (OR) search over the same fields as [`FtsStore::search`].
+    ///
+    /// Used by the literal relaxed fallback: when the exact AND pass matches
+    /// nothing, candidates holding only PART of the query terms are still
+    /// worth surfacing. The caller filters them by term coverage afterwards —
+    /// raw OR ranking alone would drown precise queries in noise, which is
+    /// why `search` stays conjunctive by default.
+    pub fn search_relaxed(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
+        let searcher = self.reader.searcher();
+
+        let mut query_parser = QueryParser::for_index(
+            &self.index,
+            vec![self.content_field, self.signature_field, self.kind_field],
+        );
+        query_parser.set_field_boost(self.signature_field, 2.0);
+
+        let parsed_query = match query_parser.parse_query(query) {
+            Ok(q) => q,
+            Err(_) => {
+                let escaped = query.replace(
+                    [
+                        ':', '(', ')', '[', ']', '{', '}', '^', '"', '~', '*', '?', '\\', '/',
+                    ],
+                    " ",
+                );
+                query_parser.parse_query(&escaped)?
+            }
+        };
+
+        let top_docs =
+            searcher.search(&parsed_query, &TopDocs::with_limit(limit).order_by_score())?;
+
+        self.collect_fts_results(top_docs)
+    }
+
     /// Search for exact identifier matches (boosted)
     ///
     /// Used for improving exact name matching (e.g., "BaseRestClient", "UserService").
@@ -711,12 +812,14 @@ impl FtsStore {
     }
 
     /// Clear the entire index
-    #[allow(dead_code)] // Reserved for index reset
     pub fn clear(&mut self) -> Result<()> {
         self.ensure_writer()?;
         let writer = self.writer.as_mut().unwrap();
         writer.delete_all_documents()?;
-        writer.commit()?;
+        // classifier scope: is_transient_fts_commit_error matches only this prefix
+        writer
+            .commit()
+            .map_err(|e| anyhow!("{FTS_COMMIT_FAILED_CONTEXT}: {e}"))?;
         self.reader.reload()?;
         Ok(())
     }
@@ -733,6 +836,51 @@ pub struct FtsStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classifier must match the AV/new-segment race shapes seen in the
+    /// field (the exact logged incident message included) and refuse
+    /// everything a full-pass retry cannot fix.
+    #[test]
+    fn transient_fts_commit_classifier_matches_the_av_race_only() {
+        let logged = "FTS commit failed while flushing indexing workers: Failed to open \
+             file for write: 'IoError { io_error: Os { code: 5, kind: PermissionDenied, \
+             message: \"Access is denied.\" }, filepath: \"55fb.pos\" }'";
+        assert!(FtsStore::is_transient_fts_commit_error(logged));
+        assert!(FtsStore::is_transient_fts_commit_error(
+            "FTS commit failed: Failed to open file (os error 5)"
+        ));
+        assert!(FtsStore::is_transient_fts_commit_error(
+            "FTS commit failed: Failed to open file (os error 32)"
+        ));
+        assert!(FtsStore::is_transient_fts_commit_error(
+            "FTS commit failed after 5 retries: Failed to open file (os error 33)"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error(
+            "writer was killed"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error(
+            "Access is denied (os error 5)"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error(
+            "FTS writer was killed during commit: Access is denied. os error 5"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error(
+            "FTS commit after recovery failed: Access is denied. (os error 5)"
+        ));
+        assert!(!FtsStore::is_transient_fts_commit_error("schema error"));
+    }
+
+    #[test]
+    fn clear_removes_committed_documents() -> Result<()> {
+        let mut store = FtsStore::new_in_memory()?;
+        store.add_chunk(1, "fn hello() {}", "src/main.rs", Some("hello"), "function")?;
+        store.commit()?;
+        assert_eq!(store.stats()?.num_documents, 1);
+
+        store.clear()?;
+        assert_eq!(store.stats()?.num_documents, 0);
+        Ok(())
+    }
 
     #[test]
     fn test_fts_basic() -> Result<()> {
@@ -935,6 +1083,43 @@ mod tests {
         store.add_chunk(1, "recovery probe content", "probe.rs", None, "block")?;
         store.commit()?;
         let results = store.search("recovery probe", 10, None)?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_id, 1);
+
+        Ok(())
+    }
+
+    /// `new` must not materialize the tantivy writer until the first write:
+    /// an eager writer parked its pipeline threads (indexing workers, segment
+    /// updater, merge pool) for every warm repo in a serve pool — thousands of
+    /// resident OS threads on a large pool. Its Manual reload policy must
+    /// also make our own commit searchable with no reliance on the
+    /// OnCommitWithDelay poll loop.
+    #[test]
+    fn new_is_lazy_and_manual_commit_is_immediately_searchable() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let tantivy_lock = tmp.path().join("fts").join(".tantivy-writer.lock");
+
+        let mut store = FtsStore::new(tmp.path())?;
+        assert!(
+            !tantivy_lock.exists(),
+            "opening the store must not take the tantivy writer lock"
+        );
+
+        store.add_chunk(
+            1,
+            "lazy tantivy writer probe",
+            "a.rs",
+            Some("fn a()"),
+            "function",
+        )?;
+        assert!(
+            tantivy_lock.exists(),
+            "first write must materialize the writer and its lockfile"
+        );
+        store.commit()?;
+
+        let results = store.search("lazy tantivy", 10, None)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk_id, 1);
 

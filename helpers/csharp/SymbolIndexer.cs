@@ -4,13 +4,17 @@ using Microsoft.CodeAnalysis.MSBuild;
 namespace ScipCsharp;
 
 /// <summary>
-/// Walks Roslyn compilation symbols and produces a ScipIndex with only definition
-/// occurrences (no references). References are resolved lazily at find_impact time
-/// by the `find-refs` subcommand, giving 10–50× faster rebuild on large solutions.
+/// Walks Roslyn compilation symbols and produces a ScipIndex: definition
+/// occurrences per document plus, on a full run, every reference to those
+/// definitions, collected in one pass over all documents
+/// (<see cref="ReferencePass"/>) instead of one FindReferencesAsync per symbol.
+/// A `--filter-project` run emits definitions only (References is null).
 /// </summary>
 public sealed class SymbolIndexer
 {
-    public async Task<ScipIndex> IndexAsync(MSBuildWorkspace workspace, string? projectFilter)
+    public async Task<ScipIndex> IndexAsync(
+        MSBuildWorkspace workspace,
+        string? projectFilter)
     {
         var index = new ScipIndex();
         var solution = workspace.CurrentSolution;
@@ -41,6 +45,10 @@ public sealed class SymbolIndexer
         // vs the full-rebuild paths ("src/ExampleProject.Dam/Caches/ICache.cs"),
         // causing duplicate definitions in find_impact results.
         var projectRoot = FindCommonRoot(solution.Projects.Select(p => p.FilePath).Where(p => p != null).Cast<string>());
+        var referencePass = string.IsNullOrEmpty(projectFilter)
+            ? new ReferencePass(projectRoot, solution.Projects.Select(p => p.AssemblyName))
+            : null;
+        var referencesSw = new System.Diagnostics.Stopwatch();
 
         // Materialize project list once so we can log progress (i / total).
         var projectList = projects as IReadOnlyList<Project> ?? projects.ToList();
@@ -56,7 +64,9 @@ public sealed class SymbolIndexer
         {
             var project = projectList[i];
             Console.Error.WriteLine($"  [{i + 1}/{totalProjects}] Compiling: {project.Name}");
-            var compilation = await project.GetCompilationAsync().ConfigureAwait(false);
+            var projectSw = System.Diagnostics.Stopwatch.StartNew();
+            var (compilation, _) =
+                await GeneratorSupport.GetCompilationWithGeneratorsAsync(project).ConfigureAwait(false);
             if (compilation is null)
             {
                 Console.Error.WriteLine($"[WARN] Could not compile project: {project.Name}");
@@ -67,34 +77,53 @@ public sealed class SymbolIndexer
             // resolution cascades into tens of thousands of errors per
             // project (CS0518 "System.Object not defined" turns every type
             // use into CS0246) — that is ONE root cause, not N problems, so
-            // the warnings channel carries ONE aggregated line per project
-            // (count + dominant code + first specimen). Symbols below are
-            // still collected: a Roslyn compilation with errors yields a
-            // complete symbol tree — the same reason IntelliSense works
-            // while the build is red.
+            // the log carries ONE aggregated line per project (count +
+            // dominant code + first specimen). Symbols below are still
+            // collected: a Roslyn compilation with errors yields a complete
+            // symbol tree — the same reason IntelliSense works while the
+            // build is red.
             var diagnostics = compilation.GetDiagnostics()
                 .Where(d => d.Severity == DiagnosticSeverity.Error)
                 .ToList();
             if (diagnostics.Count > 0)
             {
+                // Compile diagnostics are ALWAYS [INFO]: the project loaded
+                // and its symbol tree is complete, so nothing here means
+                // "find_impact may miss symbols" — they are code-health, and
+                // the index-warning channel is index-health only. Generator
+                // failures and restore-caused diagnostics were already
+                // [INFO]; by this rule every compile summary is.
                 erroringProjects.Add((diagnostics.Count,
                     WarningLineFor(project.Name, diagnostics)));
             }
 
             CollectSymbols(compilation.GlobalNamespace, symbolMap);
+            Console.Error.WriteLine(
+                $"  [{i + 1}/{totalProjects}] Compiled {project.Name} in {StageTiming.Seconds(projectSw.Elapsed)}");
+
+            // Runs here so the compilation is reused while alive; only key
+            // strings and positions outlive the iteration.
+            if (referencePass is not null)
+            {
+                compileSw.Stop();
+                referencesSw.Start();
+                await referencePass.CollectAsync(compilation).ConfigureAwait(false);
+                referencesSw.Stop();
+                compileSw.Start();
+            }
         }
         compileSw.Stop();
         foreach (var (_, line) in erroringProjects.OrderByDescending(e => e.Count))
         {
             Console.Error.WriteLine(line);
         }
-        Console.Error.WriteLine($"Compiled {totalProjects} project(s) in {compileSw.Elapsed.TotalSeconds:F1}s");
+        StageTiming.Log("compile", compileSw.Elapsed);
         Console.Error.WriteLine($"Collected {symbolMap.Count} project-internal symbols — building definition index...");
 
-        // Walk symbols and emit definition occurrences only.
-        // References are intentionally omitted here; they are resolved lazily
-        // on first `find_impact` call via `scip-csharp find-refs` and then
-        // cached in LMDB so subsequent calls are instant.
+        var definitionsSw = System.Diagnostics.Stopwatch.StartNew();
+
+        // Documents carry definition occurrences only; references go to
+        // index.References, never into Documents[].Occurrences.
         var occurrenceMap = new Dictionary<string, List<ScipOccurrence>>();
 
         foreach (var (symbol, scipName) in symbolMap)
@@ -103,7 +132,15 @@ public sealed class SymbolIndexer
             {
                 if (loc.IsInSource)
                 {
-                    var relPath = MakeRelative(loc.SourceTree?.FilePath, projectRoot);
+                    // Document key from the MAPPED path: a source-generated
+                    // tree (Razor) maps to its .razor/.cshtml source file, so
+                    // definitions land on the source the user edits. Hidden
+                    // regions keep the last #line mapping (Roslyn semantics);
+                    // a tree with no directives at all maps to nothing —
+                    // empty path, skip.
+                    var mapped = loc.GetMappedLineSpan();
+                    if (string.IsNullOrEmpty(mapped.Path)) continue;
+                    var relPath = MakeRelative(mapped.Path, projectRoot);
                     if (relPath is null) continue;
 
                     var occ = new ScipOccurrence
@@ -145,6 +182,17 @@ public sealed class SymbolIndexer
             });
         }
 
+        StageTiming.Log("definitions", definitionsSw.Elapsed);
+
+        if (referencePass is not null)
+        {
+            referencesSw.Start();
+            index.References = referencePass.Build(symbolMap);
+            referencesSw.Stop();
+            Console.Error.WriteLine(
+                $"Reference pass: {index.References.Count} reference(s) across {referencePass.FileCount} file(s)");
+            StageTiming.Log("references", referencesSw.Elapsed);
+        }
         return index;
     }
 
@@ -162,17 +210,30 @@ public sealed class SymbolIndexer
         var byCode = errors.GroupBy(d => d.Id)
             .OrderByDescending(g => g.Count()).ToList();
         var first = errors[0].ToString();
-        if (first.Length > 160) first = first[..160] + "…";
+        const int MaxSpecimenChars = 160;
+        if (first.Length > MaxSpecimenChars)
+        {
+            // Cut at the last whitespace inside the budget: a hard cut lands
+            // mid-identifier (e.g. inside the quoted CS0103 name) and makes
+            // the specimen useless for pinpointing the symbol. A single token
+            // longer than the budget still takes the hard cap.
+            var cut = first.LastIndexOf(' ', MaxSpecimenChars);
+            first = (cut > 0 ? first[..cut] : first[..MaxSpecimenChars]) + "…";
+        }
         return
             $"Compilation errors in {project}: {errors.Count} error(s) — dominant " +
             $"{byCode[0].Key} x{byCode[0].Count()}; first: {first}";
     }
 
-    /// The channel-emittable form. The `[WARN] ` prefix is LOAD-BEARING:
-    /// the Rust capture (`is_helper_warning_line`) keys on it, so a dropped
-    /// prefix does not flood the channel — it silently empties it.
+    /// The channel-emittable form. The prefix is `[INFO] ` BY DESIGN: the
+    /// Rust capture (`is_helper_warning_line`) keys on `[WARN] `/`[Failure]`,
+    /// so compile summaries never enter the index-warnings channel — they
+    /// are code-health, and the index-warning channel is index-health only
+    /// (restore state, load failures). An accidentally-dropped prefix cannot
+    /// flood the channel; it would only vanish from the serve log.
+    /// </summary>
     internal static string WarningLineFor(string project, IReadOnlyList<Diagnostic> errors) =>
-        "[WARN] " + CompilationErrorSummaryLine(project, errors);
+        "[INFO] " + CompilationErrorSummaryLine(project, errors);
 
     internal static void CollectSymbols(INamespaceSymbol ns, Dictionary<ISymbol, string> map)
     {
@@ -267,7 +328,7 @@ public sealed class SymbolIndexer
     /// (Foo`1 vs Foo, M`1 vs M), nested types carry their full containing-type
     /// chain (Outer1.Inner vs Outer2.Inner) and parameter types are fully
     /// qualified (A.P vs B.P). Any change here must bump the index version
-    /// (ScipModels "2.0") and SCIP_KEY_FORMAT so old indexes rebuild.
+    /// (ScipMetadata.Version) and SCIP_KEY_FORMAT so old indexes rebuild.
     /// </summary>
     internal static string SymbolToScipName(ISymbol symbol)
     {
@@ -352,7 +413,10 @@ public sealed class SymbolIndexer
 
     internal static List<int> LocationToRange(Location loc)
     {
-        var lineSpan = loc.GetLineSpan();
+        // Mapped: #line directives (Razor source generators) resolve to the
+        // .razor/.cshtml source path and line — the same mechanism VS's
+        // ctrl-click uses. Identity for ordinary files.
+        var lineSpan = loc.GetMappedLineSpan();
         return
         [
             lineSpan.StartLinePosition.Line + 1,  // 1-based line

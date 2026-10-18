@@ -93,7 +93,8 @@ const SAMPLE_INDEX_JSON: &str = r#"{
 #[test]
 fn test_parse_json_index_from_sample() {
     let index = scip_parse::parse_json_index(SAMPLE_INDEX_JSON.as_bytes())
-        .expect("Failed to parse sample JSON");
+        .expect("Failed to parse sample JSON")
+        .definitions;
 
     // Should have symbols for Calculator class and its methods
     assert!(
@@ -184,7 +185,9 @@ fn test_parse_json_index_multiple_symbols_same_file() {
         "external_symbols": []
     }"#;
 
-    let index = scip_parse::parse_json_index(json.as_bytes()).unwrap();
+    let index = scip_parse::parse_json_index(json.as_bytes())
+        .unwrap()
+        .definitions;
 
     // Method1 should have 1 definition + 1 reference
     let method1_refs = index.get("csharp . . A#Method1().").unwrap();
@@ -225,7 +228,9 @@ fn test_parse_json_index_role_fallback() {
         "external_symbols": []
     }"#;
 
-    let index = scip_parse::parse_json_index(json.as_bytes()).unwrap();
+    let index = scip_parse::parse_json_index(json.as_bytes())
+        .unwrap()
+        .definitions;
     let refs = index.get("csharp . . A#X.").unwrap();
 
     // symbol_roles=1 should map to "definition" via role_to_kind

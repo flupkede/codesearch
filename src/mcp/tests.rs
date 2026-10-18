@@ -95,6 +95,20 @@ fn test_tool_registration_exposes_exactly_the_six_tools() {
         names, expected,
         "tools/list must expose exactly the consolidated 6-tool surface"
     );
+    // Issue #339: every tool is a read-only index query — the declared
+    // readOnlyHint is what lets Claude Code plan mode auto-allow the call.
+    for tool in router.list_all() {
+        let read_only = tool
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint)
+            .unwrap_or(false);
+        assert!(
+            read_only,
+            "tool {} must declare annotations.read_only_hint = true",
+            tool.name
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -382,6 +396,7 @@ fn test_low_confidence_response_serialization() {
         results: vec![],
         low_confidence: Some(true),
         suggested_tool: Some("literal_search".to_string()),
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -408,6 +423,7 @@ fn test_normal_response_omits_confidence_fields() {
         }],
         low_confidence: None,
         suggested_tool: None,
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -503,6 +519,25 @@ fn test_path_prefix_mixed_separators() {
 fn test_path_prefix_no_alias() {
     let result = super::prefix_path_with_alias("C:/repo/src/main.rs", None, "C:/repo");
     assert_eq!(result, "src/main.rs");
+}
+
+#[test]
+fn test_strip_alias_prefix_variants() {
+    // The inbound counterpart of prefix_path_with_alias: find_impact
+    // position queries arrive as find reports them — alias-prefixed.
+    let alias = "myrepo".to_string();
+    assert_eq!(
+        super::strip_alias_prefix("myrepo/src/main.rs", Some(&alias)),
+        "src/main.rs"
+    );
+    assert_eq!(
+        super::strip_alias_prefix("other/src/main.rs", Some(&alias)),
+        "other/src/main.rs"
+    );
+    assert_eq!(
+        super::strip_alias_prefix("src/main.rs", None),
+        "src/main.rs"
+    );
 }
 
 #[test]
@@ -659,6 +694,7 @@ async fn group_lexical_search_attributes_each_hit_to_its_repo() {
         mode: Some("lexical".to_string()),
         project: None,
         group: Some("all".to_string()),
+        min_score: None,
     };
     let mut alias_roots = std::collections::HashMap::new();
     alias_roots.insert(
@@ -1133,6 +1169,7 @@ fn test_semantic_search_response_with_results() {
         }],
         low_confidence: None,
         suggested_tool: None,
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -1147,6 +1184,7 @@ fn test_semantic_search_response_empty_with_low_confidence() {
         results: vec![],
         low_confidence: Some(true),
         suggested_tool: Some("find_definition".to_string()),
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -1182,6 +1220,9 @@ fn test_match_line_for_literal_regex() {
 #[test]
 fn test_parse_import_lines_detects_common_forms() {
     let content = "use std::fs;\nimport os\nfrom pkg import thing\n#include <stdio.h>\nconst x = require('x')\nlet y = 1;";
+    // `10` is the chunk's 1-based first line (the chunk starts on editor
+    // line 10); match lines are start_line + the 0-based offset within the
+    // chunk.
     let imports = super::parse_import_lines(content, 10);
     assert_eq!(imports.len(), 5);
     assert_eq!(imports[0].kind, "use");
@@ -1957,6 +1998,7 @@ fn test_literal_response_json_has_lc_fields() {
     let response = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: Some(true),
         suggested_tool: Some("search with mode='semantic'".to_string()),
@@ -1972,6 +2014,7 @@ fn test_literal_response_json_omits_lc_fields_when_none() {
     let response = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2120,6 +2163,7 @@ fn test_literal_search_response_shape_json() {
             signature: None,
         }],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2136,6 +2180,7 @@ fn test_literal_search_response_carries_note_when_promoted() {
     let response = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: Some(true),
+        relaxed_fallback: None,
         note: Some("auto-promoted".to_string()),
         low_confidence: None,
         suggested_tool: None,
@@ -2204,6 +2249,251 @@ fn note_store_failure_survives_a_short_alias_list() {
     assert!(warnings[0].contains("unknown"));
 }
 
+// === relaxed-fallback coverage gate =====================================
+//
+// The relaxed BM25 pass rescues candidates via signature/kind matches, so
+// the coverage gate must see the same fields the rescue saw. These pin the
+// searchable_text gate text against both the signature-only candidate (the
+// exact misattribution class the fallback exists for) and legacy blobs that
+// predate the stored field.
+
+#[test]
+fn relaxed_gate_counts_signature_only_matches() {
+    use crate::vectordb::ChunkMetadata;
+
+    let chunk = ChunkMetadata {
+        content: "let x = compute();".to_string(),
+        path: "src/dispatch.rs".to_string(),
+        start_line: 0,
+        end_line: 2,
+        kind: "Function".to_string(),
+        signature: Some("fn transfer_overdue_process()".to_string()),
+        docstring: None,
+        context: None,
+        hash: String::new(),
+        context_prev: None,
+        context_next: None,
+        searchable_text: "fn transfer_overdue_process()\nFunction\nlet x = compute();".to_string(),
+    };
+    let terms = super::literal_search::significant_query_terms("transfer overdue process");
+
+    // The signature carries all three terms; the gate over searchable_text
+    // must keep this candidate...
+    assert!(super::literal_search::chunk_covers_significant_terms(
+        super::literal_search::relaxed_gate_text(&chunk),
+        &terms,
+    ));
+    // ...while the old content-only gate dropped it — the self-defeating
+    // behaviour this fixes.
+    assert!(!super::literal_search::chunk_covers_significant_terms(
+        &chunk.content,
+        &terms,
+    ));
+}
+
+#[test]
+fn relaxed_gate_falls_back_to_content_for_legacy_blobs() {
+    use crate::vectordb::ChunkMetadata;
+
+    let chunk = ChunkMetadata {
+        content: "transfer_overdue_process(ctx)".to_string(),
+        path: "src/legacy.rs".to_string(),
+        start_line: 0,
+        end_line: 0,
+        kind: "Function".to_string(),
+        signature: Some("fn transfer_overdue_process(ctx)".to_string()),
+        docstring: None,
+        context: None,
+        hash: String::new(),
+        context_prev: None,
+        context_next: None,
+        searchable_text: String::new(),
+    };
+    let terms = super::literal_search::significant_query_terms("transfer overdue process");
+
+    assert!(super::literal_search::chunk_covers_significant_terms(
+        super::literal_search::relaxed_gate_text(&chunk),
+        &terms,
+    ));
+}
+
+// === unified search dispatch: min_score honesty ========================
+//
+// min_score used to be silently ignored on the literal path and dropped on
+// both federated legs; the tool advertised it anyway. These pin the
+// by-name refusal and the peer body composition.
+
+#[test]
+fn build_remote_search_body_forwards_min_score_to_peers() {
+    let request = crate::mcp::types::SearchRequest {
+        query: "transfer overdue".to_string(),
+        mode: Some("semantic".to_string()),
+        compact: None,
+        semantic_mode: None,
+        filter_path: None,
+        min_score: Some(0.42),
+        regex: None,
+        phrase: None,
+        file_glob: None,
+        language: None,
+        format: None,
+        limit: None,
+        project: None,
+        group: None,
+    };
+    let body = super::CodesearchService::build_remote_search_body(&request, "semantic", Some(50));
+    let got = body["min_score"]
+        .as_f64()
+        .expect("min_score must be numeric in the peer body");
+    assert!(
+        (got - 0.42).abs() < 1e-6,
+        "body must forward min_score: {body}"
+    );
+    assert_eq!(body["mode"], "semantic", "body must keep its shape: {body}");
+}
+
+#[test]
+fn group_fusion_interning_gives_colliding_chunk_ids_distinct_synthetic_ids() {
+    // The group fusion feeds the pure rrf_fusion, which keys on a single
+    // bare u32 — two repos both holding local chunk id 0 used to fuse into
+    // ONE entry, silently dropping a whole repo's hit. The interning table
+    // is the fix; this pins its contract at the unit level, without
+    // standing up stores.
+    use std::collections::HashMap;
+
+    fn vector_hit(id: u32, score: f32) -> crate::vectordb::SearchResult {
+        crate::vectordb::SearchResult {
+            id,
+            content: String::new(),
+            path: format!("file{id}.rs"),
+            start_line: 0,
+            end_line: 1,
+            kind: "Function".to_string(),
+            signature: None,
+            docstring: None,
+            context: None,
+            hash: String::new(),
+            distance: 1.0 - score,
+            score,
+            context_prev: None,
+            context_next: None,
+        }
+    }
+
+    // The collision the old bare-u32 fusion actually hit: same chunk id,
+    // different repos — one fused entry.
+    let colliding = vec![vector_hit(0, 0.9), vector_hit(0, 0.8)];
+    let fused_colliding = crate::rerank::rrf_fusion(&colliding, &[], 60.0);
+    assert_eq!(
+        fused_colliding.len(),
+        1,
+        "bare ids must collide in rrf_fusion — this is what interning exists to fix"
+    );
+
+    let mut interned: HashMap<(String, u32), u32> = HashMap::new();
+    let a = super::intern_group_chunk_id(&mut interned, ("alpha".to_string(), 0));
+    let b = super::intern_group_chunk_id(&mut interned, ("beta".to_string(), 0));
+    assert_ne!(a, b, "same local id in different repos must intern apart");
+
+    // Repeat lookups return the SAME synthetic id — the reverse table maps
+    // fused ids back to owners, so re-interning would orphan results.
+    let a_again = super::intern_group_chunk_id(&mut interned, ("alpha".to_string(), 0));
+    assert_eq!(a, a_again, "re-interning the same pair must be stable");
+
+    // With interned ids both hits survive the fusion.
+    let interned_hits = vec![vector_hit(a, 0.9), vector_hit(b, 0.8)];
+    let fused = crate::rerank::rrf_fusion(&interned_hits, &[], 60.0);
+    assert_eq!(fused.len(), 2, "interned ids must keep both repos' hits");
+    assert_eq!(fused[0].chunk_id, a, "rank order follows the input scores");
+    assert_eq!(fused[1].chunk_id, b, "rank order follows the input scores");
+}
+
+#[test]
+fn mixed_model_group_warning_fires_only_for_genuinely_mixed_groups() {
+    use crate::embed::ModelType;
+
+    // One model — even repeated by several repos — is one scale.
+    assert!(
+        super::mixed_model_group_warning([ModelType::AllMiniLML6V2Q]).is_none(),
+        "a single-model group must not warn"
+    );
+    assert!(
+        super::mixed_model_group_warning([ModelType::AllMiniLML6V2Q, ModelType::AllMiniLML6V2Q,])
+            .is_none(),
+        "the same model across repos is still one scale"
+    );
+
+    let warning =
+        super::mixed_model_group_warning([ModelType::AllMiniLML6V2Q, ModelType::BGESmallENV15])
+            .expect("a genuinely mixed group must warn");
+    assert!(
+        warning.contains("NOT comparable"),
+        "the warning must say the scores are not comparable: {warning}"
+    );
+    for name in [
+        ModelType::AllMiniLML6V2Q.short_name(),
+        ModelType::BGESmallENV15.short_name(),
+    ] {
+        assert!(
+            warning.contains(name),
+            "every distinct model must be named ('{name}' missing): {warning}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_refuses_min_score_in_literal_mode_by_name() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    // Minimal hermetic service fixture: the refusal fires before any store
+    // access, so an empty index is enough.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join(".codesearch.db");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(
+        db.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = std::sync::Arc::new(crate::index::SharedStores::new(&db, 2).expect("stores"));
+    let service =
+        super::CodesearchService::new_with_stores(Some(tmp.path().to_path_buf()), Some(stores))
+            .expect("service");
+
+    let request = crate::mcp::types::SearchRequest {
+        query: "handle_transfer".to_string(),
+        mode: Some("literal".to_string()),
+        compact: None,
+        semantic_mode: None,
+        filter_path: None,
+        min_score: Some(0.5),
+        regex: None,
+        phrase: None,
+        file_glob: None,
+        language: None,
+        format: None,
+        limit: None,
+        project: None,
+        group: None,
+    };
+    let res = service
+        .search(Parameters(request))
+        .await
+        .expect("search must answer");
+    let text = match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    assert!(
+        text.contains("min_score"),
+        "refusal must name the field: {text}"
+    );
+    assert!(
+        text.contains("literal"),
+        "refusal must name the mode: {text}"
+    );
+}
+
 // === status(kind="index") multi-store summary ==========================
 //
 // Follow-up 16: a store failing mid-fan-out used to render identically to
@@ -2213,14 +2503,14 @@ fn note_store_failure_survives_a_short_alias_list() {
 
 #[test]
 fn index_status_summary_reports_building_before_anything_failed() {
-    let (status, message) = super::index_status_summary(3, 0, 0, true);
+    let (status, message) = super::index_status_summary(3, 0, 0, true, false);
     assert_eq!(status, "building");
     assert!(!message.contains("failed"), "got: {message}");
 }
 
 #[test]
 fn index_status_summary_reports_clean_ready_with_no_failures() {
-    let (status, message) = super::index_status_summary(3, 0, 500, true);
+    let (status, message) = super::index_status_summary(3, 0, 500, true, false);
     assert_eq!(status, "ready");
     assert!(!message.contains("failed"), "got: {message}");
     assert!(message.contains("3 repo(s)"), "got: {message}");
@@ -2230,7 +2520,7 @@ fn index_status_summary_reports_clean_ready_with_no_failures() {
 fn index_status_summary_surfaces_a_degraded_group_as_ready_with_a_count() {
     // This is the exact case that used to be indistinguishable from
     // "index still warming": some data is in, one store didn't answer.
-    let (status, message) = super::index_status_summary(3, 1, 500, true);
+    let (status, message) = super::index_status_summary(3, 1, 500, true, false);
     assert_eq!(
         status, "ready",
         "the two healthy stores must not be masked by the one that failed"
@@ -2250,7 +2540,7 @@ fn index_status_summary_reports_error_when_every_store_failed() {
     // this fix, `total_chunks == 0` was checked first and this rendered as
     // "building" — byte-identical to "not indexed yet" — even though every
     // store actively failed. `failed_count >= total_repos` must win.
-    let (status, message) = super::index_status_summary(3, 3, 0, true);
+    let (status, message) = super::index_status_summary(3, 3, 0, true, false);
     assert_eq!(
         status, "error",
         "a group where every store failed must not read as merely 'still building'"
@@ -2395,13 +2685,24 @@ fn record_stats_or_warn_does_not_duplicate_the_same_warning() {
 #[test]
 fn into_results_routes_failures_into_warnings() {
     let outcome = super::MultiReadOutcome {
-        results: vec![1u32, 2],
+        results: vec![
+            super::SourcedResult::new("inriver", 1u32),
+            super::SourcedResult::new("example-repo", 2),
+        ],
         failures: vec![("inriver".to_string(), "os error 22".to_string())],
     };
     let mut warnings = Vec::new();
     let results = outcome.into_results(&mut warnings, "chunk lookup");
 
-    assert_eq!(results, vec![1, 2]);
+    // Unwrap the origin tags the way every consumer now reads them.
+    let unwrapped: Vec<(String, u32)> = results
+        .into_iter()
+        .map(|tagged| (tagged.alias, tagged.result))
+        .collect();
+    assert_eq!(
+        unwrapped,
+        vec![("inriver".to_string(), 1), ("example-repo".to_string(), 2)]
+    );
     assert_eq!(
         warnings,
         vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()],
@@ -2685,6 +2986,7 @@ fn semantic_response_emits_warnings_to_the_caller() {
         results: vec![],
         low_confidence: Some(true),
         suggested_tool: None,
+        note: None,
         warnings: Some(vec!["repo 'inriver' search failed: os error 22".to_string()]),
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -2700,10 +3002,12 @@ fn semantic_response_omits_warnings_when_healthy() {
         results: vec![],
         low_confidence: None,
         suggested_tool: None,
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
     assert!(!json.contains("warnings"), "got: {json}");
+    assert!(!json.contains("note"), "got: {json}");
 }
 
 #[test]
@@ -2711,6 +3015,7 @@ fn literal_response_emits_warnings_and_omits_them_when_healthy() {
     let failed = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2725,6 +3030,7 @@ fn literal_response_emits_warnings_and_omits_them_when_healthy() {
     let healthy = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2739,6 +3045,7 @@ fn test_literal_search_response_omits_fields_when_not_promoted() {
     let response = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2762,6 +3069,7 @@ fn test_grep_format_includes_comment_when_promoted() {
             signature: None,
         }],
         auto_promoted_to_regex: Some(true),
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2796,6 +3104,7 @@ fn test_grep_format_no_comment_when_plain() {
             signature: None,
         }],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2976,7 +3285,7 @@ fn readonly_or_require_ready_never_creates_a_missing_index() {
 /// failed with "Index not built. Call build_index() after inserting chunks."
 #[test]
 fn index_status_summary_reports_building_when_chunks_exist_but_graph_is_not_built() {
-    let (status, message) = super::index_status_summary(3, 0, 500, false);
+    let (status, message) = super::index_status_summary(3, 0, 500, false, false);
     assert_eq!(
         status, "building",
         "chunks without a built vector index are not searchable"
@@ -2987,27 +3296,274 @@ fn index_status_summary_reports_building_when_chunks_exist_but_graph_is_not_buil
         "message must still name the scope, got: {message}"
     );
     // A stats() failure on some stores must NOT be misread as "not built".
-    let (status, _) = super::index_status_summary(3, 1, 500, true);
+    let (status, _) = super::index_status_summary(3, 1, 500, true, false);
     assert_eq!(
         status, "ready",
         "a failed store is surfaced as degraded-ready"
     );
 }
 
+/// A running rebuild turns every would-be "ready" into "building"; states that
+/// already carry a more specific verdict (all stores failed) are left alone.
+#[test]
+fn index_status_summary_reports_building_while_a_rebuild_runs() {
+    // (total_repos, failed, chunks, all_built, indexing) -> expected status
+    let cases = [
+        ((3, 0, 500, true, true), "building"),
+        ((3, 1, 500, true, true), "building"),
+        ((3, 0, 500, true, false), "ready"),
+        ((3, 3, 0, true, true), "error"),
+    ];
+    for ((repos, failed, chunks, built, indexing), expected) in cases {
+        let (status, message) = super::index_status_summary(repos, failed, chunks, built, indexing);
+        assert_eq!(
+            status, expected,
+            "case ({repos},{failed},{chunks},{built},{indexing}): {message}"
+        );
+    }
+    let (_, message) = super::index_status_summary(3, 0, 500, true, true);
+    assert!(message.contains("rebuild"), "got: {message}");
+}
+
 /// Single-store counterpart: the same `total_chunks > 0` shortcut reported
 /// `ready` for a store whose graph was never built (`indexed == false`).
 #[test]
 fn single_index_status_requires_a_built_graph_to_report_ready() {
-    let (status, message) = super::single_index_status(403, false);
+    let (status, message) = super::single_index_status(403, false, false);
     assert_eq!(
         status, "building",
         "403 chunks with no built graph are not searchable"
     );
     assert!(message.contains("not built"), "got: {message}");
 
-    let (status, _) = super::single_index_status(403, true);
+    let (status, _) = super::single_index_status(403, true, false);
     assert_eq!(status, "ready");
 
-    let (status, _) = super::single_index_status(0, false);
+    let (status, _) = super::single_index_status(0, false, false);
     assert_eq!(status, "building");
+}
+
+// === group fan-out degradation under write locks ===
+//
+// A multi-repo fan-out is an interactive query: it must never queue behind a
+// repo held by a running indexing batch. Before the fix the fan-out used the
+// bounded 300s read wait per store, so N busy repos summed to N waits and
+// stalled every other repo's answer — the MCP wedge.
+
+#[tokio::test]
+async fn vector_fan_out_skips_write_locked_store_instead_of_waiting() {
+    // alpha's vector write lock is held for the whole call, as an indexing
+    // batch would hold it; beta is free. The fan-out must skip alpha (one
+    // failure naming it) instead of blocking on it.
+    let root_a = tempfile::tempdir().expect("tempdir a");
+    let stores_a = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_a.path().join(".codesearch.db"), 2)
+            .expect("stores a"),
+    );
+    let root_b = tempfile::tempdir().expect("tempdir b");
+    let stores_b = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_b.path().join(".codesearch.db"), 2)
+            .expect("stores b"),
+    );
+    let service = super::CodesearchService::new_with_stores(
+        Some(root_b.path().to_path_buf()),
+        Some(stores_b.clone()),
+    )
+    .expect("service");
+
+    let _alpha_write = stores_a.vector_store.write().await;
+
+    let outcome = service
+        .with_vector_store_read_multi(
+            |_alias, _store| Ok::<_, anyhow::Error>(Vec::<crate::vectordb::SearchResult>::new()),
+            vec![stores_a.clone(), stores_b.clone()],
+            &["alpha".to_string(), "beta".to_string()],
+        )
+        .await
+        .expect("fan-out itself must not error");
+
+    assert!(
+        outcome.results.is_empty(),
+        "the locked store must be skipped, not answered from"
+    );
+    assert_eq!(
+        outcome.failures.len(),
+        1,
+        "only alpha must fail, failures: {:?}",
+        outcome.failures
+    );
+    assert_eq!(outcome.failures[0].0, "alpha");
+    assert!(
+        outcome.failures[0].1.contains("store busy"),
+        "failure must explain itself: {}",
+        outcome.failures[0].1
+    );
+}
+
+#[tokio::test]
+async fn lexical_group_search_degrades_per_repo_when_a_store_is_write_locked() {
+    use rmcp::model::ContentBlock;
+
+    // Same contract through the full lexical flow: alpha mid-indexing, beta
+    // searchable. The group answers from beta alone, with a warning naming
+    // alpha — the skipped repo must degrade visibly, never silently.
+    let root_a = tempfile::tempdir().expect("tempdir a");
+    let stores_a = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_a.path().join(".codesearch.db"), 2)
+            .expect("stores a"),
+    );
+    {
+        let mut vs = stores_a.vector_store.write().await;
+        let chunk = crate::chunker::Chunk::new(
+            "fn gadget() {}".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/lib.rs".to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![0.0, 1.0],
+        )])
+        .expect("insert chunk a");
+        vs.build_index().expect("build index a");
+    }
+    {
+        let mut fts = stores_a.fts_store.write().await;
+        fts.add_chunk(0, "fn gadget() {}", "src/lib.rs", None, "Function")
+            .expect("fts doc a");
+        fts.commit().expect("commit a");
+    }
+    let root_b = tempfile::tempdir().expect("tempdir b");
+    let stores_b = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_b.path().join(".codesearch.db"), 2)
+            .expect("stores b"),
+    );
+    {
+        // insert_chunks assigns ids from 0 per store, so a filler chunk keeps
+        // the real one at id 1 and the two test repos never share a chunk id.
+        let mut vs = stores_b.vector_store.write().await;
+        let filler = crate::chunker::Chunk::new(
+            "filler".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/filler.rs".to_string(),
+        );
+        let chunk = crate::chunker::Chunk::new(
+            "gadget helper".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/util.rs".to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            filler,
+            vec![0.5, 0.5],
+        )])
+        .expect("insert filler b");
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![1.0, 0.0],
+        )])
+        .expect("insert chunk b");
+        vs.build_index().expect("build index b");
+    }
+    {
+        let mut fts = stores_b.fts_store.write().await;
+        fts.add_chunk(1, "gadget helper", "src/util.rs", None, "Function")
+            .expect("fts doc b");
+        fts.commit().expect("commit b");
+    }
+
+    let service = super::CodesearchService::new_with_stores(
+        Some(root_b.path().to_path_buf()),
+        Some(stores_b.clone()),
+    )
+    .expect("service");
+
+    let request = super::SemanticSearchRequest {
+        query: "gadget".to_string(),
+        limit: Some(10),
+        compact: Some(false),
+        filter_path: None,
+        mode: Some("lexical".to_string()),
+        project: None,
+        group: Some("all".to_string()),
+        min_score: None,
+    };
+    let mut alias_roots = std::collections::HashMap::new();
+    alias_roots.insert(
+        "alpha".to_string(),
+        crate::cache::normalize_path_str(&root_a.path().to_string_lossy()),
+    );
+    alias_roots.insert(
+        "beta".to_string(),
+        crate::cache::normalize_path_str(&root_b.path().to_string_lossy()),
+    );
+
+    // Hold alpha's FTS write lock across the call, as a live indexing run
+    // would. The query must still return promptly from beta.
+    let _alpha_fts_write = stores_a.fts_store.write().await;
+
+    let result = service
+        .semantic_search_multi(
+            &request,
+            &[],
+            10,
+            false,
+            vec![stores_a.clone(), stores_b.clone()],
+            &["alpha".to_string(), "beta".to_string()],
+            &alias_roots,
+        )
+        .await
+        .expect("group search must succeed despite one busy store");
+
+    let json = match &result.content[0] {
+        ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json response");
+    let paths: Vec<&str> = parsed["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|r| r["path"].as_str().expect("path string"))
+        .collect();
+    assert_eq!(paths, vec!["beta/src/util.rs"], "paths: {paths:?}");
+    let warnings_text = parsed["warnings"]
+        .as_array()
+        .map(|ws| {
+            ws.iter()
+                .map(|w| w.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    assert!(
+        warnings_text.contains("alpha") && warnings_text.contains("store busy"),
+        "warnings must name the skipped repo and why: {warnings_text}"
+    );
+}
+
+/// A running rebuild overrides "ready": the stores are still being rewritten
+/// even though the previous generation's graph reports built.
+#[test]
+fn single_index_status_reports_building_while_a_rebuild_runs() {
+    // (total_chunks, indexed, indexing) -> expected status
+    let cases = [
+        ((403, true, true), "building"),
+        ((403, false, true), "building"),
+        ((0, false, true), "building"),
+        ((403, true, false), "ready"),
+    ];
+    for ((chunks, indexed, indexing), expected) in cases {
+        let (status, message) = super::single_index_status(chunks, indexed, indexing);
+        assert_eq!(
+            status, expected,
+            "case ({chunks},{indexed},{indexing}): {message}"
+        );
+    }
+    let (_, message) = super::single_index_status(403, true, true);
+    assert!(message.contains("rebuild"), "got: {message}");
 }

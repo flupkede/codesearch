@@ -205,9 +205,11 @@ fn build_chunk(group: &CellGroup, file_name: &str, file_breadcrumb: &str) -> Chu
     // distinguish code from markdown content.
     let prefixed = format!("# [{}]\n{}", group.cell_type, group.content);
 
+    // Group lines are 0-based offsets into the notebook; chunks surface
+    // 1-based editor lines.
     let mut chunk = Chunk::new(
         prefixed,
-        group.start_line,
+        group.start_line + 1,
         group.end_line,
         ChunkKind::Block,
         file_name.to_string(),

@@ -2,6 +2,30 @@ use std::path::Path;
 
 // === Multi-store fan-out traits ===
 
+/// A fan-out result tagged with the repo whose store produced it.
+///
+/// Chunk ids are store-local counters, so a bare id identifies a chunk only
+/// within one repo's store — across a group fan-out, two different chunks
+/// share an id as soon as both repos have that many chunks. Every downstream
+/// resolution (`get_chunk`, path prefixing, content attribution) must therefore
+/// use `alias` to address the ORIGIN store, never "whichever store answers
+/// first".
+pub(crate) struct SourcedResult<R> {
+    /// Alias of the repo whose store produced this result.
+    pub(crate) alias: String,
+    /// The result itself.
+    pub(crate) result: R,
+}
+
+impl<R> SourcedResult<R> {
+    pub(crate) fn new(alias: impl Into<String>, result: R) -> Self {
+        Self {
+            alias: alias.into(),
+            result,
+        }
+    }
+}
+
 /// Trait for types that have a chunk ID (used for deduplication in group fan-out).
 pub(crate) trait HasChunkId {
     fn chunk_id(&self) -> u32;

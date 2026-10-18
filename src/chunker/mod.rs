@@ -24,10 +24,12 @@ pub struct Chunk {
     /// The actual content of the chunk
     pub content: String,
 
-    /// Starting line number (0-indexed)
+    /// Starting line number (1-based editor line, as emitted by every
+    /// chunker; responses pass it through unchanged)
     pub start_line: usize,
 
-    /// Ending line number (0-indexed)
+    /// Ending line number (1-based editor line, as emitted by every
+    /// chunker; responses pass it through unchanged)
     pub end_line: usize,
 
     /// Type of chunk
@@ -133,7 +135,8 @@ impl Chunk {
 
     /// Get the number of lines in this chunk
     pub fn line_count(&self) -> usize {
-        self.end_line.saturating_sub(self.start_line)
+        // 1-based inclusive end minus 1-based start, +1: the true line count.
+        self.end_line.saturating_sub(self.start_line) + 1
     }
 
     /// Get the size of this chunk in bytes

@@ -413,3 +413,34 @@ fn resident_pool_surfaces_client_failure_to_the_fallback() {
         .expect_err("a failing helper must surface an error for the one-shot fallback");
     assert!(err.to_string().contains("mock helper failed"));
 }
+
+/// serve shutdown: statics are never dropped at process exit, so the
+/// `ServeClient::Drop` kill never fires there. `kill_all` must kill every
+/// resident child and leave the pool empty (a later request respawns).
+#[test]
+fn kill_all_kills_every_resident_child_and_empties_the_pool() {
+    let h = harness(2, Duration::from_secs(600));
+
+    h.pool
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .unwrap();
+    h.pool
+        .find_refs(&PathBuf::from("h.exe"), &sln("b"), "Sym")
+        .unwrap();
+    assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 0);
+
+    h.pool.kill_all();
+
+    assert_eq!(
+        h.state.kill_count.load(Ordering::SeqCst),
+        2,
+        "every resident child must be killed on shutdown"
+    );
+
+    // Pool emptied: a follow-up request respawns instead of reusing a
+    // killed client.
+    h.pool
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .unwrap();
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
+}

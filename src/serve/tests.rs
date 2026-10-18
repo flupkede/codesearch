@@ -114,6 +114,58 @@ async fn get_chunk_routes_mounted_remote_projects_through_federation() {
 }
 
 #[test]
+fn idle_mcp_sessions_are_bounded_to_reap_after_30_minutes() {
+    // The idle-reap fix is exactly this configuration: keep_alive=None
+    // assumed TCP liveness would collect wedged sessions, but a stuck
+    // request keeps its socket and its FIFO-serialized worker alive
+    // indefinitely (observed active_sessions=4 with a single client).
+    // The bound must stay a plain half hour — far beyond any human pause in
+    // local interactive use, yet a guarantee the session eventually goes
+    // away without a serve restart.
+    let manager = crate::serve::session_manager_with_idle_reap();
+    assert_eq!(
+        manager.session_config.keep_alive,
+        Some(std::time::Duration::from_secs(
+            crate::constants::MCP_IDLE_SESSION_SECS
+        )),
+        "the reap bound must be configured on the rmcp session manager"
+    );
+    assert_eq!(
+        crate::constants::MCP_IDLE_SESSION_SECS,
+        30 * 60,
+        "the reap bound must stay at thirty minutes"
+    );
+}
+
+#[test]
+fn shutdown_drain_notice_bounds_the_pause_and_forbids_the_reflex_ctrl_c() {
+    // The notice exists because the ~3 s drain after `q` reads as a hang
+    // from the restored terminal, and the reflex second Ctrl-C hard-kills
+    // serve mid-drain (raw mode is already off, so it IS delivered). Every
+    // element matters: the bounded wait, the session count, and the
+    // explicit "exits by itself".
+    let quiet = crate::serve::tui::shutdown_drain_notice(0);
+    assert_eq!(
+        quiet, "🛑 Shutting down…",
+        "no sessions — no drain to explain"
+    );
+
+    let draining = crate::serve::tui::shutdown_drain_notice(4);
+    assert!(
+        draining.contains("4 open MCP session(s)"),
+        "the count of draining sessions must be named, got: {draining}"
+    );
+    assert!(
+        draining.contains("~3 s"),
+        "the visibly bounded wait is the whole point, got: {draining}"
+    );
+    assert!(
+        draining.contains("exiting by itself"),
+        "the user must be told NOT to intervene, got: {draining}"
+    );
+}
+
+#[test]
 fn tracked_session_drop_balances_active_sessions() {
     // A genuine MCP session increments on connect and the serve factory
     // marks it tracked, so Drop decrements and the counter returns to 0.
@@ -262,6 +314,120 @@ async fn remove_repo_reports_db_locked_when_delete_fails() {
         outcome.db_delete_error.is_some(),
         "a delete error reason must be present on failure"
     );
+}
+
+#[tokio::test]
+async fn remove_repo_quarantines_db_dir_when_delete_budget_expires() {
+    // When the delete budget expires (external holder: another process, an
+    // AV scanner), the directory used to stay in place as a "valid" index —
+    // the next registration adopted its stale metadata and chunk stores as a
+    // false readiness, and re-registration against that legacy data ended in
+    // arroy EINVAL (the pilot's bare-stamp repos). The quarantine rename
+    // makes a fresh registration build from scratch; the quarantined sibling
+    // stays for manual cleanup, same convention as .codesearch.db.bak-*.
+    let (_tmp, repo_path, state) = state_with_repo("ghostrepo");
+    // db_path is a FILE: remove_dir_all fails every retry with a non-lock
+    // error, deterministically exhausting the budget branch on every OS.
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::write(&db_path, "not a directory").unwrap();
+
+    let outcome = state
+        .remove_repo("ghostrepo")
+        .await
+        .expect("remove_repo returns Ok(outcome); delete failure is non-fatal");
+
+    assert!(!outcome.db_deleted);
+    let quarantine = outcome
+        .db_quarantined
+        .expect("a surviving db path must be quarantined, not left in place");
+    assert!(!db_path.exists(), "the original db path must be gone");
+    assert!(quarantine.exists(), "the quarantined sibling must exist");
+    assert!(
+        quarantine
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".codesearch.db.removed-"),
+        "quarantine follows the <DB_DIR_NAME>.removed-* convention: {}",
+        quarantine.display()
+    );
+}
+
+#[tokio::test]
+async fn delete_repo_http_mapping_reports_a_quarantined_db_honestly() {
+    // The DELETE /repos/{alias} payload must not read "removed" when the DB
+    // dir survived the delete budget: the caller (an operator or an agent
+    // driving /repos) decides whether the disk still holds a stale index by
+    // `status` and `db_quarantined`. The quarantine outcome itself is pinned
+    // by remove_repo_quarantines_db_dir_when_delete_budget_expires; this
+    // pins its HTTP mapping.
+    let (_tmp, repo_path, state) = state_with_repo("qmap");
+    let state = Arc::new(state);
+    // A FILE as the db path: remove_dir_all fails every retry with a
+    // non-lock error, deterministically exhausting the budget into the
+    // quarantine branch on every OS.
+    std::fs::write(repo_path.join(DB_DIR_NAME), "not a directory").unwrap();
+
+    let (status, body) = crate::serve::remove_repo_handler(
+        axum::extract::Path("qmap".to_string()),
+        axum::extract::State(state),
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK, "got body: {body:?}");
+    assert_eq!(
+        body["status"], "removed_db_quarantined",
+        "the status must name the honest outcome, got: {body:?}"
+    );
+    assert_eq!(
+        body["db_deleted"], false,
+        "a quarantined dir was NOT deleted, got: {body:?}"
+    );
+    let quarantine = body["db_quarantined"]
+        .as_str()
+        .expect("db_quarantined must be a string path")
+        .to_string();
+    assert!(
+        quarantine.contains(&format!("{DB_DIR_NAME}.removed-")),
+        "the payload must point at the quarantined sibling, got: {quarantine}"
+    );
+}
+
+#[test]
+fn sweep_removes_quarantine_remnants_and_leaves_everything_else() {
+    // The quarantine rename leaves the survivor "for manual cleanup", and
+    // manual cleanup never happens — every budget-expired delete leaked a
+    // full stale index copy forever. The startup sweep is the cleanup:
+    // by serve start the previous session's external holders are gone, so
+    // the tombstone has no readers left to protect.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let remnant = repo.join(format!("{DB_DIR_NAME}.removed-1700000000000"));
+    std::fs::create_dir_all(&remnant).unwrap();
+    std::fs::write(remnant.join("metadata.json"), "{}").unwrap();
+    let live_db = repo.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&live_db).unwrap();
+    // Similar name, different prefix family — must not be touched.
+    let other = repo.join("notes.removed-manual");
+    std::fs::create_dir_all(&other).unwrap();
+
+    crate::serve::sweep_quarantined_db_remnants(std::slice::from_ref(&repo));
+
+    assert!(
+        !remnant.exists(),
+        "the .codesearch.db.removed-* sibling must be swept"
+    );
+    assert!(live_db.exists(), "the live db dir must stay untouched");
+    assert!(
+        other.exists(),
+        "unrelated .removed names must not be touched"
+    );
+
+    // A repo path that cannot be listed warns but does not panic.
+    let missing = tmp.path().join("gone");
+    crate::serve::sweep_quarantined_db_remnants(&[missing]);
 }
 
 #[test]
@@ -950,7 +1116,12 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
 /// serve-wide default's dimension (`codesearch serve --model X`), not the
 /// built-in 384-dim default. This is the write-side counterpart of the per-repo
 /// query-model contract.
+///
+/// `#[serial]`: the handler reads `CODESEARCH_ALLOWED_ROOTS`, so this test
+/// must exclude the mutating `allowed_roots_tests` group — the 403 flake
+/// named in that module's comment is a serial-vs-non-serial race.
 #[tokio::test]
+#[serial]
 async fn add_repo_handler_uses_serve_default_model_for_new_index() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("defaulted");
@@ -997,8 +1168,10 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
 
 /// The serve-wide default must NOT override an index that already records its
 /// own model: re-adding a repo whose `.codesearch.db` is still on disk keeps the
-/// recorded model and dimension.
+/// recorded model and dimension. `#[serial]` for the same allowed-roots read
+/// as its sibling above.
 #[tokio::test]
+#[serial]
 async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("existing");
@@ -2744,6 +2917,73 @@ fn evicting_idle_repo_clears_frozen_csharp_error_state() {
     );
 }
 
+/// A build longer than the idle timeout must not leave the repo "idle" the
+/// instant it finishes: the reaper skips an indexing repo AND restarts its idle
+/// clock, so the first sweep after the build still finds it fresh.
+///
+/// Regression guard: the reaper used to skip indexing repos without touching
+/// `last_access`, so a 30+ minute SCIP/index run ended with the repo already
+/// past the timeout and the very next sweep evicted it.
+#[tokio::test]
+#[serial]
+async fn idle_reaper_restarts_the_idle_clock_of_an_indexing_repo() {
+    let _env = crate::testing::EnvRestore::set(&[
+        (crate::constants::REPO_IDLE_TIMEOUT_ENV, "60"),
+        (crate::constants::MAX_INDEXING_SECS_ENV, "600"),
+    ]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = crate::cache::safe_canonicalize(tmp.path())
+        .unwrap()
+        .join(DB_DIR_NAME);
+    let OpenedStores::Write(stores) = state
+        .try_open_stores("longbuild", &db_path, true, false, None)
+        .expect("open must succeed")
+    else {
+        panic!("brand-new repo must open Write");
+    };
+    state
+        .repos
+        .insert("longbuild".to_string(), RepoState::Warm { stores });
+    let long_ago = || {
+        Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("monotonic clock at least 2 minutes old")
+    };
+    state
+        .last_access
+        .insert("longbuild".to_string(), long_ago());
+    assert!(state.begin_indexing("longbuild", IndexingOwner::Reindex));
+
+    state.evict_idle_repos();
+    assert!(
+        state.repos.contains_key("longbuild"),
+        "a repo past the idle timeout must not be evicted while it is indexing"
+    );
+    let age = state.last_access.get("longbuild").unwrap().elapsed();
+    assert!(
+        age < Duration::from_secs(60),
+        "a sweep that sees the repo indexing must restart its idle clock, age was {age:?}"
+    );
+
+    state.end_indexing("longbuild", IndexingOwner::Reindex);
+    state.evict_idle_repos();
+    assert!(
+        state.repos.contains_key("longbuild"),
+        "the first sweep after the build must find the repo fresh, not idle"
+    );
+
+    // Control: once the idle period really passes, the reaper still evicts.
+    state
+        .last_access
+        .insert("longbuild".to_string(), long_ago());
+    state.evict_idle_repos();
+    assert!(
+        !state.repos.contains_key("longbuild"),
+        "a repo idle past the timeout with no build running must still be evicted"
+    );
+}
+
 /// The model a serve query is embedded with is read from the routed repo's own
 /// index metadata — never assumed to be the hub-wide default.
 ///
@@ -3035,6 +3275,87 @@ async fn a_second_format_recovery_for_the_same_alias_is_refused() {
     );
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn format_recovery_refuses_to_wipe_while_an_index_task_is_alive() {
+    // recover_repo_format's safety guard: wiping the DB dir from under a
+    // live indexing task can wedge the task while it holds the store handles
+    // and the process-wide job permit. The refusal branch ("did not stop
+    // within the cooperative budget; refusing to wipe") was pinned nowhere.
+    let (_tmp, repo_path, state) = state_with_repo("liverun");
+    let state = Arc::new(state);
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+    // A task with no cancellation point: it ignores the token the way a real
+    // build_index parked inside its synchronous arroy pass does. The sleep is
+    // virtual — with paused time the 5 s cooperative budget expires the
+    // instant the timeout is awaited.
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    });
+    state.index_tasks.insert(
+        "liverun".to_string(),
+        IndexTask {
+            handle,
+            token,
+            db_path: db_path.clone(),
+            started_at: Instant::now(),
+        },
+    );
+
+    let result = state.recover_repo_format("liverun").await;
+
+    let err = result.expect_err("a live indexing task must block the wipe");
+    assert!(
+        err.contains("refusing to wipe"),
+        "the refusal must say what it refused, got: {err}"
+    );
+    assert!(
+        db_path.exists(),
+        "the DB dir must survive a refused format-recovery wipe"
+    );
+    assert!(
+        !state.format_recovery_done.contains_key("liverun"),
+        "a refused wipe must not tombstone the alias"
+    );
+
+    // Cleanup: the parked task must not outlive the test. await_index_task
+    // put it back into the map ("keeping it tracked"), so abort from there.
+    if let Some((_, task)) = state.index_tasks.remove("liverun") {
+        task.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn format_recovery_permanent_delete_failure_surfaces_and_stays_retryable() {
+    // A non-lock delete failure (here: the db path is a regular file) must
+    // NOT burn the lock-class retry budget, must surface as an explicit
+    // error, and — because format_recovery_done records at the WIPE, not at
+    // the rebuild — the alias stays eligible for another attempt instead of
+    // entering the one-wipe-per-process tombstone on a wipe that never
+    // happened.
+    let (_tmp, repo_path, state) = state_with_repo("filerun");
+    let state = Arc::new(state);
+    let db_path = repo_path.join(DB_DIR_NAME);
+    // A FILE: remove_dir_all fails immediately with a non-lock error on
+    // every OS, deterministically taking the permanent-failure branch.
+    std::fs::write(&db_path, "not a directory").unwrap();
+
+    let result = state.recover_repo_format("filerun").await;
+    let err = result.expect_err("a permanent delete failure must surface");
+    assert!(
+        err.contains("could not wipe"),
+        "the error must name the failed wipe, got: {err}"
+    );
+    assert!(
+        state.enqueue_format_recovery("filerun"),
+        "a wipe that never happened must not tombstone the alias — the next \
+         corruption detection has to be able to retry once the holder is gone"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn await_index_task_cancels_and_releases_the_task_handles() {
@@ -3242,6 +3563,80 @@ async fn indexing_marker_heartbeat_survives_past_max() {
         !state.is_indexing("hb"),
         "end_indexing must clear the marker"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn symbol_marker_guard_keeps_the_marker_alive_until_dropped() {
+    // Regression: the SCIP rebuild is one opaque blocking call with no
+    // per-batch heartbeat, so its Symbol marker aged out at MAX_INDEXING_SECS
+    // and the reaper evicted the repo mid-build. The guard renews it for the
+    // whole run and ends it (and the heartbeat) on drop.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Control: a bare Symbol marker expires at the threshold.
+    assert!(state.begin_indexing("ctrl", IndexingOwner::Symbol));
+    let guard = IndexingMarkerGuard::begin(
+        &state,
+        "guarded",
+        IndexingOwner::Symbol,
+        Duration::from_millis(100),
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !state.is_indexing("ctrl"),
+        "an unrenewed Symbol marker must expire at the threshold"
+    );
+    assert!(
+        state.is_indexing("guarded"),
+        "the guard's heartbeat must keep the marker alive past the threshold"
+    );
+
+    drop(guard);
+    assert!(
+        !state.is_indexing("guarded"),
+        "dropping the guard must end the marker"
+    );
+    // A heartbeat tick racing the drop must not resurrect the marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !state.active_reindexes.contains_key("guarded"),
+        "the heartbeat must stop with the guard"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn symbol_marker_guard_is_inert_while_another_owner_holds_the_alias() {
+    // Nested rebuilds run under the Reindex marker: the guard must neither
+    // add a Symbol marker nor end anyone else's on drop.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "600")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    assert!(state.begin_indexing("nested", IndexingOwner::Reindex));
+    let guard = IndexingMarkerGuard::begin(
+        &state,
+        "nested",
+        IndexingOwner::Symbol,
+        Duration::from_millis(50),
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let owners: Vec<IndexingOwner> = state
+        .active_reindexes
+        .get("nested")
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    assert_eq!(owners, vec![IndexingOwner::Reindex]);
+
+    drop(guard);
+    assert!(
+        state.is_indexing("nested"),
+        "an inert guard must leave the holder's marker alone"
+    );
+    state.end_indexing("nested", IndexingOwner::Reindex);
 }
 
 #[tokio::test]
@@ -3522,6 +3917,36 @@ fn csharp_success_outcome_partial_when_warnings_survived() {
     );
 }
 
+/// A running build wins over a cached (stale) Ready and over the probe, and
+/// skips the probe entirely; idle falls back cache → probe.
+#[test]
+fn resolve_csharp_status_precedence() {
+    use CSharpIndexStatus as S;
+    // (cached, indexing, probe result, expected, probe expected to run)
+    let cases = [
+        (Some(S::Ready), true, S::Ready, S::Indexing, false),
+        (None, true, S::Ready, S::Indexing, false),
+        (Some(S::Ready), false, S::None, S::Ready, false),
+        (None, false, S::Ready, S::Ready, true),
+        (None, false, S::None, S::None, true),
+    ];
+    for (cached, indexing, probe_result, expected, probe_runs) in cases {
+        let mut probed = false;
+        let got = resolve_csharp_status(cached, indexing, || {
+            probed = true;
+            probe_result
+        });
+        assert_eq!(
+            got, expected,
+            "cached={cached:?} indexing={indexing} probe={probe_result:?}"
+        );
+        assert_eq!(
+            probed, probe_runs,
+            "probe invocation for cached={cached:?} indexing={indexing}"
+        );
+    }
+}
+
 /// The watcher notifier must apply the SAME status contract as
 /// trigger_symbol_rebuild's success arm: Succeeded-with-warnings → Partial
 /// (red C#⚠) with bounded detail — never green — and a clean Succeeded →
@@ -3572,6 +3997,84 @@ fn csharp_notifier_partial_on_succeeded_with_warnings() {
     );
 }
 
+/// A rebuild abandoned because `dotnet restore` never finished within the
+/// retry cap leaves the previous index live — so the notifier must render
+/// a WARNING (Partial, yellow `C#⚠`, with the abandonment detail), never a
+/// red Error: a hung restore is an environment condition, not a broken
+/// index.
+#[test]
+fn csharp_notifier_renders_restore_exhaustion_as_partial_not_error() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    let notifier = state.make_csharp_notifier("bayr");
+
+    notifier(SymbolRebuildSignal::Started);
+    notifier(SymbolRebuildSignal::Abandoned(
+        "dotnet restore for this solution did not finish within 3 attempts \
+         (backoff 60s + 120s) — rebuild abandoned, the previous index stays live (issue #225)"
+            .to_string(),
+    ));
+    assert_eq!(
+        state.csharp_index_status.get("bayr").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Partial),
+        "restore exhaustion is a warning — the previous index stays live"
+    );
+    let detail = state
+        .csharp_index_error
+        .get("bayr")
+        .map(|e| e.value().clone())
+        .expect("the abandonment reason must be the info-panel detail");
+    assert!(
+        detail.contains("did not finish within 3 attempts"),
+        "{detail}"
+    );
+
+    // A later clean rebuild clears the warning again.
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: Vec::new(),
+    });
+    assert_eq!(
+        state.csharp_index_status.get("bayr").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Ready)
+    );
+    assert!(!state.csharp_index_error.contains_key("bayr"));
+}
+
+/// The failure classifier must keep the three outcomes apart — and check
+/// restore-exhaustion FIRST: the typed error carries its own contract
+/// (LMDB untouched, previous index live) that the corruption matcher must
+/// not override. Reordering the checks or flipping the restore arm back to
+/// Error ships the red-error regression with a green suite.
+#[test]
+fn symbol_rebuild_failure_classification_keeps_restore_exhaustion_a_warning() {
+    let exhausted: anyhow::Error = csharp::RestoreExhaustedError {
+        attempts: 3,
+        backoff: "60s + 120s".to_string(),
+    }
+    .into();
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{exhausted:#}"), &exhausted, true),
+        SymbolRebuildFailureKind::RestoreExhausted,
+        "a C# restore-exhausted rebuild must classify as the warning path"
+    );
+    // Not C#: the restore gate is C#-only, the same error falls through.
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{exhausted:#}"), &exhausted, false),
+        SymbolRebuildFailureKind::Generic
+    );
+    // Corruption keeps its own path for a non-exhausted error.
+    let corrupt: anyhow::Error = anyhow::anyhow!("heed -> MDB_BAD_VALSIZE");
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{corrupt:#}"), &corrupt, true),
+        SymbolRebuildFailureKind::LmdbCorruption
+    );
+    // Everything else stays a red Error.
+    let generic: anyhow::Error = anyhow::anyhow!("helper exited with 1");
+    assert_eq!(
+        classify_symbol_rebuild_failure(&format!("{generic:#}"), &generic, true),
+        SymbolRebuildFailureKind::Generic
+    );
+}
+
 /// `repo_statuses_lightweight()` must carry the Partial status AND its
 /// detail message — that pair is what renders the red `C#⚠` and the info
 /// panel's failure line.
@@ -3597,6 +4100,186 @@ fn repo_statuses_lightweight_carries_partial_with_detail() {
         info.csharp_error.as_deref(),
         Some("summary | A.csproj: failure one"),
         "the detail message must ride on the status row"
+    );
+}
+
+/// Owner-scoped status: a TEXT reindex lights the general `Indexing` label
+/// and never the symbol columns; a SYMBOL marker lights the applicable
+/// language column only and leaves the general label on the repo's resting
+/// state. A Rust-only repo keeps `None` in both symbol columns either way.
+#[test]
+#[serial]
+fn indexing_labels_are_owner_scoped_in_status() {
+    let (_tmp, repo_path, bare) = state_with_repo("langrepo");
+    let state = std::sync::Arc::new(bare);
+    assert!(state.begin_indexing("langrepo", IndexingOwner::Reindex));
+
+    let row = |state: &ServeState| {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "langrepo")
+            .expect("langrepo row")
+            .1
+    };
+
+    let info = row(&state);
+    assert_eq!(info.status, RepoStateLabel::Indexing);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::None);
+    assert_eq!(info.typescript_index, CSharpIndexStatus::None);
+
+    // A .sln alone does not make a text reindex a C# rebuild: the C# column
+    // lights only when a symbol marker is present.
+    std::fs::write(repo_path.join("App.sln"), "").unwrap();
+    assert_eq!(row(&state).csharp_index, CSharpIndexStatus::None);
+
+    state.end_indexing("langrepo", IndexingOwner::Reindex);
+    // An on-disk db makes the resting state Idle (not NoIndex).
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+    assert!(state.begin_indexing("langrepo", IndexingOwner::Symbol));
+    let info = row(&state);
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a pure SCIP rebuild must not light the general Indexing label"
+    );
+
+    state.end_indexing("langrepo", IndexingOwner::Symbol);
+}
+
+/// TS twin of the owner-scoping test above: with a resolvable helper env
+/// override, a SYMBOL marker lights the TS column while the general label
+/// rests; a TEXT reindex never lights the TS column, tsconfig or not.
+/// `#[serial]` + `EnvRestore`: the helper override is process env.
+#[test]
+#[serial]
+fn typescript_column_is_symbol_owner_scoped() {
+    let (_tmp, repo_path, bare) = state_with_repo("tsrepo");
+    let state = std::sync::Arc::new(bare);
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+    std::fs::write(repo_path.join("tsconfig.json"), "{}").unwrap();
+    // The env override must point at a regular file; content is never run.
+    let helper = repo_path.join("fake-scip-typescript");
+    std::fs::write(&helper, "").unwrap();
+    let helper_env = crate::constants::SCIP_TYPESCRIPT_HELPER_ENV;
+    let helper_path = helper.display().to_string();
+
+    let row = |state: &ServeState| {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "tsrepo")
+            .expect("tsrepo row")
+            .1
+    };
+
+    assert!(state.begin_indexing("tsrepo", IndexingOwner::Reindex));
+    {
+        let _env = crate::testing::EnvRestore::set(&[(helper_env, helper_path.as_str())]);
+        let info = row(&state);
+        assert_eq!(info.status, RepoStateLabel::Indexing);
+        assert_eq!(
+            info.typescript_index,
+            CSharpIndexStatus::None,
+            "a text reindex must not light the TS column"
+        );
+    }
+    state.end_indexing("tsrepo", IndexingOwner::Reindex);
+
+    assert!(state.begin_indexing("tsrepo", IndexingOwner::Symbol));
+    let _env = crate::testing::EnvRestore::set(&[(helper_env, helper_path.as_str())]);
+    let info = row(&state);
+    assert_eq!(info.typescript_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a pure SCIP rebuild must not light the general Indexing label"
+    );
+    state.end_indexing("tsrepo", IndexingOwner::Symbol);
+}
+
+/// A queued phase-2 rebuild holds no active_reindexes marker yet: the C#
+/// cache pre-mark alone must light the C# COLUMN (queued work stays visible)
+/// while the general label stays on the repo's resting state — a pure SCIP
+/// pass never made the text index busy.
+#[test]
+fn queued_rebuild_pre_mark_shows_in_the_csharp_column_only() {
+    let (_tmp, repo_path, bare) = state_with_repo("queuedrepo");
+    let state = std::sync::Arc::new(bare);
+    std::fs::create_dir_all(repo_path.join(DB_DIR_NAME)).unwrap();
+
+    // The phase-2 queue pre-mark — no begin_indexing, the task hasn't started.
+    state
+        .csharp_index_status
+        .insert("queuedrepo".to_string(), CSharpIndexStatus::Indexing);
+
+    let row = || {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "queuedrepo")
+            .expect("queuedrepo row")
+            .1
+    };
+
+    let info = row();
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Indexing);
+    assert_eq!(
+        info.status,
+        RepoStateLabel::Idle,
+        "a queued symbol rebuild must not light the general Indexing label"
+    );
+
+    // Completed rebuilds overwrite the cache; without pending work the same
+    // closed repo reads Idle again.
+    state.csharp_index_status.remove("queuedrepo");
+    assert_eq!(row().status, RepoStateLabel::Idle);
+}
+
+/// The `!applies` skip in trigger_symbol_rebuild must drop a queued pre-mark:
+/// applicability can change while the task waits for its semaphore slot, and
+/// no rebuild will start to overwrite the mark.
+#[tokio::test]
+async fn trigger_symbol_rebuild_clears_a_pre_mark_when_not_applicable() {
+    let (_tmp, repo_path, bare) = state_with_repo("naq");
+    let state = std::sync::Arc::new(bare);
+    // No .sln written → C# does not apply to this repo.
+    state
+        .csharp_index_status
+        .insert("naq".to_string(), CSharpIndexStatus::Indexing);
+
+    trigger_symbol_rebuild(
+        "naq",
+        &repo_path,
+        &repo_path.join(DB_DIR_NAME),
+        &state,
+        LANG_CSHARP,
+    )
+    .await;
+
+    assert!(
+        state.csharp_index_status.get("naq").is_none(),
+        "a skipped rebuild must not leave the queue pre-mark behind"
+    );
+}
+
+/// A repo whose directory is gone by the time phase-2 runs must never show
+/// indexing: either candidacy filtering skips it or the task's skip guard
+/// drops the pre-mark. No helper env is set (applicability gates before
+/// availability, so a missing dir is decided without probing a helper) —
+/// env-mutating variants of this test must stay `#[serial]`.
+#[tokio::test]
+async fn phase_2_never_marks_a_missing_repo_indexing() {
+    let (_tmp, repo_path, bare) = state_with_repo("gone");
+    std::fs::remove_dir_all(&repo_path).unwrap();
+    let state = std::sync::Arc::new(bare);
+
+    state.run_phase_2_symbols().await;
+
+    assert!(
+        state.csharp_index_status.get("gone").is_none(),
+        "a missing repo must not end up marked indexing"
     );
 }
 
@@ -3648,6 +4331,377 @@ fn build_info_overlay_reads_symbol_warnings_from_meta() {
         }
         other => panic!("expected Info overlay, got {other:?}"),
     }
+}
+
+/// A failed first build must KEEP the registration and release the marker:
+/// the old rollback unregistered the alias and let self-cleanup delete the
+/// DB dir — the vanishing-repo defect (a 202 was the operator's last
+/// word). A registered half-built store heals via reindex.
+#[test]
+fn note_add_index_failure_keeps_the_repo_registered() {
+    let (_tmp, repo_path, state) = state_with_repo("addfail");
+    let alias = "addfail";
+    // The add handler begins indexing before spawning the build task.
+    assert!(state.begin_indexing(alias, IndexingOwner::Reindex));
+
+    state.note_add_index_failure(
+        alias,
+        &repo_path,
+        &anyhow::anyhow!("FTS commit failed: Access is denied. (os error 5)"),
+    );
+
+    assert!(
+        state.config_snapshot().resolve(alias).is_some(),
+        "the repo must stay registered after a failed first build"
+    );
+    assert!(
+        state.begin_indexing(alias, IndexingOwner::Reindex),
+        "the failed marker must be released so a retry can start immediately"
+    );
+}
+
+/// The symbol-index status collector reads plain meta (never a helper):
+/// stale without a current builder stamp, ready with one, degraded with
+/// warnings — and a repo without entrypoints reads not-applicable instead
+/// of blaming an absent index.
+#[test]
+#[serial]
+fn symbol_index_status_reflects_the_on_disk_meta() {
+    use crate::constants::{
+        SCIP_INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_REFS_COVERAGE_KEY,
+        SCIP_REFS_COVERAGE_LAZY,
+    };
+
+    let (_tmp, repo_path, state) = state_with_repo("syminfo");
+    let db = repo_path.join(DB_DIR_NAME);
+    let registry = state.symbol_registry();
+
+    // No entrypoints at all: both languages are explicitly not-applicable.
+    let statuses = crate::symbols::symbol_index_status(&registry, &repo_path, &db);
+    assert!(
+        statuses.iter().all(|s| s.not_applicable),
+        "a repo without entrypoints must not blame an absent index: {statuses:?}"
+    );
+
+    // Applicable from here on: a solution file.
+    std::fs::write(repo_path.join("test.sln"), b"Solution File").unwrap();
+
+    // Key-format stamp only (no builder stamp): has_index accepts it, the
+    // builder check reads stale — the inherited-index class.
+    seed_scip_meta(&db, &[]);
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "stale", "{csharp:?}");
+
+    // Current builder stamp without a refs_coverage stamp: still stale.
+    seed_scip_meta(
+        &db,
+        &[(SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION)],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "stale", "{csharp:?}");
+
+    // A rebuild by THIS binary (both stamps): ready.
+    seed_scip_meta(
+        &db,
+        &[
+            (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_LAZY),
+        ],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "ready", "{csharp:?}");
+    assert!(!csharp.not_applicable);
+
+    // Survived build failures in meta: degraded — serving but incomplete.
+    seed_scip_meta(
+        &db,
+        &[
+            (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
+            (
+                crate::constants::SCIP_INDEX_WARNINGS_KEY,
+                r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
+            ),
+        ],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "degraded", "{csharp:?}");
+}
+
+/// The overlay's age renderer must turn the unknown-age sentinel into
+/// words — a consumer must never read "18446744073709551615" as an age.
+#[test]
+fn human_age_seconds_renders_the_unknown_sentinel_as_words() {
+    assert_eq!(crate::serve::tui::human_age_seconds(0), "0s");
+    assert_eq!(crate::serve::tui::human_age_seconds(59), "59s");
+    assert_eq!(crate::serve::tui::human_age_seconds(120), "2m");
+    assert_eq!(crate::serve::tui::human_age_seconds(3 * 3600), "3h");
+    assert_eq!(crate::serve::tui::human_age_seconds(72 * 3600), "3d");
+    assert_eq!(
+        crate::serve::tui::human_age_seconds(u64::MAX),
+        "unknown age"
+    );
+}
+
+/// `c` copies the warnings of an Info overlay — and nothing else: other
+/// overlays ignore the key, Esc still dismisses everywhere.
+#[test]
+fn overlay_copy_key_only_fires_on_info_overlays() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let info = crate::serve::tui_common::OverlayState::Info {
+        alias: "demo.app".to_string(),
+        path: String::new(),
+        chunks: 0,
+        files: 0,
+        max_chunk_id: 0,
+        db_size_human: String::new(),
+        model: String::new(),
+        dims: 0,
+        lock: "write".to_string(),
+        index_age: String::new(),
+        symbol_warnings: vec!["w1".to_string()],
+        symbol_index: Vec::new(),
+        copy_feedback: None,
+    };
+    let copy_key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(matches!(
+        crate::serve::tui_common::handle_overlay_key(copy_key, &info),
+        Some(crate::serve::tui_common::OverlayKeyAction::CopyWarnings)
+    ));
+
+    let doctor = crate::serve::tui_common::OverlayState::Doctor {
+        alias: "x".to_string(),
+        results: vec![],
+    };
+    assert!(
+        crate::serve::tui_common::handle_overlay_key(copy_key, &doctor).is_none(),
+        "'c' must not fire outside the Info overlay"
+    );
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(matches!(
+        crate::serve::tui_common::handle_overlay_key(esc, &doctor),
+        Some(crate::serve::tui_common::OverlayKeyAction::Dismiss)
+    ));
+}
+
+/// The clipboard text is the full record: alias header naming the subject,
+/// then every stored warning line verbatim.
+#[test]
+fn symbol_warnings_copy_text_heads_with_alias_and_carries_every_line() {
+    let text = crate::serve::tui_common::symbol_warnings_copy_text(
+        "acme-web",
+        &["summary line".to_string(), "A.csproj: boom".to_string()],
+    );
+    assert!(text.starts_with("acme-web — symbol index warnings (2):"));
+    assert!(text.contains("\nsummary line\nA.csproj: boom"));
+}
+
+/// An empty warnings list must report honestly instead of copying a bare
+/// header — a silent "success" would read as copied content.
+#[test]
+fn apply_copy_warnings_reports_when_nothing_is_recorded() {
+    let mut info = crate::serve::tui_common::OverlayState::Info {
+        alias: "acme-web".to_string(),
+        path: String::new(),
+        chunks: 0,
+        files: 0,
+        max_chunk_id: 0,
+        db_size_human: String::new(),
+        model: String::new(),
+        dims: 0,
+        lock: "write".to_string(),
+        index_age: String::new(),
+        symbol_warnings: vec![],
+        symbol_index: Vec::new(),
+        copy_feedback: None,
+    };
+    crate::serve::tui_common::apply_copy_warnings(&mut info);
+    match info {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("no symbol warnings recorded")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
+/// Both clipboard outcomes surface as the overlay's feedback line: success
+/// confirms the copy, failure names the reason. The clipboard write is
+/// injected so the test pins the feedback contract, not the OS clipboard.
+#[test]
+fn apply_copy_warnings_feedback_covers_success_and_failure() {
+    fn info() -> crate::serve::tui_common::OverlayState {
+        crate::serve::tui_common::OverlayState::Info {
+            alias: "acme-web".to_string(),
+            path: String::new(),
+            chunks: 0,
+            files: 0,
+            max_chunk_id: 0,
+            db_size_human: String::new(),
+            model: String::new(),
+            dims: 0,
+            lock: "write".to_string(),
+            index_age: String::new(),
+            symbol_warnings: vec!["summary".to_string()],
+            symbol_index: Vec::new(),
+            copy_feedback: None,
+        }
+    }
+
+    let mut overlay = info();
+    let seen_text = std::cell::RefCell::new(String::new());
+    crate::serve::tui_common::apply_copy_warnings_with(&mut overlay, |text| {
+        *seen_text.borrow_mut() = text.to_string();
+        Ok(())
+    });
+    match &overlay {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("✓ symbol warnings copied to clipboard")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+    assert_eq!(
+        seen_text.into_inner(),
+        "acme-web — symbol index warnings (1):\nsummary"
+    );
+
+    let mut overlay = info();
+    crate::serve::tui_common::apply_copy_warnings_with(&mut overlay, |_| {
+        Err("powershell: not found".to_string())
+    });
+    match overlay {
+        crate::serve::tui_common::OverlayState::Info { copy_feedback, .. } => {
+            assert_eq!(
+                copy_feedback.as_deref(),
+                Some("copy failed: powershell: not found")
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
+/// Greedy word-wrap row estimate: words that do not fit start a new row, a
+/// word longer than the row hard-splits, every line takes at least one row.
+/// A char-based ceiling would undershoot the URL case (break lands just
+/// before the row end) and clip the modal's last content row.
+#[test]
+fn estimate_wrapped_height_counts_multi_row_lines() {
+    use ratatui::text::Line;
+    let lines = vec![Line::raw("short"), Line::raw("x".repeat(120))];
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&lines, 56),
+        4
+    );
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&lines, 200),
+        2
+    );
+    // Word wrap: "aaa" + "bbb" does not fit side by side in 5 columns.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("aaa bbb")], 5),
+        2
+    );
+    // Hard split: a 60-char URL word across 58 columns takes 2 rows on its
+    // own even though ceil(60/58) would also say 2 — the pinned case is the
+    // prose line that leaves the URL to start a fresh row.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(
+            &[Line::raw(
+                "src index for source https://pkgs/nuget/v3/index.json"
+            )],
+            50
+        ),
+        2
+    );
+    // trim: false keeps the warning line's 4-space indent on the first row,
+    // so an indent-width word that would fit on its own needs two rows.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(
+            &[Line::raw(format!("    {}", "a".repeat(58)))],
+            58
+        ),
+        2
+    );
+    // A mid-line separator run is real columns: "a  b" fits exactly in 4,
+    // wraps in 3.
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("a  b")], 4),
+        1
+    );
+    assert_eq!(
+        crate::serve::tui_common::estimate_wrapped_height(&[Line::raw("a  b")], 3),
+        2
+    );
+}
+
+/// Long warning lines must WRAP inside the modal, not clip at the border:
+/// the tail of the failure text (the feed URL) stays readable, and the
+/// key-hint footer survives on the border's bottom title.
+#[test]
+fn modal_wraps_long_warning_lines_instead_of_clipping() {
+    use ratatui::backend::TestBackend;
+    use ratatui::text::{Line, Span};
+    use ratatui::Terminal;
+
+    let warning = "Sample.Web.csproj: Unable to load the service index for source https://pkgs.example.com/private-feed/nuget/v3/index.json";
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal
+        .draw(|f| {
+            let lines = vec![Line::from(Span::raw(format!("    {warning}")))];
+            crate::serve::tui_common::render_centered_modal_with_footer(
+                f,
+                f.area(),
+                " acme-web — Index Info ",
+                Some(" [Esc] close · [c] copy warnings "),
+                lines,
+                ratatui::style::Color::Cyan,
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let mut rendered = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            rendered.push_str(buffer[(x, y)].symbol());
+        }
+        rendered.push('\n');
+    }
+    // Wrapping splits the text at arbitrary columns and the modal border
+    // characters sit between the wrapped segments, so compare with all
+    // whitespace and box-drawing characters stripped: every character of
+    // the warning must be rendered somewhere in order — with clipping (the
+    // old behaviour) the tail past the modal edge is simply gone.
+    let flat: String = rendered
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '│' | '┌' | '┐' | '└' | '┘' | '─'))
+        .collect();
+    let want: String = warning.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains(&want),
+        "the full warning must wrap inside the modal, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("[c] copy warnings"),
+        "the copy-hint footer must stay visible, got:\n{rendered}"
+    );
 }
 
 /// The serve-mode find_impact self-heal spawn must reach
@@ -3801,19 +4855,50 @@ fn evaluate_rebuilds_an_index_from_an_older_binary() {
     );
 }
 
+/// Meta a rebuild by this binary writes: builder stamp plus coverage stamp.
+const CURRENT_BUILD_META: &[(&str, &str)] = &[
+    (
+        crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+        crate::constants::SCIP_INDEX_BUILDER_VERSION,
+    ),
+    (
+        crate::constants::SCIP_REFS_COVERAGE_KEY,
+        crate::constants::SCIP_REFS_COVERAGE_LAZY,
+    ),
+];
+
+/// An index with this binary's builder stamp but no `refs_coverage` stamp
+/// predates precomputed references and must rebuild once.
+#[test]
+#[serial]
+fn evaluate_rebuilds_an_index_without_a_coverage_stamp() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
+        "nocoverage",
+        &[(
+            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+            crate::constants::SCIP_INDEX_BUILDER_VERSION,
+        )],
+    );
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild(
+            "csharp",
+            "nocoverage",
+            &repo_path,
+            &repo_path.join(DB_DIR_NAME)
+        ),
+        RebuildDecision::ChangedSinceLastBuild,
+        "absent coverage stamp must read as stale"
+    );
+}
+
 /// A degraded index (warnings in meta, current builder version) rebuilds
 /// exactly once per serve process: the second evaluation is Fresh (no loop
 /// while the environment stays broken); a fresh process gets a fresh set.
 #[test]
 #[serial]
 fn evaluate_retries_a_degraded_index_once_per_process() {
-    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
-        "degraded",
-        &[(
-            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
-            crate::constants::INDEX_BUILDER_VERSION,
-        )],
-    );
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture("degraded", CURRENT_BUILD_META);
     let db = repo_path.join(DB_DIR_NAME);
     // Re-seed WITH warnings (the fixture seeded only the version stamp).
     seed_scip_meta(
@@ -3841,13 +4926,7 @@ fn evaluate_retries_a_degraded_index_once_per_process() {
 #[test]
 #[serial]
 fn evaluate_stays_fresh_when_index_is_current_and_clean() {
-    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
-        "cleanidx",
-        &[(
-            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
-            crate::constants::INDEX_BUILDER_VERSION,
-        )],
-    );
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture("cleanidx", CURRENT_BUILD_META);
 
     assert_eq!(
         state.evaluate_symbol_rebuild(
@@ -4177,4 +5256,1322 @@ async fn sweeper_reasserts_cancellation_for_a_removed_live_task() {
             entry.value().handle.abort();
         }
     }
+}
+
+// === Group fan-out chunk-id collision (misattribution) =================
+//
+// Chunk ids are per-repo counters, so every repo in a group holds chunk id 0.
+// The group tools used to resolve a bare id by probing every store and taking
+// the first answer — the alphabetically-first repo won the hit, the true
+// definition was filtered out as "wrong kind", and unrelated content rode the
+// stolen score. These fixtures seed BOTH repos' only chunk at id 0 so any
+// resolution that ignores the origin repo fails deterministically.
+
+/// Seed `<root>/.codesearch.db` with one chunk (id 0) whose content mentions
+/// the search term, then release the writer handle so ServeState can open it.
+async fn seed_collision_repo(
+    root: &std::path::Path,
+    rel_path: &str,
+    kind: crate::chunker::ChunkKind,
+    signature: Option<&str>,
+    content: &str,
+) {
+    let db_path = root.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        let mut chunk =
+            crate::chunker::Chunk::new(content.to_string(), 1, 4, kind, rel_path.to_string());
+        chunk.signature = signature.map(str::to_string);
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![0.25, 0.75],
+        )])
+        .expect("insert chunk");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(0, content, rel_path, signature, &format!("{:?}", kind))
+            .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+}
+
+/// Two-repo uvz-shaped fixture where both repos hold exactly one chunk at the
+/// SAME id 0: `accounting-operations` (alphabetically first — the thief before
+/// the fix) has a prose comment mentioning the symbol, `bankruptcy` holds the
+/// real Java interface definition.
+async fn colliding_group_fixture() -> (tempfile::TempDir, crate::mcp::CodesearchService) {
+    let (tmp, _state, service) = colliding_group_fixture_with_state().await;
+    (tmp, service)
+}
+
+/// Same fixture, keeping the `ServeState` handle so tests can reach the very
+/// `SharedStores` instances routing opens (`get_opened_stores`) and hold
+/// their vector write guards — a fresh `SharedStores::new` would build other
+/// RwLocks and the held guard would gate nothing.
+async fn colliding_group_fixture_with_state() -> (
+    tempfile::TempDir,
+    std::sync::Arc<ServeState>,
+    crate::mcp::CodesearchService,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("accounting-operations");
+    let root_b = tmp.path().join("bankruptcy");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    seed_collision_repo(
+        &root_a,
+        "src/hooks/useBankruptcyFolder.ts",
+        crate::chunker::ChunkKind::Comment,
+        None,
+        "// TODO migrate this hook to BankruptcyFolderService from the bankruptcy service",
+    )
+    .await;
+    seed_collision_repo(
+        &root_b,
+        "src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        crate::chunker::ChunkKind::Interface,
+        Some("public interface BankruptcyFolderService"),
+        "public interface BankruptcyFolderService { BankruptcyFolder folderFor(String inn); }",
+    )
+    .await;
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root_a.clone(), Some("accounting-operations".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(root_b.clone(), Some("bankruptcy".to_string()))
+        .unwrap();
+    config.groups.insert(
+        "uvz".to_string(),
+        vec![
+            "accounting-operations".to_string(),
+            "bankruptcy".to_string(),
+        ],
+    );
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state.clone()).unwrap();
+    (tmp, state, service)
+}
+
+fn tool_text(res: &rmcp::model::CallToolResult) -> String {
+    match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn group_find_definition_attributes_hit_to_origin_repo_on_id_collision() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, service) = colliding_group_fixture().await;
+
+    let request = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .find(Parameters(request))
+        .await
+        .expect("group find must succeed");
+    let text = tool_text(&res);
+
+    // Before the fix this was the empty-result arm ("No definition found"):
+    // both hits resolved in accounting-operations' comment chunk, failed the
+    // DEFINITION_KINDS filter, and the true interface never surfaced.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a bare result array, got: {text}"));
+    assert_eq!(
+        items.len(),
+        1,
+        "exactly the interface definition, got: {text}"
+    );
+    assert_eq!(
+        items[0]["path"],
+        "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        "the hit must carry its origin repo's alias prefix: {text}"
+    );
+    assert_eq!(items[0]["kind"], "Interface", "got: {text}");
+    assert_eq!(
+        items[0]["line"], 1,
+        "responses must emit 1-based editor lines (the interface sits on editor line 1): {text}"
+    );
+}
+
+/// Group-scoped get_chunk must read surrounding lines from the OWNING repo's
+/// root. Stored chunk paths are project-relative, and the old context read
+/// joined them onto the serve process's own project_path after alias
+/// prefixing — a path that never exists — so every group answer came back
+/// with the "source file not readable" note and zero context. Here chunk id 5
+/// lives only in accounting-operations (bankruptcy holds just id 0), so the
+/// smart-candidate detection routes to the unique owner.
+#[tokio::test]
+async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("accounting-operations");
+    let root_b = tmp.path().join("bankruptcy");
+    std::fs::create_dir_all(root_a.join("src/service")).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    // The real source file the context read has to find.
+    std::fs::write(
+        root_a.join("src/service/TargetService.java"),
+        "line one\nline two\nTARGET LINE THREE\nTARGET LINE FOUR\nTARGET LINE FIVE\nline six\nline seven\nline eight\n",
+    )
+    .unwrap();
+
+    // Repo A: five filler chunks (ids 0..=4) then the target at id 5,
+    // spanning editor lines [3, 5] of the file above (chunk lines are
+    // 1-based — the same convention the real chunker emits).
+    let db_a = root_a.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_a).unwrap();
+    std::fs::write(
+        db_a.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_a, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        for i in 0..5u32 {
+            vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+                crate::chunker::Chunk::new(
+                    format!("filler {i}"),
+                    0,
+                    0,
+                    crate::chunker::ChunkKind::Comment,
+                    "src/Filler.java".to_string(),
+                ),
+                vec![0.25, 0.75],
+            )])
+            .expect("insert filler");
+        }
+        let mut target = crate::chunker::Chunk::new(
+            "TARGET LINE THREE\nTARGET LINE FOUR\nTARGET LINE FIVE".to_string(),
+            3,
+            5,
+            crate::chunker::ChunkKind::Function,
+            "src/service/TargetService.java".to_string(),
+        );
+        target.signature = Some("fn target()".to_string());
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            target,
+            vec![0.5, 0.5],
+        )])
+        .expect("insert target");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(
+            5,
+            "target",
+            "src/service/TargetService.java",
+            Some("fn target()"),
+            "Function",
+        )
+        .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+
+    // Repo B holds only id 0, so chunk id 5 is unique to repo A.
+    seed_collision_repo(
+        &root_b,
+        "src/B.java",
+        crate::chunker::ChunkKind::Comment,
+        None,
+        "// b",
+    )
+    .await;
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root_a.clone(), Some("accounting-operations".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(root_b.clone(), Some("bankruptcy".to_string()))
+        .unwrap();
+    config.groups.insert(
+        "uvz".to_string(),
+        vec![
+            "accounting-operations".to_string(),
+            "bankruptcy".to_string(),
+        ],
+    );
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 5,
+        chunk_ref: None,
+        context_lines: Some(2),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("group get_chunk must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+
+    assert_eq!(
+        parsed["path"], "accounting-operations/src/service/TargetService.java",
+        "got: {text}"
+    );
+    assert_eq!(
+        parsed["context_before"], "line one\nline two",
+        "context above must come from the owning repo's real file: {text}"
+    );
+    assert_eq!(
+        parsed["context_after"], "line six\nline seven",
+        "context below must come from the owning repo's real file: {text}"
+    );
+    assert!(
+        parsed.get("note").is_none(),
+        "the context read resolved — no fallback note expected, got: {text}"
+    );
+}
+
+/// End-to-end line-convention tie: a chunk produced by the REAL chunker
+/// (1-based editor lines) must come back through get_chunk with that same
+/// line — no emit boundary may re-convert it. The PR #308 merge paired
+/// develop's 1-based chunker with the PR's +1 emits and every response
+/// reported line N as N+1; the two green-but-contradictory halves (the
+/// chunker's own test vs response fixtures hand-building 0-based chunks)
+/// could not see it. This test ties producer to emitter so they cannot
+/// drift apart again.
+#[tokio::test]
+async fn get_chunk_reports_the_real_chunker_editor_line_unchanged() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("solo");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = "// line one\n// line two\nfn target_fn() {\n    let _ = 1;\n}\n";
+    std::fs::write(root.join("lib.rs"), source).unwrap();
+
+    // Real chunker: whatever editor line it says the fn starts on is the
+    // truth the response must repeat (its 1-based-ness is pinned by the
+    // chunker's own tests).
+    let mut chunker = crate::chunker::SemanticChunker::new(100, 4000, 2);
+    let chunks = chunker
+        .chunk_semantic(
+            crate::file::Language::Rust,
+            std::path::Path::new("lib.rs"),
+            source,
+        )
+        .expect("real chunker must parse the source");
+    let target = chunks
+        .iter()
+        .find(|c| c.content.contains("fn target_fn"))
+        .expect("the fn must be chunked");
+    let true_line = target.start_line;
+    let source_lines: Vec<&str> = source.lines().collect();
+    let expected_before = if true_line >= 2 {
+        Some(source_lines[true_line - 2])
+    } else {
+        None
+    };
+
+    // Store it exactly as the indexer would.
+    let db_path = root.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            target.clone(),
+            vec![0.5, 0.5],
+        )])
+        .expect("insert chunk");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(
+            0,
+            &target.content,
+            &target.path,
+            target.signature.as_deref(),
+            &format!("{:?}", target.kind),
+        )
+        .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root.clone(), Some("solo".to_string()))
+        .unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 0,
+        chunk_ref: None,
+        context_lines: Some(1),
+        project: None,
+        group: None,
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("get_chunk must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert_eq!(
+        parsed["start_line"], true_line,
+        "the emitted line must equal the chunker's 1-based editor line, got: {text}"
+    );
+    if let Some(expected_before) = expected_before {
+        assert_eq!(
+            parsed["context_before"], expected_before,
+            "context_before must be the editor line above the chunk, got: {text}"
+        );
+    }
+}
+
+/// get_chunk warns when the source file on disk is newer than the last
+/// indexing write (file_meta.json's mtime): the indexed lines may not match
+/// disk — pending re-index, or the last pass failed (seen in the field).
+#[tokio::test]
+async fn get_chunk_notes_stale_source_newer_than_last_indexing_write() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("solo");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = "fn stale_fn() {}\n";
+    std::fs::write(root.join("lib.rs"), source).unwrap();
+
+    let mut chunker = crate::chunker::SemanticChunker::new(100, 4000, 2);
+    let chunks = chunker
+        .chunk_semantic(
+            crate::file::Language::Rust,
+            std::path::Path::new("lib.rs"),
+            source,
+        )
+        .expect("real chunker must parse the source");
+    let target = chunks.first().expect("at least one chunk").clone();
+
+    let db_path = root.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            target.clone(),
+            vec![0.5, 0.5],
+        )])
+        .expect("insert chunk");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(
+            0,
+            &target.content,
+            &target.path,
+            target.signature.as_deref(),
+            &format!("{:?}", target.kind),
+        )
+        .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+
+    // file_meta.json = the last indexing write; then edit the source so its
+    // mtime is strictly newer than the index.
+    let mut meta = crate::cache::FileMetaStore::new("minilm-l6-q".to_string(), 2);
+    meta.update_file(&root.join("lib.rs"), "lib.rs", vec![0])
+        .unwrap();
+    meta.save(&db_path).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::write(root.join("lib.rs"), "fn stale_fn() {}\n// edited\n").unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root.clone(), Some("solo".to_string()))
+        .unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 0,
+        chunk_ref: None,
+        context_lines: None,
+        project: None,
+        group: None,
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("get_chunk must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        parsed["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("modified after the last indexing pass")),
+        "a source file newer than file_meta.json must carry the stale note, got: {text}"
+    );
+}
+
+/// The no-download model gate: with an empty model cache, a semantic search
+/// must answer the explicit refusal (naming `codesearch setup`) instead of
+/// turning the query into an unbounded network fetch — the whole-night serve
+/// stall this gate exists to prevent.
+#[tokio::test]
+#[serial]
+async fn semantic_search_refuses_when_the_model_is_not_cached() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("solo");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = root.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    drop(stores);
+
+    // Empty model cache: no model files anywhere under CODESEARCH_HOME.
+    let scratch = tempfile::tempdir().unwrap();
+    let cs_home = scratch.path().join("cs-home");
+    let bare_home = scratch.path().join("bare-home");
+    std::fs::create_dir_all(&cs_home).unwrap();
+    std::fs::create_dir_all(&bare_home).unwrap();
+    let _env = crate::testing::EnvRestore::set(&[
+        (
+            crate::constants::CODESEARCH_HOME_ENV,
+            cs_home.to_str().unwrap(),
+        ),
+        ("HOME", bare_home.to_str().unwrap()),
+        ("USERPROFILE", bare_home.to_str().unwrap()),
+    ]);
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root.clone(), Some("solo".to_string()))
+        .unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let req = crate::mcp::types::SearchRequest {
+        query: "anything".to_string(),
+        mode: Some("semantic".to_string()),
+        compact: None,
+        semantic_mode: None,
+        filter_path: None,
+        min_score: None,
+        regex: None,
+        phrase: None,
+        file_glob: None,
+        language: None,
+        format: None,
+        limit: None,
+        project: Some("solo".to_string()),
+        group: None,
+    };
+    let res = service
+        .search(Parameters(req))
+        .await
+        .expect("search must answer, not error");
+    let text = tool_text(&res);
+    assert!(
+        text.contains("not available locally") && text.contains("codesearch setup"),
+        "semantic search with an empty model cache must answer the no-download \
+         refusal naming the setup hint, got: {text}"
+    );
+}
+
+// ═══ Interactive fan-outs skip busy stores instead of queueing behind the
+// write lock (review cluster B). The priming call opens the group's stores
+// so `get_opened_stores` hands back the SAME SharedStores the handlers
+// resolve; holding its vector write guard then reproduces an active indexing
+// run. A regression to bounded waits wedges each test on the 300 s lock
+// timeout instead of returning the skip-with-warning answer asserted here.
+
+#[tokio::test]
+async fn group_find_skips_a_write_locked_store_instead_of_waiting() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, state, service) = colliding_group_fixture_with_state().await;
+
+    // Prime routing so the group's stores are opened and lockable.
+    let prime = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    service
+        .find(Parameters(prime))
+        .await
+        .expect("priming find must succeed");
+
+    let alpha = state
+        .get_opened_stores("accounting-operations")
+        .expect("priming call must open accounting-operations");
+    let _guard = alpha.vector_store.write().await;
+
+    let request = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .find(Parameters(request))
+        .await
+        .expect("group find must succeed without waiting on the locked store");
+    let text = tool_text(&res);
+
+    // The healthy repo still answers; the busy one is named in `warnings`,
+    // not silently folded into a plausible-looking short result list.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed
+        .as_object()
+        .and_then(|o| o.get("results"))
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("expected a {{results, warnings}} object, got: {text}"));
+    assert_eq!(
+        items.len(),
+        1,
+        "only the bankruptcy definition must be reported, got: {text}"
+    );
+    assert_eq!(
+        items[0]["path"],
+        "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        "got: {text}"
+    );
+    assert!(
+        text.contains("store busy") && text.contains("accounting-operations"),
+        "the skipped repo must be named with a store-busy warning, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn group_get_chunk_skips_a_write_locked_candidate_repo() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, state, service) = colliding_group_fixture_with_state().await;
+
+    // Prime routing so the group's stores are opened and lockable.
+    let prime = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    service
+        .find(Parameters(prime))
+        .await
+        .expect("priming find must succeed");
+
+    let alpha = state
+        .get_opened_stores("accounting-operations")
+        .expect("priming call must open accounting-operations");
+    let _guard = alpha.vector_store.write().await;
+
+    // Both repos hold id 0; with accounting-operations locked, the candidate
+    // scan must skip it (not wait) and auto-route to bankruptcy alone.
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 0,
+        chunk_ref: None,
+        context_lines: None,
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("group get_chunk must succeed without waiting on the locked store");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+
+    assert_eq!(
+        parsed["path"],
+        "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        "the only answering candidate must own the answer, got: {text}"
+    );
+    assert!(
+        text.contains("store busy") && text.contains("accounting-operations"),
+        "the skipped candidate must be named with a store-busy warning, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn group_similar_skips_a_write_locked_store_instead_of_waiting() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, state, service) = colliding_group_fixture_with_state().await;
+
+    // Prime routing so the group's stores are opened and lockable; the
+    // unprimed answer would be an id-0 ambiguity report, which is fine —
+    // only the side effect (stores opened) matters here.
+    let prime = crate::mcp::types::ExploreRequest {
+        kind: Some("similar".to_string()),
+        target: "0".to_string(),
+        limit: Some(5),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    service
+        .explore(Parameters(prime))
+        .await
+        .expect("priming explore must succeed");
+
+    let alpha = state
+        .get_opened_stores("accounting-operations")
+        .expect("priming call must open accounting-operations");
+    let _guard = alpha.vector_store.write().await;
+
+    // Covers BOTH converted fan-out sites of similar_chunks in one call:
+    // the embedding lookup and the neighbour search both try-lock alpha.
+    let req = crate::mcp::types::SimilarChunksRequest {
+        chunk_id: 0,
+        limit: Some(5),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .similar_chunks(Parameters(req))
+        .await
+        .expect("group similar must succeed without waiting on the locked store");
+    let text = tool_text(&res);
+
+    // The embedding resolves against bankruptcy alone (unique holder), and
+    // its neighbour set is just the source chunk itself — filtered out — so
+    // the answer is the empty message PLUS the store-busy warnings naming
+    // the skipped repo.
+    assert!(
+        text.contains("No similar chunks found for chunk_id 0"),
+        "expected the empty-result answer from the sole answering repo, got: {text}"
+    );
+    assert!(
+        text.contains("store busy") && text.contains("accounting-operations"),
+        "the skipped repo must be named with a store-busy warning, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn group_literal_search_attributes_each_hit_to_its_origin_repo() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, service) = colliding_group_fixture().await;
+
+    let request = crate::mcp::types::LiteralSearchRequest {
+        query: "BankruptcyFolderService".to_string(),
+        regex: None,
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .literal_search(Parameters(request))
+        .await
+        .expect("group literal search must succeed");
+    let text = tool_text(&res);
+
+    // Before the fix BOTH hits resolved against accounting-operations' chunk
+    // (first store answering id 0): two identical hook paths, the Java file's
+    // content lost. After the fix each hit resolves in its own repo and every
+    // path carries its origin alias.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a results array, got: {text}"))
+        .clone();
+    assert_eq!(items.len(), 2, "both repos must answer, got: {text}");
+
+    let mut paths: Vec<String> = items
+        .iter()
+        .map(|i| i["path"].as_str().unwrap_or_default().to_string())
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            "accounting-operations/src/hooks/useBankruptcyFolder.ts".to_string(),
+            "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java"
+                .to_string(),
+        ],
+        "each hit must keep its own repo's path and alias prefix: {text}"
+    );
+
+    // Snippet attribution: the prefixed java hit must be the interface content,
+    // not the accounting comment that stole it before the fix.
+    let java = items
+        .iter()
+        .find(|i| i["path"].as_str().unwrap_or("").starts_with("bankruptcy/"))
+        .expect("java hit present");
+    assert!(
+        java["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("public interface BankruptcyFolderService"),
+        "the bankruptcy hit must carry bankruptcy's own content: {text}"
+    );
+}
+
+/// Exact-AND literal search returns silence for multi-word queries whose
+/// relevant chunks hold only MOST of the terms. The relaxed fallback must
+/// surface those partial hits (>=60% significant-term coverage, >=2 terms)
+/// instead of an empty answer, flag `relaxed_fallback` and explain itself
+/// in the note — while single-identifier queries keep their honest refusal.
+#[tokio::test]
+async fn group_literal_search_relaxed_fallback_covers_partial_term_hits() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("partial");
+    std::fs::create_dir_all(&root).unwrap();
+    {
+        let db_path = root.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+        )
+        .unwrap();
+        let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+        {
+            let mut vs = stores.vector_store.write().await;
+            let rich = crate::chunker::Chunk::new(
+                "create package documents quickly".to_string(),
+                1,
+                3,
+                crate::chunker::ChunkKind::Comment,
+                "docs/create.md".to_string(),
+            );
+            let poor = crate::chunker::Chunk::new(
+                "package".to_string(),
+                1,
+                1,
+                crate::chunker::ChunkKind::Comment,
+                "docs/other.md".to_string(),
+            );
+            vs.insert_chunks(vec![
+                crate::embed::EmbeddedChunk::new(rich, vec![0.25, 0.75]),
+                crate::embed::EmbeddedChunk::new(poor, vec![0.5, 0.5]),
+            ])
+            .expect("insert chunks");
+            vs.build_index().expect("build index");
+        }
+        {
+            let mut fts = stores.fts_store.write().await;
+            fts.add_chunk(
+                0,
+                "create package documents quickly",
+                "docs/create.md",
+                None,
+                "Comment",
+            )
+            .expect("fts doc");
+            fts.add_chunk(1, "package", "docs/other.md", None, "Comment")
+                .expect("fts doc");
+            fts.commit().expect("fts commit");
+        }
+        drop(stores);
+    }
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root.clone(), Some("partial".to_string()))
+        .unwrap();
+    config
+        .groups
+        .insert("solo".to_string(), vec!["partial".to_string()]);
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    // Four significant terms; no chunk holds all four, so exact AND is empty.
+    // The rich chunk covers 3/4 (>=60%), the poor one 1/4 (<2 terms).
+    let request = crate::mcp::types::LiteralSearchRequest {
+        query: "create package documents signature".to_string(),
+        regex: None,
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: Some("solo".to_string()),
+    };
+    let res = service
+        .literal_search(Parameters(request))
+        .await
+        .expect("relaxed literal search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("expected a results array, got: {text}"));
+    assert_eq!(
+        items.len(),
+        1,
+        "only the >=60%-coverage chunk survives the relaxed gate: {text}"
+    );
+    assert_eq!(items[0]["path"], "partial/docs/create.md", "got: {text}");
+    assert_eq!(
+        items[0]["start_line"], 1,
+        "responses must emit 1-based editor lines (the chunk starts on editor line 1): {text}"
+    );
+    assert_eq!(
+        parsed["relaxed_fallback"],
+        serde_json::json!(true),
+        "the fallback must be visible to the caller: {text}"
+    );
+    assert!(
+        parsed["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("relaxed"),
+        "the note must explain the mode: {text}"
+    );
+
+    // A single-identifier query never relaxes: the empty exact answer stays
+    // an honest refusal, not a wall of partial matches.
+    let request = crate::mcp::types::LiteralSearchRequest {
+        query: "QzMissingUvzBusinessSymbol99Xy".to_string(),
+        regex: None,
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: Some("solo".to_string()),
+    };
+    let res = service
+        .literal_search(Parameters(request))
+        .await
+        .expect("refusal literal search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        parsed["results"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(true),
+        "an unknown identifier must stay empty: {text}"
+    );
+    assert!(
+        parsed.get("relaxed_fallback").is_none(),
+        "single-term queries must not trigger the fallback: {text}"
+    );
+}
+
+/// `min_score` lets a caller turn the nearest-neighbour firehose into an
+/// honest refusal: hits below the threshold are dropped and the empty
+/// answer explains itself in `note`, instead of presenting irrelevant
+/// neighbours as if they were matches. Lexical mode rides the same
+/// `build_semantic_response` funnel as the embedding-backed modes, so it
+/// exercises the threshold without needing a real embedding model.
+#[tokio::test]
+async fn group_semantic_search_min_score_refuses_instead_of_returning_noise() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, service) = colliding_group_fixture().await;
+
+    let make_request = |min_score: Option<f32>| crate::mcp::types::SearchRequest {
+        query: "BankruptcyFolderService".to_string(),
+        mode: None,
+        compact: None,
+        semantic_mode: Some("lexical".to_string()),
+        filter_path: None,
+        min_score,
+        regex: None,
+        phrase: None,
+        file_glob: None,
+        language: None,
+        format: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+
+    // An unreachable threshold must refuse with an explanation, not return
+    // the (weakly scored) candidates it found.
+    let res = service
+        .search(Parameters(make_request(Some(10_000.0))))
+        .await
+        .expect("min_score search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        parsed["results"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(false),
+        "an unreachable threshold must yield an explicit refusal: {text}"
+    );
+    assert_eq!(
+        parsed["low_confidence"],
+        serde_json::json!(true),
+        "a refusal is a low-confidence outcome: {text}"
+    );
+    assert!(
+        parsed["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("min_score"),
+        "the refusal must name the threshold so the caller can retune it: {text}"
+    );
+
+    // Without the threshold the same query must still answer with hits:
+    // `min_score` adds a refusal path, never a silent filter.
+    let res = service
+        .search(Parameters(make_request(None)))
+        .await
+        .expect("unfiltered search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        !parsed["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the same query without a threshold must return its hits: {text}"
+    );
+}
+
+/// Regression for the pilot's "ghost loss" of freshly registered aliases.
+///
+/// The debounced persist clones its snapshot and writes the file WITHOUT the
+/// config lock, so a registration landing in that window used to exist only
+/// in memory while the stale snapshot hit disk. Every reader-side
+/// `reload_if_changed` (warmup / aliases / info / group resolve) then saw the
+/// fresh mtime, trusted "the file changed", and swapped the stale disk copy
+/// into memory — silently dropping the registration (alias 404s in /info, its
+/// build ending with "repo removed or cancelled mid-index").
+///
+/// Two guards fix it: `persist_config` adopts its own write's mtime so an
+/// internal persist never masquerades as an external edit, and
+/// `run_persist_pass` re-verifies memory against the snapshot and rewrites
+/// until disk converges.
+#[tokio::test]
+async fn own_persist_never_clobbers_a_racing_registration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("alpha-repo");
+    let root_b = tmp.path().join("beta-repo");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root_a.clone(), Some("alpha".to_string()))
+        .unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    // Warm the mtime cache exactly as production does after its first reader
+    // passes (ServeState starts with a None mtime; this reload adopts it).
+    let _ = state.aliases();
+
+    // The debounce worker clones its snapshot...
+    let stale = state.config.read().unwrap().clone();
+
+    // ...and a registration lands + persists while the worker is mid-write.
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.register_with_alias(root_b.clone(), Some("beta".to_string()))
+            .unwrap();
+    }
+    let current = state.config.read().unwrap().clone();
+    state.persist_config(&current).unwrap();
+
+    // The worker's stale snapshot finally hits the file — on disk, beta is gone.
+    state.persist_config(&stale).unwrap();
+    let disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        !disk.repos.contains_key("beta"),
+        "fixture premise: the stale snapshot must have won the disk race"
+    );
+
+    // Before the fix this reader-side reload saw the fresh mtime and clobbered
+    // the in-memory registration with the disk copy.
+    let aliases = state.aliases();
+    assert!(
+        aliases.iter().any(|a| a == "beta"),
+        "the in-memory registration must survive the worker's stale write"
+    );
+    assert!(
+        state.config_snapshot().repos.contains_key("beta"),
+        "beta must still resolve from the live config"
+    );
+
+    // The divergence check converges disk back to memory.
+    state.run_persist_pass().await;
+    let disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        disk.repos.contains_key("beta"),
+        "run_persist_pass must rewrite the racing registration to disk"
+    );
+}
+
+// ── status snapshot ──────────────────────────────────────────────────────
+
+#[test]
+fn status_snapshot_handle_starts_empty_and_roundtrips() {
+    let handle = status_snapshot::StatusSnapshotHandle::new();
+    // Before the first background pass handlers must see None and answer
+    // their "starting" shape — never measure inline.
+    assert!(handle.get().is_none());
+
+    let snap = status_snapshot::StatusSnapshot {
+        repos: Vec::new(),
+        projects: Vec::new(),
+        projects_warnings: Vec::new(),
+        active_sessions: 0,
+        cpu_percent: "0%".to_string(),
+        csharp_helper: false,
+        ts_helper: false,
+        generated_at: std::time::Instant::now(),
+    };
+    handle.store(snap);
+
+    let got = handle.get().expect("snapshot readable after store");
+    assert_eq!(got.cpu_percent, "0%");
+    assert!(got.age_secs() <= 1, "fresh snapshot must have ~0 age");
+}
+
+#[test]
+fn compute_status_snapshot_reports_empty_fleet_without_state() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    assert!(state.latest_status_snapshot().is_none());
+
+    let snap = state.compute_status_snapshot();
+    assert!(snap.repos.is_empty());
+    assert_eq!(snap.active_sessions, 0);
+    assert!(!snap.cpu_percent.is_empty(), "cpu is always a string");
+    assert!(snap.age_secs() <= 1);
+}
+
+#[test]
+#[serial]
+fn status_refresh_interval_env_overrides() {
+    {
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "7")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(7));
+    }
+    {
+        // Unparseable falls back to the default rather than failing.
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "abc")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(2));
+    }
+    {
+        // Zero would busy-loop the measuring task; the default floor applies.
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "0")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(2));
+    }
+    {
+        let _env =
+            crate::testing::EnvRestore::set(&[(crate::constants::STATUS_REFRESH_SECS_ENV, "")]);
+        assert_eq!(status_snapshot::refresh_interval(), Duration::from_secs(2));
+    }
+}
+
+#[tokio::test]
+async fn status_handler_answers_starting_then_snapshot_with_load() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    // Before the first background pass: immediate "starting" answer, no
+    // measurement, null age.
+    let res = status_handler(axum::extract::State(state.clone())).await;
+    assert_eq!(res.0["status"], "starting");
+    assert!(res.0["snapshot_age_secs"].is_null());
+    assert!(res.0["repos"].is_array());
+
+    // After a pass is stored: the full contract callers depend on — legacy
+    // fields preserved, load counters present, age numeric.
+    state.status_snapshot.store(state.compute_status_snapshot());
+    let res = status_handler(axum::extract::State(state)).await;
+    let v = res.0;
+    assert!(
+        v["status"].is_null(),
+        "stored pass must not read 'starting'"
+    );
+    assert_eq!(v["load"]["text_indexing"], 0);
+    assert_eq!(v["load"]["symbol_indexing"], 0);
+    assert_eq!(v["load"]["errored"], 0);
+    assert!(v["load"]["refresh_interval_secs"].is_u64());
+    assert!(v["snapshot_age_secs"].is_u64());
+    assert!(v["version"].is_string());
+    assert!(v["uptime_secs"].is_u64());
+}
+
+#[tokio::test]
+async fn mcp_status_and_projects_answer_starting_pre_first_pass() {
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    // kind=index, no snapshot yet: structured "starting" answer.
+    let res = service
+        .status(rmcp::handler::server::wrapper::Parameters(
+            crate::mcp::types::StatusRequest {
+                kind: Some("index".to_string()),
+                project: None,
+                group: None,
+            },
+        ))
+        .await
+        .expect("status must not error");
+    let text = match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    assert!(
+        text.contains("\"starting\""),
+        "scope-free index status must answer starting pre-first-pass, got: {text}"
+    );
+
+    // kind=projects, no snapshot yet: empty list + explicit warming warning
+    // (the warnings channel terminates — never a silent empty answer).
+    let res = service
+        .status(rmcp::handler::server::wrapper::Parameters(
+            crate::mcp::types::StatusRequest {
+                kind: Some("projects".to_string()),
+                project: None,
+                group: None,
+            },
+        ))
+        .await
+        .expect("projects must not error");
+    let text = match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    assert!(
+        text.contains("warming up"),
+        "projects pre-first-pass must carry the warming warning, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn finish_force_reindex_starts_fsw_and_keeps_guard_contract() {
+    // Seam pin for the shared FORCE tail (HTTP force branch + TUI `n` both
+    // end here). The harness has no SCIP helpers, so the forced symbol
+    // pass is a per-language no-op here — the forced semantics are pinned
+    // by the maybe_rebuild_symbols(force=true) test and by the tail
+    // carrying NO flag a refactor could flip. What this test pins is the
+    // wiring: the tail (re)starts the FSW for the alias and leaves the
+    // reindex guard release to the callers (HTTP/TUI), in that order.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(&project).unwrap();
+    let db_path = project.join(DB_DIR_NAME);
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+
+    let stores = match state
+        .try_open_stores("repo", &db_path, true, false, None)
+        .expect("a fresh repo must open in write mode")
+    {
+        OpenedStores::Write(s) => s,
+        OpenedStores::Readonly(_) => panic!("allow_create=true must open write mode"),
+    };
+    assert!(state.begin_indexing("repo", IndexingOwner::Reindex));
+    // restart_fsw skips aliases that are not registered — register first.
+    state
+        .config
+        .write()
+        .unwrap()
+        .repos
+        .insert("repo".to_string(), project.clone());
+
+    // Production order: the force path builds the index BEFORE the tail,
+    // and the tail's IndexManager init needs a real (empty) index to open.
+    let token = tokio_util::sync::CancellationToken::new();
+    IndexManager::force_reindex_with_stores(&project, &db_path, &stores, None, &token, None)
+        .await
+        .expect("force reindex of an empty repo must succeed");
+
+    super::finish_force_reindex(&state, "repo", &project, &db_path, stores).await;
+
+    assert!(
+        state.fsw_tasks.contains_key("repo"),
+        "the force tail must leave an FSW task registered for the alias"
+    );
+    assert!(
+        state.is_indexing("repo"),
+        "the tail must not release the reindex guard — callers own that"
+    );
+    state.end_indexing("repo", IndexingOwner::Reindex);
 }

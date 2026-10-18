@@ -382,6 +382,146 @@ fn test_file_meta_store() {
     assert!(loaded.is_tracked("test.txt"));
 }
 
+/// A store produced by ANOTHER build (or from before the builder stamp
+/// existed) must wipe its records on load: the chunker's output convention
+/// can change without a single source byte changing, so every content
+/// signal reports "fresh" while the stored chunk lines are wrong-by-
+/// convention. The wipe makes the manager re-chunk everything once; the
+/// reloaded store carries the current stamp so the next run is incremental
+/// again.
+#[test]
+fn builder_version_mismatch_invalidates_the_store() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+
+    let test_file = dir.path().join("test.txt");
+    fs::write(&test_file, "hello world").unwrap();
+
+    let mut store = FileMetaStore::new("test-model".to_string(), 384);
+    store
+        .update_file(&test_file, "test.txt", vec![1, 2, 3])
+        .unwrap();
+    store.save(db_path).unwrap();
+
+    // Simulate a store written by an older build (or a pre-stamp one).
+    let meta_path = db_path.join("file_meta.json");
+    let content = fs::read_to_string(&meta_path).unwrap();
+    let stripped: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let mut obj = stripped.as_object().expect("json object").clone();
+    obj.insert(
+        "builder_version".to_string(),
+        serde_json::Value::String("0.0.0-old".to_string()),
+    );
+    fs::write(&meta_path, serde_json::to_string_pretty(&obj).unwrap()).unwrap();
+
+    let loaded = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
+    assert!(
+        loaded.files.is_empty(),
+        "records from another build must not survive, got {} file(s)",
+        loaded.files.len()
+    );
+    assert_eq!(
+        loaded.builder_version,
+        crate::constants::INDEX_BUILDER_VERSION
+    );
+    // And the wiped store behaves like a fresh one: the file is new again.
+    let (needs_reindex, _) = loaded.check_file(&test_file, "test.txt").unwrap();
+    assert!(needs_reindex);
+}
+
+/// The chunk-cache stamp must be a hand-bumped generation marker, never the
+/// package version: the bump-bot moves the patch version on every merged
+/// PR, and a per-build stamp wiped the whole fleet's chunk caches on every
+/// binary swap (field incident 14–15 Oct 2026 — full fleet re-embeds per
+/// restart, AV lock races killing builds, repos left at 0 chunks).
+#[test]
+fn builder_version_stamp_is_a_generation_marker_not_the_package_version() {
+    let stamp = crate::constants::INDEX_BUILDER_VERSION;
+    assert!(
+        !stamp.contains('+'),
+        "stamp must not carry build metadata: {stamp}"
+    );
+    assert_ne!(stamp, env!("CARGO_PKG_VERSION_FULL"));
+}
+
+/// save() must replace atomically (tmp + rename): the store is written once
+/// per index batch now, so a crash mid-write must never truncate the file.
+/// Temp names are pid+counter-unique (the refresh task and the FSW update
+/// path may save concurrently), so a crashed writer's leftover .tmp is
+/// never consumed by the next save — the invariant is that leftovers are
+/// ignored on load, while the save's own tmp is consumed by its rename.
+#[test]
+fn save_replaces_atomically_and_leaves_no_tmp_behind() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+
+    let test_file = dir.path().join("a.txt");
+    fs::write(&test_file, "hello world").unwrap();
+
+    let mut store = FileMetaStore::new("test-model".to_string(), 384);
+    store.update_file(&test_file, "a.txt", vec![1, 2]).unwrap();
+    store.save(db_path).unwrap();
+
+    // A crashed write left a garbage .tmp behind (another pid's unique
+    // name): the next save must not touch it, the load must ignore it, and
+    // the real content must survive.
+    let leftover = db_path.join(format!(
+        "{}.999999.0.tmp",
+        crate::constants::FILE_META_DB_NAME
+    ));
+    fs::write(&leftover, "{ not json").unwrap();
+    store.save(db_path).unwrap();
+
+    let own_tmp_left = std::fs::read_dir(db_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with(&format!("{}.", crate::constants::FILE_META_DB_NAME))
+                && name.ends_with(".tmp")
+                && name != leftover.file_name().unwrap().to_string_lossy()
+        });
+    assert!(
+        !own_tmp_left,
+        "save must consume its own tmp file via rename"
+    );
+
+    let loaded = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
+    assert_eq!(loaded.files.len(), 1, "second save must fully replace");
+}
+
+/// A pre-stamp store (no builder_version field at all) is treated the same
+/// way: serde's default is an empty string, which never matches the current
+/// version.
+#[test]
+fn pre_stamp_store_invalidates_too() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+
+    let test_file = dir.path().join("test.txt");
+    fs::write(&test_file, "hello world").unwrap();
+
+    let mut store = FileMetaStore::new("test-model".to_string(), 384);
+    store
+        .update_file(&test_file, "test.txt", vec![1, 2, 3])
+        .unwrap();
+    store.save(db_path).unwrap();
+
+    // Strip the field entirely, as an older binary would have written it.
+    let meta_path = db_path.join("file_meta.json");
+    let content = fs::read_to_string(&meta_path).unwrap();
+    let stripped: serde_json::Value = serde_json::from_str(&content).unwrap();
+    let mut obj = stripped.as_object().expect("json object").clone();
+    obj.remove("builder_version");
+    fs::write(&meta_path, serde_json::to_string_pretty(&obj).unwrap()).unwrap();
+
+    let loaded = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
+    assert!(
+        loaded.files.is_empty(),
+        "pre-stamp records must not survive"
+    );
+}
+
 #[test]
 fn test_storage_key_relative_and_portable() {
     let dir = tempdir().unwrap();
@@ -540,4 +680,105 @@ fn test_path_matches_filter_matches_exact_directory_name() {
     let root = normalize_path_str("/repo");
     let filter = normalize_filter_path("src");
     assert!(path_matches_filter("/repo/src/main.rs", &filter, &root));
+}
+
+// =========================================================================
+// Crash-recovery tests — the pilot incident behind the hardening:
+// a serve killed mid-`save` left a torn `file_meta.json` and the next
+// warmup either skipped the repo forever (hard parse error) or fell into
+// the deliberate full-wipe path, re-embedding an entire unchanged repo
+// (payment-identification: 323/323 files). `save` now writes tmp+fsync+
+// rename with one `.bak` generation, and `load_or_create` recovers from
+// that backup instead of failing or silently losing all incremental state.
+// =========================================================================
+
+#[test]
+fn torn_main_file_recovers_from_backup_generation() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+    let f1 = dir.path().join("a.txt");
+    fs::write(&f1, "one").unwrap();
+
+    // Generation 1: only `a.txt` tracked.
+    let mut g1 = FileMetaStore::new("test-model".to_string(), 384);
+    g1.update_file(&f1, "a.txt", vec![1]).unwrap();
+    g1.save(db_path).unwrap();
+
+    // Generation 2 adds a second file; its save moves gen 1 into `.bak`.
+    let f2 = dir.path().join("b.txt");
+    fs::write(&f2, "two").unwrap();
+    let mut g2 = FileMetaStore::new("test-model".to_string(), 384);
+    g2.update_file(&f1, "a.txt", vec![1]).unwrap();
+    g2.update_file(&f2, "b.txt", vec![2, 3]).unwrap();
+    g2.save(db_path).unwrap();
+
+    // Simulate the crash: a truncated write replaces the main file while
+    // the `.bak` generation survives untouched.
+    fs::write(db_path.join(FILE_META_DB_NAME), "{\"files\": {").unwrap();
+
+    let recovered = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
+    assert!(
+        recovered.is_tracked("a.txt"),
+        "gen-1 entry must survive via the .bak generation"
+    );
+    assert!(
+        !recovered.is_tracked("b.txt"),
+        "recovery yields the previous generation, not the torn one"
+    );
+}
+
+#[test]
+fn corrupt_metadata_without_backup_degrades_to_empty_store_instead_of_error() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+    // Torn file with no `.bak` (e.g. written by a pre-hardening binary).
+    fs::write(db_path.join(FILE_META_DB_NAME), "not json at all").unwrap();
+
+    // Previously this was a hard error: warmup skipped the repo on every
+    // start because the corrupt file never self-heals. Now it degrades to
+    // an empty store so the B1 guard can re-index deliberately.
+    let store = FileMetaStore::load_or_create(db_path, "test-model", 384).unwrap();
+    assert!(store.is_empty());
+    assert_eq!(store.model_name, "test-model");
+    assert_eq!(store.dimensions, 384);
+}
+
+#[test]
+fn save_is_atomic_and_keeps_one_backup_generation() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path();
+    let f1 = dir.path().join("a.txt");
+    fs::write(&f1, "one").unwrap();
+
+    let mut g1 = FileMetaStore::new("test-model".to_string(), 384);
+    g1.update_file(&f1, "a.txt", vec![1]).unwrap();
+    g1.save(db_path).unwrap();
+
+    let mut g2 = FileMetaStore::new("test-model".to_string(), 384);
+    g2.update_file(&f1, "a.txt", vec![1, 7]).unwrap();
+    g2.save(db_path).unwrap();
+
+    // No temp litter from the tmp+rename dance.
+    let leftovers: Vec<String> = fs::read_dir(db_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp") || name.ends_with(".new"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
+
+    // Main file holds the fresh generation; `.bak` holds the previous one.
+    assert!(db_path.join(FILE_META_DB_NAME).exists());
+    let bak_content = fs::read_to_string(db_path.join(format!("{FILE_META_DB_NAME}.bak"))).unwrap();
+    let bak_store: FileMetaStore = serde_json::from_str(&bak_content).unwrap();
+    assert_eq!(bak_store.tracked_chunk_ids(), [1].iter().copied().collect());
+    let main_content = fs::read_to_string(db_path.join(FILE_META_DB_NAME)).unwrap();
+    let main_store: FileMetaStore = serde_json::from_str(&main_content).unwrap();
+    assert_eq!(
+        main_store.tracked_chunk_ids(),
+        [1, 7].iter().copied().collect()
+    );
 }

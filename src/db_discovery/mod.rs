@@ -269,7 +269,14 @@ fn find_global_databases() -> Result<Vec<DatabaseInfo>> {
     Ok(databases)
 }
 
-/// Register a repository in the global tracking file
+/// Register a repository in the global tracking file.
+///
+/// No longer called by the `--global` index path: registering a project whose
+/// store lives out-of-tree actively harmed serve — discovery looks for the
+/// store at `<project>/.codesearch.db` and would build an empty local one for
+/// the alias. Kept `pub` for CLI/admin tooling that wants a plain register
+/// with no file side effect (mirrors [`unregister_repository`]).
+#[allow(dead_code)] // CLI/admin tooling, see the doc comment above
 pub fn register_repository(project_path: &Path) -> Result<()> {
     let mut config = ReposConfig::load()?;
     config.register(project_path.to_path_buf());

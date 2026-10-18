@@ -152,6 +152,11 @@ impl Language {
             "toml" => Self::Toml,
             "sql" => Self::Sql,
             "html" | "htm" => Self::Html,
+            // Razor rides the Html variant: no extractor/grammar exists for it,
+            // so it takes the text fallback chunker — markup blocks (directives,
+            // component tags) become searchable without pretending to be C#
+            // (a CSharp mapping would run the WRONG tree-sitter parser on it).
+            "razor" | "cshtml" => Self::Html,
             "css" | "scss" | "sass" | "less" => Self::Css,
             "xml" | "csproj" | "props" | "targets" | "resx" | "config" => Self::Xml,
             "ipynb" => Self::Jupyter,
@@ -336,6 +341,17 @@ mod tests {
     fn test_protobuf_detection() {
         assert_eq!(Language::from_extension("proto"), Language::Protobuf);
         assert_eq!(detect("schema.proto"), Language::Protobuf);
+    }
+
+    #[test]
+    fn test_razor_detection() {
+        // Razor maps to Html: no extractor exists, so the chunker takes the
+        // text fallback (searchable markup blocks) instead of the C# parser.
+        assert_eq!(Language::from_extension("razor"), Language::Html);
+        assert_eq!(Language::from_extension("cshtml"), Language::Html);
+        assert_eq!(detect("Index.cshtml"), Language::Html);
+        assert_eq!(detect("Counter.razor"), Language::Html);
+        assert!(Language::Html.is_indexable());
     }
 
     #[test]

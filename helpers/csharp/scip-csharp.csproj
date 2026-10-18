@@ -7,6 +7,10 @@
     <Nullable>enable</Nullable>
     <AssemblyName>scip-csharp</AssemblyName>
     <RootNamespace>ScipCsharp</RootNamespace>
+    <!-- Kept in sync with Cargo.toml by scripts/bump-version.sh: the
+         version line the helper prints is how a deployed helper proves
+         which build it is (a stale helper is otherwise invisible). -->
+    <Version>1.6.0</Version>
     <!-- Self-contained single-file: RuntimeIdentifier is set per publish invocation -->
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>

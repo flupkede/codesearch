@@ -75,7 +75,7 @@ jobs:
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
           echo "::notice::Bump $CURRENT -> $NEW"
 
-      - name: Bump version in Cargo.toml + Cargo.lock
+      - name: Bump version in Cargo.toml, Cargo.lock + scip-csharp.csproj
         env:
           CURRENT: ${{ steps.ver.outputs.current }}
           NEW: ${{ steps.ver.outputs.new }}
@@ -88,9 +88,15 @@ jobs:
           # dependency versions (unlike `cargo update --workspace`, which would
           # opportunistically bump transitive deps as a side effect).
           sed -i "/^name = \"codesearch\"/,/^version = /{ s/^version = \"$CURRENT\"/version = \"$NEW\"/ }" Cargo.lock
-          # Hard-verify both files now carry the new version before committing.
+          # scip-csharp.csproj — the helper's <Version> feeds its --version line,
+          # the same-build identity the host logs and copy-to-common compares.
+          # Rewrite WHATEVER value is there, never anchor on $CURRENT: once the
+          # files drift apart the substitution silently no-ops forever.
+          sed -i "0,/<Version>[^<]*<\/Version>/s//<Version>$NEW<\/Version>/" helpers/csharp/scip-csharp.csproj
+          # Hard-verify all three files now carry the new version before committing.
           grep -m1 "^version = \"$NEW\"" Cargo.toml >/dev/null
           grep -A1 '^name = "codesearch"$' Cargo.lock | grep -m1 "^version = \"$NEW\"" >/dev/null
+          grep -m1 "<Version>$NEW</Version>" helpers/csharp/scip-csharp.csproj >/dev/null
 
       - name: Commit & push bump
         env:
@@ -100,7 +106,7 @@ jobs:
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock helpers/csharp/scip-csharp.csproj
           # No-op guard (e.g. a re-merge that already left develop at NEW).
           if git diff --cached --quiet; then
             echo "No version change to commit (already at $NEW)."

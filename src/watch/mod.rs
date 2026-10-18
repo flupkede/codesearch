@@ -71,17 +71,21 @@ pub struct FileWatcher {
     receiver: Option<Receiver<DebounceEventResult>>,
     /// Compiled .gitignore matcher for the repo root (None if no .gitignore found).
     gitignore: Option<Gitignore>,
+    /// Whitelist matcher (.codesearchinclude); None = no whitelist active.
+    include_matcher: Option<Gitignore>,
 }
 
 impl FileWatcher {
     /// Create a new file watcher for the given root directory
     pub fn new(root: PathBuf) -> Self {
         let gitignore = Self::build_gitignore(&root);
+        let include_matcher = crate::file::build_include_matcher(&root);
         Self {
             root,
             debouncer: None,
             receiver: None,
             gitignore,
+            include_matcher,
         }
     }
 
@@ -181,6 +185,17 @@ impl FileWatcher {
         }
     }
 
+    /// Whitelist verdict for one path: included when the path itself or an
+    /// ancestor matches an include rule (last match along the component
+    /// chain wins, so a `!` rule inside the include file un-includes).
+    /// Delegates to the shared walker helper so both gates cannot drift.
+    fn is_included(&self, path: &Path) -> bool {
+        let Some(ref inc) = self.include_matcher else {
+            return true; // no include list = everything is included
+        };
+        crate::file::is_included(inc, &self.root, path)
+    }
+
     /// Start watching for file changes
     pub fn start(&mut self, debounce_ms: u64) -> Result<()> {
         let (tx, rx) = channel();
@@ -272,6 +287,14 @@ impl FileWatcher {
             return false;
         }
 
+        // Whitelist gate: with an active include list, a file no include
+        // rule covers is not watchable (never indexed incrementally). Runs
+        // AFTER the ignore machinery — an include can never resurrect an
+        // ignored file.
+        if !self.is_included(path) {
+            return false;
+        }
+
         // Skip hardcoded extensions (e.g. .tmp, .map, .lock)
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
@@ -288,6 +311,21 @@ impl FileWatcher {
                 .any(|&s| lower.ends_with(s))
             {
                 return false;
+            }
+        }
+
+        // C# restore inputs (Directory.Packages.props etc.) are not an
+        // indexable language, but the watcher must still see them: a change
+        // invalidates NuGet restore state for the whole solution and drives
+        // a full C# symbol rebuild (issue #225). Checked before the
+        // 0-byte/language gates — an empty NuGet.config is a meaningful
+        // restore input too.
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if crate::constants::CSHARP_RESTORE_INPUT_FILES
+                .iter()
+                .any(|f| name.eq_ignore_ascii_case(f))
+            {
+                return true;
             }
         }
 
@@ -632,6 +670,34 @@ impl GitHeadWatcher {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    #[serial]
+    fn include_list_gates_the_watcher() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("drop.py"), "print(1)").unwrap();
+        std::fs::write(dir.path().join(".codesearchinclude"), "*.rs\n").unwrap();
+
+        let watcher = watcher_with_isolated_home(dir.path().to_path_buf());
+        assert!(
+            watcher.is_watchable(&dir.path().join("keep.rs")),
+            "whitelisted file must be watchable"
+        );
+        assert!(
+            !watcher.is_watchable(&dir.path().join("drop.py")),
+            "file outside the include list must not be watchable"
+        );
+
+        // Absent include list: everything the ignore rules allow.
+        let dir2 = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir2.path().join("drop.py"), "print(1)").unwrap();
+        let watcher2 = watcher_with_isolated_home(dir2.path().to_path_buf());
+        assert!(
+            watcher2.is_watchable(&dir2.path().join("drop.py")),
+            "no include list = historical behavior"
+        );
+    }
     use super::*;
     use crate::testing::EnvRestore;
     use serial_test::serial;
@@ -674,14 +740,24 @@ mod tests {
         Ok(())
     }
 
-    /// Build a `FileWatcher` with the home directory pointed at an empty
-    /// temporary directory, so the developer's real
-    /// `~/.codesearch/.codesearchignore` cannot leak into the assertions.
+    /// Build a `FileWatcher` with the home directory AND `CODESEARCH_HOME`
+    /// pointed at empty temporary directories, so the developer's real global
+    /// `.codesearchignore` (from either root) cannot leak into the assertions.
     /// CI has no such file, which is why the ambient dependency went unnoticed.
     fn watcher_with_isolated_home(root: PathBuf) -> FileWatcher {
-        let home = tempdir().unwrap();
-        let home = home.path().to_string_lossy().into_owned();
-        let _guard = EnvRestore::set(&[("HOME", &home), ("USERPROFILE", &home)]);
+        let scratch = tempdir().unwrap();
+        let bare_home = scratch.path().join("bare-home");
+        let cs_home = scratch.path().join("cs-home");
+        fs::create_dir_all(&bare_home).unwrap();
+        fs::create_dir_all(&cs_home).unwrap();
+        let _guard = EnvRestore::set(&[
+            (
+                crate::constants::CODESEARCH_HOME_ENV,
+                cs_home.to_str().unwrap(),
+            ),
+            ("HOME", bare_home.to_str().unwrap()),
+            ("USERPROFILE", bare_home.to_str().unwrap()),
+        ]);
         FileWatcher::new(root)
     }
 
@@ -724,6 +800,35 @@ mod tests {
         // SHOULD watch (special files)
         assert!(watcher.is_watchable(Path::new("/tmp/Dockerfile")));
         assert!(watcher.is_watchable(Path::new("/tmp/Makefile")));
+    }
+
+    /// The restore-input admission gate: an EMPTY NuGet.config is a
+    /// meaningful restore input, so the name gate must sit BEFORE the
+    /// 0-byte skip — and .props is not an indexable language, so without the
+    /// gate the file would never reach the full-rebuild flush at all.
+    #[test]
+    #[serial]
+    fn restore_inputs_are_watchable_even_empty_and_lookalikes_are_not() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("NuGet.config"), "").unwrap();
+        fs::write(root.join("Directory.Packages.props.bak"), "x").unwrap();
+
+        let watcher = watcher_with_isolated_home(root.to_path_buf());
+
+        assert!(
+            watcher.is_watchable(&root.join("NuGet.config")),
+            "an empty nuget.config must stay watchable: the restore-input gate precedes the 0-byte skip"
+        );
+        assert!(
+            watcher.is_watchable(&root.join("Directory.Packages.props")),
+            ".props is not indexable — only the restore-input gate admits it"
+        );
+        assert!(
+            !watcher.is_watchable(&root.join("Directory.Packages.props.bak")),
+            ".bak lookalike must not pass the name gate"
+        );
     }
 
     #[test]

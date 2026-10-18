@@ -96,6 +96,13 @@ pub struct FindImpactResult {
     /// never fail the response).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_head_sha: Option<String>,
+    /// Per-language symbol-index status for the searched repo (applicable
+    /// languages only) — lets a consumer judge `references: []` against the
+    /// state of the index that produced it (`absent`/`stale`/
+    /// `restore-pending` mean the empty answer reflects the index, not the
+    /// code) without a second round-trip to repo info. Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub symbol_index: Vec<SymbolIndexStatus>,
 }
 
 /// Serialize `index_age_seconds`, mapping the internal unknown-age sentinel
@@ -110,6 +117,15 @@ where
     } else {
         serializer.serialize_u64(*age)
     }
+}
+
+/// The deserialize half of [`serialize_index_age`]: a JSON null (an
+/// unknown-age index on the wire) lands back in the `u64::MAX` sentinel.
+fn deserialize_index_age<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u64>::deserialize(deserializer)?.unwrap_or(u64::MAX))
 }
 
 /// A `find_impact` query in the form the adapters resolve it.
@@ -256,6 +272,11 @@ pub struct SymbolLookupFailure {
     pub class: SymbolLookupFailureClass,
     /// Actionable hint for the agent.
     pub hint_for_agent: String,
+    /// Index-level context (heal running, partially loaded index): without
+    /// it the failure would advise an action that is already in progress.
+    /// Absent from the wire when empty — the historical failure shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl SymbolLookupFailure {
@@ -268,6 +289,7 @@ impl SymbolLookupFailure {
                              immediately; fall back to `find` with kind=\"usages\" (text-based) \
                              and/or reindex the project to rebuild the symbol index."
                 .to_string(),
+            warnings: Vec::new(),
         }
     }
 
@@ -280,6 +302,7 @@ impl SymbolLookupFailure {
                              first (`codesearch index` / `index reindex`), then retry the \
                              same call."
                 .to_string(),
+            warnings: Vec::new(),
         }
     }
 
@@ -483,6 +506,15 @@ pub trait SymbolIndexer: Send + Sync {
         Vec::new()
     }
 
+    /// True while this index's rebuild is waiting out a still-running NuGet
+    /// restore (C# restore gate, issue #225). Callers attach one
+    /// caller-facing warning to answers served from the previous index;
+    /// the flag lifts when the retry loop ends either way. Default false —
+    /// adapters without a restore gate are never pending.
+    fn restore_pending(&self, _db_path: &Path) -> bool {
+        false
+    }
+
     /// Which codesearch build produced the current symbol index
     /// (`scip_meta[index_builder_version]`). `None` means absent or
     /// unreadable — the C# rebuild gate treats that as stale, so a newly
@@ -490,6 +522,15 @@ pub trait SymbolIndexer: Send + Sync {
     /// instead of serving an index it never produced.
     fn index_builder_version(&self, _db_path: &Path) -> Option<String> {
         None
+    }
+
+    /// Whether the current symbol index was produced by THIS build — the
+    /// same freshness check the rebuild gate applies before serving without
+    /// a rebuild (absent stamp or a stamp from another build ⇒ stale).
+    /// Default `true`: adapters that do not stamp their indexes are never
+    /// stale by builder alone (there is no stamp to compare against).
+    fn index_matches_builder(&self, _db_path: &Path) -> bool {
+        true
     }
 
     /// The git HEAD sha the current symbol index was built for, when
@@ -604,6 +645,81 @@ impl Default for SymbolIndexerRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// One symbol language's index status for a repository — the on-disk truth
+/// the rebuild gates act on, composed from plain meta reads (never a
+/// helper). Info surfaces (REST `/repos/:alias/info`, both TUI Info
+/// overlays) and `find_impact` answers carry it so a consumer can judge an
+/// answer against the state of the index that produced it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolIndexStatus {
+    /// Symbol language this entry describes (e.g. `csharp`).
+    pub language: String,
+    /// `ready` | `degraded` | `stale` | `restore-pending` | `absent` |
+    /// `not-applicable`.
+    pub state: String,
+    /// Seconds since the last rebuild; the unknown-age sentinel
+    /// (`u64::MAX`) serializes as null and a null payload deserializes back
+    /// into the sentinel — the remote TUI consumes REST JSON where an
+    /// unreadable index arrives as null.
+    #[serde(
+        serialize_with = "serialize_index_age",
+        deserialize_with = "deserialize_index_age"
+    )]
+    pub age_seconds: u64,
+    /// The repo lacks this language's entrypoint — no index is expected
+    /// here. `find_impact` filters these out; info surfaces keep them so
+    /// the operator sees why a language is missing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub not_applicable: bool,
+}
+
+/// Compose [`SymbolIndexStatus`] for every registered symbol language, in
+/// registration order. Priority when several states apply:
+/// `restore-pending` (a live gate) > `stale` (a rebuild is imminent) >
+/// `degraded` (serving but incomplete) > `ready`.
+pub fn symbol_index_status(
+    registry: &SymbolIndexerRegistry,
+    project_path: &Path,
+    db_path: &Path,
+) -> Vec<SymbolIndexStatus> {
+    registry
+        .available_languages()
+        .iter()
+        .filter_map(|lang| registry.get(lang))
+        .map(|indexer| {
+            let age = indexer.index_age(db_path);
+            let base = SymbolIndexStatus {
+                language: indexer.language().to_string(),
+                state: String::new(),
+                age_seconds: age,
+                not_applicable: false,
+            };
+            if !indexer.applies_to(project_path) {
+                return SymbolIndexStatus {
+                    state: "not-applicable".to_string(),
+                    not_applicable: true,
+                    ..base
+                };
+            }
+            let state = if !indexer.has_index(db_path) {
+                "absent"
+            } else if indexer.restore_pending(db_path) {
+                "restore-pending"
+            } else if !indexer.index_matches_builder(db_path) {
+                "stale"
+            } else if !indexer.index_warnings(db_path).is_empty() {
+                "degraded"
+            } else {
+                "ready"
+            };
+            SymbolIndexStatus {
+                state: state.to_string(),
+                ..base
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

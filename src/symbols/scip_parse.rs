@@ -33,6 +33,27 @@ struct JsonIndex {
     documents: Vec<JsonDocument>,
     #[allow(dead_code)]
     external_symbols: Vec<JsonSymbolInfo>,
+    #[serde(default)]
+    references: Option<Vec<JsonIndexReference>>,
+}
+
+#[derive(Deserialize)]
+struct JsonIndexReference {
+    symbol: String,
+    file: String,
+    start_line: u32,
+    end_line: u32,
+    kind: String,
+}
+
+/// Output of `scip-csharp index`.
+#[derive(Debug)]
+pub struct ParsedIndex {
+    /// Definition occurrences per canonical symbol.
+    pub definitions: ScipIndex,
+    /// Solution-wide references per canonical symbol; `None` when the helper
+    /// did not compute them.
+    pub references: Option<ScipIndex>,
 }
 
 #[derive(Deserialize)]
@@ -75,8 +96,9 @@ mod roles {
     pub const IMPLEMENTATION: u32 = 256;
 }
 
-/// The only scip-csharp output version this parser understands (index, find-refs, batch-find-refs).
-/// Bump together with the helper whenever any JSON schema changes.
+/// The scip-csharp `find-refs` / `batch-find-refs` output version this parser
+/// understands; `index` versions are [`crate::constants::SCIP_CSHARP_INDEX_VERSIONS`].
+/// Bump together with the helper whenever either JSON schema changes.
 pub const SUPPORTED_INDEX_VERSION: &str = "2.0";
 
 // ── find-refs output format ───────────────────────────────────────
@@ -142,22 +164,36 @@ pub fn parse_find_refs_output(data: &[u8]) -> Result<FindRefsResult> {
     })
 }
 
-/// Parse a JSON byte slice into a symbol -> references map.
+/// Parse `scip-csharp index` JSON into definitions plus optional references.
 ///
-/// The JSON format is produced by `scip-csharp` and mirrors the SCIP schema
-/// with snake_case field names. Line numbers in the JSON are already 1-based.
-pub fn parse_json_index(data: &[u8]) -> Result<ScipIndex> {
+/// The JSON format mirrors the SCIP schema with snake_case field names. Line
+/// numbers in the JSON are already 1-based.
+pub fn parse_json_index(data: &[u8]) -> Result<ParsedIndex> {
     let index: JsonIndex =
         serde_json::from_slice(data).with_context(|| "Failed to parse symbol index JSON")?;
 
-    if index.metadata.version != SUPPORTED_INDEX_VERSION {
+    let accepted = crate::constants::SCIP_CSHARP_INDEX_VERSIONS;
+    if !accepted.contains(&index.metadata.version.as_str()) {
         anyhow::bail!(
-            "Unsupported scip-csharp index version: '{}' (expected '{}'). \
+            "Unsupported scip-csharp index version: '{}' (expected one of {:?}). \
              The scip-csharp helper may need to be rebuilt.",
             index.metadata.version,
-            SUPPORTED_INDEX_VERSION
+            accepted
         );
     }
+
+    let references = index.references.map(|refs| {
+        let mut by_symbol: ScipIndex = HashMap::new();
+        for r in refs.into_iter().filter(|r| !r.symbol.is_empty()) {
+            by_symbol.entry(r.symbol).or_default().push(ScipReference {
+                file: PathBuf::from(r.file),
+                start_line: r.start_line,
+                end_line: r.end_line,
+                kind: r.kind,
+            });
+        }
+        by_symbol
+    });
 
     let mut result: ScipIndex = HashMap::new();
 
@@ -205,7 +241,10 @@ pub fn parse_json_index(data: &[u8]) -> Result<ScipIndex> {
         }
     }
 
-    Ok(result)
+    Ok(ParsedIndex {
+        definitions: result,
+        references,
+    })
 }
 
 /// Convert SCIP symbol_roles bitmask to a human-readable kind string.
@@ -260,7 +299,9 @@ mod tests {
             "external_symbols": []
         }"#;
 
-        let index = parse_json_index(json.as_bytes()).unwrap();
+        let parsed = parse_json_index(json.as_bytes()).unwrap();
+        assert!(parsed.references.is_none(), "2.0 carries no references");
+        let index = parsed.definitions;
         assert_eq!(index.len(), 1);
 
         let refs = &index["csharp App . Program.Main()."];
@@ -288,8 +329,58 @@ mod tests {
             "external_symbols": []
         }"#;
 
-        let index = parse_json_index(json.as_bytes()).unwrap();
+        let index = parse_json_index(json.as_bytes()).unwrap().definitions;
         assert!(index.is_empty());
+    }
+
+    const INDEX_2_1_HEAD: &str = r#"{
+        "metadata": {"version": "2.1", "tool_info": "scip-csharp"},
+        "documents": [{
+            "relative_path": "src/A.cs",
+            "occurrences": [{
+                "range": [1, 0, 1, 5],
+                "symbol": "csharp Ns . A#Run().",
+                "symbol_roles": 1,
+                "kind": "definition"
+            }]
+        }],
+        "external_symbols": []"#;
+
+    fn index_2_1(references: &str) -> String {
+        format!("{INDEX_2_1_HEAD}, \"references\": {references}}}")
+    }
+
+    #[test]
+    fn index_2_1_with_references_groups_them_per_symbol() {
+        let json = index_2_1(
+            r#"[
+            {"symbol": "csharp Ns . A#Run().", "file": "src/B.cs", "start_line": 3, "end_line": 3, "kind": "reference"},
+            {"symbol": "csharp Ns . A#Run().", "file": "src/C.cs", "start_line": 7, "end_line": 8, "kind": "reference"}
+        ]"#,
+        );
+        let parsed = parse_json_index(json.as_bytes()).unwrap();
+        assert_eq!(parsed.definitions.len(), 1);
+        let refs = parsed.references.expect("2.1 list must parse as Some");
+        let run = &refs["csharp Ns . A#Run()."];
+        assert_eq!(run.len(), 2);
+        assert_eq!(run[0].file, PathBuf::from("src/B.cs"));
+        assert_eq!((run[1].start_line, run[1].end_line), (7, 8));
+        assert_eq!(run[1].kind, "reference");
+    }
+
+    #[test]
+    fn index_2_1_with_empty_references_is_some_empty() {
+        let refs = parse_json_index(index_2_1("[]").as_bytes())
+            .unwrap()
+            .references;
+        assert!(refs.is_some_and(|r| r.is_empty()));
+    }
+
+    #[test]
+    fn index_2_1_with_null_references_is_none() {
+        let parsed = parse_json_index(index_2_1("null").as_bytes()).unwrap();
+        assert_eq!(parsed.definitions.len(), 1);
+        assert!(parsed.references.is_none());
     }
 
     #[test]

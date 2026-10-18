@@ -16,10 +16,112 @@ const LOCK_STATUS_HELD_IN_PROCESS: &str = "held-in-process";
 const LOCK_STATUS_LOCKED_EXTERNALLY: &str = "locked-externally";
 const LOCK_STATUS_AVAILABLE: &str = "available";
 
+/// One full projects-measure pass for the background status-snapshot task
+/// — the ONLY place these per-repo probes (metadata reads, try_read stats,
+/// lock detection) run. `list_projects` answers from the stored result and
+/// must never call this on the request path.
+pub(crate) fn compute_projects_snapshot(
+    serve_state: &crate::serve::ServeState,
+) -> (Vec<RepoInfo>, Vec<String>) {
+    let config = serve_state.config_snapshot();
+    let project_groups = config.project_groups();
+    let mut repos_info = Vec::new();
+    let mut list_warnings: Vec<String> = Vec::new();
+
+    for (alias, path) in &config.repos {
+        let db_path = path.join(crate::constants::DB_DIR_NAME);
+
+        let (total_chunks, total_files, model, lock_status, error) = if db_path.exists() {
+            let (model_name, _dims) = read_model_metadata(&db_path);
+
+            // For repos already opened in DashMap, use the live SharedStores for stats
+            // WITHOUT opening a new VectorStore connection.
+            // For unopened repos, just report metadata — do NOT open the DB.
+            let opened = serve_state.get_opened_stores(alias);
+            // Never wait on the store lock: an indexing run holds it for
+            // whole batches, and status must answer immediately.
+            let stats_result = opened
+                .as_ref()
+                .and_then(|stores| stores.vector_store.try_read().ok().map(|vs| vs.stats()));
+            if let Some(stats_result) = stats_result {
+                // `0 chunks` alone reads exactly like "not indexed yet" — the
+                // repo may in fact be full and simply failing to answer (the
+                // read-only-incident shape this branch exists for). Attribute
+                // the failure to THIS repo rather than a top-level channel:
+                // list_projects returns one entry per repo, so per-item is the
+                // shape that actually matches the fan-out.
+                // `repo_stats_from_result` carries only the part of this
+                // decision that varies by Ok/Err — see its doc comment.
+                // `record_stats_or_warn` wraps it so this call site cannot
+                // silently drop the warning half without also breaking the
+                // counts it returns — see its own doc comment.
+                let (total_chunks, total_files, error) =
+                    record_stats_or_warn(stats_result, alias, &mut list_warnings);
+                (
+                    total_chunks,
+                    total_files,
+                    model_name,
+                    serve_state
+                        .repo_lock_status(alias)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    error,
+                )
+            } else {
+                // Not opened, or its store is busy — persisted stats from
+                // metadata.json; do NOT open the DB. Our own holders are
+                // checked before the file-lock probe, which cannot tell
+                // this process apart from another one.
+                let (md_chunks, md_files) = read_metadata_stats(&db_path);
+                let lock_status = if serve_state.is_indexing(alias) {
+                    LOCK_STATUS_INDEXING
+                } else if opened.is_some() {
+                    LOCK_STATUS_BUSY
+                } else if serve_state.is_held_in_process(alias, &db_path) {
+                    LOCK_STATUS_HELD_IN_PROCESS
+                } else if crate::index::is_database_locked(&db_path) {
+                    LOCK_STATUS_LOCKED_EXTERNALLY
+                } else {
+                    LOCK_STATUS_AVAILABLE
+                };
+                (
+                    md_chunks,
+                    md_files,
+                    model_name,
+                    lock_status.to_string(),
+                    None,
+                )
+            }
+        } else {
+            (0, 0, "not indexed".to_string(), "unknown".to_string(), None)
+        };
+
+        repos_info.push(RepoInfo {
+            alias: alias.clone(),
+            project_path: path.display().to_string(),
+            database_path: db_path.display().to_string(),
+            total_chunks,
+            total_files,
+            model,
+            lock_status,
+            groups: project_groups.get(alias).cloned().unwrap_or_default(),
+            error,
+        });
+    }
+
+    (repos_info, list_warnings)
+}
+
 #[tool_router(router = status_router, vis = "pub(crate)")]
 impl CodesearchService {
     /// Unified status tool — dispatches based on `kind`.
     #[tool(
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Unified status/info tool. Set `kind` to choose the action:\n\n- `index` (default): get the status of the local search index (model info, chunk count, readiness)\n- `projects`: list all registered projects/repositories, groups, and their index status"
     )]
     pub(crate) async fn status(
@@ -78,7 +180,32 @@ impl CodesearchService {
                 // Count the virtual "all" group when repos are registered, so the
                 // summary doesn't read "0 group(s)" while `all` is actually available.
                 let group_count = config.groups.len() + if config.repos.is_empty() { 0 } else { 1 };
-                let statuses = serve_state.repo_statuses_lightweight();
+                // From the background snapshot, never an inline measure: under a
+                // rebuild wave the snapshot task is the ONLY thing allowed to
+                // touch the filesystem (the GET /status timeout fix) — and this
+                // tool must always answer too. Pre-first-pass answers "starting".
+                let Some(snap) = serve_state.latest_status_snapshot() else {
+                    let response = IndexStatusResponse {
+                        indexed: repo_count > 0,
+                        status: "starting".to_string(),
+                        status_message:
+                            "serve is computing its first status snapshot; retry in a few seconds"
+                                .to_string(),
+                        total_chunks: 0,
+                        total_files: 0,
+                        model: self.model_type.short_name().to_string(),
+                        dimensions: 0,
+                        max_chunk_id: 0,
+                        db_path: format!("({} repos)", repo_count),
+                        project_path: format!("serve mode — {} repo(s)", repo_count),
+                        error_message: None,
+                        mode: self.mcp_mode(),
+                    };
+                    let json =
+                        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
+                };
+                let statuses = &snap.repos;
                 let open_count = statuses
                     .iter()
                     .filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Open))
@@ -220,8 +347,17 @@ impl CodesearchService {
                 }
             }
 
-            let (status, status_message) =
-                index_status_summary(sv.len(), failed_count, total_chunks, all_built);
+            let any_indexing = self
+                .serve_state
+                .as_ref()
+                .is_some_and(|s| ctx.aliases().iter().any(|a| s.is_indexing(a)));
+            let (status, status_message) = index_status_summary(
+                sv.len(),
+                failed_count,
+                total_chunks,
+                all_built,
+                any_indexing,
+            );
 
             let response = IndexStatusResponse {
                 indexed: all_indexed,
@@ -275,7 +411,13 @@ impl CodesearchService {
 
         // Determine status based on database state. `stats.indexed` (the HNSW
         // graph is built) is load-bearing — see `single_index_status`.
-        let (status, status_message) = single_index_status(stats.total_chunks, stats.indexed);
+        let indexing = self
+            .serve_state
+            .as_ref()
+            .zip(ctx.project_alias.as_deref())
+            .is_some_and(|(s, a)| s.is_indexing(a));
+        let (status, status_message) =
+            single_index_status(stats.total_chunks, stats.indexed, indexing);
 
         let response = IndexStatusResponse {
             indexed: stats.indexed,
@@ -336,90 +478,23 @@ impl CodesearchService {
         // When serve is active, use ServeState as source of truth for lock status
         if let Some(ref serve_state) = self.serve_state {
             let config = serve_state.config_snapshot();
-            let project_groups = config.project_groups();
-            let mut repos_info = Vec::new();
-            let mut list_warnings: Vec<String> = Vec::new();
-
-            for (alias, path) in &config.repos {
-                let db_path = path.join(crate::constants::DB_DIR_NAME);
-
-                let (total_chunks, total_files, model, lock_status, error) = if db_path.exists() {
-                    let (model_name, _dims) = read_model_metadata(&db_path);
-
-                    // For repos already opened in DashMap, use the live SharedStores for stats
-                    // WITHOUT opening a new VectorStore connection.
-                    // For unopened repos, just report metadata — do NOT open the DB.
-                    let opened = serve_state.get_opened_stores(alias);
-                    // Never wait on the store lock: an indexing run holds it for
-                    // whole batches, and status must answer immediately.
-                    let stats_result = opened.as_ref().and_then(|stores| {
-                        stores.vector_store.try_read().ok().map(|vs| vs.stats())
-                    });
-                    if let Some(stats_result) = stats_result {
-                        // `0 chunks` alone reads exactly like "not indexed yet" — the
-                        // repo may in fact be full and simply failing to answer (the
-                        // read-only-incident shape this branch exists for). Attribute
-                        // the failure to THIS repo rather than a top-level channel:
-                        // list_projects returns one entry per repo, so per-item is the
-                        // shape that actually matches the fan-out.
-                        // `repo_stats_from_result` carries only the part of this
-                        // decision that varies by Ok/Err — see its doc comment.
-                        // `record_stats_or_warn` wraps it so this call site cannot
-                        // silently drop the warning half without also breaking the
-                        // counts it returns — see its own doc comment.
-                        let (total_chunks, total_files, error) =
-                            record_stats_or_warn(stats_result, alias, &mut list_warnings);
-                        (
-                            total_chunks,
-                            total_files,
-                            model_name,
-                            serve_state
-                                .repo_lock_status(alias)
-                                .unwrap_or("unknown")
-                                .to_string(),
-                            error,
-                        )
-                    } else {
-                        // Not opened, or its store is busy — persisted stats from
-                        // metadata.json; do NOT open the DB. Our own holders are
-                        // checked before the file-lock probe, which cannot tell
-                        // this process apart from another one.
-                        let (md_chunks, md_files) = read_metadata_stats(&db_path);
-                        let lock_status = if serve_state.is_indexing(alias) {
-                            LOCK_STATUS_INDEXING
-                        } else if opened.is_some() {
-                            LOCK_STATUS_BUSY
-                        } else if serve_state.is_held_in_process(alias, &db_path) {
-                            LOCK_STATUS_HELD_IN_PROCESS
-                        } else if crate::index::is_database_locked(&db_path) {
-                            LOCK_STATUS_LOCKED_EXTERNALLY
-                        } else {
-                            LOCK_STATUS_AVAILABLE
-                        };
-                        (
-                            md_chunks,
-                            md_files,
-                            model_name,
-                            lock_status.to_string(),
-                            None,
-                        )
-                    }
-                } else {
-                    (0, 0, "not indexed".to_string(), "unknown".to_string(), None)
-                };
-
-                repos_info.push(RepoInfo {
-                    alias: alias.clone(),
-                    project_path: path.display().to_string(),
-                    database_path: db_path.display().to_string(),
-                    total_chunks,
-                    total_files,
-                    model,
-                    lock_status,
-                    groups: project_groups.get(alias).cloned().unwrap_or_default(),
-                    error,
-                });
-            }
+            // From the background snapshot, never an inline measure — the same
+            // contract as /status and status(kind=index): under a rebuild wave
+            // the measuring task is the only thing that touches the filesystem,
+            // and the project list must still answer (it was the second timeout
+            // in the 2026-10-16 field case). Pre-first-pass answers an empty
+            // list with an explicit warming warning instead of hanging.
+            let (repos_info, list_warnings) = match serve_state.latest_status_snapshot() {
+                Some(snap) => (snap.projects.clone(), snap.projects_warnings.clone()),
+                None => (
+                    Vec::new(),
+                    vec![
+                        "status snapshot still warming up — the project list is empty for a few \
+                     seconds after serve startup; retry shortly"
+                            .to_string(),
+                    ],
+                ),
+            };
 
             let response = ListProjectsResponse {
                 repos: repos_info,

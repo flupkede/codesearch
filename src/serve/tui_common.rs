@@ -11,7 +11,7 @@
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState, Wrap};
 
 /// Format elapsed time since `started_at` as "Up xxd xxh xxm xxs".
 /// Omits days/hours/minutes when zero.
@@ -52,7 +52,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone)]
 pub struct RepoRow {
     pub alias: String,
-    /// Human-readable status: "open", "warm", "readonly", "idle", "indexing", "error", "no_index"
+    /// Human-readable status: "open", "warm", "readonly", "idle" (wire "idle"/"closed":
+    /// index on disk, repo unloaded — resting, not indexing), "indexing", "error", "no_index"
     pub status: String,
     /// C# index status: "none", "ready", "indexing", "error" (empty also treated as none)
     pub csharp_index: String,
@@ -153,6 +154,14 @@ pub enum OverlayState {
         /// helper survived. Unlike the in-memory C# status these survive a
         /// serve restart — the durable record of a degraded index.
         symbol_warnings: Vec<String>,
+        /// Per-language symbol-index status (ready/degraded/stale/
+        /// restore-pending/absent/not-applicable) — the shared
+        /// [`crate::symbols::symbol_index_status`] collector, so the TUI,
+        /// REST info and find_impact answers cannot disagree.
+        symbol_index: Vec<crate::symbols::SymbolIndexStatus>,
+        /// Transient result of the `c` (copy warnings) key, shown as the
+        /// overlay's last content line until it closes.
+        copy_feedback: Option<String>,
     },
     /// Info modal for a *mounted remote project* (federation peer). Remote
     /// mounts have no local on-disk index, so the chunk/file/db-size/model stats
@@ -245,12 +254,15 @@ pub enum OverlayKeyAction {
     Dismiss,
     /// Confirm the removal action (Enter or 'y' pressed on a ConfirmRemove overlay).
     ConfirmRemove,
+    /// Copy the Info overlay's symbol warnings to the OS clipboard ('c').
+    CopyWarnings,
 }
 
 /// Handle key events when an overlay is active.
 ///
 /// - `Esc` always dismisses.
 /// - `Enter` or `'y'` confirms a `ConfirmRemove` overlay.
+/// - `'c'` copies the symbol warnings of an `Info` overlay.
 /// - All other keys are ignored (returns `None`).
 pub fn handle_overlay_key(key: KeyEvent, overlay: &OverlayState) -> Option<OverlayKeyAction> {
     match key.code {
@@ -262,7 +274,136 @@ pub fn handle_overlay_key(key: KeyEvent, overlay: &OverlayState) -> Option<Overl
                 None
             }
         }
+        KeyCode::Char('c') => {
+            if matches!(overlay, OverlayState::Info { .. }) {
+                Some(OverlayKeyAction::CopyWarnings)
+            } else {
+                None
+            }
+        }
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Copy-to-clipboard (Info overlay's `c` key)
+// ---------------------------------------------------------------------------
+
+/// The text the Info overlay's `c` key puts on the clipboard: a header
+/// naming the repo, then every stored warning line verbatim — the copy is
+/// the escape hatch for lines the terminal cannot fit, so it must carry
+/// everything the index recorded.
+pub fn symbol_warnings_copy_text(alias: &str, warnings: &[String]) -> String {
+    let mut out = format!("{alias} — symbol index warnings ({}):", warnings.len());
+    for warning in warnings {
+        out.push('\n');
+        out.push_str(warning);
+    }
+    out
+}
+
+/// Best-effort OS clipboard write with no new dependency: spawn the
+/// platform helper with the text on stdin. `Err` carries the reason so the
+/// overlay can show it — a silent no-op copy would read as success.
+pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Child, Command, Stdio};
+
+    fn spawn_helper(program: &str, args: &[&str]) -> Result<Child, String> {
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("{program}: {e}"))
+    }
+
+    fn spawn_clipboard_helper() -> Result<Child, String> {
+        #[cfg(windows)]
+        {
+            // clip.exe decodes stdin with the OEM code page and would
+            // mangle the em-dashes/ellipses the warning lines carry;
+            // Set-Clipboard with an explicit UTF-8 stdin does not.
+            spawn_helper(
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; $input | Set-Clipboard",
+                ],
+            )
+        }
+        #[cfg(target_os = "macos")]
+        {
+            spawn_helper("pbcopy", &[])
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            // No single standard clipboard tool on Linux: try the common
+            // three in order and surface which (if any) is missing.
+            let candidates: &[(&str, &[&str])] = &[
+                ("wl-copy", &[]),
+                ("xclip", &["-selection", "clipboard"]),
+                ("xsel", &["--clipboard", "--input"]),
+            ];
+            let mut last_err = String::from("no clipboard tool found (tried wl-copy, xclip, xsel)");
+            for (program, args) in candidates {
+                match spawn_helper(program, args) {
+                    Ok(child) => return Ok(child),
+                    Err(e) => last_err = e,
+                }
+            }
+            Err(last_err)
+        }
+    }
+
+    let mut child = spawn_clipboard_helper()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // The write must not block the TUI's event loop: every helper
+        // above exits right after stdin reaches EOF.
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("write stdin: {e}"))?;
+    }
+    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("clipboard helper exited with {status}"))
+    }
+}
+
+/// Handle `OverlayKeyAction::CopyWarnings`: copy the Info overlay's symbol
+/// warnings to the OS clipboard and record the outcome as the overlay's
+/// feedback line. Shared by both TUI event loops.
+pub fn apply_copy_warnings(overlay: &mut OverlayState) {
+    apply_copy_warnings_with(overlay, copy_text_to_clipboard);
+}
+
+/// The [`apply_copy_warnings`] logic with the clipboard write injected, so
+/// tests can pin both outcome feedback lines without touching the real OS
+/// clipboard (which would be a machine side effect, not an assertion).
+pub(crate) fn apply_copy_warnings_with(
+    overlay: &mut OverlayState,
+    clipboard: impl Fn(&str) -> Result<(), String>,
+) {
+    if let OverlayState::Info {
+        alias,
+        symbol_warnings,
+        copy_feedback,
+        ..
+    } = overlay
+    {
+        *copy_feedback = if symbol_warnings.is_empty() {
+            Some("no symbol warnings recorded".to_string())
+        } else {
+            let text = symbol_warnings_copy_text(alias, symbol_warnings);
+            match clipboard(&text) {
+                Ok(()) => Some("✓ symbol warnings copied to clipboard".to_string()),
+                Err(e) => Some(format!("copy failed: {e}")),
+            }
+        };
     }
 }
 
@@ -818,6 +959,8 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             lock,
             index_age,
             symbol_warnings,
+            symbol_index,
+            copy_feedback,
         } => {
             let title = format!(" {} — Index Info ", alias);
             let lines = vec![
@@ -869,8 +1012,43 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                 ]),
             ];
             let mut lines = lines;
+            // Per-language symbol-index status — the same shared collector
+            // find_impact answers carry. The chunk stats above say nothing
+            // about the SCIP index; this line-up does.
+            if !symbol_index.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Symbol index:",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for status in symbol_index {
+                    let (color, note) = match status.state.as_str() {
+                        "ready" => (Color::Green, ""),
+                        "degraded" => (Color::Red, " (incomplete — see warnings)"),
+                        "stale" => (
+                            Color::Yellow,
+                            " (another build produced it; rebuild queued)",
+                        ),
+                        "restore-pending" => (Color::Yellow, " (waiting out a NuGet restore)"),
+                        _ => (Color::DarkGray, ""),
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "    {}: {} · {}{}",
+                            status.language,
+                            status.state,
+                            super::tui::human_age_seconds(status.age_seconds),
+                            note
+                        ),
+                        Style::default().fg(color),
+                    )));
+                }
+            }
             // Durable record of a degraded symbol index: the build problems
-            // the helper survived. Red, like the table's `C#⚠` indicator.
+            // the helper survived. Red — the table's `C#⚠` indicator is
+            // yellow (degraded-index semantics stay the stronger red here).
             if !symbol_warnings.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
@@ -884,12 +1062,24 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                     )));
                 }
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  [Esc] close",
-                Style::default().fg(Color::DarkGray),
-            )));
-            render_centered_modal(f, area, &title, lines);
+            if let Some(note) = copy_feedback {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("  {note}"),
+                    Style::default().fg(Color::Green),
+                )));
+            }
+            // The footer rides the border's bottom title: wrapped warning
+            // text can outgrow the terminal, and the key hints must stay
+            // visible when the content above is clipped.
+            render_centered_modal_with_footer(
+                f,
+                area,
+                &title,
+                Some(" [Esc] close · [c] copy warnings "),
+                lines,
+                Color::Cyan,
+            );
         }
         OverlayState::RemoteInfo {
             alias,
@@ -1074,7 +1264,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
 
 /// Render a centered modal with a title and content lines.
 /// Uses the default cyan border/title color; delegates to
-/// [`render_centered_modal_with_border_color`].
+/// [`render_centered_modal_with_footer`].
 pub fn render_centered_modal(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -1093,10 +1283,76 @@ pub fn render_centered_modal_with_border_color(
     lines: Vec<Line<'_>>,
     border_color: Color,
 ) {
-    let content_height = lines.len() as u16 + 2; // +2 for border
+    render_centered_modal_with_footer(f, area, title, None, lines, border_color);
+}
+
+/// Wrapped-row count `content` needs at `inner_width`, mirroring ratatui's
+/// greedy word wrapper (`Wrap { trim: false }`): the line's leading indent
+/// and the separators between words occupy real columns on the current row,
+/// words that do not fit start a new row, a word longer than the row
+/// hard-splits, every line takes at least one row. A naive char ceiling
+/// UNDERSHOOTS — a row that breaks early at a word boundary pushes its
+/// remainder onto an extra row, and dropped indent columns do the same.
+pub(crate) fn estimate_wrapped_height(content: &[Line<'_>], inner_width: u16) -> u16 {
+    let w = inner_width.max(1) as usize;
+    let mut total: u16 = 0;
+    for line in content {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let chars: Vec<char> = text.chars().collect();
+        // trim: false preserves the leading indent on the first row.
+        let mut i = chars.iter().take_while(|c| **c == ' ').count();
+        let mut col = i;
+        let mut rows: u16 = 1;
+        while i < chars.len() {
+            let mut sep = 0usize;
+            while i < chars.len() && chars[i] == ' ' {
+                sep += 1;
+                i += 1;
+            }
+            if i >= chars.len() {
+                break;
+            }
+            let start = i;
+            while i < chars.len() && chars[i] != ' ' {
+                i += 1;
+            }
+            let len = i - start;
+            if col == 0 {
+                // The word starts on a fresh row: only hard splits add rows.
+                col = len;
+            } else if col + sep + len <= w {
+                col += sep + len;
+            } else {
+                rows += 1;
+                col = len;
+            }
+            while col > w {
+                rows += 1;
+                col -= w;
+            }
+        }
+        total += rows;
+    }
+    total
+}
+
+/// Render a centered modal with a title, content lines, an optional footer
+/// (drawn as the block's bottom border title so it survives clipping) and a
+/// custom border color. Content wraps instead of clipping at the modal
+/// edge: warning lines routinely carry URLs wider than the terminal.
+pub fn render_centered_modal_with_footer(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    footer: Option<&str>,
+    lines: Vec<Line<'_>>,
+    border_color: Color,
+) {
     let max_line_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(20);
     let title_w = title.len() as u16;
-    let content_width = (max_line_w + 4).max(title_w + 4).max(30);
+    let content_width = (max_line_w + 4).max(title_w + 4).max(30).min(area.width);
+
+    let content_height = estimate_wrapped_height(&lines, content_width.saturating_sub(2)) + 2; // +2 for border
 
     // Center the modal
     let modal_area = Rect {
@@ -1127,10 +1383,16 @@ pub fn render_centered_modal_with_border_color(
                 .add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(Color::Rgb(20, 20, 35)));
+    let block = match footer {
+        Some(footer) => {
+            block.title_bottom(Span::styled(footer, Style::default().fg(Color::DarkGray)))
+        }
+        None => block,
+    };
     let inner = block.inner(modal_area);
     f.render_widget(block, modal_area);
 
-    let content = ratatui::widgets::Paragraph::new(lines);
+    let content = ratatui::widgets::Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(content, inner);
 }
 
@@ -1375,7 +1637,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_cell_renders_idle_and_legacy_closed_as_gray() {
+    fn status_cell_renders_idle_and_legacy_closed_as_idle() {
         let expected = (
             "○ idle       ".to_string(),
             Style::default().fg(Color::Gray),

@@ -1,4 +1,4 @@
-use super::helpers::prefix_path_with_alias;
+use super::helpers::{prefix_path_with_alias, SourcedResult};
 use crate::embed::ModelType;
 use crate::index::SharedStores;
 use crate::vectordb::VectorStore;
@@ -155,12 +155,19 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
 /// investigation chasing an indexing problem that did not exist.
 #[must_use]
 pub(crate) struct MultiReadOutcome<R> {
-    /// Merged, deduplicated, score-sorted results from the stores that worked.
-    pub(crate) results: Vec<R>,
+    /// Merged, deduplicated, score-sorted results from the stores that worked,
+    /// each tagged with its origin repo. Chunk ids are store-local counters, so
+    /// the tag — not the id — is what downstream resolution must key on; see
+    /// [`crate::mcp::SourcedResult`].
+    pub(crate) results: Vec<SourcedResult<R>>,
     /// `(alias, full error chain)` for every store that failed. Empty on a
     /// clean run.
     pub(crate) failures: Vec<(String, String)>,
 }
+
+/// Message for the "rebuild running" override shared by the single- and
+/// multi-store status paths.
+const REBUILD_RUNNING_MESSAGE: &str = "A rebuild (FTS, vector and symbol indexes) is running — results may be incomplete until it completes.";
 
 /// Decide the `status`/`status_message` pair for a multi-store
 /// `status(kind="index"|"projects")` response.
@@ -182,6 +189,7 @@ pub(crate) fn index_status_summary(
     failed_count: usize,
     total_chunks: usize,
     all_indexed: bool,
+    indexing: bool,
 ) -> (String, String) {
     if total_repos > 0 && failed_count >= total_repos {
         (
@@ -208,6 +216,8 @@ pub(crate) fn index_status_summary(
                 "Chunks are indexed across {total_repos} repo(s) but the vector index is not built yet — searches may fail until indexing completes."
             ),
         )
+    } else if indexing {
+        ("building".to_string(), REBUILD_RUNNING_MESSAGE.to_string())
     } else if failed_count > 0 {
         (
             "ready".to_string(),
@@ -267,8 +277,14 @@ pub(crate) fn aggregate_serve_index_status(
 /// fails with "Index not built" — so it must not read as `ready`. During a
 /// rebuild there is a window where chunks are inserted but `build_index()` has
 /// not run yet, which is exactly when an operator asks "is the migration done?".
-pub(crate) fn single_index_status(total_chunks: usize, indexed: bool) -> (String, String) {
-    if total_chunks == 0 {
+pub(crate) fn single_index_status(
+    total_chunks: usize,
+    indexed: bool,
+    indexing: bool,
+) -> (String, String) {
+    if indexing {
+        ("building".to_string(), REBUILD_RUNNING_MESSAGE.to_string())
+    } else if total_chunks == 0 {
         (
             "building".to_string(),
             "Index is being built in the background. Searches may fail until indexing completes. Please check back in a few minutes.".to_string(),
@@ -565,7 +581,11 @@ impl<R> MultiReadOutcome<R> {
     /// Deliberately the only ergonomic way to get at `results`: reaching for
     /// the field directly and dropping `failures` is `unwrap_or_default()`
     /// under a new name, and that is the bug this whole type exists to stop.
-    pub(crate) fn into_results(self, warnings: &mut Vec<String>, what: &str) -> Vec<R> {
+    pub(crate) fn into_results(
+        self,
+        warnings: &mut Vec<String>,
+        what: &str,
+    ) -> Vec<SourcedResult<R>> {
         for (alias, err) in &self.failures {
             push_store_warning(warnings, &store_warning(alias, what, err));
         }
@@ -645,5 +665,21 @@ impl MultiStoreContext {
             );
         }
         crate::cache::normalize_path_str(path)
+    }
+
+    /// Prefix a chunk path with its KNOWN source alias (group fan-out results).
+    ///
+    /// `prefix_result_path` infers the alias by matching the path against every
+    /// repo root — which never matches a project-relative stored path, so group
+    /// results silently shipped unprefixed. A fan-out result already carries
+    /// its origin alias, so no inference is needed here: strip the root when
+    /// the path is absolute, treat it as repo-relative otherwise.
+    pub(crate) fn prefix_sourced_path(&self, alias: &str, path: &str) -> String {
+        let root = self
+            .alias_roots
+            .get(alias)
+            .map(String::as_str)
+            .unwrap_or("");
+        prefix_path_with_alias(path, Some(alias), root)
     }
 }

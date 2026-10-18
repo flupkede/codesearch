@@ -26,7 +26,7 @@ public class ScipModelTests
     {
         var index = new ScipIndex
         {
-            Metadata = new ScipMetadata { Version = "2.0", ToolInfo = "scip-csharp" },
+            Metadata = new ScipMetadata { Version = "2.1", ToolInfo = "scip-csharp" },
             Documents =
             [
                 new ScipDocument
@@ -247,11 +247,13 @@ public class ScipModelTests
         Assert.Contains("dominant CS0518 x2", line);
         Assert.Contains("first:", line);
 
-        // The channel-emittable form carries the [WARN] marker the Rust
-        // capture keys on — a dropped prefix would silently EMPTY the
-        // index-warnings channel instead of flooding it.
+        // The channel-emittable form carries the [INFO] marker BY DESIGN:
+        // compile diagnostics are code-health (the symbol tree of a loaded
+        // project is complete) — the index-warning channel is index-health
+        // only, so the Rust capture must never see [WARN] here.
         var warning = SymbolIndexer.WarningLineFor("Acme.Catalog", errors);
-        Assert.StartsWith("[WARN] Compilation errors in", warning);
+        Assert.StartsWith("[INFO] Compilation errors in", warning);
+        Assert.False(warning.StartsWith("[WARN]", StringComparison.Ordinal));
     }
 
     /// The specimen is capped: a full Roslyn diagnostic string can run
@@ -268,5 +270,50 @@ public class ScipModelTests
 
         Assert.True(line.Length < 300, $"summary must be capped, got {line.Length} chars");
         Assert.Contains("…", line);
+    }
+
+    /// The hard 160-char cut landed mid-identifier (inside the quoted CS0103
+    /// name), producing unusable specimens. The cut must move to the last
+    /// whitespace inside the budget instead.
+    [Fact]
+    public void CompilationErrorSummary_TruncatesAtWhitespaceBoundary()
+    {
+        var filler = string.Join(" ", Enumerable.Range(0, 20).Select(i => $"w{i}"));
+        // 'The name ' starts at index 60; the quoted identifier spans
+        // [70, 270) — the old hard cap at 160 cut inside it.
+        var message = filler + " The name '" + new string('n', 200) + "' does not exist in the current context";
+        var descriptor = new DiagnosticDescriptor(
+            "CS0103", title: message, messageFormat: message,
+            category: "Test", DiagnosticSeverity.Error, isEnabledByDefault: true);
+        var err = Diagnostic.Create(descriptor, Location.None);
+
+        var line = SymbolIndexer.CompilationErrorSummaryLine("Proj", [err]);
+
+        Assert.EndsWith("The name…", line);
+        Assert.DoesNotContain("nnnnnnnnnn…", line);
+        Assert.True(line.Length < 300, $"summary must stay capped, got {line.Length} chars");
+    }
+
+    /// The compile-summary contract: the summaries ALWAYS carry the [INFO]
+    /// marker — the Rust capture (`is_helper_warning_line`) files only
+    /// [WARN]/[Failure] as index warnings, so a compile summary can never
+    /// drive the warning icon, whatever the diagnostics are.
+    [Fact]
+    public void WarningLineFor_CarriesInfoPrefixNeverWarn()
+    {
+        static Diagnostic Err(string id, string message)
+        {
+            var descriptor = new DiagnosticDescriptor(
+                id, title: message, messageFormat: message, category: "Test",
+                DiagnosticSeverity.Error, isEnabledByDefault: true);
+            return Diagnostic.Create(descriptor, Location.None);
+        }
+
+        var errors = new List<Diagnostic> { Err("CS0103", "The name 'count' does not exist") };
+
+        var line = SymbolIndexer.WarningLineFor("Proj", errors);
+
+        Assert.StartsWith("[INFO] ", line);
+        Assert.DoesNotContain("[WARN]", line);
     }
 }

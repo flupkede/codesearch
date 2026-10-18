@@ -1,12 +1,30 @@
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig,
+        PaginatedRequestParams, ResultType, ServerCapabilities, ServerConfig,
     },
     service::RequestContext,
     ErrorData as McpError, RoleClient, RoleServer, ServerHandler,
 };
 use std::sync::{Arc, Mutex};
+
+/// The serve hub strips the SEP-2322 `resultType` discriminator for the
+/// hub↔proxy session (rmcp's client always requests a handshake version, so
+/// that session stays pre-2026-07-28). Re-stamp `"complete"` on forwarded
+/// results; rmcp's dispatch strips it again when the client on the stdio side
+/// is itself pre-2026-07-28, so the legacy wire shape is preserved there.
+fn restamp_complete(mut result: ListToolsResult) -> ListToolsResult {
+    result.result_type = Some(ResultType::COMPLETE);
+    result
+}
+
+/// Same as [`restamp_complete`] for `tools/call` outcomes.
+fn restamp_complete_response(mut response: CallToolResponse) -> CallToolResponse {
+    if let CallToolResponse::Complete(ref mut result) = response {
+        result.result_type = Some(ResultType::COMPLETE);
+    }
+    response
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // MCP Proxy Service  (--mode client / --mode auto with serve detected)
@@ -374,7 +392,7 @@ impl ServerHandler for McpProxyService {
                 Some(p) => match p.list_tools(request.clone()).await {
                     Ok(r) => {
                         self.mark_activity();
-                        return Ok(r);
+                        return Ok(restamp_complete(r));
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -434,7 +452,7 @@ impl ServerHandler for McpProxyService {
                 Some(p) => match p.call_tool(request.clone()).await {
                     Ok(r) => {
                         self.mark_activity();
-                        return Ok(r.into());
+                        return Ok(restamp_complete_response(r.into()));
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -486,6 +504,10 @@ impl ServerHandler for McpProxyService {
 #[cfg(test)]
 #[path = "proxy_idle_tests.rs"]
 mod proxy_idle_tests;
+
+#[cfg(test)]
+#[path = "proxy_stamp_tests.rs"]
+mod proxy_stamp_tests;
 
 /// Unit tests for `await_peer_bounded`'s refusal clamp and the
 /// `note_connect_failure` call site that fires it in production, isolated

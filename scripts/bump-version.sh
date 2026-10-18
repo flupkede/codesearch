@@ -89,6 +89,23 @@ sed -i "0,/^version = \"$CURRENT\"/s//version = \"$NEW_VERSION\"/" "$CARGO_TOML"
 # Keep Cargo.lock in sync
 cargo update --workspace --quiet 2>/dev/null || true
 
+# ── Update scip-csharp csproj ────────────────────────────────────────────────
+# The helper's <Version> feeds its `--version` line — the identity the host
+# logs at startup and copy-to-common compares, so it must move with the crate.
+# Match ANY current value, not $CURRENT: once the two files drift apart (a
+# manual sync landing between auto-bumps does it), a $CURRENT-anchored sed
+# silently no-ops forever and the deploy warns "version mismatch" on every
+# helper. A failed match is loud, never silent.
+CSPROJ="helpers/csharp/scip-csharp.csproj"
+if [[ -f "$CSPROJ" ]]; then
+    echo -e "${CYAN}→ Updating $CSPROJ...${NC}"
+    sed -i "0,/<Version>[^<]*<\/Version>/s//<Version>$NEW_VERSION<\/Version>/" "$CSPROJ"
+    if ! grep -q "<Version>$NEW_VERSION</Version>" "$CSPROJ"; then
+        echo -e "${RED}Error: failed to set $CSPROJ <Version> to $NEW_VERSION${NC}" >&2
+        exit 1
+    fi
+fi
+
 # ── Update AGENTS.md ─────────────────────────────────────────────────────────
 echo -e "${CYAN}→ Updating AGENTS.md...${NC}"
 TODAY=$(date +%Y-%m-%d)

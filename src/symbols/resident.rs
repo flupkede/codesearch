@@ -454,6 +454,20 @@ impl WorkspacePool {
         resident
     }
 
+    /// Kill every resident workspace child — serve shutdown. Statics are
+    /// never dropped at process exit, so neither the [`ServeClient::Drop`]
+    /// kill nor TTL reaping runs there; without this a `scip-csharp serve`
+    /// child keeps waiting on its stdin pipe after the host is gone.
+    pub(crate) fn kill_all(&self) {
+        let victims: Vec<Arc<dyn ClientLike>> = {
+            let mut entries = self.entries.lock().expect("workspace pool poisoned");
+            entries.drain().map(|(_, e)| e.client).collect()
+        };
+        for c in victims {
+            c.kill(); // OS call — outside the pool lock
+        }
+    }
+
     /// Drop the resident workspace for `solution`, if any, so the next
     /// `find_refs` respawns against current on-disk source instead of
     /// answering from a compilation loaded before the latest change. A

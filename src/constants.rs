@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// is honoured within a few seconds even during heavy CPU work.
 pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Grace for blocking tasks after serve returns; anything still running is
+/// abandoned with the process.
+pub const RUNTIME_SHUTDOWN_GRACE_SECS: u64 = 5;
+
 /// Check whether a graceful shutdown has been requested (CTRL-C).
 #[inline]
 pub fn is_shutdown_requested() -> bool {
@@ -40,6 +44,13 @@ pub const CONFIG_DIR_NAME: &str = ".codesearch";
 
 /// Name of the file metadata database
 pub const FILE_META_DB_NAME: &str = "file_meta.json";
+
+/// Name of the persisted default-model choice in `<codesearch_home>/`.
+///
+/// Written by `codesearch setup`, adopted by `codesearch serve` when its own
+/// `--model` flag is absent — so an operator's setup choice survives across
+/// serve launches instead of being silently dropped.
+pub const DEFAULT_MODEL_FILE: &str = "default_model.json";
 
 /// Subdirectory name for embedding models within the global config dir
 const MODELS_SUBDIR: &str = "models";
@@ -137,6 +148,12 @@ pub fn get_global_cache_dir() -> PathBuf {
 /// Name of the global codesearchignore file in ~/.codesearch/
 pub const GLOBAL_CODESEARCHIGNORE_FILE: &str = ".codesearchignore";
 
+/// Name of the per-repo and global whitelist file. When it exists (repo
+/// root or ~/.codesearch/), ONLY files matching its gitignore-style rules
+/// are indexed — ignore rules still win first. Absent = index everything
+/// the ignore rules allow (the historical behavior).
+pub const CODESEARCHINCLUDE_FILE: &str = ".codesearchinclude";
+
 /// Get the path to the global .codesearchignore file
 /// (`<codesearch_home>/.codesearchignore`).
 ///
@@ -150,6 +167,13 @@ pub fn global_codesearchignore_path() -> Option<PathBuf> {
     codesearch_home()
         .ok()
         .map(|root| root.join(GLOBAL_CODESEARCHIGNORE_FILE))
+}
+
+/// The global whitelist file in ~/.codesearch/ (applies to every repo).
+pub fn global_codesearchinclude_path() -> Option<PathBuf> {
+    codesearch_home()
+        .ok()
+        .map(|root| root.join(CODESEARCHINCLUDE_FILE))
 }
 
 /// Name of the global extension→language map file in ~/.codesearch/
@@ -440,6 +464,13 @@ pub const FIND_IMPACT_PATH: &str = "/find-impact";
 /// Override with `CODESEARCH_REPO_IDLE_TIMEOUT_SECS`.
 pub const REPO_IDLE_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
 
+/// Idle MCP session reap bound (rmcp `LocalSessionManager` keep_alive).
+/// A wedged session keeps its socket and its FIFO-serialized worker alive
+/// indefinitely; 30 minutes is far beyond any human pause in local
+/// interactive use, yet guarantees a stuck session eventually goes away
+/// without a serve restart.
+pub const MCP_IDLE_SESSION_SECS: u64 = 30 * 60; // 30 minutes
+
 /// How often the idle-reaper background task checks for repos to evict.
 pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 
@@ -560,6 +591,11 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
 
+/// How often a flow without its own progress callback (the SCIP symbol
+/// rebuild) renews its indexing marker so it never ages out at
+/// `MAX_INDEXING_SECS` mid-run. Must stay well below that threshold.
+pub const INDEXING_MARKER_HEARTBEAT_SECS: u64 = 60;
+
 /// How long an MCP handler may wait for the vector-store read lock before
 /// giving up with a "store busy" error.
 ///
@@ -575,6 +611,21 @@ pub const STORE_LOCK_WAIT_SECS: u64 = 300;
 
 /// Environment variable overriding [`STORE_LOCK_WAIT_SECS`].
 pub const STORE_LOCK_WAIT_SECS_ENV: &str = "CODESEARCH_STORE_LOCK_WAIT_SECS";
+
+/// How long a lazy embedding-model load may take before it is abandoned
+/// with an actionable error.
+///
+/// `EmbeddingService::with_cache_dir` resolves model files through hf-hub,
+/// which on a cold cache means a network download. On networks that
+/// black-hole the model host this fetch never completes — and never errors —
+/// so an unbounded load wedges every caller stuck on the model's init lock
+/// (observed as a whole-night serve stall). The bound turns that into a
+/// fail-fast error pointing at `codesearch setup`; generous enough to let a
+/// legitimate first-time download through.
+pub const MODEL_LOAD_TIMEOUT_SECS: u64 = 600;
+
+/// Environment variable overriding [`MODEL_LOAD_TIMEOUT_SECS`].
+pub const MODEL_LOAD_TIMEOUT_SECS_ENV: &str = "CODESEARCH_MODEL_LOAD_TIMEOUT_SECS";
 
 /// Total number of attempts (initial request + retries) the federation client
 /// makes against a remote peer that answers with a transient HTTP status
@@ -600,6 +651,12 @@ pub const REMOTE_PEER_RETRY_BACKOFF_MS: &[u64] = &[3000, 8000];
 /// Environment variable overriding every federation retry backoff with a
 /// single millisecond value (test hook so retry tests don't sleep for real).
 pub const REMOTE_PEER_RETRY_BACKOFF_ENV: &str = "CODESEARCH_REMOTE_RETRY_BACKOFF_MS";
+
+/// Cadence of the background status-snapshot refresher (seconds). Read
+/// endpoints answer from the stored snapshot, so this only trades staleness
+/// (`snapshot_age_secs`) for probing cost — under load the cadence
+/// stretches on its own; this knob only sets the idle pace.
+pub const STATUS_REFRESH_SECS_ENV: &str = "CODESEARCH_STATUS_REFRESH_SECS";
 
 /// Cooperative join window (seconds) for `await_index_task` and
 /// `await_fsw_shutdown`: how long a background indexing / file-watcher task
@@ -676,6 +733,27 @@ pub const HELPERS_SUBDIR: &str = "helpers";
 /// Debounce time in milliseconds for .cs file changes triggering a symbol rebuild.
 pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 
+/// Environment variable overriding the restore-pending retry interval in
+/// seconds (issue #225). Values ≤ 0 or unparseable fall back to the
+/// built-in interval (a zero interval would hot-spin the helper); tests
+/// use 1 to exercise the retry loop in seconds instead of minutes.
+pub const SCIP_RESTORE_RETRY_INTERVAL_SECS_ENV: &str = "CODESEARCH_RESTORE_RETRY_INTERVAL_SECS";
+
+/// File names whose change invalidates NuGet restore state: the serve file
+/// watcher fires a FULL C# symbol rebuild when any of these changes, not
+/// just the per-project incremental (.cs) rebuild — a central-package-
+/// management bump invalidates every project at once (issue #225). Must
+/// stay in sync with the C# helper's `RestoreInputs` (helpers/csharp/
+/// RestorePolicy.cs), which gates the workspace load on the same names.
+/// Compared case-insensitively by the watcher.
+pub const CSHARP_RESTORE_INPUT_FILES: &[&str] = &[
+    "Directory.Packages.props",
+    "Directory.Build.props",
+    "Directory.Build.targets",
+    "NuGet.config",
+    "global.json",
+];
+
 /// LMDB database name for the SCIP symbols table.
 pub const SCIP_SYMBOLS_DB_NAME: &str = "scip_symbols";
 
@@ -704,21 +782,56 @@ pub const SCIP_KEY_FORMAT_KEY: &str = "key_format";
 /// list out of a partially loaded solution may be missing callers.
 pub const SCIP_INDEX_WARNINGS_KEY: &str = "index_warnings";
 
-/// LMDB metadata key stamping which codesearch build produced the symbol
-/// index (full `CARGO_PKG_VERSION_FULL`, so every rebuilt binary differs).
-/// The C# rebuild gate treats an index whose stamp is absent or differs from
-/// [`INDEX_BUILDER_VERSION`] as stale: after a deploy, serve rebuilds the
-/// indexes itself at startup instead of waiting for a manual command.
+/// LMDB metadata key stamping which index-builder generation produced the
+/// index (chunk file-meta cache and SCIP symbol meta alike).
+/// The rebuild gates treat an index whose stamp is absent or differs from
+/// [`INDEX_BUILDER_VERSION`] as stale: after a conventions change, serve
+/// rebuilds the indexes itself at startup instead of waiting for a manual
+/// command.
 pub const SCIP_INDEX_BUILDER_VERSION_KEY: &str = "index_builder_version";
 
 /// The value written for [`SCIP_INDEX_BUILDER_VERSION_KEY`] by this binary.
-pub const INDEX_BUILDER_VERSION: &str = env!("CARGO_PKG_VERSION_FULL");
+///
+/// A HAND-BUMPED generation marker, deliberately NOT tied to the package
+/// version: the patch version bumps on every merged PR, and a per-build
+/// stamp wiped every repo's chunk cache and symbol indexes at each binary
+/// swap (field incident 14–15 Oct 2026: ten patch bumps in one day meant a
+/// full fleet re-embed per restart, and the long commit windows let the
+/// Windows AV/Search-Indexer lock race kill builds, leaving repos
+/// registered with 0 chunks). Bump this ONLY when the chunker or SCIP
+/// conventions change shape — not for code or dependency changes that do
+/// not alter what gets written.
+pub const INDEX_BUILDER_VERSION: &str = "2026-10.1";
+
+/// Stamp for the SCIP symbol indexes specifically. Split from
+/// [`INDEX_BUILDER_VERSION`] so a SCIP-only convention change (the helper
+/// now emits #line-mapped .razor/.cshtml paths) forces a symbol rebuild
+/// WITHOUT a text re-embed wave: file_meta keeps comparing
+/// [`INDEX_BUILDER_VERSION`].
+pub const SCIP_INDEX_BUILDER_VERSION: &str = "2026-10.2";
 
 /// Current value written for [`SCIP_KEY_FORMAT_KEY`]. Bump whenever the
 /// canonical SCIP symbol key format produced by a language helper changes
 /// shape (B4: C# generic arity / containing-type path / fully qualified
 /// parameter types).
 pub const SCIP_KEY_FORMAT: &str = "2";
+
+/// `metadata.version` values accepted from `scip-csharp index` output; the
+/// later version adds the optional precomputed `references` list.
+pub const SCIP_CSHARP_INDEX_VERSIONS: &[&str] = &["2.0", "2.1"];
+
+/// LMDB metadata key recording how much of `scip_ref_cache` a C# rebuild
+/// precomputed. Absent means the index predates the stamp and is stale.
+pub const SCIP_REFS_COVERAGE_KEY: &str = "refs_coverage";
+
+/// Every symbol has a cache entry, empty when nothing references it.
+pub const SCIP_REFS_COVERAGE_COMPLETE: &str = "complete";
+
+/// Only symbols with at least one reference are cached; a miss resolves lazily.
+pub const SCIP_REFS_COVERAGE_PARTIAL: &str = "partial";
+
+/// Nothing was precomputed; every reference lookup resolves lazily.
+pub const SCIP_REFS_COVERAGE_LAZY: &str = "lazy";
 
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
@@ -880,7 +993,7 @@ pub const SCIP_WORKSPACE_HEAP_CAP_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_HEAP_CA
 /// Resident workspaces idle longer than this are torn down by lazy reaping
 /// (checked on pool access). Restarting a workspace costs one solution load —
 /// acceptable for an idle repo, which is exactly what the TTL measures.
-pub const DEFAULT_SCIP_WORKSPACE_IDLE_SECS: u64 = 600;
+pub const DEFAULT_SCIP_WORKSPACE_IDLE_SECS: u64 = 3600;
 pub const SCIP_WORKSPACE_IDLE_SECS_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_IDLE_SECS";
 
 /// How long (seconds) a budget-overrun `find_impact` lookup stays tracked
@@ -944,6 +1057,11 @@ pub const ALWAYS_SKIP_FILENAME_SUFFIXES: &[&str] = &[
     // Generated GraphQL
     ".generated.ts",
     ".generated.graphql",
+    // Generated C# (Razor gen, WPF/WinForms designers, source generators).
+    // The watch-layer comment historically claimed .designer.cs was skipped;
+    // it never was until now.
+    ".g.cs",
+    ".designer.cs",
     // Snapshot test output
     ".snap",
     // Editor swap / backup
@@ -973,6 +1091,12 @@ pub const ALWAYS_EXCLUDED: &[&str] = &[
     "dist",
     "build",
     "out",
+    // .NET build output — always generated (project.assets.json, generated
+    // sources like *_razor.g.cs). Excluded by NAME so a repo whose
+    // .gitignore misses obj/ still cannot leak generated code into the
+    // index. `bin` is deliberately NOT here: several ecosystems keep real
+    // scripts in a bin/ directory.
+    "obj",
     // Python
     "__pycache__",
     ".pytest_cache",
@@ -1032,6 +1156,9 @@ mod tests {
     }
 
     #[test]
+    // Reads global-path accessors that resolve via CODESEARCH_HOME: must not
+    // overlap the serial tests that set/clear that env var in this binary.
+    #[serial_test::serial]
     fn global_codesearchignore_path_returns_home_codesearch_dir() {
         let path = global_codesearchignore_path();
         assert!(path.is_some(), "Should return Some when home dir exists");
@@ -1138,5 +1265,29 @@ mod tests {
             repos_path,
             "CODESEARCH_REPOS_CONFIG must win over CODESEARCH_HOME"
         );
+    }
+
+    /// Razor markup must ride the text fallback (Html variant), never the
+    /// C# parser, and generated C# must not leak into the index — the
+    /// *_razor.g.cs coverage that once made component refs findable was an
+    /// accident of obj/ not being excluded, not a feature.
+    #[test]
+    fn razor_indexable_and_generated_csharp_excluded() {
+        assert!(ALWAYS_EXCLUDED.contains(&"obj"));
+        assert!(!ALWAYS_EXCLUDED.contains(&"bin"));
+
+        for name in ["Counter.razor.g.cs", "Index.cshtml.g.cs", "Foo.designer.cs"] {
+            let lower = name.to_ascii_lowercase();
+            assert!(
+                ALWAYS_SKIP_FILENAME_SUFFIXES
+                    .iter()
+                    .any(|s| lower.ends_with(s)),
+                "{name} must be skipped as generated"
+            );
+        }
+        // Real source must not match the suffix patterns.
+        assert!(!ALWAYS_SKIP_FILENAME_SUFFIXES
+            .iter()
+            .any(|s| "program.cs".ends_with(s)));
     }
 }

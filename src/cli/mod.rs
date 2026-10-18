@@ -2025,6 +2025,68 @@ async fn run_hook_git_install(path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of [`refresh_codesearch_post_checkout_hook`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HookRefreshOutcome {
+    /// A codesearch-managed block was present and already current.
+    UpToDate,
+    /// An outdated codesearch-managed block was rewritten with this build's
+    /// version (e.g. the `pwd -W` fix or the CODESEARCH_HOME serve_url path).
+    Upgraded,
+    /// No post-checkout hook exists — never installed or removed by hand.
+    NotInstalled,
+    /// A post-checkout hook exists but carries no codesearch-managed block.
+    Foreign,
+    /// The hooks dir could not be resolved or the rewrite failed.
+    Failed(String),
+}
+
+/// Upgrade a codesearch-managed `post-checkout` block written by an OLDER
+/// binary to the current block, without touching anything else.
+///
+/// The pilot kept 515 repos whose hooks were installed once and then left
+/// behind as new binaries fixed the block (`pwd -W`, `$CODESEARCH_HOME`
+/// serve_url lookup) — the only upgrade path was re-running
+/// `codesearch hooks git install` per repo by hand. serve now calls this for
+/// every registered repo at startup so a new binary regenerates its own
+/// blocks automatically.
+///
+/// Deliberately conservative: a repo with NO hook or a foreign hook is left
+/// untouched — automatic installation into user repos is too invasive to do
+/// from a background pass; only OUR region is rewritten, foreign content in
+/// the same file is preserved byte-for-byte.
+pub(crate) fn refresh_codesearch_post_checkout_hook(
+    repo_path: &std::path::Path,
+) -> HookRefreshOutcome {
+    let hooks_dir = match resolve_hooks_dir(repo_path) {
+        Ok(dir) => dir,
+        Err(e) => return HookRefreshOutcome::Failed(format!("{e:#}")),
+    };
+    let hook_path = hooks_dir.join("post-checkout");
+    let Ok(existing) = std::fs::read_to_string(&hook_path) else {
+        return HookRefreshOutcome::NotInstalled;
+    };
+    if !existing.contains(HOOK_BEGIN) || !existing.contains(HOOK_END) {
+        return HookRefreshOutcome::Foreign;
+    }
+    let updated = match replace_hook_block(&existing, &codesearch_hook_block()) {
+        Some(updated) => updated,
+        None => {
+            return HookRefreshOutcome::Failed(
+                "managed markers present but the region could not be located".to_string(),
+            )
+        }
+    };
+    if updated == existing {
+        return HookRefreshOutcome::UpToDate;
+    }
+    if let Err(e) = std::fs::write(&hook_path, &updated) {
+        return HookRefreshOutcome::Failed(format!("{e:#}"));
+    }
+    let _ = make_executable(&hook_path);
+    HookRefreshOutcome::Upgraded
+}
+
 pub mod claude_hooks;
 pub mod doctor;
 pub mod setup;
@@ -2104,6 +2166,80 @@ mod tests {
     #[test]
     fn test_replace_hook_block_returns_none_without_markers() {
         assert!(replace_hook_block("#!/bin/sh\necho hi\n", &codesearch_hook_block()).is_none());
+    }
+
+    // --- startup hook self-heal (serve refreshes blocks written by older binaries)
+
+    /// Fixture: a temp "repo" whose hooks dir resolves without a real git
+    /// binary — `git rev-parse` fails in a bare tempdir, so the manual
+    /// `.git/hooks` fallback kicks in (a plain `.git` directory is enough).
+    fn hook_refresh_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = tmp.path().join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        (tmp, hooks.join("post-checkout"))
+    }
+
+    #[test]
+    fn refresh_upgrades_an_outdated_managed_block_idempotently() {
+        let (tmp, hook_path) = hook_refresh_fixture();
+        let repo = tmp.path();
+        // A hook written by an OLDER binary: our markers, stale body.
+        let stale = format!(
+            "#!/bin/sh\n# foreign header\necho mine\n{}\nREPO_PATH=\"$(pwd)\"\n{}\necho bye\n",
+            HOOK_BEGIN, HOOK_END
+        );
+        std::fs::write(&hook_path, stale).unwrap();
+
+        assert_eq!(
+            refresh_codesearch_post_checkout_hook(repo),
+            HookRefreshOutcome::Upgraded
+        );
+        let updated = std::fs::read_to_string(&hook_path).unwrap();
+        // Foreign lines preserved, fresh body swapped in, stale body gone.
+        assert!(updated.contains("echo mine"));
+        assert!(updated.contains("echo bye"));
+        assert!(updated.contains("pwd -W 2>/dev/null || pwd"));
+        assert!(!updated.contains("REPO_PATH=\"$(pwd)\""));
+
+        // Second pass over the same file must be a no-op.
+        assert_eq!(
+            refresh_codesearch_post_checkout_hook(repo),
+            HookRefreshOutcome::UpToDate
+        );
+    }
+
+    #[test]
+    fn refresh_never_touches_foreign_or_missing_hooks() {
+        let (tmp, hook_path) = hook_refresh_fixture();
+        let repo = tmp.path();
+
+        // No hook at all → nothing to upgrade, nothing created.
+        assert_eq!(
+            refresh_codesearch_post_checkout_hook(repo),
+            HookRefreshOutcome::NotInstalled
+        );
+        assert!(!hook_path.exists(), "refresh must not install hooks");
+
+        // A purely foreign hook → left byte-for-byte alone.
+        let foreign = "#!/bin/sh\necho untouched\n";
+        std::fs::write(&hook_path, foreign).unwrap();
+        assert_eq!(
+            refresh_codesearch_post_checkout_hook(repo),
+            HookRefreshOutcome::Foreign
+        );
+        assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), foreign);
+    }
+
+    #[test]
+    fn refresh_reports_failure_for_a_non_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Neither `git rev-parse` nor the manual `.git` fallback can resolve
+        // a hooks dir here — must degrade to Failed, never panic.
+        assert!(matches!(
+            refresh_codesearch_post_checkout_hook(tmp.path()),
+            HookRefreshOutcome::Failed(_)
+        ));
     }
 
     #[test]
