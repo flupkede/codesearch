@@ -12,7 +12,7 @@
 import assert from "node:assert/strict"
 import http from "node:http"
 import type { AddressInfo } from "node:net"
-import { HealthRunner, stripJsonc } from "../codesearch.ts"
+import { HealthRunner, astGrepToolNames, stripJsonc } from "../codesearch.ts"
 
 type Loose = Record<string, any>
 
@@ -59,6 +59,22 @@ function testStripJsonc(): void {
 
   // CRLF line comments terminate at the newline, not at a literal \r.
   assert.deepEqual(JSON.parse(stripJsonc('{\r\n  // note\r\n  "a": 1\r\n}\r\n')), { a: 1 })
+}
+
+/* ------------------------------------------------------------------ *
+ * astGrepToolNames
+ * ------------------------------------------------------------------ */
+
+function testAstGrepToolNames(): void {
+  assert.deepEqual(astGrepToolNames(undefined), [], "no tool map is silent")
+  assert.deepEqual(astGrepToolNames(null), [], "null tool map is silent")
+  assert.deepEqual(astGrepToolNames("ast_grep_search"), [], "non-object maps are ignored")
+  assert.deepEqual(astGrepToolNames({ grep: {}, glob: {}, read: {} }), [], "non-ast-grep tools are ignored")
+  assert.deepEqual(
+    astGrepToolNames({ read: {}, ast_grep_search: {}, ast_grep_edit: {}, "ast-grep_search": {} }),
+    ["ast_grep_search", "ast_grep_edit", "ast-grep_search"],
+    "ast-grep-shaped names are returned in tool-map order",
+  )
 }
 
 /* ------------------------------------------------------------------ *
@@ -223,6 +239,7 @@ async function testHealthRunner(): Promise<void> {
 
 async function main(): Promise<void> {
   testStripJsonc()
+  testAstGrepToolNames()
   await testHealthRunner()
   console.log("unit: OK")
 }

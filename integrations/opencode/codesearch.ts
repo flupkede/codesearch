@@ -1148,6 +1148,18 @@ function formatSearchHits(result: Loose | undefined, limit: number): string[] {
   return lines
 }
 
+/**
+ * Names of tools in a request's tool map that look like an ast-grep
+ * integration (`ast_grep_search`, `ast-grep_edit`, ...). Every ast-grep
+ * mention in this plugin is gated on this: codesearch users are not expected
+ * to have ast-grep installed, so guidance must never name tools the host does
+ * not expose. Unknown or absent maps stay silent.
+ */
+export function astGrepToolNames(tools: unknown): string[] {
+  if (!isPlainObject(tools)) return []
+  return Object.keys(tools as Loose).filter((name) => /ast[-_]grep/i.test(name))
+}
+
 /* ------------------------------------------------------------------ *
  * Plugin
  * ------------------------------------------------------------------ */
@@ -1331,6 +1343,10 @@ export default {
     const seenMessages = new Set<string>()
     const seenSessions = new Set<string>()
     const nudged = new Set<string>()
+    /** Sessions whose request tool map exposed ast-grep tools, set by the
+     *  context hook and read by block mode so its denial only ever names
+     *  callable tools. An absent entry means "do not mention ast-grep". */
+    const astGrepBySession = new Map<string, string[]>()
 
     function markSeen(set: Set<string>, key: string): boolean {
       if (set.has(key)) return false
@@ -1353,6 +1369,13 @@ export default {
         const scope = resolveScope()
         const system = Array.isArray(event?.system) ? (event.system as SystemPart[]) : undefined
         if (!system) return
+
+        // Tool-map snapshot: this is the only place the assembled tool map is
+        // visible, and every ast-grep mention is gated on it so environments
+        // without an ast-grep integration see unchanged guidance.
+        const astGrep = astGrepToolNames(event?.tools)
+        astGrepBySession.set(sessionID, astGrep)
+        if (astGrepBySession.size > MAX_SEEN) astGrepBySession.clear()
 
         // 1. Opt-in auto-recall: inject index context for the user message.
         if (settings.recall.enabled && scope.project && isLikelyCodeQuestion(userMessage.text)) {
@@ -1381,6 +1404,11 @@ export default {
           }
           if (health.state === "down" && !pruneActive) {
             extra.push(`- The codesearch serve hub is unreachable right now; grep/glob is an acceptable fallback until it recovers.`)
+          }
+          if (astGrep.length > 0) {
+            extra.push(
+              `- For syntax-shaped queries and multi-file mechanical rewrites, prefer the ast-grep tools (${astGrep.join(" / ")}); codesearch and grep match text, not structure.`,
+            )
           }
           if (freshUnindexedWarning(scope)) {
             extra.push(`- The registered index for "${scope.project}" is empty or was built with an unknown model; searches will miss until \`codesearch index\` refreshes it.`)
@@ -1447,17 +1475,23 @@ export default {
 
     /* ---------------- tool hooks (guards, rescue, nudge) ---------------- */
 
-    function blockMessage(tool: string, scope: ScopeInfo): string {
-      return (
-        `codesearch: ${tool} is disabled here — this repository is indexed as project "${scope.project}".\n` +
-        `Use the codesearch MCP tools instead:\n` +
-        `  - search { project: "${scope.project}", query: "<concept>" }   (add mode: "literal", regex: true for exact syntax)\n` +
-        `  - find { project: "${scope.project}", symbol: "<name>", kind: "definition" | "usages" | "imports" | "dependents" }\n` +
-        `  - find_impact { project: "${scope.project}", symbol_name: "<name>" }  (C#/TypeScript call sites)\n` +
-        `  - explore { project: "${scope.project}", target: "<file>", kind: "outline" }\n` +
-        `  - get_chunk { project: "${scope.project}", chunk_id: <id> }\n` +
-        `If codesearch is genuinely unavailable, set "guards": { "mode": "off" } in ~/.config/opencode/codesearch.json (or CODESEARCH_PLUGIN_GUARDS=off) and retry.`
+    function blockMessage(tool: string, scope: ScopeInfo, astGrep: string[] = []): string {
+      const lines = [
+        `codesearch: ${tool} is disabled here — this repository is indexed as project "${scope.project}".`,
+        `Use the codesearch MCP tools instead:`,
+        `  - search { project: "${scope.project}", query: "<concept>" }   (add mode: "literal", regex: true for exact syntax)`,
+        `  - find { project: "${scope.project}", symbol: "<name>", kind: "definition" | "usages" | "imports" | "dependents" }`,
+        `  - find_impact { project: "${scope.project}", symbol_name: "<name>" }  (C#/TypeScript call sites)`,
+        `  - explore { project: "${scope.project}", target: "<file>", kind: "outline" }`,
+        `  - get_chunk { project: "${scope.project}", chunk_id: <id> }`,
+      ]
+      if (astGrep.length > 0) {
+        lines.push(`  - ${astGrep.join(" / ")} for syntax-shaped queries and multi-file rewrites (structure, not text)`)
+      }
+      lines.push(
+        `If codesearch is genuinely unavailable, set "guards": { "mode": "off" } in ~/.config/opencode/codesearch.json (or CODESEARCH_PLUGIN_GUARDS=off) and retry.`,
       )
+      return lines.join("\n")
     }
 
     async function onToolBefore(event: Loose): Promise<void> {
@@ -1469,7 +1503,8 @@ export default {
         const alias = coveredAlias()
         if (!alias) return
         if (health.state !== "ok") return // fail open unless the hub is confirmed up
-        blocked = new Error(blockMessage(tool, resolveScope()))
+        const astGrep = astGrepBySession.get(String(event?.sessionID ?? "")) ?? []
+        blocked = new Error(blockMessage(tool, resolveScope(), astGrep))
       } catch (err) {
         if (settings.debug) warn(`execute.before error: ${err instanceof Error ? err.message : err}`)
       }
