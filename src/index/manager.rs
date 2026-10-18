@@ -2709,7 +2709,7 @@ impl IndexManager {
             // commit used to leave the failed attempt's vector chunks
             // untracked (never in file_meta) while the tracked generation's
             // ids were already deleted from the vector store — search (FTS)
-            // and get_chunk (vector) then disagreed (the HUSQ stale-index
+            // and get_chunk (vector) then disagreed (the field-reported stale-index
             // symptom). Delete untracked vector ids; queue tracked files
             // whose ids are missing from the vector store for Phase 4.
             {
@@ -3132,7 +3132,7 @@ impl IndexManager {
         // vector insert above must be rolled back: the failed attempt's ids
         // would otherwise never reach file_meta, so no later pass could find
         // and clean them — orphaned vector chunks next to lingering old FTS
-        // chunks = mixed generations (the HUSQ stale-index symptom).
+        // chunks = mixed generations (the field-reported stale-index symptom).
         // file_meta is deliberately left untouched: it still names the old
         // generation, so the next pass (redrive or refresh) heals cleanly.
         if let Err(e) = Self::publish_file_chunks(
@@ -4720,7 +4720,7 @@ mod tests {
         // The tracked file was queued for re-index; without a real embedding
         // model the re-index attempt fails gracefully (warn + continue), so
         // the meta ids stay missing — the assertion pins the graceful path,
-        // the real heal is covered by the HUSQ remediation reindex.
+        // the real heal is covered by the remediation reindex after deploy.
         assert!(
             !lib_ids.contains(&ids[0]),
             "no embedding model in tests: the re-index attempt must fail gracefully, got: {lib_ids:?}"

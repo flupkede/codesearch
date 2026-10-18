@@ -5670,7 +5670,7 @@ async fn get_chunk_reports_the_real_chunker_editor_line_unchanged() {
 
 /// get_chunk warns when the source file on disk is newer than the last
 /// indexing write (file_meta.json's mtime): the indexed lines may not match
-/// disk — pending re-index, or the last pass failed (the HUSQ symptom).
+/// disk — pending re-index, or the last pass failed (seen in the field).
 #[tokio::test]
 async fn get_chunk_notes_stale_source_newer_than_last_indexing_write() {
     use rmcp::handler::server::wrapper::Parameters;
