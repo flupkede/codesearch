@@ -241,14 +241,14 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
-- **v1.5.33 (pending)** — status CPU = whole serve process tree (incl. scip/dotnet children) instead of the serve process alone
-- **v1.5.33 (pending)** — Razor refs mapped to source: helper emits `GetMappedLineSpan()` paths/lines (#line → .razor/.cshtml), SCIP stamp split (`SCIP_INDEX_BUILDER_VERSION`) so symbol rebuilds skip the text re-embed wave
-- **v1.5.33 (pending)** — FTS commit-failure hardening: per-file transient redrive, crash-safe vector rollback, mixed-generation sweep in refresh, stale note on get_chunk
-- **v1.5.33 (pending)** — `.codesearchinclude` whitelist: when present (repo root or `~/.codesearch/`), only matching files are indexed; ignore rules still win, absent list = historical behavior
-- **v1.5.33 (pending)** — MCP tools declare `readOnlyHint` annotations: Claude Code plan mode auto-allows all six tools instead of prompting every call
-- **v1.5.33 (pending)** — force reindex (`n`, `index -f`) rebuilds the SCIP symbol indexes too — shared `finish_force_reindex` tail for HTTP + TUI; `?symbols=true` stays symbol-only, plain reindex stays gate-driven
-- **v1.5.33 (pending)** — Razor searchable: `.razor`/`.cshtml` via text chunking (Html variant); `obj/`, `.g.cs`, `.designer.cs` excluded as generated
-- **v1.5.33 (pending)** — /status + MCP status answer from a background snapshot (never measure inline): always responsive under rebuild waves, with `snapshot_age_secs` + a `load` summary for calling agents (`CODESEARCH_STATUS_REFRESH_SECS`, default 2s)
+- **v1.6.0** — status CPU = whole serve process tree (incl. scip/dotnet children) instead of the serve process alone
+- **v1.6.0** — Razor refs mapped to source: helper emits `GetMappedLineSpan()` paths/lines (#line → .razor/.cshtml), SCIP stamp split (`SCIP_INDEX_BUILDER_VERSION`) so symbol rebuilds skip the text re-embed wave
+- **v1.6.0** — FTS commit-failure hardening: per-file transient redrive, crash-safe vector rollback, mixed-generation sweep in refresh, stale note on get_chunk
+- **v1.6.0** — `.codesearchinclude` whitelist: when present (repo root or `~/.codesearch/`), only matching files are indexed; ignore rules still win, absent list = historical behavior
+- **v1.6.0** — MCP tools declare `readOnlyHint` annotations: Claude Code plan mode auto-allows all six tools instead of prompting every call
+- **v1.6.0** — force reindex (`n`, `index -f`) rebuilds the SCIP symbol indexes too — shared `finish_force_reindex` tail for HTTP + TUI; `?symbols=true` stays symbol-only, plain reindex stays gate-driven
+- **v1.6.0** — Razor searchable: `.razor`/`.cshtml` via text chunking (Html variant); `obj/`, `.g.cs`, `.designer.cs` excluded as generated
+- **v1.6.0** — /status + MCP status answer from a background snapshot (never measure inline): always responsive under rebuild waves, with `snapshot_age_secs` + a `load` summary for calling agents (`CODESEARCH_STATUS_REFRESH_SECS`, default 2s)
 - **v1.5.31 (pending)** — scip-csharp VS-MSBuild restore fallback: NETSDK1045-class CLI SDK gaps (hollow SDK dir, net10-only-in-VS) retry via vswhere + `MSBuild -t:restore`, and MSBuild registration picks a VS instance when no CLI SDK can target the repo
 - **v1.5.31 (pending)** — serve TUI status: `Indexing` only for real text indexing (pure SCIP rebuilds drive the C#/TS columns only); resting repos read `Idle` again
 - **v1.5.16 (pending)** — C# restore-pending retries 20×60s → 3 attempts with exponential backoff; restore exhaustion renders as yellow C#⚠ partial on every serve path instead of a red error
