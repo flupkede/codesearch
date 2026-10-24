@@ -1336,3 +1336,138 @@ fn remotes_alias_base_url_field() {
     let cfg = ReposConfig::load_from(&path).unwrap();
     assert_eq!(cfg.remotes.get("cloud").unwrap().url, "https://cloud");
 }
+
+/// Initialise a git repo at `dir` with one commit on the default branch, so
+/// `git worktree add` has a HEAD to branch from.
+fn init_git_with_commit(dir: &Path) {
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git must be available in the test env");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "test"]);
+    std::fs::write(dir.join("f.txt"), "x").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-m", "init"]);
+}
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "flaky on Windows: concurrent git subprocesses race the AV/Search-indexer on freshly created .git trees; logic is platform-independent, covered on Linux/macOS CI"
+)]
+fn captures_git_common_dir_on_register() {
+    let _serial = git_serial_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_git_with_commit(&repo);
+
+    let mut cfg = ReposConfig::default();
+    let alias = cfg.register(repo.clone());
+    let expected = normalize_identity_path(&repo.join(".git"));
+    assert_eq!(
+        cfg.meta(&alias).git_common_dir.as_deref(),
+        Some(&expected[..])
+    );
+}
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "flaky on Windows: concurrent git subprocesses race the AV/Search-indexer on freshly created .git trees; logic is platform-independent, covered on Linux/macOS CI"
+)]
+fn worktree_and_main_tree_share_git_common_dir() {
+    let _serial = git_serial_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    init_git_with_commit(&main);
+    let wt = tmp.path().join("wt");
+    let wt_str = wt.to_str().unwrap().to_string();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", &wt_str, "-b", "wt-branch"])
+        .output()
+        .expect("git must be available in the test env");
+    assert!(
+        out.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The core identity property: main tree and linked worktree resolve to
+    // the SAME common dir — via the git spawn and via the fs-only climb.
+    let via_git_main = git_common_dir(&main).expect("main tree identity");
+    let via_git_wt = git_common_dir(&wt).expect("worktree identity");
+    assert_eq!(via_git_main, via_git_wt);
+    assert_eq!(git_common_dir_fs(&main), git_common_dir_fs(&wt));
+    assert_eq!(
+        git_common_dir_fs(&wt).as_deref(),
+        Some(via_git_main.as_str()),
+        "fs climb must agree with the git spawn"
+    );
+
+    // And registration captures that shared identity for both aliases.
+    let mut cfg = ReposConfig::default();
+    let main_alias = cfg.register(main);
+    let wt_alias = cfg.register(wt);
+    assert_ne!(main_alias, wt_alias);
+    assert_eq!(
+        cfg.meta(&main_alias).git_common_dir,
+        cfg.meta(&wt_alias).git_common_dir,
+        "one family (main + worktree) must carry one identity"
+    );
+}
+
+#[test]
+fn git_common_dir_fs_returns_none_outside_git_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    assert_eq!(git_common_dir_fs(&plain), None);
+    // A `.git` file whose gitdir target is gone (deleted main tree) must not
+    // fabricate an identity from the dangling worktree gitdir path.
+    let orphan = tmp.path().join("orphan-wt");
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::write(
+        orphan.join(".git"),
+        "gitdir: /nonexistent/path/worktrees/wt\n",
+    )
+    .unwrap();
+    assert_eq!(git_common_dir_fs(&orphan), None);
+}
+
+#[test]
+fn git_common_dir_roundtrips_through_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("a");
+    std::fs::create_dir(&repo_dir).unwrap();
+    let mut cfg = ReposConfig::default();
+    let alias = cfg.register(repo_dir);
+    cfg.meta_mut(&alias).git_common_dir = Some("/repos/x/.git".to_string());
+    let path = tmp.path().join("repos.json");
+    cfg.save_to(&path).unwrap();
+    let loaded = ReposConfig::load_from(&path).unwrap();
+    assert_eq!(
+        loaded.meta(&alias).git_common_dir.as_deref(),
+        Some("/repos/x/.git")
+    );
+
+    // Absent field: legacy entries without the key load as None.
+    let legacy = r#"{"repos": {"b": "/tmp/b"}}"#;
+    std::fs::write(&path, legacy).unwrap();
+    let loaded = ReposConfig::load_from(&path).unwrap();
+    assert_eq!(loaded.meta("b").git_common_dir, None);
+}

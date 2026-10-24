@@ -125,6 +125,15 @@ pub struct RepoMeta {
     /// Used to re-locate a repo whose folder was renamed/moved (best-effort).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_remote: Option<String>,
+    /// Canonical path of the repo's shared git common dir (e.g. `<main>/.git`),
+    /// captured at registration time. The main tree and every linked worktree
+    /// of one repository resolve to the SAME common dir, so this value is the
+    /// repo-family identity: group resolution treats all registered repos that
+    /// share it as one family. Persisted once computed so a deleted main tree
+    /// keeps its identity; entries registered before this field existed are
+    /// backfilled lazily at group resolution (best-effort).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,8 +435,12 @@ impl ReposConfig {
         }
 
         let alias = unique_alias_for_path(&self.repos, &canonical);
+        let meta = self.repos_meta.entry(alias.clone()).or_default();
         if let Some(remote) = git_remote_url(&canonical) {
-            self.repos_meta.entry(alias.clone()).or_default().git_remote = Some(remote);
+            meta.git_remote = Some(remote);
+        }
+        if let Some(common) = git_common_dir(&canonical) {
+            meta.git_common_dir = Some(common);
         }
         self.repos.insert(alias.clone(), canonical);
         alias
@@ -458,11 +471,12 @@ impl ReposConfig {
             None => unique_alias_for_path(&self.repos, &canonical),
         };
 
+        let meta = self.repos_meta.entry(final_alias.clone()).or_default();
         if let Some(remote) = git_remote_url(&canonical) {
-            self.repos_meta
-                .entry(final_alias.clone())
-                .or_default()
-                .git_remote = Some(remote);
+            meta.git_remote = Some(remote);
+        }
+        if let Some(common) = git_common_dir(&canonical) {
+            meta.git_common_dir = Some(common);
         }
         self.repos.insert(final_alias.clone(), canonical);
         Ok(final_alias)
@@ -1218,36 +1232,31 @@ fn normalize_path_for_compare(path: &Path) -> String {
     crate::cache::normalize_path(path)
 }
 
-/// Best-effort lookup of a directory's git remote URL (`remote.origin.url`).
-///
-/// Returns `None` when `git` is unavailable, the path is not a git repo, or the
-/// repo has no `origin` remote. Used both to capture a repo's identity at
-/// registration time and to match candidate directories during relocation.
-pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
-    // `git` is spawned once per candidate directory. On Windows/msys (and Unix
-    // under heavy parallel load) the OS can transiently refuse to fork the
-    // subprocess (EAGAIN / "Resource temporarily unavailable"). Treating that
-    // transient spawn failure the same as "no remote" would silently strip a
-    // repo's git identity — breaking relocation and causing valid repos to be
-    // pruned. Retry a few times with a short backoff on spawn failure; a
-    // definitive `NotFound` (git not installed) returns immediately, and an
-    // `Ok` result whose status is non-success (not a repo / no origin) is a
-    // real answer that is NOT retried.
+/// Outcome of spawning a `git` subprocess with transient-failure retry.
+enum GitSpawn {
+    /// `git` ran and produced an output (status may still be non-success).
+    Output(std::process::Output),
+    /// `git` is genuinely absent, or spawning kept failing transiently until
+    /// the retry budget was exhausted. For both callers this means "no answer
+    /// from git" — `git_remote_url` gives up, `git_common_dir` falls back to
+    /// the filesystem-only climb.
+    Unavailable,
+}
+
+/// Spawn `git -C <dir> <args>` with a bounded retry on transient spawn
+/// failure (EAGAIN-style fork exhaustion).
+fn spawn_git_with_retry(dir: &Path, args: &[&str]) -> GitSpawn {
     const MAX_ATTEMPTS: u32 = 8;
-    let mut output = None;
     for attempt in 0..MAX_ATTEMPTS {
         match std::process::Command::new("git")
             .arg("-C")
-            .arg(path)
-            .args(["config", "--get", "remote.origin.url"])
+            .arg(dir)
+            .args(args)
             .output()
         {
-            Ok(o) => {
-                output = Some(o);
-                break;
-            }
+            Ok(o) => return GitSpawn::Output(o),
             // git binary genuinely absent — retrying cannot help.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return GitSpawn::Unavailable,
             // Transient spawn failure (fork exhaustion). Back off and retry.
             Err(_) => {
                 if attempt + 1 < MAX_ATTEMPTS {
@@ -1256,8 +1265,29 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
             }
         }
     }
+    GitSpawn::Unavailable
+}
 
-    let output = output?;
+/// Best-effort lookup of a directory's git remote URL (`remote.origin.url`).
+///
+/// Returns `None` when `git` is unavailable, the path is not a git repo, or the
+/// repo has no `origin` remote. Used both to capture a repo's identity at
+/// registration time and to match candidate directories during relocation.
+pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
+    // On Windows/msys (and Unix under heavy parallel load) the OS can
+    // transiently refuse to fork the subprocess (EAGAIN / "Resource
+    // temporarily unavailable"). Treating that transient spawn failure the
+    // same as "no remote" would silently strip a repo's git identity —
+    // breaking relocation and causing valid repos to be pruned. The retry
+    // lives in `spawn_git_with_retry`; a definitive `NotFound` (git not
+    // installed) is not retried, and an `Ok` result whose status is
+    // non-success (not a repo / no origin) is a real answer that is NOT
+    // retried either.
+    let output = match spawn_git_with_retry(path, &["config", "--get", "remote.origin.url"]) {
+        GitSpawn::Output(o) => o,
+        GitSpawn::Unavailable => return None,
+    };
+
     if !output.status.success() {
         return None;
     }
@@ -1268,6 +1298,85 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     } else {
         Some(url)
     }
+}
+
+/// Best-effort lookup of a directory's canonical shared git common dir.
+///
+/// Spawns `git rev-parse --path-format=absolute --git-common-dir` once (same
+/// transient-retry policy as [`git_remote_url`]); on any git failure falls
+/// back to the filesystem-only climb in [`git_common_dir_fs`]. The result is
+/// normalized (`safe_canonicalize`, `normalize_user_path` fallback) so the
+/// main tree and every linked worktree of one repository produce the
+/// identical string — the repo-family identity compared by group resolution.
+///
+/// Returns `None` when the path is not a git repository (or its git metadata
+/// is gone, e.g. a worktree whose main tree was deleted without a persisted
+/// identity). Best-effort: used at registration time and by the lazy backfill.
+pub(crate) fn git_common_dir(path: &Path) -> Option<String> {
+    let output = match spawn_git_with_retry(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) {
+        GitSpawn::Output(o) => o,
+        GitSpawn::Unavailable => return git_common_dir_fs(path),
+    };
+
+    if output.status.success() {
+        let line = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !line.is_empty() {
+            return Some(normalize_identity_path(Path::new(&line)));
+        }
+    }
+    // git ran but refused (not a repo, broken metadata) or printed nothing —
+    // the fs-only climb is harmless (it finds nothing without a `.git` entry)
+    // and covers environments where the git binary misbehaves.
+    git_common_dir_fs(path)
+}
+
+/// Filesystem-only fallback for [`git_common_dir`], used when `git` cannot
+/// answer. Same climb as `resolve_hooks_dir_manual` (`src/cli/mod.rs`):
+/// `.git` file → `gitdir:` target → `commondir` file → shared common dir.
+fn git_common_dir_fs(repo_path: &Path) -> Option<String> {
+    let dot_git = repo_path.join(".git");
+    let git_dir = if dot_git.is_file() {
+        let content = fs::read_to_string(&dot_git).ok()?;
+        let first_line = content.lines().next().unwrap_or("");
+        let rel = first_line.strip_prefix("gitdir: ")?;
+        let resolved = repo_path.join(rel.trim());
+        if !resolved.exists() {
+            // gitdir target gone (main tree deleted) — the identity cannot be
+            // derived from disk; registration-time persistence is what keeps it.
+            return None;
+        }
+        // A linked worktree's gitdir holds a `commondir` file pointing at the
+        // shared common dir (relative to the per-worktree gitdir).
+        match fs::read_to_string(resolved.join("commondir")) {
+            Ok(cd) => resolved.join(cd.trim()),
+            Err(_) => resolved,
+        }
+    } else if dot_git.is_dir() {
+        dot_git
+    } else {
+        return None;
+    };
+    Some(normalize_identity_path(&git_dir))
+}
+
+/// Normalize a git-dir path to the canonical string form used for identity
+/// comparison: `safe_canonicalize` (UNC/MSYS-aware) with the lexicographic
+/// `normalize_user_path` fallback for paths that no longer exist. Both the
+/// git-spawn path and the fs-only fallback funnel through here, so the main
+/// tree and its worktrees always compare equal.
+fn normalize_identity_path(path: &Path) -> String {
+    safe_canonicalize(path)
+        .unwrap_or_else(|_| normalize_user_path(path))
+        .to_string_lossy()
+        .to_string()
 }
 
 /// Configured relocation scan depth (`CODESEARCH_RELOCATE_MAX_DEPTH`, default 3).
