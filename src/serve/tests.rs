@@ -2423,6 +2423,117 @@ fn resolve_group_aliases_all_returns_every_repo() {
     assert!(state.resolve_group_aliases("does-not-exist").is_err());
 }
 
+/// A group member registered before the git-identity field existed (no
+/// `repos_meta` entry at all) must get its identity computed at the first
+/// group resolution and PERSISTED through the serve persist path, so a later
+/// deletion of the main tree cannot lose the family identity.
+#[tokio::test]
+async fn backfill_group_git_identities_persists_computed_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = crate::testing::plant_worktree_layout(tmp.path());
+
+    // Pre-existing entry: registered repo + group, but no repos_meta entry.
+    let mut config = ReposConfig::default();
+    config
+        .repos
+        .insert("wt".to_string(), safe_canonicalize(&wt).unwrap());
+    config
+        .groups
+        .insert("fam".to_string(), vec!["wt".to_string()]);
+
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    state.backfill_group_git_identities("fam").await;
+
+    let expected = crate::db_discovery::repos::git_common_dir(&wt)
+        .expect("worktree layout must yield an identity");
+    assert!(expected.ends_with(".git"), "identity = {expected:?}");
+
+    // In memory ...
+    let in_memory = state.config_snapshot().meta("wt").git_common_dir;
+    assert_eq!(in_memory.as_deref(), Some(expected.as_str()));
+    // ... and on disk, through persist_config (never a bare save()).
+    let on_disk = ReposConfig::load_from(&config_file)
+        .unwrap()
+        .meta("wt")
+        .git_common_dir;
+    assert_eq!(on_disk.as_deref(), Some(expected.as_str()));
+
+    // Idempotent: a second pass keeps the value.
+    state.backfill_group_git_identities("fam").await;
+    assert_eq!(state.config_snapshot().meta("wt").git_common_dir, in_memory);
+}
+
+/// An identity that is already present is never recomputed/overwritten —
+/// the backfill exists to fill gaps, not to churn persisted values.
+#[tokio::test]
+async fn backfill_group_git_identities_never_overwrites_existing_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .repos
+        .insert("kept".to_string(), safe_canonicalize(&plain).unwrap());
+    config.meta_mut("kept").git_common_dir = Some("PERSISTED-IDENTITY".to_string());
+    config
+        .groups
+        .insert("fam".to_string(), vec!["kept".to_string()]);
+
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    state.backfill_group_git_identities("fam").await;
+
+    assert_eq!(
+        state
+            .config_snapshot()
+            .meta("kept")
+            .git_common_dir
+            .as_deref(),
+        Some("PERSISTED-IDENTITY")
+    );
+    assert_eq!(
+        ReposConfig::load_from(&config_file)
+            .unwrap()
+            .meta("kept")
+            .git_common_dir
+            .as_deref(),
+        Some("PERSISTED-IDENTITY")
+    );
+}
+
+/// Best-effort by construction: a member that is not a git repo simply keeps
+/// no identity, and an unknown group is skipped without erroring (the
+/// caller's own resolution reports it right after).
+#[tokio::test]
+async fn backfill_group_git_identities_tolerates_non_git_members_and_unknown_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .repos
+        .insert("plain".to_string(), safe_canonicalize(&plain).unwrap());
+    config
+        .groups
+        .insert("fam".to_string(), vec!["plain".to_string()]);
+
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    state.backfill_group_git_identities("fam").await;
+    state.backfill_group_git_identities("does-not-exist").await;
+
+    assert_eq!(state.config_snapshot().meta("plain").git_common_dir, None);
+}
+
 /// Tests for `build_streamable_http_config` — DNS rebinding defence env vars
 /// (`CODESEARCH_ALLOWED_HOSTS`, `CODESEARCH_DISABLE_HOST_VALIDATION`) added
 /// for issue #149 / GHSA-89vp-x53w-74fx.

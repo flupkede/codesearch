@@ -3567,3 +3567,49 @@ fn single_index_status_reports_building_while_a_rebuild_runs() {
     let (_, message) = super::single_index_status(403, true, true);
     assert!(message.contains("rebuild"), "got: {message}");
 }
+
+/// Wiring guard for the lazy git-identity backfill (worktree-group-expansion,
+/// stage 2): a group query through the single routing entry must trigger the
+/// backfill BEFORE resolution and store opens, so the computed identity is
+/// persisted even when the member's store cannot be opened (this member has
+/// no index, so the routing call errors). Deleting the backfill call in
+/// `resolve_repo_stores_multi` turns this test red.
+#[tokio::test]
+async fn group_query_triggers_git_identity_backfill_before_store_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = crate::testing::plant_worktree_layout(tmp.path());
+
+    // Pre-existing entry: registered repo + group, but no repos_meta entry.
+    let mut config = crate::db_discovery::repos::ReposConfig::default();
+    config.repos.insert(
+        "wt".to_string(),
+        crate::cache::safe_canonicalize(&wt).unwrap(),
+    );
+    config
+        .groups
+        .insert("fam".to_string(), vec!["wt".to_string()]);
+
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(crate::serve::ServeState::new(
+        config,
+        Some(config_file.clone()),
+    ));
+    let service = super::CodesearchService::new_for_serve(state).unwrap();
+
+    let group = Some("fam".to_string());
+    let result = service.resolve_repo_stores_multi(&None, &group, true).await;
+    assert!(
+        result.is_err(),
+        "a member without an index must fail the store open"
+    );
+
+    let on_disk = crate::db_discovery::repos::ReposConfig::load_from(&config_file)
+        .unwrap()
+        .meta("wt")
+        .git_common_dir;
+    assert!(
+        on_disk.is_some(),
+        "group query must backfill + persist the git identity even when the store open fails"
+    );
+}

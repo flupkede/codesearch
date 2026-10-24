@@ -52,3 +52,27 @@ impl Drop for EnvRestore {
         }
     }
 }
+
+/// Hand-crafted worktree-style git layout (no `git init`, no git subprocess
+/// variance): a shared common dir at `<root>/shared/.git` plus a worktree at
+/// `<root>/wt` whose `.git` file points into it via a `commondir` link.
+/// `db_discovery::repos::git_common_dir` resolves it to `<root>/shared/.git` —
+/// through the git spawn when git accepts the layout, through the fs-only
+/// climb otherwise. Real-git identity equality is pinned separately in
+/// `db_discovery::repos::tests::worktree_and_main_tree_share_git_common_dir`.
+/// Returns the worktree path.
+pub fn plant_worktree_layout(root: &std::path::Path) -> std::path::PathBuf {
+    let common = root.join("shared").join(".git");
+    let wt_meta = common.join("worktrees").join("wt");
+    std::fs::create_dir_all(&wt_meta).unwrap();
+    let wt = root.join("wt");
+    std::fs::create_dir(&wt).unwrap();
+    std::fs::write(wt.join(".git"), format!("gitdir: {}", wt_meta.display())).unwrap();
+    std::fs::write(wt_meta.join("commondir"), "../..").unwrap();
+    std::fs::write(
+        wt_meta.join("gitdir"),
+        wt.join(".git").display().to_string(),
+    )
+    .unwrap();
+    wt
+}

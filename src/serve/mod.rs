@@ -516,7 +516,10 @@ impl RebuildDecision {
 }
 
 impl ServeState {
-    fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
+    // Crate-visible (not private) so sibling modules' test code — e.g. the
+    // mcp routing tests — can build a hermetic ServeState with a config
+    // override, exactly like serve's own tests do.
+    pub(crate) fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
         let mut sys = sysinfo::System::new();
         sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
         Self {
@@ -3791,6 +3794,92 @@ impl ServeState {
             .get(group)
             .cloned()
             .ok_or_else(|| format!("Unknown group '{}'", group))
+    }
+
+    /// Lazy backfill of the per-repo git identity (`RepoMeta::git_common_dir`)
+    /// for every member of `group`.
+    ///
+    /// Entries registered before the identity field existed lack the value; the
+    /// first group resolution computes it (best-effort, off the async runtime)
+    /// and persists it once, so the identity survives even after the member's
+    /// main tree is later deleted. Unknown groups are silently skipped — the
+    /// caller's own resolution errors immediately after.
+    pub(crate) async fn backfill_group_git_identities(self: &Arc<Self>, group: &str) {
+        if let Ok(aliases) = self.resolve_group_aliases(group) {
+            self.backfill_git_identities(&aliases).await;
+        }
+    }
+
+    /// Compute and persist [`RepoMeta::git_common_dir`] for `aliases` that are
+    /// registered but lack the value. Idempotent and cheap once complete: the
+    /// second call finds nothing missing and never spawns git.
+    ///
+    /// Phases: (1) cheap read under the config lock, (2) git spawn + fs climb
+    /// in `spawn_blocking` (blocking I/O must not run on the runtime), (3)
+    /// TOCTOU-safe merge under the write lock — an identity that landed
+    /// meanwhile is never overwritten — then persist through the serve persist
+    /// path ([`Self::run_persist_pass`] → [`Self::persist_config`], never a
+    /// bare `save()`), so the mtime-adoption guard holds.
+    pub(crate) async fn backfill_git_identities(self: &Arc<Self>, aliases: &[String]) {
+        // Phase 1 — members that exist but lack the persisted identity.
+        let missing: Vec<(String, PathBuf)> = {
+            let cfg = match self.config.read() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            aliases
+                .iter()
+                .filter_map(|alias| {
+                    let path = cfg.repos.get(alias)?;
+                    let has_identity = cfg
+                        .repos_meta
+                        .get(alias)
+                        .and_then(|m| m.git_common_dir.as_ref())
+                        .is_some();
+                    if has_identity {
+                        return None;
+                    }
+                    Some((alias.clone(), path.clone()))
+                })
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+
+        // Phase 2 — compute off the async runtime.
+        let computed = match tokio::task::spawn_blocking(move || {
+            missing
+                .into_iter()
+                .filter_map(|(alias, path)| {
+                    crate::db_discovery::repos::git_common_dir(&path).map(|cd| (alias, cd))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(v) if !v.is_empty() => v,
+            _ => return,
+        };
+
+        // Phase 3 — merge under the write lock, persist once.
+        let mut changed = false;
+        {
+            let mut cfg = match self.config.write() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            for (alias, common) in computed {
+                let meta = cfg.repos_meta.entry(alias.clone()).or_default();
+                if meta.git_common_dir.is_none() {
+                    meta.git_common_dir = Some(common);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.run_persist_pass().await;
+        }
     }
 
     /// Record that a repo was just accessed (query or reindex).

@@ -1276,6 +1276,10 @@ impl CodesearchService {
         }
 
         if let Some(ref group_name) = group {
+            // Lazy backfill first: members registered before the git-identity
+            // field existed get their identity computed + persisted once, so
+            // downstream family logic (and later restarts) see a complete map.
+            serve_state.backfill_group_git_identities(group_name).await;
             let aliases = serve_state.resolve_group_aliases(group_name)?;
             if aliases.is_empty() {
                 return Err(format!("Group '{}' has no members.", group_name));
