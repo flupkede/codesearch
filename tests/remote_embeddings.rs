@@ -65,6 +65,7 @@ async fn remote_refresh_failure_preserves_completed_and_previous_files_then_retr
                     std::thread::sleep(std::time::Duration::from_millis(2));
                     continue;
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                     .unwrap();

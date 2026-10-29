@@ -72,6 +72,7 @@ impl Drop for Mock {
     }
 }
 fn read_request(stream: &mut TcpStream) -> Option<(String, serde_json::Value)> {
+    stream.set_nonblocking(false).ok()?;
     let mut data = Vec::new();
     let mut buffer = [0; 4096];
     loop {
@@ -99,6 +100,31 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, serde_json::Value)> {
 }
 fn success(count: usize) -> (u16, String, String) {
     (200, String::new(), serde_json::json!({"data": (0..count).rev().map(|index| serde_json::json!({"index": index, "embedding": [3.0, 4.0]})).collect::<Vec<_>>()}).to_string())
+}
+
+#[test]
+fn mock_reads_fragmented_request_on_an_accepted_nonblocking_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        client
+            .write_all(b"POST /v1/embeddings HTTP/1.1\r\nContent-Length: 2\r\n\r\n")
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        client.write_all(b"{}").unwrap();
+    });
+    let request = read_request(&mut stream);
+    sender.join().unwrap();
+    assert_eq!(
+        request.expect("complete fragmented request").1,
+        serde_json::json!({})
+    );
 }
 
 #[test]
@@ -246,6 +272,6 @@ fn http_deadline_bounds_retry_after() {
     let mut embedder = OpenAiEmbedder::new(config).unwrap();
     let start = std::time::Instant::now();
     let error = embedder.embed_query("query").unwrap_err().to_string();
-    assert!(error.contains("deadline"));
+    assert!(error.contains("deadline"), "unexpected error: {error:#}");
     assert!(start.elapsed() < Duration::from_secs(3));
 }
