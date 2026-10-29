@@ -1,6 +1,5 @@
 use anyhow::Result;
 use colored::Colorize;
-use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -521,18 +520,36 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // Perform incremental sync if requested (after we know the model)
     if options.sync {
         info_print!("{}", "🔄 Syncing database...".yellow());
-        sync_database(&db_path, model_type)?;
+        if crate::vectordb::storage_backend(&db_path)? == "postgres" {
+            crate::index::index_quiet_with_model(
+                Some(project_path.clone()),
+                false,
+                false,
+                Some(model_type),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        } else {
+            sync_database(&db_path, model_type)?;
+        }
     }
 
     // Literal mode (--literal/--phrase/--regex): run the Tantivy primitives
     // directly — no embeddings, no fusion, no model load.
     if options.literal {
-        return literal::run(query, &db_path, &project_path, dimensions, &options);
+        return literal::run(query, &db_path, &project_path, dimensions, &options).await;
     }
 
     // Load database
     let start = Instant::now();
-    let store = VectorStore::new(&db_path, dimensions)?;
+    let store = crate::vectordb::ChunkStore::open_for_path(
+        &db_path,
+        &project_path,
+        model_type.short_name(),
+        dimensions,
+        false,
+    )
+    .await?;
     let load_duration = start.elapsed();
 
     // Initialize embedding service with the correct model
@@ -571,10 +588,18 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     // OPTIMIZATION: Use efficient deduplication with top-N tracking
     use std::collections::BinaryHeap;
 
-    let vector_search_results: Vec<Vec<crate::vectordb::SearchResult>> = all_query_embeddings
-        .par_iter()
-        .map(|query_emb| store.search(query_emb, retrieval_limit))
-        .collect::<Result<Vec<_>>>()?;
+    let prefix = options
+        .filter_path
+        .as_deref()
+        .map(crate::cache::normalize_filter_path);
+    let mut vector_search_results = Vec::with_capacity(all_query_embeddings.len());
+    for query_embedding in &all_query_embeddings {
+        vector_search_results.push(
+            store
+                .search(query_embedding, prefix.as_deref(), retrieval_limit)
+                .await?,
+        );
+    }
 
     // OPTIMIZATION: Deduplicate with top-N tracking using BinaryHeap
     // This avoids collecting all results and then truncating
@@ -807,7 +832,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             results.push(r);
         } else {
             // Result only from FTS, need to fetch from store
-            if let Ok(Some(mut result)) = store.get_chunk_as_result(fused.chunk_id) {
+            if let Some(mut result) = store.get_chunk_as_result(fused.chunk_id).await? {
                 // OPTIMIZATION: Skip early if path filter doesn't match
                 if should_filter_by_path {
                     if let Some(ref filter) = filter_path_normalized {

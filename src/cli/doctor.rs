@@ -34,6 +34,34 @@ pub struct DoctorReport {
     pub errors: usize,
 }
 
+pub async fn diagnose_storage(
+    project_path: &Path,
+    store: &crate::vectordb::ChunkStore,
+) -> Result<DoctorReport> {
+    if let Some(local) = store.local() {
+        return diagnose_with_store(project_path, local);
+    }
+    let mut results = vec![CheckResult::pass(
+        "Storage backend",
+        "postgres (Tantivy, symbols and sync state remain local)",
+    )];
+    match store.stats().await {
+        Ok(stats) => results.push(CheckResult::pass(
+            "Postgres connection",
+            format!(
+                "healthy: {} chunks across {} files, {} dimensions",
+                stats.total_chunks, stats.total_files, stats.dimensions
+            ),
+        )),
+        Err(error) => results.push(CheckResult::fail(
+            "Postgres connection",
+            format!("{error:#}"),
+        )),
+    }
+    results.push(check_fts_health(&project_path.join(DB_DIR_NAME)));
+    Ok(DoctorReport::from_results(results))
+}
+
 impl DoctorReport {
     fn from_results(results: Vec<CheckResult>) -> Self {
         let warnings = results
@@ -739,7 +767,21 @@ pub fn diagnose_with_store(project_path: &Path, store: &VectorStore) -> Result<D
 /// Run all checks for a single project path, print results, optionally fix.
 /// Returns (warnings, errors). Does not bail — caller decides.
 async fn run_for_path(project_path: &Path, fix: bool, json: bool) -> Result<(usize, usize)> {
-    let report = diagnose(project_path)?;
+    let db_path = project_path.join(DB_DIR_NAME);
+    let report = if crate::vectordb::storage_backend(&db_path)? == "postgres" {
+        let (model, dimensions) = crate::index::IndexManager::resolve_embed_model(&db_path)?;
+        let store = crate::vectordb::ChunkStore::open_for_path(
+            &db_path,
+            project_path,
+            model.short_name(),
+            dimensions,
+            true,
+        )
+        .await?;
+        diagnose_storage(project_path, &store).await?
+    } else {
+        diagnose(project_path)?
+    };
 
     // Print results
     print_results(&report.results, json);

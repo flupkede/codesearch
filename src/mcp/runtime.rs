@@ -119,6 +119,7 @@ pub(crate) async fn require_prebuilt_index_ready(
         let vector_store = crate::mcp::bounded_vector_read(&stores.vector_store).await?;
         vector_store
             .index_health()
+            .await
             .context("Failed to inspect prebuilt vector index")?
     };
     let fts_documents = {
@@ -714,8 +715,15 @@ pub async fn run_mcp_server_with_options(
         let fts_path = db_path.join("fts");
         std::fs::create_dir_all(&fts_path)?;
 
-        // Create LMDB file by opening VectorStore (creates minimal structure)
-        let _store = crate::vectordb::VectorStore::new(&db_path, dimensions)?;
+        // Initialize the selected chunk backend without loading embeddings.
+        let _store = crate::vectordb::ChunkStore::open_for_path(
+            &db_path,
+            &db_root,
+            model_type.short_name(),
+            dimensions,
+            false,
+        )
+        .await?;
 
         tracing::info!("✅ Minimal database created successfully");
         tracing::info!("🔄 Background indexing will begin shortly via incremental refresh");
@@ -761,8 +769,17 @@ pub async fn run_mcp_server_with_options(
     // Otherwise try write mode first and fall back to readonly if it is held,
     // so multiple terminal windows can use the same database.
     tracing::info!("📦 Creating shared stores...");
+    let model = crate::embed::ModelType::from_index_metadata(&db_path).unwrap_or_default();
     let (shared_stores, is_readonly) = if startup.readonly {
-        (SharedStores::new_readonly(&db_path, dimensions)?, true)
+        (
+            SharedStores::open(&db_path, &project_path, model, dimensions, true).await?,
+            true,
+        )
+    } else if crate::vectordb::storage_backend(&db_path)? == "postgres" {
+        (
+            SharedStores::open(&db_path, &project_path, model, dimensions, false).await?,
+            false,
+        )
     } else {
         SharedStores::new_or_readonly(&db_path, dimensions)?
     };

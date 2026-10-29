@@ -333,7 +333,33 @@ pub struct ChunkMetadata {
 }
 
 impl ChunkMetadata {
-    fn from_embedded_chunk(chunk: &EmbeddedChunk) -> Self {
+    pub(crate) fn into_result(
+        self,
+        id: u32,
+        distance: f32,
+        origin: Option<String>,
+    ) -> SearchResult {
+        SearchResult {
+            id,
+            content: self.content,
+            path: self.path,
+            start_line: self.start_line,
+            end_line: self.end_line,
+            kind: self.kind,
+            signature: self.signature,
+            docstring: self.docstring,
+            context: self.context,
+            hash: self.hash,
+            distance,
+            score: 1.0 - distance,
+            context_prev: self.context_prev,
+            context_next: self.context_next,
+            origin,
+            also_in: Vec::new(),
+        }
+    }
+
+    pub(crate) fn from_embedded_chunk(chunk: &EmbeddedChunk) -> Self {
         // Build searchable text from signature, docstring, and content
         let searchable_text = {
             let mut parts = Vec::new();

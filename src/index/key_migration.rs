@@ -57,6 +57,9 @@ pub(crate) async fn repair_legacy_index_shared(
     file_meta: &mut FileMetaStore,
     stores: &SharedStores,
 ) -> Result<bool> {
+    if stores.vector_store.read().await.backend() != "local" {
+        return Ok(false);
+    }
     let migration = file_meta.relativize_legacy_keys(project_root);
     if migration.is_empty() {
         return Ok(false);
@@ -67,7 +70,9 @@ pub(crate) async fn repair_legacy_index_shared(
     for batch in updates.chunks(PATH_REWRITE_BATCH) {
         let batch = batch.to_vec();
         let rewritten = on_store(&stores.vector_store, move |vs| {
-            vs.rewrite_chunk_paths(&batch)
+            vs.local_mut()
+                .ok_or_else(|| anyhow!("Path migration requires local storage"))?
+                .rewrite_chunk_paths(&batch)
         })
         .await?;
         rewritten_count += rewritten.len();
@@ -85,7 +90,12 @@ pub(crate) async fn repair_legacy_index_shared(
     let tracked = file_meta.tracked_chunk_ids();
     let vector_store = Arc::clone(&stores.vector_store);
     let untracked = tokio::task::spawn_blocking(move || {
-        untracked_among(&vector_store.blocking_read(), &tracked)
+        let store = vector_store.blocking_read();
+        match &*store {
+            crate::vectordb::ChunkStore::Local(local) => untracked_among(local, &tracked),
+            #[cfg(feature = "pgvector")]
+            crate::vectordb::ChunkStore::Postgres { .. } => Ok(Vec::new()),
+        }
     })
     .await
     .map_err(|e| anyhow!("legacy index repair task panicked: {}", e))??;
@@ -93,7 +103,11 @@ pub(crate) async fn repair_legacy_index_shared(
         let count = untracked.len();
         let ids = untracked.clone();
         on_store(&stores.vector_store, move |vs| {
-            delete_from_vector_store(vs, &ids)
+            delete_from_vector_store(
+                vs.local_mut()
+                    .ok_or_else(|| anyhow!("Path migration requires local storage"))?,
+                &ids,
+            )
         })
         .await?;
         on_store(&stores.fts_store, move |fts| {

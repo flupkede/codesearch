@@ -71,14 +71,14 @@ impl CodesearchService {
                 ) else {
                     continue;
                 };
-                match store.chunks_for_file(&normalized) {
+                match store.chunks_for_file(&normalized).await {
                     Ok(metas) => {
                         for meta in metas {
                             if !is_import_kind(&meta.kind) {
                                 continue;
                             }
                             if seen_ids.insert((store_idx, meta.id)) {
-                                match store.get_chunk(meta.id) {
+                                match store.get_chunk(meta.id).await {
                                     Ok(Some(chunk)) => all_items.extend(parse_import_lines(
                                         &chunk.content,
                                         chunk.start_line,
@@ -108,23 +108,21 @@ impl CodesearchService {
             }
             all_items
         } else {
-            match self
-                .with_vector_store_read_for(
-                    |store| {
-                        let mut out = Vec::new();
-                        for meta in store.chunks_for_file(&normalized)? {
-                            if !is_import_kind(&meta.kind) {
-                                continue;
-                            }
-                            if let Some(chunk) = store.get_chunk(meta.id)? {
-                                out.extend(parse_import_lines(&chunk.content, chunk.start_line));
-                            }
-                        }
-                        Ok(out)
-                    },
-                    ctx.stores.clone(),
-                )
-                .await
+            match async {
+                let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                let store = bounded_vector_read(&handle).await?;
+                let mut out = Vec::new();
+                for meta in store.chunks_for_file(&normalized).await? {
+                    if !is_import_kind(&meta.kind) {
+                        continue;
+                    }
+                    if let Some(chunk) = store.get_chunk(meta.id).await? {
+                        out.extend(parse_import_lines(&chunk.content, chunk.start_line));
+                    }
+                }
+                Ok::<_, anyhow::Error>(out)
+            }
+            .await
             {
                 Ok(items) => items,
                 Err(e) => {
@@ -186,7 +184,7 @@ impl CodesearchService {
                     ) else {
                         continue;
                     };
-                    match store.get_chunk(hit.result.chunk_id) {
+                    match store.get_chunk(hit.result.chunk_id).await {
                         Ok(Some(chunk)) => {
                             if crate::cache::normalize_path_str(&chunk.path) == normalized {
                                 resolved
@@ -240,36 +238,31 @@ impl CodesearchService {
                     }
                 }
 
-                items = self
-                    .with_vector_store_read_for(
-                        |store| {
-                            let mut out = Vec::new();
-                            for hit in &all_hits {
-                                if let Some(chunk) = store.get_chunk(hit.result.chunk_id)? {
-                                    if crate::cache::normalize_path_str(&chunk.path) == normalized {
-                                        out.extend(parse_import_lines(
-                                            &chunk.content,
-                                            chunk.start_line,
-                                        ));
-                                    }
-                                }
+                items = async {
+                    let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                    let store = bounded_vector_read(&handle).await?;
+                    let mut out = Vec::new();
+                    for hit in &all_hits {
+                        if let Some(chunk) = store.get_chunk(hit.result.chunk_id).await? {
+                            if crate::cache::normalize_path_str(&chunk.path) == normalized {
+                                out.extend(parse_import_lines(&chunk.content, chunk.start_line));
                             }
-                            Ok(out)
-                        },
-                        ctx.stores.clone(),
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        push_store_warning(
-                            &mut import_warnings,
-                            &store_warning(
-                                ctx.project_alias.as_deref().unwrap_or("unknown"),
-                                "chunk lookup",
-                                &format!("{e:#}"),
-                            ),
-                        );
-                        Vec::new()
-                    });
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(out)
+                }
+                .await
+                .unwrap_or_else(|e| {
+                    push_store_warning(
+                        &mut import_warnings,
+                        &store_warning(
+                            ctx.project_alias.as_deref().unwrap_or("unknown"),
+                            "chunk lookup",
+                            &format!("{e:#}"),
+                        ),
+                    );
+                    Vec::new()
+                });
             }
         }
 
@@ -424,7 +417,7 @@ impl CodesearchService {
                 ) else {
                     continue;
                 };
-                match store.get_chunk(f.result.chunk_id) {
+                match store.get_chunk(f.result.chunk_id).await {
                     Ok(Some(chunk)) => {
                         if !is_import_kind(&chunk.kind) {
                             continue; // try next FTS result
@@ -474,55 +467,53 @@ impl CodesearchService {
             }
             out
         } else {
-            match self
-                .with_vector_store_read_for(
-                    |store| {
-                        let mut seen_paths = HashSet::new();
-                        let mut out = Vec::new();
-                        let term_lower = search_term.to_lowercase();
-                        for f in &fts_results {
-                            if let Some(chunk) = store.get_chunk(f.result.chunk_id)? {
-                                if !is_import_kind(&chunk.kind) {
-                                    continue;
-                                }
-
-                                let norm = crate::cache::normalize_path_str(&chunk.path);
-                                if !seen_paths.insert(norm) {
-                                    continue;
-                                }
-
-                                // Extract the specific import line(s) that mention the
-                                // module name, rather than returning the entire chunk content.
-                                let import_statement =
-                                    if chunk.content.to_lowercase().contains(&term_lower) {
-                                        chunk
-                                            .content
-                                            .lines()
-                                            .find(|l| l.to_lowercase().contains(&term_lower))
-                                            .unwrap_or("")
-                                            .to_string()
-                                    } else {
-                                        chunk.signature.filter(|s| !s.is_empty()).unwrap_or(
-                                            chunk.content.lines().next().unwrap_or("").to_string(),
-                                        )
-                                    };
-
-                                out.push(DependentItem {
-                                    path: chunk.path,
-                                    line: chunk.start_line,
-                                    import_statement,
-                                });
-
-                                if out.len() >= limit {
-                                    break;
-                                }
-                            }
+            match async {
+                let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                let store = bounded_vector_read(&handle).await?;
+                let mut seen_paths = HashSet::new();
+                let mut out = Vec::new();
+                let term_lower = search_term.to_lowercase();
+                for f in &fts_results {
+                    if let Some(chunk) = store.get_chunk(f.result.chunk_id).await? {
+                        if !is_import_kind(&chunk.kind) {
+                            continue;
                         }
-                        Ok(out)
-                    },
-                    ctx.stores.clone(),
-                )
-                .await
+
+                        let norm = crate::cache::normalize_path_str(&chunk.path);
+                        if !seen_paths.insert(norm) {
+                            continue;
+                        }
+
+                        // Extract the specific import line(s) that mention the
+                        // module name, rather than returning the entire chunk content.
+                        let import_statement =
+                            if chunk.content.to_lowercase().contains(&term_lower) {
+                                chunk
+                                    .content
+                                    .lines()
+                                    .find(|l| l.to_lowercase().contains(&term_lower))
+                                    .unwrap_or("")
+                                    .to_string()
+                            } else {
+                                chunk.signature.filter(|s| !s.is_empty()).unwrap_or(
+                                    chunk.content.lines().next().unwrap_or("").to_string(),
+                                )
+                            };
+
+                        out.push(DependentItem {
+                            path: chunk.path,
+                            line: chunk.start_line,
+                            import_statement,
+                        });
+
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>(out)
+            }
+            .await
             {
                 Ok(items) => items,
                 Err(e) => {
@@ -593,7 +584,7 @@ impl CodesearchService {
                 ) else {
                     continue;
                 };
-                match store.get_embedding(request.chunk_id) {
+                match store.get_embedding(request.chunk_id).await {
                     Ok(Some(emb)) => candidates.push((i, emb)),
                     Ok(None) => continue,
                     Err(ref e) => {
@@ -609,7 +600,7 @@ impl CodesearchService {
                 }
             }
 
-            let embedding = match candidates.len() {
+            let (source_idx, embedding) = match candidates.len() {
                 0 => {
                     return Ok(CallToolResult::success(vec![ContentBlock::text(
                         qualify_empty_result(
@@ -621,7 +612,7 @@ impl CodesearchService {
                         ),
                     )]));
                 }
-                1 => candidates.pop().expect("len == 1 checked").1,
+                1 => candidates.pop().expect("len == 1 checked"),
                 _ => {
                     let holder_names: Vec<&str> = candidates
                         .iter()
@@ -645,57 +636,44 @@ impl CodesearchService {
             // Search across all stores with the found embedding. Dedup keys on
             // (store, id): a bare id collides across repos and would drop a
             // whole repo's neighbours whenever another repo reused the id.
+            let embeddings = aliases
+                .iter()
+                .map(|alias| (alias.clone(), embedding.clone()))
+                .collect();
+            let outcome = self
+                .search_vector_stores(sv, aliases, &embeddings, None, limit + 1)
+                .await
+                .map_err(|error| {
+                    McpError::internal_error(format!("Similarity search failed: {error:#}"), None)
+                })?;
+            similar_warnings.extend(
+                outcome.failures.into_iter().map(|(alias, error)| {
+                    format!("repo '{alias}' similarity search failed: {error}")
+                }),
+            );
             let mut all_results: Vec<SearchResultItem> = Vec::new();
-            let mut seen_ids: HashSet<(usize, u32)> = HashSet::new();
-            for (store_idx, store_arc) in sv.iter().enumerate() {
-                let alias = aliases
-                    .get(store_idx)
-                    .map(String::as_str)
-                    .unwrap_or_default();
-                let Some(store) = try_vector_read_or_note(
-                    &store_arc.vector_store,
-                    aliases,
-                    store_idx,
-                    &mut similar_warnings,
-                    "search",
-                ) else {
+            let mut seen_ids: HashSet<(String, u32)> = HashSet::new();
+            for hit in outcome.results {
+                let r = hit.result;
+                if hit.alias == aliases[source_idx] && r.id == request.chunk_id {
                     continue;
-                };
-                match store.search(&embedding, limit + 1) {
-                    Ok(mut neighbors) => {
-                        neighbors.retain(|r| r.id != request.chunk_id);
-                        for r in neighbors {
-                            if seen_ids.insert((store_idx, r.id)) {
-                                all_results.push(SearchResultItem {
-                                    chunk_id: Some(r.id),
-                                    path: ctx.prefix_sourced_path(alias, &r.path),
-                                    start_line: r.start_line,
-                                    end_line: r.end_line,
-                                    kind: r.kind,
-                                    score: r.score,
-                                    signature: r.signature,
-                                    content: None,
-                                    context_prev: None,
-                                    context_next: None,
-                                    source: None,
-                                    also_in: Vec::new(),
-                                    chunk_ref: None,
-                                });
-                            }
-                        }
-                    }
-                    Err(ref e) => {
-                        // The embedding was found, so the handler returns results
-                        // either way; without this, a group query silently omits
-                        // every neighbour from the broken repo.
-                        note_store_failure(
-                            &mut similar_warnings,
-                            aliases,
-                            store_idx,
-                            "similarity search",
-                            e,
-                        );
-                    }
+                }
+                if seen_ids.insert((hit.alias.clone(), r.id)) {
+                    all_results.push(SearchResultItem {
+                        chunk_id: Some(r.id),
+                        path: ctx.prefix_sourced_path(&hit.alias, &r.path),
+                        start_line: r.start_line,
+                        end_line: r.end_line,
+                        kind: r.kind,
+                        score: r.score,
+                        signature: r.signature,
+                        content: None,
+                        context_prev: None,
+                        context_next: None,
+                        source: None,
+                        also_in: Vec::new(),
+                        chunk_ref: None,
+                    });
                 }
             }
 
@@ -707,44 +685,41 @@ impl CodesearchService {
             all_results.truncate(limit);
             all_results
         } else {
-            match self
-                .with_vector_store_read_for(
-                    |store| {
-                        let embedding =
-                            store.get_embedding(request.chunk_id)?.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "embedding not found for chunk_id {}",
-                                    request.chunk_id
-                                )
-                            })?;
+            match async {
+                let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                let store = bounded_vector_read(&handle).await?;
+                let embedding = store
+                    .get_embedding(request.chunk_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("embedding not found for chunk_id {}", request.chunk_id)
+                    })?;
 
-                        let mut neighbors = store.search(&embedding, limit + 1)?;
-                        neighbors.retain(|r| r.id != request.chunk_id);
-                        neighbors.truncate(limit);
+                let mut neighbors = store.search(&embedding, None, limit + 1).await?;
+                neighbors.retain(|r| r.id != request.chunk_id);
+                neighbors.truncate(limit);
 
-                        let items = neighbors
-                            .into_iter()
-                            .map(|r| SearchResultItem {
-                                chunk_id: Some(r.id),
-                                path: r.path,
-                                start_line: r.start_line,
-                                end_line: r.end_line,
-                                kind: r.kind,
-                                score: r.score,
-                                signature: r.signature,
-                                content: None,
-                                context_prev: None,
-                                context_next: None,
-                                source: None,
-                                also_in: Vec::new(),
-                                chunk_ref: None,
-                            })
-                            .collect::<Vec<_>>();
-                        Ok(items)
-                    },
-                    ctx.stores.clone(),
-                )
-                .await
+                let items = neighbors
+                    .into_iter()
+                    .map(|r| SearchResultItem {
+                        chunk_id: Some(r.id),
+                        path: r.path,
+                        start_line: r.start_line,
+                        end_line: r.end_line,
+                        kind: r.kind,
+                        score: r.score,
+                        signature: r.signature,
+                        content: None,
+                        context_prev: None,
+                        context_next: None,
+                        source: None,
+                        also_in: Vec::new(),
+                        chunk_ref: None,
+                    })
+                    .collect::<Vec<_>>();
+                Ok::<_, anyhow::Error>(items)
+            }
+            .await
             {
                 Ok(items) => items,
                 Err(e) => {

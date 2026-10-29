@@ -197,7 +197,7 @@ impl CodesearchService {
                 ) else {
                     continue 'outer;
                 };
-                match store.get_chunk(fts_hit.result.chunk_id) {
+                match store.get_chunk(fts_hit.result.chunk_id).await {
                     Ok(Some(chunk)) => {
                         // Skip non-definition kinds — try next FTS result
                         if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
@@ -235,48 +235,46 @@ impl CodesearchService {
             }
             items
         } else {
-            match self
-                .with_vector_store_read_for(
-                    |store| {
-                        // Resolve chunk metadata first: a store `Err` must
-                        // reach the error arm below ("Error opening database")
-                        // instead of masquerading as a non-definition or
-                        // missing chunk — `Ok(None)` alone is a true miss.
-                        let resolved: anyhow::Result<Vec<_>> = fts_results
-                            .iter()
-                            .map(|fts_hit| {
-                                let chunk = store.get_chunk(fts_hit.result.chunk_id)?;
-                                Ok((chunk, fts_hit.result.chunk_id, fts_hit.result.score))
-                            })
-                            .collect();
-                        let items = resolved?
-                            .into_iter()
-                            .filter_map(|(looked_up, chunk_id, score)| {
-                                let chunk = looked_up?;
-                                if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
-                                    return None;
-                                }
-                                if let Some(ref requested_kind) = requested_kind {
-                                    if chunk.kind != *requested_kind {
-                                        return None;
-                                    }
-                                }
-                                Some(ReferenceItem {
-                                    chunk_id,
-                                    path: chunk.path,
-                                    line: chunk.start_line,
-                                    kind: chunk.kind,
-                                    signature: chunk.signature,
-                                    score,
-                                })
-                            })
-                            .take(limit)
-                            .collect();
-                        Ok(items)
-                    },
-                    ctx.stores.clone(),
-                )
-                .await
+            match async {
+                let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                let store = bounded_vector_read(&handle).await?; // Resolve chunk metadata first: a store `Err` must
+                                                                 // reach the error arm below ("Error opening database")
+                                                                 // instead of masquerading as a non-definition or
+                                                                 // missing chunk — `Ok(None)` alone is a true miss.
+                let mut resolved = Vec::new();
+                for hit in &fts_results {
+                    resolved.push((
+                        store.get_chunk(hit.result.chunk_id).await?,
+                        hit.result.chunk_id,
+                        hit.result.score,
+                    ));
+                }
+                let items = resolved
+                    .into_iter()
+                    .filter_map(|(looked_up, chunk_id, score)| {
+                        let chunk = looked_up?;
+                        if !DEFINITION_KINDS.contains(&chunk.kind.as_str()) {
+                            return None;
+                        }
+                        if let Some(ref requested_kind) = requested_kind {
+                            if chunk.kind != *requested_kind {
+                                return None;
+                            }
+                        }
+                        Some(ReferenceItem {
+                            chunk_id,
+                            path: chunk.path,
+                            line: chunk.start_line,
+                            kind: chunk.kind,
+                            signature: chunk.signature,
+                            score,
+                        })
+                    })
+                    .take(limit)
+                    .collect();
+                Ok::<_, anyhow::Error>(items)
+            }
+            .await
             {
                 Ok(items) => items,
                 Err(e) => {
@@ -414,7 +412,7 @@ impl CodesearchService {
                 ) else {
                     continue;
                 };
-                match store.get_chunk(fts_hit.result.chunk_id) {
+                match store.get_chunk(fts_hit.result.chunk_id).await {
                     Ok(Some(chunk)) => {
                         if !is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
                             items.push(ReferenceItem {
@@ -444,41 +442,39 @@ impl CodesearchService {
             }
             items
         } else {
-            match self
-                .with_vector_store_read_for(
-                    |store| {
-                        // Resolve first: a store `Err` must reach the error
-                        // arm below instead of masquerading as a definition
-                        // chunk or a miss — `Ok(None)` alone is a true miss.
-                        let resolved: anyhow::Result<Vec<_>> = fts_results
-                            .iter()
-                            .map(|fts_hit| {
-                                let chunk = store.get_chunk(fts_hit.result.chunk_id)?;
-                                Ok((chunk, fts_hit.result.chunk_id, fts_hit.result.score))
-                            })
-                            .collect();
-                        let items = resolved?
-                            .into_iter()
-                            .filter_map(|(looked_up, chunk_id, score)| {
-                                let chunk = looked_up?;
-                                if is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
-                                    return None;
-                                }
-                                Some(ReferenceItem {
-                                    chunk_id,
-                                    path: chunk.path,
-                                    line: chunk.start_line,
-                                    kind: chunk.kind,
-                                    signature: chunk.signature,
-                                    score,
-                                })
-                            })
-                            .collect();
-                        Ok(items)
-                    },
-                    ctx.stores.clone(),
-                )
-                .await
+            match async {
+                let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                let store = bounded_vector_read(&handle).await?; // Resolve first: a store `Err` must reach the error
+                                                                 // arm below instead of masquerading as a definition
+                                                                 // chunk or a miss — `Ok(None)` alone is a true miss.
+                let mut resolved = Vec::new();
+                for hit in &fts_results {
+                    resolved.push((
+                        store.get_chunk(hit.result.chunk_id).await?,
+                        hit.result.chunk_id,
+                        hit.result.score,
+                    ));
+                }
+                let items = resolved
+                    .into_iter()
+                    .filter_map(|(looked_up, chunk_id, score)| {
+                        let chunk = looked_up?;
+                        if is_definition_chunk(&chunk.kind, &chunk.signature, &symbol) {
+                            return None;
+                        }
+                        Some(ReferenceItem {
+                            chunk_id,
+                            path: chunk.path,
+                            line: chunk.start_line,
+                            kind: chunk.kind,
+                            signature: chunk.signature,
+                            score,
+                        })
+                    })
+                    .collect();
+                Ok::<_, anyhow::Error>(items)
+            }
+            .await
             {
                 Ok(items) => items,
                 Err(e) => {

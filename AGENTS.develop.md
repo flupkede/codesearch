@@ -241,6 +241,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **v1.7.4** — optional PostgreSQL/pgvector chunk storage with shared scoped search, transactional replacement and local Tantivy hybrid retrieval; default local backend unchanged
+
 - **v1.7.3 (pending)** — serve self-heals its registry: a repo whose path is gone and unrelocatable is unregistered at startup and on every status refresh, no more manual `codesearch index prune`
 - **v1.6.0** — status CPU = whole serve process tree (incl. scip/dotnet children) instead of the serve process alone
 - **v1.6.0** — Razor refs mapped to source: helper emits `GetMappedLineSpan()` paths/lines (#line → .razor/.cshtml), SCIP stamp split (`SCIP_INDEX_BUILDER_VERSION`) so symbol rebuilds skip the text re-embed wave

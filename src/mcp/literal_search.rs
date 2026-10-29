@@ -45,7 +45,7 @@ impl CodesearchService {
                 ) else {
                     continue;
                 };
-                let all_chunks = match store.iter_all_chunks() {
+                let all_chunks = match store.iter_all_chunks().await {
                     Ok(chunks) => chunks,
                     Err(_) => continue,
                 };
@@ -95,58 +95,53 @@ impl CodesearchService {
             Ok(items)
         } else {
             // Single-store scan
-            match self
-                .with_vector_store_read_for(
-                    |store| {
-                        let all_chunks = store.iter_all_chunks()?;
-                        let mut items: Vec<LiteralSearchResultItem> = Vec::new();
-                        for (_, chunk) in all_chunks {
-                            if let Some(ref lang) = lang_filter {
-                                let file_lang =
-                                    Language::from_path(std::path::Path::new(&chunk.path));
-                                if file_lang.name() != lang {
-                                    continue;
-                                }
-                            }
-                            if let Some(ref glob) = glob_filter {
-                                let relative_path = chunk
-                                    .path
-                                    .strip_prefix(project_root_normalized)
-                                    .unwrap_or(&chunk.path)
-                                    .trim_start_matches('/');
-                                if !simple_glob_match(glob, relative_path) {
-                                    continue;
-                                }
-                            }
-                            if let Some((match_offset, snippet)) = match_line_for_literal(
-                                &chunk.content,
-                                effective_query,
-                                snippet_regex,
-                            ) {
-                                let match_line = chunk.start_line + match_offset;
-                                items.push(LiteralSearchResultItem {
-                                    path: chunk.path,
-                                    start_line: match_line,
-                                    end_line: match_line,
-                                    snippet,
-                                    score: 0.0, // No BM25 score — scan-path results are unranked
-                                    kind: if chunk.kind.is_empty() {
-                                        None
-                                    } else {
-                                        Some(chunk.kind)
-                                    },
-                                    signature: chunk.signature.filter(|s| !s.is_empty()),
-                                });
-                                if items.len() >= limit {
-                                    break;
-                                }
-                            }
+            match async {
+                let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                let store = bounded_vector_read(&handle).await?;
+                let all_chunks = store.iter_all_chunks().await?;
+                let mut items: Vec<LiteralSearchResultItem> = Vec::new();
+                for (_, chunk) in all_chunks {
+                    if let Some(ref lang) = lang_filter {
+                        let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                        if file_lang.name() != lang {
+                            continue;
                         }
-                        Ok(items)
-                    },
-                    ctx.stores.clone(),
-                )
-                .await
+                    }
+                    if let Some(ref glob) = glob_filter {
+                        let relative_path = chunk
+                            .path
+                            .strip_prefix(project_root_normalized)
+                            .unwrap_or(&chunk.path)
+                            .trim_start_matches('/');
+                        if !simple_glob_match(glob, relative_path) {
+                            continue;
+                        }
+                    }
+                    if let Some((match_offset, snippet)) =
+                        match_line_for_literal(&chunk.content, effective_query, snippet_regex)
+                    {
+                        let match_line = chunk.start_line + match_offset;
+                        items.push(LiteralSearchResultItem {
+                            path: chunk.path,
+                            start_line: match_line,
+                            end_line: match_line,
+                            snippet,
+                            score: 0.0, // No BM25 score — scan-path results are unranked
+                            kind: if chunk.kind.is_empty() {
+                                None
+                            } else {
+                                Some(chunk.kind)
+                            },
+                            signature: chunk.signature.filter(|s| !s.is_empty()),
+                        });
+                        if items.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                Ok::<_, anyhow::Error>(items)
+            }
+            .await
             {
                 Ok(items) => Ok(items),
                 Err(e) => Err(format!("Error scanning chunks: {e:#}")),
@@ -406,7 +401,7 @@ impl CodesearchService {
                     ) else {
                         continue 'outer;
                     };
-                    let looked_up = store.get_chunk(fts_hit.result.chunk_id);
+                    let looked_up = store.get_chunk(fts_hit.result.chunk_id).await;
                     if let Err(ref e) = looked_up {
                         note_store_failure(
                             &mut literal_warnings,
@@ -473,89 +468,86 @@ impl CodesearchService {
                 }
                 items
             } else {
-                match self
-                    .with_vector_store_read_for(
-                        |store| {
-                            // Resolve chunk metadata first so a store `Err`
-                            // propagates to the error arm below ("Error
-                            // resolving search results") instead of silently
-                            // dropping the hit — `Ok(None)` alone is a true
-                            // miss ("chunk not in this store").
-                            let resolved: anyhow::Result<Vec<_>> = fts_results
-                                .iter()
-                                .map(|fts_hit| {
-                                    let chunk = store.get_chunk(fts_hit.result.chunk_id)?;
-                                    Ok((chunk, fts_hit.result.score))
-                                })
-                                .collect();
-                            let items: Vec<LiteralSearchResultItem> = resolved?
-                                .into_iter()
-                                .filter_map(|(looked_up, score)| {
-                                    let chunk = looked_up?;
-                                    Some((chunk, score))
-                                })
-                                .filter(|(chunk, _)| {
-                                    if relaxed_fallback
-                                        && !chunk_covers_significant_terms(
-                                            relaxed_gate_text(chunk),
-                                            &significant_terms,
-                                        )
-                                    {
-                                        return false;
-                                    }
-                                    if let Some(ref lang) = lang_filter {
-                                        let file_lang =
-                                            Language::from_path(std::path::Path::new(&chunk.path));
-                                        if file_lang.name() != lang {
-                                            return false;
-                                        }
-                                    }
-                                    if let Some(ref glob) = glob_filter {
-                                        let relative_path = chunk
-                                            .path
-                                            .strip_prefix(&project_root_normalized)
-                                            .unwrap_or(&chunk.path)
-                                            .trim_start_matches('/');
-                                        if !simple_glob_match(glob, relative_path) {
-                                            return false;
-                                        }
-                                    }
-                                    true
-                                })
-                                .take(limit)
-                                .filter_map(|(chunk, score)| {
-                                    let match_info = match_line_for_literal(
-                                        &chunk.content,
-                                        &effective_query,
-                                        snippet_regex.as_ref(),
-                                    );
-                                    if regex_enabled && match_info.is_none() {
-                                        return None;
-                                    }
-                                    let (match_offset, snippet) = match_info.unwrap_or_else(|| {
-                                        (0, chunk.content.lines().next().unwrap_or("").to_string())
-                                    });
-                                    let match_line = chunk.start_line + match_offset;
-                                    Some(LiteralSearchResultItem {
-                                        path: chunk.path,
-                                        start_line: match_line,
-                                        end_line: match_line,
-                                        snippet,
-                                        score,
-                                        kind: if chunk.kind.is_empty() {
-                                            None
-                                        } else {
-                                            Some(chunk.kind)
-                                        },
-                                        signature: chunk.signature.filter(|s| !s.is_empty()),
-                                    })
-                                })
-                                .collect();
-                            Ok(items)
-                        },
-                        ctx.stores.clone(),
-                    )
-                    .await
+                match async {
+                    let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                    let store = bounded_vector_read(&handle).await?; // Resolve chunk metadata first so a store `Err`
+                                                                     // propagates to the error arm below ("Error
+                                                                     // resolving search results") instead of silently
+                                                                     // dropping the hit — `Ok(None)` alone is a true
+                                                                     // miss ("chunk not in this store").
+                    let mut resolved = Vec::new();
+                    for hit in &fts_results {
+                        resolved.push((
+                            store.get_chunk(hit.result.chunk_id).await?,
+                            hit.result.score,
+                        ));
+                    }
+                    let items: Vec<LiteralSearchResultItem> = resolved
+                        .into_iter()
+                        .filter_map(|(looked_up, score)| {
+                            let chunk = looked_up?;
+                            Some((chunk, score))
+                        })
+                        .filter(|(chunk, _)| {
+                            if relaxed_fallback
+                                && !chunk_covers_significant_terms(
+                                    relaxed_gate_text(chunk),
+                                    &significant_terms,
+                                )
+                            {
+                                return false;
+                            }
+                            if let Some(ref lang) = lang_filter {
+                                let file_lang =
+                                    Language::from_path(std::path::Path::new(&chunk.path));
+                                if file_lang.name() != lang {
+                                    return false;
+                                }
+                            }
+                            if let Some(ref glob) = glob_filter {
+                                let relative_path = chunk
+                                    .path
+                                    .strip_prefix(&project_root_normalized)
+                                    .unwrap_or(&chunk.path)
+                                    .trim_start_matches('/');
+                                if !simple_glob_match(glob, relative_path) {
+                                    return false;
+                                }
+                            }
+                            true
+                        })
+                        .take(limit)
+                        .filter_map(|(chunk, score)| {
+                            let match_info = match_line_for_literal(
+                                &chunk.content,
+                                &effective_query,
+                                snippet_regex.as_ref(),
+                            );
+                            if regex_enabled && match_info.is_none() {
+                                return None;
+                            }
+                            let (match_offset, snippet) = match_info.unwrap_or_else(|| {
+                                (0, chunk.content.lines().next().unwrap_or("").to_string())
+                            });
+                            let match_line = chunk.start_line + match_offset;
+                            Some(LiteralSearchResultItem {
+                                path: chunk.path,
+                                start_line: match_line,
+                                end_line: match_line,
+                                snippet,
+                                score,
+                                kind: if chunk.kind.is_empty() {
+                                    None
+                                } else {
+                                    Some(chunk.kind)
+                                },
+                                signature: chunk.signature.filter(|s| !s.is_empty()),
+                            })
+                        })
+                        .collect();
+                    Ok::<_, anyhow::Error>(items)
+                }
+                .await
                 {
                     Ok(items) => items,
                     Err(e) => {

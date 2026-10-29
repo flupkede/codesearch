@@ -273,16 +273,15 @@ impl CodesearchService {
         }
 
         // Search vector store
-        let vector_results = match self
-            .with_vector_store_read_for(
-                |store| {
-                    store
-                        .search(&query_embedding, limit * 5)
-                        .context("Error searching vector store")
-                },
-                ctx.stores.clone(),
-            )
-            .await
+        let vector_results = match async {
+            let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+            let store = bounded_vector_read(&handle).await?;
+            store
+                .search(&query_embedding, request.filter_path.as_deref(), limit * 5)
+                .await
+                .context("Error searching vector store")
+        }
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -471,41 +470,38 @@ impl CodesearchService {
                     continue;
                 }
 
-                let maybe_resolved = match self
-                    .with_vector_store_read_for(
-                        |store| {
-                            // `Ok(None)` means "this store does not hold that
-                            // chunk" — a normal miss to skip. `Err` means the
-                            // store is broken and must propagate: flattening
-                            // the two silently dropped every remaining literal
-                            // hit whenever the vector store was down, turning a
-                            // dead store into an ordinary-looking short result.
-                            let chunk = match store.get_chunk(fts.chunk_id)? {
-                                Some(c) => c,
-                                None => return Ok(None),
-                            };
-                            Ok(Some(crate::vectordb::SearchResult {
-                                id: fts.chunk_id,
-                                content: chunk.content,
-                                path: chunk.path,
-                                start_line: chunk.start_line,
-                                end_line: chunk.end_line,
-                                kind: chunk.kind,
-                                signature: chunk.signature,
-                                docstring: chunk.docstring,
-                                context: chunk.context,
-                                hash: chunk.hash,
-                                distance: 0.0,
-                                score: fts.score,
-                                context_prev: chunk.context_prev,
-                                context_next: chunk.context_next,
-                                origin: None,
-                                also_in: Vec::new(),
-                            }))
-                        },
-                        ctx.stores.clone(),
-                    )
-                    .await
+                let maybe_resolved = match async {
+                    let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                    let store = bounded_vector_read(&handle).await?; // `Ok(None)` means "this store does not hold that
+                                                                     // chunk" — a normal miss to skip. `Err` means the
+                                                                     // store is broken and must propagate: flattening
+                                                                     // the two silently dropped every remaining literal
+                                                                     // hit whenever the vector store was down, turning a
+                                                                     // dead store into an ordinary-looking short result.
+                    let chunk = match store.get_chunk(fts.chunk_id).await? {
+                        Some(c) => c,
+                        None => return Ok::<_, anyhow::Error>(None),
+                    };
+                    Ok(Some(crate::vectordb::SearchResult {
+                        id: fts.chunk_id,
+                        content: chunk.content,
+                        path: chunk.path,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        kind: chunk.kind,
+                        signature: chunk.signature,
+                        docstring: chunk.docstring,
+                        context: chunk.context,
+                        hash: chunk.hash,
+                        distance: 0.0,
+                        score: fts.score,
+                        context_prev: chunk.context_prev,
+                        context_next: chunk.context_next,
+                        origin: None,
+                        also_in: Vec::new(),
+                    }))
+                }
+                .await
                 {
                     Ok(resolved) => resolved,
                     Err(e) => {
@@ -784,20 +780,12 @@ impl CodesearchService {
             ))]));
         }
         let outcome = self
-            .with_vector_store_read_multi(
-                |alias, store| {
-                    let embedding = embeddings_by_alias.get(alias).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "internal error: no query embedding resolved for repo '{alias}'"
-                        )
-                    })?;
-                    let found = store
-                        .search(embedding, limit * 5)
-                        .context("Error searching vector store")?;
-                    Ok(found)
-                },
-                vector_stores,
+            .search_vector_stores(
+                &vector_stores,
                 &vector_aliases,
+                &embeddings_by_alias,
+                request.filter_path.as_deref(),
+                limit * 5,
             )
             .await;
 
@@ -1108,7 +1096,7 @@ impl CodesearchService {
                 return None;
             }
         };
-        match store.get_chunk(chunk_id) {
+        match store.get_chunk(chunk_id).await {
             Ok(Some(chunk)) => Some(crate::vectordb::SearchResult {
                 id: chunk_id,
                 content: chunk.content,
@@ -1175,7 +1163,7 @@ impl CodesearchService {
                     continue;
                 }
             };
-            let looked_up = store.get_chunk(fts.result.chunk_id);
+            let looked_up = store.get_chunk(fts.result.chunk_id).await;
             if let Err(ref e) = looked_up {
                 note_store_failure(warnings, aliases, idx, "chunk lookup", e);
             }
@@ -1431,43 +1419,42 @@ impl CodesearchService {
         stores: Option<Arc<SharedStores>>,
         warnings: &mut Vec<String>,
     ) -> Vec<crate::vectordb::SearchResult> {
-        let outcome = self
-            .with_vector_store_read_for(
-                |store| {
-                    let mut results = Vec::new();
-                    for fts in fts_results.iter().take(limit) {
-                        // A failed lookup is not an absent chunk. Propagating the
-                        // error keeps a broken vector store from rendering as an
-                        // ordinary empty literal search.
-                        let chunk = store
-                            .get_chunk(fts.chunk_id)
-                            .context("Error resolving FTS hit to chunk metadata")?;
-                        if let Some(chunk) = chunk {
-                            results.push(crate::vectordb::SearchResult {
-                                id: fts.chunk_id,
-                                content: chunk.content,
-                                path: chunk.path,
-                                start_line: chunk.start_line,
-                                end_line: chunk.end_line,
-                                kind: chunk.kind,
-                                signature: chunk.signature,
-                                docstring: chunk.docstring,
-                                context: chunk.context,
-                                hash: chunk.hash,
-                                distance: 0.0,
-                                score: fts.score,
-                                context_prev: chunk.context_prev,
-                                context_next: chunk.context_next,
-                                origin: None,
-                                also_in: Vec::new(),
-                            });
-                        }
-                    }
-                    Ok(results)
-                },
-                stores,
-            )
-            .await;
+        let outcome: anyhow::Result<Vec<crate::vectordb::SearchResult>> = async {
+            let handle = self.chunk_store_for(stores).await?;
+            let store = bounded_vector_read(&handle).await?;
+            let mut results = Vec::new();
+            for fts in fts_results.iter().take(limit) {
+                // A failed lookup is not an absent chunk. Propagating the
+                // error keeps a broken vector store from rendering as an
+                // ordinary empty literal search.
+                let chunk = store
+                    .get_chunk(fts.chunk_id)
+                    .await
+                    .context("Error resolving FTS hit to chunk metadata")?;
+                if let Some(chunk) = chunk {
+                    results.push(crate::vectordb::SearchResult {
+                        id: fts.chunk_id,
+                        content: chunk.content,
+                        path: chunk.path,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        kind: chunk.kind,
+                        signature: chunk.signature,
+                        docstring: chunk.docstring,
+                        context: chunk.context,
+                        hash: chunk.hash,
+                        distance: 0.0,
+                        score: fts.score,
+                        context_prev: chunk.context_prev,
+                        context_next: chunk.context_next,
+                        origin: None,
+                        also_in: Vec::new(),
+                    });
+                }
+            }
+            Ok(results)
+        }
+        .await;
         match outcome {
             Ok(results) => results,
             Err(e) => {

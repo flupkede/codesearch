@@ -168,6 +168,7 @@ pub enum OverlayState {
         chunks: usize,
         files: usize,
         max_chunk_id: u32,
+        storage: String,
         db_size_human: String,
         model: String,
         dims: usize,
@@ -1089,6 +1090,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             chunks,
             files,
             max_chunk_id,
+            storage,
             db_size_human,
             model,
             dims,
@@ -1120,7 +1122,11 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  DB size:     ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("  Storage:     ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(storage.clone(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Local size:  ", Style::default().fg(Color::DarkGray)),
                     Span::styled(db_size_human.clone(), Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![

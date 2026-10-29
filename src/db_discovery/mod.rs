@@ -66,7 +66,14 @@ pub fn is_valid_database(db_path: &Path) -> bool {
     let fts_exists = db_path.join("fts").is_dir();
 
     // All three components must exist
-    metadata_exists && lmdb_exists && fts_exists
+    metadata_exists && (lmdb_exists || uses_postgres(db_path)) && fts_exists
+}
+
+fn uses_postgres(db_path: &Path) -> bool {
+    std::fs::read_to_string(db_path.join("metadata.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .is_some_and(|metadata| metadata["storage_backend"] == "postgres")
 }
 
 /// Check if a database directory exists but is incomplete/corrupt
@@ -86,7 +93,7 @@ pub fn check_database_integrity(db_path: &Path) -> Option<String> {
     if !db_path.join("metadata.json").exists() {
         missing.push("metadata.json");
     }
-    if !db_path.join("data.mdb").exists() {
+    if !db_path.join("data.mdb").exists() && !uses_postgres(db_path) {
         missing.push("data.mdb");
     }
     if !db_path.join("fts").is_dir() {

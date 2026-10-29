@@ -170,6 +170,69 @@ recording contract) is queried with the built-in 384-dim default rather than the
 serve default, and the search response carries a warning naming the assumed model
 and the re-index command.
 
+## Optional PostgreSQL storage
+
+Default builds use local LMDB/arroy and need no database service. Build with
+`cargo build --features pgvector` to enable PostgreSQL storage, then configure
+both indexing and serving processes:
+
+```bash
+export CODESEARCH_STORAGE=postgres
+export CODESEARCH_DATABASE_URL='postgres://codesearch@db.example.net/codesearch?sslmode=verify-full&sslrootcert=/path/to/ca.pem'
+codesearch index /path/to/repository
+codesearch mcp --mode local --path /path/to/repository
+```
+
+Provide credentials through your process environment or secret manager; do not
+commit connection URLs. PostgreSQL must have pgvector **0.8 or later**. An
+administrator can install it with `CREATE EXTENSION vector`; the application
+role needs access to that extension and permission to create tables/indexes in
+its schema, plus SELECT/INSERT/UPDATE/DELETE on its tables. Initialization creates
+`codesearch_index`, `codesearch_repos`, and `codesearch_chunks` idempotently.
+
+For Amazon RDS, enable the supported `vector` extension as an administrative
+role, use the RDS endpoint hostname and current RDS CA bundle, and retain
+`sslmode=verify-full`. Connections default to full certificate/hostname
+verification when no `sslmode` is supplied. `sslmode=disable` is suitable only for
+isolated local test databases. SQLx uses Tokio/rustls and a bounded connection
+pool; operations have a 30-second server statement timeout.
+
+Each database holds **one embedding model and dimension**, shared by all
+repositories. Full-precision cosine HNSW supports dimensions 1–2000 here. A model
+or dimension mismatch fails before a per-repository force reset. To change the
+embedding space, stop all writers, reset all codesearch tables in a dedicated
+database (or provision another database), and reindex every repository. Merely
+removing one repository does not reset database-wide model metadata.
+
+PostgreSQL stores vectors and complete indexed chunk payloads. Repository-scoped
+file replacements are transactional and inserts are batched. Group vector
+queries scope the shared table with `repo = ANY(...)`; selective searches use
+iterative HNSW scanning with exact fallback when the candidate limit underfills.
+Local Tantivy still supplies BM25 and hybrid RRF ranking.
+
+This is **not stateless serving**: Tantivy, SCIP/symbol indexes, embedding cache,
+incremental-sync files and `metadata.json` remain local. Keep that state with its
+repository and preserve the recorded `storage_repo` namespace. Run one writer per
+repository/local index; this backend does not coordinate independent writers on
+multiple hosts. Local publication is separate from the SQL transaction: a failed
+publication leaves committed SQL payloads available, and subsequent refreshes
+reconcile mismatched generations. `get_chunk` still reads surrounding context
+from the current source file and reports freshness; extra context lines are not
+snapshotted in PostgreSQL.
+
+`index rm` deletes the repository's SQL rows before removing local state; a SQL
+failure preserves local registration for retry. Backend selection is recorded in
+`metadata.json`; conflicting `CODESEARCH_STORAGE` settings fail rather than
+silently switching an existing index. There is no automatic LMDB migration: keep
+the default backend or explicitly rebuild into PostgreSQL.
+
+Feature integration tests require Docker and start disposable
+`pgvector/pgvector:0.8.0-pg17` containers:
+
+```bash
+cargo test --features pgvector --test postgres_storage
+```
+
 ## MCP Configuration
 
 codesearch connects to AI agents via MCP. Two modes:

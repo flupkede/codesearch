@@ -1034,7 +1034,7 @@ impl ServeState {
             alias
         );
 
-        match tui::spawn_force_reindex(alias.to_string(), self) {
+        match tui::spawn_force_reindex(alias.to_string(), self).await {
             tui::ReindexLaunch::Started => {
                 // Sequential guarantee: wait until this alias stops indexing
                 // before the worker loop picks the next one. Poll — the
@@ -2364,6 +2364,13 @@ impl ServeState {
             .await_index_task_with_budget(alias, index_task_budget)
             .await;
 
+        if crate::vectordb::storage_backend(&db_path)? == "postgres" {
+            if !index_task_exited {
+                return Err(anyhow::anyhow!("Postgres repository deletion deferred: indexing task still running; registration retained"));
+            }
+            crate::vectordb::delete_postgres_repo(&db_path, &project_path).await?;
+        }
+
         // 3. Unregister from repos.json
         {
             let mut config = self
@@ -3080,7 +3087,10 @@ impl ServeState {
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly, None)? {
+        let stores = match self
+            .try_open_stores(alias, &db_path, false, force_readonly, None)
+            .await?
+        {
             OpenedStores::Readonly(stores) => {
                 // Already registered as Readonly by try_open_stores.
                 //
@@ -3095,7 +3105,7 @@ impl ServeState {
                 // `index_health()` (not `stats()`) on purpose: this arm is the
                 // cheap path that keeps the 2 GiB replica alive, and `stats()`
                 // would deserialize every chunk just to count unique paths.
-                match stores.vector_store.read().await.index_health() {
+                match stores.vector_store.read().await.index_health().await {
                     Ok((total_chunks, false)) if total_chunks > 0 => warn!(
                         "Warmup '{}': opened READ-ONLY but its vector index has no HNSW graph \
                          ({} chunks present). Semantic search will return 0 results for this \
@@ -3128,7 +3138,7 @@ impl ServeState {
         // every chunk in the store just to count unique file paths.
         let needs_build = {
             let vstore = stores.vector_store.read().await;
-            match vstore.index_health() {
+            match vstore.index_health().await {
                 Ok((total_chunks, false)) if total_chunks > 0 => Some(total_chunks),
                 Ok(_) => None,
                 Err(e) => {
@@ -3148,7 +3158,9 @@ impl ServeState {
             let vector_store = Arc::clone(&stores.vector_store);
             match tokio::task::spawn_blocking(move || {
                 let mut vstore = vector_store.blocking_write();
-                vstore.build_index()
+                vstore
+                    .local_mut()
+                    .map_or(Ok(()), |local| local.build_index())
             })
             .await
             {
@@ -3327,7 +3339,10 @@ impl ServeState {
         let db_path = path.join(DB_DIR_NAME);
 
         // Open stores: existence check + write/readonly/conflicted logic.
-        let stores = match self.try_open_stores(alias, &db_path, false, force_readonly, None)? {
+        let stores = match self
+            .try_open_stores(alias, &db_path, false, force_readonly, None)
+            .await?
+        {
             OpenedStores::Readonly(s) => {
                 // Already registered as Readonly; touch and return.
                 self.touch_access(alias);
@@ -3357,13 +3372,19 @@ impl ServeState {
                 // `(total_chunks, indexed)`, while `stats()` deserializes every
                 // ChunkMetadata in the store just to count unique file paths.
                 // Same two values from the same source, on a memory-sensitive path.
-                match vstore.index_health() {
+                let Some(local) = vstore.local() else {
+                    return;
+                };
+                match local.index_health() {
                     Ok((total_chunks, false)) if total_chunks > 0 => {
                         info!(
                             "Building vector index for '{}' ({} existing chunks)",
                             alias_owned, total_chunks
                         );
-                        if let Err(e) = vstore.build_index() {
+                        if let Err(e) = vstore
+                            .local_mut()
+                            .map_or(Ok(()), |local| local.build_index())
+                        {
                             warn!("Failed to build vector index for '{}': {}", alias_owned, e);
                         }
                     }
@@ -3589,19 +3610,15 @@ impl ServeState {
     /// `allow_create=false`: warmup / incremental reindex path — fails if DB is missing.
     /// `allow_create=true`:  force-reindex / add-repo path — creates fresh DB if missing.
     ///
-    /// `dimension_override` forces the embeddings dimension (e.g. a model
-    /// override on `POST /repos`); `None` reads it from `metadata.json`. The
-    /// caller must have made the on-disk store consistent with the override
-    /// (a fresh DB, or one whose data will be cleared by the reindex) — opening
-    /// a store at a different dimension than its vectors were written with
-    /// yields a dimension mismatch on the first insert.
-    fn try_open_stores(
+    /// `model_override` selects the embedding space for index creation.
+    /// PostgreSQL validates it against the database before any replacement.
+    async fn try_open_stores(
         &self,
         alias: &str,
         db_path: &Path,
         allow_create: bool,
         force_readonly: bool,
-        dimension_override: Option<usize>,
+        model_override: Option<crate::embed::ModelType>,
     ) -> std::result::Result<OpenedStores, String> {
         if !db_path.exists() && !allow_create {
             let parent = db_path
@@ -3617,14 +3634,28 @@ impl ServeState {
             ));
         }
 
-        let dims = dimension_override.unwrap_or_else(|| self.get_dimensions_for_path(db_path));
+        let model = model_override
+            .or_else(|| crate::embed::ModelType::from_index_metadata(db_path))
+            .or(self.default_model())
+            .unwrap_or_default();
+        let dims = model_override
+            .map(|model| model.dimensions())
+            .unwrap_or_else(|| self.get_dimensions_for_path(db_path));
+        let project_path = self
+            .config
+            .read()
+            .map_err(|error| format!("Config lock failed: {error}"))?
+            .repos
+            .get(alias)
+            .cloned()
+            .unwrap_or_else(|| db_path.parent().unwrap_or(db_path).to_path_buf());
 
         // Read-only requested via the per-repo `repo_read_only` config flag:
         // open readonly directly and never attempt a write open. This makes
         // warmup return early (no incremental-refresh embedding), which is the
         // point for large static corpora on a memory-constrained replica.
         if force_readonly {
-            return match SharedStores::new_readonly(db_path, dims) {
+            return match SharedStores::open(db_path, &project_path, model, dims, true).await {
                 Ok(s) => {
                     info!("Opened repo in readonly mode (forced by config): {}", alias);
                     let stores_arc = Arc::new(s.with_job_gate(Arc::clone(&self.job_gate)));
@@ -3644,7 +3675,7 @@ impl ServeState {
             };
         }
 
-        match SharedStores::new(db_path, dims) {
+        match SharedStores::open(db_path, &project_path, model, dims, false).await {
             Ok(s) => {
                 info!("Opened repo in write mode: {}", alias);
                 Ok(OpenedStores::Write(Arc::new(
@@ -3658,7 +3689,7 @@ impl ServeState {
                         alias, write_err
                     ));
                 }
-                match SharedStores::new_readonly(db_path, dims) {
+                match SharedStores::open(db_path, &project_path, model, dims, true).await {
                     Ok(s) => {
                         info!("Opened repo in readonly mode: {}", alias);
                         let stores_arc = Arc::new(s.with_job_gate(Arc::clone(&self.job_gate)));
@@ -4930,18 +4961,23 @@ async fn info_handler(
     // open (nothing live to ask), so a consumer can tell "no graph" apart from
     // "unknown" instead of reading a defaulted `false` as a hard failure.
     let mut indexed: Option<bool> = None;
+    let backend = crate::vectordb::storage_backend(&db_path).unwrap_or_else(|_| "unknown".into());
+    let mut storage_error: Option<String> = None;
 
     // If stores are open, live stats override metadata.
     if let Some(stores) = state.get_opened_stores(&alias) {
         if let Ok(vs) = stores.vector_store.try_read() {
-            if let Ok(live_stats) = vs.stats() {
-                chunks = live_stats.total_chunks;
-                files = live_stats.total_files;
-                max_chunk_id = live_stats.max_chunk_id;
-                indexed = Some(live_stats.indexed);
-                if dims == 0 {
-                    dims = live_stats.dimensions;
+            match vs.stats().await {
+                Ok(live_stats) => {
+                    chunks = live_stats.total_chunks;
+                    files = live_stats.total_files;
+                    max_chunk_id = live_stats.max_chunk_id;
+                    indexed = Some(live_stats.indexed);
+                    if dims == 0 {
+                        dims = live_stats.dimensions;
+                    }
                 }
+                Err(error) => storage_error = Some(format!("{error:#}")),
             }
         }
         lock = if stores.readonly {
@@ -4966,6 +5002,8 @@ async fn info_handler(
         "chunks": chunks,
         "files": files,
         "max_chunk_id": max_chunk_id,
+        "backend": backend,
+        "storage_error": storage_error,
         "db_size_human": db_size_human,
         "model": model,
         "dims": dims,
@@ -5023,11 +5061,26 @@ async fn doctor_handler(
     // (via blocking_read inside the blocking task) to avoid double-opening the
     // env; otherwise diagnose() opens its own read-only handle.
     let opened = state.get_opened_stores(&alias);
+    if let Some(ref stores) = opened {
+        let store = stores.vector_store.read().await;
+        if store.backend() == "postgres" {
+            let results = match crate::cli::doctor::diagnose_storage(&project_path, &store).await {
+                Ok(report) => report.render_tui(),
+                Err(error) => vec![format!("Doctor failed: {error:#}")],
+            };
+            return AxumJson(json!({ "results": results })).into_response();
+        }
+    }
     let pp = project_path.clone();
     let report = tokio::task::spawn_blocking(move || match opened {
         Some(stores) => {
             let vs = stores.vector_store.blocking_read();
-            crate::cli::doctor::diagnose_with_store(&pp, &vs)
+            match vs.local() {
+                Some(local) => crate::cli::doctor::diagnose_with_store(&pp, local),
+                None => Err(anyhow::anyhow!(
+                    "Postgres diagnostics require async storage check"
+                )),
+            }
         }
         None => crate::cli::doctor::diagnose(&pp),
     })
@@ -5557,7 +5610,10 @@ async fn reindex_handler(
                 // FSW not running -- open existing or create fresh DB.
                 // allow_create=true so a force-reindex can recover a deleted DB.
                 let cancel = CancellationToken::new();
-                match state.try_open_stores(&alias, &db_path, true, false, None) {
+                match state
+                    .try_open_stores(&alias, &db_path, true, false, None)
+                    .await
+                {
                     Ok(OpenedStores::Write(s)) => {
                         // Register as Write to block double-open races while we reindex.
                         state.repos.insert(
@@ -5970,13 +6026,10 @@ async fn add_repo_handler(
     // This eliminates the LMDB double-open race that occurred when the old
     //  path opened its own LMDB handle, conflicting with
     //  calls from the serve's request handlers.
-    let stores = match state.try_open_stores(
-        &alias,
-        &db_path,
-        true,
-        false,
-        model_override.map(|m| m.dimensions()),
-    ) {
+    let stores = match state
+        .try_open_stores(&alias, &db_path, true, false, model_override)
+        .await
+    {
         Ok(OpenedStores::Write(s)) => s,
         Ok(OpenedStores::Readonly(_)) => {
             unreachable!(
@@ -6179,7 +6232,9 @@ async fn add_repo_handler(
                 let alias_bi = alias_bg.clone();
                 match tokio::task::spawn_blocking(move || {
                     let mut vstore = vector_store.blocking_write();
-                    vstore.build_index()
+                    vstore
+                        .local_mut()
+                        .map_or(Ok(()), |local| local.build_index())
                 })
                 .await
                 {

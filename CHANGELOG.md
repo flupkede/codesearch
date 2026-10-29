@@ -18,6 +18,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Added
 
+- **Optional PostgreSQL/pgvector chunk storage** behind the `pgvector` Cargo feature and `CODESEARCH_STORAGE=postgres`. Stores vectors and complete chunk payloads with transactional file replacement, shared repository-scoped cosine HNSW search, model/dimension validation, and SQL-aware deletion/recovery. Tantivy, symbols and sync state remain local; the default offline LMDB backend is unchanged. Includes RDS/TLS setup documentation and disposable PostgreSQL integration qualification.
+
 - **Space toggles collapse/expand of worktree families and peer groups in the serve TUI.** The family tree made big fleets longer than one screen, and there was no way to hide what you were not working on. Space resolves the selected row's group (a family main, a peer header, or a child walking back to its anchor) and toggles it; collapsed groups hide their children from the rendered rows while the anchor row stays selectable so space expands again. The footer gains a space hint; the remote dashboard has no grouping, so space is a no-op there.
 
 - **PageUp/PageDown page through the repo table.** The selection moves by one page — the frame's body height minus the table header chrome, captured during draw — clamped to the row range; a page at or above the row count degenerates to Home/End. Wired into both the embedded and the remote dashboard loops.

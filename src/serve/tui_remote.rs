@@ -372,6 +372,13 @@ async fn run_remote_tui_loop(
                                                 chunks: info.chunks,
                                                 files: info.files,
                                                 max_chunk_id: info.max_chunk_id,
+                                                storage: match info.storage_error {
+                                                    Some(error) => format!(
+                                                        "{} unavailable: {error}",
+                                                        info.backend
+                                                    ),
+                                                    None => info.backend,
+                                                },
                                                 db_size_human: info.db_size_human,
                                                 model: info.model,
                                                 dims: info.dims,
@@ -519,6 +526,8 @@ struct InfoResponse {
     /// deserializes instead of failing with "missing field" — it just renders empty.
     #[serde(default)]
     path: String,
+    backend: String,
+    storage_error: Option<String>,
     chunks: usize,
     files: usize,
     max_chunk_id: u32,

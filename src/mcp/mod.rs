@@ -46,8 +46,8 @@ fn store_lock_wait() -> std::time::Duration {
 /// up; the bound turns that into a retryable "store busy" error and lets
 /// eviction proceed.
 pub(crate) async fn bounded_vector_read(
-    lock: &tokio::sync::RwLock<VectorStore>,
-) -> Result<tokio::sync::RwLockReadGuard<'_, VectorStore>> {
+    lock: &tokio::sync::RwLock<ChunkStore>,
+) -> Result<tokio::sync::RwLockReadGuard<'_, ChunkStore>> {
     let wait = store_lock_wait();
     tokio::time::timeout(wait, lock.read()).await.map_err(|_| {
         anyhow::anyhow!(
@@ -87,12 +87,12 @@ pub(crate) async fn bounded_fts_read(
 /// Returns `None` after appending the same "store busy" warning the search
 /// fan-outs emit, so every skipped repo is named in the response.
 pub(crate) fn try_vector_read_or_note<'a>(
-    lock: &'a tokio::sync::RwLock<VectorStore>,
+    lock: &'a tokio::sync::RwLock<ChunkStore>,
     aliases: &[String],
     idx: usize,
     warnings: &mut Vec<String>,
     what: &str,
-) -> Option<tokio::sync::RwLockReadGuard<'a, VectorStore>> {
+) -> Option<tokio::sync::RwLockReadGuard<'a, ChunkStore>> {
     match lock.try_read() {
         Ok(store) => Some(store),
         Err(_) => {
@@ -160,7 +160,7 @@ use crate::index::SharedStores;
 use crate::rerank::{rrf_fusion, rrf_fusion_with_exact, vector_only, EXACT_MATCH_RRF_K};
 use crate::search::{adapt_rrf_k, boost_kind, detect_identifiers, detect_structural_intent};
 use crate::symbols::SymbolIndexerRegistry;
-use crate::vectordb::VectorStore;
+use crate::vectordb::{ChunkStore, VectorStore};
 use anyhow::{Context, Result};
 use regex::Regex;
 use rmcp::{
@@ -958,6 +958,7 @@ fn parse_import_lines(content: &str, start_line: usize) -> Vec<ImportItem> {
 /// Stdio MCP (`--mode local`) and HTTP serve both hold a live `SharedStores` on
 /// the same LMDB path. A second open is rejected by `TrackedEnv`. Gating only on
 /// `serve_state` left stdio (shared stores, no serve state) on the fallback path.
+#[cfg(test)]
 pub(crate) fn allow_vector_store_second_open(has_shared_stores: bool) -> bool {
     !has_shared_stores
 }
@@ -1407,16 +1408,36 @@ impl CodesearchService {
         payload.to_string()
     }
 
+    async fn chunk_store_for(
+        &self,
+        store_override: Option<Arc<SharedStores>>,
+    ) -> Result<Arc<tokio::sync::RwLock<ChunkStore>>> {
+        if let Some(stores) = store_override.or_else(|| self.shared_stores.clone()) {
+            return Ok(Arc::clone(&stores.vector_store));
+        }
+        Ok(Arc::new(tokio::sync::RwLock::new(
+            ChunkStore::open_for_path(
+                &self.db_path,
+                &self.project_path,
+                self.model_type.short_name(),
+                self.dimensions,
+                false,
+            )
+            .await?,
+        )))
+    }
+
     /// Execute a read-only action against the vector store with an explicit store override.
     ///
     /// If `store_override` is provided (from project/group routing), it takes precedence.
+    #[cfg(test)]
     async fn with_vector_store_read_for<R, F>(
         &self,
         mut action: F,
         store_override: Option<Arc<SharedStores>>,
     ) -> Result<R>
     where
-        F: FnMut(&VectorStore) -> anyhow::Result<R>,
+        F: FnMut(&ChunkStore) -> anyhow::Result<R>,
     {
         // Priority 1: explicit store override (from project/group routing)
         if let Some(stores) = store_override {
@@ -1445,8 +1466,15 @@ impl CodesearchService {
         }
 
         // No live shared store: true standalone CLI (not stdio MCP with SharedStores).
-        let store = VectorStore::new(&self.db_path, self.dimensions)
-            .context("Error opening database for read fallback")?;
+        let store = ChunkStore::open_for_path(
+            &self.db_path,
+            &self.project_path,
+            self.model_type.short_name(),
+            self.dimensions,
+            false,
+        )
+        .await
+        .context("Error opening database for read fallback")?;
         action(&store).context("Error reading from vector store")
     }
 
@@ -1459,7 +1487,8 @@ impl CodesearchService {
         store_override: Option<Arc<SharedStores>>,
     ) -> Result<R>
     where
-        F: Fn(&FtsStore) -> Result<R>,
+        F: Fn(&FtsStore) -> Result<R> + Send,
+        R: Send,
     {
         // Priority 1: explicit store override (from project/group routing)
         if let Some(stores) = store_override {
@@ -1490,6 +1519,76 @@ impl CodesearchService {
     /// not blind a group query to the healthy ones — but it is reported back in
     /// [`MultiReadOutcome::failures`] so the caller can tell an genuinely empty
     /// result apart from a total failure.
+    async fn search_vector_stores(
+        &self,
+        stores: &[Arc<SharedStores>],
+        aliases: &[String],
+        embeddings: &std::collections::HashMap<String, Vec<f32>>,
+        prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<MultiReadOutcome<crate::vectordb::SearchResult>> {
+        let mut outcome = MultiReadOutcome::default();
+        #[cfg(feature = "pgvector")]
+        let mut remote: Option<(
+            crate::vectordb::PostgresStore,
+            Vec<String>,
+            std::collections::HashMap<String, String>,
+        )> = None;
+        for (shared, alias) in stores.iter().zip(aliases) {
+            let backend = match shared.vector_store.try_read() {
+                Ok(store) => store,
+                Err(_) => {
+                    outcome.failures.push((
+                        alias.clone(),
+                        "store busy: active indexing holds the write lock".into(),
+                    ));
+                    continue;
+                }
+            };
+            #[cfg(feature = "pgvector")]
+            if let ChunkStore::Postgres { store, repo } = &*backend {
+                let (_, repos, names) = remote.get_or_insert_with(|| {
+                    (store.clone(), Vec::new(), std::collections::HashMap::new())
+                });
+                repos.push(repo.clone());
+                names.insert(repo.clone(), alias.clone());
+                continue;
+            }
+            let embedding = embeddings.get(alias).context("Missing query embedding")?;
+            match backend.search(embedding, prefix, limit).await {
+                Ok(results) => outcome.results.extend(
+                    results
+                        .into_iter()
+                        .map(|result| SourcedResult::new(alias.clone(), result)),
+                ),
+                Err(error) => outcome.failures.push((alias.clone(), format!("{error:#}"))),
+            }
+        }
+        #[cfg(feature = "pgvector")]
+        if let Some((store, repos, names)) = remote {
+            let alias = names.get(&repos[0]).context("Missing repository alias")?;
+            let embedding = embeddings.get(alias).context("Missing query embedding")?;
+            match store.search(&repos, embedding, prefix, limit).await {
+                Ok(results) => {
+                    for mut result in results {
+                        let repo = result.origin.take().context("Missing result repository")?;
+                        let alias = names.get(&repo).context("Unknown result repository")?;
+                        outcome
+                            .results
+                            .push(SourcedResult::new(alias.clone(), result));
+                    }
+                }
+                Err(error) => {
+                    for alias in names.into_values() {
+                        outcome.failures.push((alias, format!("{error:#}")));
+                    }
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    #[cfg(test)]
     async fn with_vector_store_read_multi<R, F>(
         &self,
         mut action: F,
@@ -1526,7 +1625,10 @@ impl CodesearchService {
                     continue;
                 }
             };
-            match action(alias, &store) {
+            let local = store
+                .local()
+                .ok_or_else(|| anyhow::anyhow!("Postgres queries require shared SQL scope"))?;
+            match action(alias, local) {
                 Ok(results) => {
                     for r in results {
                         let key = (alias.to_string(), r.chunk_id());

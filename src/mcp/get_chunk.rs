@@ -136,7 +136,7 @@ impl CodesearchService {
                     ) else {
                         continue;
                     };
-                    match store.get_chunk(request.chunk_id) {
+                    match store.get_chunk(request.chunk_id).await {
                         Ok(Some(_)) => {
                             // A store that HAS the chunk stays a candidate even if
                             // its alias is missing. `resolve_repo_stores_multi`
@@ -206,7 +206,12 @@ impl CodesearchService {
                         // project-relative stored path, so the group-scoped
                         // answer used to ship unprefixed.
                         let root = ctx.alias_roots.get(alias).map(String::as_str).unwrap_or("");
-                        match store.as_ref().map(|s| s.get_chunk(request.chunk_id)) {
+                        let looked_up = if let Some(store) = store.as_ref() {
+                            Some(store.get_chunk(request.chunk_id).await)
+                        } else {
+                            None
+                        };
+                        match looked_up {
                             Some(Ok(Some(mut c))) => {
                                 owner_alias = Some(alias.clone());
                                 stored_path_raw = Some(c.path.clone());
@@ -254,7 +259,7 @@ impl CodesearchService {
                             continue;
                         }
                     };
-                    match store.get_chunk(request.chunk_id) {
+                    match store.get_chunk(request.chunk_id).await {
                         Ok(Some(c)) => {
                             owner_alias = aliases.get(i).cloned();
                             found = Some(c);
@@ -273,12 +278,12 @@ impl CodesearchService {
                 found
             }
         } else {
-            match self
-                .with_vector_store_read_for(
-                    |store| store.get_chunk(request.chunk_id),
-                    ctx.stores.clone(),
-                )
-                .await
+            match async {
+                let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                let store = bounded_vector_read(&handle).await?;
+                store.get_chunk(request.chunk_id).await
+            }
+            .await
             {
                 Ok(c) => {
                     owner_alias = ctx.project_alias.clone();

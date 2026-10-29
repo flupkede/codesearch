@@ -13,9 +13,11 @@ use std::time::Instant;
 
 use super::{JsonOutput, JsonResult, JsonTiming, SearchOptions};
 use crate::fts::FtsStore;
+use crate::vectordb::ChunkStore;
+#[cfg(test)]
 use crate::vectordb::VectorStore;
 
-pub fn run(
+pub async fn run(
     query: &str,
     db_path: &Path,
     project_path: &Path,
@@ -23,7 +25,8 @@ pub fn run(
     options: &SearchOptions,
 ) -> Result<()> {
     let start = Instant::now();
-    let (results, scan_fallback) = search_fts(query, db_path, project_path, dimensions, options)?;
+    let (results, scan_fallback) =
+        search_fts(query, db_path, project_path, dimensions, options).await?;
     let search_ms = start.elapsed().as_millis() as u64;
     emit(query, &results, options, search_ms, scan_fallback)
 }
@@ -31,7 +34,7 @@ pub fn run(
 /// The search core: FTS primitive dispatch → chunk resolution → filter →
 /// dedup → truncate. Separated from `run` so tests can drive it without
 /// stdout. The bool reports whether the raw-content scan fallback ran.
-fn search_fts(
+async fn search_fts(
     query: &str,
     db_path: &Path,
     project_path: &Path,
@@ -49,7 +52,8 @@ fn search_fts(
             // can be 0-for-N even when the text exists. Fall back to a raw
             // chunk-content scan — the same escape hatch MCP literal_search
             // uses for tokenless patterns.
-            let scanned = scan_chunks_for_regex(query, db_path, project_path, dimensions, options)?;
+            let scanned =
+                scan_chunks_for_regex(query, db_path, project_path, dimensions, options).await?;
             return Ok((scanned, true));
         }
         hits
@@ -67,11 +71,14 @@ fn search_fts(
     fts_results.truncate(limit);
 
     // Resolve chunk content via the vector store's metadata side of the DB.
-    let store = VectorStore::open_readonly(db_path, dimensions)?;
+    let model = crate::embed::ModelType::from_index_metadata(db_path).unwrap_or_default();
+    let store =
+        ChunkStore::open_for_path(db_path, project_path, model.short_name(), dimensions, true)
+            .await?;
     let mut results: Vec<crate::vectordb::SearchResult> = Vec::with_capacity(fts_results.len());
     for hit in fts_results {
         // A store error must never silently become "no results".
-        match store.get_chunk_as_result(hit.chunk_id) {
+        match store.get_chunk_as_result(hit.chunk_id).await {
             Ok(Some(mut r)) => {
                 r.score = hit.score;
                 results.push(r);
@@ -130,7 +137,7 @@ fn finalize_results(
 /// `ref:classification\s+search=` never matches even when the text exists;
 /// this walks every chunk's raw content instead. Unranked (score 0.0,
 /// insertion order), bounded by `max_results`.
-fn scan_chunks_for_regex(
+async fn scan_chunks_for_regex(
     query: &str,
     db_path: &Path,
     project_path: &Path,
@@ -138,11 +145,14 @@ fn scan_chunks_for_regex(
     options: &SearchOptions,
 ) -> Result<Vec<crate::vectordb::SearchResult>> {
     let re = regex::Regex::new(query).map_err(|e| anyhow::anyhow!("invalid regex: {e:#}"))?;
-    let store = VectorStore::open_readonly(db_path, dimensions)?;
+    let model = crate::embed::ModelType::from_index_metadata(db_path).unwrap_or_default();
+    let store =
+        ChunkStore::open_for_path(db_path, project_path, model.short_name(), dimensions, true)
+            .await?;
     let limit = options.max_results.max(1);
 
     let mut results: Vec<crate::vectordb::SearchResult> = Vec::new();
-    for (chunk_id, meta) in store.iter_all_chunks()? {
+    for (chunk_id, meta) in store.iter_all_chunks().await? {
         if results.len() >= limit {
             break;
         }
@@ -423,12 +433,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn literal_tokens_find_xml_content() {
+    #[tokio::test]
+    async fn literal_tokens_find_xml_content() {
         let tmp = tempfile::tempdir().unwrap();
         seed(tmp.path());
         let (hits, scan_fallback) =
-            search_fts("ref:classification", tmp.path(), tmp.path(), 2, &opts("l")).unwrap();
+            search_fts("ref:classification", tmp.path(), tmp.path(), 2, &opts("l"))
+                .await
+                .unwrap();
         assert!(!scan_fallback);
         assert_eq!(
             hits.len(),
@@ -439,17 +451,19 @@ mod tests {
         assert_eq!(hits[0].path, "src/a.xml");
     }
 
-    #[test]
-    fn phrase_matches_token_sequence() {
+    #[tokio::test]
+    async fn phrase_matches_token_sequence() {
         let tmp = tempfile::tempdir().unwrap();
         seed(tmp.path());
-        let (hits, _) = search_fts("no watermark", tmp.path(), tmp.path(), 2, &opts("lp")).unwrap();
+        let (hits, _) = search_fts("no watermark", tmp.path(), tmp.path(), 2, &opts("lp"))
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "src/a.xml");
     }
 
-    #[test]
-    fn scan_fallback_applies_filter_path_inside_the_loop() {
+    #[tokio::test]
+    async fn scan_fallback_applies_filter_path_inside_the_loop() {
         // The scan must filter BEFORE consuming a limit slot: with the first
         // matching chunk outside the filter and max_results 1, an unfiltered
         // break would return 0 while a filtered hit exists (round-1 review
@@ -461,7 +475,9 @@ mod tests {
         o.filter_path = Some("src".to_string());
         o.max_results = 1;
         let (hits, scan_fallback) =
-            search_fts(r"ref:classification\s+id=", tmp.path(), tmp.path(), 2, &o).unwrap();
+            search_fts(r"ref:classification\s+id=", tmp.path(), tmp.path(), 2, &o)
+                .await
+                .unwrap();
         assert!(scan_fallback, "separator-spanning regex must scan");
         assert_eq!(
             hits.len(),
@@ -519,8 +535,8 @@ mod tests {
         fts.commit().unwrap();
     }
 
-    #[test]
-    fn regex_spanning_separators_falls_back_to_raw_scan() {
+    #[tokio::test]
+    async fn regex_spanning_separators_falls_back_to_raw_scan() {
         // The XML rule-config class of query: anchorable tokens exist, but the
         // token-regex can never match a separator-spanning pattern. The 0-hits
         // fallback scans raw chunk content, so the hit is still found.
@@ -533,6 +549,7 @@ mod tests {
             2,
             &opts("lr"),
         )
+        .await
         .unwrap();
         assert!(scan_fallback, "separator-spanning regex must scan");
         assert_eq!(
@@ -549,8 +566,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_literal_falls_back_to_relaxed() {
+    #[tokio::test]
+    async fn empty_literal_falls_back_to_relaxed() {
         let tmp = tempfile::tempdir().unwrap();
         seed(tmp.path());
         // "unrelated" alone hits chunk 1; AND-ing it with a missing term stays
@@ -562,6 +579,7 @@ mod tests {
             2,
             &opts("l"),
         )
+        .await
         .unwrap();
         assert!(
             hits.iter().any(|h| h.path == "src/b.rs"),

@@ -704,7 +704,15 @@ async fn index_with_options(
     log_file: Option<PathBuf>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    let (db_path, project_path) = get_db_path_smart(path, global, force)?;
+    let requested_project = path.as_deref().unwrap_or(Path::new("."));
+    let candidate = requested_project.join(crate::constants::DB_DIR_NAME);
+    let existing = find_best_database(path.as_deref())?;
+    let backend_path = existing
+        .as_ref()
+        .map(|info| info.db_path.as_path())
+        .unwrap_or(&candidate);
+    let postgres = crate::vectordb::storage_backend(backend_path)? == "postgres";
+    let (db_path, project_path) = get_db_path_smart(path, global, force && !postgres)?;
     // Resolve the embedding model BEFORE touching the index: on an existing
     // index the model recorded in metadata.json wins, and an explicit `--model`
     // that disagrees is rejected (rebuild with --force). Defaulting here would
@@ -773,6 +781,32 @@ async fn index_with_options(
     log_print!("   Total size: {:.2} MB", stats.total_size_mb());
 
     if files.is_empty() {
+        if !dry_run && postgres && db_path.join("metadata.json").exists() {
+            let stores = SharedStores::open(
+                &db_path,
+                &project_path,
+                model_type,
+                model_type.dimensions(),
+                false,
+            )
+            .await?;
+            if force {
+                stores.vector_store.write().await.clear().await?;
+                stores.fts_store.write().await.clear()?;
+                FileMetaStore::new(model_type.short_name().into(), model_type.dimensions())
+                    .save(&db_path)?;
+            } else {
+                IndexManager::perform_incremental_refresh_with_stores(
+                    &project_path,
+                    &db_path,
+                    &stores,
+                    &cancel_token,
+                    None,
+                    None,
+                )
+                .await?;
+            }
+        }
         log_print!("\n{}", "No files to index!".yellow());
         return Ok(());
     }
@@ -805,9 +839,16 @@ async fn index_with_options(
         // the metadata was lost/reset. Re-indexing without clearing would create
         // duplicate chunks. Detect and clear before proceeding.
         if file_meta_store.is_empty() {
-            let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
-            let existing_chunks = vs.stats().map(|s| s.total_chunks).unwrap_or(0);
-            if existing_chunks > 0 {
+            let mut vs = crate::vectordb::ChunkStore::open_for_path(
+                &db_path,
+                &project_path,
+                model_type.short_name(),
+                model_type.dimensions(),
+                false,
+            )
+            .await?;
+            let existing_chunks = vs.stats().await?.total_chunks;
+            if existing_chunks > 0 && vs.local().is_some() {
                 log_print!(
                     "{}",
                     format!(
@@ -817,7 +858,7 @@ async fn index_with_options(
                     )
                     .yellow()
                 );
-                vs.clear()?;
+                vs.clear().await?;
                 drop(vs);
                 // Also clear FTS
                 let mut fts = FtsStore::new_with_writer(&db_path)?;
@@ -829,27 +870,56 @@ async fn index_with_options(
         }
 
         if !file_meta_store.is_empty() {
-            let mut vs = VectorStore::new(&db_path, model_type.dimensions())?;
-            let mut fts = FtsStore::new_with_writer(&db_path)?;
-            if key_migration::repair_legacy_index(
+            let mut vs = crate::vectordb::ChunkStore::open_for_path(
+                &db_path,
                 &project_path,
-                file_meta_store,
-                &mut vs,
-                &mut fts,
-            )? {
-                file_meta_store.save(&db_path)?;
+                model_type.short_name(),
+                model_type.dimensions(),
+                false,
+            )
+            .await?;
+            if let Some(local) = vs.local_mut() {
+                let mut fts = FtsStore::new_with_writer(&db_path)?;
+                if key_migration::repair_legacy_index(
+                    &project_path,
+                    file_meta_store,
+                    local,
+                    &mut fts,
+                )? {
+                    file_meta_store.save(&db_path)?;
+                }
             }
         }
 
         // Find changed and deleted files
         let mut changed_files = Vec::new();
         let mut unchanged_files = 0;
+        let remote_files = if crate::vectordb::storage_backend(&db_path)? == "postgres" {
+            let store = crate::vectordb::ChunkStore::open_for_path(
+                &db_path,
+                &project_path,
+                model_type.short_name(),
+                model_type.dimensions(),
+                true,
+            )
+            .await?;
+            Some(store.get_chunks_by_file().await?)
+        } else {
+            None
+        };
 
         for file in &files {
             let key = storage_key(&file.path, &project_path);
-            let (needs_reindex, _old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
+            let (needs_reindex, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
+            let publication_incomplete = remote_files.as_ref().is_some_and(|files| {
+                let mut committed = files.get(&key).cloned().unwrap_or_default();
+                let mut published = old_chunk_ids.clone();
+                committed.sort_unstable();
+                published.sort_unstable();
+                committed != published
+            });
 
-            if needs_reindex {
+            if needs_reindex || publication_incomplete {
                 changed_files.push(file.clone());
                 debug!("📝 File changed (needs reindex): {}", file.path.display());
             } else {
@@ -859,7 +929,16 @@ async fn index_with_options(
         }
 
         // Find deleted files (in metadata but not on disk)
-        let deleted_files = file_meta_store.find_deleted_files(&project_path);
+        let mut deleted_files = file_meta_store.find_deleted_files(&project_path);
+        if let Some(remote_files) = &remote_files {
+            for (path, ids) in remote_files {
+                if !project_path.join(path).exists()
+                    && !deleted_files.iter().any(|(key, _)| key == path)
+                {
+                    deleted_files.push((path.clone(), ids.clone()));
+                }
+            }
+        }
 
         for (file_path, _chunk_ids) in &deleted_files {
             debug!("🗑️  File deleted from disk: {}", file_path);
@@ -874,7 +953,11 @@ async fn index_with_options(
             // Safety net: if a previous run was cancelled/interrupted mid-way,
             // the HNSW vector index may never have been built. Detect this and
             // rebuild now so the database is usable without requiring --force.
-            match ensure_hnsw_index_if_needed(&db_path, model_type.dimensions()) {
+            match if crate::vectordb::storage_backend(&db_path)? == "local" {
+                ensure_hnsw_index_if_needed(&db_path, model_type.dimensions())
+            } else {
+                Ok(false)
+            } {
                 Ok(true) => {
                     log_print!(
                         "\n{}",
@@ -909,7 +992,14 @@ async fn index_with_options(
         if total_chunks_to_delete > 0 {
             log_print!("\n🔄 Deleting {} old chunks...", total_chunks_to_delete);
 
-            let mut store = VectorStore::new(&db_path, model_type.dimensions())?;
+            let mut store = crate::vectordb::ChunkStore::open_for_path(
+                &db_path,
+                &project_path,
+                model_type.short_name(),
+                model_type.dimensions(),
+                false,
+            )
+            .await?;
             let mut fts_store = FtsStore::new_with_writer(&db_path)?;
 
             // Delete deleted files' metadata and chunks
@@ -921,7 +1011,7 @@ async fn index_with_options(
                         file_path
                     );
                     debug!("   File path: {}", file_path);
-                    store.delete_chunks(&chunk_ids)?;
+                    store.delete_file(&file_path).await?;
                     for chunk_id in &chunk_ids {
                         fts_store.delete_chunk(*chunk_id)?;
                     }
@@ -941,7 +1031,9 @@ async fn index_with_options(
                         file_path_str
                     );
                     debug!("   File path: {}", file.path.display());
-                    store.delete_chunks(&old_chunk_ids)?;
+                    if let Some(local) = store.local_mut() {
+                        local.delete_chunks(&old_chunk_ids)?;
+                    }
                     for chunk_id in &old_chunk_ids {
                         fts_store.delete_chunk(*chunk_id)?;
                     }
@@ -952,7 +1044,7 @@ async fn index_with_options(
 
             // Rebuild vector index after deletions - critical for ANN search correctness
             log_print!("🔨 Rebuilding vector index after deletions...");
-            store.build_index()?;
+            store.build_index().await?;
 
             log_print!("✅ Deleted {} chunks", total_chunks_to_delete);
 
@@ -1011,10 +1103,23 @@ async fn index_with_options(
     }
 
     // Initialize vector store
-    let mut store = VectorStore::new(&db_path, embedding_service.dimensions())?;
+    let mut store = crate::vectordb::ChunkStore::open_for_path(
+        &db_path,
+        &project_path,
+        model_type.short_name(),
+        embedding_service.dimensions(),
+        false,
+    )
+    .await?;
+    if force {
+        store.clear().await?;
+    }
 
     // Initialize FTS store
     let mut fts_store = FtsStore::new_with_writer(&db_path)?;
+    if force && store.backend() == "postgres" {
+        fts_store.clear()?;
+    }
 
     // Track chunk IDs per file for metadata (memory efficient: only file paths, not chunk contents)
     let mut file_chunks: std::collections::HashMap<String, Vec<u32>> =
@@ -1086,6 +1191,8 @@ async fn index_with_options(
             // but unchunkable" — record it with an empty chunk list so check_file()
             // returns (unchanged) on future runs and doctor doesn't flag it.
             let path_str = storage_key(&file.path, &project_path);
+            store.replace_file(&path_str, Vec::new()).await?;
+            fts_store.delete_by_path(&path_str)?;
             file_chunks.insert(path_str, vec![]);
             pb.inc(1);
             continue;
@@ -1124,16 +1231,23 @@ async fn index_with_options(
             .collect();
 
         // Phase 2d: Insert into vector store (takes ownership, no clone needed)
-        let chunk_ids = store.insert_chunks_with_ids(embedded_chunks)?;
+        let chunk_ids = store
+            .replace_file(&rel_path.to_string_lossy(), embedded_chunks)
+            .await?;
+
+        fts_store.delete_by_path(&rel_path.to_string_lossy())?;
 
         // Phase 2e: Insert into FTS with real chunk IDs from vector store.
-        // FTS failures are non-fatal: vector search is the primary search method,
-        // FTS (BM25) is supplementary for hybrid search. If tantivy encounters
-        // I/O errors (common on Windows due to antivirus interference), we log
-        // a warning and continue rather than aborting the entire indexing run.
+        // PostgreSQL publication errors leave file metadata uncommitted for retry.
+        // Local vector search remains available when supplementary FTS fails.
         for ((content, path, signature, kind), &chunk_id) in fts_data.iter().zip(chunk_ids.iter()) {
             if let Err(e) = fts_store.add_chunk(chunk_id, content, path, signature.as_deref(), kind)
             {
+                if store.backend() == "postgres" {
+                    return Err(e.context(
+                        "Postgres file committed; local FTS publication failed, retry indexing",
+                    ));
+                }
                 tracing::warn!(
                     "FTS add_chunk failed in {}: {} (continuing without FTS for this chunk)",
                     file.path.display(),
@@ -1149,11 +1263,15 @@ async fn index_with_options(
         total_chunks += chunk_count;
         pb.inc(1);
 
-        // Periodic FTS commit to flush the in-memory segment to disk in a controlled
-        // way. Non-fatal: if commit fails, we log and continue. Some FTS data may
-        // be lost but vector search (primary) is unaffected.
+        // Periodic FTS commit bounds pending documents. PostgreSQL publication
+        // must succeed before file metadata records the committed generation.
         if total_chunks % 1000 == 0 && total_chunks > 0 {
             if let Err(e) = fts_store.commit() {
+                if store.backend() == "postgres" {
+                    return Err(e.context(
+                        "Postgres files committed; local FTS publication failed, retry indexing",
+                    ));
+                }
                 tracing::warn!(
                     "Periodic FTS commit failed at {} chunks: {} (continuing, some FTS data may be lost)",
                     total_chunks,
@@ -1183,6 +1301,11 @@ async fn index_with_options(
         // Commit FTS
         if total_chunks > 0 {
             if let Err(e) = fts_store.commit() {
+                if store.backend() == "postgres" {
+                    return Err(e.context(
+                        "Postgres files committed; local FTS publication failed, retry indexing",
+                    ));
+                }
                 log_print!("{}   FTS commit warning: {}", "⚠️ ".yellow(), e);
             }
         }
@@ -1194,7 +1317,7 @@ async fn index_with_options(
                 "   Building vector index for {} partial chunks...",
                 total_chunks
             );
-            store.build_index()?;
+            store.build_index().await?;
             log_print!("   ✅ Vector index built");
         }
 
@@ -1256,7 +1379,7 @@ async fn index_with_options(
         }
 
         // Persist stats — best-effort, only for display; failures are non-fatal.
-        match store.stats() {
+        match store.stats().await {
             Ok(db_stats) => {
                 update_metadata_stats(&db_path, db_stats.total_chunks, db_stats.total_files);
                 log_print!(
@@ -1283,8 +1406,13 @@ async fn index_with_options(
     drop(embedding_service);
     drop(chunker);
 
-    // Commit FTS store (non-fatal: vector search works without FTS)
+    // Commit FTS before publishing file metadata.
     if let Err(e) = fts_store.commit() {
+        if store.backend() == "postgres" {
+            return Err(e.context(
+                "Postgres files committed; local FTS publication failed, retry indexing",
+            ));
+        }
         tracing::warn!(
             "Final FTS commit failed: {} (vector search will work, but hybrid/BM25 search may have gaps)",
             e
@@ -1351,7 +1479,7 @@ async fn index_with_options(
 
     // Build vector index (now that all chunks are inserted)
     let storage_start = Instant::now();
-    store.build_index()?;
+    store.build_index().await?;
     let _storage_duration = storage_start.elapsed();
 
     // Save model metadata (read-modify-write so existing stats are preserved).
@@ -1403,7 +1531,7 @@ async fn index_with_options(
     }
 
     // Show final stats
-    let db_stats = store.stats()?;
+    let db_stats = store.stats().await?;
     log_print!("\n{}", "📊 Final Statistics".bright_green().bold());
     log_print!("{}", "=".repeat(60));
     log_print!("   Total chunks: {}", db_stats.total_chunks);
@@ -1496,8 +1624,18 @@ pub async fn stats(path: Option<PathBuf>) -> Result<()> {
     println!("💾 Database: {}", db_path.display());
     println!("📂 Project: {}", project_path.display());
 
-    let store = VectorStore::new(&db_path, recorded_dimensions(&db_path))?;
-    let stats = store.stats()?;
+    let (model, dimensions) = IndexManager::resolve_embed_model(&db_path)?;
+    let store = crate::vectordb::ChunkStore::open_for_path(
+        &db_path,
+        &project_path,
+        model.short_name(),
+        dimensions,
+        true,
+    )
+    .await?;
+    let stats = store.stats().await?;
+    println!("   Backend: {}", store.backend());
+    println!("   Connection: healthy");
 
     println!("\n{}", "Vector Store:".bright_green());
     println!("   Total chunks: {}", stats.total_chunks);
@@ -1558,6 +1696,7 @@ pub async fn clear(path: Option<PathBuf>, yes: bool) -> Result<()> {
     }
 
     println!("\n🔄 Removing database...");
+    crate::vectordb::delete_postgres_repo(&db_path, &project_path).await?;
     crate::lmdb_registry::close_shared_envs_under(&db_path);
     std::fs::remove_dir_all(&db_path)?;
 
@@ -1949,6 +2088,7 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
             );
         }
         println!("\n{}", "Removing local index...".cyan());
+        crate::vectordb::delete_postgres_repo(&local_db, &canonical_path).await?;
         crate::lmdb_registry::close_shared_envs_under(&local_db);
         if let Err(e) = fs::remove_dir_all(&local_db) {
             eprintln!(
@@ -1995,6 +2135,7 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
             let global_db = global_dir.join(".codesearch.db");
             if global_db.exists() {
                 println!("\n{}", "Removing global index...".cyan());
+                crate::vectordb::delete_postgres_repo(&global_db, &canonical_path).await?;
                 crate::lmdb_registry::close_shared_envs_under(&global_db);
                 if let Err(e) = fs::remove_dir_all(&global_db) {
                     eprintln!(

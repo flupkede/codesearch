@@ -626,12 +626,13 @@ async fn group_lexical_search_attributes_each_hit_to_its_repo() {
             crate::chunker::ChunkKind::Function,
             "src/lib.rs".to_string(),
         );
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             chunk,
             vec![0.0, 1.0],
         )])
+        .await
         .expect("insert chunk a");
-        vs.build_index().expect("build index a");
+        vs.build_index().await.expect("build index a");
     }
     {
         let mut fts = stores_a.fts_store.write().await;
@@ -663,17 +664,19 @@ async fn group_lexical_search_attributes_each_hit_to_its_repo() {
             crate::chunker::ChunkKind::Function,
             "src/util.rs".to_string(),
         );
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             filler,
             vec![0.5, 0.5],
         )])
+        .await
         .expect("insert filler b");
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             chunk,
             vec![1.0, 0.0],
         )])
+        .await
         .expect("insert chunk b");
-        vs.build_index().expect("build index b");
+        vs.build_index().await.expect("build index b");
     }
     {
         let mut fts = stores_b.fts_store.write().await;
@@ -766,12 +769,13 @@ async fn literal_regex_zero_bm25_hits_falls_back_to_raw_scan() {
             crate::chunker::ChunkKind::Block,
             "rules/other.xml".to_string(),
         );
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             chunk_b,
             vec![1.0, 0.0],
         )])
+        .await
         .expect("insert chunks");
-        vs.build_index().expect("build index");
+        vs.build_index().await.expect("build index");
     }
     {
         let mut fts = stores.fts_store.write().await;
@@ -850,12 +854,13 @@ async fn seed_group_store(
             crate::chunker::ChunkKind::Function,
             rel_path.to_string(),
         );
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             chunk,
             embedding.to_vec(),
         )])
+        .await
         .expect("insert chunk");
-        vs.build_index().expect("build index");
+        vs.build_index().await.expect("build index");
     }
     {
         let mut fts = stores.fts_store.write().await;
@@ -3570,12 +3575,16 @@ async fn require_ready_reads_live_stores_and_rejects_partial_metadata() {
             "src/lib.rs".to_string(),
         );
         vector_store
-            .insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            .insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
                 chunk,
                 vec![0.0, 1.0],
             )])
+            .await
             .expect("insert vector chunk");
-        vector_store.build_index().expect("build vector index");
+        vector_store
+            .build_index()
+            .await
+            .expect("build vector index");
     }
     {
         let mut fts_store = stores.fts_store.write().await;
@@ -3737,21 +3746,55 @@ async fn vector_fan_out_skips_write_locked_store_instead_of_waiting() {
     )
     .expect("service");
 
+    {
+        let mut store = stores_b.vector_store.write().await;
+        store
+            .insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
+                crate::chunker::Chunk::new(
+                    "gadget".into(),
+                    1,
+                    1,
+                    crate::chunker::ChunkKind::Function,
+                    "lib.rs".into(),
+                ),
+                vec![1.0, 0.0],
+            )])
+            .await
+            .unwrap();
+        store.build_index().await.unwrap();
+    }
     let _alpha_write = stores_a.vector_store.write().await;
+    let embeddings = ["alpha", "beta"]
+        .into_iter()
+        .map(|alias| (alias.to_string(), vec![1.0, 0.0]))
+        .collect();
 
     let outcome = service
-        .with_vector_store_read_multi(
-            |_alias, _store| Ok::<_, anyhow::Error>(Vec::<crate::vectordb::SearchResult>::new()),
-            vec![stores_a.clone(), stores_b.clone()],
+        .search_vector_stores(
+            &[stores_a.clone(), stores_b.clone()],
             &["alpha".to_string(), "beta".to_string()],
+            &embeddings,
+            None,
+            5,
         )
         .await
         .expect("fan-out itself must not error");
 
-    assert!(
-        outcome.results.is_empty(),
-        "the locked store must be skipped, not answered from"
-    );
+    assert_eq!(outcome.results.len(), 1);
+    assert_eq!(outcome.results[0].alias, "beta");
+    assert_eq!(outcome.results[0].result.content, "gadget");
+    let local_outcome = service
+        .with_vector_store_read_multi(
+            |_alias, store| store.search(&[1.0, 0.0], 5),
+            vec![stores_a.clone(), stores_b.clone()],
+            &["alpha".into(), "beta".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(local_outcome.results.len(), outcome.results.len());
+    assert_eq!(local_outcome.failures.len(), 1);
+    assert_eq!(local_outcome.failures[0].0, "alpha");
+    assert!(local_outcome.failures[0].1.contains("store busy"));
     assert_eq!(
         outcome.failures.len(),
         1,
@@ -3787,12 +3830,13 @@ async fn lexical_group_search_degrades_per_repo_when_a_store_is_write_locked() {
             crate::chunker::ChunkKind::Function,
             "src/lib.rs".to_string(),
         );
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             chunk,
             vec![0.0, 1.0],
         )])
+        .await
         .expect("insert chunk a");
-        vs.build_index().expect("build index a");
+        vs.build_index().await.expect("build index a");
     }
     {
         let mut fts = stores_a.fts_store.write().await;
@@ -3823,17 +3867,19 @@ async fn lexical_group_search_degrades_per_repo_when_a_store_is_write_locked() {
             crate::chunker::ChunkKind::Function,
             "src/util.rs".to_string(),
         );
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             filler,
             vec![0.5, 0.5],
         )])
+        .await
         .expect("insert filler b");
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             chunk,
             vec![1.0, 0.0],
         )])
+        .await
         .expect("insert chunk b");
-        vs.build_index().expect("build index b");
+        vs.build_index().await.expect("build index b");
     }
     {
         let mut fts = stores_b.fts_store.write().await;

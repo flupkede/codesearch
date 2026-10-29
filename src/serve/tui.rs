@@ -453,7 +453,7 @@ async fn run_tui_loop(
                     KeyAction::ForceReindex(idx) => match rows.get(idx) {
                         Some(row) if !row.is_remote => {
                             let alias = row.alias.clone();
-                            let msg = match spawn_force_reindex(alias.clone(), &state) {
+                            let msg = match spawn_force_reindex(alias.clone(), &state).await {
                                 ReindexLaunch::Started => {
                                     format!("⟳ Reindex started for '{alias}' …")
                                 }
@@ -1119,7 +1119,7 @@ pub(crate) fn build_info_overlay(alias: &str, state: &Arc<ServeState>) -> Option
     // If stores are open, get live stats (overrides metadata)
     if let Some(stores) = state.get_opened_stores(alias) {
         if let Ok(vs) = stores.vector_store.try_read() {
-            if let Ok(live_stats) = vs.stats() {
+            if let Some(Ok(live_stats)) = vs.local().map(|local| local.stats()) {
                 chunks = live_stats.total_chunks;
                 files = live_stats.total_files;
                 max_chunk_id = live_stats.max_chunk_id;
@@ -1151,6 +1151,8 @@ pub(crate) fn build_info_overlay(alias: &str, state: &Arc<ServeState>) -> Option
         chunks,
         files,
         max_chunk_id,
+        storage: crate::vectordb::storage_backend(&db_path)
+            .unwrap_or_else(|error| format!("unavailable: {error:#}")),
         db_size_human,
         model,
         dims,
@@ -1272,7 +1274,33 @@ fn spawn_info_overlay(
     gen: u64,
 ) {
     tokio::spawn(async move {
-        if let Some(ov) = build_info_overlay(&alias, &state) {
+        if let Some(mut ov) = build_info_overlay(&alias, &state) {
+            if let Some(stores) = state.get_opened_stores(&alias) {
+                let store = stores.vector_store.read().await;
+                if store.backend() == "postgres" {
+                    let result = store.stats().await;
+                    if let OverlayState::Info {
+                        chunks,
+                        files,
+                        max_chunk_id,
+                        dims,
+                        storage,
+                        ..
+                    } = &mut ov
+                    {
+                        match result {
+                            Ok(stats) => {
+                                *chunks = stats.total_chunks;
+                                *files = stats.total_files;
+                                *max_chunk_id = stats.max_chunk_id;
+                                *dims = stats.dimensions;
+                                *storage = "postgres (connected)".into();
+                            }
+                            Err(error) => *storage = format!("postgres unavailable: {error:#}"),
+                        }
+                    }
+                }
+            }
             let _ = tx.send((gen, ov)).await;
         }
     });
@@ -1312,7 +1340,10 @@ fn spawn_doctor(
             match stores {
                 Ok(s) => {
                     let vs = s.vector_store.read().await;
-                    let report = doctor::diagnose_with_store(&project_path, &vs);
+                    let report = match vs.local() {
+                        Some(local) => doctor::diagnose_with_store(&project_path, local),
+                        None => doctor::diagnose_storage(&project_path, &vs).await,
+                    };
                     drop(vs);
                     match report {
                         Ok(r) => OverlayState::Doctor {
@@ -1428,7 +1459,7 @@ pub(crate) enum ReindexLaunch {
 
 /// Spawn a background force reindex task for the given repo alias.
 /// Follows the same flow as the HTTP `reindex_handler`.
-pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
+pub(crate) async fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> ReindexLaunch {
     // Guard against concurrent reindex
     if !state.begin_indexing(&alias, IndexingOwner::Reindex) {
         tracing::warn!(
@@ -1438,36 +1469,38 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
         return ReindexLaunch::AlreadyRunning;
     }
 
-    let config = match state.config.read() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Config lock poisoned: {}", e);
-            state.end_indexing(&alias, IndexingOwner::Reindex);
-            return ReindexLaunch::Failed;
-        }
-    };
-    let project_path = match config.resolve(&alias) {
-        Some(p) => p,
-        None => {
-            tracing::error!("Cannot resolve alias '{}' for force reindex", alias);
-            state.end_indexing(&alias, IndexingOwner::Reindex);
-            return ReindexLaunch::Failed;
-        }
-    };
-    // Same guard as the HTTP reindex route: a force reindex opens the repo
-    // write-mode and rebuilds its index, which for a read-only repo means both a
-    // memory blow-up on a constrained replica and divergence from the index its
-    // owning job publishes.
-    if config.repo_read_only.get(&alias) == Some(&true) {
-        tracing::warn!(
-            "Refusing force reindex of '{}': marked read-only (repo_read_only) — its index is \
+    let project_path = {
+        let config = match state.config.read() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Config lock poisoned: {}", e);
+                state.end_indexing(&alias, IndexingOwner::Reindex);
+                return ReindexLaunch::Failed;
+            }
+        };
+        let project_path = match config.resolve(&alias) {
+            Some(p) => p,
+            None => {
+                tracing::error!("Cannot resolve alias '{}' for force reindex", alias);
+                state.end_indexing(&alias, IndexingOwner::Reindex);
+                return ReindexLaunch::Failed;
+            }
+        };
+        // Same guard as the HTTP reindex route: a force reindex opens the repo
+        // write-mode and rebuilds its index, which for a read-only repo means both a
+        // memory blow-up on a constrained replica and divergence from the index its
+        // owning job publishes.
+        if config.repo_read_only.get(&alias) == Some(&true) {
+            tracing::warn!(
+                "Refusing force reindex of '{}': marked read-only (repo_read_only) — its index is \
              owned by another writer",
-            alias
-        );
-        state.end_indexing(&alias, IndexingOwner::Reindex);
-        return ReindexLaunch::Failed;
-    }
-    drop(config); // release read lock
+                alias
+            );
+            state.end_indexing(&alias, IndexingOwner::Reindex);
+            return ReindexLaunch::Failed;
+        }
+        project_path
+    };
 
     let db_path = project_path.join(DB_DIR_NAME);
 
@@ -1477,7 +1510,10 @@ pub(crate) fn spawn_force_reindex(alias: String, state: &Arc<ServeState>) -> Rei
         None => {
             // Try to open stores (allow_create=true for recovery)
             let cancel = CancellationToken::new();
-            match state.try_open_stores(&alias, &db_path, true, false, None) {
+            match state
+                .try_open_stores(&alias, &db_path, true, false, None)
+                .await
+            {
                 Ok(super::OpenedStores::Write(s)) => {
                     state.repos.insert(
                         alias.clone(),

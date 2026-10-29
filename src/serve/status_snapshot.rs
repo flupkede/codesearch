@@ -98,7 +98,38 @@ pub(crate) fn spawn(state: Arc<ServeState>) {
             })
             .await;
             match snap {
-                Ok(snapshot) => handle.store(snapshot),
+                Ok(mut snapshot) => {
+                    for project in &mut snapshot.projects {
+                        let Some(stores) = state.get_opened_stores(&project.alias) else {
+                            continue;
+                        };
+                        let Ok(store) = stores.vector_store.try_read() else {
+                            continue;
+                        };
+                        if store.backend() != "postgres" {
+                            continue;
+                        }
+                        match store.stats().await {
+                            Ok(stats) => {
+                                project.total_chunks = stats.total_chunks;
+                                project.total_files = stats.total_files;
+                                project.lock_status = state
+                                    .repo_lock_status(&project.alias)
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "repo '{}' PostgreSQL storage unavailable: {error:#}",
+                                    project.alias
+                                );
+                                project.error = Some(message.clone());
+                                snapshot.projects_warnings.push(message);
+                            }
+                        }
+                    }
+                    handle.store(snapshot);
+                }
                 Err(err) => {
                     // Join failure means the runtime is shutting down; the
                     // next loop iteration would also fail, but sleeping

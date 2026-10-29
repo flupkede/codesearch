@@ -40,9 +40,17 @@ pub(crate) fn compute_projects_snapshot(
             let opened = serve_state.get_opened_stores(alias);
             // Never wait on the store lock: an indexing run holds it for
             // whole batches, and status must answer immediately.
-            let stats_result = opened
-                .as_ref()
-                .and_then(|stores| stores.vector_store.try_read().ok().map(|vs| vs.stats()));
+            let stats_result = opened.as_ref().and_then(|stores| {
+                stores
+                    .vector_store
+                    .try_read()
+                    .ok()
+                    .and_then(|vs| match &*vs {
+                        ChunkStore::Local(local) => Some(local.stats()),
+                        #[cfg(feature = "pgvector")]
+                        ChunkStore::Postgres { .. } => None,
+                    })
+            });
             if let Some(stats_result) = stats_result {
                 // `0 chunks` alone reads exactly like "not indexed yet" — the
                 // repo may in fact be full and simply failing to answer (the
@@ -300,11 +308,11 @@ impl CodesearchService {
                 // answer immediately — the same contract as list_projects. A
                 // busy store is attributed to THIS store, never skipped
                 // silently.
-                let stats_result = store_arc
-                    .vector_store
-                    .try_read()
-                    .ok()
-                    .map(|store| store.stats());
+                let stats_result = if let Ok(store) = store_arc.vector_store.try_read() {
+                    Some(store.stats().await)
+                } else {
+                    None
+                };
                 match stats_result {
                     Some(Ok(stats)) => {
                         total_chunks += stats.total_chunks;
@@ -378,12 +386,12 @@ impl CodesearchService {
         }
 
         // Single-store path
-        let stats = match self
-            .with_vector_store_read_for(
-                |store| store.stats().context("Error getting index stats"),
-                ctx.stores.clone(),
-            )
-            .await
+        let stats = match async {
+            let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+            let store = bounded_vector_read(&handle).await?;
+            store.stats().await.context("Error getting index stats")
+        }
+        .await
         {
             Ok(s) => s,
             Err(e) => {

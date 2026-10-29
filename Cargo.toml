@@ -93,6 +93,8 @@ indicatif = "0.18"
 dirs = "7"
 num_cpus = "1.16"
 async-trait = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "json"], optional = true }
+pgvector = { version = "0.4", features = ["sqlx"], optional = true }
 # Vector database
 arroy = "0.9"
 # `longer-keys` builds LMDB with MDB_MAXKEYSIZE=0, so the key limit is derived
@@ -155,6 +157,7 @@ inherits = "release"
 
 [features]
 default = []
+pgvector = ["dep:sqlx", "dep:pgvector"]
 cuda = ["ort/cuda"]        # Enable CUDA GPU acceleration (requires cuDNN)
 tensorrt = ["ort/tensorrt"] # Enable TensorRT acceleration (NVIDIA only)
 csharp_helper_integration = []  # Enable integration tests that require the scip-csharp helper binary

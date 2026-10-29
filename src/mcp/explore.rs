@@ -101,7 +101,7 @@ impl CodesearchService {
                 ) else {
                     continue;
                 };
-                match store.chunks_for_file(normalized) {
+                match store.chunks_for_file(normalized).await {
                     Ok(metas) => {
                         for c in metas {
                             if seen_ids.insert((store_idx, c.id)) {
@@ -124,25 +124,24 @@ impl CodesearchService {
             Ok(all_items)
         } else {
             let normalized_owned = normalized.to_string();
-            self.with_vector_store_read_for(
-                move |store| {
-                    let mut out: Vec<FileOutlineItem> = store
-                        .chunks_for_file(&normalized_owned)?
-                        .into_iter()
-                        .map(|c| FileOutlineItem {
-                            chunk_id: c.id,
-                            kind: c.kind,
-                            signature: c.signature,
-                            start_line: c.start_line,
-                            end_line: c.end_line,
-                        })
-                        .collect();
-                    out.sort_by_key(|i| i.start_line);
-                    Ok(out)
-                },
-                ctx.stores.clone(),
-            )
-            .await
+            {
+                let handle = self.chunk_store_for(ctx.stores.clone()).await?;
+                let store = bounded_vector_read(&handle).await?;
+                let mut out: Vec<FileOutlineItem> = store
+                    .chunks_for_file(&normalized_owned)
+                    .await?
+                    .into_iter()
+                    .map(|c| FileOutlineItem {
+                        chunk_id: c.id,
+                        kind: c.kind,
+                        signature: c.signature,
+                        start_line: c.start_line,
+                        end_line: c.end_line,
+                    })
+                    .collect();
+                out.sort_by_key(|i| i.start_line);
+                Ok(out)
+            }
         }
     }
 

@@ -13,6 +13,7 @@ async fn try_open_stores_attaches_the_serve_job_gate() {
 
     let stores = match state
         .try_open_stores("repo", &db_path, true, false, None)
+        .await
         .expect("a fresh repo must open in write mode")
     {
         OpenedStores::Write(s) => s,
@@ -1077,7 +1078,10 @@ async fn try_open_stores_creates_db_for_brand_new_repo() {
 
     let state = state_with_config(ReposConfig::default());
 
-    match state.try_open_stores("brandnew", &db_path, true, false, None) {
+    match state
+        .try_open_stores("brandnew", &db_path, true, false, None)
+        .await
+    {
         Ok(OpenedStores::Write(_)) => {}
         Ok(OpenedStores::Readonly(_)) => {
             panic!("brand-new repo opened Readonly; expected Write")
@@ -1203,6 +1207,7 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
         .try_read()
         .unwrap()
         .stats()
+        .await
         .unwrap()
         .dimensions;
     assert_eq!(
@@ -1264,6 +1269,7 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
         .try_read()
         .unwrap()
         .stats()
+        .await
         .unwrap()
         .dimensions;
     assert_eq!(
@@ -1319,8 +1325,9 @@ async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
                     chunk,
                     vec![0.5f32; 384],
                 )])
+                .await
                 .expect("seed vector chunk");
-            vs.build_index().expect("build fixture index");
+            vs.build_index().await.expect("build fixture index");
             ids
         };
         {
@@ -1373,7 +1380,13 @@ async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
     let stores = state
         .get_opened_stores("adopted")
         .expect("store must still be open after the add");
-    let stats = stores.vector_store.try_read().unwrap().stats().unwrap();
+    let stats = stores
+        .vector_store
+        .try_read()
+        .unwrap()
+        .stats()
+        .await
+        .unwrap();
     assert_eq!(
         stats.total_chunks, 1,
         "an existing index must be adopted, not cleared and rebuilt"
@@ -1388,6 +1401,7 @@ async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
             .try_read()
             .unwrap()
             .get_chunk(chunk_id)
+            .await
             .expect("read back adopted chunk")
             .is_some(),
         "the previously indexed chunk must still be present (id {chunk_id})"
@@ -3129,6 +3143,7 @@ async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
     // Serve opens the repo FOR REAL — a live LMDB env under db_path.
     let opened = state
         .try_open_stores("heldenv", &db_path, true, false, None)
+        .await
         .expect("opening a real store for a brand-new repo must succeed");
     let OpenedStores::Write(stores) = opened else {
         panic!("brand-new repo must open Write, not Readonly");
@@ -3248,6 +3263,7 @@ async fn idle_reaper_restarts_the_idle_clock_of_an_indexing_repo() {
         .join(DB_DIR_NAME);
     let OpenedStores::Write(stores) = state
         .try_open_stores("longbuild", &db_path, true, false, None)
+        .await
         .expect("open must succeed")
     else {
         panic!("brand-new repo must open Write");
@@ -3462,7 +3478,16 @@ async fn try_open_stores_honours_dimension_override_for_a_fresh_repo() {
 
     let state = state_with_config(ReposConfig::default());
 
-    let stores = match state.try_open_stores("gemmarepo", &db_path, true, false, Some(768)) {
+    let stores = match state
+        .try_open_stores(
+            "gemmarepo",
+            &db_path,
+            true,
+            false,
+            Some(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        )
+        .await
+    {
         Ok(OpenedStores::Write(s)) => s,
         Ok(OpenedStores::Readonly(_)) => panic!("expected Write, got Readonly"),
         Err(e) => panic!("fresh open with a dimension override must succeed, got: {e}"),
@@ -3473,6 +3498,7 @@ async fn try_open_stores_honours_dimension_override_for_a_fresh_repo() {
         .read()
         .await
         .stats()
+        .await
         .expect("stats on a freshly created store")
         .dimensions;
     assert_eq!(
@@ -3815,6 +3841,7 @@ async fn warm_query_does_not_start_fsw_while_warmup_indexes() {
         .join(DB_DIR_NAME);
     let OpenedStores::Write(stores) = state
         .try_open_stores("warming", &db_path, true, false, None)
+        .await
         .expect("open must succeed")
     else {
         panic!("brand-new repo must open Write");
@@ -4769,6 +4796,7 @@ fn overlay_copy_key_only_fires_on_info_overlays() {
 
     let info = crate::serve::tui_common::OverlayState::Info {
         alias: "demo.app".to_string(),
+        storage: "local".into(),
         path: String::new(),
         chunks: 0,
         files: 0,
@@ -4821,6 +4849,7 @@ fn symbol_warnings_copy_text_heads_with_alias_and_carries_every_line() {
 fn apply_copy_warnings_reports_when_nothing_is_recorded() {
     let mut info = crate::serve::tui_common::OverlayState::Info {
         alias: "acme-web".to_string(),
+        storage: "local".into(),
         path: String::new(),
         chunks: 0,
         files: 0,
@@ -4854,6 +4883,7 @@ fn apply_copy_warnings_feedback_covers_success_and_failure() {
     fn info() -> crate::serve::tui_common::OverlayState {
         crate::serve::tui_common::OverlayState::Info {
             alias: "acme-web".to_string(),
+            storage: "local".into(),
             path: String::new(),
             chunks: 0,
             files: 0,
@@ -4961,6 +4991,39 @@ fn estimate_wrapped_height_counts_multi_row_lines() {
 /// Long warning lines must WRAP inside the modal, not clip at the border:
 /// the tail of the failure text (the feed URL) stays readable, and the
 /// key-hint footer survives on the border's bottom title.
+#[test]
+fn info_overlay_renders_storage_health_separately_from_symbol_warnings() {
+    let overlay = crate::serve::tui_common::OverlayState::Info {
+        alias: "storage".into(),
+        path: "/index".into(),
+        chunks: 2,
+        files: 1,
+        max_chunk_id: 1,
+        storage: "postgres (connected)".into(),
+        db_size_human: "1 MB".into(),
+        model: "minilm-l6-q".into(),
+        dims: 384,
+        lock: "read".into(),
+        index_age: "1m".into(),
+        symbol_warnings: vec![],
+        symbol_index: vec![],
+        copy_feedback: None,
+    };
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+    terminal
+        .draw(|frame| crate::serve::tui_common::render_overlay(frame, frame.area(), &overlay))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rendered = buffer
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("postgres (connected)"));
+    assert!(rendered.contains("Local size:"));
+    assert!(!rendered.contains("Storage: postgres"));
+}
+
 #[test]
 fn modal_wraps_long_warning_lines_instead_of_clipping() {
     use ratatui::backend::TestBackend;
@@ -5677,12 +5740,13 @@ async fn seed_collision_repo(
         let mut chunk =
             crate::chunker::Chunk::new(content.to_string(), 1, 4, kind, rel_path.to_string());
         chunk.signature = signature.map(str::to_string);
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             chunk,
             vec![0.25, 0.75],
         )])
+        .await
         .expect("insert chunk");
-        vs.build_index().expect("build index");
+        vs.build_index().await.expect("build index");
     }
     {
         let mut fts = stores.fts_store.write().await;
@@ -5845,7 +5909,7 @@ async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
     {
         let mut vs = stores.vector_store.write().await;
         for i in 0..5u32 {
-            vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
                 crate::chunker::Chunk::new(
                     format!("filler {i}"),
                     0,
@@ -5855,6 +5919,7 @@ async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
                 ),
                 vec![0.25, 0.75],
             )])
+            .await
             .expect("insert filler");
         }
         let mut target = crate::chunker::Chunk::new(
@@ -5865,12 +5930,13 @@ async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
             "src/service/TargetService.java".to_string(),
         );
         target.signature = Some("fn target()".to_string());
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             target,
             vec![0.5, 0.5],
         )])
+        .await
         .expect("insert target");
-        vs.build_index().expect("build index");
+        vs.build_index().await.expect("build index");
     }
     {
         let mut fts = stores.fts_store.write().await;
@@ -6000,12 +6066,13 @@ async fn get_chunk_reports_the_real_chunker_editor_line_unchanged() {
     let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
     {
         let mut vs = stores.vector_store.write().await;
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             target.clone(),
             vec![0.5, 0.5],
         )])
+        .await
         .expect("insert chunk");
-        vs.build_index().expect("build index");
+        vs.build_index().await.expect("build index");
     }
     {
         let mut fts = stores.fts_store.write().await;
@@ -6089,12 +6156,13 @@ async fn get_chunk_notes_stale_source_newer_than_last_indexing_write() {
     let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
     {
         let mut vs = stores.vector_store.write().await;
-        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+        vs.insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
             target.clone(),
             vec![0.5, 0.5],
         )])
+        .await
         .expect("insert chunk");
-        vs.build_index().expect("build index");
+        vs.build_index().await.expect("build index");
     }
     {
         let mut fts = stores.fts_store.write().await;
@@ -6504,12 +6572,13 @@ async fn group_literal_search_relaxed_fallback_covers_partial_term_hits() {
                 crate::chunker::ChunkKind::Comment,
                 "docs/other.md".to_string(),
             );
-            vs.insert_chunks(vec![
+            vs.insert_chunks_with_ids(vec![
                 crate::embed::EmbeddedChunk::new(rich, vec![0.25, 0.75]),
                 crate::embed::EmbeddedChunk::new(poor, vec![0.5, 0.5]),
             ])
+            .await
             .expect("insert chunks");
-            vs.build_index().expect("build index");
+            vs.build_index().await.expect("build index");
         }
         {
             let mut fts = stores.fts_store.write().await;
@@ -6930,6 +6999,7 @@ async fn finish_force_reindex_starts_fsw_and_keeps_guard_contract() {
 
     let stores = match state
         .try_open_stores("repo", &db_path, true, false, None)
+        .await
         .expect("a fresh repo must open in write mode")
     {
         OpenedStores::Write(s) => s,
