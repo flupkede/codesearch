@@ -4,7 +4,7 @@ use super::proxy::{
 };
 use super::{serve_url_from_env, CodesearchService};
 use crate::db_discovery::find_best_database;
-use crate::embed::ModelType;
+use crate::embed::EmbeddingModel;
 use crate::index::{IndexManager, SharedStores};
 use anyhow::{Context, Result};
 use rmcp::RoleClient;
@@ -690,7 +690,7 @@ pub async fn run_mcp_server_with_options(
         std::fs::create_dir_all(&db_path)?;
 
         // Get model info
-        let model_type = ModelType::default();
+        let model_type = EmbeddingModel::default();
         let model_short_name = model_type.short_name().to_string();
         let dimensions = model_type.dimensions();
 

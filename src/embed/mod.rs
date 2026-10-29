@@ -1,6 +1,13 @@
 mod batch;
 mod cache;
+mod config;
 mod embedder;
+mod identity;
+mod openai;
+mod provider;
+pub use config::{active_config, configure, save_defaults, EmbedConfig};
+pub use identity::EmbeddingModel;
+pub use provider::Embedder;
 
 use anyhow::Result;
 pub use batch::{BatchEmbedder, EmbeddedChunk};
@@ -8,17 +15,35 @@ pub use cache::{
     CacheStats, CachedBatchEmbedder, PersistentCacheStats, PersistentEmbeddingCache, QueryCache,
     QueryCacheStats,
 };
-pub use embedder::{
-    is_model_in_cache, load_default_model, save_default_model, FastEmbedder, ModelType,
-};
+pub use embedder::{FastEmbedder, ModelType};
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
 
+pub fn is_model_in_cache(model: impl Into<EmbeddingModel>) -> bool {
+    match model.into() {
+        EmbeddingModel::Local(model) => embedder::is_model_in_cache(model),
+        EmbeddingModel::ActiveRemote => true,
+    }
+}
+pub fn load_default_model() -> Option<EmbeddingModel> {
+    if active_config().remote() {
+        Some(EmbeddingModel::ActiveRemote)
+    } else {
+        embedder::load_default_model().map(EmbeddingModel::Local)
+    }
+}
+pub fn save_default_model(model: impl Into<EmbeddingModel>) -> Result<()> {
+    match model.into() {
+        EmbeddingModel::Local(model) => embedder::save_default_model(model),
+        EmbeddingModel::ActiveRemote => save_defaults(),
+    }
+}
+
 /// High-level embedding service that combines all features
 pub struct EmbeddingService {
     cached_embedder: CachedBatchEmbedder,
-    model_type: ModelType,
+    model_type: EmbeddingModel,
     query_cache: QueryCache,
     persistent_cache: Option<PersistentEmbeddingCache>,
 }
@@ -26,20 +51,32 @@ pub struct EmbeddingService {
 impl EmbeddingService {
     /// Create a new embedding service with default model
     pub fn new() -> Result<Self> {
-        Self::with_model(ModelType::default())
+        Self::with_model(EmbeddingModel::default())
     }
 
     /// Create a new embedding service with specified model
-    pub fn with_model(model_type: ModelType) -> Result<Self> {
-        Self::with_cache_dir(model_type, None)
+    pub fn with_model(model_type: impl Into<EmbeddingModel>) -> Result<Self> {
+        Self::with_cache_dir(model_type.into(), None)
     }
 
     /// Create a new embedding service with specified model and cache directory
     pub fn with_cache_dir(
-        model_type: ModelType,
+        model_type: impl Into<EmbeddingModel>,
         cache_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let embedder = FastEmbedder::with_cache_dir(model_type, cache_dir)?;
+        let model_type = model_type.into();
+        let embedder: Box<dyn Embedder> = match model_type {
+            EmbeddingModel::Local(model) => {
+                Box::new(FastEmbedder::with_cache_dir(model, cache_dir)?)
+            }
+            EmbeddingModel::ActiveRemote => {
+                let dimensions = model_type.try_dimensions()?;
+                Box::new(openai::OpenAiEmbedder::with_known_dimensions(
+                    active_config().clone(),
+                    dimensions,
+                )?)
+            }
+        };
         let arc_embedder = Arc::new(Mutex::new(embedder));
         let batch_embedder = BatchEmbedder::new(arc_embedder);
 
@@ -58,7 +95,7 @@ impl EmbeddingService {
         // Initialize persistent embedding cache (disk-backed, survives restarts)
         // This is critical for fast branch switches: embeddings for previously-seen
         // content are looked up by content hash instead of recomputed via ONNX.
-        let persistent_cache = match PersistentEmbeddingCache::open(model_type.short_name()) {
+        let persistent_cache = match PersistentEmbeddingCache::open(&model_type.cache_identity()?) {
             Ok(cache) => {
                 tracing::debug!("📦 Persistent embedding cache opened");
                 Some(cache)
@@ -239,6 +276,7 @@ impl EmbeddingService {
     }
 
     /// Get model short name (for storage)
+    #[allow(dead_code)] // Public diagnostic accessor
     pub fn model_short_name(&self) -> &str {
         self.model_type.short_name()
     }
@@ -263,7 +301,7 @@ impl EmbeddingService {
     #[allow(dead_code)]
     pub fn with_persistent_cache(&mut self) -> Result<()> {
         if self.persistent_cache.is_none() {
-            let cache = PersistentEmbeddingCache::open(self.model_short_name())?;
+            let cache = PersistentEmbeddingCache::open(&self.model_type.cache_identity()?)?;
             self.persistent_cache = Some(cache);
         }
         Ok(())
@@ -300,6 +338,36 @@ impl Default for EmbeddingService {
     }
 }
 
+pub fn embed_query_bounded(service: Arc<Mutex<EmbeddingService>>, query: &str) -> Result<Vec<f32>> {
+    if !active_config().remote() {
+        return service
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .embed_query(query);
+    }
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(active_config().embed_timeout_secs);
+    loop {
+        match service.try_lock() {
+            Ok(mut guard) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("Remote embedding query deadline exceeded while queued");
+                }
+                return guard.embed_query(query);
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return error.into_inner().embed_query(query)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("Remote embedding query deadline exceeded while queued");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 /// Lazily-created, per-model cache of [`EmbeddingService`]s.
 ///
 /// Serve mode is multi-repo and different repos may be indexed with different
@@ -311,12 +379,12 @@ impl Default for EmbeddingService {
 /// do not serialise on one global lock.
 #[derive(Default)]
 pub struct EmbeddingServicePool {
-    services: Mutex<HashMap<ModelType, Arc<Mutex<EmbeddingService>>>>,
+    services: Mutex<HashMap<EmbeddingModel, Arc<Mutex<EmbeddingService>>>>,
     /// Per-model init locks. The `services` map lock is only ever held for a
     /// lookup — loading a model runs under the per-model init lock, so a slow
     /// (or wedged) load of one model cannot block lookups or loads of any
     /// other model.
-    init_locks: Mutex<HashMap<ModelType, Arc<Mutex<()>>>>,
+    init_locks: Mutex<HashMap<EmbeddingModel, Arc<Mutex<()>>>>,
     cache_dir: Option<std::path::PathBuf>,
 }
 
@@ -334,15 +402,19 @@ impl EmbeddingServicePool {
     /// Return the service for `model` if it is already loaded, without ever
     /// triggering a load. Search handlers use this to guarantee that a query
     /// never turns into a network fetch of model files.
-    pub fn get_if_cached(&self, model: ModelType) -> Option<Arc<Mutex<EmbeddingService>>> {
-        self.services.lock().ok()?.get(&model).cloned()
+    pub fn get_if_cached(
+        &self,
+        model: impl Into<EmbeddingModel>,
+    ) -> Option<Arc<Mutex<EmbeddingService>>> {
+        self.services.lock().ok()?.get(&model.into()).cloned()
     }
 
     /// Return the service for `model`, loading its ONNX model on first use.
     ///
     /// The returned `Arc` is locked independently per model, so a caller can
     /// hold it across an `embed_query` without blocking other models.
-    pub fn get(&self, model: ModelType) -> Result<Arc<Mutex<EmbeddingService>>> {
+    pub fn get(&self, model: impl Into<EmbeddingModel>) -> Result<Arc<Mutex<EmbeddingService>>> {
+        let model = model.into();
         if let Some(existing) = self.get_if_cached(model) {
             return Ok(existing);
         }
@@ -383,7 +455,7 @@ impl EmbeddingServicePool {
     /// On timeout the loader thread is deliberately leaked — there is no safe
     /// way to kill a thread mid-download — but it holds no pool locks, so it
     /// can only waste its own resources until the underlying fetch gives up.
-    fn load_bounded(&self, model: ModelType) -> Result<EmbeddingService> {
+    fn load_bounded(&self, model: EmbeddingModel) -> Result<EmbeddingService> {
         let timeout_secs = std::env::var(crate::constants::MODEL_LOAD_TIMEOUT_SECS_ENV)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -421,15 +493,16 @@ impl EmbeddingServicePool {
     /// model between mini-batches.
     pub fn embed_chunks_yielding(
         &self,
-        model: ModelType,
+        model: impl Into<EmbeddingModel>,
         chunks: Vec<crate::chunker::Chunk>,
         pause: std::time::Duration,
     ) -> Result<Vec<EmbeddedChunk>> {
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
+        let model = model.into();
         let service = self.get(model)?;
-        let group_size = FastEmbedder::effective_batch_size(model).max(1);
+        let group_size = model.batch_size();
         let mut out: Vec<EmbeddedChunk> = Vec::with_capacity(chunks.len());
         for group in chunks.chunks(group_size) {
             {

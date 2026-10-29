@@ -432,7 +432,7 @@ pub(crate) struct ServeState {
     /// break a working legacy repo the moment an operator set it. The default
     /// applies only when `POST /repos` creates a brand-new index without an
     /// explicit `model`, and to the scope-free status summary.
-    default_model: Option<crate::embed::ModelType>,
+    default_model: Option<crate::embed::EmbeddingModel>,
     /// Aliases for which the unrecorded-model query warning has already been
     /// emitted, so a long-running serve logs it once per repo instead of once
     /// per query. See [`Self::mark_legacy_model_warned`].
@@ -675,14 +675,17 @@ impl ServeState {
     ///
     /// Set once at startup, before the state is shared. `None` leaves the
     /// built-in default in place.
-    pub(crate) fn with_default_model(mut self, model: Option<crate::embed::ModelType>) -> Self {
+    pub(crate) fn with_default_model(
+        mut self,
+        model: Option<crate::embed::EmbeddingModel>,
+    ) -> Self {
         self.default_model = model;
         self
     }
 
     /// The serve-wide default embedding model for newly created indexes, or
     /// `None` for the built-in default. See [`Self::with_default_model`].
-    pub(crate) fn default_model(&self) -> Option<crate::embed::ModelType> {
+    pub(crate) fn default_model(&self) -> Option<crate::embed::EmbeddingModel> {
         self.default_model
     }
 
@@ -690,15 +693,15 @@ impl ServeState {
     ///
     /// Returns `None` when the alias is unknown or its index has no
     /// `model_short_name` (unindexed / legacy), so callers can fall back to
-    /// [`crate::embed::ModelType::default`]. This is the read side of the
+    /// [`crate::embed::EmbeddingModel::default`]. This is the read side of the
     /// per-repo model contract: a query against `alias` MUST be embedded with
     /// the model returned here, or the vector search fails with a dimension
     /// mismatch (768-dim EmbeddingGemma index, 384-dim default query) or
     /// silently compares incomparable vector spaces.
-    pub(crate) fn model_for_alias(&self, alias: &str) -> Option<crate::embed::ModelType> {
+    pub(crate) fn model_for_alias(&self, alias: &str) -> Option<crate::embed::EmbeddingModel> {
         let cfg = self.config_snapshot();
         let project_path = cfg.resolve(alias)?;
-        crate::embed::ModelType::from_index_metadata(&project_path.join(DB_DIR_NAME))
+        crate::embed::EmbeddingModel::from_index_metadata(&project_path.join(DB_DIR_NAME))
     }
 
     /// Record that `alias` was queried with the built-in default because its
@@ -3247,6 +3250,15 @@ impl ServeState {
         touch: bool,
     ) -> std::result::Result<Arc<SharedStores>, String> {
         let _ = self.reload_if_changed();
+        // Validate even the cached-store path: changing the active strategy
+        // never authorizes queries against another vector space.
+        if let Some(path) = self.config_snapshot().resolve(alias) {
+            let db = path.join(DB_DIR_NAME);
+            if db.join("metadata.json").exists() {
+                crate::embed::EmbeddingModel::validate_strategy(&db)
+                    .map_err(|e| format!("{e:#}"))?;
+            }
+        }
 
         // A cached `Conflicted` is a STALE FAILURE, not a terminal state: drop it
         // and fall through to a fresh open attempt below.
@@ -4802,7 +4814,7 @@ async fn status_handler(
         "version": version,
         "repos": repo_json,
         "active_sessions": snap.active_sessions,
-        "default_model": state.default_model().map(|m| m.short_name()),
+        "default_model": state.default_model().map(|m| m.short_name().to_owned()),
         "cpu_percent": snap.cpu_percent,
         "csharp_helper": snap.csharp_helper,
         "ts_helper": snap.ts_helper,
@@ -5801,10 +5813,10 @@ struct AddRepoRequest {
 /// 3. an index that already records its own model keeps it, exactly as if
 ///    `--model` had not been passed.
 fn resolve_add_repo_model(
-    explicit: Option<crate::embed::ModelType>,
-    recorded: Option<crate::embed::ModelType>,
-    serve_default: Option<crate::embed::ModelType>,
-) -> Option<crate::embed::ModelType> {
+    explicit: Option<crate::embed::EmbeddingModel>,
+    recorded: Option<crate::embed::EmbeddingModel>,
+    serve_default: Option<crate::embed::EmbeddingModel>,
+) -> Option<crate::embed::EmbeddingModel> {
     explicit.or(if recorded.is_none() {
         serve_default
     } else {
@@ -5821,8 +5833,8 @@ fn resolve_add_repo_model(
 /// explicit/override model that differs from the recorded one invalidates every
 /// stored vector (dimensions and vector space change), so it must rebuild.
 fn should_adopt_existing_index(
-    recorded: Option<crate::embed::ModelType>,
-    model_override: Option<crate::embed::ModelType>,
+    recorded: Option<crate::embed::EmbeddingModel>,
+    model_override: Option<crate::embed::EmbeddingModel>,
 ) -> bool {
     recorded.is_some() && model_override.is_none_or(|requested| recorded == Some(requested))
 }
@@ -5878,14 +5890,14 @@ async fn add_repo_handler(
     // Previously the store was opened at the default (or the previous metadata's)
     // dimension and the override was only applied to metadata afterwards, so the
     // reindex embedded 768-dim vectors into a 384-dim store and indexed nothing.
-    let explicit_model: Option<crate::embed::ModelType> = match body.model.as_deref() {
-        Some(model_str) => match crate::embed::ModelType::parse(model_str) {
+    let explicit_model: Option<crate::embed::EmbeddingModel> = match body.model.as_deref() {
+        Some(model_str) => match crate::embed::EmbeddingModel::parse(model_str) {
             Some(mt) => Some(mt),
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
                     axum::response::Json(json!({
-                        "error": format!("Unknown model: '{}'. Use one of: {}", model_str, crate::embed::ModelType::valid_short_names()),
+                        "error": format!("Unknown model: '{}'. Use one of: {}", model_str, crate::embed::EmbeddingModel::valid_short_names()),
                         "status": "error"
                     })),
                 );
@@ -5899,7 +5911,17 @@ async fn add_repo_handler(
     // creating a brand-new index: an existing index keeps the model recorded in
     // its `metadata.json`, exactly as if the flag had not been set. An explicit
     // `model` still wins and rebuilds at that model's dimension.
-    let recorded_model = crate::embed::ModelType::from_index_metadata(&db_path);
+    if db_path.join("metadata.json").exists() {
+        if let Err(error) = crate::embed::EmbeddingModel::resolve_index(&db_path) {
+            return (
+                StatusCode::CONFLICT,
+                axum::response::Json(json!({
+                    "error": format!("{error:#}"), "status": "embedding_strategy_mismatch"
+                })),
+            );
+        }
+    }
+    let recorded_model = crate::embed::EmbeddingModel::from_index_metadata(&db_path);
     let model_override =
         resolve_add_repo_model(explicit_model, recorded_model, state.default_model());
 
@@ -6993,7 +7015,7 @@ pub async fn run_serve(
     host: Option<String>,
     port: Option<u16>,
     register_paths: Vec<PathBuf>,
-    default_model: Option<crate::embed::ModelType>,
+    default_model: Option<crate::embed::EmbeddingModel>,
     no_tui: bool,
     keep_warm_url: Option<String>,
     idle_suspend_secs: Option<u64>,

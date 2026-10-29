@@ -148,7 +148,7 @@ impl CodesearchService {
     /// hardcoded default in serve mode — so every repo read as `minilm-l6-q`
     /// even when indexed with EmbeddingGemma. See the serve query-model fix.
     pub(crate) fn group_model_label(&self, aliases: &[String]) -> String {
-        let mut common: Option<ModelType> = None;
+        let mut common: Option<EmbeddingModel> = None;
         for alias in aliases {
             let model = self.query_model(Some(alias));
             match common {

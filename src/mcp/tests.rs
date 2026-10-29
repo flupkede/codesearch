@@ -2775,18 +2775,26 @@ fn mixed_model_group_warning_fires_only_for_genuinely_mixed_groups() {
 
     // One model — even repeated by several repos — is one scale.
     assert!(
-        super::mixed_model_group_warning([ModelType::AllMiniLML6V2Q]).is_none(),
+        super::mixed_model_group_warning([crate::embed::EmbeddingModel::Local(
+            ModelType::AllMiniLML6V2Q
+        )])
+        .is_none(),
         "a single-model group must not warn"
     );
     assert!(
-        super::mixed_model_group_warning([ModelType::AllMiniLML6V2Q, ModelType::AllMiniLML6V2Q,])
-            .is_none(),
+        super::mixed_model_group_warning([
+            crate::embed::EmbeddingModel::Local(ModelType::AllMiniLML6V2Q),
+            crate::embed::EmbeddingModel::Local(ModelType::AllMiniLML6V2Q)
+        ])
+        .is_none(),
         "the same model across repos is still one scale"
     );
 
-    let warning =
-        super::mixed_model_group_warning([ModelType::AllMiniLML6V2Q, ModelType::BGESmallENV15])
-            .expect("a genuinely mixed group must warn");
+    let warning = super::mixed_model_group_warning([
+        crate::embed::EmbeddingModel::Local(ModelType::AllMiniLML6V2Q),
+        crate::embed::EmbeddingModel::Local(ModelType::BGESmallENV15),
+    ])
+    .expect("a genuinely mixed group must warn");
     assert!(
         warning.contains("NOT comparable"),
         "the warning must say the scores are not comparable: {warning}"

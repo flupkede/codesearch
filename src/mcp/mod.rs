@@ -119,10 +119,10 @@ pub(crate) fn try_vector_read_or_note<'a>(
 /// models are genuinely mixed, name every distinct model, explain that each
 /// score is within-repo relevance only — is testable without standing up
 /// two on-disk embedding models.
-pub(crate) fn mixed_model_group_warning<I: IntoIterator<Item = ModelType>>(
+pub(crate) fn mixed_model_group_warning<I: IntoIterator<Item = EmbeddingModel>>(
     models: I,
 ) -> Option<String> {
-    let distinct: std::collections::HashSet<ModelType> = models.into_iter().collect();
+    let distinct: std::collections::HashSet<EmbeddingModel> = models.into_iter().collect();
     if distinct.len() < 2 {
         return None;
     }
@@ -153,7 +153,7 @@ pub(crate) fn intern_group_chunk_id(
 }
 
 use crate::db_discovery::{find_best_database, load_repos_config};
-use crate::embed::{EmbeddingServicePool, ModelType};
+use crate::embed::{EmbeddingModel, EmbeddingServicePool};
 use crate::file::Language;
 use crate::fts::FtsStore;
 use crate::index::SharedStores;
@@ -273,7 +273,7 @@ pub struct CodesearchService {
     tool_router: ToolRouter<CodesearchService>,
     db_path: PathBuf,
     project_path: PathBuf,
-    model_type: ModelType,
+    model_type: EmbeddingModel,
     dimensions: usize,
     // Lazily initialized on first search. A per-model pool: serve mode is
     // multi-repo and each index records the model it was built with, so the
@@ -328,7 +328,7 @@ impl Drop for CodesearchService {
 /// See [`CodesearchService::resolve_query_model`].
 pub(crate) struct QueryModel {
     /// The model the query must be embedded with.
-    pub model: ModelType,
+    pub model: EmbeddingModel,
     /// A caller-facing warning, set when the target index records no model and
     /// the built-in default was assumed. `None` when the model was recorded or
     /// the query is scope-free.
@@ -992,24 +992,28 @@ impl CodesearchService {
         let project_path = db_info.project_path;
 
         // Read model metadata from database
+        EmbeddingModel::validate_strategy(&db_path)?;
         let metadata_path = db_path.join("metadata.json");
-        let (model_type, dimensions) = if metadata_path.exists() {
+        let (model_type, dimensions) = if crate::embed::active_config().remote() {
+            let model = EmbeddingModel::resolve_index(&db_path)?;
+            (model, model.try_dimensions()?)
+        } else if metadata_path.exists() {
             let content = std::fs::read_to_string(&metadata_path)?;
             let json: serde_json::Value = serde_json::from_str(&content)?;
             let model_name = json
                 .get("model_short_name")
-                .and_then(|v| v.as_str())
+                .and_then(|value| value.as_str())
                 .unwrap_or("minilm-l6");
-            let dims = json
+            let dimensions = json
                 .get("dimensions")
-                .and_then(|v| v.as_u64())
+                .and_then(|value| value.as_u64())
                 .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS as u64)
                 as usize;
-            let mt = ModelType::parse(model_name).unwrap_or_default();
-            (mt, dims)
+            let model = crate::embed::ModelType::parse(model_name).unwrap_or_default();
+            (EmbeddingModel::Local(model), dimensions)
         } else {
             (
-                ModelType::default(),
+                EmbeddingModel::default(),
                 crate::constants::DEFAULT_EMBEDDING_DIMENSIONS,
             )
         };
@@ -1047,7 +1051,7 @@ impl CodesearchService {
             db_path: PathBuf::from("serve://multi-repo"),
             project_path: PathBuf::from("serve://multi-repo"),
             model_type,
-            dimensions: model_type.dimensions(),
+            dimensions: model_type.try_dimensions()?,
             embedding_pool: serve_state.embedding_pool(),
             shared_stores: None,
             serve_state: Some(serve_state),
@@ -1078,7 +1082,7 @@ impl CodesearchService {
     /// metadata in stdio mode, the serve default in serve mode (the scope-free
     /// status summary). Prefer [`Self::resolve_query_model`] when the caller can
     /// surface the unrecorded-model warning.
-    pub(crate) fn query_model(&self, alias: Option<&str>) -> ModelType {
+    pub(crate) fn query_model(&self, alias: Option<&str>) -> EmbeddingModel {
         self.resolve_query_model(alias).model
     }
 
@@ -1102,7 +1106,7 @@ impl CodesearchService {
                     assumed_warning: None,
                 };
             }
-            let model = ModelType::default();
+            let model = EmbeddingModel::default();
             let warning = format!(
                 "repo '{alias}' records no embedding model; queried with the built-in default '{}' ({} dims). If this repo was indexed with a different model, re-index it: codesearch index --force --model <name>",
                 model.short_name(),
@@ -1134,7 +1138,7 @@ impl CodesearchService {
     /// where it belongs to a background task with progress, not to a query.
     pub(crate) async fn embedding_service_for_query(
         &self,
-        model: ModelType,
+        model: EmbeddingModel,
     ) -> Result<Option<Arc<Mutex<crate::embed::EmbeddingService>>>> {
         if let Some(service) = self.embedding_pool.get_if_cached(model) {
             return Ok(Some(service));

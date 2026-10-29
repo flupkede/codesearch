@@ -1,12 +1,14 @@
 use anyhow::Result;
-use clap::{builder::BoolishValueParser, ArgAction, Parser, Subcommand};
+use clap::{
+    builder::BoolishValueParser, ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand,
+};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 use crate::constants::{
     DEFAULT_SERVE_URL, REPO_REINDEX_PATH_PREFIX, REPO_REINDEX_PATH_SUFFIX, SERVE_PORT_ENV,
 };
-use crate::embed::ModelType;
+use crate::embed::EmbeddingModel;
 use crate::search::SearchOptions;
 
 /// Index subcommands
@@ -260,6 +262,8 @@ pub enum HookClaudeCommands {
 #[command(name = "codesearch")]
 #[command(author, version = env!("CARGO_PKG_VERSION_FULL"), about, long_about = None)]
 pub struct Cli {
+    #[command(flatten)]
+    pub embedding: crate::embed::EmbedConfig,
     #[command(subcommand)]
     pub command: Commands,
 
@@ -1012,29 +1016,29 @@ async fn run_remote_reindex(peer_name: &str, alias: &str, force: bool, json: boo
     Ok(())
 }
 
-fn warn_if_heavier_model(model_type: ModelType) {
+fn warn_if_heavier_model(model_type: EmbeddingModel) {
     if model_type.is_heavier_than_default() {
         crate::warn_print!(
             "Warning: model '{}' produces {}-dimensional vectors (default: {}). \
              Expect higher vector-index RAM and disk usage.",
             model_type.short_name(),
             model_type.dimensions(),
-            ModelType::default().dimensions()
+            EmbeddingModel::default().dimensions()
         );
     }
 }
 
-/// Resolve a CLI `--model` flag to an optional [`ModelType`].
+/// Resolve a CLI `--model` flag to an optional [`EmbeddingModel`].
 ///
 /// `None` (flag absent) stays `None` so runtime paths keep their per-query
 /// model resolution; an unknown name is rejected with the full valid-model
 /// list. Shared by every command that takes `--model`.
-pub(crate) fn parse_model_arg(model: Option<&str>) -> Result<Option<ModelType>> {
+pub(crate) fn parse_model_arg(model: Option<&str>) -> Result<Option<EmbeddingModel>> {
     match model {
-        Some(name) => ModelType::parse(name).map(Some).ok_or_else(|| {
+        Some(name) => EmbeddingModel::parse(name).map(Some).ok_or_else(|| {
             anyhow::anyhow!(
                 "Unknown model '{name}' (valid models: {})",
-                ModelType::valid_short_names()
+                EmbeddingModel::valid_short_names()
             )
         }),
         None => Ok(None),
@@ -1042,7 +1046,22 @@ pub(crate) fn parse_model_arg(model: Option<&str>) -> Result<Option<ModelType>> 
 }
 
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let explicit: Vec<String> = matches
+        .ids()
+        .filter(|id| {
+            id.as_str().starts_with("embed_")
+                && matches.value_source(id.as_str())
+                    != Some(clap::parser::ValueSource::DefaultValue)
+        })
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    let cli = Cli::from_arg_matches(&matches)?;
+    let active_model = match &cli.command {
+        Commands::Setup { model } => model.as_deref().or(cli.model.as_deref()),
+        _ => cli.model.as_deref(),
+    };
+    crate::embed::configure(cli.embedding.clone(), active_model, &explicit)?;
 
     // Parse model from CLI flag
     let model_type = parse_model_arg(cli.model.as_deref())?;
@@ -1289,6 +1308,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     crate::serve::run_tui_standalone(url, api_key).await
                 }
                 crate::cli::ServeAction::Start => {
+                    if crate::embed::active_config().remote() {
+                        EmbeddingModel::ActiveRemote.try_dimensions()?;
+                    }
                     // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
                     // regardless of whether a database exists in the current directory.
                     // This is a central log for the multi-repo serve process, separate from
@@ -1400,7 +1422,7 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
     // Parse model name
     let model_name = model
         .as_deref()
-        .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
+        .map(|m| EmbeddingModel::parse(m).map(|mt| mt.short_name().to_owned()))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
 
     if model_name.is_none() {
@@ -1423,13 +1445,13 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
 
     // Show stats for specific model or all models
     if let Some(name) = model_name {
-        let model_cache_dir = cache_dir.join(name);
+        let model_cache_dir = cache_dir.join(&name);
         if !model_cache_dir.exists() {
             eprintln!("No cache found for model: {}", name);
             return Ok(());
         }
 
-        let cache = crate::embed::PersistentEmbeddingCache::open(name)?;
+        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
         let stats = cache.stats()?;
 
         println!("Persistent Cache Statistics ({})", name);
@@ -1482,7 +1504,7 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
     // Parse model name
     let model_name = model
         .as_deref()
-        .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
+        .map(|m| EmbeddingModel::parse(m).map(|mt| mt.short_name().to_owned()))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
 
     // Get cache directory
@@ -1515,13 +1537,13 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
 
     // Clear cache for specific model or all models
     if let Some(name) = model_name {
-        let model_cache_dir = cache_dir.join(name);
+        let model_cache_dir = cache_dir.join(&name);
         if !model_cache_dir.exists() {
             eprintln!("No cache found for model: {}", name);
             return Ok(());
         }
 
-        let cache = crate::embed::PersistentEmbeddingCache::open(name)?;
+        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
         let stats_before = cache.stats()?;
         cache.clear()?;
         eprintln!(

@@ -155,7 +155,53 @@ spaces are model-specific. Keep the same model selected for later indexing runs.
 Search rejects a `--model` value that differs from the indexed model and points
 to the required `--force` rebuild instead of mixing incompatible vector spaces.
 
-In **serve** mode the model is resolved **per repository**, from each index's own
+By default, **fastembed** keeps all embedding inference local and offline (after
+its one-time model download). Optional OpenAI-compatible HTTP embeddings use
+**one active strategy** for the entire process/install, not per-repository
+endpoints. No remote service is contacted unless explicitly configured.
+
+For example, run a LiteLLM proxy with a Bedrock embedding deployment:
+
+```yaml
+# LiteLLM proxy config.yaml (AWS credentials belong to the proxy, not codesearch)
+model_list:
+  - model_name: bedrock-embed
+    litellm_params:
+      model: bedrock/amazon.titan-embed-text-v2:0
+      aws_region_name: us-east-1
+```
+
+```bash
+# Start your separately installed proxy with the configuration above:
+# litellm --config config.yaml --port 4000
+export CODESEARCH_EMBED_PROVIDER=openai
+export CODESEARCH_EMBED_BASE_URL=http://127.0.0.1:4000/v1
+# Optional for authenticated proxies; never pass a key as a command-line flag.
+export CODESEARCH_EMBED_API_KEY='your-proxy-key'
+codesearch --model bedrock-embed setup
+codesearch --model bedrock-embed index /path/to/project --force
+codesearch serve
+```
+
+The base URL must include the API prefix (for example `/v1`); codesearch appends
+`/embeddings`. Credentials in URLs are rejected. `setup` probes the endpoint and
+persists only nonsecret defaults; it downloads no local model. `doctor` validates
+the active provider and probes remote inference. The key is read only from
+`CODESEARCH_EMBED_API_KEY` and may be omitted for unauthenticated servers.
+Source chunks and queries are sent to your configured endpoint: choose a proxy
+and backend appropriate for your code's confidentiality requirements.
+
+Changing provider, remote model, dimensions, prefixes or input limit requires
+**`--force` reindexing every affected repository**. Incompatible indexes fail
+clearly rather than silently mixing vector spaces. Keep the active remote
+configuration available on subsequent runs. To return to local inference, set
+`CODESEARCH_EMBED_PROVIDER=fastembed` and rebuild with `--force`.
+Remote requests use bounded batches, concurrency, deadlines and retries for
+429/5xx responses. Remote vectors are L2-normalized; local inputs and vectors
+are unchanged. Oversized remote inputs are truncated at a UTF-8 boundary (not
+skipped), so every successfully indexed file remains complete in text search.
+
+In **local fastembed serve** mode the model is resolved **per repository**, from each index's own
 metadata, not from a hub-wide setting: a hub may hold indexes built with
 different models, and every query is embedded with the model of the repo it
 targets (mixed-model groups are fine). `codesearch serve --model <name>` sets a
@@ -608,7 +654,17 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_MODEL_LOAD_TIMEOUT_SECS` | Bound on a cold-cache embedding-model load (default: 600). On expiry the loader fails fast with a hint to pre-populate the cache via `codesearch setup`; search itself only uses models already loaded or provably on disk |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
 | `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` | Hard cap (MB) for LMDB auto-resize on `MDB_MAP_FULL`, applied to both the vector store and the persistent embedding cache (default: 16384 = 16GB; clamped to at least 1024). Raise this for very large corpora (millions of chunks) that legitimately exceed the default cap — see #189. |
-| `CODESEARCH_BATCH_SIZE` | Embedding batch size |
+| `CODESEARCH_BATCH_SIZE` | Local ONNX embedding batch size |
+| `CODESEARCH_EMBED_PROVIDER` | `fastembed` (default) or `openai`; one active strategy per process/install (`--embed-provider`) |
+| `CODESEARCH_EMBED_BASE_URL` | Explicit OpenAI-compatible API base URL, e.g. `http://localhost:4000/v1`; no default (`--embed-base-url`) |
+| `CODESEARCH_EMBED_API_KEY` | Optional bearer key for embedding requests; environment only, never persisted |
+| `CODESEARCH_EMBED_DIMENSIONS` | Optional requested remote dimensions; otherwise discovered once by a probe (`--embed-dimensions`) |
+| `CODESEARCH_EMBED_BATCH_SIZE` | Remote inputs per HTTP request (default: 32; `--embed-batch-size`) |
+| `CODESEARCH_EMBED_TIMEOUT_SECS` | Remote operation deadline including queue/retries (default: 30; `--embed-timeout-secs`) |
+| `CODESEARCH_EMBED_CONCURRENCY` | Max concurrent remote requests (default: 2; `--embed-concurrency`) |
+| `CODESEARCH_EMBED_QUERY_PREFIX` | Remote query prefix (default: empty; `--embed-query-prefix`) |
+| `CODESEARCH_EMBED_DOCUMENT_PREFIX` | Remote document prefix (default: empty; `--embed-document-prefix`) |
+| `CODESEARCH_EMBED_MAX_INPUT_BYTES` | Remote UTF-8 input limit including prefix (default: 24000; `--embed-max-input-bytes`) |
 | `CODESEARCH_INCREMENTAL_BATCH_SIZE` | Files read/chunked per incremental-refresh batch (default: 200) |
 | `CODESEARCH_INDEX_JOBS` | Max concurrent heavy repo jobs — refresh / reindex / HNSW build — in one serve process (default: 1; queries are never gated). See [Indexing limits](#indexing-limits) |
 | `CODESEARCH_EMBED_THREADS` | ONNX intra-op threads per embedding session (unset = ONNX default, all cores) |

@@ -20,7 +20,7 @@ use crate::constants::{
     DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
     SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS, WRITER_LOCK_FILE,
 };
-use crate::embed::{EmbeddingServicePool, ModelType};
+use crate::embed::{EmbeddingModel, EmbeddingServicePool};
 use crate::fts::FtsStore;
 use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
 use crate::vectordb::VectorStore;
@@ -705,52 +705,17 @@ impl IndexManager {
 
     /// Resolve the embedding model recorded in `metadata.json` for an index.
     ///
-    /// Returns the parsed [`ModelType`] and its dimension count. Vectors written
+    /// Returns the parsed [`EmbeddingModel`] and its dimension count. Vectors written
     /// to an index MUST be produced by this exact model — embedding with any
     /// other model (including the hardcoded default) silently corrupts the index
     /// and, for non-384d models, yields a dimension mismatch. Every embedding
-    /// path resolves the model through this helper instead of `ModelType::default()`.
+    /// path resolves the model through this helper instead of `EmbeddingModel::default()`.
     ///
     /// Fails fast if metadata is missing, names an unknown model, or records a
     /// dimension count that disagrees with the resolved model.
-    pub(crate) fn resolve_embed_model(db_path: &Path) -> Result<(ModelType, usize)> {
-        let metadata_path = db_path.join("metadata.json");
-        if !metadata_path.exists() {
-            return Err(anyhow::anyhow!(
-                "No metadata.json found in {}",
-                db_path.display()
-            ));
-        }
-        let content = std::fs::read_to_string(&metadata_path)?;
-        let json: serde_json::Value = serde_json::from_str(&content)?;
-        let model_name = json
-            .get("model_short_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("minilm-l6-q");
-        let dimensions = json
-            .get("dimensions")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(384) as usize;
-        let model = ModelType::parse(model_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Unknown embedding model '{}' in {}. Valid models: {}",
-                model_name,
-                metadata_path.display(),
-                ModelType::valid_short_names()
-            )
-        })?;
-        if model.dimensions() != dimensions {
-            return Err(anyhow::anyhow!(
-                "Metadata inconsistency in {}: model '{}' has {} dimensions but \
-                 metadata records {}. The index is corrupt — re-create it with a \
-                 single consistent model.",
-                metadata_path.display(),
-                model_name,
-                model.dimensions(),
-                dimensions
-            ));
-        }
-        Ok((model, dimensions))
+    pub(crate) fn resolve_embed_model(db_path: &Path) -> Result<(EmbeddingModel, usize)> {
+        let model = EmbeddingModel::resolve_index(db_path)?;
+        Ok((model, model.try_dimensions()?))
     }
 
     /// Perform incremental refresh using shared stores.
@@ -849,6 +814,8 @@ impl IndexManager {
         } else {
             return Err(anyhow::anyhow!("No metadata.json found in database"));
         };
+
+        EmbeddingModel::validate_strategy(db_path)?;
 
         // Load FileMetaStore
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, &model_name, dimensions)?;
@@ -967,33 +934,6 @@ impl IndexManager {
             file_meta_store.remove_file(file_path);
         }
 
-        // Delete old chunks for changed files
-        for file in &changed_files {
-            let key = crate::cache::storage_key(&file.path, codebase_path);
-            let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
-            if !old_chunk_ids.is_empty() {
-                debug!(
-                    "🔄 Deleting {} old chunks for: {}",
-                    old_chunk_ids.len(),
-                    file.path.display()
-                );
-
-                // Delete from vector store
-                {
-                    let mut store = stores.vector_store.write().await;
-                    store.delete_chunks(&old_chunk_ids)?;
-                }
-
-                // Delete from FTS
-                {
-                    let mut fts_store = stores.fts_store.write().await;
-                    for chunk_id in &old_chunk_ids {
-                        fts_store.delete_chunk(*chunk_id)?;
-                    }
-                }
-            }
-        }
-
         // Commit FTS deletions
         {
             let mut fts_store = stores.fts_store.write().await;
@@ -1101,7 +1041,7 @@ impl IndexManager {
                             consumed += 1;
                             let content = match std::fs::read_to_string(&file.path) {
                                 Ok(c) => c,
-                                Err(_) => continue,
+                                Err(error) => return Err(error.into()),
                             };
                             // Chunk under the project-relative storage key so
                             // chunk metadata stays machine-portable.
@@ -1158,6 +1098,33 @@ impl IndexManager {
                 // the batch to the stores must skip the insert + the final
                 // build_index, so a removed repo never receives fresh data.
                 Self::ensure_indexing_active(cancel_token)?;
+
+                // Delete old chunks for changed files
+                for file in file_batch {
+                    let key = crate::cache::storage_key(&file.path, codebase_path);
+                    let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
+                    if !old_chunk_ids.is_empty() {
+                        debug!(
+                            "🔄 Deleting {} old chunks for: {}",
+                            old_chunk_ids.len(),
+                            file.path.display()
+                        );
+
+                        // Delete from vector store
+                        {
+                            let mut store = stores.vector_store.write().await;
+                            store.delete_chunks(&old_chunk_ids)?;
+                        }
+
+                        // Delete from FTS
+                        {
+                            let mut fts_store = stores.fts_store.write().await;
+                            for chunk_id in &old_chunk_ids {
+                                fts_store.delete_chunk(*chunk_id)?;
+                            }
+                        }
+                    }
+                }
 
                 if !embedded_chunks.is_empty() {
                     info!(
@@ -1234,6 +1201,11 @@ impl IndexManager {
                 // meta empty while chunks exist — the next open then wipes
                 // the whole store (the B1 guard) and re-embeds everything.
                 file_meta_store.save(db_path)?;
+                // Remote failures can end the pass at any batch; completed files
+                // must remain searchable even when the next request fails.
+                if embed_model == EmbeddingModel::ActiveRemote {
+                    stores.vector_store.write().await.build_index()?;
+                }
             }
 
             // Build the HNSW index once, after every batch has been inserted.
@@ -1320,7 +1292,7 @@ impl IndexManager {
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
-        model_override: Option<ModelType>,
+        model_override: Option<EmbeddingModel>,
         cancel_token: &CancellationToken,
         embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
@@ -1380,7 +1352,7 @@ impl IndexManager {
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
-        model_override: Option<ModelType>,
+        model_override: Option<EmbeddingModel>,
         cancel_token: &CancellationToken,
         embedding_pool: Option<&Arc<EmbeddingServicePool>>,
     ) -> Result<()> {
@@ -1430,6 +1402,19 @@ impl IndexManager {
             })
         };
 
+        let recorded_provider = preserved_metadata
+            .get("embedding_provider")
+            .and_then(|value| value.as_str())
+            .unwrap_or("fastembed");
+        let strategy_changed =
+            (recorded_provider == "openai") != crate::embed::active_config().remote();
+        let model_override = model_override.or_else(|| {
+            (strategy_changed || crate::embed::active_config().remote())
+                .then(EmbeddingModel::default)
+        });
+        if let Some(model) = model_override {
+            model.try_dimensions()?;
+        }
         // Apply model override if provided (e.g. from `index add --model`)
         if let Some(ref mt) = model_override {
             if let Some(obj) = preserved_metadata.as_object_mut() {
@@ -1454,7 +1439,7 @@ impl IndexManager {
         // making a perfectly-good index look empty. Only runs when no explicit
         // override was given (the override block above already populated these).
         if preserved_metadata.get("model_short_name").is_none() {
-            let default_model = ModelType::default();
+            let default_model = EmbeddingModel::default();
             if let Some(obj) = preserved_metadata.as_object_mut() {
                 default_model.write_metadata_fields(obj);
             }
@@ -3905,7 +3890,7 @@ mod tests {
         let db_path = temp.path().join("db");
         std::fs::create_dir_all(&codebase_path).unwrap();
         std::fs::create_dir_all(&db_path).unwrap();
-        let dims = ModelType::default().dimensions();
+        let dims = EmbeddingModel::default().dimensions();
         let stores = create_test_stores(&db_path, dims).await;
 
         // A large corpus so the full pass spans multiple embed batches and takes
@@ -3985,7 +3970,7 @@ mod tests {
 
         // create_test_stores → VectorStore::new → ensure_schema_version, which
         // writes the real "schema_version only" metadata.json — the exact bug state.
-        let dims = ModelType::default().dimensions();
+        let dims = EmbeddingModel::default().dimensions();
         let stores = create_test_stores(&db_path, dims).await;
 
         // Precondition: the bootstrap wrote NO model field.
@@ -4014,7 +3999,7 @@ mod tests {
         let after_json: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert_eq!(
             after_json.get("model_short_name").and_then(|v| v.as_str()),
-            Some(ModelType::default().short_name()),
+            Some(EmbeddingModel::default().short_name()),
             "metadata.json must have the default model_short_name stamped, got: {after}"
         );
         assert_eq!(

@@ -138,6 +138,22 @@ impl CheckResult {
     }
 }
 
+fn check_embedding_strategy(db_path: &Path) -> CheckResult {
+    match crate::embed::EmbeddingModel::resolve_index(db_path).and_then(|model| {
+        if model == crate::embed::EmbeddingModel::ActiveRemote {
+            let mut embedder = crate::embed::EmbeddingService::with_model(model)?;
+            embedder.embed_query("doctor probe")?;
+        }
+        Ok(model)
+    }) {
+        Ok(model) => CheckResult::pass(
+            "Embedding strategy",
+            format!("{} ({} dimensions)", model.name(), model.dimensions()),
+        ),
+        Err(error) => CheckResult::fail("Embedding strategy", format!("{error:#}")),
+    }
+}
+
 /// Check 1: Find database
 fn check_find_database(project_path: &Path) -> CheckResult {
     match find_best_database(Some(project_path)) {
@@ -292,7 +308,16 @@ fn check_file_integrity(db_path: &Path, project_path: &Path) -> CheckResult {
     let file_meta_path = db_path.join(FILE_META_DB_NAME);
 
     // Read model info from file_meta.json
-    let (model_name, dimensions) = read_model_info(&file_meta_path);
+    let (model_name, dimensions) = if is_remote_index(db_path) {
+        match crate::embed::EmbeddingModel::resolve_index(db_path)
+            .and_then(|model| Ok((model.short_name().to_owned(), model.try_dimensions()?)))
+        {
+            Ok(identity) => identity,
+            Err(error) => return CheckResult::fail("File integrity", format!("{error:#}")),
+        }
+    } else {
+        read_model_info(&file_meta_path)
+    };
 
     // Load FileMetaStore
     let store = match FileMetaStore::load_or_create(db_path, &model_name, dimensions) {
@@ -403,13 +428,24 @@ fn read_model_info(file_meta_path: &Path) -> (String, usize) {
         .unwrap_or_else(|| ("minilm-l6-q".to_string(), 384))
 }
 
-/// Read dimensions from metadata.json (fallback to 384)
-fn read_dimensions(db_path: &Path) -> usize {
-    fs::read_to_string(db_path.join("metadata.json"))
+fn is_remote_index(db_path: &Path) -> bool {
+    fs::read(db_path.join("metadata.json"))
+        .ok()
+        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+        .is_some_and(|json| {
+            json.get("embedding_provider").and_then(|v| v.as_str()) == Some("openai")
+        })
+}
+
+fn read_dimensions(db_path: &Path) -> Result<usize> {
+    if is_remote_index(db_path) {
+        return crate::embed::EmbeddingModel::resolve_index(db_path)?.try_dimensions();
+    }
+    Ok(fs::read_to_string(db_path.join("metadata.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get("dimensions").and_then(|v| v.as_u64()))
-        .unwrap_or(384) as usize
+        .unwrap_or(384) as usize)
 }
 
 /// Check 6: Chunk integrity - vector store health
@@ -520,7 +556,21 @@ fn format_bytes(bytes: usize) -> String {
 }
 
 /// Check 9: Embedding cache
-fn check_embedding_cache(_db_path: &Path, model_name: &str) -> CheckResult {
+fn check_embedding_cache(db_path: &Path, model_name: &str) -> CheckResult {
+    let remote_identity;
+    let model_name = if is_remote_index(db_path) {
+        match crate::embed::EmbeddingModel::resolve_index(db_path)
+            .and_then(|model| model.cache_identity())
+        {
+            Ok(identity) => {
+                remote_identity = identity;
+                remote_identity.as_str()
+            }
+            Err(error) => return CheckResult::fail("Embedding cache", format!("{error:#}")),
+        }
+    } else {
+        model_name
+    };
     // Resolve the cache directory WITHOUT opening LMDB. This lets us detect the
     // "not initialised" case and — critically — the "already held open by the
     // serve process" case without tripping TrackedEnv's double-open guard.
@@ -654,14 +704,14 @@ pub fn diagnose(project_path: &Path) -> Result<DoctorReport> {
 
     // Open VectorStore once for checks that need it.
     // In standalone CLI context this is fine (no conflicting handles).
-    let dims = read_dimensions(&db_path);
-    let vector_store = VectorStore::new(&db_path, dims);
+    let vector_store = read_dimensions(&db_path).and_then(|dims| VectorStore::new(&db_path, dims));
 
     // Run all checks in order
     let mut results = vec![
         check_find_database(&project_path),
         check_database_structure(&db_path),
         check_model_consistency(&db_path),
+        check_embedding_strategy(&db_path),
         check_git_root_placement(&db_path, &project_path),
         check_file_integrity(&db_path, &project_path),
     ];
@@ -722,6 +772,7 @@ pub fn diagnose_with_store(project_path: &Path, store: &VectorStore) -> Result<D
         check_find_database(&project_path),
         check_database_structure(&db_path),
         check_model_consistency(&db_path),
+        check_embedding_strategy(&db_path),
         check_git_root_placement(&db_path, &project_path),
         check_file_integrity(&db_path, &project_path),
     ];

@@ -135,6 +135,26 @@ impl CodesearchService {
     /// Internal: semantic/hybrid search implementation used by `search(mode="semantic")`.
     pub(crate) async fn semantic_search(
         &self,
+        request: Parameters<SemanticSearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if !crate::embed::active_config().remote() {
+            return self.semantic_search_inner(request).await;
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(crate::embed::active_config().embed_timeout_secs),
+            self.semantic_search_inner(request),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                "Remote embedding query deadline exceeded (including queue and retries)",
+            )])),
+        }
+    }
+
+    async fn semantic_search_inner(
+        &self,
         Parameters(request): Parameters<SemanticSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         // Resolve project/group routing (multi-store for group fan-out)
@@ -238,10 +258,7 @@ impl CodesearchService {
             // propagated — same contract as embed_chunks_yielding.
             let query_text = request.query.clone();
             match tokio::task::spawn_blocking(move || {
-                let mut guard = service
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.embed_query(&query_text)
+                crate::embed::embed_query_bounded(service, &query_text)
             })
             .await
             {
@@ -664,16 +681,16 @@ impl CodesearchService {
         // Distinct models that actually answered (embedding resolved): a
         // group mixing them produces scores from different vector spaces,
         // which the merge presents as one ranking.
-        let mut answering_models: std::collections::HashSet<crate::embed::ModelType> =
+        let mut answering_models: std::collections::HashSet<crate::embed::EmbeddingModel> =
             std::collections::HashSet::new();
         {
-            let mut by_model: std::collections::HashMap<crate::embed::ModelType, Vec<f32>> =
+            let mut by_model: std::collections::HashMap<crate::embed::EmbeddingModel, Vec<f32>> =
                 std::collections::HashMap::new();
             // One warning per distinct missing model, not per repo: a group
             // often shares a single model, and N copies of the same warning is
             // noise an agent has to read past.
             let mut missing_by_model: std::collections::HashMap<
-                crate::embed::ModelType,
+                crate::embed::EmbeddingModel,
                 Vec<String>,
             > = std::collections::HashMap::new();
             for alias in aliases {
@@ -692,10 +709,7 @@ impl CodesearchService {
                             // path.
                             let query_text = request.query.clone();
                             let embedding = match tokio::task::spawn_blocking(move || {
-                                let mut guard = service
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                guard.embed_query(&query_text)
+                                crate::embed::embed_query_bounded(service, &query_text)
                             })
                             .await
                             {

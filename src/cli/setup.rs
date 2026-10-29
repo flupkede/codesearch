@@ -1,19 +1,34 @@
 use anyhow::{anyhow, Result};
 
-use crate::embed::ModelType;
+use crate::embed::EmbeddingModel;
 
-/// Resolve the CLI `--model` argument to a [`ModelType`].
+/// Resolve the CLI `--model` argument to a [`EmbeddingModel`].
 ///
 /// Thin setup-specific wrapper over [`super::parse_model_arg`]: setup wants
 /// the default model when the flag is absent, where other commands keep
 /// `None` for per-query resolution.
-fn resolve_model(model: Option<&str>) -> Result<ModelType> {
+fn resolve_model(model: Option<&str>) -> Result<EmbeddingModel> {
     Ok(super::parse_model_arg(model)?.unwrap_or_default())
 }
 
 pub async fn run(model: Option<String>) -> Result<()> {
     let model_type = resolve_model(model.as_deref())?;
 
+    if model_type == EmbeddingModel::ActiveRemote {
+        let model = model_type;
+        let dimensions = model.try_dimensions()?;
+        let mut service = crate::embed::EmbeddingService::with_model(model)?;
+        service.embed_query("setup probe")?;
+        crate::embed::save_default_model(model)?;
+        println!(
+            "Remote embeddings ready: {} ({dimensions} dimensions); nonsecret defaults saved",
+            model.name()
+        );
+        return Ok(());
+    }
+    let EmbeddingModel::Local(local_model) = model_type else {
+        unreachable!()
+    };
     let cache_dir = crate::constants::get_global_models_cache_dir()?;
 
     println!(
@@ -26,7 +41,7 @@ pub async fn run(model: Option<String>) -> Result<()> {
     // Unlike the runtime paths, setup shows the download progress bar: it
     // pulls hundreds of MB on purpose and a silent run looks like a hang.
     let mut embedder = crate::embed::FastEmbedder::with_cache_dir_progress(
-        model_type,
+        local_model,
         Some(&cache_dir),
         true,
     )
@@ -77,25 +92,25 @@ mod tests {
             "error must echo the bad name: {msg}"
         );
         assert!(
-            msg.contains(ModelType::valid_short_names().as_str()),
+            msg.contains(EmbeddingModel::valid_short_names().as_str()),
             "error must list valid models: {msg}"
         );
     }
 
     #[test]
     fn none_resolves_to_default_model() {
-        assert_eq!(resolve_model(None).unwrap(), ModelType::default());
+        assert_eq!(resolve_model(None).unwrap(), EmbeddingModel::default());
     }
 
     #[test]
     fn known_short_names_resolve() {
         assert_eq!(
             resolve_model(Some("embeddinggemma-q4")).unwrap(),
-            ModelType::EmbeddingGemma300MQ4
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4)
         );
         assert_eq!(
             resolve_model(Some("minilm-l6-q")).unwrap(),
-            ModelType::default()
+            EmbeddingModel::default()
         );
     }
 }
