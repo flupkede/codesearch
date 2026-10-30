@@ -188,7 +188,7 @@ impl CodesearchService {
         let stripped_path = strip_alias_prefix(&request.path, ctx.project_alias.as_ref());
         let normalized = normalize_tool_path(&stripped_path, &project_root);
 
-        let mut outline_warnings: Vec<String> = Vec::new();
+        let mut outline_warnings: Vec<String> = ctx.routing_warnings.clone();
         let mut items = match self
             .outline_items_for_normalized(&normalized, &ctx, &mut outline_warnings)
             .await

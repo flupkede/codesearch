@@ -171,7 +171,7 @@ use rmcp::{
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 // Re-export types
 pub use types::*;
@@ -294,6 +294,13 @@ pub struct CodesearchService {
     // AtomicU64 underflows (0 - 1 wraps to u64::MAX) on every REST request,
     // corrupting the `/status` health signal.
     tracks_session: bool,
+    // MCP roots the client advertised for this session (worktree-safe scoping,
+    // todo #270). Fetched lazily on the first tool call — SEP-2260 requires a
+    // server→client request to ride an originating client request, and rmcp
+    // attaches that id automatically inside the `call_tool` scope. `None` =
+    // not fetched yet; `Some` (possibly empty) = fetched, empty meaning the
+    // client has no roots or no roots support.
+    session_roots: RwLock<Option<Arc<Vec<PathBuf>>>>,
 }
 
 impl std::fmt::Debug for CodesearchService {
@@ -1027,6 +1034,7 @@ impl CodesearchService {
             serve_state: None,
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
             tracks_session: false,
+            session_roots: RwLock::new(None),
         })
     }
 
@@ -1053,6 +1061,7 @@ impl CodesearchService {
             serve_state: Some(serve_state),
             symbol_registry,
             tracks_session: false,
+            session_roots: RwLock::new(None),
         })
     }
 
@@ -1178,6 +1187,93 @@ impl CodesearchService {
         Ok(())
     }
 
+    /// Fetch the client's MCP roots once per session (best-effort).
+    ///
+    /// Only serve mode resolves scope from roots; stdio mode has a single DB
+    /// and never raises `scope_required`, so it records an empty set without a
+    /// round-trip. A client that did not advertise the `roots` capability, an
+    /// error, or a timeout all record an empty set — resolution then falls
+    /// back to the historical `scope_required` behaviour.
+    #[allow(deprecated)] // roots is deprecated by SEP-2577; still the only mechanism this SDK ships
+    async fn ensure_session_roots(&self, peer: &rmcp::service::Peer<rmcp::RoleServer>) {
+        let already_fetched = self.session_roots.read().unwrap().is_some();
+        if already_fetched {
+            return;
+        }
+        let roots: Vec<PathBuf> = if self.serve_state.is_none() {
+            vec![]
+        } else if peer
+            .peer_info()
+            .is_some_and(|info| info.capabilities.roots.is_some())
+        {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), peer.list_roots()).await {
+                Ok(Ok(result)) => {
+                    let parsed: Vec<PathBuf> = result
+                        .roots
+                        .iter()
+                        .filter_map(|r| root_uri_to_path(&r.uri))
+                        .collect();
+                    tracing::info!("MCP: session roots: {:?}", parsed);
+                    parsed
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        "MCP: roots/list failed ({e:#}); scope falls back to explicit project"
+                    );
+                    vec![]
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "MCP: roots/list timed out; scope falls back to explicit project"
+                    );
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+        *self.session_roots.write().unwrap() = Some(Arc::new(roots));
+    }
+
+    /// The session's MCP roots (empty when none were fetched or the fetch has
+    /// not happened yet).
+    fn session_roots_snapshot(&self) -> Vec<PathBuf> {
+        self.session_roots
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|roots| roots.as_ref().clone())
+            .unwrap_or_default()
+    }
+
+    /// Resolve the session's roots against the registered projects.
+    ///
+    /// A root picks the project whose `project_path` equals it after
+    /// normalization (separators unified, case-insensitive on Windows).
+    /// Exact match only — no prefix guessing, because a prefix match would
+    /// silently route a parent-directory session into a child repo. Zero or
+    /// multiple matches return `None`: multiple means an ambiguous multi-root
+    /// workspace, and the historical `scope_required` behaviour stands.
+    fn resolve_root_project(
+        &self,
+        cfg: &crate::db_discovery::repos::ReposConfig,
+    ) -> Option<String> {
+        resolve_root_project_in(&self.session_roots_snapshot(), cfg)
+    }
+
+    /// Caller-facing warning for an explicit `project` that differs from the
+    /// session root's own index: the agent is working in a directory with its
+    /// own registered index but queried another one. The request is served
+    /// anyway — the explicit choice wins — but the mismatch is surfaced so
+    /// the agent can correct course instead of reasoning over stale code.
+    fn root_mismatch_warning(
+        &self,
+        cfg: &crate::db_discovery::repos::ReposConfig,
+        alias: &str,
+    ) -> Option<String> {
+        root_mismatch_in(&self.session_roots_snapshot(), cfg, alias)
+    }
+
     /// Resolve project/group parameters to a specific `Arc<SharedStores>`.
     ///
     /// For groups with multiple members, only the first store is returned.
@@ -1198,11 +1294,26 @@ impl CodesearchService {
         project: &Option<String>,
         group: &Option<String>,
         allow_unscoped: bool,
+        root_scopable: bool,
     ) -> std::result::Result<Option<(Vec<Arc<SharedStores>>, Vec<String>)>, String> {
         // No routing params → resolve based on repo count
         if project.is_none() && group.is_none() {
             if let Some(ref serve_state) = self.serve_state {
                 let cfg = serve_state.config_snapshot();
+                // Worktree-safe scoping: a session root that exactly matches
+                // one registered project picks it. Scoped tools resolve as if
+                // the agent had passed project= (touch=true); get_chunk
+                // narrows its fan-out but keeps touch=false — the fan-out rule
+                // deliberately avoids spawning FSW from it. status keeps the
+                // full fan-out: its scope-free answer IS the hub overview.
+                if root_scopable {
+                    if let Some(alias) = self.resolve_root_project(&cfg) {
+                        let stores = serve_state
+                            .get_or_open_stores(&alias, !allow_unscoped)
+                            .await?;
+                        return Ok(Some((vec![stores], vec![alias])));
+                    }
+                }
                 let aliases: Vec<String> = cfg.repos.keys().cloned().collect();
                 if aliases.len() > 1 && !allow_unscoped {
                     // Multi-repo: reject fan-out, require explicit scope
@@ -1272,8 +1383,12 @@ impl CodesearchService {
         allow_unscoped: bool,
         tool_name: &str,
     ) -> std::result::Result<MultiStoreContext, String> {
+        // Root-based scoping applies to the scoped tools and to get_chunk's
+        // fan-out; status keeps the full fan-out (its scope-free answer is the
+        // hub overview).
+        let root_scopable = !allow_unscoped || tool_name == "get_chunk";
         let resolved = self
-            .resolve_repo_stores_multi(project, group, allow_unscoped)
+            .resolve_repo_stores_multi(project, group, allow_unscoped, root_scopable)
             .await?;
         let is_multi = resolved
             .as_ref()
@@ -1314,6 +1429,18 @@ impl CodesearchService {
 
         let needs_local_db = stores.is_none() && !is_multi;
 
+        // Explicit project that differs from the session root's own index:
+        // serve it, but surface the mismatch so the agent can correct course.
+        let mut routing_warnings: Vec<String> = Vec::new();
+        if let Some(alias) = project {
+            if let Some(ref serve_state) = self.serve_state {
+                let cfg = serve_state.config_snapshot();
+                if let Some(warning) = self.root_mismatch_warning(&cfg, alias) {
+                    routing_warnings.push(warning);
+                }
+            }
+        }
+
         // Record tool call for serve dashboard tracking.
         // Skip recording for unscoped multi-store fan-out (allow_unscoped=true means
         // get_chunk or status — get_chunk will record after candidate detection,
@@ -1342,6 +1469,7 @@ impl CodesearchService {
             alias_roots,
             is_multi,
             needs_local_db,
+            routing_warnings,
         })
     }
 
@@ -2297,8 +2425,146 @@ impl CodesearchService {
     }
 }
 
+/// Exact-match resolution of session roots against registered projects.
+///
+/// Pure so the matching rules are testable without a live service.
+fn resolve_root_project_in(
+    roots: &[PathBuf],
+    cfg: &crate::db_discovery::repos::ReposConfig,
+) -> Option<String> {
+    if roots.is_empty() {
+        return None;
+    }
+    let root_keys: HashSet<String> = roots.iter().map(|p| normalize_root_key(p)).collect();
+    let matches: Vec<String> = cfg
+        .repos
+        .iter()
+        .filter(|(_, path)| root_keys.contains(&normalize_root_key(path)))
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// The mismatch warning for an explicit `project` alias whose session root
+/// has its own index. Pure sibling of [`resolve_root_project_in`].
+fn root_mismatch_in(
+    roots: &[PathBuf],
+    cfg: &crate::db_discovery::repos::ReposConfig,
+    alias: &str,
+) -> Option<String> {
+    let root_alias = resolve_root_project_in(roots, cfg)?;
+    if root_alias == alias {
+        return None;
+    }
+    let root_display = cfg
+        .resolve(&root_alias)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| root_alias.clone());
+    Some(format!(
+        "working directory {root_display} has its own index '{root_alias}'; you queried '{alias}'"
+    ))
+}
+
+/// Normalized comparison key for a project path: separators unified via the
+/// single normalize utility, plus case-folding on Windows where paths are
+/// case-insensitive.
+fn normalize_root_key(path: &Path) -> String {
+    let normalized = crate::cache::normalize_path(path);
+    #[cfg(windows)]
+    {
+        normalized.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
+/// Convert an MCP root URI (`file:///C:/repo`, `file:///home/x`) to a path.
+///
+/// Roots are workspace directories in practice; anything that is not a
+/// `file://` URI is skipped rather than guessed at.
+#[allow(deprecated)] // Root is deprecated by SEP-2577; still the only roots shape in this SDK
+fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let decoded = percent_decode(rest);
+    #[cfg(windows)]
+    {
+        let p = decoded.trim_start_matches('/');
+        // file:///C:/repo → "/C:/repo" → "C:/repo"; a path without a drive
+        // letter is not a Windows workspace root.
+        if p.len() >= 2 && p.as_bytes()[1] == b':' {
+            Some(PathBuf::from(p))
+        } else {
+            None
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Some(PathBuf::from(decoded))
+    }
+}
+
+/// Minimal percent-decoding for root URIs (`%20` → space). Roots rarely carry
+/// escapes beyond this, and a full URL crate dependency is not warranted.
+fn percent_decode(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = if bytes[i] == b'%' && i + 2 < bytes.len() {
+            std::str::from_utf8(&bytes[i + 1..i + 3]).ok()
+        } else {
+            None
+        };
+        if let Some(hex) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            out.push(hex);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[tool_handler(router = Self::merged_tool_router())]
 impl ServerHandler for CodesearchService {
+    /// Fetch the client's MCP roots once per session, then dispatch to the
+    /// tool router.
+    ///
+    /// `#[tool_handler]` only generates `call_tool` when the impl block lacks
+    /// one, so this override is the single seam where a request context (and
+    /// therefore the client peer) is available. SEP-2260: a server→client
+    /// request must ride an originating client request — rmcp attaches that id
+    /// automatically inside this scope — which is why roots are fetched here
+    /// and not in `on_initialized`.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<rmcp::model::CallToolResponse, McpError> {
+        self.ensure_session_roots(&context.peer).await;
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::merged_tool_router().call(tcc).await
+    }
+
+    /// The client changed its roots — drop the cache so the next tool call
+    /// re-fetches via the same lazy path as the first fetch.
+    async fn on_roots_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::RoleServer>,
+    ) {
+        *self.session_roots.write().unwrap() = None;
+    }
+
     fn get_info(&self) -> ServerConfig {
         let db_exists = self.db_path.exists();
         let mode = if self.serve_state.is_some() {

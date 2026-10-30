@@ -612,6 +612,11 @@ pub(crate) struct MultiStoreContext {
     pub(crate) is_multi: bool,
     /// True when no serve-state stores resolved and local DB should be checked.
     pub(crate) needs_local_db: bool,
+    /// Caller-facing warnings produced while resolving routing — today only
+    /// an explicit `project` that differs from the session root's own index.
+    /// Handlers seed their warnings channel from this so it rides every
+    /// response shape (`respond_with_*` renders it).
+    pub(crate) routing_warnings: Vec<String>,
 }
 
 impl MultiStoreContext {
