@@ -198,6 +198,23 @@ impl RepoStateLabel {
     }
 }
 
+/// How long after the last text-indexing activity the general status keeps
+/// showing "Indexing". The status snapshot samples every ~2 s, so a 1-2 s
+/// flush can land entirely between samples — without the hold a repo under
+/// continuous editing reads "Idle" while every flush still burns an embed
+/// wave.
+const INDEXING_DISPLAY_HOLD_SECS: u64 = 5;
+
+/// The general "Indexing" label decision: a live text-indexing marker wins;
+/// otherwise the hold window since the last watcher activity keeps it lit.
+/// Pure so the hold contract is table-testable.
+fn text_label_indexing(marker: bool, last_active: Option<Instant>, now: Instant) -> bool {
+    marker
+        || last_active.is_some_and(|t| {
+            now.duration_since(t) <= Duration::from_secs(INDEXING_DISPLAY_HOLD_SECS)
+        })
+}
+
 /// Format a tool call name and elapsed time into a human-readable string.
 fn format_tool_call_ago(tool_name: &str, elapsed: std::time::Duration) -> String {
     let secs = elapsed.as_secs();
@@ -382,6 +399,14 @@ pub(crate) struct ServeState {
     /// `DashMap::clone()` is a deep copy and would silently disconnect the
     /// file-watcher callback from this field).
     active_reindexes: Arc<ActiveReindexes>,
+    /// Per-repo last moment a watcher text-indexing flow was active — stamped
+    /// on BOTH begin and end by [`Self::make_indexing_status_callback`].
+    /// Drives the "Indexing" display hold ([`INDEXING_DISPLAY_HOLD_SECS`]):
+    /// the status snapshot samples every ~2 s, so a 1-2 s flush lands between
+    /// samples and a continuously-editing repo read "Idle" while embedding
+    /// burned CPU. Display-only — the reindex 409 guard reads
+    /// `active_reindexes` exclusively and is unaffected by the hold.
+    indexing_last_active: Arc<DashMap<String, std::time::Instant>>,
     /// Per-repo change count since serve started (incremented by index/reindex operations).
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
@@ -533,6 +558,7 @@ impl ServeState {
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
             active_reindexes: Arc::new(DashMap::new()),
+            indexing_last_active: Arc::new(DashMap::new()),
             repo_changes: DashMap::new(),
             last_tool_call: DashMap::new(),
             remote_peer_activity: DashMap::new(),
@@ -783,8 +809,12 @@ impl ServeState {
     /// the completion half must not erase another flow's marker.
     fn make_indexing_status_callback(&self, alias: &str) -> IndexingStatusCallback {
         let reindexes = self.active_reindexes.clone();
+        let last_active = self.indexing_last_active.clone();
         let alias_key = alias.to_string();
         Arc::new(move |active: bool| {
+            // Stamp on BOTH arms (every call): the hold must run from the
+            // flush END, so the inactive call re-stamps after the work.
+            last_active.insert(alias_key.clone(), Instant::now());
             if active {
                 reindexes
                     .entry(alias_key.clone())
@@ -4160,7 +4190,13 @@ impl ServeState {
             self.is_indexing(alias);
             // Owner-scoped: only text-indexing flows light the general
             // "Indexing" label; symbol rebuilds own the language columns.
-            let text_indexing = self.has_text_indexing_marker(alias);
+            // The display hold keeps the label lit through the quiet gap
+            // between flush end and the next snapshot sample.
+            let text_indexing = text_label_indexing(
+                self.has_text_indexing_marker(alias),
+                self.indexing_last_active.get(alias).map(|e| *e.value()),
+                Instant::now(),
+            );
             let symbol_indexing = self.has_symbol_indexing_marker(alias);
 
             let changes = match self.repos.get(alias) {

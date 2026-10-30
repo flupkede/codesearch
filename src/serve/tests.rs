@@ -4458,6 +4458,100 @@ fn indexing_labels_are_owner_scoped_in_status() {
     state.end_indexing("langrepo", IndexingOwner::Symbol);
 }
 
+/// The "Indexing" display hold: a live text marker wins outright; after the
+/// marker clears, the hold window since the last watcher stamp keeps the
+/// label lit — the status snapshot samples every ~2 s, so a 1-2 s flush can
+/// otherwise land entirely between samples and read "Idle" mid-embed.
+#[test]
+fn indexing_display_hold_table() {
+    let now = Instant::now();
+    let hold = Duration::from_secs(INDEXING_DISPLAY_HOLD_SECS);
+    let cases = [
+        ("live marker wins even with no stamp", true, None, now, true),
+        (
+            "live marker beats an ancient stamp",
+            true,
+            Some(now - hold * 10),
+            now,
+            true,
+        ),
+        (
+            "just-cleared stamp inside the hold stays lit",
+            false,
+            Some(now - hold + Duration::from_millis(500)),
+            now,
+            true,
+        ),
+        (
+            "exact hold boundary is still lit",
+            false,
+            Some(now - hold),
+            now,
+            true,
+        ),
+        (
+            "one tick past the hold goes dark",
+            false,
+            Some(now - hold - Duration::from_millis(1)),
+            now,
+            false,
+        ),
+        ("no stamp and no marker is dark", false, None, now, false),
+    ];
+    for (why, marker, last_active, now, expected) in cases {
+        assert_eq!(
+            text_label_indexing(marker, last_active, now),
+            expected,
+            "{why}"
+        );
+    }
+}
+
+/// Wiring: a completed watcher flush (marker on, then off) keeps the general
+/// label on Indexing through the hold; backdating the stamp past the hold
+/// returns the label to its resting state — and `begin_indexing` stays free
+/// the whole time, proving the hold is display-only (the 409 guard reads
+/// `active_reindexes` exclusively).
+#[test]
+fn completed_flush_stays_indexing_through_display_hold() {
+    let (_tmp, _path, bare) = state_with_repo("holdrepo");
+    let state = std::sync::Arc::new(bare);
+    let cb = state.make_indexing_status_callback("holdrepo");
+    cb(true);
+    cb(false);
+
+    let label = || {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "holdrepo")
+            .expect("holdrepo row")
+            .1
+            .status
+    };
+    assert_eq!(
+        label(),
+        RepoStateLabel::Indexing,
+        "the flush-end stamp must hold the label after the marker clears"
+    );
+
+    state.indexing_last_active.insert(
+        "holdrepo".to_string(),
+        Instant::now() - Duration::from_secs(INDEXING_DISPLAY_HOLD_SECS * 2),
+    );
+    assert_eq!(
+        label(),
+        RepoStateLabel::NoIndex,
+        "past the hold the label returns to the fixture's resting state"
+    );
+
+    assert!(
+        state.begin_indexing("holdrepo", IndexingOwner::Reindex),
+        "the display hold must never block the 409 guard"
+    );
+    state.end_indexing("holdrepo", IndexingOwner::Reindex);
+}
+
 /// TS twin of the owner-scoping test above: with a resolvable helper env
 /// override, a SYMBOL marker lights the TS column while the general label
 /// rests; a TEXT reindex never lights the TS column, tsconfig or not.
