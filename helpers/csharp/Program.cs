@@ -958,6 +958,7 @@ public static class Program
             .Concat(loadable.Where(l => excludedPaths.Contains(l.RelativePath)).Select(l => l.LineIndex))
             .ToHashSet();
         var filteredContent = BuildFilteredSolution(lines, skipIndices);
+        WorkspaceLoad.CleanupStaleFilteredSolutions(solutionDir, Path.GetFileNameWithoutExtension(solutionPath));
         var tempSlnName = $"{Path.GetFileNameWithoutExtension(solutionPath)}-filtered-{Guid.NewGuid():N}.sln";
         var tempSlnPath = Path.Combine(solutionDir, tempSlnName);
         await File.WriteAllTextAsync(tempSlnPath, filteredContent).ConfigureAwait(false);
