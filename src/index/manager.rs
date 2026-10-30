@@ -108,11 +108,27 @@ pub type IndexingStatusCallback = Arc<dyn Fn(bool) + Send + Sync>;
 /// the reaper/FSW can then race the live refresh (todo #131 shape).
 pub type IndexingHeartbeat = Arc<dyn Fn() + Send + Sync>;
 
-/// Batch flush timeout in milliseconds.
-/// Events are batched and flushed when:
-/// 1. No new events for this duration, OR
-/// 2. Buffer has events and this duration passes since last flush
-const FSW_BATCH_FLUSH_MS: u64 = 2000;
+/// Text-batch quiet gate in milliseconds: events are batched and flushed only
+/// after this much silence (default 5 s, overridable via
+/// [`crate::constants::FSW_TEXT_QUIET_MS_ENV`]).
+///
+/// Under continuous editing every brief editor pause closes the gate, and
+/// each flush costs chunking + embedding + an FTS/vector commit — at the old
+/// 2 s gate that meant a CPU burst every few seconds (the "recompile per
+/// edit" wave on the serve hub). Symbol rebuilds keep their own, much longer
+/// quiet gates (`SCIP_CSHARP_DEBOUNCE_MS` / `SCIP_TYPESCRIPT_DEBOUNCE_MS`).
+const DEFAULT_FSW_TEXT_QUIET_MS: u64 = 5000;
+/// Floor for the quiet gate: 0 would flush on every loop tick.
+const MIN_FSW_TEXT_QUIET_MS: u64 = 250;
+
+/// Resolve the text-batch quiet gate from the env value (absent or invalid →
+/// default). Pure over its input so the parse contract is table-testable.
+fn resolve_fsw_text_quiet_ms(env_val: Option<&str>) -> u64 {
+    env_val
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|ms| ms.max(MIN_FSW_TEXT_QUIET_MS))
+        .unwrap_or(DEFAULT_FSW_TEXT_QUIET_MS)
+}
 
 // === Lock File Management ===
 
@@ -1728,7 +1744,8 @@ impl IndexManager {
     /// - Spawns a detached background task
     /// - Watches for file modifications, deletions, and renames
     /// - **Batches events** to avoid overhead with rapid changes
-    /// - Flushes batch when no new events for FSW_BATCH_FLUSH_MS
+    /// - Flushes batch when no new events for the text quiet gate
+    ///   (5 s default, `CODESEARCH_FSW_TEXT_QUIET_MS`)
     /// - Logs all file system events and refresh operations
     /// - Continues running even if individual refresh operations fail
     /// - Stops gracefully when the cancellation token is cancelled
@@ -1782,7 +1799,11 @@ impl IndexManager {
             let mut files_to_index: HashSet<PathBuf> = HashSet::new();
             let mut files_to_remove: HashSet<PathBuf> = HashSet::new();
             let mut last_event_time = std::time::Instant::now();
-            let flush_duration = std::time::Duration::from_millis(FSW_BATCH_FLUSH_MS);
+            let flush_duration = std::time::Duration::from_millis(resolve_fsw_text_quiet_ms(
+                std::env::var(crate::constants::FSW_TEXT_QUIET_MS_ENV)
+                    .ok()
+                    .as_deref(),
+            ));
 
             // Symbol indexer debounce: .cs files are buffered separately and
             // flushed after SCIP_CSHARP_DEBOUNCE_MS of quiet time.
@@ -3367,6 +3388,33 @@ mod tests {
                 classify_symbol_rebuild_event(Path::new(path)),
                 expected,
                 "path: {path}"
+            );
+        }
+    }
+
+    /// The text quiet gate: default 5 s, a valid env override wins, an
+    /// absent or unparseable value falls back to the default, and anything
+    /// below the floor clamps up — the flush loop must never spin per tick.
+    #[test]
+    fn fsw_text_quiet_resolution_table() {
+        assert_eq!(DEFAULT_FSW_TEXT_QUIET_MS, 5000);
+        assert_eq!(MIN_FSW_TEXT_QUIET_MS, 250);
+        let cases = [
+            (None, DEFAULT_FSW_TEXT_QUIET_MS),
+            (Some("3000"), 3000),
+            (Some(" 1500 "), 1500),
+            (Some("0"), MIN_FSW_TEXT_QUIET_MS),
+            (Some("249"), MIN_FSW_TEXT_QUIET_MS),
+            (Some("250"), 250),
+            (Some(""), DEFAULT_FSW_TEXT_QUIET_MS),
+            (Some("abc"), DEFAULT_FSW_TEXT_QUIET_MS),
+            (Some("-1"), DEFAULT_FSW_TEXT_QUIET_MS),
+        ];
+        for (env_val, expected) in cases {
+            assert_eq!(
+                resolve_fsw_text_quiet_ms(env_val),
+                expected,
+                "env value: {env_val:?}"
             );
         }
     }
