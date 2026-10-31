@@ -135,6 +135,12 @@ pub enum GroupsCommands {
         /// Aliases to include in the group (space-separated)
         #[arg(short, long, num_args = 1..)]
         aliases: Vec<String>,
+
+        /// Do NOT expand this group with linked worktrees of its members
+        /// (default: expansion is on — every registered repo sharing a
+        /// member's git identity joins the group's queries).
+        #[arg(long, default_value_t = false)]
+        no_worktrees: bool,
     },
 
     /// Remove a group
@@ -328,6 +334,19 @@ pub enum Commands {
         /// Use vector-only search (disable hybrid FTS)
         #[arg(long)]
         vector_only: bool,
+
+        /// Literal FTS-only search: no embeddings, no fusion, no model load
+        #[arg(long)]
+        literal: bool,
+
+        /// Phrase search over the analyzed tokens (implies --literal)
+        #[arg(long)]
+        phrase: bool,
+
+        /// Regex over the analyzed tokens — never raw text; punctuation does
+        /// not exist in the token index (implies --literal)
+        #[arg(long)]
+        regex: bool,
 
         /// RRF k parameter for score fusion (default 20)
         #[arg(long, default_value = "20")]
@@ -1049,6 +1068,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             json,
             path,
             vector_only,
+            literal,
+            phrase,
+            regex,
             rrf_k,
             rerank,
             rerank_top,
@@ -1073,6 +1095,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 filter_path,
                 model_override: model_type.map(|mt| mt.short_name().to_string()),
                 vector_only,
+                literal: literal || phrase || regex,
+                phrase,
+                regex,
                 rrf_k: if rrf_k == 60.0 {
                     None
                 } else {
@@ -1528,6 +1553,32 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Human-facing grouped rendering for `groups list`: a member that is a
+/// worktree of another member is annotated `"(<main>)"`, and a
+/// family's main tree in the list gets `"+ N"` (counted within the
+/// group). The alias list itself stays flat — display only.
+fn render_group_members(
+    family_map: &std::collections::HashMap<String, String>,
+    aliases: &[String],
+) -> Vec<String> {
+    // Counting scope: within the group (display only).
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for alias in aliases {
+        if let Some(main) = family_map.get(alias.as_str()) {
+            *counts.entry(main.clone()).or_insert(0) += 1;
+        }
+    }
+    aliases
+        .iter()
+        .map(
+            |alias| match crate::db_discovery::repos::family_note(family_map, &counts, alias) {
+                Some(note) => format!("{alias} ({note})"),
+                None => alias.clone(),
+            },
+        )
+        .collect()
+}
+
 /// Handle groups subcommands
 async fn run_groups_command(command: GroupsCommands) -> Result<()> {
     use crate::constants::ALL_GROUP_NAME;
@@ -1545,11 +1596,19 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
                 let count = config.repos.len();
                 println!("  {} (virtual): {} repos", ALL_GROUP_NAME, count);
             }
+            // Human-facing grouped rendering (display only — the alias list
+            // itself stays flat).
+            let family_map = config.worktree_family_map();
             for (name, aliases) in &config.groups {
-                println!("  {}: {}", name, aliases.join(", "));
+                let rendered = render_group_members(&family_map, aliases);
+                println!("  {}: {}", name, rendered.join(", "));
             }
         }
-        GroupsCommands::Add { name, aliases } => {
+        GroupsCommands::Add {
+            name,
+            aliases,
+            no_worktrees,
+        } => {
             if name == ALL_GROUP_NAME {
                 return Err(anyhow::anyhow!(
                     "Group name '{}' is reserved — it always resolves to all registered repos automatically.",
@@ -1572,6 +1631,17 @@ async fn run_groups_command(command: GroupsCommands) -> Result<()> {
                 }
             }
             config.add_group(name.clone(), aliases)?;
+            if no_worktrees {
+                config.groups_meta.insert(
+                    name.clone(),
+                    crate::db_discovery::repos::GroupMeta {
+                        expand_worktrees: false,
+                    },
+                );
+            } else {
+                // Re-adding without the flag clears a previous opt-out.
+                config.groups_meta.remove(name.as_str());
+            }
             config.save()?;
             println!("Group '{}' created/updated.", name);
         }
@@ -2592,5 +2662,78 @@ mod tests {
             }
             _ => panic!("expected Index::Reindex with --remote and --force"),
         }
+    }
+
+    /// `groups add --no-worktrees` records the expansion opt-out in
+    /// groups_meta; re-adding the group without the flag clears it
+    /// (card #261 TODO 2). Drives run_groups_command against a hermetic
+    /// config via CODESEARCH_REPOS_CONFIG.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn groups_add_no_worktrees_records_and_clears_opt_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("repos.json");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut seed = crate::db_discovery::repos::ReposConfig::default();
+        seed.register_with_alias(repo, Some("alpha".to_string()))
+            .unwrap();
+        seed.save_to(&config_file).unwrap();
+
+        let _env = crate::testing::EnvRestore::set(&[(
+            crate::constants::REPOS_CONFIG_ENV,
+            config_file.to_str().unwrap(),
+        )]);
+
+        run_groups_command(GroupsCommands::Add {
+            name: "g".to_string(),
+            aliases: vec!["alpha".to_string()],
+            no_worktrees: true,
+        })
+        .await
+        .unwrap();
+        let cfg = crate::db_discovery::load_repos_config().unwrap();
+        assert!(
+            !cfg.group_expands_worktrees("g"),
+            "--no-worktrees must record the opt-out"
+        );
+
+        // Re-adding without the flag clears a previous opt-out.
+        run_groups_command(GroupsCommands::Add {
+            name: "g".to_string(),
+            aliases: vec!["alpha".to_string()],
+            no_worktrees: false,
+        })
+        .await
+        .unwrap();
+        let cfg = crate::db_discovery::load_repos_config().unwrap();
+        assert!(
+            cfg.group_expands_worktrees("g"),
+            "re-add without the flag must clear the opt-out"
+        );
+    }
+
+    /// `groups list` grouped rendering is display-only: worktree members get
+    /// the "(<main>)" annotation, the family's main tree gets
+    /// "+ N" counted within the group, others stay bare.
+    #[test]
+    fn groups_list_renders_family_annotations() {
+        let mut family_map = std::collections::HashMap::new();
+        family_map.insert("wt1".to_string(), "main".to_string());
+        family_map.insert("wt2".to_string(), "main".to_string());
+        let aliases: Vec<String> = ["main", "wt1", "wt2", "solo"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let rendered = render_group_members(&family_map, &aliases);
+        assert_eq!(
+            rendered,
+            vec![
+                "main (+ 2)".to_string(),
+                "wt1 (main)".to_string(),
+                "wt2 (main)".to_string(),
+                "solo".to_string(),
+            ]
+        );
     }
 }

@@ -142,7 +142,7 @@ internal static class RestorePolicy
 
     private static bool AnyRestoreInputNewerThan(string startDir, string walkRoot, DateTime assetsTime)
     {
-        var dir = Path.GetFullPath(startDir);
+        var dir = PathGuard.Inside(walkRoot, startDir);
         while (true)
         {
             // Enumerate + compare case-insensitively instead of File.Exists

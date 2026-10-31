@@ -254,10 +254,12 @@ fn index_warnings_roundtrip_and_clean_absence() {
     );
 
     let env = crate::symbols::get_shared_scip_env(&db_path).unwrap();
+    let meta = crate::lmdb_registry::create_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
-        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap();
     let stored = vec![
         "summary line".to_string(),
         "App.Dam.csproj: Analyzer.X not found".to_string(),
@@ -326,10 +328,12 @@ fn index_matches_builder_mirrors_the_rebuild_gate() {
 
     // A foreign binary's stamp: stale.
     let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let meta_db = crate::lmdb_registry::create_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
-        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap();
     meta_db
         .put(&mut wtxn, SCIP_INDEX_BUILDER_VERSION_KEY, "v0.0.0+1")
         .unwrap();
@@ -341,11 +345,13 @@ fn index_matches_builder_mirrors_the_rebuild_gate() {
 
     // This build's stamp but no reference-coverage stamp: stale.
     let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let meta_db = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
-        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap()
-        .unwrap();
     meta_db
         .put(
             &mut wtxn,
@@ -366,11 +372,13 @@ fn index_matches_builder_mirrors_the_rebuild_gate() {
         crate::constants::SCIP_REFS_COVERAGE_LAZY,
     ] {
         let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+        let meta_db = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(
+            &env,
+            crate::constants::SCIP_META_DB_NAME,
+        )
+        .unwrap()
+        .unwrap();
         let mut wtxn = env.write_txn().unwrap();
-        let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
-            .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-            .unwrap()
-            .unwrap();
         super::csharp::CSharpSymbolIndexer::write_rebuild_meta(&meta_db, &mut wtxn, &[], coverage)
             .expect("meta write must succeed");
         wtxn.commit().unwrap();
@@ -392,10 +400,12 @@ fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
 
     // Degraded previous build: stale warnings + an old binary's stamp.
     let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let meta_db = crate::lmdb_registry::create_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
-        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap();
     meta_db
         .put(
             &mut wtxn,
@@ -410,11 +420,13 @@ fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
 
     // A clean rebuild's meta write: stamp this build, clear the warnings.
     let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let meta_db = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
-        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap()
-        .unwrap();
     super::csharp::CSharpSymbolIndexer::write_rebuild_meta(
         &meta_db,
         &mut wtxn,
@@ -437,11 +449,13 @@ fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
 
     // A degraded rebuild's meta write persists its warnings instead.
     let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let meta_db = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
-        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap()
-        .unwrap();
     super::csharp::CSharpSymbolIndexer::write_rebuild_meta(
         &meta_db,
         &mut wtxn,
@@ -581,11 +595,13 @@ fn symbol_index_status_reports_restore_pending_over_a_ready_index() {
     let db = dir.path().join("db");
     {
         let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+        let meta = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(
+            &env,
+            SCIP_META_DB_NAME,
+        )
+        .unwrap()
+        .unwrap();
         let mut wtxn = env.write_txn().unwrap();
-        let meta: heed::Database<heed::types::Str, heed::types::Str> = env
-            .open_database(&wtxn, Some(SCIP_META_DB_NAME))
-            .unwrap()
-            .unwrap();
         for (key, value) in [
             (SCIP_REBUILD_TIMESTAMP_KEY, "0"),
             (SCIP_KEY_FORMAT_KEY, SCIP_KEY_FORMAT),

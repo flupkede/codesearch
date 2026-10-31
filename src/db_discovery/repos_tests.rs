@@ -1,3 +1,4 @@
+use super::test_support::{git_serial_lock, init_git_repo_with_commit};
 use super::*;
 use std::io::Write;
 
@@ -15,21 +16,6 @@ fn canon_norm(p: &Path) -> String {
 /// Process-wide lock serializing the git-spawning / directory-renaming
 /// relocation tests.
 ///
-/// These tests `git init` a directory and then rename it. On Windows the OS
-/// indexer / antivirus scans each freshly-created `.git` tree and holds
-/// handles on it, which blocks the rename ("Access is denied"). When many
-/// such tests run concurrently the scanner is overwhelmed and the handles
-/// linger for many seconds — long enough to exhaust even a generous
-/// `rename_retry`. Serializing them so only one `.git` tree is created/
-/// renamed at a time keeps each scan window short and the rename reliable.
-static GIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Acquire the relocation-test serialization lock, recovering from a
-/// poisoned mutex (a panic in one test must not cascade-fail the rest).
-fn git_serial_lock() -> std::sync::MutexGuard<'static, ()> {
-    GIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Initialise a git repo at `dir` with an `origin` remote pointing at `url`.
 fn init_git_remote(dir: &Path, url: &str) {
     // Retry on transient spawn failure (fork exhaustion under parallel test
@@ -1335,4 +1321,341 @@ fn remotes_alias_base_url_field() {
     std::fs::write(&path, json).unwrap();
     let cfg = ReposConfig::load_from(&path).unwrap();
     assert_eq!(cfg.remotes.get("cloud").unwrap().url, "https://cloud");
+}
+
+#[test]
+fn captures_git_common_dir_on_register_and_links_worktrees() {
+    let _serial = git_serial_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    init_git_repo_with_commit(&main);
+
+    let wt = tmp.path().join("wt");
+    let run = |args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    run(&["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"]);
+
+    let mut cfg = ReposConfig::default();
+    let main_alias = cfg.register(main.clone());
+    let wt_alias = cfg.register(wt.clone());
+
+    let main_identity = cfg.meta(&main_alias).git_common_dir.clone();
+    let wt_identity = cfg.meta(&wt_alias).git_common_dir.clone();
+    assert!(
+        main_identity.is_some(),
+        "main tree must capture a git identity"
+    );
+    assert_eq!(
+        main_identity, wt_identity,
+        "main tree and its worktree must share one identity"
+    );
+    // The identity is the canonical common dir, not the worktree gitdir.
+    let expected = identity_string(&main.join(".git"));
+    assert_eq!(main_identity, Some(expected));
+}
+
+#[test]
+fn git_common_dir_fs_fallback_resolves_worktree_and_main_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Main tree: `.git` is a directory — the common dir is that dir itself.
+    let main = tmp.path().join("main");
+    let main_git = main.join(".git");
+    std::fs::create_dir_all(&main_git).unwrap();
+    // Worktree: `.git` is a FILE ("gitdir: ...") whose gitdir holds a
+    // `commondir` file pointing back at the shared dir (relative form).
+    let wt = tmp.path().join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    let wt_gitdir = tmp.path().join(".git-worktrees-wt");
+    std::fs::create_dir_all(&wt_gitdir).unwrap();
+    std::fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", wt_gitdir.display()),
+    )
+    .unwrap();
+    std::fs::write(wt_gitdir.join("commondir"), "../main/.git\n").unwrap();
+
+    let main_identity = git_common_dir_fs_fallback(&main).unwrap();
+    let wt_identity = git_common_dir_fs_fallback(&wt).unwrap();
+    assert_eq!(main_identity, wt_identity);
+    assert_eq!(main_identity, identity_string(&main_git));
+}
+
+/// Hand-set identity helper: registers two paths as repos and stamps both
+/// with one shared git identity, without spawning git (the expansion logic
+/// reads only the recorded identity, so the unit tests exercise exactly that).
+fn register_family(cfg: &mut ReposConfig, a: &Path, b: &Path) -> (String, String) {
+    let alias_a = cfg.register(a.to_path_buf());
+    let alias_b = cfg.register(b.to_path_buf());
+    let identity = format!("{}/.git", a.display());
+    cfg.repos_meta
+        .entry(alias_a.clone())
+        .or_default()
+        .git_common_dir = Some(identity.clone());
+    cfg.repos_meta
+        .entry(alias_b.clone())
+        .or_default()
+        .git_common_dir = Some(identity);
+    (alias_a, alias_b)
+}
+
+#[test]
+fn expand_group_members_appends_same_identity_repos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(&mut cfg, &tmp.path().join("main"), &tmp.path().join("wt"));
+    // An unrelated repo must not be pulled in.
+    let other = cfg.register(tmp.path().join("other"));
+    cfg.add_group("g".to_string(), vec![main.clone()]).unwrap();
+
+    let expanded = cfg.expand_group_members("g", cfg.groups.get("g").unwrap());
+    assert_eq!(expanded, vec![main.clone(), wt.clone()]);
+    // The unrelated repo is absent.
+    assert!(!expanded.contains(&other));
+
+    // resolve_group_targets fans out to both family members.
+    let targets = cfg.resolve_group_targets("g");
+    let mut aliases: Vec<String> = targets
+        .into_iter()
+        .filter_map(|t| match t {
+            Target::Local { alias, .. } => Some(alias),
+            _ => None,
+        })
+        .collect();
+    aliases.sort();
+    assert_eq!(aliases, vec![main, wt]);
+}
+
+#[test]
+fn expand_group_members_respects_per_group_opt_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, _wt) = register_family(&mut cfg, &tmp.path().join("main"), &tmp.path().join("wt"));
+    cfg.add_group("g".to_string(), vec![main.clone()]).unwrap();
+    cfg.groups_meta.insert(
+        "g".to_string(),
+        GroupMeta {
+            expand_worktrees: false,
+        },
+    );
+
+    let expanded = cfg.expand_group_members("g", cfg.groups.get("g").unwrap());
+    assert_eq!(expanded, vec![main], "opt-out must keep the group exact");
+    // The opt-out is recorded; an absent entry (unknown group) stays default-on.
+    assert!(!cfg.group_expands_worktrees("g"));
+    assert!(cfg.group_expands_worktrees("unknown-group"));
+}
+
+#[test]
+fn expand_group_members_works_from_persisted_identity_after_main_tree_deletion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(&mut cfg, &tmp.path().join("main"), &tmp.path().join("wt"));
+    cfg.add_group("g".to_string(), vec![main.clone()]).unwrap();
+    // Round-trip through repos.json: the identity must survive as a plain
+    // string, independent of the main tree's directory.
+    let file = tmp.path().join("repos.json");
+    cfg.save_to(&file).unwrap();
+    let mut reloaded = ReposConfig::load_from(&file).unwrap();
+    assert!(
+        reloaded.repos_meta[&main].git_common_dir.is_some(),
+        "identity must survive the repos.json round-trip"
+    );
+    // Expansion works purely from recorded identities; @peer refs pass
+    // through untouched.
+    reloaded
+        .groups
+        .insert("fed".to_string(), vec!["@cloud".to_string(), wt.clone()]);
+    reloaded.remotes.insert(
+        "cloud".to_string(),
+        RemotePeer {
+            url: "http://127.0.0.1:1".to_string(),
+            api_key: "k".to_string(),
+            group: None,
+            timeout_secs: None,
+        },
+    );
+    let expanded = reloaded.expand_group_members("fed", reloaded.groups.get("fed").unwrap());
+    // Members keep their order; `wt`'s family identity pulls in `main`
+    // (persisted, directory-independent) as a sorted extra; `@cloud` passes
+    // through untouched.
+    assert_eq!(expanded, vec!["@cloud".to_string(), wt, main]);
+}
+
+#[test]
+fn reconcile_prunes_orphan_groups_meta() {
+    let mut cfg = ReposConfig::default();
+    let tmp = tempfile::tempdir().unwrap();
+    let alias = cfg.register(tmp.path().join("r"));
+    cfg.add_group("g".to_string(), vec![alias]).unwrap();
+    cfg.groups_meta.insert(
+        "g".to_string(),
+        GroupMeta {
+            expand_worktrees: false,
+        },
+    );
+    cfg.groups_meta.insert(
+        "ghost".to_string(),
+        GroupMeta {
+            expand_worktrees: false,
+        },
+    );
+    cfg.reconcile();
+    assert!(cfg.groups_meta.contains_key("g"));
+    assert!(
+        !cfg.groups_meta.contains_key("ghost"),
+        "orphan override must be pruned"
+    );
+}
+
+#[test]
+fn worktree_family_map_annotates_shortest_path_main_and_omits_mains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(
+        &mut cfg,
+        &tmp.path().join("main"),
+        &tmp.path().join("main/sub-wt"),
+    );
+    let (fmain, fwt) = register_family(
+        &mut cfg,
+        &tmp.path().join("fam"),
+        &tmp.path().join("fam-wt"),
+    );
+    let solo = cfg.register(tmp.path().join("solo"));
+
+    let map = cfg.worktree_family_map();
+    assert_eq!(
+        map.get(wt.as_str()).map(String::as_str),
+        Some(main.as_str())
+    );
+    assert_eq!(
+        map.get(fwt.as_str()).map(String::as_str),
+        Some(fmain.as_str())
+    );
+    assert!(
+        !map.contains_key(main.as_str()),
+        "main trees are not annotated"
+    );
+    assert!(!map.contains_key(fmain.as_str()));
+    assert!(
+        !map.contains_key(solo.as_str()),
+        "identity-less repos are skipped"
+    );
+}
+
+#[test]
+fn worktree_family_map_prefers_exact_git_dir_main_over_shortest_path() {
+    // The main tree is the member whose own `.git` IS the family identity —
+    // a worktree parked at a shorter path must not steal the main label
+    // (centralized worktree dirs are a common layout).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(
+        &mut cfg,
+        &tmp.path().join("somewhere-longer/main-tree"),
+        &tmp.path().join("w/main-wt"),
+    );
+    let map = cfg.worktree_family_map();
+    assert_eq!(
+        map.get(wt.as_str()).map(String::as_str),
+        Some(main.as_str())
+    );
+    assert!(
+        !map.contains_key(main.as_str()),
+        "the real main tree is never annotated as a worktree"
+    );
+}
+
+#[test]
+fn worktree_family_map_elects_identity_less_main_via_git_dir() {
+    // A main tree registered before identity capture existed has no recorded
+    // git_common_dir — but its `<repo>/.git` still equals the family
+    // identity, so the exact-match election must consider it. Without this,
+    // the shortest-path fallback elects a worktree (possibly parked in a
+    // temp dir) as the family's "main".
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let (main, wt) = register_family(
+        &mut cfg,
+        &tmp.path().join("main-tree"),
+        &tmp.path().join("wt"), // shorter path: would win the fallback
+    );
+    cfg.repos_meta
+        .entry(main.clone())
+        .or_default()
+        .git_common_dir = None;
+    let map = cfg.worktree_family_map();
+    assert_eq!(
+        map.get(wt.as_str()).map(String::as_str),
+        Some(main.as_str()),
+        "the identity-less main must be elected via its .git path"
+    );
+    assert!(!map.contains_key(main.as_str()));
+}
+
+#[test]
+fn worktree_family_map_tie_breaks_on_alias() {
+    // Same-length paths, same identity: the lexicographically smallest alias
+    // is the main tree.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = ReposConfig::default();
+    let p1 = tmp.path().join("braa");
+    let p2 = tmp.path().join("brzz");
+    let a1 = cfg.register(p1.clone());
+    let a2 = cfg.register(p2);
+    for alias in [&a1, &a2] {
+        cfg.repos_meta
+            .entry(alias.clone())
+            .or_default()
+            .git_common_dir = Some(format!("{}/.git", p1.display()));
+    }
+    let map = cfg.worktree_family_map();
+    assert_eq!(
+        map.get(a2.as_str()).map(String::as_str),
+        Some(a1.as_str()),
+        "map: {map:?}"
+    );
+    assert!(!map.contains_key(a1.as_str()));
+}
+
+#[test]
+fn family_note_covers_both_arms() {
+    use super::family_note;
+    let mut family_map = std::collections::HashMap::new();
+    family_map.insert("wt1".to_string(), "main".to_string());
+    let mut counts = std::collections::HashMap::new();
+    counts.insert("main".to_string(), 2);
+    counts.insert("lonely".to_string(), 1);
+    counts.insert("zero".to_string(), 0);
+    assert_eq!(
+        family_note(&family_map, &counts, "wt1").as_deref(),
+        Some("main")
+    );
+    assert_eq!(
+        family_note(&family_map, &counts, "main").as_deref(),
+        Some("+ 2"),
+        "count-only note: the Worktree column header carries the word"
+    );
+    assert_eq!(
+        family_note(&family_map, &counts, "lonely").as_deref(),
+        Some("+ 1")
+    );
+    assert_eq!(
+        family_note(&family_map, &counts, "zero").as_deref(),
+        None,
+        "a zero count renders no note"
+    );
+    assert_eq!(family_note(&family_map, &counts, "solo").as_deref(), None);
 }

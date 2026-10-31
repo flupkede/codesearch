@@ -417,22 +417,29 @@ fn build_applicable_service() -> (CodesearchService, tempfile::TempDir) {
 /// enough for every resolution arm (only key-presence is read).
 fn populate_overload_fixture(db_path: &std::path::Path) {
     let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
-    let mut wtxn = env.write_txn().expect("wtxn");
     let v1 = "csharp Ns . V#Validate().".to_string();
     let v2 = "csharp Ns . V#Validate(System.String).".to_string();
-    let symbols: heed::Database<heed::types::Str, heed::types::Bytes> = env
-        .open_database(&wtxn, Some(crate::constants::SCIP_SYMBOLS_DB_NAME))
-        .unwrap()
-        .unwrap();
+    let symbols = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Bytes>(
+        &env,
+        crate::constants::SCIP_SYMBOLS_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
+    let names = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Bytes>(
+        &env,
+        crate::constants::SCIP_SIMPLE_NAMES_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
+    let mut wtxn = env.write_txn().expect("wtxn");
     for key in [&v1, &v2] {
         symbols.put(&mut wtxn, key.as_str(), &[1u8]).unwrap();
     }
-    let names: heed::Database<heed::types::Str, heed::types::Bytes> = env
-        .open_database(&wtxn, Some(crate::constants::SCIP_SIMPLE_NAMES_DB_NAME))
-        .unwrap()
-        .unwrap();
     let mut payload = vec![1u8];
-    payload.extend_from_slice(&bincode::serialize(&vec![v1.clone(), v2.clone()]).unwrap());
+    payload.extend_from_slice(
+        &bincode::serde::encode_to_vec(vec![v1.clone(), v2.clone()], bincode::config::legacy())
+            .unwrap(),
+    );
     names.put(&mut wtxn, "Validate", &payload).unwrap();
     wtxn.commit().unwrap();
 }
@@ -736,12 +743,10 @@ async fn without_language_a_single_installed_helper_answers_deterministically() 
 fn stored_refs_bytes(file: &str, kind: &str) -> Vec<u8> {
     let mut bytes = vec![1u8];
     bytes.extend_from_slice(
-        &bincode::serialize(&vec![(
-            std::path::PathBuf::from(file),
-            7u32,
-            9u32,
-            kind.to_string(),
-        )])
+        &bincode::serde::encode_to_vec(
+            vec![(std::path::PathBuf::from(file), 7u32, 9u32, kind.to_string())],
+            bincode::config::legacy(),
+        )
         .unwrap(),
     );
     bytes
@@ -752,7 +757,9 @@ fn stored_refs_bytes(file: &str, kind: &str) -> Vec<u8> {
 fn warnings_bytes(warnings: &[&str]) -> Vec<u8> {
     let owned: Vec<String> = warnings.iter().map(|w| w.to_string()).collect();
     let mut bytes = vec![1u8];
-    bytes.extend_from_slice(&bincode::serialize(&owned).unwrap());
+    bytes.extend_from_slice(
+        &bincode::serde::encode_to_vec(&owned, bincode::config::legacy()).unwrap(),
+    );
     bytes
 }
 
@@ -761,10 +768,12 @@ fn warnings_bytes(warnings: &[&str]) -> Vec<u8> {
 /// out of a partially loaded solution.
 fn write_index_warnings_meta(db_path: &std::path::Path, warnings: &[String]) {
     let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
+    let meta = crate::lmdb_registry::create_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap();
     let mut wtxn = env.write_txn().expect("wtxn");
-    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
-        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap();
     meta.put(
         &mut wtxn,
         crate::constants::SCIP_INDEX_WARNINGS_KEY,
@@ -779,11 +788,19 @@ fn populate_warnings_fixture(db_path: &std::path::Path) -> (String, String) {
     let warned_key = "csharp Ns . W#Warned().".to_string();
     let clean_key = "csharp Ns . C#Clean().".to_string();
     let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
-    let mut wtxn = env.write_txn().expect("wtxn");
-    let symbols: heed::Database<heed::types::Str, heed::types::Bytes> = env
-        .open_database(&wtxn, Some(crate::constants::SCIP_SYMBOLS_DB_NAME))
-        .unwrap()
+    let symbols = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Bytes>(
+        &env,
+        crate::constants::SCIP_SYMBOLS_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
+    let warnings_db =
+        crate::lmdb_registry::create_named_db::<heed::types::Str, heed::types::Bytes>(
+            &env,
+            crate::constants::SCIP_REF_WARNINGS_DB_NAME,
+        )
         .unwrap();
+    let mut wtxn = env.write_txn().expect("wtxn");
     for key in [&warned_key, &clean_key] {
         symbols
             .put(
@@ -793,9 +810,6 @@ fn populate_warnings_fixture(db_path: &std::path::Path) -> (String, String) {
             )
             .unwrap();
     }
-    let warnings_db: heed::Database<heed::types::Str, heed::types::Bytes> = env
-        .create_database(&mut wtxn, Some(crate::constants::SCIP_REF_WARNINGS_DB_NAME))
-        .unwrap();
     warnings_db
         .put(
             &mut wtxn,
@@ -1037,12 +1051,17 @@ async fn position_miss_answers_loud_failure_not_empty_references() {
     // "nothing at that position", not a missing DB.
     {
         let env = crate::symbols::get_shared_scip_env(&db).expect("shared env");
-        let mut wtxn = env.write_txn().expect("wtxn");
-        let positions: heed::Database<heed::types::Str, heed::types::Bytes> = env
-            .create_database(&mut wtxn, Some(crate::constants::SCIP_POSITION_DB_NAME))
+        let positions =
+            crate::lmdb_registry::create_named_db::<heed::types::Str, heed::types::Bytes>(
+                &env,
+                crate::constants::SCIP_POSITION_DB_NAME,
+            )
             .unwrap();
+        let mut wtxn = env.write_txn().expect("wtxn");
         let mut entry = vec![1u8];
-        entry.extend_from_slice(&bincode::serialize(&vec![clean_key]).unwrap());
+        entry.extend_from_slice(
+            &bincode::serde::encode_to_vec(vec![clean_key], bincode::config::legacy()).unwrap(),
+        );
         positions.put(&mut wtxn, "src/w.cs:5", &entry).unwrap();
         wtxn.commit().unwrap();
     }

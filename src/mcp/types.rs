@@ -317,12 +317,19 @@ pub struct SearchResultItem {
     pub context_prev: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_next: Option<String>,
-    /// Federation source tag: `None` for local results,
+    /// Federation source tag: `None` for local single-repo results,
     /// `Some("<peer>/<remote_alias>")` for results merged in from a remote peer
-    /// (e.g. `Some("cloud/inriver")`). Lets the agent tell where a hit
-    /// originated.
+    /// (e.g. `Some("cloud/inriver")`), or `Some("<alias>")` for local
+    /// group-fan-out results naming the repo the hit came from. Lets the
+    /// agent tell where a hit originated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Aliases of other registered repos sharing this hit's git identity
+    /// (linked worktrees of the same clone) whose identical copy — same
+    /// relative path + content hash — was collapsed into this hit. Empty on
+    /// single-repo paths and when no duplicate was collapsed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_in: Vec<String>,
     /// Federated chunk reference for retrieval, of the form
     /// `"<peer>/<remote_alias>:<chunk_id>"` (e.g. `"cloud/inriver:12345"`).
     /// Present only for remote results; pass it back to
@@ -408,8 +415,13 @@ pub struct LiteralSearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relaxed_fallback: Option<bool>,
 
+    /// True when the BM25 token-regex matched nothing and these results come
+    /// from the raw chunk-content scan fallback instead (unranked, score 0.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_fallback: Option<bool>,
+
     /// Actionable note for the LLM caller (present iff auto_promoted_to_regex,
-    /// relaxed_fallback or low_confidence is set).
+    /// relaxed_fallback, scan_fallback or low_confidence is set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 

@@ -177,6 +177,7 @@ fn get_db_path_smart(
                 )
                 .yellow()
             );
+            crate::lmdb_registry::close_shared_envs_under(&local_db);
             std::fs::remove_dir_all(&local_db).map_err(|e| {
                 // On Windows, OS error 32 = "file in use by another process".
                 // This typically means 'codesearch serve' has the LMDB memory-mapped.
@@ -231,6 +232,7 @@ fn get_db_path_smart(
                     )
                     .yellow()
                 );
+                crate::lmdb_registry::close_shared_envs_under(&db_info.db_path);
                 std::fs::remove_dir_all(&db_info.db_path)?;
                 std::thread::sleep(std::time::Duration::from_millis(1000));
                 println!("✅ Existing database deleted");
@@ -273,6 +275,7 @@ fn get_db_path_smart(
                     .yellow()
                 );
                 // Delete local database
+                crate::lmdb_registry::close_shared_envs_under(&db_info.db_path);
                 std::fs::remove_dir_all(&db_info.db_path)?;
                 println!("✅ Local database removed");
             }
@@ -984,10 +987,11 @@ async fn index_with_options(
     } else {
         let pb = ProgressBar::new(files.len() as u64);
         pb.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("█▓▒░ "),
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}",
+            )
+            .expect("valid progress template")
+            .progress_chars("█▓▒░ "),
         );
         pb
     };
@@ -1554,6 +1558,7 @@ pub async fn clear(path: Option<PathBuf>, yes: bool) -> Result<()> {
     }
 
     println!("\n🔄 Removing database...");
+    crate::lmdb_registry::close_shared_envs_under(&db_path);
     std::fs::remove_dir_all(&db_path)?;
 
     println!("{}", "✅ Database cleared!".green());
@@ -1944,6 +1949,7 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
             );
         }
         println!("\n{}", "Removing local index...".cyan());
+        crate::lmdb_registry::close_shared_envs_under(&local_db);
         if let Err(e) = fs::remove_dir_all(&local_db) {
             eprintln!(
                 "⚠️ Database files may be locked by a running codesearch serve. \
@@ -1989,6 +1995,7 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
             let global_db = global_dir.join(".codesearch.db");
             if global_db.exists() {
                 println!("\n{}", "Removing global index...".cyan());
+                crate::lmdb_registry::close_shared_envs_under(&global_db);
                 if let Err(e) = fs::remove_dir_all(&global_db) {
                     eprintln!(
                         "{}",

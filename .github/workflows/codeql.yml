@@ -44,6 +44,15 @@ jobs:
           languages: ${{ matrix.language }}
           config-file: .github/codeql/codeql-config.yml
 
+      # Cache ort-sys prebuilt ONNX Runtime: the cdn.pyke.io download dropped
+      # mid-transfer once ("Peer disconnected") and failed the whole job.
+      # pin@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.cache/ort.pyke.io/
+          key: ${{ runner.os }}-ort-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ort-
+
       - name: Build Rust
         run: cargo build --verbose
 

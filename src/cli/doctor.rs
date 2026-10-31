@@ -447,7 +447,7 @@ fn check_fts_health(db_path: &Path) -> CheckResult {
 
 /// Check 8: LMDB bloat
 fn check_lmdb_bloat(_db_path: &Path, store: &VectorStore) -> CheckResult {
-    // Use real LMDB page stats: env.non_free_pages_size() vs env.real_disk_size()
+    // Use real LMDB page stats: per-database live-page sum vs env.real_disk_size()
     // No guessing, no bytes/chunk estimate needed
     let page_stats = match store.lmdb_page_stats() {
         Ok(s) => s,

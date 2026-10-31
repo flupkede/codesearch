@@ -280,6 +280,34 @@ pub struct FileMetaStore {
     builder_version: String,
 }
 
+/// Validate a path derived from `db_path` before any fs operation on it.
+///
+/// Every path this module reads or writes is `db_path` plus a fixed,
+/// operator-independent file name (`file_meta.json`, its `.bak` / `.tmp`
+/// siblings). `db_path` itself comes from the operator's repos.json; if a
+/// corrupted entry or hostile alias smuggles in `..` segments, the store
+/// would silently read/write outside the index directory. Closes Aikido
+/// SAST 30640695 (path traversal, priority 90): the check sits between
+/// the derived path and every fs op below.
+fn guard_derived_path(db_path: &Path, joined: &Path) -> Result<()> {
+    if !joined.starts_with(db_path) {
+        return Err(anyhow!(
+            "refusing derived path outside the index directory: {}",
+            joined.display()
+        ));
+    }
+    let has_parent = joined
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir));
+    if has_parent {
+        return Err(anyhow!(
+            "refusing derived path with '..' component: {}",
+            joined.display()
+        ));
+    }
+    Ok(())
+}
+
 impl FileMetaStore {
     const CURRENT_VERSION: u32 = 1;
     const FILENAME: &'static str = FILE_META_DB_NAME;
@@ -309,34 +337,34 @@ impl FileMetaStore {
     /// shutdown).
     pub fn load_or_create(db_path: &Path, model_name: &str, dimensions: usize) -> Result<Self> {
         let meta_path = db_path.join(Self::FILENAME);
+        guard_derived_path(db_path, &meta_path)?;
+        let bak_path = Self::backup_path(&meta_path);
+        guard_derived_path(db_path, &bak_path)?;
 
         let mut store = if meta_path.exists() {
             match Self::read_store_file(&meta_path) {
                 Ok(store) => Some(store),
-                Err(main_err) => {
-                    let bak_path = Self::backup_path(&meta_path);
-                    match Self::read_store_file(&bak_path) {
-                        Ok(bak) => {
-                            tracing::warn!(
-                                "file metadata {} is corrupt ({}); recovered the previous \
+                Err(main_err) => match Self::read_store_file(&bak_path) {
+                    Ok(bak) => {
+                        tracing::warn!(
+                            "file metadata {} is corrupt ({}); recovered the previous \
                                  generation from {}",
-                                meta_path.display(),
-                                main_err,
-                                bak_path.display()
-                            );
-                            Some(bak)
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "file metadata {} is corrupt ({}) with no recoverable backup; \
-                                 starting with an empty store, full re-index will follow",
-                                meta_path.display(),
-                                main_err
-                            );
-                            None
-                        }
+                            meta_path.display(),
+                            main_err,
+                            bak_path.display()
+                        );
+                        Some(bak)
                     }
-                }
+                    Err(_) => {
+                        tracing::warn!(
+                            "file metadata {} is corrupt ({}) with no recoverable backup; \
+                                 starting with an empty store, full re-index will follow",
+                            meta_path.display(),
+                            main_err
+                        );
+                        None
+                    }
+                },
             }
         } else {
             None
@@ -412,10 +440,13 @@ impl FileMetaStore {
         use std::io::Write;
 
         let meta_path = db_path.join(Self::FILENAME);
+        guard_derived_path(db_path, &meta_path)?;
 
         // (1) One-generation backup, best-effort.
+        let bak_path = Self::backup_path(&meta_path);
+        guard_derived_path(db_path, &bak_path)?;
         if meta_path.exists() {
-            let _ = fs::copy(&meta_path, Self::backup_path(&meta_path));
+            let _ = fs::copy(&meta_path, &bak_path);
         }
 
         // (2) Atomic replace: temp file + rename over the target.
@@ -427,6 +458,7 @@ impl FileMetaStore {
             std::process::id(),
             seq
         ));
+        guard_derived_path(db_path, &tmp_path)?;
 
         let data = serde_json::to_string_pretty(self)?;
         let write_result = (|| -> std::io::Result<()> {

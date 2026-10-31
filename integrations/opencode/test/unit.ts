@@ -12,7 +12,7 @@
 import assert from "node:assert/strict"
 import http from "node:http"
 import type { AddressInfo } from "node:net"
-import { HealthRunner, stripJsonc } from "../codesearch.ts"
+import { astGrepToolNames, bashCommandGrep, HealthRunner, stripJsonc } from "../codesearch.ts"
 
 type Loose = Record<string, any>
 
@@ -59,6 +59,22 @@ function testStripJsonc(): void {
 
   // CRLF line comments terminate at the newline, not at a literal \r.
   assert.deepEqual(JSON.parse(stripJsonc('{\r\n  // note\r\n  "a": 1\r\n}\r\n')), { a: 1 })
+}
+
+/* ------------------------------------------------------------------ *
+ * astGrepToolNames
+ * ------------------------------------------------------------------ */
+
+function testAstGrepToolNames(): void {
+  assert.deepEqual(astGrepToolNames(undefined), [], "no tool map is silent")
+  assert.deepEqual(astGrepToolNames(null), [], "null tool map is silent")
+  assert.deepEqual(astGrepToolNames("ast_grep_search"), [], "non-object maps are ignored")
+  assert.deepEqual(astGrepToolNames({ grep: {}, glob: {}, read: {} }), [], "non-ast-grep tools are ignored")
+  assert.deepEqual(
+    astGrepToolNames({ read: {}, ast_grep_search: {}, ast_grep_edit: {}, "ast-grep_search": {} }),
+    ["ast_grep_search", "ast_grep_edit", "ast-grep_search"],
+    "ast-grep-shaped names are returned in tool-map order",
+  )
 }
 
 /* ------------------------------------------------------------------ *
@@ -221,8 +237,31 @@ async function testHealthRunner(): Promise<void> {
   await hub.close()
 }
 
+/* ------------------------------------------------------------------ *
+ * bashCommandGrep — the shell-tool escape hatch detector
+ * ------------------------------------------------------------------ */
+
+function testBashCommandGrep(): void {
+  assert.equal(bashCommandGrep('grep -rn "new Uri" --include="*.cs" .'), true, "plain grep")
+  assert.equal(bashCommandGrep("rg pattern src/"), true, "ripgrep")
+  assert.equal(bashCommandGrep("egrep -i foo bar.txt"), true, "egrep")
+  assert.equal(bashCommandGrep("cat f | grep -i bar"), true, "piped grep")
+  assert.equal(bashCommandGrep("git grep -n TODO"), true, "git grep")
+  assert.equal(bashCommandGrep("/usr/bin/grep -i x file"), true, "absolute-path grep")
+  assert.equal(bashCommandGrep("C:/tools/grep.exe -i x"), true, "windows grep.exe")
+  assert.equal(bashCommandGrep("timeout 5 grep -r x ."), true, "grep behind another command")
+  assert.equal(bashCommandGrep("echo `grep -rn foo src/`"), true, "backtick substitution is an invocation")
+  assert.equal(bashCommandGrep('echo "grep is slow, use codesearch"'), false, "grep mentioned in quotes is not an invocation")
+  assert.equal(bashCommandGrep("cargo build --release"), false, "unrelated command")
+  assert.equal(bashCommandGrep("progress --all"), false, "word boundary: progress is not grep")
+  assert.equal(bashCommandGrep("rgx = /ab/"), false, "word boundary: rgx is not rg")
+  assert.equal(bashCommandGrep(""), false, "empty command")
+}
+
 async function main(): Promise<void> {
   testStripJsonc()
+  testAstGrepToolNames()
+  testBashCommandGrep()
   await testHealthRunner()
   console.log("unit: OK")
 }

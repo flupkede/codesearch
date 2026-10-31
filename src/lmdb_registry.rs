@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::cache::safe_canonicalize;
@@ -48,6 +48,57 @@ use crate::cache::safe_canonicalize;
 // MDB_NOTLS itself is unchanged in LMDB — same flag, same behavior.
 #[allow(deprecated)]
 pub const BASE_ENV_FLAGS: heed::EnvFlags = heed::EnvFlags::NO_TLS;
+
+// ── heed 0.23 database open/create shims ────────────────────────
+
+/// Create (or type-check) one named database and commit a dedicated write
+/// transaction for it.
+///
+/// heed 0.23 removed `Env::create_database`: creation must go through
+/// `create_databases_and_commit`, which OWNS and commits its transaction —
+/// a database can no longer be created inside a transaction that does other
+/// work. Call this FIRST, then open a fresh transaction for the real work;
+/// the returned `'static` handle is environment-global and usable inside any
+/// later transaction.
+pub fn create_named_db<KC, DC>(
+    env: &heed::Env,
+    name: &str,
+) -> heed::Result<heed::Database<'static, KC, DC>>
+where
+    KC: 'static,
+    DC: 'static,
+{
+    let wtxn = env.write_txn()?;
+    Ok(env
+        .create_databases_and_commit(wtxn, |dbo, wtxn| {
+            dbo.create_database::<KC, DC>(wtxn, Some(name))
+                .map(heed::CommitOrAbort::<_, ()>::Commit)
+        })?
+        .unwrap_commit())
+}
+
+/// Open one existing named database (read-only check) and commit the read
+/// transaction the opener requires.
+///
+/// Returns `Ok(None)` when the database does not exist yet. The returned
+/// `'static` handle is environment-global and usable inside any later
+/// transaction.
+pub fn open_named_db<KC, DC>(
+    env: &heed::Env,
+    name: &str,
+) -> heed::Result<Option<heed::Database<'static, KC, DC>>>
+where
+    KC: 'static,
+    DC: 'static,
+{
+    let rtxn = env.read_txn()?;
+    Ok(env
+        .open_databases_and_commit(rtxn, |dbo, rtxn| {
+            dbo.open_database::<KC, DC>(rtxn, Some(name))
+                .map(heed::CommitOrAbort::<_, ()>::Commit)
+        })?
+        .unwrap_commit())
+}
 
 // ── Global registry ─────────────────────────────────────────────
 
@@ -130,30 +181,58 @@ pub fn is_open(path: &Path) -> bool {
 ///
 /// A path that cannot be canonicalized (e.g. already deleted) reports no
 /// holders — the safe "nothing left to wait for" answer.
+///
+/// A shared env held ONLY by the strong cache (no live `Arc` clone anywhere)
+/// does NOT report: the cache entry is process-lifetime furniture, and
+/// counting it would block idle-repo eviction and "is this repo busy" status
+/// forever after the repo's first query. Deletion paths release such an env
+/// via [`close_shared_envs_under`] before waiting on this function.
 pub fn open_holders_under(path: &Path) -> Vec<String> {
     let canonical = match safe_canonicalize(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    match LMDB_REGISTRY.get() {
-        Some(registry) => registry
-            .iter()
-            .filter(|entry| entry.key().starts_with(&canonical))
-            .map(|entry| entry.value().description.clone())
-            .collect(),
-        None => Vec::new(),
-    }
+    let Some(registry) = LMDB_REGISTRY.get() else {
+        return Vec::new();
+    };
+    // Take the registry shard's read guard ONLY while iterating: probing
+    // SHARED_ENVS inside the loop would hold two shard locks at once, and
+    // get_or_open_shared_env's Vacant arm holds a SHARED_ENVS write guard
+    // across TrackedEnv::open → register() (an LMDB_REGISTRY write) — a
+    // cross-shard ABBA deadlock.
+    let candidates: Vec<(PathBuf, String)> = registry
+        .iter()
+        .filter(|entry| entry.key().starts_with(&canonical))
+        .map(|entry| (entry.key().clone(), entry.value().description.clone()))
+        .collect();
+    let shared_cache = SHARED_ENVS.get();
+    candidates
+        .into_iter()
+        .filter(|(key, _)| match shared_cache.and_then(|c| c.get(key)) {
+            // strong_count == 1 means the cache itself is the only holder.
+            Some(env) => Arc::strong_count(env.value()) > 1,
+            None => true,
+        })
+        .map(|(_, description)| description)
+        .collect()
 }
 
 // ── Shared-env cache ────────────────────────────────────────────
 
 /// Process-wide cache of LMDB environments that multiple components must use
 /// CONCURRENTLY (queries, rebuilds, per-language adapters on the same
-/// directory). Holds only [`Weak`] references: the cache never keeps an
-/// environment alive, it just hands out the live one when it exists. When the
-/// last user drops their `Arc`, the [`TrackedEnv`] drops, its registry slot
-/// frees, and the stale cache entry is reaped on the next lookup.
-static SHARED_ENVS: OnceLock<DashMap<PathBuf, Weak<TrackedEnv>>> = OnceLock::new();
+/// directory). Holds STRONG references: an entry lives for the process
+/// lifetime so recurring callers (every SCIP query) reuse one env instead of
+/// churning open→close cycles — each `mdb_env_open` on Windows leaks two
+/// anonymous kernel mutex handles (lmdb-master-sys's `mdb.c` creates
+/// `mti_rmutex`/`mti_wmutex` per env but `mdb_env_close` destroys only
+/// `me_rpmutex`), and that leak saturated the process handle table after
+/// ~1.7M env reopens.
+///
+/// Entries are released explicitly via [`close_shared_envs_under`] BEFORE a
+/// DB directory is wiped. An env an in-flight caller still holds closes when
+/// that caller drops its last `Arc`, as before.
+static SHARED_ENVS: OnceLock<DashMap<PathBuf, Arc<TrackedEnv>>> = OnceLock::new();
 
 /// Open the environment at `path`, or return the already-open shared instance.
 ///
@@ -187,33 +266,62 @@ pub fn get_or_open_shared_env(
         .with_context(|| format!("Cannot canonicalize LMDB path: {}", path.display()))?;
     let cache = SHARED_ENVS.get_or_init(DashMap::new);
 
-    loop {
-        use dashmap::mapref::entry::Entry;
-        match cache.entry(canonical.clone()) {
-            Entry::Occupied(occupied) => {
-                if let Some(env) = occupied.get().upgrade() {
-                    return Ok(env);
-                }
-                // Last Arc dropped but the entry survived — reap and retry so
-                // the Vacant arm below performs a fresh open.
-                occupied.remove();
-            }
-            Entry::Vacant(vacant) => {
-                let mut opts = heed::EnvOpenOptions::new();
-                build_opts(&mut opts);
-                // SAFETY: caller contract — same as `TrackedEnv::open`. The
-                // registry slot guards against any concurrent direct open.
-                let tracked = unsafe { TrackedEnv::open(&opts, path, description)? };
-                // Run init before publishing: the `?` early-return drops
-                // `tracked`, freeing the registry slot, so a failed init
-                // leaves the path openable.
-                init(&tracked)?;
-                let env = Arc::new(tracked);
-                vacant.insert(Arc::downgrade(&env));
-                return Ok(env);
-            }
+    use dashmap::mapref::entry::Entry;
+    match cache.entry(canonical) {
+        Entry::Occupied(occupied) => Ok(occupied.get().clone()),
+        Entry::Vacant(vacant) => {
+            let mut opts = heed::EnvOpenOptions::new();
+            build_opts(&mut opts);
+            // SAFETY: caller contract — same as `TrackedEnv::open`. The
+            // registry slot guards against any concurrent direct open.
+            let tracked = unsafe { TrackedEnv::open(&opts, path, description)? };
+            // Run init before publishing: the `?` early-return drops
+            // `tracked`, freeing the registry slot, so a failed init
+            // leaves the path openable.
+            init(&tracked)?;
+            let env = Arc::new(tracked);
+            vacant.insert(Arc::clone(&env));
+            Ok(env)
         }
     }
+}
+
+/// Close every cached shared environment at or under `path`; returns the
+/// canonical paths whose cache entries were removed.
+///
+/// MUST run before a DB directory is deleted (`remove_dir_all` on `db_path`
+/// or a parent of it): the strong cache keeps its env — and with it the
+/// Windows file locks — alive for the process lifetime, so a delete without
+/// this call fails with a sharing violation through the whole retry budget.
+/// An env an in-flight caller still holds stays open until that caller drops
+/// its `Arc` (the delete's holder-wait covers that); the cache entry is gone
+/// either way, so the next use opens a fresh env.
+///
+/// Fine print: an env inside `get_or_open_shared_env`'s open-but-not-yet-
+/// published window (microseconds) is missed by the sweep; every wipe happens
+/// after the target repo's queries were torn down, so the window has no
+/// concurrent openers in practice.
+pub fn close_shared_envs_under(path: &Path) -> Vec<PathBuf> {
+    let Some(cache) = SHARED_ENVS.get() else {
+        return Vec::new();
+    };
+    let Ok(canonical) = safe_canonicalize(path) else {
+        return Vec::new();
+    };
+    let mut released: Vec<(PathBuf, Arc<TrackedEnv>)> = Vec::new();
+    cache.retain(|key, env| {
+        if key.starts_with(&canonical) {
+            released.push((key.clone(), Arc::clone(env)));
+            false
+        } else {
+            true
+        }
+    });
+    let paths: Vec<PathBuf> = released.iter().map(|(p, _)| p.clone()).collect();
+    // Drop the removed Arcs AFTER `retain` returns so `TrackedEnv::drop`'s
+    // env-close path never runs while a cache shard lock is held.
+    drop(released);
+    paths
 }
 
 // ── TrackedEnv wrapper ──────────────────────────────────────────
@@ -501,26 +609,83 @@ mod tests {
         assert!(err.contains("shared-1"));
     }
 
-    /// The cache holds only weak refs: once the last user drops their Arc the
-    /// registry slot frees (a direct open succeeds) and the next shared caller
-    /// transparently reopens.
+    /// Strong-cache contract: the shared env OUTLIVES its callers' `Arc`s
+    /// (process-lifetime reuse — the Windows handle-leak fix), so a direct
+    /// open stays blocked and the SAME instance is handed out again. Only
+    /// `close_shared_envs_under` releases it, after which the path is
+    /// openable again.
     #[test]
-    fn shared_env_reopens_after_all_arcs_drop() {
+    fn shared_env_outlives_arcs_until_explicit_close() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().to_path_buf();
 
-        {
-            let _env = get_or_open_shared_env(&path, "shared-1", shared_opts, |_| Ok(())).unwrap();
-        }
+        let env1 = get_or_open_shared_env(&path, "shared-1", shared_opts, |_| Ok(())).unwrap();
+        drop(env1);
 
-        // Slot freed after the last Arc dropped.
-        {
-            let _direct =
-                unsafe { TrackedEnv::open(&shared_compatible_opts(), &path, "direct").unwrap() };
-        }
+        // The cache keeps the env alive: a direct open now trips the guard.
+        let direct = unsafe { TrackedEnv::open(&shared_compatible_opts(), &path, "direct") };
+        assert!(direct
+            .unwrap_err()
+            .to_string()
+            .contains("double-open prevented"));
 
-        // And the shared getter opens fresh again.
-        let _again = get_or_open_shared_env(&path, "shared-2", shared_opts, |_| Ok(())).unwrap();
+        // The same instance is handed out again.
+        let env2 = get_or_open_shared_env(&path, "shared-2", shared_opts, |_| Ok(())).unwrap();
+        let env3 = get_or_open_shared_env(&path, "shared-3", shared_opts, |_| Ok(())).unwrap();
+        assert!(Arc::ptr_eq(&env2, &env3));
+        drop(env2);
+        drop(env3);
+
+        // Explicit close releases it: the path is openable again.
+        let closed = close_shared_envs_under(&path);
+        assert_eq!(
+            closed.len(),
+            1,
+            "exactly the one shared env must be released"
+        );
+        let _direct =
+            unsafe { TrackedEnv::open(&shared_compatible_opts(), &path, "direct").unwrap() };
+    }
+
+    /// A cache-only shared env must not count as a work-in-progress holder
+    /// (`open_holders_under` drives idle eviction and "is this repo busy"
+    /// status), but it DOES keep the directory locked — deletion requires
+    /// `close_shared_envs_under` first, which closes the env (heed's own
+    /// registry drains) and makes the dir deletable again.
+    #[test]
+    fn cache_only_shared_env_is_not_a_holder_but_blocks_deletion_until_closed() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db");
+        std::fs::create_dir(&db_path).unwrap();
+        let heed_key = safe_canonicalize(&db_path).unwrap();
+
+        {
+            let _env =
+                get_or_open_shared_env(&db_path, "cache-only", shared_opts, |_| Ok(())).unwrap();
+            assert!(
+                !open_holders_under(&db_path).is_empty(),
+                "a live caller Arc is a real holder"
+            );
+        }
+        assert!(
+            open_holders_under(&db_path).is_empty(),
+            "cache-only env must not report as a holder"
+        );
+
+        // The cache keeps the env open, which on Windows locks the dir.
+        #[cfg(target_os = "windows")]
+        assert!(
+            std::fs::remove_dir_all(&db_path).is_err(),
+            "cache-only env must keep the directory locked"
+        );
+
+        let closed = close_shared_envs_under(&db_path);
+        assert_eq!(closed.len(), 1);
+        assert!(
+            heed::env_closing_event(&heed_key).is_none(),
+            "explicit close must run mdb_env_close (heed registry drains)"
+        );
+        std::fs::remove_dir_all(&db_path).expect("dir deletable after explicit close");
     }
 
     /// An `init` failure must not leak the registry slot: the error propagates

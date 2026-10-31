@@ -33,9 +33,19 @@ raw="$(cat)"
 [ -z "$raw" ] && exit 0
 
 tool=$(echo "$raw" | jq -r '.tool_name // empty' | jq_str)
-[ "$tool" != "Grep" ] && exit 0
 
-path=$(echo "$raw" | jq -r '.tool_input.path // empty' | jq_str)
+# Bash escape hatch: a Bash tool command invoking the grep family is guarded
+# exactly like the Grep tool — the shell tool is otherwise a clean way around
+# the Grep denial. A shell grep has no path parameter; it runs in the session
+# cwd, so the target repo resolves as for an empty/relative path (cwd repo).
+path=""
+if [ "$tool" = "Bash" ]; then
+    shell_cmd=$(echo "$raw" | jq -r '.tool_input.command // empty' | jq_str)
+    command_grep_family "$shell_cmd" || exit 0
+else
+    [ "$tool" = "Grep" ] || exit 0
+    path=$(echo "$raw" | jq -r '.tool_input.path // empty' | jq_str)
+fi
 
 # ------------------------------------------------------------------
 # 1+2. Resolve the TARGET repo (the repo this Grep is aimed at) and check
@@ -171,8 +181,10 @@ fi
 # ------------------------------------------------------------------
 msg=$(cat <<'EOF'
 codesearch is LIVE for this repo (its /healthz probe just answered) — use it,
-do NOT fall back to Grep. Grep on an indexed internal path is only auto-allowed
-when the codesearch serve hub is actually DOWN, which it is not right now.
+do NOT fall back to Grep, and do NOT work around this via a shell grep/rg in
+the Bash tool: the same guard denies that too. Grep on an indexed internal
+path is only auto-allowed when the codesearch serve hub is actually DOWN,
+which it is not right now.
 
 IMPORTANT: a low-confidence or EMPTY codesearch result is a SUCCESSFUL call that
 means "reformulate your query" — it does NOT mean codesearch is down and it will

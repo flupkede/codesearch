@@ -115,6 +115,7 @@ interface CodeSearchSettings {
   guards: {
     mode: GuardMode
     tools: string[]
+    bash: boolean
     rescue: boolean
     rescueLimit: number
     rescueTimeoutMs: number
@@ -186,6 +187,7 @@ const DEFAULTS: CodeSearchSettings = {
   guards: {
     mode: "nudge",
     tools: ["grep", "glob"],
+    bash: true,
     rescue: true,
     rescueLimit: 5,
     rescueTimeoutMs: 3000,
@@ -229,7 +231,7 @@ const MAX_SEEN = 20_000
 const DEFAULT_GUIDANCE = `codesearch indexes this workspace and serves semantic code search over MCP. Prefer it over grep/glob for anything conceptual, cross-file, or symbol-shaped.
 
 Tool routing:
-- search — concepts, unknown locations, mixed natural language + identifiers. Default mode is semantic (hybrid vector + BM25); use mode="literal" with regex=true or phrase=true for exact syntax.
+- search — concepts, unknown locations, mixed natural language + identifiers. Default mode is semantic (hybrid vector + BM25); mode="literal" for exact syntax — phrase=true only for true adjacent multi-word phrases, regex=true only within a single token (punctuation never reaches the token index; a separator-spanning pattern with zero hits auto-falls back to a raw content scan).
 - find — where a symbol is defined (kind="definition"), its call-sites (kind="usages"), a file's imports (kind="imports"), or a module's dependents (kind="dependents").
 - find_impact — precise transitive call sites before a rename or edit (SCIP: C#, TypeScript; on a "no backend" answer fall back to find kind="usages").
 - explore — outline a file's top-level symbols (kind="outline") or find chunks similar to a known hit (kind="similar").
@@ -504,7 +506,10 @@ function readMcpEntry(serverName: string): { url: string; authorization: string 
 }
 
 function resolveSettings(ctx: PluginContext): CodeSearchSettings {
-  let settings = mergeDeep(DEFAULTS, ctx.options ?? {})
+  // Deep-clone DEFAULTS: mergeDeep copies the top level only, so a later
+  // `settings.guards.mode = ...` env override would mutate DEFAULTS and leak
+  // into every other resolveSettings call in the same process.
+  let settings = mergeDeep(structuredClone(DEFAULTS), ctx.options ?? {})
 
   const configPath =
     process.env.CODESEARCH_CONFIG || `${configDir()}/opencode/codesearch.json`
@@ -519,6 +524,7 @@ function resolveSettings(ctx: PluginContext): CodeSearchSettings {
   settings.debug = bool(env.CODESEARCH_PLUGIN_DEBUG, settings.debug)
 
   if (env.CODESEARCH_PLUGIN_GUARDS) settings.guards.mode = env.CODESEARCH_PLUGIN_GUARDS as GuardMode
+  if (env.CODESEARCH_PLUGIN_BASH_GUARD) settings.guards.bash = bool(env.CODESEARCH_PLUGIN_BASH_GUARD, settings.guards.bash)
   if (env.CODESEARCH_PLUGIN_SCOPE) settings.scope.inject = env.CODESEARCH_PLUGIN_SCOPE as CodeSearchSettings["scope"]["inject"]
   if (env.CODESEARCH_PLUGIN_RESCUE) settings.guards.rescue = bool(env.CODESEARCH_PLUGIN_RESCUE, settings.guards.rescue)
   if (env.CODESEARCH_PLUGIN_RECALL) settings.recall.enabled = bool(env.CODESEARCH_PLUGIN_RECALL, settings.recall.enabled)
@@ -1102,6 +1108,30 @@ export class HealthRunner {
  * Guard helpers
  * ------------------------------------------------------------------ */
 
+/** grep-family commands a bash tool call can smuggle past the native-tool guards. */
+const BASH_GREP_WORDS = new Set(["grep", "egrep", "fgrep", "zgrep", "rg"])
+
+function bashToolCommand(event: Loose): string {
+  const input = isPlainObject(event?.input) ? event.input : undefined
+  return typeof input?.command === "string" ? input.command : ""
+}
+
+/**
+ * True when the command line invokes grep/egrep/fgrep/zgrep/rg. Quoted strings
+ * are stripped first, so `echo "grep is slow"` is not an invocation; tokens are
+ * compared whole (with `.exe` and path prefixes removed), so `progress` or
+ * `rgx` never match.
+ */
+export function bashCommandGrep(command: string): boolean {
+  const bare = String(command ?? "").replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, " ")
+  for (const raw of bare.split(/[\s;&|()`]+/)) {
+    if (!raw) continue
+    const word = raw.replace(/\.exe$/i, "").split(/[\\/]/).pop() ?? ""
+    if (BASH_GREP_WORDS.has(word.toLowerCase())) return true
+  }
+  return false
+}
+
 function resultOfToolEvent(event: Loose): { output?: string; metadata?: Loose } {
   const result = isPlainObject(event?.result) ? event.result : undefined
   if (!result) return {}
@@ -1146,6 +1176,18 @@ function formatSearchHits(result: Loose | undefined, limit: number): string[] {
     lines.push(`  - ${path}${line}${kind}${signature}`)
   }
   return lines
+}
+
+/**
+ * Names of tools in a request's tool map that look like an ast-grep
+ * integration (`ast_grep_search`, `ast-grep_edit`, ...). Every ast-grep
+ * mention in this plugin is gated on this: codesearch users are not expected
+ * to have ast-grep installed, so guidance must never name tools the host does
+ * not expose. Unknown or absent maps stay silent.
+ */
+export function astGrepToolNames(tools: unknown): string[] {
+  if (!isPlainObject(tools)) return []
+  return Object.keys(tools as Loose).filter((name) => /ast[-_]grep/i.test(name))
 }
 
 /* ------------------------------------------------------------------ *
@@ -1331,6 +1373,10 @@ export default {
     const seenMessages = new Set<string>()
     const seenSessions = new Set<string>()
     const nudged = new Set<string>()
+    /** Sessions whose request tool map exposed ast-grep tools, set by the
+     *  context hook and read by block mode so its denial only ever names
+     *  callable tools. An absent entry means "do not mention ast-grep". */
+    const astGrepBySession = new Map<string, string[]>()
 
     function markSeen(set: Set<string>, key: string): boolean {
       if (set.has(key)) return false
@@ -1353,6 +1399,13 @@ export default {
         const scope = resolveScope()
         const system = Array.isArray(event?.system) ? (event.system as SystemPart[]) : undefined
         if (!system) return
+
+        // Tool-map snapshot: this is the only place the assembled tool map is
+        // visible, and every ast-grep mention is gated on it so environments
+        // without an ast-grep integration see unchanged guidance.
+        const astGrep = astGrepToolNames(event?.tools)
+        astGrepBySession.set(sessionID, astGrep)
+        if (astGrepBySession.size > MAX_SEEN) astGrepBySession.clear()
 
         // 1. Opt-in auto-recall: inject index context for the user message.
         if (settings.recall.enabled && scope.project && isLikelyCodeQuestion(userMessage.text)) {
@@ -1381,6 +1434,11 @@ export default {
           }
           if (health.state === "down" && !pruneActive) {
             extra.push(`- The codesearch serve hub is unreachable right now; grep/glob is an acceptable fallback until it recovers.`)
+          }
+          if (astGrep.length > 0) {
+            extra.push(
+              `- For syntax-shaped queries and multi-file mechanical rewrites, prefer the ast-grep tools (${astGrep.join(" / ")}); codesearch and grep match text, not structure.`,
+            )
           }
           if (freshUnindexedWarning(scope)) {
             extra.push(`- The registered index for "${scope.project}" is empty or was built with an unknown model; searches will miss until \`codesearch index\` refreshes it.`)
@@ -1447,29 +1505,61 @@ export default {
 
     /* ---------------- tool hooks (guards, rescue, nudge) ---------------- */
 
-    function blockMessage(tool: string, scope: ScopeInfo): string {
+    function blockMessage(tool: string, scope: ScopeInfo, astGrep: string[] = []): string {
+      const lines = [
+        `codesearch: ${tool} is disabled here — this repository is indexed as project "${scope.project}".`,
+        `Use the codesearch MCP tools instead:`,
+        `  - search { project: "${scope.project}", query: "<concept>" }   (add mode: "literal", regex: true for exact syntax)`,
+        `  - find { project: "${scope.project}", symbol: "<name>", kind: "definition" | "usages" | "imports" | "dependents" }`,
+        `  - find_impact { project: "${scope.project}", symbol_name: "<name>" }  (C#/TypeScript call sites)`,
+        `  - explore { project: "${scope.project}", target: "<file>", kind: "outline" }`,
+        `  - get_chunk { project: "${scope.project}", chunk_id: <id> }`,
+      ]
+      if (astGrep.length > 0) {
+        lines.push(`  - ${astGrep.join(" / ")} for syntax-shaped queries and multi-file rewrites (structure, not text)`)
+      }
+      lines.push(
+        `If codesearch is genuinely unavailable, set "guards": { "mode": "off" } in ~/.config/opencode/codesearch.json (or CODESEARCH_PLUGIN_GUARDS=off) and retry.`,
+      )
+      return lines.join("\n")
+    }
+
+    function bashBlockMessage(scope: ScopeInfo, command: string): string {
       return (
-        `codesearch: ${tool} is disabled here — this repository is indexed as project "${scope.project}".\n` +
+        `codesearch: shell grep is blocked here — this repository is indexed as project "${scope.project}".\n` +
+        `Raw grep through the shell tool bypasses the grep/glob guards. Command: ${truncate(command.trim(), 120)}\n` +
         `Use the codesearch MCP tools instead:\n` +
         `  - search { project: "${scope.project}", query: "<concept>" }   (add mode: "literal", regex: true for exact syntax)\n` +
         `  - find { project: "${scope.project}", symbol: "<name>", kind: "definition" | "usages" | "imports" | "dependents" }\n` +
-        `  - find_impact { project: "${scope.project}", symbol_name: "<name>" }  (C#/TypeScript call sites)\n` +
-        `  - explore { project: "${scope.project}", target: "<file>", kind: "outline" }\n` +
         `  - get_chunk { project: "${scope.project}", chunk_id: <id> }\n` +
-        `If codesearch is genuinely unavailable, set "guards": { "mode": "off" } in ~/.config/opencode/codesearch.json (or CODESEARCH_PLUGIN_GUARDS=off) and retry.`
+        `If codesearch is genuinely unavailable, set "guards": { "bash": false } in ~/.config/opencode/codesearch.json (or CODESEARCH_PLUGIN_BASH_GUARD=0) and retry.`
       )
     }
 
     async function onToolBefore(event: Loose): Promise<void> {
       let blocked: Error | null = null
       try {
-        if (settings.guards.mode !== "block") return
+        if (settings.guards.mode === "off") return
         const tool = String(event?.tool ?? "").toLowerCase()
-        if (!settings.guards.tools.includes(tool)) return
-        const alias = coveredAlias()
-        if (!alias) return
-        if (health.state !== "ok") return // fail open unless the hub is confirmed up
-        blocked = new Error(blockMessage(tool, resolveScope()))
+        if (tool === "bash" || tool === "shell") {
+          // Shell grep is the escape hatch around the native grep/glob guards:
+          // denied in every mode except "off", because a shell grep is exactly
+          // the workaround the guards exist to stop. Kill switch: guards.bash=false.
+          if (!settings.guards.bash) return
+          const command = bashToolCommand(event)
+          if (!bashCommandGrep(command)) return
+          if (!coveredAlias()) return
+          if (health.state !== "ok") return // fail open unless the hub is confirmed up
+          blocked = new Error(bashBlockMessage(resolveScope(), command))
+        } else {
+          if (settings.guards.mode !== "block") return
+          if (!settings.guards.tools.includes(tool)) return
+          const alias = coveredAlias()
+          if (!alias) return
+          if (health.state !== "ok") return // fail open unless the hub is confirmed up
+          const astGrep = astGrepBySession.get(String(event?.sessionID ?? "")) ?? []
+          blocked = new Error(blockMessage(tool, resolveScope(), astGrep))
+        }
       } catch (err) {
         if (settings.debug) warn(`execute.before error: ${err instanceof Error ? err.message : err}`)
       }
@@ -1480,11 +1570,15 @@ export default {
       try {
         if (event?.status && event.status !== "completed") return
         const tool = String(event?.tool ?? "").toLowerCase()
+        const result = isPlainObject(event?.result) ? event.result : undefined
+        if (!result) return
+        if (tool === "bash" || tool === "shell") {
+          maybeNudgeBashGrep(event, result)
+          return
+        }
         if (!settings.guards.tools.includes(tool)) return
         const scope = resolveScope()
         if (!scope.project) return
-        const result = isPlainObject(event?.result) ? event.result : undefined
-        if (!result) return
 
         if (looksEmptyResult(event)) {
           await rescueEmptyResult(event, result, scope)
@@ -1494,6 +1588,23 @@ export default {
       } catch (err) {
         if (settings.debug) warn(`execute.after error: ${err instanceof Error ? err.message : err}`)
       }
+    }
+
+    /** A shell grep that ran anyway (hub down at before-time) still gets the one-time tip. */
+    function maybeNudgeBashGrep(event: Loose, result: Loose): void {
+      if (settings.guards.mode === "off") return
+      if (!settings.guards.bash) return
+      if (!bashCommandGrep(bashToolCommand(event))) return
+      const scope = resolveScope()
+      if (!scope.project) return
+      const sessionID = String(event?.sessionID ?? "unknown")
+      if (!markSeen(nudged, sessionID)) return
+      const existing = typeof result.output === "string" ? result.output : ""
+      result.output =
+        existing +
+        `\n[codesearch] tip: raw shell grep bypasses the codesearch guards — this repository is indexed as project "${scope.project}". ` +
+        `Prefer search (mode: "literal" for exact syntax) or find/get_chunk.`
+      logGuard(`nudged session ${sessionID} after shell grep (bash tool)`)
     }
 
     async function rescueEmptyResult(event: Loose, result: Loose, scope: ScopeInfo): Promise<void> {

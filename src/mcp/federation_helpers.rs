@@ -97,6 +97,7 @@ pub(crate) fn parse_search_items_from_call_result(
                 context_prev: None,
                 context_next: None,
                 source: None,
+                also_in: Vec::new(),
                 chunk_ref: None,
             })
             .collect(),
@@ -152,6 +153,7 @@ pub(crate) fn convert_remote_item(
         context_prev: item.context_prev,
         context_next: item.context_next,
         source: Some(format!("{peer_name}/{remote_alias}")),
+        also_in: Vec::new(),
         chunk_ref,
     }
 }

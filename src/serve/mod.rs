@@ -45,7 +45,7 @@ use crate::constants::{
     REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
     STATUS_PATH,
 };
-use crate::db_discovery::repos::{config_dir, ReposConfig};
+use crate::db_discovery::repos::{config_dir, git_common_dir_for, ReposConfig};
 use crate::index::{
     CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback, SharedStores,
     SymbolRebuildSignal,
@@ -196,6 +196,23 @@ impl RepoStateLabel {
             Self::NoIndex => "No Index".dimmed(),
         }
     }
+}
+
+/// How long after the last text-indexing activity the general status keeps
+/// showing "Indexing". The status snapshot samples every ~2 s, so a 1-2 s
+/// flush can land entirely between samples — without the hold a repo under
+/// continuous editing reads "Idle" while every flush still burns an embed
+/// wave.
+const INDEXING_DISPLAY_HOLD_SECS: u64 = 5;
+
+/// The general "Indexing" label decision: a live text-indexing marker wins;
+/// otherwise the hold window since the last watcher activity keeps it lit.
+/// Pure so the hold contract is table-testable.
+fn text_label_indexing(marker: bool, last_active: Option<Instant>, now: Instant) -> bool {
+    marker
+        || last_active.is_some_and(|t| {
+            now.duration_since(t) <= Duration::from_secs(INDEXING_DISPLAY_HOLD_SECS)
+        })
 }
 
 /// Format a tool call name and elapsed time into a human-readable string.
@@ -382,6 +399,14 @@ pub(crate) struct ServeState {
     /// `DashMap::clone()` is a deep copy and would silently disconnect the
     /// file-watcher callback from this field).
     active_reindexes: Arc<ActiveReindexes>,
+    /// Per-repo last moment a watcher text-indexing flow was active — stamped
+    /// on BOTH begin and end by [`Self::make_indexing_status_callback`].
+    /// Drives the "Indexing" display hold ([`INDEXING_DISPLAY_HOLD_SECS`]):
+    /// the status snapshot samples every ~2 s, so a 1-2 s flush lands between
+    /// samples and a continuously-editing repo read "Idle" while embedding
+    /// burned CPU. Display-only — the reindex 409 guard reads
+    /// `active_reindexes` exclusively and is unaffected by the hold.
+    indexing_last_active: Arc<DashMap<String, std::time::Instant>>,
     /// Per-repo change count since serve started (incremented by index/reindex operations).
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
@@ -533,6 +558,7 @@ impl ServeState {
             config_mtime: std::sync::RwLock::new(None),
             config_path_override,
             active_reindexes: Arc::new(DashMap::new()),
+            indexing_last_active: Arc::new(DashMap::new()),
             repo_changes: DashMap::new(),
             last_tool_call: DashMap::new(),
             remote_peer_activity: DashMap::new(),
@@ -783,8 +809,12 @@ impl ServeState {
     /// the completion half must not erase another flow's marker.
     fn make_indexing_status_callback(&self, alias: &str) -> IndexingStatusCallback {
         let reindexes = self.active_reindexes.clone();
+        let last_active = self.indexing_last_active.clone();
         let alias_key = alias.to_string();
         Arc::new(move |active: bool| {
+            // Stamp on BOTH arms (every call): the hold must run from the
+            // flush END, so the inactive call re-stamps after the work.
+            last_active.insert(alias_key.clone(), Instant::now());
             if active {
                 reindexes
                     .entry(alias_key.clone())
@@ -996,6 +1026,10 @@ impl ServeState {
                 alias
             ));
         }
+
+        // Release the process-lifetime shared env(s) under the DB dir before
+        // the wipe — same reason as remove_repo's delete flow.
+        crate::lmdb_registry::close_shared_envs_under(&db_path);
 
         let deadline =
             Instant::now() + Duration::from_secs(crate::constants::DB_DELETE_RETRY_BUDGET_SECS);
@@ -1741,14 +1775,16 @@ impl ServeState {
         );
     }
 
-    /// Reconcile registered repo paths against the filesystem before warmup.
+    /// Reconcile registered repo paths against the filesystem.
     ///
-    /// For each alias whose stored path no longer exists (folder renamed/moved),
-    /// attempt a best-effort git-identity relocation and rewrite `repos.json`.
-    /// When relocation fails the entry is left in place and merely logged — it is
-    /// skipped safely at warmup and never crashes serve. Explicit cleanup of
-    /// unrecoverable entries is available via `codesearch index prune`.
-    pub(crate) fn reconcile_all_paths(self: &Arc<Self>) {
+    /// For each alias whose stored path no longer exists (folder renamed/moved,
+    /// or a worktree deleted while the hub keeps running), attempt a best-effort
+    /// git-identity relocation. What cannot be relocated is unregistered, its
+    /// in-memory state evicted, and `repos.json` rewritten. Boot warmup has its
+    /// own prune, but a long-lived serve never reboots — without this pass a
+    /// deleted worktree ghosted `status kind=projects` forever. Explicit manual
+    /// cleanup remains available via `codesearch index prune`.
+    pub(crate) fn reconcile_all_paths(&self) {
         let aliases = self.aliases();
         if aliases.is_empty() {
             return;
@@ -1762,27 +1798,30 @@ impl ServeState {
             }
         };
 
-        let (relocated, unresolved) = config.relocate_missing();
+        let (relocated, removed) = config.prune_stale();
 
         for (alias, new_path) in &relocated {
             info!("reconcile: relocated '{}' → {}", alias, new_path.display());
         }
-        for alias in &unresolved {
-            let missing = config
-                .repos
-                .get(alias)
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            warn!(
-                "reconcile: '{}' path missing ({}); skipping — \
-                 run `codesearch index prune` to remove it",
-                alias, missing
+        for alias in &removed {
+            info!(
+                "reconcile: unregistered stale '{}' (path no longer exists)",
+                alias
             );
+            // Same eviction shape as reload_if_changed: fire the Write task's
+            // cancel token while removing its RepoState, then detach the FSW
+            // handle so a draining task never races the config swap. The DB
+            // dir lived inside the vanished tree — nothing left to delete.
+            if let Some((_, RepoState::Write { cancel_token, .. })) = self.repos.remove(alias) {
+                cancel_token.cancel();
+            }
+            self.last_access.remove(alias);
+            self.fsw_tasks.remove(alias);
         }
 
-        if !relocated.is_empty() {
+        if !relocated.is_empty() || !removed.is_empty() {
             if let Err(e) = self.persist_config(&config) {
-                warn!("reconcile: failed to persist relocated paths: {}", e);
+                warn!("reconcile: failed to persist reconciled registry: {}", e);
             }
         }
     }
@@ -2390,6 +2429,11 @@ impl ServeState {
         // transient search holding the LMDB mmap). We now track the real
         // outcome and surface it via `RepoRemovalOutcome` so the caller can
         // report honestly.
+        // Release the process-lifetime shared env(s) under the DB dir (the
+        // SCIP cache) BEFORE the delete/wait flow: otherwise the strong cache
+        // keeps the directory locked for the process lifetime and every wait
+        // on `open_holders_under` burns the whole retry budget.
+        crate::lmdb_registry::close_shared_envs_under(&db_path);
         let mut db_deleted = !db_path.exists();
         let mut db_delete_error: Option<String> = None;
         // True when the DB dir's cleanup is owned by the still-running index
@@ -2834,6 +2878,9 @@ impl ServeState {
     /// right after releasing it. Failures are non-fatal — the repo is already
     /// unregistered, and a serve restart reaps any leftover.
     fn remove_orphaned_db_dir(alias: &str, db_path: &std::path::Path) {
+        // The strong shared-env cache may still hold the SCIP env for this
+        // dir; release it or the delete below fails with a sharing violation.
+        crate::lmdb_registry::close_shared_envs_under(db_path);
         match std::fs::remove_dir_all(db_path) {
             Ok(()) => tracing::info!(
                 "Self-cleanup deleted orphaned DB dir for '{}': {}",
@@ -3777,8 +3824,115 @@ impl ServeState {
         config
             .groups
             .get(group)
-            .cloned()
+            .map(|members| {
+                // Worktree expansion: every registered repo sharing a member's
+                // git identity joins the alias list (default on, per-group
+                // opt-out). The virtual "all" branch above never expands.
+                config.expand_group_members(group, members)
+            })
             .ok_or_else(|| format!("Unknown group '{}'", group))
+    }
+
+    /// Lazily backfill `repos_meta[].git_common_dir` for a group's local
+    /// members.
+    ///
+    /// Repos registered before the identity field existed have no recorded
+    /// common dir; group expansion needs it. Computed off-thread (one git
+    /// spawn per member), written back under the config write lock and
+    /// persisted once, so a later deletion of the main tree cannot lose the
+    /// identity again. Best-effort: a member whose identity cannot be
+    /// resolved simply stays unexpanded. The virtual "all" group never
+    /// expands, so it never backfills either.
+    pub(crate) async fn backfill_group_identities(&self, group: &str) {
+        if group == crate::constants::ALL_GROUP_NAME {
+            return;
+        }
+        let missing: Vec<(String, std::path::PathBuf)> = {
+            let config = self.config_snapshot();
+            let Some(members) = config.groups.get(group) else {
+                return;
+            };
+            members
+                .iter()
+                .filter(|m| !m.starts_with(crate::db_discovery::repos::REMOTE_REF_PREFIX))
+                .filter_map(|alias| {
+                    let path = config.repos.get(alias)?;
+                    let known = config
+                        .repos_meta
+                        .get(alias)
+                        .and_then(|m| m.git_common_dir.as_ref())
+                        .is_some();
+                    (!known).then(|| (alias.clone(), path.clone()))
+                })
+                .collect()
+        };
+        self.backfill_missing_identities(missing).await;
+    }
+
+    /// One-shot startup backfill: compute the git common dir for every
+    /// registered repo still missing one (registered before identity capture
+    /// existed, or added outside the group-resolution path). Without this, a
+    /// pre-capture main tree cannot be elected main and its worktrees fall
+    /// out of the family map until a group happens to include them.
+    pub(crate) async fn backfill_all_missing_identities(&self) {
+        let missing: Vec<(String, std::path::PathBuf)> = {
+            let config = self.config_snapshot();
+            config
+                .repos
+                .iter()
+                .filter_map(|(alias, path)| {
+                    let known = config
+                        .repos_meta
+                        .get(alias)
+                        .and_then(|m| m.git_common_dir.as_ref())
+                        .is_some();
+                    (!known).then(|| (alias.clone(), path.clone()))
+                })
+                .collect()
+        };
+        self.backfill_missing_identities(missing).await;
+    }
+
+    async fn backfill_missing_identities(&self, missing: Vec<(String, std::path::PathBuf)>) {
+        if missing.is_empty() {
+            return;
+        }
+        let computed = tokio::task::spawn_blocking(move || {
+            missing
+                .into_iter()
+                .map(|(alias, path)| (alias, git_common_dir_for(&path)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .ok();
+        let Some(computed) = computed else {
+            return;
+        };
+        let mut config = match self.config.write() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut changed = false;
+        for (alias, identity) in computed {
+            let Some(identity) = identity else {
+                continue;
+            };
+            // Only fill when still absent: a concurrent registration may have
+            // captured a fresher identity meanwhile.
+            let entry = config.repos_meta.entry(alias).or_default();
+            if entry.git_common_dir.is_none() {
+                entry.git_common_dir = Some(identity);
+                changed = true;
+            }
+        }
+        // Persist while still holding the write guard, exactly like every
+        // sibling persist site: persisting a clone after dropping the lock
+        // could revert a concurrent writer's change back onto disk (the
+        // "ghost loss" class persist_config's mtime adoption exists for).
+        if changed {
+            let _ = self.persist_config(&config);
+        }
+        drop(config);
     }
 
     /// Record that a repo was just accessed (query or reindex).
@@ -3940,6 +4094,15 @@ impl ServeState {
         let repos = self.repo_statuses_lightweight();
         let active_sessions = self.active_session_count();
 
+        // Periodic registry heal: this pass is the only recurring
+        // reconciliation in a long-lived serve (boot warmup runs once), and
+        // it already runs on the blocking pool. It runs AFTER the status
+        // pass on purpose: reconcile's aliases() may trigger a config
+        // reload, and the statuses above must measure the config as-was —
+        // the order the read endpoints implicitly rely on. Cheap when
+        // nothing moved: one exists() probe per registered alias.
+        self.reconcile_all_paths();
+
         // CPU usage — serve process PLUS all its descendants. The SCIP
         // helpers and their dotnet children do the heavy lifting during a
         // rebuild wave; measuring the serve process alone reads near-zero
@@ -4027,7 +4190,13 @@ impl ServeState {
             self.is_indexing(alias);
             // Owner-scoped: only text-indexing flows light the general
             // "Indexing" label; symbol rebuilds own the language columns.
-            let text_indexing = self.has_text_indexing_marker(alias);
+            // The display hold keeps the label lit through the quiet gap
+            // between flush end and the next snapshot sample.
+            let text_indexing = text_label_indexing(
+                self.has_text_indexing_marker(alias),
+                self.indexing_last_active.get(alias).map(|e| *e.value()),
+                Instant::now(),
+            );
             let symbol_indexing = self.has_symbol_indexing_marker(alias);
 
             let changes = match self.repos.get(alias) {
@@ -4582,6 +4751,15 @@ async fn status_handler(
         }));
     };
 
+    // Worktree-family provenance: flat `worktree_of` on the aliases that are
+    // worktrees of a shorter-path registered main tree (main-tree aliases get
+    // no key). Computed from the config snapshot, never from the live lock.
+    // A reload failure ( poisoned lock) just serves the previous file state.
+    let _ = state.reload_if_changed();
+    let worktree_of = match state.config.read() {
+        Ok(c) => c.worktree_family_map(),
+        Err(_) => std::collections::HashMap::new(),
+    };
     let repo_json: Vec<serde_json::Value> = snap
         .repos
         .iter()
@@ -4614,7 +4792,7 @@ async fn status_handler(
                 CSharpIndexStatus::Error => "error",
                 CSharpIndexStatus::Indexing => "indexing",
             };
-            json!({
+            let mut entry = json!({
                 "alias": alias,
                 "status": status_str,
                 "lock_mode": lock_mode,
@@ -4624,7 +4802,13 @@ async fn status_handler(
                 "csharp_index": csharp_str,
                 "csharp_error": info.csharp_error,
                 "typescript_index": ts_str,
-            })
+            });
+            // Flat annotation, inserted conditionally: `json!` would render a
+            // missing main as an explicit `null`.
+            if let Some(main) = worktree_of.get(alias.as_str()) {
+                entry["worktree_of"] = json!(main);
+            }
+            entry
         })
         .collect();
 
@@ -5664,12 +5848,28 @@ fn resolve_add_repo_model(
     })
 }
 
+/// Whether `POST /repos` may keep an index already on disk instead of
+/// force-rebuilding it.
+///
+/// Adopt when the index recorded a model and no model change was requested;
+/// `None` from `from_index_metadata` means there is no usable index (or a
+/// pre-model legacy index), which the destructive force path rebuilds. An
+/// explicit/override model that differs from the recorded one invalidates every
+/// stored vector (dimensions and vector space change), so it must rebuild.
+fn should_adopt_existing_index(
+    recorded: Option<crate::embed::ModelType>,
+    model_override: Option<crate::embed::ModelType>,
+) -> bool {
+    recorded.is_some() && model_override.is_none_or(|requested| recorded == Some(requested))
+}
+
 /// Add-repo handler: POST /repos
 ///
 /// Registers a new repo in repos.json, opens the LMDB/Tantivy stores inline
 /// (fast — prevents the double-open race from the old `index_quiet` path),
-/// then spawns a full reindex + vector index build + FSW start in the
-/// background. Returns 202 Accepted immediately.
+/// then spawns the indexing work in the background: an incremental refresh when
+/// an index already exists (adopted), a full reindex otherwise. Returns 202
+/// Accepted immediately.
 async fn add_repo_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
     axum::extract::Json(body): axum::extract::Json<AddRepoRequest>,
@@ -5735,11 +5935,19 @@ async fn add_repo_handler(
     // creating a brand-new index: an existing index keeps the model recorded in
     // its `metadata.json`, exactly as if the flag had not been set. An explicit
     // `model` still wins and rebuilds at that model's dimension.
-    let model_override = resolve_add_repo_model(
-        explicit_model,
-        crate::embed::ModelType::from_index_metadata(&db_path),
-        state.default_model(),
-    );
+    let recorded_model = crate::embed::ModelType::from_index_metadata(&db_path);
+    let model_override =
+        resolve_add_repo_model(explicit_model, recorded_model, state.default_model());
+
+    // A usable index already on disk is adopted (incremental refresh), never
+    // thrown away: `POST /repos` is also the registration path behind
+    // `codesearch index add`, whose local path explicitly reuses an existing
+    // index. Force-rebuilding every registration meant adding N already-indexed
+    // repos cleared all N indexes and re-embedded them, serialized behind the
+    // heavy-job gate — minutes-to-hours of no visible progress for work that was
+    // already on disk. Build fresh only when there is no index yet or the caller
+    // asked for a different embedding model (the dimensions change).
+    let adopt_existing = should_adopt_existing_index(recorded_model, model_override);
 
     // Register in repos.json
     let alias = {
@@ -5890,26 +6098,55 @@ async fn add_repo_handler(
     let task_db_path = db_path.clone();
 
     let index_handle = tokio::spawn(async move {
-        tracing::info!(
-            "Indexing newly added repo '{}' ({}) in background",
-            alias_bg,
-            project_path.display()
-        );
+        if adopt_existing {
+            tracing::info!(
+                "Refreshing existing index for newly added repo '{}' ({}) in background",
+                alias_bg,
+                project_path.display()
+            );
+        } else {
+            tracing::info!(
+                "Indexing newly added repo '{}' ({}) in background",
+                alias_bg,
+                project_path.display()
+            );
+        }
 
         let pool = state_bg.embedding_pool();
-        match IndexManager::force_reindex_with_stores(
-            &project_path,
-            &db_path,
-            &stores,
-            model_override,
-            &token_for_task,
-            Some(&pool),
-        )
-        .await
-        {
+        let indexed = if adopt_existing {
+            // Incremental refresh: unchanged files stay in the index, only real
+            // changes are re-chunked/re-embedded. Same heavy-job gate and
+            // cancellation semantics as the force path (the public wrapper
+            // acquires the permit).
+            IndexManager::perform_incremental_refresh_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                &token_for_task,
+                Some(&pool),
+                None,
+            )
+            .await
+        } else {
+            IndexManager::force_reindex_with_stores(
+                &project_path,
+                &db_path,
+                &stores,
+                model_override,
+                &token_for_task,
+                Some(&pool),
+            )
+            .await
+        };
+        match indexed {
             Ok(()) => {
                 tracing::info!(
-                    "Index created for '{}' ({})",
+                    "{} for '{}' ({})",
+                    if adopt_existing {
+                        "Existing index refreshed"
+                    } else {
+                        "Index created"
+                    },
                     alias_bg,
                     project_path.display()
                 );
@@ -5949,38 +6186,47 @@ async fn add_repo_handler(
             return;
         }
 
-        // Build vector index from freshly indexed data.
+        // Build vector index from freshly indexed data — force path only.
+        // On the adopt path `perform_incremental_refresh_with_stores` already
+        // rebuilt the HNSW once after its last batch (or left the existing
+        // valid graph untouched when nothing changed), so a second build here
+        // would redo the whole graph per adopted registration for an
+        // identical result.
         // build_index() is CPU-heavy — offload to the blocking pool, under the
         // same process-wide job permit as every other heavy pass. The wait is
         // cancellation-aware: a repo removed while queued behind another build
         // must not keep its stores (and a queue position) parked.
-        let _job_permit = match stores.acquire_job_permit_or_cancel(&token_for_task).await {
-            JobAcquire::Ready(permit) => permit,
-            JobAcquire::Cancelled => {
+        if !adopt_existing {
+            let _job_permit = match stores.acquire_job_permit_or_cancel(&token_for_task).await {
+                JobAcquire::Ready(permit) => permit,
+                JobAcquire::Cancelled => {
+                    state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
+                    return;
+                }
+            };
+            // Re-check liveness after the wait: a removal that landed while the
+            // task was parked must not resurrect the alias's vector index.
+            if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
                 state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
                 return;
             }
-        };
-        // Re-check liveness after the wait: a removal that landed while the
-        // task was parked must not resurrect the alias's vector index.
-        if !state_bg.is_alias_live(&alias_bg, &token_for_task) {
-            state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
-            return;
-        }
-        {
-            let vector_store = Arc::clone(&stores.vector_store);
-            let alias_bi = alias_bg.clone();
-            match tokio::task::spawn_blocking(move || {
-                let mut vstore = vector_store.blocking_write();
-                vstore.build_index()
-            })
-            .await
             {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to build vector index for '{}': {}", alias_bi, e)
+                let vector_store = Arc::clone(&stores.vector_store);
+                let alias_bi = alias_bg.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mut vstore = vector_store.blocking_write();
+                    vstore.build_index()
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to build vector index for '{}': {}", alias_bi, e)
+                    }
+                    Err(e) => {
+                        tracing::warn!("build_index task panicked for '{}': {:?}", alias_bi, e)
+                    }
                 }
-                Err(e) => tracing::warn!("build_index task panicked for '{}': {:?}", alias_bi, e),
             }
         }
 
@@ -6954,6 +7200,11 @@ pub async fn run_serve(
     // — it never polls a federated peer on a timer at all.
     let serve_state = Arc::new(ServeState::new(config, None).with_default_model(default_model));
 
+    // Backfill git identities for repos registered before identity capture
+    // existed — awaited so the first status/TUI render already sees complete
+    // worktree families (a few git spawns at most, only for missing entries).
+    serve_state.backfill_all_missing_identities().await;
+
     // The status snapshot refresher: only this task measures. Read
     // endpoints (GET /status, MCP status) answer from its stored result,
     // so they respond in microseconds even while a rebuild wave starves
@@ -7394,4 +7645,4 @@ pub async fn run_serve(
 
 #[cfg(test)]
 #[path = "tests.rs"]
-mod tests;
+pub(crate) mod tests;

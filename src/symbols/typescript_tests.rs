@@ -14,8 +14,7 @@ fn populate_ambiguity_fixture(db_path: &Path) -> (String, String, String) {
     let add2 = "scip-typescript npm mypkg 1.0.0 `src/math.ts`/add(`x`: number).".to_string();
     let mul = "scip-typescript npm mypkg 1.0.0 `src/math.ts`/mul().".to_string();
 
-    let symbols: Database<Str, Bytes> = env
-        .open_database(&wtxn, Some(SCIP_DB_NAME))
+    let symbols = crate::lmdb_registry::open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)
         .unwrap()
         .unwrap();
     for key in [&add1, &add2, &mul] {
@@ -29,8 +28,7 @@ fn populate_ambiguity_fixture(db_path: &Path) -> (String, String, String) {
         symbols.put(&mut wtxn, key.as_str(), &refs).unwrap();
     }
 
-    let names: Database<Str, Bytes> = env
-        .open_database(&wtxn, Some(SCIP_NAMES_DB_NAME))
+    let names = crate::lmdb_registry::open_named_db::<Str, Bytes>(&env, SCIP_NAMES_DB_NAME)
         .unwrap()
         .unwrap();
     // Stored deliberately out of order: resolution must sort.
@@ -49,8 +47,7 @@ fn populate_ambiguity_fixture(db_path: &Path) -> (String, String, String) {
         )
         .unwrap();
 
-    let positions: Database<Str, Bytes> = env
-        .open_database(&wtxn, Some(SCIP_POS_DB_NAME))
+    let positions = crate::lmdb_registry::open_named_db::<Str, Bytes>(&env, SCIP_POS_DB_NAME)
         .unwrap()
         .unwrap();
     positions
@@ -196,11 +193,10 @@ fn lookup_warnings_reads_the_index_warnings_meta_entry() {
     // Hand-populate the meta entry exactly the way the rebuild flow writes
     // it: a JSON array under the namespaced meta key.
     let env = crate::symbols::get_shared_scip_env(&db).unwrap();
-    let mut wtxn = env.write_txn().unwrap();
-    let meta: Database<Str, Str> = env
-        .open_database(&wtxn, Some(SCIP_META_DB_NAME))
+    let meta = crate::lmdb_registry::open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
         .unwrap()
         .unwrap();
+    let mut wtxn = env.write_txn().unwrap();
     meta.put(
         &mut wtxn,
         META_INDEX_WARNINGS,
@@ -226,11 +222,10 @@ fn lookup_warnings_reads_the_index_warnings_meta_entry() {
     );
 
     // An empty array (what a clean reindex writes) must read as complete.
-    let mut wtxn = env.write_txn().unwrap();
-    let meta: Database<Str, Str> = env
-        .open_database(&wtxn, Some(SCIP_META_DB_NAME))
+    let meta = crate::lmdb_registry::open_named_db::<Str, Str>(&env, SCIP_META_DB_NAME)
         .unwrap()
         .unwrap();
+    let mut wtxn = env.write_txn().unwrap();
     meta.put(&mut wtxn, META_INDEX_WARNINGS, "[]").unwrap();
     wtxn.commit().unwrap();
     assert!(

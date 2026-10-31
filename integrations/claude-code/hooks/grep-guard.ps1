@@ -62,11 +62,21 @@ try {
 $tool = $data.tool_name
 $inp  = $data.tool_input
 
-if ($tool -ne 'Grep') { exit 0 }
-if ($null -eq $inp)   { exit 0 }
-
-$names = @($inp.PSObject.Properties.Name)
-$path  = if ($names -contains 'path') { [string]$inp.path } else { '' }
+# Bash escape hatch: a Bash tool command invoking the grep family is guarded
+# exactly like the Grep tool — the shell tool is otherwise a clean way around
+# the Grep denial. A shell grep has no path parameter; it runs in the session
+# cwd, so the target repo resolves as for an empty/relative path (cwd repo).
+$path = ''
+if ($tool -eq 'Bash') {
+    $cmd = if ($null -ne $inp -and @($inp.PSObject.Properties.Name) -contains 'command') { [string]$inp.command } else { '' }
+    if (-not (Test-GrepFamilyCommand $cmd)) { exit 0 }
+} elseif ($tool -ne 'Grep') {
+    exit 0
+} else {
+    if ($null -eq $inp)   { exit 0 }
+    $names = @($inp.PSObject.Properties.Name)
+    $path  = if ($names -contains 'path') { [string]$inp.path } else { '' }
+}
 
 # ------------------------------------------------------------------
 # 1+2. Resolve the TARGET repo (the repo this Grep is aimed at) and check
@@ -188,8 +198,10 @@ to proceed.
 # ------------------------------------------------------------------
 $msg = @"
 codesearch is LIVE for this repo (its /healthz probe just answered) — use it,
-do NOT fall back to Grep. Grep on an indexed internal path is only auto-allowed
-when the codesearch serve hub is actually DOWN, which it is not right now.
+do NOT fall back to Grep, and do NOT work around this via a shell grep/rg in
+the Bash tool: the same guard denies that too. Grep on an indexed internal
+path is only auto-allowed when the codesearch serve hub is actually DOWN,
+which it is not right now.
 
 IMPORTANT: a low-confidence or EMPTY codesearch result is a SUCCESSFUL call that
 means "reformulate your query" — it does NOT mean codesearch is down and it will

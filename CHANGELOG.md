@@ -14,6 +14,86 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.5]
+
+### Changed
+
+- **File-watcher text indexing no longer flushes on every brief editing pause: the batch quiet gate rose from 2 s to 5 s (env `CODESEARCH_FSW_TEXT_QUIET_MS`, floor 250 ms).** Under continuous editing every pause of 2 s or more closed the gate, and each flush cost an embedding burst on all cores plus a FTS/vector commit — a busy editing session pinned the serve process at ~10 cores. Flushes now fire only after 5 s of true quiet: a measured edit storm (12 bursts) dropped from 12 embedding waves to a single end-of-session flush.
+
+- **Symbol rebuilds coalesce instead of stacking.** Watcher flushes (C# incremental, TypeScript, restore-input FULL, branch-change FULL) that land while a rebuild is already running now merge into one follow-up pass per repo instead of queueing duplicate rebuilds behind the guard. A restore-input FULL absorbs pending C# work, a branch-change FULL absorbs everything, and pending TypeScript work is never absorbed by a C#-only restore FULL (it runs as its own pass right after).
+
+### Added
+
+- **The serve status keeps a repo at "Indexing" for 5 s after watcher activity ends.** The status snapshot samples every ~2 s, so a 1–2 s flush landed between samples and an actively-edited repo read "Idle" while embedding burned CPU. Display-only: the reindex 409 guard still reads the live markers exclusively.
+
+### Fixed
+
+- **scip-csharp cleans up stale filtered-solution leftovers.** Every solution load writes a `<name>-filtered-<guid>.sln` next to the real solution and deletes it afterwards — but a crash before that delete left it behind in the repo. Creating a new filtered solution now sweeps older `<name>-filtered-*.sln` leftovers first (case-insensitive, best-effort, count to stderr).
+
+## [1.7.4] - 2026-10-28
+
+### Added
+
+- **Space toggles collapse/expand of worktree families and peer groups in the serve TUI.** The family tree made big fleets longer than one screen, and there was no way to hide what you were not working on. Space resolves the selected row's group (a family main, a peer header, or a child walking back to its anchor) and toggles it; collapsed groups hide their children from the rendered rows while the anchor row stays selectable so space expands again. The footer gains a space hint; the remote dashboard has no grouping, so space is a no-op there.
+
+- **PageUp/PageDown page through the repo table.** The selection moves by one page — the frame's body height minus the table header chrome, captured during draw — clamped to the row range; a page at or above the row count degenerates to Home/End. Wired into both the embedded and the remote dashboard loops.
+
+### Changed
+
+- **The local repo Info overlay (`i`) builds off the UI loop.** Its file/meta reads ran synchronously in the event loop and blocked every redraw, making arrow-key navigation feel slow whenever an overlay was requested. The build now runs in a background task and arrives over the existing doctor channel, tagged with a generation so a superseded request can never apply; the overlay appears when ready.
+
+### Fixed
+
+- **Dependency bumps: fastembed 7.3→7.5 (Qwen3 reranker: f32 scores without padding, long-text kept-prefix tokenization, shared prompt head per score call) and uuid minor/patch — no API changes on our call sites.**
+
+- **The serve TUI could delete the wrong repository.** The render shows tree-ordered rows (worktrees grouped under their main, peers grouped), but the ShowInfo/RunDoctor/ForceReindex/Remove actions resolved the selected row's index against the unordered registry snapshot — so on a grouped view the confirmation dialog could name (and, once confirmed, remove) a different repo than the row under the cursor. All four action arms now resolve through the rendered rows; remote rows flash a "not supported" hint instead. Peer mounts group in the same tree style: multi-mount peers get a synthetic header row naming the federated peer and its server **hostname** (`<remote-name>/<hostname>`, parsed from the peer URL; no host in the URL falls back to the remote name alone — a group label, so its stat cells render empty), and each of its mounts is `|`-indented beneath it showing the bare repository name — no mount reads as another's parent and the remote name no longer masquerades as part of a repo name.
+
+- **Repos registered before identity capture now join their worktree family after a serve restart.** Startup backfills the missing git common-dir identities for every registered repo (previously only group members were backfilled during group resolution), so the TUI family tree groups all worktrees under their real main even when the main predates identity capture.
+
+- **Stale registrations now disappear on their own.** Serve unregisters a repo whose stored path is gone and unrelocatable — at startup, and again on every background status refresh — instead of keeping it listed forever as a `not indexed` ghost until someone ran `codesearch index prune` by hand. Moved repos are still relocated first via their git-remote identity, and the manual verb stays available for the same sweep while serve is not running.
+
+- **The serve TUI no longer decays into unreadable columns, and worktree families render as a tree.** The family note ("worktree of …", up to ~40 chars) was budgeted into the alias column, so on busy fleets the alias column overflowed and ratatui clipped every column from the left. The note now renders in its own dim "Worktree" column (capped at 30 chars with ellipsis), long aliases middle-ellipsis instead of clipping, and the column-width budget accounts for the lock column and ratatui's inter-column spacing. Worktrees now group under their main tree with a `|` indent (families anchor at the main's position; orphans stay indented at the tail), the note text is the bare main alias, and `groups list` renders `alias (main)`. Also fixes main-tree election when the main repo was registered before identity capture existed (identity-less mains now win the exact `.git`-path match over a shortest-path worktree).
+
+## [1.7.2] - 2026-10-27
+
+### Added
+
+- **The CLI can now do what the MCP tool can: literal search.** `codesearch search` gained `--literal` (Tantivy primitives directly — no embeddings, no fusion, no model load), `--phrase` (true adjacent multi-word phrases) and `--regex` (matches analyzed tokens, never raw text — punctuation never reaches the token index). A separator-spanning pattern like `ref:classification\s+search=` has anchorable tokens but the token combination never co-occurs, so the BM25 token-regex returned 0 hits while the text existed; both the CLI and the MCP `literal` tool now fall back to a raw chunk-content scan when the token-regex matches nothing, reporting the results as unranked with an explicit `scan_fallback` note. Guidance (plugin + docs) now states the discipline: `phrase` only for true adjacent phrases, `regex` only within a single token.
+
+## [1.7.1] - 2026-10-27
+
+### Fixed
+
+- **Shell grep through the Bash tool no longer bypasses the codesearch-first guards.** Both guard surfaces only watched the native Grep/Glob tools, so a raw `grep`/`rg` in a shell command ran the exact workload the guards exist to reroute (reported live: `grep | head -200 --include="*.cs"` between codesearch calls). The opencode plugin now denies bash-tool commands invoking `grep`/`egrep`/`fgrep`/`zgrep`/`rg` on covered, live repos in every guard mode except `off` (`guards.bash: false` or `CODESEARCH_PLUGIN_BASH_GUARD=0` to opt out) and appends the one-per-session tip when a shell grep slips through while the hub is down; the Claude Code grep-guard hook fires on the Bash tool via the same detector (`Grep` matcher widened to `Grep|Bash`, and re-running the installer upgrades an existing settings.json entry in place). The detector strips quoted spans and compares whole tokens (`echo "grep"`, `progress`, `rgx` pass; pipes, `git grep`, `/usr/bin/grep.exe`, `$()` and backtick substitution deny). Also fixes a latent plugin leak where `resolveSettings` mutated the shared `DEFAULTS` object, so one session's env overrides leaked into every later session in the same process.
+
+## [1.7.0] - 2026-10-26
+
+### Added
+
+- **Worktree groups: registering one member of a git-worktree family makes the whole family searchable as one unit.** Coders work in git worktrees of the same repo, and until now a group had to enumerate each worktree alias by hand — miss one and its code is invisible to every group search. Each registered repo now records its git identity (`git rev-parse --git-common-dir`, with a filesystem-only fallback reading `.git`/`gitdir:`/`commondir` when git cannot run), captured at registration and lazily backfilled for pre-existing entries; the identity is persisted, so a deleted main tree keeps its family. Group resolution expands to every registered repo sharing a member's identity — default on, per-group opt-out via `groups_meta.expand_worktrees` / `codesearch groups add --no-worktrees`, and `@peer` refs plus the virtual `all` group are untouched. Search results collapse exact duplicates within a family (key: family + relative path + content hash) across all three multi-repo paths — semantic, hybrid, literal — keeping the best score, recording alternate origins in `also_in`, and backfilling the freed slots to the requested limit, so a family of four worktrees no longer floods the top-N with the same hit. Provenance is annotation-only and flat where machine-readable: local group hits carry `source` (the origin alias), collapsed hits list `also_in`, status reports `worktree_of`, scope errors list `worktree_families`, and the TUI repo table plus `codesearch groups list` render `main (+ N worktrees)` / `wt (worktree of main)`.
+
+### Changed
+
+- **OpenCode plugin: syntax-shaped queries are routed to ast-grep tools, but only when the host exposes them.** codesearch matches text, not code structure, so the injected guidance now adds one routing line (and the block-mode denial one alternative line) pointing at ast-grep tools such as `ast_grep_search`/`ast_grep_edit` — gated per request on the assembled tool map, so environments without an ast-grep integration see unchanged guidance and no one is pointed at tools they do not have. Unit and smoke coverage pin both the mention and its absence.
+
+### Fixed
+
+- **Read-only vector stores open again after the heed 0.23 bump.** The bump's database-open shims commit their own read transaction per named database (heed 0.23 requires that commit to persist the dbi handles env-globally), but `VectorStore::open_readonly` still opened its data-read transaction BEFORE those commits — a transaction started earlier does not know the handles, so the first data read failed with a bare EINVAL (os error 22). Every `repo_read_only` repo (the whole remote DOCS corpus on the serve replica) failed to open since the bump; the write path already ordered its creates before its bootstrap transaction. The `readonly_reopen` regression test pins the ordering and is green again — it has been the one red test in CI since the bump landed.
+
+- **A cross-shard LMDB registry deadlock is closed, and every symbol query now opens its named databases before starting its read transaction.** `open_holders_under` iterated the registry (holding a shard read guard) while probing the shared-env cache (another shard lock) — the exact inverse of `get_or_open_shared_env`'s populate path, which holds the shared-env write guard across `TrackedEnv::open` → `register()`; concurrent first-symbol-query + idle-eviction/busy-status could block both forever with no timeout. The registry iteration now collects candidates first and probes the cache with no lock held. The heed-0.23 migration mechanically rewrote ~20 symbol-query sites in the C#/TypeScript adapters leaving `env.read_txn()` above the new `open_named_db` calls — one handle-generation behind, the same shape as the readonly EINVAL — masked only because the shared-env init pre-creates all six named databases before any query. Every site now opens before the txn, and a reopen-without-init pin test fails with the live EINVAL under the old order for both adapters.
+
+- **The serve hub no longer leaks Windows kernel mutex handles until the OS handle table saturates and the hub dies.** Two stacked causes, both measured live on a hub that crashed with `os error 1450` (`Insufficient system resources`) and tokio `failed to spawn thread` after holding the process-limit 2²⁴ ≈ 16.7M handles. (1) LMDB's Windows port (lmdb-master-sys 0.2.6, heed 0.23's backend) leaks two anonymous kernel mutex handles per `mdb_env_open`: the env's reader/writer-lock mutexes are created unconditionally but `mdb_env_close` destroys only the resize mutex. (2) The shared SCIP env cache held only `Weak` references by design, so the environment died between operations and every later query re-opened it — ~250 opens/sec on a busy hub, ≈1.7M opens ≈ 3.4M leaked handles, saturating the handle table in about a day. The cache now holds strong references: the SCIP env lives for the process lifetime and `mdb_env_open` runs once per directory (the leak drops to ~2 handles per rebuild, the env-open count itself). A new `close_shared_envs_under` releases the cached env before every in-process DB-directory delete (`index rm`/`clear`/force rebuild in the CLI; `remove_repo`, corruption format-recovery and the orphan-cleanup backstop in serve — the cache-only env would otherwise lock the directory forever), and `open_holders_under` no longer counts a cache-only env as a holder, so idle eviction and the held-in-process status keep their old semantics. The timing after the heed 0.23 bump was churn volume, not new code: lmdb-master-sys 0.2.6 predates the bump and is still the latest release; an upstream fix remains the endgame for the residual per-open leak.
+
+## [1.6.1]
+
+### Fixed
+
+- **`POST /repos` adopts an index that is already on disk instead of clearing and re-embedding it.** Registering a repo (`codesearch index add`, the git-hook path, or a script adding many repos at once) unconditionally ran the destructive force reindex, so a repo that already had a valid `.codesearch.db` — for example one indexed directly before being registered — lost its index and had to re-embed every file, serialized behind the process-wide job gate. The local `codesearch index add` path already reused an existing index; the serve path now matches it. A new index (no `metadata.json`) and an explicit model change still take the force-rebuild path, because changing the embedding model invalidates every stored vector.
+
+- **Adopting an index on `POST /repos` no longer rebuilds the HNSW graph a second time.** The adoption path's incremental refresh already rebuilds the index once under the job gate; the add-repo task still re-ran a full graph build afterwards, doubling the work (serialized behind the job gate) for an identical result. The extra build now runs only on the force-rebuild path, which builds no index internally.
+
+- **The C# helper now evaluates with the SDK pinned by `global.json`, not the machine's default.** `dotnet build` resolves the pinned SDK from the muxer, but the helper registered MSBuild from the default SDK — on machines whose default is newer than the repo's pin (Visual Studio 2026 RC ships the .NET 11 RC), every project evaluated under the wrong SDK and the symbol index degraded with evaluation failures no actual build shows (duplicate `Compile` items, unresolvable project references). The helper now picks the installed SDK the same way the muxer would (exact pin → same minor → same major) and falls back to discovery only when nothing matches.
+
 ## [1.6.0] - 2026-10-18
 
 ### Fixed

@@ -288,6 +288,52 @@ async fn remove_repo_reports_db_deleted_when_delete_succeeds() {
     assert!(!db_path.exists(), "DB directory must be removed from disk");
 }
 
+/// `remove_repo` must release a CACHE-ONLY shared env (the strong
+/// process-lifetime cache — no live caller Arc) before deleting the DB dir.
+///
+/// Regression pin for the Windows handle-leak fix's wipe-flow wiring: without
+/// the `close_shared_envs_under` call, the cached env keeps `data.mdb`/
+/// `lock.mdb` open for the process lifetime — the delete burns its whole
+/// retry budget on a sharing violation (Windows) and a `.removed-` tombstone
+/// leaks until the next serve restart. Cross-platform signal:
+/// `heed::env_closing_event` must be gone after the removal, which fails on
+/// every OS when the hook is deleted, even where the unlink itself succeeds.
+#[tokio::test]
+#[serial_test::serial]
+async fn remove_repo_releases_cache_only_shared_env_before_delete() {
+    let (_tmp, repo_path, state) = state_with_repo("cachewipe");
+    let db_path = repo_path.join(DB_DIR_NAME);
+
+    // get_shared_scip_env creates db_path/scip and caches the env; dropping
+    // our Arc leaves the cache as the only holder — the state a long-running
+    // serve accumulates after the first query on every repo.
+    let env = crate::symbols::get_shared_scip_env(&db_path).expect("shared scip env");
+    drop(env);
+    assert!(
+        crate::lmdb_registry::open_holders_under(&db_path).is_empty(),
+        "cache-only env must not report as a holder"
+    );
+    let scip_key = crate::cache::safe_canonicalize(&db_path.join("scip")).unwrap();
+    assert!(
+        heed::env_closing_event(&scip_key).is_some(),
+        "precondition: the cached env is alive before the removal"
+    );
+
+    let outcome = state.remove_repo("cachewipe").await.expect("remove_repo");
+
+    assert!(
+        outcome.db_deleted,
+        "cache-only env must be released before the delete, got: {:?}",
+        outcome.db_delete_error
+    );
+    assert!(!db_path.exists(), "DB directory must be removed from disk");
+    assert!(
+        heed::env_closing_event(&scip_key).is_none(),
+        "remove_repo must close the cache-only shared env — a surviving env \
+         means the close_shared_envs_under hook is missing"
+    );
+}
+
 #[tokio::test]
 async fn remove_repo_reports_db_locked_when_delete_fails() {
     // FINDINGS #2: when the DB path CANNOT be removed, `RepoRemovalOutcome`
@@ -1227,6 +1273,127 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
     );
 }
 
+/// `POST /repos` for a path whose `.codesearch.db` already holds a usable index
+/// must adopt it (incremental refresh), not clear and re-embed it. The old
+/// force path re-indexed every re-registration, so registering a batch of
+/// already-indexed repos threw away all their work and re-ran it serialized
+/// behind the heavy-job gate.
+///
+/// Fixture: one unchanged whitespace `lib.rs` tracked by an index holding one
+/// chunk. Adoption sees "up to date" and keeps the chunk (no embedding model is
+/// loaded). The force path clears the store first; re-indexing the file yields
+/// zero chunks, so the chunk count drops to zero.
+#[tokio::test]
+#[serial]
+async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("adopted");
+    std::fs::create_dir(&repo_path).unwrap();
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+
+    // Non-empty (the walker skips empty files) but yields no chunks, so the
+    // force path cannot re-embed and needs no ONNX session.
+    let file_path = repo_path.join("lib.rs");
+    std::fs::write(&file_path, "\n\n").unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":384,"model_short_name":"minilm-l6-q","indexed_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let chunk_id = {
+        let stores = crate::index::SharedStores::new(&db_path, 384).expect("fixture stores");
+        let chunk = crate::chunker::Chunk::new(
+            "\n\n".to_string(),
+            1,
+            2,
+            crate::chunker::ChunkKind::Function,
+            "lib.rs".to_string(),
+        );
+        let ids = {
+            let mut vs = stores.vector_store.write().await;
+            let ids = vs
+                .insert_chunks_with_ids(vec![crate::embed::EmbeddedChunk::new(
+                    chunk,
+                    vec![0.5f32; 384],
+                )])
+                .expect("seed vector chunk");
+            vs.build_index().expect("build fixture index");
+            ids
+        };
+        {
+            let mut fts = stores.fts_store.write().await;
+            fts.add_chunk(ids[0], "\n\n", "lib.rs", Some("adopted"), "Function")
+                .expect("seed fts doc");
+            fts.commit().expect("commit fts");
+        }
+        {
+            let mut fm = crate::cache::FileMetaStore::load_or_create(&db_path, "minilm-l6-q", 384)
+                .expect("seed file meta");
+            let key = crate::cache::storage_key(&file_path, &repo_path);
+            fm.update_file(&file_path, &key, ids.clone())
+                .expect("track the unchanged file");
+            fm.save(&db_path).expect("save file meta");
+        }
+        // Release the writer lock so the handler can open the stores itself.
+        ids[0]
+    };
+
+    let state = Arc::new(state_with_config(ReposConfig::default()));
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("adopted".to_string()),
+            model: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+
+    // The indexing task runs in the background; wait for it to release the
+    // alias marker (bounded so a hang fails the test instead of stalling it).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while state.is_indexing("adopted") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "adopted-index refresh did not finish within 30s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let stores = state
+        .get_opened_stores("adopted")
+        .expect("store must still be open after the add");
+    let stats = stores.vector_store.try_read().unwrap().stats().unwrap();
+    assert_eq!(
+        stats.total_chunks, 1,
+        "an existing index must be adopted, not cleared and rebuilt"
+    );
+    assert_eq!(
+        stats.total_files, 1,
+        "the tracked unchanged file must survive the adoption refresh"
+    );
+    assert!(
+        stores
+            .vector_store
+            .try_read()
+            .unwrap()
+            .get_chunk(chunk_id)
+            .expect("read back adopted chunk")
+            .is_some(),
+        "the previously indexed chunk must still be present (id {chunk_id})"
+    );
+}
+
 /// Precedence contract for the model a `POST /repos` add indexes with.
 #[test]
 fn resolve_add_repo_model_precedence() {
@@ -1247,6 +1414,28 @@ fn resolve_add_repo_model_precedence() {
     assert_eq!(resolve_add_repo_model(None, None, None), None);
     // Explicit model still wins when nothing else is set.
     assert_eq!(resolve_add_repo_model(Some(mini), None, None), Some(mini));
+}
+
+/// Adoption contract for `POST /repos`: an index already on disk is kept unless
+/// the add changes its embedding model. Rebuilding a registered-but-already-
+/// indexed repo used to clear and re-embed everything.
+#[test]
+fn should_adopt_existing_index_precedence() {
+    use crate::embed::ModelType;
+    let gemma = ModelType::EmbeddingGemma300MQ4;
+    let mini = ModelType::AllMiniLML6V2Q;
+
+    // No index on disk → nothing to adopt, force-build.
+    assert!(!should_adopt_existing_index(None, None));
+    assert!(!should_adopt_existing_index(None, Some(gemma)));
+
+    // Existing index, no model change → adopt and refresh incrementally.
+    assert!(should_adopt_existing_index(Some(mini), None));
+    // An explicit model that matches the recorded one is not a change.
+    assert!(should_adopt_existing_index(Some(mini), Some(mini)));
+
+    // A model change invalidates the vectors → force rebuild.
+    assert!(!should_adopt_existing_index(Some(mini), Some(gemma)));
 }
 
 /// The serve-wide default is the scope-free fallback model in serve mode (the
@@ -1389,6 +1578,69 @@ fn persist_config_honors_override_path() {
     assert!(
         on_disk.repos.contains_key("somerepo"),
         "persist_config must write to the override path"
+    );
+}
+
+/// A worktree deleted while serve runs must vanish from the registry on the
+/// next reconcile pass. Boot warmup prunes once, so in a long-lived hub the
+/// dead alias used to ghost `status kind=projects` forever (the old reconcile
+/// kept the entry and only logged "run index prune").
+#[test]
+fn reconcile_all_paths_unregisters_vanished_repos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let gone = tmp.path().join("gone-repo");
+    let alive = tmp.path().join("alive-repo");
+    std::fs::create_dir(&gone).unwrap();
+    std::fs::create_dir(&alive).unwrap();
+
+    let state = std::sync::Arc::new(ServeState::new(
+        ReposConfig::default(),
+        Some(config_file.clone()),
+    ));
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.register_with_alias(gone.clone(), Some("gone-repo".to_string()))
+            .unwrap();
+        cfg.register_with_alias(alive.clone(), Some("alive-repo".to_string()))
+            .unwrap();
+        state.persist_config(&cfg).unwrap();
+    }
+    std::fs::remove_dir(&gone).unwrap();
+
+    // Seed in-memory Write state for the vanished alias so the eviction
+    // branch (token cancel + map removal + FSW handle detach) is executed,
+    // not just the config unregister.
+    let gone_db = tmp.path().join("gone-db");
+    let stores = std::sync::Arc::new(SharedStores::new(&gone_db, 2).expect("fixture stores"));
+    let token = CancellationToken::new();
+    state.repos.insert(
+        "gone-repo".to_string(),
+        RepoState::Write {
+            stores,
+            index_manager: None,
+            cancel_token: token.clone(),
+        },
+    );
+
+    state.reconcile_all_paths();
+
+    let on_disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        !on_disk.repos.contains_key("gone-repo"),
+        "vanished repo must be unregistered and persisted"
+    );
+    assert!(
+        on_disk.repos.contains_key("alive-repo"),
+        "live repo must survive the reconcile pass"
+    );
+    assert!(
+        state.repos.get("gone-repo").is_none(),
+        "vanished alias must be evicted from memory"
+    );
+    assert!(
+        token.is_cancelled(),
+        "the Write task's cancel token must be cancelled"
     );
 }
 
@@ -2232,6 +2484,64 @@ fn resolve_group_aliases_all_returns_every_repo() {
 
     // "all" is never stored — an unknown real group still errors.
     assert!(state.resolve_group_aliases("does-not-exist").is_err());
+}
+
+/// Group resolution through the serve layer must expand to every registered
+/// repo sharing a member's git identity, and a `groups_meta` opt-out must
+/// keep the group exact (card #261 TODO 2).
+#[test]
+fn resolve_group_aliases_expands_worktrees_and_honors_opt_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    let wt = tmp.path().join("wt");
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&main).unwrap();
+    std::fs::create_dir(&wt).unwrap();
+    std::fs::create_dir(&other).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(main, Some("main".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(wt, Some("wt".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(other, Some("other".to_string()))
+        .unwrap();
+    let identity = format!("{}/.git", tmp.path().join("main").display());
+    config
+        .repos_meta
+        .entry("main".to_string())
+        .or_default()
+        .git_common_dir = Some(identity.clone());
+    config
+        .repos_meta
+        .entry("wt".to_string())
+        .or_default()
+        .git_common_dir = Some(identity);
+    config
+        .add_group("g".to_string(), vec!["main".to_string()])
+        .unwrap();
+
+    let state = state_with_config(config.clone());
+    let aliases = state.resolve_group_aliases("g").expect("group resolves");
+    assert_eq!(
+        aliases,
+        vec!["main".to_string(), "wt".to_string()],
+        "serve-side resolution must expand to the family, sorted extras last"
+    );
+
+    // Opt-out: the group resolves to exactly its member again.
+    config.groups_meta.insert(
+        "g".to_string(),
+        crate::db_discovery::repos::GroupMeta {
+            expand_worktrees: false,
+        },
+    );
+    let state = state_with_config(config);
+    let aliases = state.resolve_group_aliases("g").expect("group resolves");
+    assert_eq!(aliases, vec!["main".to_string()]);
 }
 
 /// Tests for `build_streamable_http_config` — DNS rebinding defence env vars
@@ -4148,6 +4458,100 @@ fn indexing_labels_are_owner_scoped_in_status() {
     state.end_indexing("langrepo", IndexingOwner::Symbol);
 }
 
+/// The "Indexing" display hold: a live text marker wins outright; after the
+/// marker clears, the hold window since the last watcher stamp keeps the
+/// label lit — the status snapshot samples every ~2 s, so a 1-2 s flush can
+/// otherwise land entirely between samples and read "Idle" mid-embed.
+#[test]
+fn indexing_display_hold_table() {
+    let now = Instant::now();
+    let hold = Duration::from_secs(INDEXING_DISPLAY_HOLD_SECS);
+    let cases = [
+        ("live marker wins even with no stamp", true, None, now, true),
+        (
+            "live marker beats an ancient stamp",
+            true,
+            Some(now - hold * 10),
+            now,
+            true,
+        ),
+        (
+            "just-cleared stamp inside the hold stays lit",
+            false,
+            Some(now - hold + Duration::from_millis(500)),
+            now,
+            true,
+        ),
+        (
+            "exact hold boundary is still lit",
+            false,
+            Some(now - hold),
+            now,
+            true,
+        ),
+        (
+            "one tick past the hold goes dark",
+            false,
+            Some(now - hold - Duration::from_millis(1)),
+            now,
+            false,
+        ),
+        ("no stamp and no marker is dark", false, None, now, false),
+    ];
+    for (why, marker, last_active, now, expected) in cases {
+        assert_eq!(
+            text_label_indexing(marker, last_active, now),
+            expected,
+            "{why}"
+        );
+    }
+}
+
+/// Wiring: a completed watcher flush (marker on, then off) keeps the general
+/// label on Indexing through the hold; backdating the stamp past the hold
+/// returns the label to its resting state — and `begin_indexing` stays free
+/// the whole time, proving the hold is display-only (the 409 guard reads
+/// `active_reindexes` exclusively).
+#[test]
+fn completed_flush_stays_indexing_through_display_hold() {
+    let (_tmp, _path, bare) = state_with_repo("holdrepo");
+    let state = std::sync::Arc::new(bare);
+    let cb = state.make_indexing_status_callback("holdrepo");
+    cb(true);
+    cb(false);
+
+    let label = || {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "holdrepo")
+            .expect("holdrepo row")
+            .1
+            .status
+    };
+    assert_eq!(
+        label(),
+        RepoStateLabel::Indexing,
+        "the flush-end stamp must hold the label after the marker clears"
+    );
+
+    state.indexing_last_active.insert(
+        "holdrepo".to_string(),
+        Instant::now() - Duration::from_secs(INDEXING_DISPLAY_HOLD_SECS * 2),
+    );
+    assert_eq!(
+        label(),
+        RepoStateLabel::NoIndex,
+        "past the hold the label returns to the fixture's resting state"
+    );
+
+    assert!(
+        state.begin_indexing("holdrepo", IndexingOwner::Reindex),
+        "the display hold must never block the 409 guard"
+    );
+    state.end_indexing("holdrepo", IndexingOwner::Reindex);
+}
+
 /// TS twin of the owner-scoping test above: with a resolvable helper env
 /// override, a SYMBOL marker lights the TS column while the general label
 /// rests; a TEXT reindex never lights the TS column, tsconfig or not.
@@ -4301,10 +4705,12 @@ fn build_info_overlay_reads_symbol_warnings_from_meta() {
     // Seed the meta the way a degraded rebuild does (see the roundtrip test
     // in csharp_tests for the read side).
     let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let meta = crate::lmdb_registry::create_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
-        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap();
     meta.put(
         &mut wtxn,
         crate::constants::SCIP_INDEX_WARNINGS_KEY,
@@ -4314,12 +4720,7 @@ fn build_info_overlay_reads_symbol_warnings_from_meta() {
     wtxn.commit().unwrap();
 
     let state = std::sync::Arc::new(bare);
-    let statuses = state.repo_statuses_lightweight();
-    let idx = statuses
-        .iter()
-        .position(|(alias, _)| alias == "inforepo")
-        .expect("inforepo row");
-    let overlay = build_info_overlay(idx, &statuses, &state).expect("overlay");
+    let overlay = build_info_overlay("inforepo", &state).expect("overlay");
     match overlay {
         crate::serve::tui_common::OverlayState::Info {
             symbol_warnings, ..
@@ -4704,6 +5105,85 @@ fn modal_wraps_long_warning_lines_instead_of_clipping() {
     );
 }
 
+/// Narrow-terminal decay guard for the repo table: the alias column must CAP
+/// via middle-ellipsis (head+…+tail) instead of letting ratatui clip columns
+/// from the left — the status column and the `| ` worktree indent must stay
+/// visible next to a long alias.
+#[test]
+fn render_table_caps_long_alias_and_keeps_columns_on_narrow_terminal() {
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::TableState;
+    use ratatui::Terminal;
+
+    let long_alias = "very-long-alias-name-for-a-repository-x";
+    let wt_alias = "wt-deploy-branch-20261023-suffix";
+    let row = |alias: &str, note: Option<String>, indent: bool| crate::serve::tui_common::RepoRow {
+        alias: alias.to_string(),
+        display_name: None,
+        status: "warm".to_string(),
+        csharp_index: "none".to_string(),
+        csharp_error: None,
+        typescript_index: "none".to_string(),
+        changes: 0,
+        tool_call_count: 0,
+        last_tool_call: None,
+        lock_mode: String::new(),
+        path: String::new(),
+        is_remote: false,
+        activity_stale: false,
+        family_note: note,
+        indent,
+        group_header: false,
+    };
+    let repos = vec![
+        row(long_alias, Some("+ 1 worktree".to_string()), false),
+        row(wt_alias, None, true),
+    ];
+
+    // Width 110: the fixed columns (note+status+changes+calls+tool+lock)
+    // fit with room to spare, so the alias cap — not ratatui's constraint
+    // squeeze — is what bounds the alias cell.
+    let mut terminal = Terminal::new(TestBackend::new(110, 10)).unwrap();
+    terminal
+        .draw(|f| {
+            let mut ts = TableState::default();
+            crate::serve::tui_common::render_table(f, f.area(), &repos, &mut ts);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let mut rendered = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            rendered.push_str(buffer[(x, y)].symbol());
+        }
+        rendered.push('\n');
+    }
+
+    // Middle-ellipsis, not a hard clip: the head region AND the tail of the
+    // long alias both survive with "..." between them (a right-clip would
+    // lose the tail, the original left-clip decay lost everything).
+    assert!(
+        rendered.contains("very-long") && rendered.contains("repository-x"),
+        "the long alias must render middle-ellipsised (head and tail kept), got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("..."),
+        "the ellipsis marker must be present, got:\n{rendered}"
+    );
+    // The worktree row keeps its tree indent.
+    assert!(
+        rendered.contains("| "),
+        "worktree rows must carry the | indent, got:\n{rendered}"
+    );
+    // The status column must still render — the original decay clipped
+    // every column from the left.
+    assert!(
+        rendered.contains("warm"),
+        "the status column must survive next to a long alias, got:\n{rendered}"
+    );
+}
+
 /// The serve-mode find_impact self-heal spawn must reach
 /// `trigger_symbol_rebuild` for a registered, applicable repo: after the
 /// warned empty answer, the C# status eventually flips to Error (dummy
@@ -4783,11 +5263,13 @@ async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
 /// tests can shape a fresh, stale or degraded index without the helper.
 fn seed_scip_meta(db: &std::path::Path, extra: &[(&str, &str)]) {
     let env = crate::symbols::get_shared_scip_env(db).unwrap();
+    let meta = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
-    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
-        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
-        .unwrap()
-        .unwrap();
     meta.put(&mut wtxn, crate::constants::SCIP_REBUILD_TIMESTAMP_KEY, "0")
         .unwrap();
     meta.put(
@@ -6574,4 +7056,264 @@ async fn finish_force_reindex_starts_fsw_and_keeps_guard_contract() {
         "the tail must not release the reindex guard — callers own that"
     );
     state.end_indexing("repo", IndexingOwner::Reindex);
+}
+
+#[tokio::test]
+#[serial]
+async fn backfill_group_identities_fills_missing_and_persists() {
+    // The git-serialization lock must be dropped before the first .await
+    // (clippy await_holding_lock): scope it around the synchronous git setup.
+    // `tmp` lives for the whole test — the backfill's git spawns need the
+    // repo paths to still exist.
+    let tmp = tempfile::tempdir().unwrap();
+    let (main_alias, wt_alias, config, config_file) = {
+        let _serial = crate::db_discovery::repos::test_support::git_serial_lock();
+        // Main tree + linked worktree: two registered repos sharing one
+        // identity, so the backfill has something real to compute via git.
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
+        let wt = tmp.path().join("wt");
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+
+        let mut config = ReposConfig::default();
+        let main_alias = config.register(main.clone());
+        let wt_alias = config.register(wt.clone());
+        config
+            .add_group(
+                "fam".to_string(),
+                vec![main_alias.clone(), wt_alias.clone()],
+            )
+            .unwrap();
+        // Simulate pre-existing entries registered before the field existed.
+        config
+            .repos_meta
+            .get_mut(&main_alias)
+            .unwrap()
+            .git_common_dir = None;
+        config.repos_meta.get_mut(&wt_alias).unwrap().git_common_dir = None;
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+        (main_alias, wt_alias, config, config_file)
+    };
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    state.backfill_group_identities("fam").await;
+
+    let snap = state.config_snapshot();
+    let main_identity = snap.meta(&main_alias).git_common_dir.clone();
+    assert!(
+        main_identity.is_some(),
+        "backfill must fill the missing identity"
+    );
+    assert_eq!(
+        main_identity,
+        snap.meta(&wt_alias).git_common_dir.clone(),
+        "backfilled identities must agree across the family"
+    );
+    // Persisted: a fresh load from disk sees the identity, so a later
+    // deletion of the main tree cannot lose it.
+    let reloaded = ReposConfig::load_from(&config_file).unwrap();
+    assert_eq!(
+        reloaded.meta(&main_alias).git_common_dir,
+        main_identity,
+        "backfilled identity must be persisted to repos.json"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn backfill_all_missing_identities_fills_every_repo() {
+    // Startup variant: no group involved — every registered repo missing an
+    // identity gets one, so pre-capture mains join their worktree families.
+    let tmp = tempfile::tempdir().unwrap();
+    let (main_alias, wt_alias, plain_alias, config, config_file) = {
+        let _serial = crate::db_discovery::repos::test_support::git_serial_lock();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
+        let wt = tmp.path().join("wt");
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        // A plain non-git directory: the backfill must leave it identity-less.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let mut config = ReposConfig::default();
+        let main_alias = config.register(main.clone());
+        let wt_alias = config.register(wt.clone());
+        let plain_alias = config.register(plain.clone());
+        config
+            .repos_meta
+            .get_mut(&main_alias)
+            .unwrap()
+            .git_common_dir = None;
+        // The oldest pre-capture configs carry no repos_meta entry at all:
+        // remove the wt entry so the absent-meta arm of the filter is pinned.
+        config.repos_meta.remove(&wt_alias);
+
+        let config_file = tmp.path().join("repos.json");
+        config.save_to(&config_file).unwrap();
+        (main_alias, wt_alias, plain_alias, config, config_file)
+    };
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    state.backfill_all_missing_identities().await;
+
+    let snap = state.config_snapshot();
+    let main_identity = snap.meta(&main_alias).git_common_dir.clone();
+    assert!(
+        main_identity.is_some(),
+        "startup backfill must fill every git repo's identity"
+    );
+    assert_eq!(
+        main_identity,
+        snap.meta(&wt_alias).git_common_dir.clone(),
+        "family members must agree on the common dir"
+    );
+    assert!(
+        snap.meta(&plain_alias).git_common_dir.is_none(),
+        "non-git directories must stay identity-less"
+    );
+    let reloaded = ReposConfig::load_from(&config_file).unwrap();
+    assert_eq!(
+        reloaded.meta(&wt_alias).git_common_dir,
+        main_identity,
+        "startup backfill must persist to repos.json"
+    );
+}
+
+// === worktree-family surfaces (card #261 TODO 4) ===
+
+/// Family config for the surface tests: two registered aliases sharing one
+/// hand-set git identity, saved to a temp repos.json wired to the state.
+/// Two-repo worktree family on a tempdir: `m` (main tree, identity
+/// `<tmp>/m/.git`) + `m-wt` sharing it, config saved to `<tmp>/repos.json`.
+/// Shared by the status/scope tests here and the TUI row tests. The
+/// returned TempDir must outlive every use of the state.
+pub(crate) fn family_state() -> (
+    tempfile::TempDir,
+    String,
+    String,
+    std::sync::Arc<ServeState>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = ReposConfig::default();
+    let main_path = tmp.path().join("m");
+    let wt_path = tmp.path().join("m-wt");
+    let main = config.register(main_path.clone());
+    let wt = config.register(wt_path.clone());
+    let identity = format!("{}/.git", main_path.display());
+    config
+        .repos_meta
+        .entry(main.clone())
+        .or_default()
+        .git_common_dir = Some(identity.clone());
+    config
+        .repos_meta
+        .entry(wt.clone())
+        .or_default()
+        .git_common_dir = Some(identity);
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    (tmp, main, wt, state)
+}
+
+#[tokio::test]
+async fn status_annotates_worktree_of_from_family_identity() {
+    let (_tmp, main, wt, state) = family_state();
+    let info = |status| RepoStatusInfo {
+        status,
+        changes: 0,
+        last_tool_call: None,
+        tool_call_count: 0,
+        csharp_index: CSharpIndexStatus::None,
+        csharp_error: None,
+        typescript_index: CSharpIndexStatus::None,
+    };
+    state
+        .status_snapshot
+        .store(status_snapshot::StatusSnapshot {
+            repos: vec![
+                (main.clone(), info(RepoStateLabel::Warm)),
+                (wt.clone(), info(RepoStateLabel::Warm)),
+            ],
+            projects: Vec::new(),
+            projects_warnings: Vec::new(),
+            active_sessions: 0,
+            cpu_percent: "0%".to_string(),
+            csharp_helper: false,
+            ts_helper: false,
+            generated_at: std::time::Instant::now(),
+        });
+
+    let resp = status_handler(axum::extract::State(state)).await;
+    let json = resp.0;
+    let repos = json["repos"].as_array().expect("repos array");
+    let wt_entry = repos
+        .iter()
+        .find(|r| r["alias"] == wt.as_str())
+        .expect("wt entry");
+    assert_eq!(wt_entry["worktree_of"], main.as_str(), "json: {json}");
+    let main_entry = repos
+        .iter()
+        .find(|r| r["alias"] == main.as_str())
+        .expect("main entry");
+    assert!(
+        main_entry.get("worktree_of").is_none(),
+        "main trees carry no worktree_of: {json}"
+    );
+}
+
+#[tokio::test]
+async fn scope_error_lists_worktree_families_and_clean_projects() {
+    let (_tmp, main, wt, state) = family_state();
+    let service = crate::mcp::CodesearchService::new_for_serve(state).expect("service");
+    let payload: serde_json::Value =
+        serde_json::from_str(&service.format_scope_error()).expect("scope payload");
+
+    assert_eq!(
+        payload["worktree_families"][wt.as_str()],
+        main.as_str(),
+        "payload: {payload}"
+    );
+    assert!(
+        payload["worktree_families"].get(main.as_str()).is_none(),
+        "main trees are not in the families map: {payload}"
+    );
+    let projects: Vec<&str> = payload["available_projects"]
+        .as_array()
+        .expect("projects array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        projects.contains(&main.as_str()) && projects.contains(&wt.as_str()),
+        "available_projects stay clean aliases: {projects:?}"
+    );
+    assert!(
+        !payload.to_string().contains("(worktree of"),
+        "machine-readable payload must stay flat: {payload}"
+    );
 }

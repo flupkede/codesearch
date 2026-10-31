@@ -80,7 +80,26 @@ graph TB
 
 ### Install
 
-Download pre-built binaries from [Releases](https://github.com/flupkede/codesearch/releases):
+One line — the installer asks for an install path on first use and updates an existing install in place (stopping a running serve from that directory first):
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://github.com/flupkede/codesearch/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1
+```
+
+**Linux / macOS (bash):**
+
+```bash
+curl -fsSLO https://github.com/flupkede/codesearch/releases/latest/download/install.sh && bash install.sh && rm install.sh
+```
+
+(The download-then-run form matters: piping straight into `bash` shares stdin with the script, which breaks the first-install path prompt.)
+
+Downloads the `-with-csharp` build by default (codesearch + `scip-csharp`, self-contained); add `-NoCSharp` / `--no-csharp` for the base build. Archives carry a `.sha256` sidecar and the installer verifies it when present. `--destination <path>` / `-Destination <path>` skips the prompt.
+
+<details>
+<summary>Manual install — download pre-built binaries from <a href="https://github.com/flupkede/codesearch/releases">Releases</a></summary>
 
 | Platform | Download |
 |----------|----------|
@@ -90,6 +109,10 @@ Download pre-built binaries from [Releases](https://github.com/flupkede/codesear
 | Linux x86_64 + C# | `codesearch-linux-x86_64-with-csharp.tar.gz` |
 | macOS ARM64 | `codesearch-macos-arm64.tar.gz` |
 | macOS ARM64 + C# | `codesearch-macos-arm64-with-csharp.tar.gz` |
+
+Unzip, put `codesearch(.exe)` on your `PATH`; for the C# builds keep `scip-csharp(.exe)` next to it.
+
+</details>
 
 Or build from source:
 
@@ -387,17 +410,14 @@ codesearch index rm /path/to/my-project
 # List registered repos
 codesearch index list
 
-# Clean up stale entries (relocates moved repos, drops the rest)
+# Clean up stale entries (relocates moved repos, drops the rest;
+# serve also does this itself at startup and on every status refresh)
 codesearch index prune
 ```
 
-The repository **alias** (the key in `repos.json`, used for groups and the MCP
-`project` argument) is always derived automatically from the directory name —
-there is no `--alias` flag.
-
 Serve reads `~/.codesearch/repos.json` on startup and manages all registered repos.
 
-#### Moved or renamed repositories
+#### Moved, renamed or deleted repositories
 
 If you rename or move a registered folder, serve does **not** crash. On startup
 it tries to **relocate** each missing repo automatically: it captures every
@@ -405,8 +425,14 @@ repo's git remote (`remote.origin.url`) at registration, and on a missing path
 it scans nearby folders (bounded depth, override with
 `CODESEARCH_RELOCATE_MAX_DEPTH`, default `3`) for a git checkout with the same
 remote. A single unambiguous match is rewritten into `repos.json`; otherwise the
-entry is logged and skipped (never indexed against a dead path). Run
-`codesearch index prune` to relocate what can be relocated and drop the rest.
+entry is logged and skipped (never indexed against a dead path).
+
+When a path is unrecoverable, serve now **unregisters it by itself** — at
+startup, and again on every background status refresh — so a deleted repo or
+worktree stops showing up as a `not indexed` ghost on its own (worktree deletion
+fires no git hook, and `rm -rf` bypasses every observer, so serve reconciles
+its own registry instead). `codesearch index prune` stays available as the
+manual trigger for the same sweep, e.g. while serve is not running.
 
 A hand-edited `repos.json` is also tolerated: empty entries, orphaned metadata,
 and group references to unknown repos are cleaned up on load rather than
@@ -548,7 +574,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | Command | Description |
 |---------|-------------|
 | `codesearch index [PATH]` | Index a repo (incremental; `--force` for full rebuild) |
-| `codesearch search <QUERY>` | CLI search (for testing) |
+| `codesearch search <QUERY>` | CLI search (for testing). `--literal` runs the FTS primitives directly (no embeddings/model load); `--phrase` for true adjacent multi-word phrases; `--regex` matches analyzed tokens only — a separator-spanning pattern with zero hits auto-falls back to a raw chunk-content scan |
 | `codesearch mcp` | Start MCP stdio server |
 | `codesearch serve` | Start multi-repo HTTP server with TUI |
 | `codesearch stats` | Show database statistics |

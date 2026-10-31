@@ -782,3 +782,39 @@ fn save_is_atomic_and_keeps_one_backup_generation() {
         [1, 7].iter().copied().collect()
     );
 }
+
+// ── guard_derived_path (Aikido SAST 30640695) ───────────────────────────
+
+#[test]
+fn guard_accepts_plain_derived_path() {
+    let tmp = tempdir().unwrap();
+    let joined = tmp.path().join(FILE_META_DB_NAME);
+    assert!(guard_derived_path(tmp.path(), &joined).is_ok());
+}
+
+#[test]
+fn guard_rejects_parent_dir_component() {
+    let tmp = tempdir().unwrap();
+    let joined = tmp.path().join("..").join(FILE_META_DB_NAME);
+    let err = guard_derived_path(tmp.path(), &joined).unwrap_err();
+    assert!(err.to_string().contains("'..'"), "unexpected error: {err}");
+}
+
+#[test]
+fn guard_rejects_path_outside_base() {
+    let a = tempdir().unwrap();
+    let b = tempdir().unwrap();
+    let joined = b.path().join(FILE_META_DB_NAME);
+    let err = guard_derived_path(a.path(), &joined).unwrap_err();
+    assert!(
+        err.to_string().contains("outside the index directory"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn load_or_create_rejects_traversal_db_path() {
+    let tmp = tempdir().unwrap();
+    let evil = tmp.path().join("..").join("elsewhere");
+    assert!(FileMetaStore::load_or_create(&evil, "m", 384).is_err());
+}

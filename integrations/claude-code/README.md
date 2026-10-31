@@ -29,10 +29,14 @@ parent's `AGENTS.md` or the MCP `initialize` instructions at all.
 Four [Claude Code hooks](https://docs.claude.com/en/docs/claude-code/hooks)
 that make the preference *structural* instead of advisory:
 
-- **`grep-guard`** — a `PreToolUse` hook on `Grep`. Blocks every `Grep`
+- **`grep-guard`** — a `PreToolUse` hook on `Grep` **and `Bash`**. Blocks every
+  `Grep`
   call against an indexed repo *for as long as the codesearch serve hub
   is reachable*, with a message telling the model exactly how to load and
-  call codesearch instead. The guarded repo is resolved from the **grep
+  call codesearch instead. The `Bash` matcher closes the shell escape hatch:
+  a Bash tool command invoking `grep`/`egrep`/`fgrep`/`zgrep`/`rg` is guarded
+  identically (quoted mentions like `echo "grep"` are not invocations; the
+  target repo is the session cwd). The guarded repo is resolved from the **grep
   target itself** — the git root of the path being searched, not the
   hook's working directory — so an absolute-path Grep into a different
   indexed repo is guarded too (a cwd-based check used to let those
@@ -132,7 +136,7 @@ want to merge manually, add to `~/.claude/settings.json` (or
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Grep",
+        "matcher": "Grep|Bash",
         "hooks": [
           { "type": "command", "command": "pwsh -NoProfile -NonInteractive -File \"<path>/grep-guard.ps1\"" }
         ]
@@ -169,7 +173,7 @@ from their own directory, so that file must be copied alongside them.
 
 ## Uninstall
 
-Remove the guard entries (matchers `Grep`, `Agent`, `WebSearch|WebFetch` and
+Remove the guard entries (matchers `Grep|Bash`, `Agent`, `WebSearch|WebFetch` and
 `Edit|Write|MultiEdit` under `PreToolUse`, and
 `mcp__codesearch__find_impact|mcp__codesearch__find` under `PostToolUse`,
 whose commands point at `hooks/codesearch/`) from `settings.json`, and delete

@@ -18,6 +18,29 @@ jq_str() {
     tr -d '\r'
 }
 
+# True when a shell command line invokes grep/egrep/fgrep/zgrep/rg — the Bash
+# tool escape hatch around the Grep-tool guard. Same detector contract as the
+# opencode plugin's bashCommandGrep: quoted spans are stripped first ("echo
+# 'grep is slow'" is not an invocation), separators become spaces so unquoted
+# pipes still split, and tokens compare whole after lowercasing, .exe and
+# path-prefix removal ("progress" and "rgx" never match; /usr/bin/grep does).
+command_grep_family() {
+    local cmd="$1" stripped token
+    [ -n "$cmd" ] || return 1
+    stripped=$(printf '%s' "$cmd" | sed -E 's/"(\\.|[^"\\])*"/ /g')
+    stripped=$(printf '%s' "$stripped" | sed -E $'s/\'(\\\\.|[^\'\\\\])*\'/ /g')
+    stripped=$(printf '%s' "$stripped" | tr ';|&()`' '      ')
+    for token in $stripped; do
+        token=$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]')
+        token="${token%.exe}"
+        token="${token##*[\\/]}"
+        case "$token" in
+            grep|egrep|fgrep|zgrep|rg) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # repos.json location — mirrors src/db_discovery/repos.rs `config_path()`
 # and constants.rs `codesearch_home()`:
 # CODESEARCH_REPOS_CONFIG > $CODESEARCH_HOME/repos.json > ~/.codesearch/repos.json.

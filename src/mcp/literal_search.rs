@@ -6,6 +6,154 @@ use super::*;
 use rmcp::model::{CallToolResult, ContentBlock};
 
 impl CodesearchService {
+    /// Raw chunk-content scan shared by two literal_search branches: the
+    /// tokenless-regex path (BM25 cannot produce useful candidates) and the
+    /// BM25-regex 0-hits fallback (the tokens exist but the pattern's implied
+    /// combination never co-occurs in the token index). Iterates every chunk,
+    /// applies the language/glob filters, and matches the query line-wise
+    /// (regex when given, else substring). Results are unranked (score 0.0).
+    /// Err carries the caller-facing error text.
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_chunks_for_literal(
+        &self,
+        ctx: &MultiStoreContext,
+        lang_filter: &Option<String>,
+        glob_filter: &Option<String>,
+        project_root_normalized: &str,
+        snippet_regex: Option<&Regex>,
+        effective_query: &str,
+        limit: usize,
+        literal_warnings: &mut Vec<String>,
+    ) -> Result<Vec<LiteralSearchResultItem>, String> {
+        if let Some(ref sv) = ctx.stores_vec {
+            // Multi-store scan. Chunks come from their own store (no id
+            // lookups), so attribution is correct by construction — only
+            // the path prefix needs the owning alias.
+            let scan_aliases = ctx.aliases();
+            let mut items: Vec<LiteralSearchResultItem> = Vec::new();
+            for (store_idx, store_arc) in sv.iter().enumerate() {
+                let alias = scan_aliases
+                    .get(store_idx)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    scan_aliases,
+                    store_idx,
+                    literal_warnings,
+                    "chunk scan",
+                ) else {
+                    continue;
+                };
+                let all_chunks = match store.iter_all_chunks() {
+                    Ok(chunks) => chunks,
+                    Err(_) => continue,
+                };
+                for (_, chunk) in all_chunks {
+                    if let Some(ref lang) = lang_filter {
+                        let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
+                        if file_lang.name() != lang {
+                            continue;
+                        }
+                    }
+                    if let Some(ref glob) = glob_filter {
+                        let relative_path = chunk
+                            .path
+                            .strip_prefix(project_root_normalized)
+                            .unwrap_or(&chunk.path)
+                            .trim_start_matches('/');
+                        if !simple_glob_match(glob, relative_path) {
+                            continue;
+                        }
+                    }
+                    if let Some((match_offset, snippet)) =
+                        match_line_for_literal(&chunk.content, effective_query, snippet_regex)
+                    {
+                        let match_line = chunk.start_line + match_offset;
+                        items.push(LiteralSearchResultItem {
+                            path: ctx.prefix_sourced_path(alias, &chunk.path),
+                            start_line: match_line,
+                            end_line: match_line,
+                            snippet,
+                            score: 0.0, // No BM25 score — scan-path results are unranked
+                            kind: if chunk.kind.is_empty() {
+                                None
+                            } else {
+                                Some(chunk.kind)
+                            },
+                            signature: chunk.signature.filter(|s| !s.is_empty()),
+                        });
+                        if items.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                if items.len() >= limit {
+                    break;
+                }
+            }
+            Ok(items)
+        } else {
+            // Single-store scan
+            match self
+                .with_vector_store_read_for(
+                    |store| {
+                        let all_chunks = store.iter_all_chunks()?;
+                        let mut items: Vec<LiteralSearchResultItem> = Vec::new();
+                        for (_, chunk) in all_chunks {
+                            if let Some(ref lang) = lang_filter {
+                                let file_lang =
+                                    Language::from_path(std::path::Path::new(&chunk.path));
+                                if file_lang.name() != lang {
+                                    continue;
+                                }
+                            }
+                            if let Some(ref glob) = glob_filter {
+                                let relative_path = chunk
+                                    .path
+                                    .strip_prefix(project_root_normalized)
+                                    .unwrap_or(&chunk.path)
+                                    .trim_start_matches('/');
+                                if !simple_glob_match(glob, relative_path) {
+                                    continue;
+                                }
+                            }
+                            if let Some((match_offset, snippet)) = match_line_for_literal(
+                                &chunk.content,
+                                effective_query,
+                                snippet_regex,
+                            ) {
+                                let match_line = chunk.start_line + match_offset;
+                                items.push(LiteralSearchResultItem {
+                                    path: chunk.path,
+                                    start_line: match_line,
+                                    end_line: match_line,
+                                    snippet,
+                                    score: 0.0, // No BM25 score — scan-path results are unranked
+                                    kind: if chunk.kind.is_empty() {
+                                        None
+                                    } else {
+                                        Some(chunk.kind)
+                                    },
+                                    signature: chunk.signature.filter(|s| !s.is_empty()),
+                                });
+                                if items.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(items)
+                    },
+                    ctx.stores.clone(),
+                )
+                .await
+            {
+                Ok(items) => Ok(items),
+                Err(e) => Err(format!("Error scanning chunks: {e:#}")),
+            }
+        }
+    }
+
     pub(crate) async fn literal_search(
         &self,
         Parameters(request): Parameters<LiteralSearchRequest>,
@@ -87,140 +235,21 @@ impl CodesearchService {
             // ── Scan path ──────────────────────────────────────────────
             // Tokenless regex (e.g. \bfn\s+\w+) — BM25 cannot produce useful
             // candidates. Scan all chunks sequentially, apply regex post-filter.
-            // Score is 0.0 for all results (no BM25 ranking applies).
-            tracing::debug!("literal_search: tokenless regex detected, using scan path");
-            if let Some(ref sv) = ctx.stores_vec {
-                // Multi-store scan. Chunks come from their own store (no id
-                // lookups), so attribution is correct by construction — only
-                // the path prefix needs the owning alias.
-                let scan_aliases = ctx.aliases();
-                let mut items: Vec<LiteralSearchResultItem> = Vec::new();
-                for (store_idx, store_arc) in sv.iter().enumerate() {
-                    let alias = scan_aliases
-                        .get(store_idx)
-                        .map(String::as_str)
-                        .unwrap_or_default();
-                    let Some(store) = try_vector_read_or_note(
-                        &store_arc.vector_store,
-                        scan_aliases,
-                        store_idx,
-                        &mut literal_warnings,
-                        "chunk scan",
-                    ) else {
-                        continue;
-                    };
-                    let all_chunks = match store.iter_all_chunks() {
-                        Ok(chunks) => chunks,
-                        Err(_) => continue,
-                    };
-                    for (_, chunk) in all_chunks {
-                        if let Some(ref lang) = lang_filter {
-                            let file_lang = Language::from_path(std::path::Path::new(&chunk.path));
-                            if file_lang.name() != lang {
-                                continue;
-                            }
-                        }
-                        if let Some(ref glob) = glob_filter {
-                            let relative_path = chunk
-                                .path
-                                .strip_prefix(&project_root_normalized)
-                                .unwrap_or(&chunk.path)
-                                .trim_start_matches('/');
-                            if !simple_glob_match(glob, relative_path) {
-                                continue;
-                            }
-                        }
-                        if let Some((match_offset, snippet)) = match_line_for_literal(
-                            &chunk.content,
-                            &effective_query,
-                            snippet_regex.as_ref(),
-                        ) {
-                            let match_line = chunk.start_line + match_offset;
-                            items.push(LiteralSearchResultItem {
-                                path: ctx.prefix_sourced_path(alias, &chunk.path),
-                                start_line: match_line,
-                                end_line: match_line,
-                                snippet,
-                                score: 0.0, // No BM25 score — scan-path results are unranked
-                                kind: if chunk.kind.is_empty() {
-                                    None
-                                } else {
-                                    Some(chunk.kind)
-                                },
-                                signature: chunk.signature.filter(|s| !s.is_empty()),
-                            });
-                            if items.len() >= limit {
-                                break;
-                            }
-                        }
-                    }
-                    if items.len() >= limit {
-                        break;
-                    }
-                }
-                items
-            } else {
-                // Single-store scan
-                match self
-                    .with_vector_store_read_for(
-                        |store| {
-                            let all_chunks = store.iter_all_chunks()?;
-                            let mut items: Vec<LiteralSearchResultItem> = Vec::new();
-                            for (_, chunk) in all_chunks {
-                                if let Some(ref lang) = lang_filter {
-                                    let file_lang =
-                                        Language::from_path(std::path::Path::new(&chunk.path));
-                                    if file_lang.name() != lang {
-                                        continue;
-                                    }
-                                }
-                                if let Some(ref glob) = glob_filter {
-                                    let relative_path = chunk
-                                        .path
-                                        .strip_prefix(&project_root_normalized)
-                                        .unwrap_or(&chunk.path)
-                                        .trim_start_matches('/');
-                                    if !simple_glob_match(glob, relative_path) {
-                                        continue;
-                                    }
-                                }
-                                if let Some((match_offset, snippet)) = match_line_for_literal(
-                                    &chunk.content,
-                                    &effective_query,
-                                    snippet_regex.as_ref(),
-                                ) {
-                                    let match_line = chunk.start_line + match_offset;
-                                    items.push(LiteralSearchResultItem {
-                                        path: chunk.path,
-                                        start_line: match_line,
-                                        end_line: match_line,
-                                        snippet,
-                                        score: 0.0, // No BM25 score — scan-path results are unranked
-                                        kind: if chunk.kind.is_empty() {
-                                            None
-                                        } else {
-                                            Some(chunk.kind)
-                                        },
-                                        signature: chunk.signature.filter(|s| !s.is_empty()),
-                                    });
-                                    if items.len() >= limit {
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(items)
-                        },
-                        ctx.stores.clone(),
-                    )
-                    .await
-                {
-                    Ok(items) => items,
-                    Err(e) => {
-                        return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                            "Error scanning chunks: {e:#}"
-                        ))]));
-                    }
-                }
+            match self
+                .scan_chunks_for_literal(
+                    &ctx,
+                    &lang_filter,
+                    &glob_filter,
+                    &project_root_normalized,
+                    snippet_regex.as_ref(),
+                    &effective_query,
+                    limit,
+                    &mut literal_warnings,
+                )
+                .await
+            {
+                Ok(items) => items,
+                Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
             }
         } else {
             // ── BM25 path ──────────────────────────────────────────────
@@ -538,6 +567,36 @@ impl CodesearchService {
             }
         };
 
+        // BM25-regex 0-hits fallback: the token-regex can return zero even
+        // when the text exists — the analyzer splits on punctuation, so a
+        // pattern like `ref:classification\s+search=` implies a token
+        // combination that never co-occurs. Fall back to the raw
+        // chunk-content scan (the same escape hatch the tokenless branch
+        // uses) and say so in the note.
+        let mut scan_fallback = false;
+        if regex_enabled && !tokenless_regex && items.is_empty() && snippet_regex.is_some() {
+            tracing::debug!(
+                "literal_search: BM25 token-regex empty, falling back to raw chunk scan"
+            );
+            scan_fallback = true;
+            items = match self
+                .scan_chunks_for_literal(
+                    &ctx,
+                    &lang_filter,
+                    &glob_filter,
+                    &project_root_normalized,
+                    snippet_regex.as_ref(),
+                    &effective_query,
+                    limit,
+                    &mut literal_warnings,
+                )
+                .await
+            {
+                Ok(items) => items,
+                Err(e) => return Ok(CallToolResult::success(vec![ContentBlock::text(e)])),
+            };
+        }
+
         // Prefix paths with the routing alias. Group items were already
         // attributed to their origin repo at resolution time; re-prefixing
         // here would double the alias onto those paths.
@@ -564,6 +623,11 @@ impl CodesearchService {
                 "Exact AND search matched nothing; showing relaxed OR results covering >=60% of the significant terms ({}) and at least two of them.",
                 significant_terms.join(", ")
             ))
+        } else if scan_fallback {
+            Some(
+                "BM25 token-regex matched nothing; showing raw chunk-content scan results (unranked)."
+                    .to_string(),
+            )
         } else if low_confidence == Some(true) {
             suggested_tool.as_ref().map(|tool| {
                 format!(
@@ -579,6 +643,7 @@ impl CodesearchService {
             results: items,
             auto_promoted_to_regex: if auto_promoted { Some(true) } else { None },
             relaxed_fallback: if relaxed_fallback { Some(true) } else { None },
+            scan_fallback: if scan_fallback { Some(true) } else { None },
             note,
             low_confidence,
             suggested_tool: if low_confidence == Some(true) {
@@ -616,6 +681,12 @@ impl CodesearchService {
             if response.relaxed_fallback == Some(true) {
                 lines.push(
                     "# exact AND matched nothing — relaxed OR fallback (>=60% term coverage)"
+                        .to_string(),
+                );
+            }
+            if response.scan_fallback == Some(true) {
+                lines.push(
+                    "# BM25 token-regex matched nothing — raw chunk-content scan fallback (unranked)"
                         .to_string(),
                 );
             }

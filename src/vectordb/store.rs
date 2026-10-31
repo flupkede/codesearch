@@ -10,8 +10,9 @@ use anyhow::{anyhow, Result};
 /// format change). The open path checks this and reports mismatches so the
 /// caller can trigger a rebuild.
 const SCHEMA_VERSION: u32 = 1;
-use crate::lmdb_registry::TrackedEnv;
+use crate::lmdb_registry::{create_named_db, open_named_db, TrackedEnv};
 use arroy::distances::Cosine;
+use arroy::internals::{KeyCodec, NodeCodec};
 use arroy::{Database as ArroyDatabase, ItemId, Reader, Writer};
 use heed::byteorder::BigEndian;
 use heed::types::*;
@@ -386,8 +387,8 @@ impl ChunkMetadata {
 /// - Memory-mapped for performance
 pub struct VectorStore {
     env: TrackedEnv,
-    vectors: ArroyDatabase<Cosine>,
-    chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
+    vectors: ArroyDatabase<'static, Cosine>,
+    chunks: Database<'static, U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
     /// Persisted high-water mark of chunk ids ever handed out ("meta" DB,
     /// key [`META_KEY_ID_HWM`]). `None` only in read-only mode on a legacy
     /// store created before the mark existed.
@@ -397,7 +398,7 @@ pub struct VectorStore {
     /// next reopen hands those ids to unrelated content — `get_chunk(old_id)`
     /// then silently returns the wrong file. The mark never decreases on
     /// delete; deleted ids stay dead forever (safe `Ok(None)` misses).
-    id_hwm_db: Option<Database<Str, SerdeBincode<u32>>>,
+    id_hwm_db: Option<Database<'static, Str, SerdeBincode<u32>>>,
     next_id: u32,
     dimensions: usize,
     indexed: bool,
@@ -421,7 +422,7 @@ pub const PATH_REWRITE_BATCH: usize = 1000;
 /// generation may restart at 0, and stale references then fail as `Ok(None)`
 /// (safe miss) instead of resolving to unrelated content.
 fn next_id_from(
-    chunks: &Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
+    chunks: &Database<'static, U32<BigEndian>, SerdeBincode<ChunkMetadata>>,
     hwm: Option<u32>,
     txn: &heed::RoTxn,
 ) -> Result<u32> {
@@ -488,14 +489,13 @@ impl VectorStore {
             )?
         };
 
-        // Open or create databases
-        let mut wtxn = env.write_txn()?;
-
-        let vectors: ArroyDatabase<Cosine> = env.create_database(&mut wtxn, Some("vectors"))?;
-        let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
-            env.create_database(&mut wtxn, Some("chunks"))?;
-        let id_hwm_db: Database<Str, SerdeBincode<u32>> =
-            env.create_database(&mut wtxn, Some("meta"))?;
+        // Open or create databases — heed 0.23: each creation commits its
+        // own transaction, before the bootstrap txn below.
+        let vectors = create_named_db::<KeyCodec, NodeCodec<Cosine>>(&env, "vectors")?;
+        let chunks: Database<'static, U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
+            create_named_db(&env, "chunks")?;
+        let id_hwm_db: Database<'static, Str, SerdeBincode<u32>> = create_named_db(&env, "meta")?;
+        let wtxn = env.write_txn()?;
 
         // Get the next ID from the maximum existing key + 1 and the persisted
         // high-water mark, whichever is higher — see `next_id_from`. Using
@@ -585,21 +585,26 @@ impl VectorStore {
             )?
         };
 
-        // Open databases (read-only, no create)
-        let rtxn = env.read_txn()?;
-
-        let vectors: ArroyDatabase<Cosine> = env
-            .open_database(&rtxn, Some("vectors"))?
-            .ok_or_else(|| anyhow::anyhow!("vectors database not found"))?;
-        let chunks: Database<U32<BigEndian>, SerdeBincode<ChunkMetadata>> = env
-            .open_database(&rtxn, Some("chunks"))?
-            .ok_or_else(|| anyhow::anyhow!("chunks database not found"))?;
+        // Open databases (read-only, no create). Each `open_named_db` runs and
+        // commits its OWN read transaction — heed 0.23 requires that commit to
+        // persist the dbi handles env-globally — so the transaction used for
+        // the data reads below must start only AFTER all of them: one started
+        // earlier does not know the handles and every use fails with EINVAL
+        // (os error 22).
+        let vectors: ArroyDatabase<'static, Cosine> =
+            open_named_db::<KeyCodec, NodeCodec<Cosine>>(&env, "vectors")?
+                .ok_or_else(|| anyhow::anyhow!("vectors database not found"))?;
+        let chunks: Database<'static, U32<BigEndian>, SerdeBincode<ChunkMetadata>> =
+            open_named_db(&env, "chunks")?
+                .ok_or_else(|| anyhow::anyhow!("chunks database not found"))?;
         // The mark DB may be absent on legacy stores (created before ids were
         // made monotonic) — `None` then, and `next_id_from` falls back to the
         // live-keys derivation. Read-only never inserts, so the mark is only
         // informational here anyway.
-        let id_hwm_db: Option<Database<Str, SerdeBincode<u32>>> =
-            env.open_database(&rtxn, Some("meta"))?;
+        let id_hwm_db: Option<Database<'static, Str, SerdeBincode<u32>>> =
+            open_named_db(&env, "meta")?;
+
+        let rtxn = env.read_txn()?;
 
         // Get the next ID from the maximum existing key + 1 and the persisted
         // high-water mark, whichever is higher — see `next_id_from`.
@@ -629,7 +634,10 @@ impl VectorStore {
         // `indexed: null` / `max_chunk_id: 0` while every search against them
         // failed, even though the HNSW graph was present (`indexed` is cached
         // here, before the invalidation, so it still read `true`).
-        rtxn.commit()?;
+        // heed 0.23: `RoTxn::commit` is private — dropping aborts, which
+        // releases the reader slot the same way. The 'static handles survive:
+        // their open transaction was already committed.
+        drop(rtxn);
 
         tracing::debug!(
             "✅ Database opened read-only (next_id: {}, indexed: {})",
@@ -892,6 +900,8 @@ impl VectorStore {
                     score: 1.0 - distance, // Convert distance to similarity score
                     context_prev: metadata.context_prev,
                     context_next: metadata.context_next,
+                    origin: None,
+                    also_in: Vec::new(),
                 });
             }
         }
@@ -901,10 +911,22 @@ impl VectorStore {
 
     /// Returns real LMDB page-level stats for accurate bloat detection.
     ///
-    /// Uses `env.non_free_pages_size()` (bytes in use) vs `env.real_disk_size()`
-    /// (actual file size on disk) to compute the bloat ratio. No guessing needed.
+    /// Sums the store's own databases' page stats (bytes in use) vs
+    /// `env.real_disk_size()` (actual file size on disk) to compute the bloat
+    /// ratio. No guessing needed. (heed 0.23 removed
+    /// `Env::non_free_pages_size`; the per-database formula is unchanged.)
     pub fn lmdb_page_stats(&self) -> Result<LmdbPageStats> {
-        let used_bytes = self.env.non_free_pages_size()?;
+        let rtxn = self.env.read_txn()?;
+        let mut used_bytes = 0u64;
+        for stat in [self.vectors.stat(&rtxn)?, self.chunks.stat(&rtxn)?] {
+            used_bytes += (stat.leaf_pages + stat.branch_pages + stat.overflow_pages) as u64
+                * stat.page_size as u64;
+        }
+        if let Some(mark_db) = &self.id_hwm_db {
+            let stat = mark_db.stat(&rtxn)?;
+            used_bytes += (stat.leaf_pages + stat.branch_pages + stat.overflow_pages) as u64
+                * stat.page_size as u64;
+        }
         let disk_size = self.env.real_disk_size()?;
         Ok(LmdbPageStats {
             used_bytes,
@@ -1373,6 +1395,8 @@ impl VectorStore {
                 score: 0.0, // Will be set by caller
                 context_prev: meta.context_prev,
                 context_next: meta.context_next,
+                origin: None,
+                also_in: Vec::new(),
             }))
         } else {
             Ok(None)
@@ -1413,13 +1437,21 @@ pub struct SearchResult {
     pub context_prev: Option<String>,
     /// Lines of code immediately after this chunk (for context)
     pub context_next: Option<String>,
+    /// Origin alias this result came from in a multi-repo fan-out (`None`
+    /// on single-store paths). Mapped to `source` on the MCP result item.
+    pub origin: Option<String>,
+    /// Aliases of OTHER family members (worktrees of the same clone) whose
+    /// identical copy of this chunk (same relative path + content hash) was
+    /// collapsed into this hit.
+    pub also_in: Vec<String>,
 }
 
 /// Statistics about the vector store
 #[derive(Debug, Clone)]
 /// Real LMDB page-level statistics for accurate bloat detection.
 pub struct LmdbPageStats {
-    /// Bytes occupied by non-free (live) pages — from `env.non_free_pages_size()`.
+    /// Bytes occupied by live pages — summed per-database via `stat()`
+    /// (heed 0.23 removed `Env::non_free_pages_size`).
     pub used_bytes: u64,
     /// Actual file size on disk — from `env.real_disk_size()`.
     pub disk_size: u64,
@@ -1511,6 +1543,33 @@ mod tests {
         assert_eq!(
             store.next_id, before,
             "ids consumed by the aborted attempt must be handed back"
+        );
+    }
+
+    /// `lmdb_page_stats()` feeds doctor's bloat detection; the heed 0.23
+    /// migration replaced `Env::non_free_pages_size` with a per-database
+    /// `stat()` sum. Pin the arithmetic: an insert must occupy pages and the
+    /// live-page total must stay within the file on disk.
+    #[test]
+    fn page_stats_count_occupied_pages_after_insert() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("stats.db");
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        let empty = store.lmdb_page_stats().expect("stats on a fresh store");
+
+        store
+            .insert_chunks_with_ids(vec![drift_chunk("src/a.rs", "fn a() {}", 0)])
+            .expect("fixture insert");
+        let after = store.lmdb_page_stats().expect("stats after insert");
+
+        assert!(
+            after.used_bytes > empty.used_bytes,
+            "insert must occupy pages"
+        );
+        assert!(after.used_bytes > 0, "live pages must be counted");
+        assert!(
+            after.disk_size >= after.used_bytes,
+            "live pages cannot exceed the file on disk"
         );
     }
 

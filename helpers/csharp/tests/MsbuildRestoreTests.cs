@@ -225,6 +225,88 @@ public class MsbuildRestoreTests : IDisposable
         Assert.Equal(10, MsbuildRestore.RequiredSdkMajorFloor(mixed));
     }
 
+    // ── global.json pin: the exact SDK `dotnet build` would use ───────
+
+    [Fact]
+    public void GlobalJsonSdkVersion_ReturnsTheFullPin()
+    {
+        var solutionPath = WriteSolution(("src\\A\\A.csproj", "net10.0"));
+        var solutionDir = Path.GetDirectoryName(Path.GetFullPath(solutionPath))!;
+        WriteGlobalJson(Path.Combine(solutionDir, "global.json"), "10.0.100");
+
+        Assert.Equal("10.0.100", MsbuildRestore.GlobalJsonSdkVersion(solutionDir));
+    }
+
+    [Fact]
+    public void GlobalJsonSdkVersion_NullWhenNothingPins()
+    {
+        var solutionPath = WriteSolution(("src\\A\\A.csproj", "net10.0"));
+        var solutionDir = Path.GetDirectoryName(Path.GetFullPath(solutionPath))!;
+
+        Assert.Null(MsbuildRestore.GlobalJsonSdkVersion(solutionDir));
+    }
+
+    [Fact]
+    public void GlobalJsonSdkVersion_NearestFileWinsAndStopsTheWalk()
+    {
+        var solutionPath = WriteSolution(("src\\A\\A.csproj", "net10.0"));
+        var solutionDir = Path.GetDirectoryName(Path.GetFullPath(solutionPath))!;
+        // The nearest global.json (the project dir) pins nothing → null, like
+        // the host itself; the root's pin must NOT be reached past it.
+        WriteGlobalJson(Path.Combine(solutionDir, "src", "A", "global.json"), "{}");
+        WriteGlobalJson(Path.Combine(solutionDir, "global.json"), "9.0.300");
+
+        Assert.Null(MsbuildRestore.GlobalJsonSdkVersion(Path.Combine(solutionDir, "src", "A")));
+    }
+
+    [Fact]
+    public void ParseListSdks_ParsesVersionsAndRoots_SkipsJunk()
+    {
+        var output = string.Join("\r\n",
+            "8.0.404 [C:\\Program Files\\dotnet\\sdk]",
+            "",
+            "10.0.100 [C:\\Program Files\\dotnet\\sdk]",
+            "11.0.0-rc.1 [C:\\Program Files\\dotnet\\sdk]");
+
+        var parsed = MsbuildRestore.ParseListSdks(output);
+
+        Assert.Equal(3, parsed.Count);
+        Assert.Equal("8.0.404", parsed[0].Version);
+        Assert.Equal("C:\\Program Files\\dotnet\\sdk", parsed[0].Root);
+        Assert.Equal("11.0.0-rc.1", parsed[2].Version);
+    }
+
+    [Fact]
+    public void ChoosePinnedSdk_ExactPinBeatsHigherSameBand()
+    {
+        var installed = new List<(string Version, string Root)>
+        {
+            ("9.0.300", "r9"), ("10.0.100", "r10a"), ("10.0.200", "r10b"), ("11.0.0-rc.1", "r11"),
+        };
+
+        var pick = MsbuildRestore.ChoosePinnedSdk(installed, "10.0.100");
+
+        Assert.Equal(("10.0.100", "r10a"), pick);
+    }
+
+    [Fact]
+    public void ChoosePinnedSdk_DefaultRollForwardBand_ThenMajor_ThenNull()
+    {
+        var installed = new List<(string Version, string Root)>
+        {
+            ("9.0.300", "r9"), ("10.0.100", "r10a"), ("10.0.200", "r10b"), ("11.0.0-rc.1", "r11"),
+        };
+
+        // Default rollForward band: same major.minor, highest patch.
+        Assert.Equal(("10.0.200", "r10b"), MsbuildRestore.ChoosePinnedSdk(installed, "10.0.50"));
+        // Band absent: highest with the same major.
+        Assert.Equal(("9.0.300", "r9"), MsbuildRestore.ChoosePinnedSdk(installed, "9.0.999"));
+        // Pre-release pin compares on its numeric prefix.
+        Assert.Equal(("11.0.0-rc.1", "r11"), MsbuildRestore.ChoosePinnedSdk(installed, "11.0.100"));
+        // Major absent: nothing matches — the caller keeps discovery.
+        Assert.Null(MsbuildRestore.ChoosePinnedSdk(installed, "12.0.100"));
+    }
+
     private static void WriteGlobalJson(string path, string version)
     {
         var content = version.StartsWith('{')

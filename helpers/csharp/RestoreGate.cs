@@ -94,7 +94,7 @@ internal static class RestorePendingMarker
         // casing maps to one marker on case-insensitive filesystems.
         var normalized = Path.GetFullPath(solutionPath).ToUpperInvariant();
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(normalized));
-        return Path.Combine(MarkerDirectory, Convert.ToHexString(hash) + ".json");
+        return PathGuard.Inside(MarkerDirectory, Path.Combine(MarkerDirectory, Convert.ToHexString(hash) + ".json"));
     }
 
     public static void Write(string solutionPath, int pid, DateTime startedUtc)

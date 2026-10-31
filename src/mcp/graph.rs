@@ -678,6 +678,7 @@ impl CodesearchService {
                                     context_prev: None,
                                     context_next: None,
                                     source: None,
+                                    also_in: Vec::new(),
                                     chunk_ref: None,
                                 });
                             }
@@ -735,6 +736,7 @@ impl CodesearchService {
                                 context_prev: None,
                                 context_next: None,
                                 source: None,
+                                also_in: Vec::new(),
                                 chunk_ref: None,
                             })
                             .collect::<Vec<_>>();

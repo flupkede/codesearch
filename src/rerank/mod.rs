@@ -260,6 +260,8 @@ mod tests {
             context: None,
             docstring: None,
             hash: String::new(),
+            origin: None,
+            also_in: Vec::new(),
         }
     }
 

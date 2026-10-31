@@ -124,12 +124,35 @@ jobs:
           cp -r helpers-publish/* staging/helpers/csharp/
           tar czf ${{ matrix.artifact_csharp }} -C staging .
 
+      # SHA256 sidecar per artifact — install.ps1/install.sh verify it before
+      # installing; missing file degrades to a loud skip in the installer.
+      - name: Checksums (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          foreach ($a in @('${{ matrix.artifact }}', '${{ matrix.artifact_csharp }}')) {
+            $h = (Get-FileHash -Algorithm SHA256 $a).Hash.ToLower()
+            "{0}  {1}" -f $h, $a | Out-File -NoNewline -Encoding ascii "$a.sha256"
+          }
+
+      - name: Checksums (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sha256sum '${{ matrix.artifact }}' > '${{ matrix.artifact }}.sha256'
+          sha256sum '${{ matrix.artifact_csharp }}' > '${{ matrix.artifact_csharp }}.sha256'
+
       - name: Upload kale artifact
         # pin@v4
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+
+      - name: Upload kale checksum
+        # pin@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ matrix.artifact }}.sha256
+          path: ${{ matrix.artifact }}.sha256
 
       - name: Upload with-csharp artifact
         # pin@v4
@@ -138,9 +161,28 @@ jobs:
           name: ${{ matrix.artifact_csharp }}
           path: ${{ matrix.artifact_csharp }}
 
+      - name: Upload with-csharp checksum
+        # pin@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ matrix.artifact_csharp }}.sha256
+          path: ${{ matrix.artifact_csharp }}.sha256
+
   build-macos:
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.include_macos)
     runs-on: macos-latest
+    env:
+      # macos-latest is a floating image: after runner-image drift its SDK (26.x)
+      # compiles ort_sys's CoreML objects with a newer minos than rustc's default
+      # aarch64 deployment target (11.0), and ld refuses the link ("built for
+      # newer macOS version than being linked"). Pin one target for rustc, cc
+      # and dotnet alike.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      # ort (version < the April-2025 fix) statically links CoreML, whose objects
+      # call ___isPlatformVersionAtLeast from clang's compiler-rt — newer Xcode
+      # no longer adds libclang_rt to mixed rustc/cc links automatically.
+      # https://ort.pyke.io/setup/linking — rustc flag from the ort docs.
+      RUSTFLAGS: -Clink-arg=-fapple-link-rtlib
     steps:
       # pin@v4
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -230,12 +272,24 @@ jobs:
           cp -r helpers-publish/* staging/helpers/csharp/
           tar czf codesearch-macos-arm64-with-csharp.tar.gz -C staging .
 
+      - name: Checksums (macOS)
+        run: |
+          shasum -a 256 codesearch-macos-arm64.tar.gz > codesearch-macos-arm64.tar.gz.sha256
+          shasum -a 256 codesearch-macos-arm64-with-csharp.tar.gz > codesearch-macos-arm64-with-csharp.tar.gz.sha256
+
       - name: Upload kale artifact
         # pin@v4
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: codesearch-macos-arm64.tar.gz
           path: codesearch-macos-arm64.tar.gz
+
+      - name: Upload kale checksum
+        # pin@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: codesearch-macos-arm64.tar.gz.sha256
+          path: codesearch-macos-arm64.tar.gz.sha256
 
       - name: Upload with-csharp artifact
         # pin@v4
@@ -244,13 +298,36 @@ jobs:
           name: codesearch-macos-arm64-with-csharp.tar.gz
           path: codesearch-macos-arm64-with-csharp.tar.gz
 
+      - name: Upload with-csharp checksum
+        # pin@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: codesearch-macos-arm64-with-csharp.tar.gz.sha256
+          path: codesearch-macos-arm64-with-csharp.tar.gz.sha256
+
   release:
-    needs: [build]
-    if: always() && needs.build.result == 'success'
+    needs: [build, build-macos]
+    # always()+skipped so a dispatch without include_macos still publishes
+    # (build-macos skipped); with macOS enabled it must have SUCCEEDED — a
+    # needs on build alone raced it: the release job once ran while macOS was
+    # still uploading, publishing only 11 of 12 artifacts (missing sidecar).
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # The installer scripts ship as release assets, so the install one-liners
+      # keep working for every tag (raw.githubusercontent at the tag would break
+      # for tags older than the scripts' introduction).
+      - name: Check out install scripts
+        # pin@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
       - name: Download all artifacts
         # pin@v4
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
@@ -258,10 +335,33 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Stage install scripts
+        run: cp install.ps1 install.sh artifacts/
+
       - name: Create or update Release
         # pin@v2
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
         with:
           files: artifacts/*
           generate_release_notes: true
+          append_body: true
+          body: |
+            ## Install
+
+            **Windows (PowerShell):**
+            ```
+            irm https://github.com/flupkede/codesearch/releases/download/${{ inputs.version || github.ref_name }}/install.ps1 -OutFile install.ps1
+            .\install.ps1
+            ```
+
+            **Linux / macOS (bash):**
+            ```
+            curl -fsSLO https://github.com/flupkede/codesearch/releases/download/${{ inputs.version || github.ref_name }}/install.sh
+            bash install.sh
+            ```
+
+            First install asks for the install path; an existing installation is
+            detected, its serve stopped, and the binaries updated in place. The
+            scripts verify the SHA256 sidecar before installing. `--no-csharp` /
+            `-NoCSharp` installs the small package without the bundled scip-csharp helper.
           tag_name: ${{ inputs.version || github.ref_name }}

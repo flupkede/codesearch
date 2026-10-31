@@ -52,6 +52,11 @@ use crossterm::event::{KeyCode, KeyEvent};
 #[derive(Debug, Clone)]
 pub struct RepoRow {
     pub alias: String,
+    /// Display-only alias override: when set, the table renders this instead
+    /// of `alias` (peer mounts show the bare repo name under their hostname
+    /// header, while `alias` stays the full `peer/repo` query name used by
+    /// actions and the info lookup). `None` everywhere else.
+    pub display_name: Option<String>,
     /// Human-readable status: "open", "warm", "readonly", "idle" (wire "idle"/"closed":
     /// index on disk, repo unloaded — resting, not indexing), "indexing", "error", "no_index"
     pub status: String,
@@ -85,6 +90,22 @@ pub struct RepoRow {
     /// "Xh ago". Always `false` for local repos (which carry live serve state)
     /// and for the standalone remote dashboard.
     pub activity_stale: bool,
+    /// Worktree-family annotation rendered in the dim Worktree column:
+    /// `"+ N worktrees"` on a family's main-tree row. Worktree rows carry
+    /// `None` — their relationship renders as the `| `-indented tree shape
+    /// under the main (see `indent`). Display-only — actions and
+    /// identity use `alias`. `None` on remote rows and familyless repos.
+    pub family_note: Option<String>,
+    /// True when this row renders with the `| ` group indent: a worktree
+    /// grouped under its family's main, or a peer mount grouped under its
+    /// peer prefix (first mount of a peer is the unindented anchor row).
+    /// Display-only.
+    pub indent: bool,
+    /// True when this row is a synthetic group header (a peer-mount header
+    /// row): it names the group but owns none of the stat columns, so the
+    /// table renders its changes/calls/last-call/lock cells EMPTY instead of
+    /// the borrowed `-`/`0`/`—` placeholders.
+    pub group_header: bool,
 }
 
 /// Actions returned by key handling.
@@ -102,6 +123,9 @@ pub enum KeyAction {
     ForceReindex(usize),
     /// User pressed `r` — request removal of repo at given index (shows confirmation).
     RequestRemove(usize),
+    /// User pressed space — toggle collapse/expand of the group (worktree
+    /// family or peer-mount group) the row at given index belongs to.
+    ToggleCollapse(usize),
 }
 
 /// Modal overlay shown on top of the normal TUI content.
@@ -195,7 +219,12 @@ pub fn is_quit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('q'))
 }
 
-pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize) -> KeyAction {
+pub fn handle_key(
+    key: KeyEvent,
+    table_state: &mut TableState,
+    row_count: usize,
+    page_size: usize,
+) -> KeyAction {
     if row_count == 0 {
         return KeyAction::None;
     }
@@ -212,6 +241,16 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
             if i < row_count - 1 {
                 table_state.select(Some(i + 1));
             }
+            KeyAction::None
+        }
+        KeyCode::PageUp => {
+            let i = table_state.selected().unwrap_or(0);
+            table_state.select(Some(page_target(i, page_size, row_count, false)));
+            KeyAction::None
+        }
+        KeyCode::PageDown => {
+            let i = table_state.selected().unwrap_or(0);
+            table_state.select(Some(page_target(i, page_size, row_count, true)));
             KeyAction::None
         }
         KeyCode::Home => {
@@ -239,7 +278,22 @@ pub fn handle_key(key: KeyEvent, table_state: &mut TableState, row_count: usize)
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::RequestRemove(idx)
         }
+        KeyCode::Char(' ') => {
+            let idx = table_state.selected().unwrap_or(0);
+            KeyAction::ToggleCollapse(idx)
+        }
         _ => KeyAction::None,
+    }
+}
+
+/// Selection after a page move: `current` shifted by one page, clamped to
+/// the row range. A page at or above the row count degenerates to Home/End.
+fn page_target(current: usize, page_size: usize, row_count: usize, down: bool) -> usize {
+    let step = page_size.max(1);
+    if down {
+        (current + step).min(row_count - 1)
+    } else {
+        current.saturating_sub(step)
     }
 }
 
@@ -504,20 +558,68 @@ pub fn ts_indicator(status: &str) -> Option<(&'static str, Style)> {
     }
 }
 
+/// The Worktree column's text: the note as-is, ellipsis-truncated at `cap`
+/// display columns, empty when the row has no note.
+fn note_cell_text(note: Option<&str>, cap: usize) -> String {
+    match note {
+        Some(n) if n.len() > cap => {
+            let cut: String = n.chars().take(cap - 1).collect();
+            format!("{cut}…")
+        }
+        Some(n) => n.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Middle-ellipsis: when `s` exceeds `cap` display columns, keep its head and
+/// tail and put "..." in the middle — a clipped-from-the-right alias hides the
+/// distinguishing suffix (deploy tags, worktree names), a middle cut keeps
+/// both ends recognizable. Char-count based, same convention as the rest of
+/// the table budgets.
+fn middle_ellipsis_text(s: &str, cap: usize) -> String {
+    let count = s.chars().count();
+    if count <= cap {
+        return s.to_string();
+    }
+    if cap < 5 {
+        // Too narrow for a sensible "..." cut; hard-truncate.
+        return s.chars().take(cap).collect();
+    }
+    let keep = cap - 3;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let head_text: String = s.chars().take(head).collect();
+    let tail_text: String = s.chars().skip(count - tail).collect();
+    format!("{head_text}...{tail_text}")
+}
+
+/// Table chrome above the data rows: the header row plus its
+/// `bottom_margin(1)`. Page stepping subtracts it from the body height.
+pub const TABLE_HEADER_ROWS: u16 = 2;
+
 pub fn render_table(
     f: &mut ratatui::Frame,
     area: Rect,
     repos: &[RepoRow],
     table_state: &mut TableState,
 ) {
-    let header_cells = [
-        "Alias",
-        "Status",
-        "Changes",
-        "Calls",
-        "Last Tool Call",
-        "Lock",
-    ];
+    // Family notes get their own dim column, capped so one very long main
+    // alias cannot re-create the overflow; hidden entirely when no row has
+    // a note (no worktrees registered).
+    const NOTE_COL_CAP: usize = 30;
+    let max_note_w = repos
+        .iter()
+        .filter_map(|r| r.family_note.as_deref().map(str::len))
+        .max()
+        .unwrap_or(0)
+        .min(NOTE_COL_CAP);
+    let show_notes = max_note_w > 0;
+
+    let mut header_cells = vec!["Alias"];
+    if show_notes {
+        header_cells.push("Worktree");
+    }
+    header_cells.extend(["Status", "Changes", "Calls", "Last Tool Call", "Lock"]);
     let header = Row::new(
         header_cells
             .iter()
@@ -531,47 +633,72 @@ pub fn render_table(
         .map(|r| {
             // Each indicator is a suffix like " C#·"; ⚠ (the partial glyph)
             // is double-width (unicode-width EAW=W) so its variant budgets
-            // 6 display cols instead of 4.
+            // 6 display cols instead of 4. The family note renders in its
+            // own column so a long "worktree of …" note can no longer blow
+            // the alias budget past the terminal width (which made ratatui
+            // clip every column from the left). Worktree rows budget the
+            // `| ` tree indent too.
             let extra = indicator_cols(&r.csharp_index) + indicator_cols(&r.typescript_index);
-            r.alias.len() + extra
+            r.alias.len() + if r.indent { 2 } else { 0 } + extra
         })
         .max()
         .unwrap_or(10)
         .max(10);
 
+    // On a narrow terminal the fixed columns after the alias can overflow the
+    // width and ratatui hard-clips cell content from the right — the exact
+    // decay the worktree-column fix chased. Cap the alias column to what the
+    // terminal can afford (status keeps its Min(24) floor) and middle-ellipsis
+    // the aliases that no longer fit, instead of letting ratatui clip them.
+    // Ratatui inserts one space between columns (default column_spacing);
+    // the alias cap must budget those gaps too, or the constraint total
+    // exceeds the width and the solver squeezes the alias column anyway
+    // (clipping the ellipsised tail from the right).
+    let gaps_after_alias: usize = if show_notes { 6 } else { 5 };
+    let fixed_after_alias: usize = if show_notes { max_note_w + 2 } else { 0 }
+        + 14 // status
+        + 7 // changes
+        + 7 // calls
+        + 7 // lock
+        + gaps_after_alias;
+    let alias_avail = (area.width as usize)
+        .saturating_sub(fixed_after_alias)
+        .saturating_sub(24) // the Min(24) tool column floor
+        .max(14); // never squeeze the alias column below a usable floor
+    let alias_content_cap = alias_avail.saturating_sub(2); // cell padding
+
+    let note_cell = |note: Option<&str>| -> Cell<'static> {
+        Cell::from(note_cell_text(note, NOTE_COL_CAP)).style(Style::default().fg(Color::DarkGray))
+    };
+
     let rows: Vec<Row> = repos
         .iter()
         .map(|repo| {
             let status_cell = status_cell(&repo.status, &repo.csharp_index);
-            let changes_str = if repo.changes > 99999 {
-                " 99k+".to_string()
+            let [changes_text, calls_text, last_text, lock_text] = stat_cell_texts(repo);
+            let changes_cell = Cell::from(changes_text).style(Style::default().fg(Color::White));
+            let calls_cell = Cell::from(calls_text).style(if repo.tool_call_count > 0 {
+                Style::default().fg(Color::Cyan)
             } else {
-                format!("{:>5}", repo.changes)
-            };
-            let changes_cell = Cell::from(changes_str).style(Style::default().fg(Color::White));
-            let calls_cell = if repo.tool_call_count > 0 {
-                Cell::from(format!("{:>5}", repo.tool_call_count))
-                    .style(Style::default().fg(Color::Cyan))
-            } else {
-                Cell::from("    -".to_string()).style(Style::default().fg(Color::DarkGray))
-            };
+                Style::default().fg(Color::DarkGray)
+            });
             // Federated peers are polled on the slow idle-suspend cadence (no
             // longer every 30s) so they can scale to zero; between refreshes the
             // cached activity is stale and rendered as `-` rather than a
             // misleading "Xh ago". Local repos are always live
             // (`activity_stale == false`).
-            let tool_cell = if repo.activity_stale {
-                Cell::from("-".to_string()).style(Style::default().fg(Color::DarkGray))
-            } else {
-                Cell::from(repo.last_tool_call.as_deref().unwrap_or("—").to_string())
-                    .style(Style::default().fg(Color::DarkGray))
-            };
-            let lock_cell = lock_cell(&repo.lock_mode);
+            let tool_cell = Cell::from(last_text).style(Style::default().fg(Color::DarkGray));
+            let lock_cell = Cell::from(lock_text).style(match repo.lock_mode.as_str() {
+                "write" => Style::default().fg(Color::Cyan),
+                "read" => Style::default().fg(Color::White),
+                _ => Style::default().fg(Color::Gray),
+            });
 
             // Alias text stays NEUTRAL — color lives only on the language
             // indicators: yellow ⚠ for a degraded (warnings) index, fully red
             // ! for a general error. A table with red aliases reads as half
             // the fleet being down, which a warnings-degraded index is not.
+            // Worktree rows indent as a tree under their family's main.
             let base_alias_style = if repo.is_remote {
                 Style::default()
                     .fg(Color::Cyan)
@@ -579,8 +706,14 @@ pub fn render_table(
             } else {
                 Style::default().fg(Color::White)
             };
-            let mut alias_spans: Vec<Span> =
-                vec![Span::styled(repo.alias.clone(), base_alias_style)];
+            let prefix = if repo.indent { "| " } else { "" };
+            let extra = indicator_cols(&repo.csharp_index) + indicator_cols(&repo.typescript_index);
+            let text_cap = alias_content_cap
+                .saturating_sub(prefix.len() + extra)
+                .max(4);
+            let shown_alias = repo.display_name.as_deref().unwrap_or(&repo.alias);
+            let alias_display = format!("{prefix}{}", middle_ellipsis_text(shown_alias, text_cap));
+            let mut alias_spans: Vec<Span> = vec![Span::styled(alias_display, base_alias_style)];
 
             if let Some((glyph, style)) =
                 csharp_indicator(repo.csharp_index.as_str(), pulse_bright())
@@ -593,40 +726,42 @@ pub fn render_table(
 
             let alias_cell = Cell::from(Text::from(Line::from(alias_spans)));
 
-            Row::new(vec![
-                alias_cell,
-                status_cell,
-                changes_cell,
-                calls_cell,
-                tool_cell,
-                lock_cell,
-            ])
+            let mut cells = vec![alias_cell];
+            if show_notes {
+                cells.push(note_cell(repo.family_note.as_deref()));
+            }
+            cells.extend([status_cell, changes_cell, calls_cell, tool_cell, lock_cell]);
+
+            Row::new(cells)
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(max_alias_w as u16 + 2),
-            Constraint::Length(14),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Min(24),
-            Constraint::Length(7),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .borders(Borders::NONE)
-            .style(Style::default().bg(Color::Reset)),
-    )
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::Rgb(30, 30, 50))
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("▶ ");
+    let mut constraints = vec![Constraint::Length(
+        (max_alias_w as u16 + 2).min(alias_avail as u16),
+    )];
+    if show_notes {
+        constraints.push(Constraint::Length(max_note_w as u16 + 2));
+    }
+    constraints.extend([
+        Constraint::Length(14),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Min(24),
+        Constraint::Length(7),
+    ]);
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::NONE)
+                .style(Style::default().bg(Color::Reset)),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(30, 30, 50))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
 
     f.render_stateful_widget(table, area, table_state);
 }
@@ -898,6 +1033,7 @@ pub fn render_footer(
         spans.extend(hint("rei", "n", "dex  ", local_only));
         spans.extend(hint("", "r", "emove  ", local_only));
         spans.extend(hint("re", "l", "oad  ", true));
+        spans.extend(hint("", "␣", " collapse  ", true));
         spans.extend(hint("", "q", "uit  ", true));
         spans.push(Span::styled(
             "↑↓",
@@ -1539,12 +1675,36 @@ fn status_cell_spec(status: &str, csharp: &str) -> (String, Style) {
     }
 }
 
-fn lock_cell(lock_mode: &str) -> Cell<'static> {
-    match lock_mode {
-        "write" => Cell::from("write".to_string()).style(Style::default().fg(Color::Cyan)),
-        "read" => Cell::from("read".to_string()).style(Style::default().fg(Color::White)),
-        _ => Cell::from("—".to_string()).style(Style::default().fg(Color::Gray)),
+/// The four stat-column texts (changes, calls, last tool call, lock) for one
+/// row, styled by the caller. A group-header row names the group but owns no
+/// stats — every text comes back empty so the header renders blank cells
+/// instead of the first mount's borrowed `0`/`-`/`—` placeholders.
+pub(crate) fn stat_cell_texts(repo: &RepoRow) -> [String; 4] {
+    if repo.group_header {
+        return [const { String::new() }; 4];
     }
+    [
+        if repo.changes > 99999 {
+            " 99k+".to_string()
+        } else {
+            format!("{:>5}", repo.changes)
+        },
+        if repo.tool_call_count > 0 {
+            format!("{:>5}", repo.tool_call_count)
+        } else {
+            "    -".to_string()
+        },
+        if repo.activity_stale {
+            "-".to_string()
+        } else {
+            repo.last_tool_call.as_deref().unwrap_or("—").to_string()
+        },
+        match repo.lock_mode.as_str() {
+            "write" => "write".to_string(),
+            "read" => "read".to_string(),
+            _ => "—".to_string(),
+        },
+    ]
 }
 
 /// Derive status label and color for the detail panel.
@@ -1635,6 +1795,30 @@ pub fn restore_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_cell_text_truncates_at_cap_and_empties_without_note() {
+        assert_eq!(note_cell_text(None, 30), "");
+        assert_eq!(note_cell_text(Some("+ 2 worktrees"), 30), "+ 2 worktrees");
+        let long = "worktree of wt-209169-deploy-20261023";
+        let got = note_cell_text(Some(long), 30);
+        assert_eq!(got.chars().count(), 30, "capped to the column width");
+        assert!(got.ends_with('…'));
+        assert!(long.starts_with(got.trim_end_matches('…')));
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_head_and_tail() {
+        assert_eq!(middle_ellipsis_text("short", 10), "short");
+        let long = "storefront-209169-deploy-2";
+        let got = middle_ellipsis_text(long, 15);
+        assert_eq!(got.chars().count(), 15, "capped to the column width");
+        assert!(got.contains("..."), "ellipsis sits in the middle");
+        assert!(long.starts_with(got.split("...").next().unwrap()));
+        assert!(long.ends_with(got.rsplit("...").next().unwrap()));
+        // Too narrow for a sensible cut: hard-truncate.
+        assert_eq!(middle_ellipsis_text("abcdef", 3), "abc");
+    }
 
     #[test]
     fn status_cell_renders_idle_and_legacy_closed_as_idle() {
@@ -1735,5 +1919,71 @@ mod tests {
             detail_status_style("future_state", ""),
             ("future_state".to_string(), Color::White)
         );
+    }
+
+    #[test]
+    fn handle_key_space_maps_to_toggle_collapse_of_the_selection() {
+        use crossterm::event::KeyModifiers;
+        let key = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty());
+        let mut ts = TableState::default();
+        ts.select(Some(3));
+        assert!(matches!(
+            handle_key(key, &mut ts, 10, 5),
+            KeyAction::ToggleCollapse(3)
+        ));
+        // Empty table: no selection to toggle.
+        let mut ts = TableState::default();
+        assert!(matches!(handle_key(key, &mut ts, 0, 5), KeyAction::None));
+    }
+
+    #[test]
+    fn page_target_moves_by_page_and_clamps_to_the_row_range() {
+        assert_eq!(page_target(5, 3, 10, true), 8);
+        assert_eq!(page_target(5, 3, 10, false), 2);
+        // Clamp at both ends.
+        assert_eq!(page_target(9, 3, 10, true), 9);
+        assert_eq!(page_target(0, 3, 10, false), 0);
+        // Page at or above the row count degenerates to Home/End.
+        assert_eq!(page_target(5, 10, 10, true), 9);
+        assert_eq!(page_target(5, 10, 10, false), 0);
+        // Zero page size floors at one row, never stalls.
+        assert_eq!(page_target(5, 0, 10, true), 6);
+        assert_eq!(page_target(5, 0, 10, false), 4);
+    }
+
+    #[test]
+    fn handle_key_page_up_down_move_the_selection_by_page() {
+        use crossterm::event::KeyModifiers;
+        let mut ts = TableState::default();
+        ts.select(Some(7));
+        handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            5,
+        );
+        assert_eq!(ts.selected(), Some(2));
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            5,
+        );
+        assert_eq!(ts.selected(), Some(7));
+        // Oversized page behaves as Home/End.
+        handle_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            50,
+        );
+        assert_eq!(ts.selected(), Some(19));
+        handle_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &mut ts,
+            20,
+            50,
+        );
+        assert_eq!(ts.selected(), Some(0));
     }
 }

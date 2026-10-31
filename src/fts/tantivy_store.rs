@@ -735,9 +735,10 @@ impl FtsStore {
 
     /// Search using a regex pattern against tokenized content.
     ///
-    /// NOTE: Tantivy regex runs on analyzed tokens, not raw file text.
-    /// This helper is test-only and used to document/tokenizer behavior.
-    #[cfg(test)]
+    /// NOTE: Tantivy regex runs on analyzed tokens, not raw file text —
+    /// punctuation never reaches the token index, so patterns spanning
+    /// separators (`\s+`, quotes, `:`) match nothing. Callers should fall
+    /// back to a raw chunk-content scan when this returns empty.
     pub fn search_regex(&self, pattern: &str, limit: usize) -> Result<Vec<FtsResult>> {
         use tantivy::query::RegexQuery;
 

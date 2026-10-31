@@ -29,6 +29,9 @@ internal static class MsbuildRestore
     /// <summary>vswhere probe bound — generous for a local EXE, still bounded.</summary>
     private const int VsWhereWaitMs = 10_000;
 
+    /// <summary><c>dotnet --list-sdks</c> probe bound — same class of local metadata probe.</summary>
+    private const int SdkListWaitMs = 10_000;
+
     /// <summary>
     /// True when a <c>dotnet restore</c> failed on SDK resolution — the
     /// CLI-visible SDK set cannot target the repo's TFM (NETSDK1045) or
@@ -196,6 +199,7 @@ internal static class MsbuildRestore
         string[] lines;
         try
         {
+            solutionPath = PathGuard.Validate(solutionPath);
             lines = File.ReadAllLines(solutionPath);
         }
         catch
@@ -233,6 +237,7 @@ internal static class MsbuildRestore
     {
         try
         {
+            path = PathGuard.Validate(path);
             return File.Exists(path) ? File.ReadAllText(path) : null;
         }
         catch
@@ -301,5 +306,137 @@ internal static class MsbuildRestore
             }
             dir = parent;
         }
+    }
+
+    /// <summary>
+    /// The exact SDK version string pinned by the nearest global.json walking
+    /// up from the solution dir (the host's own lookup order), or null when
+    /// the nearest global.json pins nothing. <c>dotnet build</c> resolves
+    /// exactly this version from the muxer; MSBuildLocator only ever reports
+    /// the muxer's DEFAULT SDK, so on a machine whose default is newer than
+    /// the pin (VS2026 RC ships the .NET 11 RC) evaluating with it diverges
+    /// from every plain build and surfaces as evaluation failures no build
+    /// shows.
+    /// </summary>
+    internal static string? GlobalJsonSdkVersion(string solutionDir)
+    {
+        var dir = Path.GetFullPath(solutionDir);
+        while (true)
+        {
+            var globalJson = Path.Combine(dir, "global.json");
+            if (File.Exists(globalJson))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    ReadTextBestEffort(globalJson) ?? "", @"""version""\s*:\s*""(\d[^""]*)""");
+                return match.Success ? match.Groups[1].Value : null;
+            }
+            var parent = Directory.GetParent(dir)?.FullName;
+            if (string.IsNullOrEmpty(parent) || string.Equals(parent, dir, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+            dir = parent;
+        }
+    }
+
+    /// <summary>
+    /// <c>dotnet --list-sdks</c>, bounded like the vswhere probe: a local
+    /// metadata probe whose death costs one fallback, never the restore.
+    /// Null on any failure — callers keep their discovery path.
+    /// </summary>
+    internal static string? ListInstalledSdks()
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "dotnet",
+                Arguments = "--list-sdks",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var process = System.Diagnostics.Process.Start(psi);
+            if (process is null)
+            {
+                return null;
+            }
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            _ = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(SdkListWaitMs))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Already exiting — nothing to bound anymore.
+                }
+                return null;
+            }
+            return stdoutTask.GetAwaiter().GetResult();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>One <c>dotnet --list-sdks</c> entry: SDK version and its root dir.</summary>
+    internal static IReadOnlyList<(string Version, string Root)> ParseListSdks(string output)
+    {
+        var result = new List<(string, string)>();
+        foreach (var raw in output.Split('\n'))
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(
+                raw.TrimEnd('\r'), @"^\s*(\d+(?:\.\d+)*(?:-[\w.]+)?)\s+\[(.+)\]\s*$");
+            if (match.Success)
+            {
+                result.Add((match.Groups[1].Value, match.Groups[2].Value.Trim()));
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Which installed SDK the muxer would resolve for a global.json pin:
+    /// exact version first, then the highest with the same major.minor (the
+    /// default rollForward band), then the highest with the same major —
+    /// null when even the major is absent, leaving the caller on its
+    /// discovery path. Pre-release labels ("11.0.0-rc.1") compare on their
+    /// numeric prefix.
+    /// </summary>
+    internal static (string Version, string Root)? ChoosePinnedSdk(
+        IReadOnlyList<(string Version, string Root)> installed, string pinned)
+    {
+        static Version? Loose(string v) =>
+            Version.TryParse(v.Split('-')[0], out var p) ? p : null;
+        var pin = Loose(pinned);
+        if (pin is null)
+        {
+            return null;
+        }
+        var entries = installed
+            .Select(e => (Entry: e, V: Loose(e.Version)))
+            .Where(e => e.V is not null)
+            .OrderByDescending(e => e.V)
+            .ToList();
+        (string, string)? best = null;
+        var bestTier = int.MaxValue;
+        foreach (var e in entries)
+        {
+            var v = e.V!;
+            var tier =
+                v == pin ? 1 :
+                v.Major == pin.Major && v.Minor == pin.Minor ? 2 :
+                v.Major == pin.Major ? 3 : int.MaxValue;
+            if (tier < bestTier)
+            {
+                best = e.Entry;
+                bestTier = tier;
+            }
+        }
+        return best;
     }
 }

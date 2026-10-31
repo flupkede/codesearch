@@ -79,6 +79,9 @@ pub struct ReposConfig {
     pub repos: HashMap<String, PathBuf>,
     #[serde(default)]
     pub groups: HashMap<String, Vec<String>>,
+    /// Per-group behavior overrides. Absent entry = all defaults.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub groups_meta: HashMap<String, GroupMeta>,
     #[serde(default)]
     pub repos_meta: HashMap<String, RepoMeta>,
     /// Per-repo read-only flag. Aliases mapped to `true` are opened **read-only**
@@ -125,6 +128,37 @@ pub struct RepoMeta {
     /// Used to re-locate a repo whose folder was renamed/moved (best-effort).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_remote: Option<String>,
+    /// Git identity: canonical path of the repo's shared common dir
+    /// (`git rev-parse --git-common-dir`), captured at registration time.
+    /// Worktrees of one clone share this dir, so two registered repos with
+    /// the same value are family members (main tree + linked worktrees).
+    /// Persisted so a later deletion of the main tree keeps the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<String>,
+}
+
+/// Per-group behavior overrides (`groups_meta` in repos.json). An absent
+/// entry means every field takes its default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupMeta {
+    /// Expand group resolution with every registered repo sharing a member's
+    /// git identity (linked worktrees of the same clone). Default: true —
+    /// set `false` (`codesearch groups add --no-worktrees`) to keep a group
+    /// pointing at exactly the aliases it was created with.
+    #[serde(default = "default_true")]
+    pub expand_worktrees: bool,
+}
+
+impl Default for GroupMeta {
+    fn default() -> Self {
+        Self {
+            expand_worktrees: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +308,20 @@ impl ReposConfig {
         for group in empty_groups {
             tracing::warn!("repos.json: dropping now-empty group '{}'", group);
             self.groups.remove(&group);
+        }
+
+        // 3b. Same for orphan group overrides: a `groups_meta` entry whose
+        //     group no longer exists would survive every round-trip and
+        //     silently re-apply its opt-outs if the group name is reused.
+        let orphan_groups_meta: Vec<String> = self
+            .groups_meta
+            .keys()
+            .filter(|group| !self.groups.contains_key(*group))
+            .cloned()
+            .collect();
+        for group in orphan_groups_meta {
+            tracing::warn!("repos.json: dropping orphan group override for '{}'", group);
+            self.groups_meta.remove(&group);
         }
 
         // 4. Prune mounted remote projects whose peer is unknown or whose name
@@ -429,6 +477,12 @@ impl ReposConfig {
         if let Some(remote) = git_remote_url(&canonical) {
             self.repos_meta.entry(alias.clone()).or_default().git_remote = Some(remote);
         }
+        if let Some(common) = git_common_dir_for(&canonical) {
+            self.repos_meta
+                .entry(alias.clone())
+                .or_default()
+                .git_common_dir = Some(common);
+        }
         self.repos.insert(alias.clone(), canonical);
         alias
     }
@@ -463,6 +517,12 @@ impl ReposConfig {
                 .entry(final_alias.clone())
                 .or_default()
                 .git_remote = Some(remote);
+        }
+        if let Some(common) = git_common_dir_for(&canonical) {
+            self.repos_meta
+                .entry(final_alias.clone())
+                .or_default()
+                .git_common_dir = Some(common);
         }
         self.repos.insert(final_alias.clone(), canonical);
         Ok(final_alias)
@@ -577,6 +637,62 @@ impl ReposConfig {
             .collect()
     }
 
+    /// Per-group opt-out switch for worktree expansion. Absent
+    /// `groups_meta` entry = expansion on (the default).
+    pub fn group_expands_worktrees(&self, group: &str) -> bool {
+        self.groups_meta
+            .get(group)
+            .map(|g| g.expand_worktrees)
+            .unwrap_or(true)
+    }
+
+    /// Expand a group's member list with every registered repo sharing a
+    /// member's git identity (linked worktrees of the same clone).
+    ///
+    /// The original members keep their order (de-duplicated); discovered
+    /// extras are appended sorted, so fan-out order stays deterministic.
+    /// `@peer` refs and unknown aliases pass through untouched — identity is
+    /// a local-repo concept. Uses only the recorded `repos_meta` identities:
+    /// no git spawn, so a deleted main tree still expands from its persisted
+    /// identity. Opt out per group via `groups_meta[group].expand_worktrees`.
+    pub fn expand_group_members(&self, group: &str, members: &[String]) -> Vec<String> {
+        if !self.group_expands_worktrees(group) {
+            return members.to_vec();
+        }
+        let mut out: Vec<String> = Vec::with_capacity(members.len());
+        for m in members {
+            if !out.contains(m) {
+                out.push(m.clone());
+            }
+        }
+        // Identity index for registered locals.
+        let identity_of: std::collections::HashMap<&str, &str> = self
+            .repos_meta
+            .iter()
+            .filter_map(|(alias, meta)| {
+                meta.git_common_dir
+                    .as_deref()
+                    .map(|id| (alias.as_str(), id))
+            })
+            .collect();
+        let member_identities: std::collections::HashSet<&str> = out
+            .iter()
+            .filter_map(|m| identity_of.get(m.as_str()).copied())
+            .collect();
+        let mut extras: Vec<&str> = identity_of
+            .iter()
+            .filter(|(alias, id)| {
+                member_identities.contains(**id) && !out.iter().any(|m| m.as_str() == **alias)
+            })
+            .map(|(alias, _)| *alias)
+            .collect();
+        extras.sort_unstable();
+        for extra in extras {
+            out.push(extra.to_string());
+        }
+        out
+    }
+
     /// Federation-aware group resolution.
     ///
     /// Like [`resolve_group`](Self::resolve_group) but also expands `"@<peer>"`
@@ -605,9 +721,13 @@ impl ReposConfig {
         let Some(members) = self.groups.get(group) else {
             return Vec::new();
         };
+        // Worktree expansion: every registered repo sharing a member's git
+        // identity joins the fan-out (default on, per-group opt-out). The
+        // virtual "all" group early-returned above and never expands.
+        let members = self.expand_group_members(group, members);
 
         let mut out = Vec::new();
-        for member in members {
+        for member in &members {
             if let Some(peer_name) = member.strip_prefix(REMOTE_REF_PREFIX) {
                 match self.remotes.get(peer_name) {
                     Some(peer) => out.push(Target::Remote {
@@ -938,6 +1058,83 @@ impl ReposConfig {
         self.groups.remove(name).is_some()
     }
 
+    /// Map each worktree alias to its family's main-tree alias: among all
+    /// registered aliases sharing one git identity (common dir), the main
+    /// tree is the SHORTEST registered path (a worktree lives under the main
+    /// tree), ties broken by the lexicographically smallest alias. Only
+    /// worktree aliases appear as keys — main-tree aliases map to themselves
+    /// and are omitted. Annotation-only: consumers (status, the scope error,
+    /// dashboard/CLI rendering) use it to label provenance; resolution never
+    /// depends on it.
+    pub fn worktree_family_map(&self) -> std::collections::HashMap<String, String> {
+        use std::collections::HashMap;
+
+        // identity -> (shortest-path fallback so far). Shortest path is the
+        // fallback for families whose main tree is not (or no longer)
+        // registered, so a worktree parked at a shorter path cannot steal
+        // the main label.
+        let mut shortest: HashMap<&str, (usize, &str)> = HashMap::new();
+        for (alias, path) in &self.repos {
+            let Some(identity) = self
+                .repos_meta
+                .get(alias)
+                .and_then(|m| m.git_common_dir.as_deref())
+            else {
+                continue;
+            };
+            let path_len = path.as_os_str().len();
+            match shortest.get_mut(identity) {
+                Some((best_len, best_alias)) => {
+                    let better = path_len < *best_len
+                        || (path_len == *best_len && alias.as_str() < *best_alias);
+                    if better {
+                        *best_len = path_len;
+                        *best_alias = alias.as_str();
+                    }
+                }
+                None => {
+                    shortest.insert(identity, (path_len, alias.as_str()));
+                }
+            }
+        }
+        // Exact main election: a member whose `<repo>/.git` IS the recorded
+        // common dir is the main tree — a worktree's common dir lives under
+        // the main's path, never its own. Aliases without a recorded
+        // identity take part too: a main tree registered before identity
+        // capture existed has None, but its .git path still equals the
+        // family identity.
+        let identities: Vec<&str> = shortest.keys().copied().collect();
+        let mut exact: HashMap<&str, &str> = HashMap::new();
+        for (alias, path) in &self.repos {
+            let norm_git = normalize_path_for_compare(&path.join(".git"));
+            for identity in &identities {
+                if normalize_path_for_compare(Path::new(identity)) == norm_git {
+                    exact.entry(*identity).or_insert(alias.as_str());
+                }
+            }
+        }
+        let mut out: HashMap<String, String> = HashMap::new();
+        for alias in self.repos.keys() {
+            let Some(identity) = self
+                .repos_meta
+                .get(alias)
+                .and_then(|m| m.git_common_dir.as_deref())
+            else {
+                continue;
+            };
+            let main = exact
+                .get(identity)
+                .copied()
+                .or_else(|| shortest.get(identity).map(|(_, a)| *a));
+            if let Some(main) = main {
+                if main != alias.as_str() {
+                    out.insert(alias.clone(), main.to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// Register (or overwrite) a remote federation peer under `name`.
     ///
     /// The peer becomes referenceable from a group as `"@<name>"`. Adding a
@@ -1146,6 +1343,28 @@ impl ReposConfig {
     }
 }
 
+/// Display-only family-note vocabulary shared by the TUI repo table and the
+/// CLI `groups list`: a worktree alias annotates as `<main>` (the tree
+/// grouping in the TUI carries the relationship; the bare alias in
+/// parentheses reads cleaner than a "worktree of" prefix), a
+/// family's main alias as `+ N` (the TUI's Worktree column header already
+/// carries the word), anything else gets no note. The counting scope is the
+/// caller's choice — the CLI counts within a group, the TUI across the whole
+/// fleet — which is why `counts` is a parameter.
+pub fn family_note(
+    family_map: &std::collections::HashMap<String, String>,
+    counts: &std::collections::HashMap<String, usize>,
+    alias: &str,
+) -> Option<String> {
+    if let Some(main) = family_map.get(alias) {
+        return Some(main.clone());
+    }
+    match counts.get(alias) {
+        Some(&n) if n > 0 => Some(format!("+ {n}")),
+        _ => None,
+    }
+}
+
 pub fn config_dir() -> Result<PathBuf> {
     crate::constants::codesearch_home()
 }
@@ -1270,6 +1489,104 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     }
 }
 
+/// Best-effort lookup of a directory's git identity: the canonical path of the
+/// repository's shared common dir (`git rev-parse --git-common-dir`).
+///
+/// Worktrees of one clone share this dir, so two registered repos with the
+/// same value are family members (main tree + linked worktrees). Returns
+/// `None` when the path is not a git repo. The spawn retry pattern mirrors
+/// `git_remote_url`; when the git binary cannot be spawned at all, a
+/// filesystem-only fallback resolves the common dir from the `.git` entry
+/// (file → `gitdir:` → `commondir` climb), so a worktree registered on a
+/// machine without git still records its identity.
+pub(crate) fn git_common_dir_for(path: &Path) -> Option<String> {
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut output = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--git-common-dir"])
+            .output()
+        {
+            Ok(o) => {
+                output = Some(o);
+                break;
+            }
+            // git binary genuinely absent — the fs fallback is all we have.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return git_common_dir_fs_fallback(path)
+            }
+            // Transient spawn failure (fork exhaustion). Back off and retry.
+            Err(_) => {
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+
+    let output = output?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if dir.is_empty() {
+        return None;
+    }
+    // git may print the common dir relative to the `-C` directory (".git",
+    // "../.git"); join before canonicalizing so both forms land on the same
+    // absolute identity string.
+    let joined = PathBuf::from(&dir);
+    let resolved = if joined.is_absolute() {
+        joined
+    } else {
+        path.join(joined)
+    };
+    Some(identity_string(&resolved))
+}
+
+/// Filesystem-only resolution of the git common dir, used when `git` cannot
+/// be spawned (binary absent). Mirrors `resolve_hooks_dir_manual` in
+/// src/cli/mod.rs: a worktree's `.git` is a FILE pointing at its per-worktree
+/// gitdir, which holds a `commondir` file pointing at the shared dir; a main
+/// tree's `.git` is the shared dir itself.
+fn git_common_dir_fs_fallback(path: &Path) -> Option<String> {
+    let dot_git = path.join(".git");
+    let git_dir = if dot_git.is_file() {
+        let content = std::fs::read_to_string(&dot_git).ok()?;
+        let first_line = content.lines().next()?.trim();
+        let rel = first_line.strip_prefix("gitdir: ")?.trim();
+        let resolved = path.join(rel);
+        match std::fs::read_to_string(resolved.join("commondir")) {
+            Ok(cd) => {
+                let common = resolved.join(cd.trim());
+                if common.exists() {
+                    common
+                } else {
+                    resolved
+                }
+            }
+            Err(_) => resolved,
+        }
+    } else if dot_git.is_dir() {
+        dot_git
+    } else {
+        return None;
+    };
+    Some(identity_string(&git_dir))
+}
+
+/// Canonical identity string for a path: `safe_canonicalize` (strips `\\?\`,
+/// translates MSYS forms) with the `normalize_user_path` fallback for paths
+/// that do not exist yet — the same convention `register()` uses for repo
+/// paths, so identity strings and repo paths compare equal byte-for-byte.
+fn identity_string(path: &Path) -> String {
+    let canonical = safe_canonicalize(path).unwrap_or_else(|_| normalize_user_path(path));
+    canonical.to_string_lossy().to_string()
+}
+
 /// Configured relocation scan depth (`CODESEARCH_RELOCATE_MAX_DEPTH`, default 3).
 fn relocate_max_depth() -> usize {
     std::env::var(crate::constants::RELOCATE_MAX_DEPTH_ENV)
@@ -1317,6 +1634,65 @@ fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<
                 scan_for_remote(&child, target_remote, depth - 1, out);
             }
         }
+    }
+}
+
+/// Shared git-spawning test helpers, used by this module's tests and by
+/// serve/tests.rs (backfill needs real repos with a shared worktree identity).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    /// Process-wide lock serializing the git-spawning / directory-renaming
+    /// tests: on Windows the OS indexer / antivirus holds `.git` handles
+    /// while scanning freshly-created trees, and concurrent git subprocesses
+    /// transiently fail under that load.
+    static GIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the serialization lock, recovering from a poisoned mutex (a
+    /// panic in one test must not cascade-fail the rest).
+    pub(crate) fn git_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+        GIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Initialise a git repo at `dir` with one commit, so `git worktree add`
+    /// has a HEAD to branch from. Same transient-spawn retry posture as the
+    /// relocation tests' `init_git_remote`.
+    pub(crate) fn init_git_repo_with_commit(dir: &Path) {
+        let run = |args: &[&str]| {
+            const MAX_ATTEMPTS: u64 = 8;
+            for attempt in 0..MAX_ATTEMPTS {
+                match std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                {
+                    Ok(o) => {
+                        assert!(
+                            o.status.success(),
+                            "git {args:?} failed: {}",
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                        return o;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        panic!("git not available in test env: {e}");
+                    }
+                    Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                        std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                    }
+                    Err(e) => panic!("git spawn failed after retries: {e}"),
+                }
+            }
+            unreachable!("loop returns or panics")
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "test\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
     }
 }
 

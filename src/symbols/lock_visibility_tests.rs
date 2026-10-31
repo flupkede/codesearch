@@ -26,12 +26,8 @@ fn readers_do_not_block_while_a_write_txn_holds_the_write_lock() {
     }
     let env = unsafe { opts.open(&dir) }.expect("open env");
 
-    let db: Database<Str, Str> = {
-        let mut wtxn = env.write_txn().expect("setup wtxn");
-        let db = env.create_database(&mut wtxn, Some("t")).expect("db");
-        wtxn.commit().expect("setup commit");
-        db
-    };
+    let db: Database<'static, Str, Str> =
+        crate::lmdb_registry::create_named_db::<Str, Str>(&env, "t").expect("db");
 
     // Hold the write lock with an UNCOMMITTED write.
     let mut wtxn = env.write_txn().expect("wtxn");
@@ -71,12 +67,8 @@ fn concurrent_reader_and_writer_do_not_deadlock() {
     }
     let env = unsafe { opts.open(&dir) }.expect("open env");
 
-    let db: Database<Str, Str> = {
-        let mut wtxn = env.write_txn().expect("setup wtxn");
-        let db = env.create_database(&mut wtxn, Some("t")).expect("db");
-        wtxn.commit().expect("setup commit");
-        db
-    };
+    let db: Database<'static, Str, Str> =
+        crate::lmdb_registry::create_named_db::<Str, Str>(&env, "t").expect("db");
 
     // Writer and reader interleaved on two threads — the steady state of a
     // serve with an active indexer and a busy find_impact.

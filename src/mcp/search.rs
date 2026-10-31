@@ -170,6 +170,7 @@ impl CodesearchService {
 
         // === Multi-store group fan-out ===
         if ctx.is_multi {
+            let families = self.family_map_for(ctx.store_aliases.as_ref().unwrap());
             return self
                 .semantic_search_multi(
                     &request,
@@ -179,6 +180,7 @@ impl CodesearchService {
                     ctx.stores_vec.unwrap(),
                     ctx.store_aliases.as_ref().unwrap(),
                     &ctx.alias_roots,
+                    &families,
                 )
                 .await;
         }
@@ -497,6 +499,8 @@ impl CodesearchService {
                                 score: fts.score,
                                 context_prev: chunk.context_prev,
                                 context_next: chunk.context_next,
+                                origin: None,
+                                also_in: Vec::new(),
                             }))
                         },
                         ctx.stores.clone(),
@@ -548,6 +552,7 @@ impl CodesearchService {
         stores: Vec<Arc<SharedStores>>,
         aliases: &[String],
         alias_roots: &std::collections::HashMap<String, String>,
+        families: &std::collections::HashMap<String, String>,
     ) -> Result<CallToolResult, McpError> {
         let mode = request.mode.as_deref().unwrap_or("auto");
         let structural_intent = detect_structural_intent(&request.query);
@@ -599,28 +604,33 @@ impl CodesearchService {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            let mut results = self
+            // Family collapse streams the (globally score-sorted) hits: exact
+            // duplicates inside one worktree family keep only their best
+            // copy, backfilling from deeper ranks so the limit stays filled.
+            let kept = self
                 .resolve_fts_to_search_results_multi(
                     &all_fts,
+                    families,
                     limit,
                     &stores,
                     aliases,
-                    alias_roots,
                     &mut lexical_warnings,
                 )
                 .await;
 
+            // Prefix AFTER collapse: the collapse key is the raw store path
+            // (identical across family members), the rendered path is not.
+            let mut results: Vec<crate::vectordb::SearchResult> = kept
+                .into_iter()
+                .map(|(alias, mut r)| {
+                    let root = alias_roots.get(&alias).map(String::as_str).unwrap_or("");
+                    r.path = prefix_path_with_alias(&r.path, Some(&alias), root);
+                    r
+                })
+                .collect();
+
             if let Some(target_kind) = structural_intent {
                 boost_kind(&mut results, target_kind);
-                return self.build_semantic_response(
-                    results,
-                    request,
-                    compact,
-                    !identifiers.is_empty(),
-                    None,
-                    alias_roots,
-                    &lexical_warnings,
-                );
             }
 
             return self.build_semantic_response(
@@ -843,22 +853,10 @@ impl CodesearchService {
         if mode == "semantic" {
             // Vector-only fan-out: no second backend to fuse with, so the RRF
             // pass would be an identity function. Iterate the origin-tagged
-            // hits directly, prefixing each path from its own tag — the old
-            // `vector_only` + id-keyed map folded different repos' chunks
-            // onto one entry whenever their local ids collided.
-            let mut results: Vec<crate::vectordb::SearchResult> = Vec::new();
-            for hit in vector_results.iter().take(limit) {
-                let mut r = hit.result.clone();
-                r.path = prefix_path_with_alias(
-                    &r.path,
-                    Some(&hit.alias),
-                    alias_roots
-                        .get(&hit.alias)
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                );
-                results.push(r);
-            }
+            // hits directly — the old `vector_only` + id-keyed map folded
+            // different repos' chunks onto one entry whenever their local ids
+            // collided.
+            let results = collapse_semantic_hits(&vector_results, families, limit, alias_roots);
             return self.build_semantic_response(
                 results,
                 request,
@@ -994,37 +992,59 @@ impl CodesearchService {
             .map(|hit| (interned[&(hit.alias.clone(), hit.result.id)], hit))
             .collect();
 
-        let mut mapped: Vec<crate::vectordb::SearchResult> = Vec::new();
-        for f in fused.into_iter().take(limit) {
+        let mut kept: Vec<(String, crate::vectordb::SearchResult)> = Vec::new();
+        let mut seen: std::collections::HashMap<(String, String, String), usize> =
+            std::collections::HashMap::new();
+        // No take(limit) up front: family duplicates must not consume result
+        // slots — streaming through the fused list backfills from deeper
+        // ranks until the limit is actually filled.
+        for f in fused {
             let Some((alias, real_id)) = origins.get(f.chunk_id as usize).cloned() else {
                 continue;
             };
-            let root = alias_roots.get(&alias).map(String::as_str).unwrap_or("");
-            if let Some(hit) = by_synth.get(&f.chunk_id) {
+            let r = if let Some(hit) = by_synth.get(&f.chunk_id) {
                 let mut r = hit.result.clone();
                 r.id = real_id;
                 r.score = f.rrf_score;
-                r.path = prefix_path_with_alias(&r.path, Some(&alias), root);
-                mapped.push(r);
+                r.origin = Some(alias.clone());
+                r
             } else {
                 // Chunk from FTS but not in vector results — resolve from its
-                // origin store only.
-                if let Some(resolved) = self
+                // origin store only (raw path; the alias prefix is applied
+                // after the collapse below).
+                match self
                     .resolve_chunk_in_origin(
                         &alias,
                         real_id,
                         f.rrf_score,
                         &stores,
                         aliases,
-                        alias_roots,
                         &mut search_warnings,
                     )
                     .await
                 {
-                    mapped.push(resolved);
+                    Some(mut resolved) => {
+                        resolved.origin = Some(alias.clone());
+                        resolved
+                    }
+                    None => continue,
                 }
+            };
+            if !collapse_family_push(&mut kept, &mut seen, families, limit, alias, r) {
+                break;
             }
         }
+
+        // Prefix AFTER collapse: the collapse key is the raw store path
+        // (identical across family members), the rendered path is not.
+        let mut mapped: Vec<crate::vectordb::SearchResult> = kept
+            .into_iter()
+            .map(|(alias, mut r)| {
+                let root = alias_roots.get(&alias).map(String::as_str).unwrap_or("");
+                r.path = prefix_path_with_alias(&r.path, Some(&alias), root);
+                r
+            })
+            .collect();
 
         // Apply kind boost
         if let Some(target_kind) = structural_intent {
@@ -1042,12 +1062,33 @@ impl CodesearchService {
         )
     }
 
+    /// Alias → git identity for the routed aliases that HAVE a recorded
+    /// identity (registered before the field existed or not a git repo → no
+    /// entry → no family dedup for that alias). Empty when no serve state.
+    fn family_map_for(&self, aliases: &[String]) -> std::collections::HashMap<String, String> {
+        let Some(serve_state) = self.serve_state.as_ref() else {
+            return std::collections::HashMap::new();
+        };
+        let cfg = serve_state.config_snapshot();
+        aliases
+            .iter()
+            .filter_map(|alias| {
+                cfg.repos_meta
+                    .get(alias)
+                    .and_then(|m| m.git_common_dir.clone())
+                    .map(|identity| (alias.clone(), identity))
+            })
+            .collect()
+    }
+
     /// Resolve a fused FTS-only hit to full metadata, in its ORIGIN store.
     ///
     /// The old name ("from_stores") probed every store for the bare chunk id
     /// and kept the first answer — on a group, ids are per-repo counters, so
     /// that answered from the wrong repo and content/path attribution went to
     /// whoever was probed first, not to the repo whose FTS actually matched.
+    /// The path stays RAW (store-relative): the hybrid loop applies the alias
+    /// prefix only after the family collapse, whose key compares raw paths.
     #[allow(clippy::too_many_arguments)]
     async fn resolve_chunk_in_origin(
         &self,
@@ -1056,7 +1097,6 @@ impl CodesearchService {
         score: f32,
         stores: &[Arc<SharedStores>],
         aliases: &[String],
-        alias_roots: &std::collections::HashMap<String, String>,
         warnings: &mut Vec<String>,
     ) -> Option<crate::vectordb::SearchResult> {
         let idx = aliases.iter().position(|a| a == alias)?;
@@ -1068,12 +1108,11 @@ impl CodesearchService {
                 return None;
             }
         };
-        let root = alias_roots.get(alias).map(String::as_str).unwrap_or("");
         match store.get_chunk(chunk_id) {
             Ok(Some(chunk)) => Some(crate::vectordb::SearchResult {
                 id: chunk_id,
                 content: chunk.content,
-                path: prefix_path_with_alias(&chunk.path, Some(alias), root),
+                path: chunk.path,
                 start_line: chunk.start_line,
                 end_line: chunk.end_line,
                 kind: chunk.kind,
@@ -1085,6 +1124,8 @@ impl CodesearchService {
                 score,
                 context_prev: chunk.context_prev,
                 context_next: chunk.context_next,
+                origin: None,
+                also_in: Vec::new(),
             }),
             Ok(None) => None,
             Err(ref e) => {
@@ -1095,18 +1136,29 @@ impl CodesearchService {
     }
 
     /// Resolve origin-tagged FTS results to SearchResult, each in its own
-    /// repo's store, with the alias prefix applied from the tag.
+    /// repo's store, collapsing exact family duplicates while streaming.
+    ///
+    /// Input must be globally score-sorted desc (the lexical branch sorts);
+    /// resolution stops once `limit` entries are kept, so duplicates in the
+    /// top ranks backfill from deeper ones instead of shrinking the result.
+    /// Paths stay RAW (store-relative) — the caller prefixes after the
+    /// collapse, whose key compares raw paths. Returns (alias, result) pairs.
     async fn resolve_fts_to_search_results_multi(
         &self,
         fts_results: &[SourcedResult<crate::fts::FtsResult>],
+        families: &std::collections::HashMap<String, String>,
         limit: usize,
         stores: &[Arc<SharedStores>],
         aliases: &[String],
-        alias_roots: &std::collections::HashMap<String, String>,
         warnings: &mut Vec<String>,
-    ) -> Vec<crate::vectordb::SearchResult> {
-        let mut results = Vec::new();
-        for fts in fts_results.iter().take(limit) {
+    ) -> Vec<(String, crate::vectordb::SearchResult)> {
+        let mut kept: Vec<(String, crate::vectordb::SearchResult)> = Vec::new();
+        let mut seen: std::collections::HashMap<(String, String, String), usize> =
+            std::collections::HashMap::new();
+        for fts in fts_results.iter() {
+            if kept.len() >= limit {
+                break;
+            }
             // `Ok(None)` means "the ORIGIN store no longer holds this chunk"
             // and is skipped; `Err` means the store is broken — collapsing
             // the two is how a dead vector store renders as an empty literal
@@ -1128,14 +1180,11 @@ impl CodesearchService {
                 note_store_failure(warnings, aliases, idx, "chunk lookup", e);
             }
             if let Ok(Some(chunk)) = looked_up {
-                let root = alias_roots
-                    .get(&fts.alias)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                results.push(crate::vectordb::SearchResult {
+                let alias = fts.alias.clone();
+                let r = crate::vectordb::SearchResult {
                     id: fts.result.chunk_id,
                     content: chunk.content,
-                    path: prefix_path_with_alias(&chunk.path, Some(&fts.alias), root),
+                    path: chunk.path,
                     start_line: chunk.start_line,
                     end_line: chunk.end_line,
                     kind: chunk.kind,
@@ -1147,10 +1196,15 @@ impl CodesearchService {
                     score: fts.result.score,
                     context_prev: chunk.context_prev,
                     context_next: chunk.context_next,
-                });
+                    origin: Some(alias.clone()),
+                    also_in: Vec::new(),
+                };
+                if !collapse_family_push(&mut kept, &mut seen, families, limit, alias, r) {
+                    break;
+                }
             }
         }
-        results
+        kept
     }
 
     /// Lexical-only search: FTS without embedding service.
@@ -1330,7 +1384,8 @@ impl CodesearchService {
                 content: if compact { None } else { Some(r.content) },
                 context_prev: if compact { None } else { r.context_prev },
                 context_next: if compact { None } else { r.context_next },
-                source: None,
+                source: r.origin,
+                also_in: r.also_in,
                 chunk_ref: None,
             })
             .collect();
@@ -1403,6 +1458,8 @@ impl CodesearchService {
                                 score: fts.score,
                                 context_prev: chunk.context_prev,
                                 context_next: chunk.context_next,
+                                origin: None,
+                                also_in: Vec::new(),
                             });
                         }
                     }
@@ -1422,5 +1479,260 @@ impl CodesearchService {
                 Vec::new()
             }
         }
+    }
+}
+
+/// Streaming family-duplicate collapse (card #261): within one worktree
+/// family, chunks that are byte-identical — same relative path + content
+/// hash — keep only their best-ranked copy; later copies are recorded in the
+/// keeper's `also_in` instead of consuming result slots. Input must arrive
+/// in global score-desc order (all three multi pools sort before this); the
+/// first copy seen is therefore the best. Aliases absent from `families`
+/// never dedup. Returns false once `kept` holds `limit` entries — the caller
+/// stops scanning, which is exactly the backfill semantics: duplicates high
+/// in the ranking pull deeper ranks into the result instead of shrinking it.
+fn collapse_family_push(
+    kept: &mut Vec<(String, crate::vectordb::SearchResult)>,
+    seen: &mut std::collections::HashMap<(String, String, String), usize>,
+    families: &std::collections::HashMap<String, String>,
+    limit: usize,
+    alias: String,
+    r: crate::vectordb::SearchResult,
+) -> bool {
+    if kept.len() >= limit && families.get(&alias).is_none() {
+        // Full limit blocks only slot-consuming hits; a family duplicate
+        // never consumes one, so it must still be recorded below.
+        return false;
+    }
+    let Some(family) = families.get(&alias) else {
+        kept.push((alias, r));
+        return true;
+    };
+    let key = (family.clone(), r.path.clone(), r.hash.clone());
+    if let Some(&idx) = seen.get(&key) {
+        kept[idx].1.also_in.push(alias);
+        return true;
+    }
+    if kept.len() >= limit {
+        return false;
+    }
+    seen.insert(key, kept.len());
+    kept.push((alias, r));
+    true
+}
+
+/// Semantic-only multi-repo mapping: origin-tag each hit, collapse family
+/// duplicates while streaming (input is globally score-sorted — the vector
+/// fan-out sorts), then apply the alias prefix AFTER the collapse so the key
+/// compares raw store paths. Extracted pure so the wiring is unit-testable
+/// without an embedding service.
+fn collapse_semantic_hits(
+    vector_results: &[SourcedResult<crate::vectordb::SearchResult>],
+    families: &std::collections::HashMap<String, String>,
+    limit: usize,
+    alias_roots: &std::collections::HashMap<String, String>,
+) -> Vec<crate::vectordb::SearchResult> {
+    let mut kept: Vec<(String, crate::vectordb::SearchResult)> = Vec::new();
+    let mut seen: std::collections::HashMap<(String, String, String), usize> =
+        std::collections::HashMap::new();
+    for hit in vector_results.iter() {
+        let mut r = hit.result.clone();
+        r.origin = Some(hit.alias.clone());
+        if !collapse_family_push(&mut kept, &mut seen, families, limit, hit.alias.clone(), r) {
+            break;
+        }
+    }
+    kept.into_iter()
+        .map(|(alias, mut r)| {
+            let root = alias_roots.get(&alias).map(String::as_str).unwrap_or("");
+            r.path = prefix_path_with_alias(&r.path, Some(&alias), root);
+            r
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod family_collapse_tests {
+    use super::collapse_family_push;
+    use crate::vectordb::SearchResult;
+    use std::collections::HashMap;
+
+    fn hit(path: &str, hash: &str, score: f32) -> SearchResult {
+        SearchResult {
+            id: 0,
+            content: String::new(),
+            path: path.to_string(),
+            start_line: 0,
+            end_line: 1,
+            kind: "Function".to_string(),
+            signature: None,
+            docstring: None,
+            context: None,
+            hash: hash.to_string(),
+            distance: 0.0,
+            score,
+            context_prev: None,
+            context_next: None,
+            origin: None,
+            also_in: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn without_family_identity_every_hit_is_kept() {
+        let mut kept: Vec<(String, SearchResult)> = Vec::new();
+        let mut seen = HashMap::new();
+        let families: HashMap<String, String> = HashMap::new();
+        for alias in ["a", "b", "c"] {
+            assert!(collapse_family_push(
+                &mut kept,
+                &mut seen,
+                &families,
+                10,
+                alias.to_string(),
+                hit("src/lib.rs", "h", 1.0),
+            ));
+        }
+        assert_eq!(kept.len(), 3);
+        assert!(kept.iter().all(|(_, r)| r.also_in.is_empty()));
+    }
+
+    #[test]
+    fn duplicate_records_alternate_and_keeps_slot() {
+        let mut kept: Vec<(String, SearchResult)> = Vec::new();
+        let mut seen = HashMap::new();
+        let mut families = HashMap::new();
+        // Every family member carries identity in production (family_map_for
+        // only maps aliases with one), so main is in the map too.
+        families.insert("main".to_string(), "fam".to_string());
+        families.insert("wt".to_string(), "fam".to_string());
+        assert!(collapse_family_push(
+            &mut kept,
+            &mut seen,
+            &families,
+            2,
+            "main".to_string(),
+            hit("src/lib.rs", "h", 0.9),
+        ));
+        // Same family + path + hash: the duplicate collapses into the kept
+        // hit's also_in and must NOT consume the second slot.
+        assert!(collapse_family_push(
+            &mut kept,
+            &mut seen,
+            &families,
+            2,
+            "wt".to_string(),
+            hit("src/lib.rs", "h", 0.4),
+        ));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "main");
+        assert_eq!(kept[0].1.also_in, vec!["wt"]);
+    }
+
+    #[test]
+    fn backfill_fills_vacated_slot() {
+        let mut kept: Vec<(String, SearchResult)> = Vec::new();
+        let mut seen = HashMap::new();
+        let mut families = HashMap::new();
+        families.insert("main".to_string(), "fam".to_string());
+        families.insert("wt".to_string(), "fam".to_string());
+        collapse_family_push(
+            &mut kept,
+            &mut seen,
+            &families,
+            2,
+            "main".to_string(),
+            hit("src/lib.rs", "h", 0.9),
+        );
+        collapse_family_push(
+            &mut kept,
+            &mut seen,
+            &families,
+            2,
+            "wt".to_string(),
+            hit("src/lib.rs", "h", 0.4),
+        );
+        // The duplicate vacated a slot; the next-ranked different repo fills it.
+        assert!(collapse_family_push(
+            &mut kept,
+            &mut seen,
+            &families,
+            2,
+            "other".to_string(),
+            hit("src/other.rs", "h2", 0.3),
+        ));
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].0, "other");
+    }
+
+    #[test]
+    fn full_limit_returns_false() {
+        let mut kept: Vec<(String, SearchResult)> = Vec::new();
+        let mut seen = HashMap::new();
+        let families: HashMap<String, String> = HashMap::new();
+        assert!(collapse_family_push(
+            &mut kept,
+            &mut seen,
+            &families,
+            1,
+            "a".to_string(),
+            hit("x.rs", "h", 1.0),
+        ));
+        // kept.len() >= limit: the stream must stop (caller breaks).
+        assert!(!collapse_family_push(
+            &mut kept,
+            &mut seen,
+            &families,
+            1,
+            "b".to_string(),
+            hit("y.rs", "h", 0.5),
+        ));
+        assert_eq!(kept.len(), 1);
+    }
+
+    // === collapse_semantic_hits (the mode="semantic" branch wiring) ===
+
+    use super::collapse_semantic_hits;
+    use crate::mcp::helpers::SourcedResult;
+
+    #[test]
+    fn semantic_hits_collapse_and_prefix_after() {
+        let mut families = HashMap::new();
+        families.insert("main".to_string(), "fam".to_string());
+        families.insert("wt".to_string(), "fam".to_string());
+        let hits = vec![
+            SourcedResult::new("main".to_string(), hit("src/lib.rs", "h", 0.9)),
+            SourcedResult::new("wt".to_string(), hit("src/lib.rs", "h", 0.4)),
+            SourcedResult::new("other".to_string(), hit("src/other.rs", "h2", 0.8)),
+        ];
+        let mut alias_roots = HashMap::new();
+        for alias in ["main", "wt", "other"] {
+            alias_roots.insert(alias.to_string(), "root".to_string());
+        }
+        let results = collapse_semantic_hits(&hits, &families, 5, &alias_roots);
+        assert_eq!(results.len(), 2, "duplicate collapsed");
+        assert_eq!(results[0].path, "main/src/lib.rs", "prefix applied after");
+        assert_eq!(results[0].origin.as_deref(), Some("main"));
+        assert_eq!(results[0].also_in, vec!["wt"]);
+        assert_eq!(results[1].path, "other/src/other.rs");
+        assert_eq!(results[1].origin.as_deref(), Some("other"));
+        assert!(results[1].also_in.is_empty());
+    }
+
+    #[test]
+    fn semantic_hits_backfill_and_stop_at_limit() {
+        let mut families = HashMap::new();
+        for alias in ["main", "wt1", "wt2"] {
+            families.insert(alias.to_string(), "fam".to_string());
+        }
+        let hits = vec![
+            SourcedResult::new("main".to_string(), hit("src/lib.rs", "h", 0.9)),
+            SourcedResult::new("wt1".to_string(), hit("src/lib.rs", "h", 0.4)),
+            SourcedResult::new("wt2".to_string(), hit("src/lib.rs", "h", 0.3)),
+        ];
+        let alias_roots: HashMap<String, String> = HashMap::new();
+        let results = collapse_semantic_hits(&hits, &families, 1, &alias_roots);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].also_in, vec!["wt1", "wt2"]);
     }
 }

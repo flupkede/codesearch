@@ -14,6 +14,8 @@ use crate::rerank::{rrf_fusion, vector_only, FusedResult, NeuralReranker, DEFAUL
 use crate::vectordb::VectorStore;
 use crate::{info_print, warn_print};
 
+pub(crate) mod literal;
+
 /// Configuration options for search operations
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
@@ -45,6 +47,15 @@ pub struct SearchOptions {
     pub rerank_top: Option<usize>,
     /// Automatically create index if it doesn't exist
     pub create_index: bool,
+    /// Literal FTS-only mode (`--literal`): Tantivy primitives directly — no
+    /// embeddings, no RRF fusion, no model load.
+    pub literal: bool,
+    /// Phrase search over the analyzed tokens (implies literal)
+    pub phrase: bool,
+    /// Regex over the analyzed tokens (implies literal). NOTE: matches
+    /// ANALYZED TOKENS, never raw text — punctuation does not exist in the
+    /// token index.
+    pub regex: bool,
 }
 
 impl Default for SearchOptions {
@@ -64,6 +75,9 @@ impl Default for SearchOptions {
             rerank: false,
             rerank_top: None,
             create_index: false,
+            literal: false,
+            phrase: false,
+            regex: false,
         }
     }
 }
@@ -75,6 +89,11 @@ struct JsonOutput {
     results: Vec<JsonResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timing: Option<JsonTiming>,
+    /// Present only when the literal path fell back to a raw chunk-content
+    /// scan (token-regex matched nothing in the token index) — results are
+    /// unranked in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_fallback: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -503,6 +522,12 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     if options.sync {
         info_print!("{}", "🔄 Syncing database...".yellow());
         sync_database(&db_path, model_type)?;
+    }
+
+    // Literal mode (--literal/--phrase/--regex): run the Tantivy primitives
+    // directly — no embeddings, no fusion, no model load.
+    if options.literal {
+        return literal::run(query, &db_path, &project_path, dimensions, &options);
     }
 
     // Load database
@@ -982,6 +1007,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
             query: query.to_string(),
             results: json_results,
             timing,
+            scan_fallback: None,
         };
 
         println!("{}", serde_json::to_string(&output)?);

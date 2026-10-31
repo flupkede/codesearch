@@ -23,6 +23,7 @@ fn local_item(chunk_id: u32, score: f32) -> SearchResultItem {
         context_next: None,
         source: None,
         chunk_ref: None,
+        also_in: Vec::new(),
     }
 }
 

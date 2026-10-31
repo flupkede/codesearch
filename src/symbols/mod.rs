@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::lmdb_registry::create_named_db;
+
 // ── Helper rendering ──────────────────────────────────────────────
 
 /// Platform-stable rendering of a helper process's exit status.
@@ -353,7 +355,11 @@ pub enum RebuildScope {
 /// (`LMDB double-open prevented`, surfaced as a red `C#!` in the TUI).
 /// Routing every open through this getter hands all concurrent users the SAME
 /// environment: writers serialise on LMDB's single-writer mutex, readers never
-/// block, and the double-open error class cannot occur.
+/// block, and the double-open error class cannot occur. The env lives for the
+/// process lifetime (strong cache in `lmdb_registry`) — reusing it across
+/// queries avoids per-operation open/close churn, which on Windows leaks two
+/// kernel mutex handles per `mdb_env_open`; deletion paths release it via
+/// `lmdb_registry::close_shared_envs_under`.
 pub(crate) fn get_shared_scip_env(
     db_path: &Path,
 ) -> Result<std::sync::Arc<crate::lmdb_registry::TrackedEnv>> {
@@ -378,33 +384,32 @@ pub(crate) fn get_shared_scip_env(
         |env| {
             // Pre-create every named database (both languages') exactly once
             // per env session: LMDB requires named DBs to exist before they
-            // can be opened in read txns.
-            let mut wtxn = env.write_txn()?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_SYMBOLS_DB_NAME),
+            // can be opened in read txns. heed 0.23: each creation commits
+            // its own transaction.
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_SYMBOLS_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Str>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_META_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Str>(
+                env,
+                crate::constants::SCIP_META_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_POSITION_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_POSITION_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_SIMPLE_NAMES_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_SIMPLE_NAMES_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_REF_CACHE_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_REF_CACHE_DB_NAME,
             )?;
-            env.create_database::<heed::types::Str, heed::types::Bytes>(
-                &mut wtxn,
-                Some(crate::constants::SCIP_REF_WARNINGS_DB_NAME),
+            create_named_db::<heed::types::Str, heed::types::Bytes>(
+                env,
+                crate::constants::SCIP_REF_WARNINGS_DB_NAME,
             )?;
-            wtxn.commit()?;
             Ok(())
         },
     )

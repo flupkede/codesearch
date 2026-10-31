@@ -1,7 +1,7 @@
 use super::batch::EmbeddedChunk;
 use crate::chunker::Chunk;
 use crate::constants::{max_lmdb_map_size_mb, DEFAULT_EMBEDDING_CACHE_LMDB_MAP_SIZE_MB};
-use crate::lmdb_registry::TrackedEnv;
+use crate::lmdb_registry::{create_named_db, TrackedEnv};
 use crate::vectordb::merge_metadata_atomic;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -286,7 +286,7 @@ impl QueryCacheStats {
 /// automatic memory management. The persistent cache provides long-term storage.
 pub struct PersistentEmbeddingCache {
     env: TrackedEnv,
-    db: Database<Str, SerdeBincode<Vec<f32>>>,
+    db: Database<'static, Str, SerdeBincode<Vec<f32>>>,
     cache_dir: PathBuf,
     /// Model name — used as the key into [`LIVE_CACHE_STATS`] and needed in
     /// [`Drop`] to unregister the entry.
@@ -423,9 +423,7 @@ impl PersistentEmbeddingCache {
             )?
         };
 
-        let mut wtxn = env.write_txn()?;
-        let db = env.create_database(&mut wtxn, Some("embeddings"))?;
-        wtxn.commit()?;
+        let db = create_named_db::<Str, SerdeBincode<Vec<f32>>>(&env, "embeddings")?;
 
         let cache = Self {
             env,

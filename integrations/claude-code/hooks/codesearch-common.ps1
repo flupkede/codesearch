@@ -16,6 +16,25 @@ function Get-CodesearchReposConfigFile {
     return (Join-Path $HOME '.codesearch/repos.json')
 }
 
+# True when a shell command line invokes grep/egrep/fgrep/zgrep/rg — the Bash
+# tool escape hatch around the Grep-tool guard. Same contract as
+# codesearch-common.sh's command_grep_family: quoted spans are stripped first
+# ("echo 'grep is slow'" is not an invocation), separators split, and tokens
+# compare whole after lowercasing, .exe and path-prefix removal ("progress"
+# and "rgx" never match; /usr/bin/grep does).
+function Test-GrepFamilyCommand {
+    param([string]$Cmd)
+    if ([string]::IsNullOrWhiteSpace($Cmd)) { return $false }
+    $stripped = [regex]::Replace($Cmd, '"(?:\\.|[^"\\])*"', ' ')
+    $stripped = [regex]::Replace($stripped, "'(?:\\.|[^'\\])*'", ' ')
+    foreach ($token in ($stripped -split '[\s;|&()`]+')) {
+        if (-not $token) { continue }
+        $word = $token.ToLowerInvariant() -replace '\.exe$', '' -replace '^.*[\\/]', ''
+        if (@('grep', 'egrep', 'fgrep', 'zgrep', 'rg') -contains $word) { return $true }
+    }
+    return $false
+}
+
 function ConvertTo-NormRepoPath {
     param([string]$P)
     $p = $P
