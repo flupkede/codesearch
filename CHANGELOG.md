@@ -14,6 +14,22 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.5]
+
+### Changed
+
+- **File-watcher text indexing no longer flushes on every brief editing pause: the batch quiet gate rose from 2 s to 5 s (env `CODESEARCH_FSW_TEXT_QUIET_MS`, floor 250 ms).** Under continuous editing every pause of 2 s or more closed the gate, and each flush cost an embedding burst on all cores plus a FTS/vector commit — a busy editing session pinned the serve process at ~10 cores. Flushes now fire only after 5 s of true quiet: a measured edit storm (12 bursts) dropped from 12 embedding waves to a single end-of-session flush.
+
+- **Symbol rebuilds coalesce instead of stacking.** Watcher flushes (C# incremental, TypeScript, restore-input FULL, branch-change FULL) that land while a rebuild is already running now merge into one follow-up pass per repo instead of queueing duplicate rebuilds behind the guard. A restore-input FULL absorbs pending C# work, a branch-change FULL absorbs everything, and pending TypeScript work is never absorbed by a C#-only restore FULL (it runs as its own pass right after).
+
+### Added
+
+- **The serve status keeps a repo at "Indexing" for 5 s after watcher activity ends.** The status snapshot samples every ~2 s, so a 1–2 s flush landed between samples and an actively-edited repo read "Idle" while embedding burned CPU. Display-only: the reindex 409 guard still reads the live markers exclusively.
+
+### Fixed
+
+- **scip-csharp cleans up stale filtered-solution leftovers.** Every solution load writes a `<name>-filtered-<guid>.sln` next to the real solution and deletes it afterwards — but a crash before that delete left it behind in the repo. Creating a new filtered solution now sweeps older `<name>-filtered-*.sln` leftovers first (case-insensitive, best-effort, count to stderr).
+
 ## [1.7.4] - 2026-10-28
 
 ### Added
