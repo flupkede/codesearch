@@ -108,11 +108,27 @@ pub type IndexingStatusCallback = Arc<dyn Fn(bool) + Send + Sync>;
 /// the reaper/FSW can then race the live refresh (todo #131 shape).
 pub type IndexingHeartbeat = Arc<dyn Fn() + Send + Sync>;
 
-/// Batch flush timeout in milliseconds.
-/// Events are batched and flushed when:
-/// 1. No new events for this duration, OR
-/// 2. Buffer has events and this duration passes since last flush
-const FSW_BATCH_FLUSH_MS: u64 = 2000;
+/// Text-batch quiet gate in milliseconds: events are batched and flushed only
+/// after this much silence (default 5 s, overridable via
+/// [`crate::constants::FSW_TEXT_QUIET_MS_ENV`]).
+///
+/// Under continuous editing every brief editor pause closes the gate, and
+/// each flush costs chunking + embedding + an FTS/vector commit — at the old
+/// 2 s gate that meant a CPU burst every few seconds (the "recompile per
+/// edit" wave on the serve hub). Symbol rebuilds keep their own, much longer
+/// quiet gates (`SCIP_CSHARP_DEBOUNCE_MS` / `SCIP_TYPESCRIPT_DEBOUNCE_MS`).
+const DEFAULT_FSW_TEXT_QUIET_MS: u64 = 5000;
+/// Floor for the quiet gate: 0 would flush on every loop tick.
+const MIN_FSW_TEXT_QUIET_MS: u64 = 250;
+
+/// Resolve the text-batch quiet gate from the env value (absent or invalid →
+/// default). Pure over its input so the parse contract is table-testable.
+fn resolve_fsw_text_quiet_ms(env_val: Option<&str>) -> u64 {
+    env_val
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|ms| ms.max(MIN_FSW_TEXT_QUIET_MS))
+        .unwrap_or(DEFAULT_FSW_TEXT_QUIET_MS)
+}
 
 // === Lock File Management ===
 
@@ -481,6 +497,128 @@ fn classify_symbol_rebuild_event(path: &Path) -> SymbolRebuildTrigger {
         SymbolRebuildTrigger::TypeScript
     } else {
         SymbolRebuildTrigger::None
+    }
+}
+
+/// The FULL kind a pending full rebuild carries. `Branch` is the superset
+/// (rebuilds every applicable language); a restore-input change only
+/// invalidates C# restore state. Upgrades are monotone: a pending `Branch`
+/// absorbs a later restore-input full, never the reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingFullKind {
+    CSharpRestore,
+    Branch,
+}
+
+/// What one runner pass executes. A pending FULL absorbs the pending C#
+/// incrementals; only a `Branch` full also absorbs the TypeScript sets —
+/// the branch rebuild re-derives everything for both languages from the
+/// working tree, while a restore full rebuilds C# only and leaves the TS
+/// sets pending for the next pass.
+#[derive(Debug, PartialEq, Eq)]
+enum RebuildPass {
+    Full {
+        branch: bool,
+    },
+    Incremental {
+        cs_modified: Vec<PathBuf>,
+        cs_deleted: Vec<PathBuf>,
+        ts_modified: Vec<PathBuf>,
+        ts_deleted: Vec<PathBuf>,
+    },
+}
+
+/// Per-repo accumulator of pending symbol-rebuild work plus the runner
+/// slot. The watcher merges every drained debounce set here instead of
+/// spawning a rebuild task per flush; at most one runner task per repo
+/// loops take_pass under the rebuild guard, so a flush landing mid-rebuild
+/// coalesces into exactly one extra pass with the merged sets instead of
+/// queueing duplicate rebuild work behind the guard.
+///
+/// Pure over its fields so the coalescing + FULL-precedence contracts are
+/// table-testable without driving the async loop.
+#[derive(Debug, Default)]
+struct SymbolRebuildQueue {
+    cs_modified: HashSet<PathBuf>,
+    cs_deleted: HashSet<PathBuf>,
+    ts_modified: HashSet<PathBuf>,
+    ts_deleted: HashSet<PathBuf>,
+    full: Option<PendingFullKind>,
+    /// At most one runner task per repo. Mutated only under the queue lock
+    /// (by [`Self::ensure_runner`] and the empty branch of
+    /// [`Self::take_pass`]) so a flush racing a runner exit either sees
+    /// pending work or a free slot — never both missed.
+    runner_alive: bool,
+}
+
+impl SymbolRebuildQueue {
+    fn enqueue_csharp(&mut self, modified: Vec<PathBuf>, deleted: Vec<PathBuf>) {
+        self.cs_modified.extend(modified);
+        self.cs_deleted.extend(deleted);
+    }
+
+    fn enqueue_typescript(&mut self, modified: Vec<PathBuf>, deleted: Vec<PathBuf>) {
+        self.ts_modified.extend(modified);
+        self.ts_deleted.extend(deleted);
+    }
+
+    fn enqueue_full(&mut self, kind: PendingFullKind) {
+        self.full = Some(match self.full {
+            Some(PendingFullKind::Branch) => PendingFullKind::Branch,
+            _ => kind,
+        });
+    }
+
+    /// Claim the runner slot; `true` means the caller must spawn it.
+    fn ensure_runner(&mut self) -> bool {
+        if self.runner_alive {
+            return false;
+        }
+        self.runner_alive = true;
+        true
+    }
+
+    /// Snapshot-and-clear the next pass. `None` releases the runner slot
+    /// under the same lock — the runner exits; any flush after that sees a
+    /// free slot and spawns a fresh runner.
+    fn take_pass(&mut self) -> Option<RebuildPass> {
+        if let Some(kind) = self.full.take() {
+            // FULL absorbs pending C# incrementals. Only the branch full
+            // re-derives TypeScript too; a restore full rebuilds C# only, so
+            // clearing the TS sets here would silently drop them — they stay
+            // pending and the loop's next take_pass rebuilds them.
+            self.cs_modified.clear();
+            self.cs_deleted.clear();
+            if kind == PendingFullKind::Branch {
+                self.ts_modified.clear();
+                self.ts_deleted.clear();
+            }
+            return Some(RebuildPass::Full {
+                branch: kind == PendingFullKind::Branch,
+            });
+        }
+        if self.cs_modified.is_empty()
+            && self.cs_deleted.is_empty()
+            && self.ts_modified.is_empty()
+            && self.ts_deleted.is_empty()
+        {
+            self.runner_alive = false;
+            return None;
+        }
+        Some(RebuildPass::Incremental {
+            cs_modified: self.cs_modified.drain().collect(),
+            cs_deleted: self.cs_deleted.drain().collect(),
+            ts_modified: self.ts_modified.drain().collect(),
+            ts_deleted: self.ts_deleted.drain().collect(),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.full.is_none()
+            && self.cs_modified.is_empty()
+            && self.cs_deleted.is_empty()
+            && self.ts_modified.is_empty()
+            && self.ts_deleted.is_empty()
     }
 }
 
@@ -1541,26 +1679,14 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Trigger a fire-and-forget FULL symbol rebuild for every applicable
-    /// language, used when a branch switch invalidates the symbol index wholesale.
-    ///
-    /// A branch change rewrites arbitrary files in the working tree, so an
-    /// incremental (per-file / per-`.csproj`) scope cannot be computed — the
-    /// buffered `.cs`/`.ts` events were discarded by the branch-change handler.
-    /// A `RebuildScope::Full` is the honest, correct choice here: it re-derives
-    /// the entire symbol index for the new branch. Runs in a detached blocking
-    /// task so the watcher loop is never blocked by the (potentially 35–84s)
-    /// scip-csharp / scip-typescript invocation.
-    ///
-    /// `indexing_cb` (if any) toggles the general TUI "Indexing" label around
-    /// the whole rebuild; `csharp_notifier` (if any) drives the C#-specific
-    /// indicator (`Started`/`Succeeded`/`Failed`). Non-applicable languages
-    /// (no `.sln` / no `tsconfig.json`) or an unavailable helper are skipped
-    /// without touching any status — mirroring the debounce path.
-    ///
-    /// Serializes with the other two C# rebuild tasks via the shared `rebuild_guard`.
+    /// Spawn the per-repo symbol-rebuild runner (at most one alive — the
+    /// queue's runner slot gates spawning). Loop body: take the rebuild
+    /// guard, snapshot+clear the pending queue, execute the pass, re-check —
+    /// so a flush landing mid-rebuild coalesces into exactly one extra pass
+    /// with the merged sets instead of queueing duplicate rebuild work
+    /// behind the guard (todo #272).
     #[allow(clippy::too_many_arguments)]
-    fn spawn_branch_change_symbol_rebuild(
+    fn spawn_symbol_rebuild_runner(
         symbol_registry: Arc<SymbolIndexerRegistry>,
         repo_path: PathBuf,
         db_path: PathBuf,
@@ -1569,80 +1695,407 @@ impl IndexManager {
         indexing_cb: Option<IndexingStatusCallback>,
         cancel_token: CancellationToken,
         rebuild_guard: Arc<std::sync::Mutex<()>>,
+        queue: Arc<std::sync::Mutex<SymbolRebuildQueue>>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::task::spawn_blocking(move || {
-            // Two rebuilds on one LMDB db must not overlap.
+        tokio::task::spawn_blocking(move || loop {
+            // Two rebuilds on one LMDB db must not overlap: the guard is held
+            // across snapshot + execution so a queued pass never interleaves.
             let _rebuild_guard = rebuild_guard.lock().unwrap_or_else(|p| p.into_inner());
-
-            // Resolve applicable + available indexers up front so we only toggle
-            // the "Indexing" label when there is real work to do.
-            let csharp = symbol_registry
-                .get(LANG_CSHARP)
-                .filter(|i| i.applies_to(&repo_path) && i.is_available());
-            let typescript = symbol_registry
-                .get(LANG_TYPESCRIPT)
-                .filter(|i| i.applies_to(&repo_path) && i.is_available());
-
-            if csharp.is_none() && typescript.is_none() {
-                // Nothing to rebuild — don't flash the TUI or touch status.
+            let pass = {
+                let mut q = queue.lock().unwrap_or_else(|p| p.into_inner());
+                q.take_pass()
+            };
+            let Some(pass) = pass else {
+                // take_pass released the runner slot under the queue lock; a
+                // flush after this point sees the free slot and spawns a
+                // fresh runner.
+                debug!(
+                    "🔬 [{}] symbol rebuild runner exiting: queue empty",
+                    repo_label
+                );
                 return;
-            }
-
-            if let Some(ref cb) = indexing_cb {
-                cb(true);
-            }
-
-            // Check-before-start bounds each language's rebuild: a single
-            // `indexer.rebuild()` call can't be interrupted mid-run (the 35–84s
-            // scip-csharp invocation), but we skip languages whose rebuild hadn't
-            // begun yet once cancellation lands.
-            if let Some(indexer) = csharp {
-                if cancel_token.is_cancelled() {
-                    info!(
-                        "🛑 [{}] symbol rebuild cancelled before C# rebuild",
-                        repo_label
-                    );
-                } else {
-                    // C# drives the serve-side status indicator: Started now,
-                    // terminal signal inside run_full_rebuild_logged.
-                    if let Some(ref n) = csharp_notifier {
-                        n(SymbolRebuildSignal::Started);
-                    }
-                    Self::run_full_rebuild_logged(
-                        indexer,
-                        &repo_path,
-                        &db_path,
-                        &repo_label,
-                        "C#",
-                        csharp_notifier.as_ref(),
-                    );
-                }
-            }
-
-            if let Some(indexer) = typescript {
-                if cancel_token.is_cancelled() {
-                    info!(
-                        "🛑 [{}] symbol rebuild cancelled before TypeScript rebuild",
-                        repo_label
-                    );
-                } else {
-                    // The TypeScript path has no serve-side status notifier yet, so
-                    // only the general "Indexing" label reflects it (via indexing_cb).
-                    Self::run_full_rebuild_logged(
-                        indexer,
-                        &repo_path,
-                        &db_path,
-                        &repo_label,
-                        "TypeScript",
-                        None,
-                    );
-                }
-            }
-
-            if let Some(ref cb) = indexing_cb {
-                cb(false);
-            }
+            };
+            Self::execute_symbol_rebuild_pass(
+                &pass,
+                &symbol_registry,
+                &repo_path,
+                &db_path,
+                &repo_label,
+                csharp_notifier.as_ref(),
+                &indexing_cb,
+                &cancel_token,
+            );
+            // The guard drops with the iteration; the loop re-checks the
+            // queue so work merged mid-pass runs as exactly one more pass.
         })
+    }
+
+    /// Execute one [`RebuildPass`] — the per-language bodies moved verbatim
+    /// from the former per-flush tasks (same skip checks, log wording and
+    /// notifier windows). An incremental pass runs the C# per-`.csproj`
+    /// groups and the TypeScript full rebuild for whichever language the
+    /// queue held sets for; a FULL pass is either the branch-change shape
+    /// (both languages under one "Indexing" window, bounded by cancellation
+    /// checks) or the restore shape (C# only — restore state is C#-specific).
+    #[allow(clippy::too_many_arguments)]
+    fn execute_symbol_rebuild_pass(
+        pass: &RebuildPass,
+        symbol_registry: &SymbolIndexerRegistry,
+        repo_path: &Path,
+        db_path: &Path,
+        repo_label: &str,
+        csharp_notifier: Option<&CSharpRebuildNotifier>,
+        indexing_cb: &Option<IndexingStatusCallback>,
+        cancel_token: &CancellationToken,
+    ) {
+        match pass {
+            RebuildPass::Full { branch: true } => {
+                // Resolve applicable + available indexers up front so we only
+                // toggle the "Indexing" label when there is real work to do.
+                let csharp = symbol_registry
+                    .get(LANG_CSHARP)
+                    .filter(|i| i.applies_to(repo_path) && i.is_available());
+                let typescript = symbol_registry
+                    .get(LANG_TYPESCRIPT)
+                    .filter(|i| i.applies_to(repo_path) && i.is_available());
+
+                if csharp.is_none() && typescript.is_none() {
+                    // Nothing to rebuild — don't flash the TUI or touch status.
+                    return;
+                }
+
+                if let Some(ref cb) = indexing_cb {
+                    cb(true);
+                }
+
+                // Check-before-start bounds each language's rebuild: a single
+                // `indexer.rebuild()` call can't be interrupted mid-run (the
+                // 35–84s scip-csharp invocation), but we skip languages whose
+                // rebuild hadn't begun yet once cancellation lands.
+                if let Some(indexer) = csharp {
+                    if cancel_token.is_cancelled() {
+                        info!(
+                            "🛑 [{}] symbol rebuild cancelled before C# rebuild",
+                            repo_label
+                        );
+                    } else {
+                        // C# drives the serve-side status indicator: Started
+                        // now, terminal signal inside run_full_rebuild_logged.
+                        if let Some(n) = csharp_notifier {
+                            n(SymbolRebuildSignal::Started);
+                        }
+                        Self::run_full_rebuild_logged(
+                            indexer,
+                            repo_path,
+                            db_path,
+                            repo_label,
+                            "C#",
+                            csharp_notifier,
+                        );
+                    }
+                }
+
+                if let Some(indexer) = typescript {
+                    if cancel_token.is_cancelled() {
+                        info!(
+                            "🛑 [{}] symbol rebuild cancelled before TypeScript rebuild",
+                            repo_label
+                        );
+                    } else {
+                        // The TypeScript path has no serve-side status notifier
+                        // yet, so only the general "Indexing" label reflects it.
+                        Self::run_full_rebuild_logged(
+                            indexer,
+                            repo_path,
+                            db_path,
+                            repo_label,
+                            "TypeScript",
+                            None,
+                        );
+                    }
+                }
+
+                if let Some(ref cb) = indexing_cb {
+                    cb(false);
+                }
+            }
+            RebuildPass::Full { branch: false } => {
+                // Restore-input FULL: a changed/deleted restore input
+                // invalidates restore state for EVERY C# project at once, so
+                // the flush is a FULL solution rebuild — a per-project
+                // incremental would index mid-restore against stale assets
+                // (issue #225). The helper's own gate refuses to index while
+                // the triggered restore is still running; rebuild()'s retry
+                // loop waits it out. TypeScript is not touched: restore state
+                // is C#-specific.
+                if let Some(indexer) = symbol_registry.get(LANG_CSHARP) {
+                    if !indexer.applies_to(repo_path) {
+                        info!(
+                            "🔬 [{}] symbol rebuild skipped: not applicable (no .sln)",
+                            repo_label
+                        );
+                    } else if !indexer.is_available() {
+                        info!(
+                            "🔬 [{}] symbol rebuild skipped: helper not available",
+                            repo_label
+                        );
+                    } else {
+                        if let Some(ref cb) = indexing_cb {
+                            cb(true);
+                        }
+                        if let Some(n) = csharp_notifier {
+                            n(SymbolRebuildSignal::Started);
+                        }
+                        Self::run_full_rebuild_logged(
+                            indexer,
+                            repo_path,
+                            db_path,
+                            repo_label,
+                            "C#",
+                            csharp_notifier,
+                        );
+                        // Clear "Indexing" regardless of outcome
+                        if let Some(ref cb) = indexing_cb {
+                            cb(false);
+                        }
+                    }
+                }
+            }
+            RebuildPass::Incremental {
+                cs_modified,
+                cs_deleted,
+                ts_modified,
+                ts_deleted,
+            } => {
+                // C# per-.csproj incremental (moved verbatim from the former
+                // per-flush task).
+                if !cs_modified.is_empty() || !cs_deleted.is_empty() {
+                    if let Some(indexer) = symbol_registry.get(LANG_CSHARP) {
+                        if !indexer.applies_to(repo_path) {
+                            info!(
+                                "🔬 [{}] symbol rebuild skipped: not applicable (no .sln)",
+                                repo_label
+                            );
+                        } else if !indexer.is_available() {
+                            info!(
+                                "🔬 [{}] symbol rebuild skipped: helper not available",
+                                repo_label
+                            );
+                        } else {
+                            // Signal "Indexing" to the TUI now that we know a
+                            // real SCIP rebuild will actually run. This toggles
+                            // both the general repo-state label (indexing_cb →
+                            // active_reindexes) and the C#-specific indicator
+                            // (notifier → Indexing).
+                            if let Some(ref cb) = indexing_cb {
+                                cb(true);
+                            }
+                            if let Some(n) = csharp_notifier {
+                                n(SymbolRebuildSignal::Started);
+                            }
+
+                            // Group modified files by their containing .csproj
+                            // so we can index per project. Each group triggers a
+                            // separate incremental rebuild with --filter-project,
+                            // which is much faster than rebuilding the entire
+                            // solution.
+                            //
+                            // Deleted files are passed to every group as `deleted`
+                            // so that their stale LMDB entries are purged
+                            // regardless of which project they belonged to (we
+                            // can't discover their csproj — they're gone).
+                            let mut groups: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
+                                std::collections::HashMap::new();
+                            let mut ungrouped: Vec<PathBuf> = Vec::new();
+
+                            for file in cs_modified {
+                                if let Some(csproj) = crate::symbols::csharp::
+                                    CSharpSymbolIndexer::find_csproj_for_file(repo_path, file)
+                                {
+                                    groups.entry(csproj).or_default().push(file.clone());
+                                } else {
+                                    ungrouped.push(file.clone());
+                                }
+                            }
+
+                            // If any modified files couldn't be mapped to a .csproj,
+                            // fall back to a full solution rebuild (previously this
+                            // incorrectly used RebuildScope::Files which only used
+                            // files.first() and silently ignored the rest).
+                            if !ungrouped.is_empty() {
+                                info!(
+                                    "🔬 [{}] {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
+                                    repo_label,
+                                    ungrouped.len()
+                                );
+                                Self::run_full_rebuild_logged(
+                                    indexer,
+                                    repo_path,
+                                    db_path,
+                                    repo_label,
+                                    "C#",
+                                    csharp_notifier,
+                                );
+                                // Clear "Indexing" regardless of outcome
+                                if let Some(ref cb) = indexing_cb {
+                                    cb(false);
+                                }
+                            } else {
+                                // Rebuild each project group separately.
+                                // Deleted files are forwarded to every group so they're
+                                // cleaned up from LMDB regardless of origin project.
+                                let total_groups = groups.len();
+                                let mut last_error: Option<String> = None;
+                                // Restore-exhausted groups land here instead:
+                                // LMDB untouched, previous index stays live.
+                                let mut last_abandon: Option<String> = None;
+                                // Index-level warnings survived by any
+                                // group's rebuild — deduped across groups
+                                // (MSBuild repeats per project).
+                                let mut index_warnings: Vec<String> = Vec::new();
+                                let mut seen_warnings = std::collections::HashSet::new();
+                                for (i, (csproj, files)) in groups.into_iter().enumerate() {
+                                    let csproj_name = csproj
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    info!(
+                                        "🔬 [{}] incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
+                                        repo_label,
+                                        i + 1,
+                                        total_groups,
+                                        csproj_name,
+                                        files.len(),
+                                        cs_deleted.len(),
+                                    );
+                                    let scope = RebuildScope::Files {
+                                        changed: files,
+                                        deleted: cs_deleted.clone(),
+                                    };
+                                    match indexer.rebuild(repo_path, db_path, scope) {
+                                        Ok(summary) => {
+                                            for w in &summary.index_warnings {
+                                                if seen_warnings.insert(w.clone()) {
+                                                    index_warnings.push(w.clone());
+                                                }
+                                            }
+                                            if summary.symbols_indexed == 0 {
+                                                warn!(
+                                                    "⚠️ [{}/{}] Symbol rebuild returned 0 symbols for '{}' — \
+                                                     project may have failed to load. Check scip-csharp logs above.",
+                                                    i + 1,
+                                                    total_groups,
+                                                    csproj_name
+                                                );
+                                            } else {
+                                                info!(
+                                                    "✅ [{}/{}] Symbol rebuild complete ({}): {} symbols, {} refs in {}ms",
+                                                    i + 1,
+                                                    total_groups,
+                                                    csproj_name,
+                                                    summary.symbols_indexed,
+                                                    summary.references_stored,
+                                                    summary.duration_ms
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // `{:#}` for the same reason as the
+                                            // full-rebuild path: the put context
+                                            // would otherwise hide the MDB_* code.
+                                            // A restore-exhausted group is an
+                                            // abandonment (previous index stays
+                                            // live), not a failure.
+                                            if crate::symbols::csharp::is_restore_exhausted(&e) {
+                                                warn!(
+                                                    "⚠️ [{}/{}] Symbol rebuild abandoned ({}): dotnet \
+                                                     restore did not finish — previous index stays live: {:#}",
+                                                    i + 1,
+                                                    total_groups,
+                                                    csproj_name,
+                                                    e
+                                                );
+                                                if last_abandon.is_none() {
+                                                    last_abandon = Some(format!("{e:#}"));
+                                                }
+                                            } else {
+                                                warn!(
+                                                    "⚠️ [{}/{}] Symbol rebuild failed ({}): {:#}",
+                                                    i + 1,
+                                                    total_groups,
+                                                    csproj_name,
+                                                    e
+                                                );
+                                                last_error = Some(format!("{e:#}"));
+                                            }
+                                        }
+                                    }
+                                }
+                                // Notify serve layer about overall outcome.
+                                // A real failure wins over an abandonment:
+                                // exhausted groups leave the previous index
+                                // live (warning), but a genuine failure must
+                                // still render red.
+                                if let Some(n) = csharp_notifier {
+                                    n(grouped_rebuild_signal(
+                                        last_error,
+                                        last_abandon,
+                                        index_warnings,
+                                    ));
+                                }
+                                // Clear "Indexing" now that all groups are done
+                                if let Some(ref cb) = indexing_cb {
+                                    cb(false);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // TypeScript full rebuild (no per-project grouping in the MVP:
+                // a single root tsconfig.json, so any tracked change triggers
+                // one full rebuild; RebuildScope::Files would fall back to Full
+                // internally anyway).
+                if !ts_modified.is_empty() || !ts_deleted.is_empty() {
+                    if let Some(indexer) = symbol_registry.get(LANG_TYPESCRIPT) {
+                        if !indexer.applies_to(repo_path) {
+                            info!(
+                                "🔬 [{}] TypeScript symbol rebuild skipped: not applicable (no tsconfig.json)",
+                                repo_label
+                            );
+                        } else if !indexer.is_available() {
+                            info!(
+                                "🔬 [{}] TypeScript symbol rebuild skipped: scip-typescript not available",
+                                repo_label
+                            );
+                        } else {
+                            // Signal "Indexing" to the TUI now that we know a
+                            // real SCIP rebuild will actually run.
+                            if let Some(ref cb) = indexing_cb {
+                                cb(true);
+                            }
+
+                            // The TypeScript path has no serve-side status
+                            // notifier yet, so only the general "Indexing" label
+                            // reflects it (via indexing_cb).
+                            Self::run_full_rebuild_logged(
+                                indexer,
+                                repo_path,
+                                db_path,
+                                repo_label,
+                                "TypeScript",
+                                None,
+                            );
+
+                            // Clear "Indexing" regardless of outcome
+                            if let Some(ref cb) = indexing_cb {
+                                cb(false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Run a `RebuildScope::Full` rebuild for one language's indexer, log the
@@ -1728,7 +2181,8 @@ impl IndexManager {
     /// - Spawns a detached background task
     /// - Watches for file modifications, deletions, and renames
     /// - **Batches events** to avoid overhead with rapid changes
-    /// - Flushes batch when no new events for FSW_BATCH_FLUSH_MS
+    /// - Flushes batch when no new events for the text quiet gate
+    ///   (5 s default, `CODESEARCH_FSW_TEXT_QUIET_MS`)
     /// - Logs all file system events and refresh operations
     /// - Continues running even if individual refresh operations fail
     /// - Stops gracefully when the cancellation token is cancelled
@@ -1782,7 +2236,11 @@ impl IndexManager {
             let mut files_to_index: HashSet<PathBuf> = HashSet::new();
             let mut files_to_remove: HashSet<PathBuf> = HashSet::new();
             let mut last_event_time = std::time::Instant::now();
-            let flush_duration = std::time::Duration::from_millis(FSW_BATCH_FLUSH_MS);
+            let flush_duration = std::time::Duration::from_millis(resolve_fsw_text_quiet_ms(
+                std::env::var(crate::constants::FSW_TEXT_QUIET_MS_ENV)
+                    .ok()
+                    .as_deref(),
+            ));
 
             // Symbol indexer debounce: .cs files are buffered separately and
             // flushed after SCIP_CSHARP_DEBOUNCE_MS of quiet time.
@@ -1802,6 +2260,13 @@ impl IndexManager {
             let mut restore_input_last_event_time: Option<std::time::Instant> = None;
             // Serializes the detached symbol rebuild tasks (incremental, restore-input full, branch-change full).
             let symbol_rebuild_guard = Arc::new(std::sync::Mutex::new(()));
+            // Pending symbol-rebuild work shared with the single runner task:
+            // debounce flushes merge their drained sets here and spawn the
+            // runner only when none is alive — a flush landing mid-rebuild
+            // coalesces into one extra pass instead of queueing duplicates
+            // behind the guard (todo #272).
+            let symbol_rebuild_queue =
+                Arc::new(std::sync::Mutex::new(SymbolRebuildQueue::default()));
 
             // Symbol indexer debounce: .ts/.tsx/.mts/.cts files are buffered separately
             // and flushed after SCIP_TYPESCRIPT_DEBOUNCE_MS of quiet time. Unlike C#'s
@@ -1866,19 +2331,28 @@ impl IndexManager {
                             // the symbol index is now stale — but no incremental
                             // scope can be computed (the working tree changed wholesale
                             // and the buffered .cs/.ts events were just discarded above).
-                            // Trigger a fire-and-forget FULL symbol rebuild for every
-                            // language that applies, so `find_impact` reflects the new
-                            // branch instead of silently serving stale references.
-                            drop(Self::spawn_branch_change_symbol_rebuild(
-                                symbol_registry.clone(),
-                                path.clone(),
-                                db_path.clone(),
-                                repo_label.clone(),
-                                csharp_notifier.clone(),
-                                indexing_cb.clone(),
-                                cancel_token.clone(),
-                                symbol_rebuild_guard.clone(),
-                            ));
+                            // The FULL rebuild funnels through the shared pending
+                            // queue: it absorbs any pending incrementals, and a
+                            // flush landing mid-rebuild coalesces into one extra
+                            // pass instead of queueing duplicate work.
+                            let mut queue = symbol_rebuild_queue
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            queue.enqueue_full(PendingFullKind::Branch);
+                            if queue.ensure_runner() {
+                                drop(Self::spawn_symbol_rebuild_runner(
+                                    symbol_registry.clone(),
+                                    path.clone(),
+                                    db_path.clone(),
+                                    repo_label.clone(),
+                                    csharp_notifier.clone(),
+                                    indexing_cb.clone(),
+                                    cancel_token.clone(),
+                                    symbol_rebuild_guard.clone(),
+                                    symbol_rebuild_queue.clone(),
+                                ));
+                            }
+                            drop(queue);
                         }
                     }
                 }
@@ -2073,211 +2547,29 @@ impl IndexManager {
                                 cs_debounce.as_secs()
                             );
 
-                            // Group changed (modified) files by .csproj so we can index per project.
-                            // Each group triggers a separate incremental rebuild with
-                            // --filter-project, which is much faster than rebuilding
-                            // the entire solution.
-                            //
-                            // Deleted files are passed to every group as `deleted` so that their
-                            // stale LMDB entries are purged regardless of which project they
-                            // belonged to (we can't discover their csproj — they're gone).
-                            let reg = symbol_registry.clone();
-                            let rp = path.clone();
-                            let dp = db_path.clone();
-                            // Clone the repo label into the blocking task (the outer
-                            // binding is reused by later loop iterations).
-                            let repo_label = repo_label.clone();
-                            let notifier = csharp_notifier.clone();
-                            // Clone indexing_cb so the SCIP rebuild can signal
-                            // active_reindexes (and therefore show "Indexing" in
-                            // the TUI) for the duration of the symbol rebuild —
-                            // separate from the text-index callback used for
-                            // branch-change refreshes above.
-                            let indexing_cb_scip = indexing_cb.clone();
-                            let guard = symbol_rebuild_guard.clone();
-                            tokio::task::spawn_blocking(move || {
-                                // Two rebuilds on one LMDB db must not overlap.
-                                let _rebuild_guard =
-                                    guard.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Some(indexer) = reg.get(LANG_CSHARP) {
-                                    if !indexer.applies_to(&rp) {
-                                        info!(
-                                            "🔬 [{}] symbol rebuild skipped: not applicable (no .sln)",
-                                            repo_label
-                                        );
-                                        return;
-                                    }
-                                    if !indexer.is_available() {
-                                        info!(
-                                            "🔬 [{}] symbol rebuild skipped: helper not available",
-                                            repo_label
-                                        );
-                                        return;
-                                    }
-
-                                    // Signal "Indexing" to the TUI now that we know
-                                    // a real SCIP rebuild will actually run. This
-                                    // toggles both the general repo-state label
-                                    // (indexing_cb → active_reindexes) and the
-                                    // C#-specific indicator (notifier → Indexing).
-                                    if let Some(ref cb) = indexing_cb_scip {
-                                        cb(true);
-                                    }
-                                    if let Some(ref n) = notifier {
-                                        n(SymbolRebuildSignal::Started);
-                                    }
-
-                                    // Group modified files by their containing .csproj
-                                    let mut groups: std::collections::HashMap<
-                                        PathBuf,
-                                        Vec<PathBuf>,
-                                    > = std::collections::HashMap::new();
-                                    let mut ungrouped: Vec<PathBuf> = Vec::new();
-
-                                    for file in &cs_modified {
-                                        if let Some(csproj) =
-                                            crate::symbols::csharp::CSharpSymbolIndexer::find_csproj_for_file(&rp, file)
-                                        {
-                                            groups.entry(csproj).or_default().push(file.clone());
-                                        } else {
-                                            ungrouped.push(file.clone());
-                                        }
-                                    }
-
-                                    // If any modified files couldn't be mapped to a .csproj,
-                                    // fall back to a full solution rebuild (previously this
-                                    // incorrectly used RebuildScope::Files which only used
-                                    // files.first() and silently ignored the rest).
-                                    if !ungrouped.is_empty() {
-                                        info!(
-                                            "🔬 [{}] {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
-                                            repo_label,
-                                            ungrouped.len()
-                                        );
-                                        Self::run_full_rebuild_logged(
-                                            indexer,
-                                            &rp,
-                                            &dp,
-                                            &repo_label,
-                                            "C#",
-                                            notifier.as_ref(),
-                                        );
-                                        // Clear "Indexing" regardless of outcome
-                                        if let Some(ref cb) = indexing_cb_scip {
-                                            cb(false);
-                                        }
-                                        return;
-                                    }
-
-                                    // Rebuild each project group separately.
-                                    // Deleted files are forwarded to every group so they're
-                                    // cleaned up from LMDB regardless of origin project.
-                                    let total_groups = groups.len();
-                                    let mut last_error: Option<String> = None;
-                                    // Restore-exhausted groups land here instead:
-                                    // LMDB untouched, previous index stays live.
-                                    let mut last_abandon: Option<String> = None;
-                                    // Index-level warnings survived by any
-                                    // group's rebuild — deduped across groups
-                                    // (MSBuild repeats per project).
-                                    let mut index_warnings: Vec<String> = Vec::new();
-                                    let mut seen_warnings = std::collections::HashSet::new();
-                                    for (i, (csproj, files)) in groups.into_iter().enumerate() {
-                                        let csproj_name = csproj
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_default();
-                                        info!(
-                                            "🔬 [{}] incremental rebuild [{}/{}]: {} ({} modified, {} deleted)",
-                                            repo_label,
-                                            i + 1,
-                                            total_groups,
-                                            csproj_name,
-                                            files.len(),
-                                            cs_deleted.len(),
-                                        );
-                                        let scope = RebuildScope::Files {
-                                            changed: files,
-                                            deleted: cs_deleted.clone(),
-                                        };
-                                        match indexer.rebuild(&rp, &dp, scope) {
-                                            Ok(summary) => {
-                                                for w in &summary.index_warnings {
-                                                    if seen_warnings.insert(w.clone()) {
-                                                        index_warnings.push(w.clone());
-                                                    }
-                                                }
-                                                if summary.symbols_indexed == 0 {
-                                                    warn!(
-                                                        "⚠️ [{}/{}] Symbol rebuild returned 0 symbols for '{}' — \
-                                                         project may have failed to load. Check scip-csharp logs above.",
-                                                        i + 1,
-                                                        total_groups,
-                                                        csproj_name
-                                                    );
-                                                } else {
-                                                    info!(
-                                                        "✅ [{}/{}] Symbol rebuild complete ({}): {} symbols, {} refs in {}ms",
-                                                        i + 1,
-                                                        total_groups,
-                                                        csproj_name,
-                                                        summary.symbols_indexed,
-                                                        summary.references_stored,
-                                                        summary.duration_ms
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                // `{:#}` for the same reason as the
-                                                // full-rebuild path: the put context
-                                                // would otherwise hide the MDB_* code.
-                                                // A restore-exhausted group is an
-                                                // abandonment (previous index stays
-                                                // live), not a failure.
-                                                if crate::symbols::csharp::is_restore_exhausted(&e)
-                                                {
-                                                    warn!(
-                                                        "⚠️ [{}/{}] Symbol rebuild abandoned ({}): dotnet \
-                                                         restore did not finish — previous index stays live: {:#}",
-                                                        i + 1,
-                                                        total_groups,
-                                                        csproj_name,
-                                                        e
-                                                    );
-                                                    if last_abandon.is_none() {
-                                                        last_abandon = Some(format!("{e:#}"));
-                                                    }
-                                                } else {
-                                                    warn!(
-                                                        "⚠️ [{}/{}] Symbol rebuild failed ({}): {:#}",
-                                                        i + 1,
-                                                        total_groups,
-                                                        csproj_name,
-                                                        e
-                                                    );
-                                                    last_error = Some(format!("{e:#}"));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Notify serve layer about overall outcome.
-                                    // A real failure wins over an abandonment:
-                                    // exhausted groups leave the previous index
-                                    // live (warning), but a genuine failure must
-                                    // still render red.
-                                    if let Some(ref n) = notifier {
-                                        n(grouped_rebuild_signal(
-                                            last_error,
-                                            last_abandon,
-                                            index_warnings,
-                                        ));
-                                    }
-                                    // Clear "Indexing" now that all groups are done
-                                    if let Some(ref cb) = indexing_cb_scip {
-                                        cb(false);
-                                    }
-                                }
-                            });
+                            // Merge into the pending queue; the single runner
+                            // task does the grouping when it actually executes
+                            // the pass — a flush landing mid-rebuild coalesces
+                            // into one extra pass with the merged sets instead
+                            // of queueing duplicate rebuild work.
+                            let mut queue = symbol_rebuild_queue
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            queue.enqueue_csharp(cs_modified, cs_deleted);
+                            if queue.ensure_runner() {
+                                drop(Self::spawn_symbol_rebuild_runner(
+                                    symbol_registry.clone(),
+                                    path.clone(),
+                                    db_path.clone(),
+                                    repo_label.clone(),
+                                    csharp_notifier.clone(),
+                                    indexing_cb.clone(),
+                                    cancel_token.clone(),
+                                    symbol_rebuild_guard.clone(),
+                                    symbol_rebuild_queue.clone(),
+                                ));
+                            }
+                            drop(queue);
                         }
                     }
                 }
@@ -2302,54 +2594,28 @@ impl IndexManager {
                                 cs_debounce.as_secs()
                             );
 
-                            let reg = symbol_registry.clone();
-                            let rp = path.clone();
-                            let dp = db_path.clone();
-                            // Clone the repo label into the blocking task (the outer
-                            // binding is reused by later loop iterations).
-                            let repo_label = repo_label.clone();
-                            let notifier = csharp_notifier.clone();
-                            let indexing_cb_scip = indexing_cb.clone();
-                            let guard = symbol_rebuild_guard.clone();
-                            tokio::task::spawn_blocking(move || {
-                                // Two rebuilds on one LMDB db must not overlap.
-                                let _rebuild_guard =
-                                    guard.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Some(indexer) = reg.get(LANG_CSHARP) {
-                                    if !indexer.applies_to(&rp) {
-                                        info!(
-                                            "🔬 [{}] symbol rebuild skipped: not applicable (no .sln)",
-                                            repo_label
-                                        );
-                                        return;
-                                    }
-                                    if !indexer.is_available() {
-                                        info!(
-                                            "🔬 [{}] symbol rebuild skipped: helper not available",
-                                            repo_label
-                                        );
-                                        return;
-                                    }
-                                    if let Some(ref cb) = indexing_cb_scip {
-                                        cb(true);
-                                    }
-                                    if let Some(ref n) = notifier {
-                                        n(SymbolRebuildSignal::Started);
-                                    }
-                                    Self::run_full_rebuild_logged(
-                                        indexer,
-                                        &rp,
-                                        &dp,
-                                        &repo_label,
-                                        "C#",
-                                        notifier.as_ref(),
-                                    );
-                                    // Clear "Indexing" regardless of outcome
-                                    if let Some(ref cb) = indexing_cb_scip {
-                                        cb(false);
-                                    }
-                                }
-                            });
+                            // FULL rides the same pending queue: it absorbs
+                            // the pending C# incrementals (restore state is
+                            // C#-specific; pending TS sets stay queued for
+                            // the next pass).
+                            let mut queue = symbol_rebuild_queue
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            queue.enqueue_full(PendingFullKind::CSharpRestore);
+                            if queue.ensure_runner() {
+                                drop(Self::spawn_symbol_rebuild_runner(
+                                    symbol_registry.clone(),
+                                    path.clone(),
+                                    db_path.clone(),
+                                    repo_label.clone(),
+                                    csharp_notifier.clone(),
+                                    indexing_cb.clone(),
+                                    cancel_token.clone(),
+                                    symbol_rebuild_guard.clone(),
+                                    symbol_rebuild_queue.clone(),
+                                ));
+                            }
+                            drop(queue);
                         }
                     }
                 }
@@ -2368,8 +2634,8 @@ impl IndexManager {
                         if elapsed >= ts_debounce {
                             let modified_count = ts_files_modified.len();
                             let deleted_count = ts_files_deleted.len();
-                            ts_files_modified.clear();
-                            ts_files_deleted.clear();
+                            let ts_modified: Vec<PathBuf> = ts_files_modified.drain().collect();
+                            let ts_deleted: Vec<PathBuf> = ts_files_deleted.drain().collect();
                             ts_last_event_time = None;
 
                             info!(
@@ -2378,54 +2644,28 @@ impl IndexManager {
                                 ts_debounce.as_secs()
                             );
 
-                            let reg = symbol_registry.clone();
-                            let rp = path.clone();
-                            let dp = db_path.clone();
-                            let indexing_cb_ts = indexing_cb.clone();
-                            // Clone the repo label into the blocking task (the outer
-                            // binding is reused by later loop iterations).
-                            let repo_label = repo_label.clone();
-                            tokio::task::spawn_blocking(move || {
-                                if let Some(indexer) = reg.get(LANG_TYPESCRIPT) {
-                                    if !indexer.applies_to(&rp) {
-                                        info!(
-                                            "🔬 [{}] TypeScript symbol rebuild skipped: not applicable (no tsconfig.json)",
-                                            repo_label
-                                        );
-                                        return;
-                                    }
-                                    if !indexer.is_available() {
-                                        info!(
-                                            "🔬 [{}] TypeScript symbol rebuild skipped: scip-typescript not available",
-                                            repo_label
-                                        );
-                                        return;
-                                    }
-
-                                    // Signal "Indexing" to the TUI now that we know
-                                    // a real SCIP rebuild will actually run.
-                                    if let Some(ref cb) = indexing_cb_ts {
-                                        cb(true);
-                                    }
-
-                                    // The TypeScript path has no serve-side status
-                                    // notifier yet, so only the general "Indexing"
-                                    // label reflects it (via indexing_cb_ts).
-                                    Self::run_full_rebuild_logged(
-                                        indexer,
-                                        &rp,
-                                        &dp,
-                                        &repo_label,
-                                        "TypeScript",
-                                        None,
-                                    );
-
-                                    // Clear "Indexing" regardless of outcome
-                                    if let Some(ref cb) = indexing_cb_ts {
-                                        cb(false);
-                                    }
-                                }
-                            });
+                            // Same pending queue as the C# paths — and unlike
+                            // the old per-flush task, the TS rebuild now runs
+                            // under the shared rebuild guard instead of racing
+                            // a concurrent C# rebuild on the same LMDB env.
+                            let mut queue = symbol_rebuild_queue
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            queue.enqueue_typescript(ts_modified, ts_deleted);
+                            if queue.ensure_runner() {
+                                drop(Self::spawn_symbol_rebuild_runner(
+                                    symbol_registry.clone(),
+                                    path.clone(),
+                                    db_path.clone(),
+                                    repo_label.clone(),
+                                    csharp_notifier.clone(),
+                                    indexing_cb.clone(),
+                                    cancel_token.clone(),
+                                    symbol_rebuild_guard.clone(),
+                                    symbol_rebuild_queue.clone(),
+                                ));
+                            }
+                            drop(queue);
                         }
                     }
                 }
@@ -3367,6 +3607,33 @@ mod tests {
                 classify_symbol_rebuild_event(Path::new(path)),
                 expected,
                 "path: {path}"
+            );
+        }
+    }
+
+    /// The text quiet gate: default 5 s, a valid env override wins, an
+    /// absent or unparseable value falls back to the default, and anything
+    /// below the floor clamps up — the flush loop must never spin per tick.
+    #[test]
+    fn fsw_text_quiet_resolution_table() {
+        assert_eq!(DEFAULT_FSW_TEXT_QUIET_MS, 5000);
+        assert_eq!(MIN_FSW_TEXT_QUIET_MS, 250);
+        let cases = [
+            (None, DEFAULT_FSW_TEXT_QUIET_MS),
+            (Some("3000"), 3000),
+            (Some(" 1500 "), 1500),
+            (Some("0"), MIN_FSW_TEXT_QUIET_MS),
+            (Some("249"), MIN_FSW_TEXT_QUIET_MS),
+            (Some("250"), 250),
+            (Some(""), DEFAULT_FSW_TEXT_QUIET_MS),
+            (Some("abc"), DEFAULT_FSW_TEXT_QUIET_MS),
+            (Some("-1"), DEFAULT_FSW_TEXT_QUIET_MS),
+        ];
+        for (env_val, expected) in cases {
+            assert_eq!(
+                resolve_fsw_text_quiet_ms(env_val),
+                expected,
+                "env value: {env_val:?}"
             );
         }
     }
@@ -4565,15 +4832,17 @@ mod tests {
         );
     }
 
-    /// The branch-change full rebuild must queue behind the shared guard so it
-    /// cannot overlap the incremental or restore-input rebuilds on one LMDB db.
+    /// The runner's passes queue behind the shared guard so they cannot
+    /// overlap each other (or a legacy concurrent rebuild) on one LMDB db.
     #[tokio::test]
-    async fn branch_change_symbol_rebuild_waits_for_shared_guard() {
+    async fn symbol_rebuild_runner_waits_for_shared_guard() {
         let temp = tempdir().unwrap();
         let guard = Arc::new(std::sync::Mutex::new(()));
         let held = guard.lock().unwrap();
+        let queue = Arc::new(std::sync::Mutex::new(SymbolRebuildQueue::default()));
+        queue.lock().unwrap().enqueue_full(PendingFullKind::Branch);
 
-        let handle = IndexManager::spawn_branch_change_symbol_rebuild(
+        let handle = IndexManager::spawn_symbol_rebuild_runner(
             Arc::new(SymbolIndexerRegistry::new()),
             temp.path().to_path_buf(),
             temp.path().join("db"),
@@ -4582,6 +4851,7 @@ mod tests {
             None,
             CancellationToken::new(),
             guard.clone(),
+            queue.clone(),
         );
 
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -4599,6 +4869,139 @@ mod tests {
         assert!(
             guard.try_lock().is_ok(),
             "guard must be released after the rebuild"
+        );
+        let q = queue.lock().unwrap();
+        assert!(
+            !q.runner_alive,
+            "the runner must release the slot once the queue is empty"
+        );
+        assert!(q.is_empty(), "the executed pass must have been drained");
+    }
+
+    /// Coalescing: flushes merged while a runner is busy produce exactly ONE
+    /// extra pass with the merged sets — never one pass per flush — and the
+    /// runner slot is released only by the empty re-check, never by a flush.
+    #[test]
+    fn pending_symbol_rebuilds_coalesce_into_one_extra_pass() {
+        let mut q = SymbolRebuildQueue::default();
+        assert!(q.ensure_runner(), "first flush spawns the runner");
+
+        q.enqueue_csharp(vec![PathBuf::from("a.cs")], vec![]);
+        // Flush lands while the runner is busy: it must merge, not spawn.
+        assert!(!q.ensure_runner(), "a live runner suppresses the spawn");
+        q.enqueue_csharp(vec![PathBuf::from("b.cs")], vec![PathBuf::from("c.cs")]);
+        q.enqueue_typescript(vec![PathBuf::from("d.ts")], vec![]);
+
+        let Some(RebuildPass::Incremental {
+            cs_modified,
+            cs_deleted,
+            ts_modified,
+            ts_deleted,
+        }) = q.take_pass()
+        else {
+            panic!("a queued pass must be waiting");
+        };
+        assert_eq!(
+            cs_modified.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([PathBuf::from("a.cs"), PathBuf::from("b.cs")]),
+            "flushes during a pass must merge into one set"
+        );
+        assert_eq!(
+            cs_deleted.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([PathBuf::from("c.cs")])
+        );
+        assert_eq!(
+            ts_modified.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([PathBuf::from("d.ts")])
+        );
+        assert!(ts_deleted.is_empty());
+
+        // The re-check after the pass finds nothing and releases the slot.
+        assert_eq!(q.take_pass(), None);
+        assert!(!q.runner_alive);
+        assert!(q.ensure_runner(), "released slot → next flush spawns again");
+    }
+
+    /// FULL precedence: a pending full absorbs the pending C# incrementals;
+    /// a restore full leaves TS sets pending (its pass rebuilds C# only),
+    /// a branch full absorbs TS sets too; full kinds upgrade monotonically
+    /// toward Branch, never downgrade.
+    #[test]
+    fn pending_full_absorbs_pending_incrementals() {
+        let mut q = SymbolRebuildQueue::default();
+        assert!(q.ensure_runner(), "the flush spawns the runner");
+        q.enqueue_csharp(vec![PathBuf::from("a.cs")], vec![PathBuf::from("b.cs")]);
+        q.enqueue_full(PendingFullKind::CSharpRestore);
+
+        assert_eq!(
+            q.take_pass(),
+            Some(RebuildPass::Full { branch: false }),
+            "the pending full must win over the queued incrementals"
+        );
+        assert!(
+            q.is_empty(),
+            "the absorbed incrementals must be dropped, not deferred"
+        );
+        assert!(
+            q.runner_alive,
+            "a full pass must not release the runner slot"
+        );
+        assert_eq!(q.take_pass(), None, "the next re-check must find nothing");
+
+        // A restore full rebuilds C# only, so it must NOT absorb pending TS
+        // incrementals — clearing them would leave the TS index stale until
+        // the next .ts event.
+        let mut q = SymbolRebuildQueue::default();
+        q.enqueue_typescript(vec![PathBuf::from("a.ts")], vec![PathBuf::from("b.ts")]);
+        q.enqueue_full(PendingFullKind::CSharpRestore);
+        assert_eq!(
+            q.take_pass(),
+            Some(RebuildPass::Full { branch: false }),
+            "the restore full still runs before the queued TS work"
+        );
+        assert!(
+            !q.is_empty(),
+            "the restore full must leave the TS sets pending"
+        );
+        assert_eq!(
+            q.take_pass(),
+            Some(RebuildPass::Incremental {
+                cs_modified: vec![],
+                cs_deleted: vec![],
+                ts_modified: vec![PathBuf::from("a.ts")],
+                ts_deleted: vec![PathBuf::from("b.ts")],
+            }),
+            "the next pass must rebuild the still-pending TS sets"
+        );
+        assert_eq!(q.take_pass(), None, "queue drained after the TS pass");
+
+        // A branch full re-derives both languages, so it absorbs TS sets too.
+        let mut q = SymbolRebuildQueue::default();
+        q.enqueue_typescript(vec![PathBuf::from("a.ts")], vec![PathBuf::from("b.ts")]);
+        q.enqueue_full(PendingFullKind::Branch);
+        assert_eq!(
+            q.take_pass(),
+            Some(RebuildPass::Full { branch: true }),
+            "the branch full wins over the queued TS work"
+        );
+        assert!(q.is_empty(), "the branch full absorbs the TS sets too");
+
+        let mut q = SymbolRebuildQueue::default();
+        q.enqueue_full(PendingFullKind::CSharpRestore);
+        q.enqueue_full(PendingFullKind::Branch);
+        assert_eq!(
+            q.take_pass(),
+            Some(RebuildPass::Full { branch: true }),
+            "a branch full must upgrade a pending restore full"
+        );
+
+        let mut q = SymbolRebuildQueue::default();
+        q.enqueue_full(PendingFullKind::Branch);
+        q.enqueue_full(PendingFullKind::CSharpRestore);
+        assert_eq!(
+            q.take_pass(),
+            Some(RebuildPass::Full { branch: true }),
+            "a branch full is never downgraded by a later restore full"
         );
     }
 
