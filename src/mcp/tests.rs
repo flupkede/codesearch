@@ -2699,6 +2699,7 @@ fn build_remote_search_body_forwards_min_score_to_peers() {
         limit: None,
         project: None,
         group: None,
+        cwd: None,
     };
     let body = super::CodesearchService::build_remote_search_body(&request, "semantic", Some(50));
     let got = body["min_score"]
@@ -2836,6 +2837,7 @@ async fn search_refuses_min_score_in_literal_mode_by_name() {
         limit: None,
         project: None,
         group: None,
+        cwd: None,
     };
     let res = service
         .search(Parameters(request))
@@ -4078,4 +4080,38 @@ fn test_root_mismatch_warns_only_on_different_project() {
     assert_eq!(super::root_mismatch_in(&[main_path2], &cfg, "main"), None);
     // No roots → no warning (unchanged behaviour).
     assert_eq!(super::root_mismatch_in(&[], &cfg, "wt"), None);
+}
+
+// === cwd-based scoping (remote-MCP worktree safety) ===
+
+#[test]
+fn test_effective_scoping_roots_precedence() {
+    let session = [PathBuf::from("/repos/demo")];
+    // Session roots win over the agent-supplied cwd.
+    assert_eq!(
+        super::effective_scoping_roots(&session, Some("C:/other")),
+        vec![PathBuf::from("/repos/demo")]
+    );
+    // No roots -> the cwd is the synthetic root.
+    assert_eq!(
+        super::effective_scoping_roots(&[], Some("/repos/demo")),
+        vec![PathBuf::from("/repos/demo")]
+    );
+    // No roots, no cwd -> empty (historical scope_required behaviour).
+    assert!(super::effective_scoping_roots(&[], None).is_empty());
+}
+
+#[test]
+fn test_extract_tool_cwd() {
+    use rmcp::model::JsonObject;
+    let mut args = JsonObject::new();
+    assert_eq!(super::extract_tool_cwd(&None), None);
+    assert_eq!(super::extract_tool_cwd(&Some(args.clone())), None);
+    args.insert("cwd".into(), serde_json::json!("  C:/repo  "));
+    assert_eq!(
+        super::extract_tool_cwd(&Some(args.clone())),
+        Some("C:/repo".to_string())
+    );
+    args.insert("cwd".into(), serde_json::json!("   "));
+    assert_eq!(super::extract_tool_cwd(&Some(args)), None);
 }

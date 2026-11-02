@@ -76,6 +76,12 @@ pub struct SearchRequest {
     /// Route to all projects in a group (requires `codesearch serve`).
     #[serde(default)]
     pub group: Option<String>,
+
+    /// Absolute working directory of the agent's session (worktree-safe
+    /// scoping). With no `project`/`group` and no MCP roots, scopes to the
+    /// registered project whose `project_path` equals this directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// Unified symbol navigation request — replaces `find_definition`, `find_usages`,
@@ -102,6 +108,12 @@ pub struct FindRequest {
     /// Route to all projects in a group (requires `codesearch serve`).
     #[serde(default)]
     pub group: Option<String>,
+
+    /// Absolute working directory of the agent's session (worktree-safe
+    /// scoping). With no `project`/`group` and no MCP roots, scopes to the
+    /// registered project whose `project_path` equals this directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// Unified exploration request — replaces `file_outline` and `similar_chunks`.
@@ -125,6 +137,12 @@ pub struct ExploreRequest {
     /// Route to all projects in a group (requires `codesearch serve`).
     #[serde(default)]
     pub group: Option<String>,
+
+    /// Absolute working directory of the agent's session (worktree-safe
+    /// scoping). With no `project`/`group` and no MCP roots, scopes to the
+    /// registered project whose `project_path` equals this directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// Unified status/info request — replaces `index_status` and `list_projects`.
@@ -187,6 +205,12 @@ pub struct FindImpactRequest {
     /// Route to all projects in a group (requires `codesearch serve`).
     #[serde(default)]
     pub group: Option<String>,
+
+    /// Absolute working directory of the agent's session (worktree-safe
+    /// scoping). With no `project`/`group` and no MCP roots, scopes to the
+    /// registered project whose `project_path` equals this directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -491,6 +515,11 @@ pub struct GetChunkRequest {
     pub project: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// Absolute working directory of the agent's session (worktree-safe
+    /// scoping). With no `project`/`group` and no MCP roots, scopes to the
+    /// registered project whose `project_path` equals this directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// Response payload for get_chunk

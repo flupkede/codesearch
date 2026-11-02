@@ -20,6 +20,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **The serve hub resolves `project` from the client's working directory (worktree-safe scoping).** On the first tool call the hub asks the MCP client for its roots and maps a root that exactly matches one registered `project_path` to that index (case-insensitive on Windows, unified separators; zero or multiple matches keep the `scope_required` behaviour). An explicit `project` that differs from the working directory's own index is served with a `warnings` entry naming both aliases, so an agent reasoning over the wrong checkout gets told instead of misled. Because real clients (Claude Code, opencode) send no roots over direct HTTP, the stdio proxy (`codesearch mcp`) now advertises the roots capability and answers `roots/list` with its own working directory — clients configured through the shim get correct worktree scoping automatically. `get_chunk` narrows its fan-out via roots (touch=false preserved); status keeps the full hub overview.
 
+### Changed
+
+- **Worktree-safe scoping now also works for remote-HTTP clients: every scopeable tool accepts a `cwd` argument.** Real MCP clients never send roots over direct HTTP, so root-based resolution alone could not help the common topology. An agent now passes its absolute working directory on search/find/find_impact/explore/get_chunk and the hub scopes to that directory's own registered index (exact normalized match; precedence: explicit `project`/`group` wins, then roots, then `cwd`). Querying an explicit project that differs from the working directory surfaces the mismatch as a `warnings` entry.
+
 ## [1.7.5]
 
 ### Changed

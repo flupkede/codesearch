@@ -384,6 +384,7 @@ fn find_impact_request() -> FindImpactRequest {
         language: Some("csharp".to_string()),
         project: None,
         group: None,
+        cwd: None,
     }
 }
 

@@ -1274,8 +1274,12 @@ impl CodesearchService {
     fn resolve_root_project(
         &self,
         cfg: &crate::db_discovery::repos::ReposConfig,
+        cwd: Option<&str>,
     ) -> Option<String> {
-        resolve_root_project_in(&self.session_roots_snapshot(), cfg)
+        resolve_root_project_in(
+            &effective_scoping_roots(&self.session_roots_snapshot(), cwd),
+            cfg,
+        )
     }
 
     /// Caller-facing warning for an explicit `project` that differs from the
@@ -1287,8 +1291,13 @@ impl CodesearchService {
         &self,
         cfg: &crate::db_discovery::repos::ReposConfig,
         alias: &str,
+        cwd: Option<&str>,
     ) -> Option<String> {
-        root_mismatch_in(&self.session_roots_snapshot(), cfg, alias)
+        root_mismatch_in(
+            &effective_scoping_roots(&self.session_roots_snapshot(), cwd),
+            cfg,
+            alias,
+        )
     }
 
     /// Resolve project/group parameters to a specific `Arc<SharedStores>`.
@@ -1312,6 +1321,7 @@ impl CodesearchService {
         group: &Option<String>,
         allow_unscoped: bool,
         root_scopable: bool,
+        tool_cwd: Option<&str>,
     ) -> std::result::Result<Option<(Vec<Arc<SharedStores>>, Vec<String>)>, String> {
         // No routing params → resolve based on repo count
         if project.is_none() && group.is_none() {
@@ -1324,7 +1334,7 @@ impl CodesearchService {
                 // deliberately avoids spawning FSW from it. status keeps the
                 // full fan-out: its scope-free answer IS the hub overview.
                 if root_scopable {
-                    if let Some(alias) = self.resolve_root_project(&cfg) {
+                    if let Some(alias) = self.resolve_root_project(&cfg, tool_cwd) {
                         let stores = serve_state
                             .get_or_open_stores(&alias, !allow_unscoped)
                             .await?;
@@ -1404,8 +1414,17 @@ impl CodesearchService {
         // fan-out; status keeps the full fan-out (its scope-free answer is the
         // hub overview).
         let root_scopable = !allow_unscoped || tool_name == "get_chunk";
+        // Agent-supplied working directory (remote-HTTP clients never send
+        // roots); outside a tool dispatch this reads as None.
+        let tool_cwd = TOOL_CWD.try_with(|c| c.clone()).unwrap_or(None);
         let resolved = self
-            .resolve_repo_stores_multi(project, group, allow_unscoped, root_scopable)
+            .resolve_repo_stores_multi(
+                project,
+                group,
+                allow_unscoped,
+                root_scopable,
+                tool_cwd.as_deref(),
+            )
             .await?;
         let is_multi = resolved
             .as_ref()
@@ -1452,7 +1471,8 @@ impl CodesearchService {
         if let Some(alias) = project {
             if let Some(ref serve_state) = self.serve_state {
                 let cfg = serve_state.config_snapshot();
-                if let Some(warning) = self.root_mismatch_warning(&cfg, alias) {
+                if let Some(warning) = self.root_mismatch_warning(&cfg, alias, tool_cwd.as_deref())
+                {
                     routing_warnings.push(warning);
                 }
             }
@@ -2410,6 +2430,7 @@ pub(crate) async fn rest_get_chunk_handler(
         chunk_ref: params.get("chunk_ref").cloned(),
         context_lines: params.get("context_lines").and_then(|s| s.parse().ok()),
         project: params.get("project").cloned(),
+        cwd: None,
         group: params.get("group").cloned(),
     };
     let service = make_service(&state)?;
@@ -2552,6 +2573,34 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+tokio::task_local! {
+    /// Working directory the agent passed as a tool-call `cwd` argument —
+    /// set by `call_tool` from the raw arguments for the duration of the
+    /// dispatch, read by `resolve_routing`. Task-local so concurrent tool
+    /// calls on one session never see each other's value; outside a scoped
+    /// dispatch (REST handlers) it reads as `None`.
+    static TOOL_CWD: Option<String>;
+}
+
+/// Extract the optional `cwd` argument from raw tool-call arguments.
+fn extract_tool_cwd(args: &Option<rmcp::model::JsonObject>) -> Option<String> {
+    let args = args.as_ref()?;
+    args.get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Roots for scope resolution: the session's MCP roots when present, else the
+/// agent-supplied `cwd` (remote-HTTP clients never send roots, but the agent
+/// always knows its own working directory). Pure so precedence is testable.
+fn effective_scoping_roots(session: &[PathBuf], cwd: Option<&str>) -> Vec<PathBuf> {
+    if !session.is_empty() {
+        return session.to_vec();
+    }
+    cwd.map(|c| vec![PathBuf::from(c)]).unwrap_or_default()
+}
+
 #[tool_handler(router = Self::merged_tool_router())]
 impl ServerHandler for CodesearchService {
     /// Fetch the client's MCP roots once per session, then dispatch to the
@@ -2569,8 +2618,11 @@ impl ServerHandler for CodesearchService {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<rmcp::model::CallToolResponse, McpError> {
         self.ensure_session_roots(&context.peer).await;
+        let cwd = extract_tool_cwd(&request.arguments);
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        Self::merged_tool_router().call(tcc).await
+        TOOL_CWD
+            .scope(cwd, Self::merged_tool_router().call(tcc))
+            .await
     }
 
     /// The client changed its roots — drop the cache so the next tool call
