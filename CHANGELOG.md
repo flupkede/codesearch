@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.6]
+
+### Added
+
+- **The serve hub resolves `project` from the client's working directory (worktree-safe scoping).** On the first tool call the hub asks the MCP client for its roots and maps a root that exactly matches one registered `project_path` to that index (case-insensitive on Windows, unified separators; zero or multiple matches keep the `scope_required` behaviour). An explicit `project` that differs from the working directory's own index is served with a `warnings` entry naming both aliases, so an agent reasoning over the wrong checkout gets told instead of misled. Because real clients (Claude Code, opencode) send no roots over direct HTTP, the stdio proxy (`codesearch mcp`) now advertises the roots capability and answers `roots/list` with its own working directory — clients configured through the shim get correct worktree scoping automatically. `get_chunk` narrows its fan-out via roots (touch=false preserved); status keeps the full hub overview.
+
 ## [1.7.5]
 
 ### Changed
