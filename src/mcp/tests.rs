@@ -3934,3 +3934,148 @@ fn single_index_status_reports_building_while_a_rebuild_runs() {
     let (_, message) = super::single_index_status(403, true, true);
     assert!(message.contains("rebuild"), "got: {message}");
 }
+
+// === Session-root project resolution (todo #270) ===
+//
+// Pure matching rules: a session root picks a registered project only on an
+// exact normalized match (separators unified, case-insensitive on Windows),
+// zero-or-multiple matches stay unresolved, and an explicit project that
+// differs from the root project yields the routing warning.
+
+use std::path::PathBuf;
+
+fn root_repos_config() -> crate::db_discovery::repos::ReposConfig {
+    // Registered project paths look platform-native, like repos.json holds them.
+    let (main, wt, other) = if cfg!(windows) {
+        (
+            "C:/repos/demo",
+            "C:/repos/demo.worktrees/wt",
+            "C:/repos/other",
+        )
+    } else {
+        ("/repos/demo", "/repos/demo.worktrees/wt", "/repos/other")
+    };
+    crate::db_discovery::repos::ReposConfig {
+        repos: [("main", main), ("wt", wt), ("other", other)]
+            .iter()
+            .map(|(alias, path)| (alias.to_string(), PathBuf::from(path)))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_root_uri_to_path_parses_file_uris() {
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            super::root_uri_to_path("file:///C:/repos/demo"),
+            Some(PathBuf::from("C:/repos/demo"))
+        );
+        // Two-slash form some clients emit.
+        assert_eq!(
+            super::root_uri_to_path("file://C:/repos/demo"),
+            Some(PathBuf::from("C:/repos/demo"))
+        );
+        // Not a Windows drive root — rejected rather than guessed at.
+        assert_eq!(super::root_uri_to_path("file:///repos/demo"), None);
+        // Percent-escaped space.
+        assert_eq!(
+            super::root_uri_to_path("file:///C:/Work%20Area/repo"),
+            Some(PathBuf::from("C:/Work Area/repo"))
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(
+            super::root_uri_to_path("file:///repos/demo"),
+            Some(PathBuf::from("/repos/demo"))
+        );
+    }
+    // Non-file URIs never become paths.
+    assert_eq!(super::root_uri_to_path("https://example.com/x"), None);
+}
+
+#[test]
+fn test_file_uri_round_trip() {
+    let p = if cfg!(windows) {
+        PathBuf::from(r"C:\repos\demo")
+    } else {
+        PathBuf::from("/repos/demo")
+    };
+    let uri = super::runtime::file_uri_from_path(&p);
+    assert!(uri.starts_with("file://"));
+    assert_eq!(super::root_uri_to_path(&uri), Some(p));
+}
+
+#[cfg(windows)]
+#[test]
+fn test_normalize_root_key_windows_case_and_separators() {
+    assert_eq!(
+        super::normalize_root_key(std::path::Path::new(r"C:\Repos\Demo")),
+        super::normalize_root_key(std::path::Path::new("c:/repos/demo"))
+    );
+}
+
+#[test]
+fn test_resolve_root_project_exact_match_only() {
+    let cfg = root_repos_config();
+    let (main_path, wt_path) = if cfg!(windows) {
+        (r"C:\repos\demo", r"C:\repos\demo.worktrees\wt")
+    } else {
+        ("/repos/demo", "/repos/demo.worktrees/wt")
+    };
+    // Exact match.
+    assert_eq!(
+        super::resolve_root_project_in(&[PathBuf::from(main_path)], &cfg),
+        Some("main".to_string())
+    );
+    // No match → None.
+    assert_eq!(
+        super::resolve_root_project_in(&[PathBuf::from("/nowhere")], &cfg),
+        None
+    );
+    // Two roots matching two projects → ambiguous → None.
+    assert_eq!(
+        super::resolve_root_project_in(&[PathBuf::from(main_path), PathBuf::from(wt_path)], &cfg),
+        None
+    );
+    // Empty roots → None (no roots, no resolution).
+    assert_eq!(super::resolve_root_project_in(&[], &cfg), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn test_resolve_root_project_case_and_separator_insensitive() {
+    let cfg = root_repos_config();
+    // Registered as /repos/demo; the client may report any casing/separator.
+    assert_eq!(
+        super::resolve_root_project_in(&[PathBuf::from(r"C:\REPOS\DEMO")], &cfg),
+        Some("main".to_string())
+    );
+}
+
+#[test]
+fn test_root_mismatch_warns_only_on_different_project() {
+    let cfg = root_repos_config();
+    let main_path = if cfg!(windows) {
+        PathBuf::from(r"C:\repos\demo")
+    } else {
+        PathBuf::from("/repos/demo")
+    };
+    // Root project differs from the queried alias → warning names both.
+    let warning = super::root_mismatch_in(&[main_path], &cfg, "wt");
+    let warning = warning.expect("mismatch must warn");
+    assert!(warning.contains("'main'"), "got: {warning}");
+    assert!(warning.contains("'wt'"), "got: {warning}");
+    assert!(warning.contains("working directory"), "got: {warning}");
+    // Queried alias IS the root project → no warning.
+    let main_path2 = if cfg!(windows) {
+        PathBuf::from(r"C:\repos\demo")
+    } else {
+        PathBuf::from("/repos/demo")
+    };
+    assert_eq!(super::root_mismatch_in(&[main_path2], &cfg, "main"), None);
+    // No roots → no warning (unchanged behaviour).
+    assert_eq!(super::root_mismatch_in(&[], &cfg, "wt"), None);
+}
