@@ -301,6 +301,11 @@ pub struct CodesearchService {
     // not fetched yet; `Some` (possibly empty) = fetched, empty meaning the
     // client has no roots or no roots support.
     session_roots: RwLock<Option<Arc<Vec<PathBuf>>>>,
+    // Bumped on every roots/list_changed invalidation. The fetcher snapshots
+    // it before the round-trip and stores only if it is unchanged — a None
+    // sentinel cannot record that an invalidation happened mid-fetch, an
+    // epoch can.
+    roots_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for CodesearchService {
@@ -1035,6 +1040,7 @@ impl CodesearchService {
             symbol_registry: Arc::new(SymbolIndexerRegistry::new()),
             tracks_session: false,
             session_roots: RwLock::new(None),
+            roots_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1062,6 +1068,7 @@ impl CodesearchService {
             symbol_registry,
             tracks_session: false,
             session_roots: RwLock::new(None),
+            roots_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1200,6 +1207,7 @@ impl CodesearchService {
         if already_fetched {
             return;
         }
+        let my_epoch = self.roots_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let roots: Vec<PathBuf> = if self.serve_state.is_none() {
             vec![]
         } else if peer
@@ -1232,11 +1240,14 @@ impl CodesearchService {
         } else {
             vec![]
         };
-        // Store only if no roots/list_changed invalidation landed while the
-        // fetch was in flight: the handler sets None, and a pre-change result
-        // must never outlive it — the next tool call then fetches fresh.
+        // Store only if nothing invalidated the cache while the fetch was in
+        // flight (epoch unchanged) and no fresher fetch stored first. A stale
+        // result must never pin the session's scoping; the next tool call
+        // fetches fresh instead.
         let mut roots_slot = self.session_roots.write().unwrap();
-        if roots_slot.is_none() {
+        if roots_slot.is_none()
+            && self.roots_epoch.load(std::sync::atomic::Ordering::SeqCst) == my_epoch
+        {
             *roots_slot = Some(Arc::new(roots));
         }
     }
@@ -2569,6 +2580,8 @@ impl ServerHandler for CodesearchService {
         _context: rmcp::service::NotificationContext<rmcp::RoleServer>,
     ) {
         *self.session_roots.write().unwrap() = None;
+        self.roots_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn get_info(&self) -> ServerConfig {
