@@ -1232,7 +1232,13 @@ impl CodesearchService {
         } else {
             vec![]
         };
-        *self.session_roots.write().unwrap() = Some(Arc::new(roots));
+        // Store only if no roots/list_changed invalidation landed while the
+        // fetch was in flight: the handler sets None, and a pre-change result
+        // must never outlive it — the next tool call then fetches fresh.
+        let mut roots_slot = self.session_roots.write().unwrap();
+        if roots_slot.is_none() {
+            *roots_slot = Some(Arc::new(roots));
+        }
     }
 
     /// The session's MCP roots (empty when none were fetched or the fetch has
