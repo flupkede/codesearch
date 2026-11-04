@@ -24,6 +24,16 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Worktree-safe scoping now also works for remote-HTTP clients: every scopeable tool accepts a `cwd` argument.** Real MCP clients never send roots over direct HTTP, so root-based resolution alone could not help the common topology. An agent now passes its absolute working directory on search/find/find_impact/explore/get_chunk and the hub scopes to that directory's own registered index (exact normalized match; precedence: explicit `project`/`group` wins, then roots, then `cwd`). Querying an explicit project that differs from the working directory surfaces the mismatch as a `warnings` entry.
 
+## [1.7.9]
+
+### Fixed
+
+- **Migrated to the sysinfo 0.40 fallible `System` constructors.** sysinfo 0.40 removed the infallible `System::new()`/`new_with_specifics()` in favour of `try_new()` variants; all call sites now handle construction failure explicitly instead of relying on removed APIs.
+
+### Changed
+
+- **Dependency bumps: sysinfo 0.39.6→0.40.1, tree-sitter-dart 0.2.0→0.3.0, and a cargo minor-and-patch group update (4 crates) — no API changes on our call sites beyond the sysinfo migration above.**
+
 ## [1.7.5]
 
 ### Changed
