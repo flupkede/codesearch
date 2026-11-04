@@ -94,6 +94,7 @@ async fn get_chunk_routes_mounted_remote_projects_through_federation() {
         context_lines: None,
         project: Some("cloud/bynder".to_string()),
         group: None,
+        cwd: None,
     };
     let res = service
         .get_chunk(rmcp::handler::server::wrapper::Parameters(req))
@@ -5219,6 +5220,7 @@ async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
         language: Some("csharp".to_string()),
         project: Some("healrepo".to_string()),
         group: None,
+        cwd: None,
     };
     // The REST mirror builds its own serve-mode service from the state —
     // the same path the MCP tool takes for a project-scoped query.
@@ -5869,6 +5871,7 @@ async fn group_find_definition_attributes_hit_to_origin_repo_on_id_collision() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     let res = service
         .find(Parameters(request))
@@ -6015,6 +6018,7 @@ async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
         context_lines: Some(2),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     let res = service
         .get_chunk(Parameters(req))
@@ -6130,6 +6134,7 @@ async fn get_chunk_reports_the_real_chunker_editor_line_unchanged() {
         context_lines: Some(1),
         project: None,
         group: None,
+        cwd: None,
     };
     let res = service
         .get_chunk(Parameters(req))
@@ -6228,6 +6233,7 @@ async fn get_chunk_notes_stale_source_newer_than_last_indexing_write() {
         context_lines: None,
         project: None,
         group: None,
+        cwd: None,
     };
     let res = service
         .get_chunk(Parameters(req))
@@ -6305,6 +6311,7 @@ async fn semantic_search_refuses_when_the_model_is_not_cached() {
         limit: None,
         project: Some("solo".to_string()),
         group: None,
+        cwd: None,
     };
     let res = service
         .search(Parameters(req))
@@ -6339,6 +6346,7 @@ async fn group_find_skips_a_write_locked_store_instead_of_waiting() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     service
         .find(Parameters(prime))
@@ -6357,6 +6365,7 @@ async fn group_find_skips_a_write_locked_store_instead_of_waiting() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     let res = service
         .find(Parameters(request))
@@ -6403,6 +6412,7 @@ async fn group_get_chunk_skips_a_write_locked_candidate_repo() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     service
         .find(Parameters(prime))
@@ -6422,6 +6432,7 @@ async fn group_get_chunk_skips_a_write_locked_candidate_repo() {
         context_lines: None,
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     let res = service
         .get_chunk(Parameters(req))
@@ -6457,6 +6468,7 @@ async fn group_similar_skips_a_write_locked_store_instead_of_waiting() {
         limit: Some(5),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     service
         .explore(Parameters(prime))
@@ -6741,6 +6753,7 @@ async fn group_semantic_search_min_score_refuses_instead_of_returning_noise() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
 
     // An unreachable threshold must refuse with an explanation, not return

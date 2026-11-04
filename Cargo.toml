@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.7.5"
+version = "1.7.9"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -53,7 +53,7 @@ tree-sitter-php = "0.25.1"
 tree-sitter-yaml = "0.7.2"
 tree-sitter-json = "0.24.8"
 tree-sitter-md = "0.5.3"
-tree-sitter-dart = "0.2.0"
+tree-sitter-dart = "0.3.0"
 tree-sitter-proto = "0.6"
 
 # File handling
@@ -115,7 +115,7 @@ rand = "0.10"
 rmcp = { version = "3.3.0", features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros"] }
 schemars = { version = "1.1.0", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-sysinfo = { version = "0.39", default-features = true }
+sysinfo = { version = "0.40", default-features = true }
 
 [patch.crates-io]
 # Vendored copy of rmcp 3.5.0 with the [codesearch bridge] change in
