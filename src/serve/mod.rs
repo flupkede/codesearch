@@ -542,7 +542,10 @@ impl RebuildDecision {
 
 impl ServeState {
     fn new(config: ReposConfig, config_path_override: Option<PathBuf>) -> Self {
-        let mut sys = sysinfo::System::new();
+        // sysinfo 0.40's constructor is fallible; failing it means the OS
+        // refuses basic system queries — nothing downstream can work, so a
+        // clear startup panic beats a hub with dead CPU metrics.
+        let mut sys = sysinfo::System::new().expect("sysinfo System::new");
         sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
         Self {
             repos: DashMap::new(),

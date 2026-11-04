@@ -103,7 +103,15 @@ pub fn max_chunks_per_batch() -> usize {
 
 /// Available (reclaimable) system memory in MB, read fresh on each call.
 pub fn available_memory_mb() -> u64 {
-    let mut sys = sysinfo::System::new();
+    let mut sys = match sysinfo::System::new() {
+        Ok(s) => s,
+        Err(e) => {
+            // Unmeasurable must not block jobs behind the memory floor: the
+            // wait loop has its own deadline and starts anyway.
+            tracing::debug!("sysinfo unavailable ({e}); skipping the free-memory floor");
+            return u64::MAX;
+        }
+    };
     sys.refresh_memory();
     sys.available_memory() / (1024 * 1024)
 }
