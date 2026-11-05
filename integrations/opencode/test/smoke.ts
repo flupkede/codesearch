@@ -65,8 +65,16 @@ const STATUS = {
   hub: { indexed: true, status: "ready" },
 }
 
-function startMockServer(): Promise<{ url: string; close: () => Promise<void>; calls: Loose[] }> {
+function startMockServer(): Promise<{
+  url: string
+  close: () => Promise<void>
+  calls: Loose[]
+  setIndexing: (value: boolean) => void
+  indexingRequests: string[]
+}> {
   const calls: Loose[] = []
+  let indexing = false
+  const indexingRequests: string[] = []
   const server = http.createServer((req, res) => {
     let body = ""
     req.on("data", (chunk) => (body += chunk))
@@ -74,6 +82,12 @@ function startMockServer(): Promise<{ url: string; close: () => Promise<void>; c
       if (req.url === "/healthz") {
         res.writeHead(200, { "content-type": "application/json" })
         res.end('{"status":"ok"}')
+        return
+      }
+      if (req.url?.startsWith("/indexing")) {
+        indexingRequests.push(new URL(req.url, "http://x").searchParams.get("path") ?? "")
+        res.writeHead(200, { "content-type": "application/json" })
+        res.end(JSON.stringify({ covered: true, alias: "my-service", indexing }))
         return
       }
       if (req.url !== "/mcp" || req.method !== "POST") {
@@ -152,6 +166,10 @@ function startMockServer(): Promise<{ url: string; close: () => Promise<void>; c
             server.close(() => done(undefined))
           }),
         calls,
+        setIndexing: (value: boolean) => {
+          indexing = value
+        },
+        indexingRequests,
       })
     })
   })
@@ -508,6 +526,45 @@ async function main(): Promise<void> {
   await uncovered.app.toolHooks["execute.before"][0]({ tool: "grep", input: {}, sessionID: "s4" })
   await uncovered.cleanup()
   await blocked.cleanup()
+
+  /* ---------------- block mode waits out a rebuild ---------------- */
+
+  // The mock answers GET /indexing: a covered, LIVE repo that is mid-rebuild
+  // must not deny while the guard can wait. First past the cap (grep opens),
+  // then once the rebuild lands (deny — codesearch will answer). Pins the
+  // wiring: the probe must name the project path, not some other target.
+  process.env.CODESEARCH_PLUGIN_REBUILD_WAIT_MS = "300"
+  mock.setIndexing(true)
+  const rebuild = await setupPlugin("/work/my-service")
+  const rebuildBefore = rebuild.app.toolHooks["execute.before"][0]
+  // Race the startup health probe: calls before it lands return instantly
+  // fail-open (the guard refuses to act on an unknown hub); the first
+  // /indexing hit from THIS instance (baseline = earlier sections' probes)
+  // marks the guard as hot.
+  const probeBaseline = mock.indexingRequests.length
+  for (let i = 0; i < 30 && mock.indexingRequests.length === probeBaseline; i++) {
+    await rebuildBefore({ tool: "grep", input: { pattern: "x" }, sessionID: "s7-warm" })
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  assert.ok(mock.indexingRequests.length > probeBaseline, "the guard probes /indexing once the hub probed ok")
+  const rebuildStart = Date.now()
+  await rebuildBefore({ tool: "grep", input: { pattern: "x" }, sessionID: "s7" })
+  const waited = Date.now() - rebuildStart
+  assert.ok(waited >= 250, `cap expiry opens the escape hatch mid-rebuild (took ${waited}ms)`)
+  assert.ok(waited < 5000, "cap expiry does not hang the call")
+  assert.equal(mock.indexingRequests.at(-1), "/work/my-service", "the probe asks /indexing for the project path")
+
+  mock.setIndexing(false)
+  let rebuildThrew = ""
+  try {
+    await rebuildBefore({ tool: "grep", input: { pattern: "x" }, sessionID: "s8" })
+  } catch (err) {
+    rebuildThrew = String(err)
+  }
+  assert.match(rebuildThrew, /project "my-service"/, "deny fires once the rebuild lands")
+  assert.equal(mock.indexingRequests.at(-1), "/work/my-service", "the settled probe targets the project path too")
+  delete process.env.CODESEARCH_PLUGIN_REBUILD_WAIT_MS
+  await rebuild.cleanup()
 
   /* ---------------- prune fails open while the hub is down ---------------- */
 
