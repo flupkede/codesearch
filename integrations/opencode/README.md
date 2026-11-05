@@ -179,7 +179,12 @@ Precedence, lowest to highest:
     "bash": true,
     "rescue": true,
     "rescueLimit": 5,
-    "rescueTimeoutMs": 3000
+    "rescueTimeoutMs": 3000,
+    // Deny-time rebuild wait: when the guard fires while the target repo's
+    // index is mid-rebuild, poll /indexing this long for the rebuild to land
+    // before denying (ms, 0 = deny immediately); past the cap grep opens.
+    // Env: CODESEARCH_PLUGIN_REBUILD_WAIT_MS or CODESEARCH_GREP_GUARD_WAIT_MS.
+    "rebuildWaitMs": 120000
   },
 
   "health": {
@@ -265,6 +270,15 @@ A base URL without `/mcp` is normalised by appending it, so pointing
   **only** while the hub is confirmed reachable (`/healthz` answered) and the
   repo is registered; in any other state the call proceeds. This mirrors the
   Claude Code `grep-guard` semantics and fails open the same way.
+
+**Rebuild wait** (applies to `block` and the shell-grep closure): a full
+refresh after a branch switch or file wave keeps `/healthz` green while every
+codesearch call times out, so denying in that exact window deadlocks the
+session — grep is denied exactly when it is the only working tool. Before
+denying, the guard polls `GET /indexing?path=<repo>` (up to
+`guards.rebuildWaitMs`, default 120000 ms): once the rebuild lands the deny
+fires as usual, past the cap grep opens. Older serves without the endpoint
+deny immediately, as before.
 
 **Shell-grep closure** (independent of `guards.mode`, kill switch
 `guards.bash: false` / `CODESEARCH_PLUGIN_BASH_GUARD=0`): a bash tool command

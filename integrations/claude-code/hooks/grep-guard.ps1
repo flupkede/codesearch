@@ -153,6 +153,11 @@ if ($env:CODESEARCH_GREP_GUARD_WAIT_MS) {
     if ([long]::TryParse($env:CODESEARCH_GREP_GUARD_WAIT_MS, [ref]$parsedCap) -and $parsedCap -ge 0) { $waitCapMs = $parsedCap }
 }
 
+# /indexing probe auth: a network-bound serve with require_auth_for_network
+# needs the bearer key; a local hub ignores the header entirely.
+$probeHeaders = @{}
+if ($env:CODESEARCH_API_KEY) { $probeHeaders['Authorization'] = "Bearer $env:CODESEARCH_API_KEY" }
+
 # ------------------------------------------------------------------
 # 3.5 Is the TARGET repo mid-reindex right now? (Freshness probe, #55.)
 #
@@ -171,7 +176,7 @@ if ($env:CODESEARCH_GREP_GUARD_WAIT_MS) {
 # ------------------------------------------------------------------
 try {
     $enc  = [uri]::EscapeDataString(($targetRoot -replace '\\', '/'))
-    $resp = Invoke-WebRequest -Uri "$base/indexing?path=$enc" -TimeoutSec 2 -UseBasicParsing
+    $resp = Invoke-WebRequest -Uri "$base/indexing?path=$enc" -TimeoutSec 2 -UseBasicParsing -Headers $probeHeaders
     $fresh = $resp.Content | ConvertFrom-Json
     if ($fresh.covered -eq $true -and $fresh.indexing -eq $true) {
         if ($waitCapMs -le 0) {
@@ -209,7 +214,7 @@ to proceed.
             if ($rest -le 0) { exit 0 }  # still rebuilding at the cap: grep is all you have
             Start-Sleep -Milliseconds ([Math]::Min(3000, [int]$rest))
             try {
-                $resp = Invoke-WebRequest -Uri "$base/indexing?path=$enc" -TimeoutSec 5 -UseBasicParsing
+                $resp = Invoke-WebRequest -Uri "$base/indexing?path=$enc" -TimeoutSec 5 -UseBasicParsing -Headers $probeHeaders
                 $fresh = $resp.Content | ConvertFrom-Json
                 if (-not ($fresh.covered -eq $true -and $fresh.indexing -eq $true)) {
                     $settledMsg = @"
