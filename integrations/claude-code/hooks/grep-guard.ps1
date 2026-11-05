@@ -34,10 +34,12 @@
 #     is genuinely all you have
 #
 # When the target repo is covered and LIVE but MID-REINDEX (branch switch
-# full refresh, todo #55), the deny message is a WAIT-AND-RETRY instruction
-# instead of the standard "use codesearch" one — searching a mid-rebuild
-# index returns stale/empty results and must not degrade into a manual grep
-# approval on every routine checkout.
+# full refresh, todo #55), the hook WAITS out the rebuild — polling
+# /indexing for up to CODESEARCH_GREP_GUARD_WAIT_MS (default 120s, 0 =
+# legacy instant WAIT message) — then denies with "retry codesearch now";
+# past the cap grep opens. A big-repo rebuild outlasts any polite WAIT
+# message, and denying grep while every codesearch call times out
+# deadlocks the session (the exact DRM-29395 report).
 #
 # Install: see ../README.md (or run ../install.ps1 to wire this up automatically).
 
@@ -143,6 +145,14 @@ function Test-CodesearchLive {
 $base = Get-CodesearchBaseUrl
 if (-not (Test-CodesearchLive -Base $base)) { exit 0 }
 
+# Wait-cap for an in-flight rebuild (parity with the opencode grep-guard
+# plugin). 0 = legacy behaviour: instant deny with the WAIT-AND-RETRY message.
+$waitCapMs = 120000L
+if ($env:CODESEARCH_GREP_GUARD_WAIT_MS) {
+    $parsedCap = 0L
+    if ([long]::TryParse($env:CODESEARCH_GREP_GUARD_WAIT_MS, [ref]$parsedCap) -and $parsedCap -ge 0) { $waitCapMs = $parsedCap }
+}
+
 # ------------------------------------------------------------------
 # 3.5 Is the TARGET repo mid-reindex right now? (Freshness probe, #55.)
 #
@@ -164,7 +174,8 @@ try {
     $resp = Invoke-WebRequest -Uri "$base/indexing?path=$enc" -TimeoutSec 2 -UseBasicParsing
     $fresh = $resp.Content | ConvertFrom-Json
     if ($fresh.covered -eq $true -and $fresh.indexing -eq $true) {
-        $waitMsg = @"
+        if ($waitCapMs -le 0) {
+            $waitMsg = @"
 codesearch is LIVE, but THIS repo's index is being rebuilt right now (a
 branch switch or file change fired the serve watcher's full refresh).
 Searching immediately would return stale or empty results — that is the
@@ -178,15 +189,48 @@ If the rebuild still has not landed after ~2 minutes, run your codesearch
 call anyway (a partially fresh index still beats grep) or ask the user how
 to proceed.
 "@
-        $waitOut = @{
-            hookSpecificOutput = @{
-                hookEventName            = 'PreToolUse'
-                permissionDecision       = 'deny'
-                permissionDecisionReason = $waitMsg
+            $waitOut = @{
+                hookSpecificOutput = @{
+                    hookEventName            = 'PreToolUse'
+                    permissionDecision       = 'deny'
+                    permissionDecisionReason = $waitMsg
+                }
+            }
+            $waitOut | ConvertTo-Json -Depth 10 -Compress
+            exit 0
+        }
+        # A big-repo rebuild outlasts any polite WAIT message, so the hook
+        # waits itself and only denies once queries will actually answer —
+        # or opens grep when the cap expires, the one state where grep is
+        # genuinely all you have (parity with the opencode grep-guard plugin).
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($waitCapMs)
+        while ($true) {
+            $rest = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($rest -le 0) { exit 0 }  # still rebuilding at the cap: grep is all you have
+            Start-Sleep -Milliseconds ([Math]::Min(3000, [int]$rest))
+            try {
+                $resp = Invoke-WebRequest -Uri "$base/indexing?path=$enc" -TimeoutSec 5 -UseBasicParsing
+                $fresh = $resp.Content | ConvertFrom-Json
+                if (-not ($fresh.covered -eq $true -and $fresh.indexing -eq $true)) {
+                    $settledMsg = @"
+codesearch rebuild on this repo landed while the guard waited
+(CODESEARCH_GREP_GUARD_WAIT_MS=$waitCapMs). Retry your codesearch call
+now — it will answer normally. Do NOT grep.
+"@
+                    $settledOut = @{
+                        hookSpecificOutput = @{
+                            hookEventName            = 'PreToolUse'
+                            permissionDecision       = 'deny'
+                            permissionDecisionReason = $settledMsg
+                        }
+                    }
+                    $settledOut | ConvertTo-Json -Depth 10 -Compress
+                    exit 0
+                }
+            } catch {
+                # transient probe failure mid-wait: keep polling until the cap
             }
         }
-        $waitOut | ConvertTo-Json -Depth 10 -Compress
-        exit 0
     }
 } catch {
     # 404 (older serve) or probe failure: no freshness signal — fall through
@@ -200,8 +244,8 @@ $msg = @"
 codesearch is LIVE for this repo (its /healthz probe just answered) — use it,
 do NOT fall back to Grep, and do NOT work around this via a shell grep/rg in
 the Bash tool: the same guard denies that too. Grep on an indexed internal
-path is only auto-allowed when the codesearch serve hub is actually DOWN,
-which it is not right now.
+path is only auto-allowed when the hub is DOWN or this repo's index is stuck
+mid-rebuild past the guard's wait cap — neither is the case right now.
 
 IMPORTANT: a low-confidence or EMPTY codesearch result is a SUCCESSFUL call that
 means "reformulate your query" — it does NOT mean codesearch is down and it will
