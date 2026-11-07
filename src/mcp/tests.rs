@@ -3105,7 +3105,7 @@ fn qualify_empty_result_contradicts_a_not_found_diagnosis() {
 fn qualify_empty_result_keeps_routing_notes_out_of_the_failure_count() {
     // A cwd/project mismatch is advisory: it must ride along as a Note, never
     // as "N store(s) in scope failed" — that lie sends agents debugging a
-    // healthy hub (the AprimoBase/Releases2026v19 report).
+    // healthy hub (the cross-project empty-positive-control report).
     let out = super::qualify_empty_result(
         "No definition found for 'Foo'. The symbol may not be indexed.".to_string(),
         &[super::as_routing_note(
