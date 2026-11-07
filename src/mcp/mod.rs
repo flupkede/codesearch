@@ -1467,13 +1467,15 @@ impl CodesearchService {
 
         // Explicit project that differs from the session root's own index:
         // serve it, but surface the mismatch so the agent can correct course.
+        // Marked as a routing NOTE so empty-result qualification counts only
+        // real store failures, never this advisory.
         let mut routing_warnings: Vec<String> = Vec::new();
         if let Some(alias) = project {
             if let Some(ref serve_state) = self.serve_state {
                 let cfg = serve_state.config_snapshot();
                 if let Some(warning) = self.root_mismatch_warning(&cfg, alias, tool_cwd.as_deref())
                 {
-                    routing_warnings.push(warning);
+                    routing_warnings.push(as_routing_note(warning));
                 }
             }
         }

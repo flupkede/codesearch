@@ -3102,6 +3102,65 @@ fn qualify_empty_result_contradicts_a_not_found_diagnosis() {
 }
 
 #[test]
+fn qualify_empty_result_keeps_routing_notes_out_of_the_failure_count() {
+    // A cwd/project mismatch is advisory: it must ride along as a Note, never
+    // as "N store(s) in scope failed" — that lie sends agents debugging a
+    // healthy hub (the AprimoBase/Releases2026v19 report).
+    let out = super::qualify_empty_result(
+        "No definition found for 'Foo'. The symbol may not be indexed.".to_string(),
+        &[super::as_routing_note(
+            "working directory /repos/demo has its own index 'main'; you queried 'wt'".to_string(),
+        )],
+    );
+    assert!(
+        !out.contains("store(s) in scope failed"),
+        "a routing note is not a store failure: {out}"
+    );
+    assert!(!out.contains("WARNING"), "advisory only: {out}");
+    assert!(
+        out.contains("Note: working directory /repos/demo has its own index 'main'"),
+        "the note still rides the empty answer: {out}"
+    );
+}
+
+#[test]
+fn qualify_empty_result_counts_failures_and_notes_separately() {
+    let out = super::qualify_empty_result(
+        "No definition found for 'Foo'.".to_string(),
+        &[
+            super::as_routing_note("working directory mismatch".to_string()),
+            "repo 'inriver' definition search failed: os error 22".to_string(),
+        ],
+    );
+    assert!(
+        out.contains("this result is not trustworthy — 1 store(s) in scope failed"),
+        "the count excludes the routing note: {out}"
+    );
+    assert!(out.contains("os error 22"));
+    assert!(out.contains("Note: working directory mismatch"));
+}
+
+#[test]
+fn retry_hint_ignores_routing_notes() {
+    // An advisory mismatch must not suppress a legitimate tool hint; a real
+    // store failure still does.
+    let notes = vec![super::as_routing_note(
+        "working directory mismatch".to_string(),
+    )];
+    assert_eq!(
+        super::retry_hint(Some("try explore".to_string()), &Some(notes)),
+        Some("try explore".to_string()),
+        "a routing note must not suppress the hint"
+    );
+    let failures = vec!["repo 'inriver' search failed: boom".to_string()];
+    assert_eq!(
+        super::retry_hint(Some("try explore".to_string()), &Some(failures)),
+        None,
+        "a real store failure still suppresses the hint"
+    );
+}
+
+#[test]
 fn respond_with_items_carries_warnings_on_every_path() {
     use rmcp::model::ContentBlock;
     let text = |r: Result<super::CallToolResult, super::McpError>| -> String {

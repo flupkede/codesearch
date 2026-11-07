@@ -531,11 +531,33 @@ pub(crate) fn retry_hint(
 ) -> Option<String> {
     // `is_some()` alone is wrong: an empty `Some(vec![])` means nothing failed,
     // and suppressing a legitimate hint on it would be a silent regression the
-    // moment a caller constructs the warnings vec eagerly.
-    if warnings.as_ref().is_some_and(|w| !w.is_empty()) {
+    // moment a caller constructs the warnings vec eagerly. Routing notes are
+    // advisory and must not suppress the hint either — only a real store
+    // failure does.
+    if warnings
+        .as_ref()
+        .is_some_and(|w| w.iter().any(|line| !is_routing_note(line)))
+    {
         return None;
     }
     suggested
+}
+
+/// Marker for advisory routing notes riding the warnings channel (today only
+/// the project/root mismatch from `resolve_routing`). Producers wrap with
+/// [`as_routing_note`]; consumers [`qualify_empty_result`] and
+/// [`retry_hint`] must never count these as store failures — "1 store(s) in
+/// scope failed" for a mere cwd mismatch sends agents debugging a healthy
+/// hub (and suppressed legitimate retry hints).
+pub(crate) const ROUTING_NOTE_PREFIX: &str = "NOTE: ";
+
+/// Wrap a routing warning as advisory. Pure sibling of [`is_routing_note`].
+pub(crate) fn as_routing_note(note: String) -> String {
+    format!("{ROUTING_NOTE_PREFIX}{note}")
+}
+
+fn is_routing_note(warning: &str) -> bool {
+    warning.starts_with(ROUTING_NOTE_PREFIX)
 }
 
 /// Qualify a "nothing found" message when a store in scope actually failed.
@@ -544,16 +566,33 @@ pub(crate) fn retry_hint(
 /// found — the symbol may not be indexed" is a *diagnosis*, and it is flatly
 /// wrong when the store never answered. An agent acts on it by giving up or by
 /// re-indexing something that was never broken.
+///
+/// Routing notes in `warnings` are advisory: they ride along as plain "Note:"
+/// lines and are never counted as failures.
 pub(crate) fn qualify_empty_result(message: String, warnings: &[String]) -> String {
     if warnings.is_empty() {
         return message;
     }
-    format!(
-        "{message}\n\nWARNING: this result is not trustworthy — {count} store(s) in \
+    let mut out = message;
+    for warning in warnings.iter().filter(|w| is_routing_note(w.as_str())) {
+        out.push_str("\n\nNote: ");
+        out.push_str(warning.trim_start_matches(ROUTING_NOTE_PREFIX));
+    }
+    let failures: Vec<&str> = warnings
+        .iter()
+        .filter(|w| !is_routing_note(w.as_str()))
+        .map(String::as_str)
+        .collect();
+    if failures.is_empty() {
+        return out;
+    }
+    out.push_str(&format!(
+        "\n\nWARNING: this result is not trustworthy — {count} store(s) in \
          scope failed, so \"not found\" may mean \"not searched\":\n{detail}",
-        count = warnings.len(),
-        detail = warnings.join("\n")
-    )
+        count = failures.len(),
+        detail = failures.join("\n")
+    ));
+    out
 }
 
 // Hand-written rather than derived: `derive(Default)` would demand `R: Default`,
