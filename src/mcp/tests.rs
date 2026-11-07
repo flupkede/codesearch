@@ -3352,6 +3352,23 @@ fn ambiguous_chunk_payload_is_unchanged_when_every_store_answered() {
 }
 
 #[test]
+fn ambiguous_chunk_payload_ignores_routing_notes_for_completeness() {
+    // A cwd/project mismatch says nothing about which stores answered, so it
+    // must not declare the candidate list incomplete — same conflation class
+    // the empty-result qualification shed.
+    let notes = vec![super::as_routing_note(
+        "working directory /repos/demo has its own index 'main'; you queried 'wt'".to_string(),
+    )];
+    let p = super::ambiguous_chunk_payload(123, &["akeneo", "custom-kb"], &notes);
+    let msg = p["message"].as_str().unwrap();
+    assert!(
+        !msg.contains("incomplete"),
+        "a routing note must not declare the list incomplete: {msg}"
+    );
+    assert_eq!(p["warnings"][0], notes[0].as_str());
+}
+
+#[test]
 fn respond_with_object_carries_warnings_without_disturbing_the_healthy_shape() {
     use rmcp::model::ContentBlock;
     let text = |r: Result<super::CallToolResult, super::McpError>| -> String {

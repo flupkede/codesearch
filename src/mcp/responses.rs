@@ -500,9 +500,12 @@ pub(crate) fn ambiguous_chunk_payload(
     candidate_projects: &[&str],
     warnings: &[String],
 ) -> serde_json::Value {
+    // Routing notes ride this vec too but say nothing about completeness —
+    // only a real store failure makes the candidate list incomplete.
+    let incomplete = warnings.iter().any(|w| !is_routing_note(w));
     let mut message =
         format!("chunk_id {chunk_id} exists in multiple repositories. Specify which one.");
-    if !warnings.is_empty() {
+    if incomplete {
         message.push_str(" The candidate list is incomplete — see `warnings`.");
     }
     let mut payload = serde_json::json!({
