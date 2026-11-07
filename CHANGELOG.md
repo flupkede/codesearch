@@ -29,10 +29,13 @@ finalized in place with a date — no renaming/migration step needed.
 ### Fixed
 
 - **Migrated to the sysinfo 0.40 fallible `System` constructors.** sysinfo 0.40 removed the infallible `System::new()`/`new_with_specifics()` in favour of `try_new()` variants; all call sites now handle construction failure explicitly instead of relying on removed APIs.
+- **Cross-project not-found answers no longer claim "store(s) in scope failed" for advisory routing notes.** The project/root mismatch note rode the same warnings vec the empty-result qualification counts, so every miss from a session whose working directory has its own index read as "not trustworthy — 1 store(s) in scope failed" while every store had answered — and `retry_hint` suppressed legitimate tool hints on it. Routing warnings are now marked and rendered as plain `Note:` lines; only real store failures produce the trustworthiness warning (`ambiguous_chunk_payload`'s "candidate list is incomplete" claim got the same treatment).
+- **The grep-guard hooks (Claude Code, both Windows and macOS/Linux twins) now wait out a mid-rebuild index instead of deadlocking the session.** A full refresh keeps `/healthz` green while every codesearch call times out, so denying grep in that exact window blocked the only working tool. The hooks poll `GET /indexing?path=<repo>` until the rebuild lands (then deny with "retry codesearch now"), and open grep past `CODESEARCH_GREP_GUARD_WAIT_MS` (default 120s, `0` = the legacy instant wait-and-retry instruction). The `/indexing` probes forward the bearer key on network-bound serves.
 
 ### Changed
 
 - **Dependency bumps: sysinfo 0.39.6→0.40.1, tree-sitter-dart 0.2.0→0.3.0, and a cargo minor-and-patch group update (4 crates) — no API changes on our call sites beyond the sysinfo migration above.**
+- **The OpenCode plugin's guards apply the same rebuild wait** before denying `grep`/`glob`/shell-grep: configurable via `guards.rebuildWaitMs` (default 120000 ms) or `CODESEARCH_PLUGIN_REBUILD_WAIT_MS` / `CODESEARCH_GREP_GUARD_WAIT_MS`; older serves without the endpoint deny immediately as before. See `integrations/opencode/README.md`.
 
 ## [1.7.5]
 

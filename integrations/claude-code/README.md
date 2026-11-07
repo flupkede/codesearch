@@ -53,12 +53,18 @@ that make the preference *structural* instead of advisory:
   and lets Grep through only when that probe fails. A low-confidence or
   empty codesearch *result* is a successful call ("reformulate"), not a
   dead server, so it does **not** unblock Grep. One exception: when the
-  target repo is live but **mid-reindex** (the serve watcher's full
-  refresh, e.g. right after a branch switch), the hook denies Grep with a
-  **wait-and-retry** instruction (sleep 15-30s, then re-run the
-  codesearch call) — searching a mid-rebuild index returns stale/empty
-  results and must not degrade into a manual grep approval on every
-  routine checkout. The freshness probe (`GET /indexing?path=<repo
+   target repo is live but **mid-reindex** (the serve watcher's full
+   refresh, e.g. right after a branch switch), the hook waits the rebuild
+   out itself — polling `GET /indexing?path=<repo root>` every few seconds
+   for up to `CODESEARCH_GREP_GUARD_WAIT_MS` (default 120s; `0` restores
+   the legacy instant wait-and-retry instruction) — and denies Grep with
+   a retry-codesearch instruction once the rebuild lands, so the denial
+   only fires when codesearch will actually answer. Past the cap Grep
+   opens: a big-repo rebuild outlasts any polite wait message, and
+   denying Grep while every codesearch call times out deadlocks the
+   session. The freshness probe (`GET /indexing?path=<repo
+   root>`, bearer key forwarded when `CODESEARCH_API_KEY` is set) is
+   skipped silently on serves that predate the endpoint, so
   root>`) is skipped silently on serves that predate the endpoint, so
   hook and server versions can be mixed freely. Grep against paths
   outside any git repo, or against repos codesearch does not cover, is
