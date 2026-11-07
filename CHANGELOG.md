@@ -24,18 +24,27 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Worktree-safe scoping now also works for remote-HTTP clients: every scopeable tool accepts a `cwd` argument.** Real MCP clients never send roots over direct HTTP, so root-based resolution alone could not help the common topology. An agent now passes its absolute working directory on search/find/find_impact/explore/get_chunk and the hub scopes to that directory's own registered index (exact normalized match; precedence: explicit `project`/`group` wins, then roots, then `cwd`). Querying an explicit project that differs from the working directory surfaces the mismatch as a `warnings` entry.
 
-## [1.7.9]
+## [1.7.10]
 
 ### Fixed
 
-- **Migrated to the sysinfo 0.40 fallible `System` constructors.** sysinfo 0.40 removed the infallible `System::new()`/`new_with_specifics()` in favour of `try_new()` variants; all call sites now handle construction failure explicitly instead of relying on removed APIs.
 - **Cross-project not-found answers no longer claim "store(s) in scope failed" for advisory routing notes.** The project/root mismatch note rode the same warnings vec the empty-result qualification counts, so every miss from a session whose working directory has its own index read as "not trustworthy — 1 store(s) in scope failed" while every store had answered — and `retry_hint` suppressed legitimate tool hints on it. Routing warnings are now marked and rendered as plain `Note:` lines; only real store failures produce the trustworthiness warning (`ambiguous_chunk_payload`'s "candidate list is incomplete" claim got the same treatment).
 - **The grep-guard hooks (Claude Code, both Windows and macOS/Linux twins) now wait out a mid-rebuild index instead of deadlocking the session.** A full refresh keeps `/healthz` green while every codesearch call times out, so denying grep in that exact window blocked the only working tool. The hooks poll `GET /indexing?path=<repo>` until the rebuild lands (then deny with "retry codesearch now"), and open grep past `CODESEARCH_GREP_GUARD_WAIT_MS` (default 120s, `0` = the legacy instant wait-and-retry instruction). The `/indexing` probes forward the bearer key on network-bound serves.
 
 ### Changed
 
-- **Dependency bumps: sysinfo 0.39.6→0.40.1, tree-sitter-dart 0.2.0→0.3.0, and a cargo minor-and-patch group update (4 crates) — no API changes on our call sites beyond the sysinfo migration above.**
 - **The OpenCode plugin's guards apply the same rebuild wait** before denying `grep`/`glob`/shell-grep: configurable via `guards.rebuildWaitMs` (default 120000 ms) or `CODESEARCH_PLUGIN_REBUILD_WAIT_MS` / `CODESEARCH_GREP_GUARD_WAIT_MS`; older serves without the endpoint deny immediately as before. See `integrations/opencode/README.md`.
+- **Version suffix now dates builds:** `+<count>` became `+<count>.<YYYYMMDD>` of the HEAD commit (source-dating, not wall-clock), so a week-old install reads as a week old: `codesearch 1.7.10+1724.20261107`.
+
+## [1.7.9]
+
+### Fixed
+
+- **Migrated to the sysinfo 0.40 fallible `System` constructors.** sysinfo 0.40 removed the infallible `System::new()`/`new_with_specifics()` in favour of `try_new()` variants; all call sites now handle construction failure explicitly instead of relying on removed APIs.
+
+### Changed
+
+- **Dependency bumps: sysinfo 0.39.6→0.40.1, tree-sitter-dart 0.2.0→0.3.0, and a cargo minor-and-patch group update (4 crates) — no API changes on our call sites beyond the sysinfo migration above.**
 
 ## [1.7.5]
 
