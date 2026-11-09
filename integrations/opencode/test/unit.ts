@@ -12,7 +12,7 @@
 import assert from "node:assert/strict"
 import http from "node:http"
 import type { AddressInfo } from "node:net"
-import { astGrepToolNames, bashCommandGrep, HealthRunner, stripJsonc } from "../codesearch.ts"
+import { astGrepToolNames, bashCommandGrep, HealthRunner, stripJsonc, waitRebuildSettled } from "../codesearch.ts"
 
 type Loose = Record<string, any>
 
@@ -258,10 +258,87 @@ function testBashCommandGrep(): void {
   assert.equal(bashCommandGrep(""), false, "empty command")
 }
 
+/* ------------------------------------------------------------------ *
+ * waitRebuildSettled — the rebuild-wait before a guard deny
+ * ------------------------------------------------------------------ */
+
+/** Minimal /indexing server whose answer comes from a getter, so a test can
+ * flip the index from mid-rebuild to settled (or keep it stuck to expire). */
+async function startIndexingHub(body: () => Loose): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify(body()))
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+  return { url, close: () => new Promise<void>((resolve) => server.close(() => resolve())) }
+}
+
+async function testWaitRebuildSettled(): Promise<void> {
+  // Cap 0 and a missing target settle immediately — legacy deny, no polling.
+  assert.equal(await waitRebuildSettled({ base: "http://127.0.0.1:1", target: "x", waitMs: 0 }), true, "cap 0 = no wait")
+  assert.equal(await waitRebuildSettled({ base: "http://127.0.0.1:1", target: "", waitMs: 500 }), true, "no target = no wait")
+
+  // An unreachable hub (connection refused) keeps "polling" until the cap,
+  // then opens the escape hatch.
+  assert.equal(
+    await waitRebuildSettled({ base: "http://127.0.0.1:1", target: "x", waitMs: 200, pollMs: 60 }),
+    false,
+    "an unreachable hub stays unsettled to the cap",
+  )
+
+  // covered:false is settled — the target is not a registered repo.
+  {
+    const hub = await startIndexingHub(() => ({ covered: false, alias: null, indexing: true }))
+    assert.equal(await waitRebuildSettled({ base: hub.url, target: "x", waitMs: 5_000, pollMs: 60 }), true, "unregistered target settles")
+    await hub.close()
+  }
+
+  // covered:true + indexing:true polls until the rebuild lands; a cap that
+  // expires first returns false (grep is all you have).
+  {
+    let stuckUntil = 0
+    let indexing = () => stuckUntil === 0 || Date.now() < stuckUntil
+    const hub = await startIndexingHub(() => ({ covered: true, alias: "x", indexing: indexing() }))
+    stuckUntil = Date.now() + 400
+    const t0 = Date.now()
+    assert.equal(
+      await waitRebuildSettled({ base: hub.url, target: "x", waitMs: 5_000, pollMs: 60 }),
+      true,
+      "settles once the rebuild lands",
+    )
+    assert.ok(Date.now() - t0 >= 380, "the settle waited for the rebuild")
+    stuckUntil = Date.now() + 60_000
+    assert.equal(
+      await waitRebuildSettled({ base: hub.url, target: "x", waitMs: 200, pollMs: 60 }),
+      false,
+      "still mid-rebuild at the cap",
+    )
+    await hub.close()
+  }
+  // A bearer token is forwarded to the probe, as McpClient does, so a
+  // network-bound serve with require_auth_for_network still answers /indexing.
+  {
+    let sawAuth = ""
+    const fetchImpl = (async (_input: any, init?: Loose) => {
+      sawAuth = String((init?.headers as Loose)?.authorization ?? "")
+      const res = { ok: false, status: 404, json: async () => ({}) } as Loose
+      return res as unknown as Response
+    }) as unknown as typeof fetch
+    assert.equal(
+      await waitRebuildSettled({ base: "http://127.0.0.1:1", target: "x", waitMs: 500, token: "secret", fetchImpl }),
+      true,
+      "token probe settles on 404",
+    )
+    assert.equal(sawAuth, "Bearer secret", "the probe forwards the bearer token")
+  }
+}
+
 async function main(): Promise<void> {
   testStripJsonc()
   testAstGrepToolNames()
   testBashCommandGrep()
+  await testWaitRebuildSettled()
   await testHealthRunner()
   console.log("unit: OK")
 }

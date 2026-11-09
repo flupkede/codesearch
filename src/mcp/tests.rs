@@ -2699,6 +2699,7 @@ fn build_remote_search_body_forwards_min_score_to_peers() {
         limit: None,
         project: None,
         group: None,
+        cwd: None,
     };
     let body = super::CodesearchService::build_remote_search_body(&request, "semantic", Some(50));
     let got = body["min_score"]
@@ -2844,6 +2845,7 @@ async fn search_refuses_min_score_in_literal_mode_by_name() {
         limit: None,
         project: None,
         group: None,
+        cwd: None,
     };
     let res = service
         .search(Parameters(request))
@@ -3108,6 +3110,65 @@ fn qualify_empty_result_contradicts_a_not_found_diagnosis() {
 }
 
 #[test]
+fn qualify_empty_result_keeps_routing_notes_out_of_the_failure_count() {
+    // A cwd/project mismatch is advisory: it must ride along as a Note, never
+    // as "N store(s) in scope failed" — that lie sends agents debugging a
+    // healthy hub (the cross-project empty-positive-control report).
+    let out = super::qualify_empty_result(
+        "No definition found for 'Foo'. The symbol may not be indexed.".to_string(),
+        &[super::as_routing_note(
+            "working directory /repos/demo has its own index 'main'; you queried 'wt'".to_string(),
+        )],
+    );
+    assert!(
+        !out.contains("store(s) in scope failed"),
+        "a routing note is not a store failure: {out}"
+    );
+    assert!(!out.contains("WARNING"), "advisory only: {out}");
+    assert!(
+        out.contains("Note: working directory /repos/demo has its own index 'main'"),
+        "the note still rides the empty answer: {out}"
+    );
+}
+
+#[test]
+fn qualify_empty_result_counts_failures_and_notes_separately() {
+    let out = super::qualify_empty_result(
+        "No definition found for 'Foo'.".to_string(),
+        &[
+            super::as_routing_note("working directory mismatch".to_string()),
+            "repo 'inriver' definition search failed: os error 22".to_string(),
+        ],
+    );
+    assert!(
+        out.contains("this result is not trustworthy — 1 store(s) in scope failed"),
+        "the count excludes the routing note: {out}"
+    );
+    assert!(out.contains("os error 22"));
+    assert!(out.contains("Note: working directory mismatch"));
+}
+
+#[test]
+fn retry_hint_ignores_routing_notes() {
+    // An advisory mismatch must not suppress a legitimate tool hint; a real
+    // store failure still does.
+    let notes = vec![super::as_routing_note(
+        "working directory mismatch".to_string(),
+    )];
+    assert_eq!(
+        super::retry_hint(Some("try explore".to_string()), &Some(notes)),
+        Some("try explore".to_string()),
+        "a routing note must not suppress the hint"
+    );
+    let failures = vec!["repo 'inriver' search failed: boom".to_string()];
+    assert_eq!(
+        super::retry_hint(Some("try explore".to_string()), &Some(failures)),
+        None,
+        "a real store failure still suppresses the hint"
+    );
+}
+
+#[test]
 fn respond_with_items_carries_warnings_on_every_path() {
     use rmcp::model::ContentBlock;
     let text = |r: Result<super::CallToolResult, super::McpError>| -> String {
@@ -3296,6 +3357,23 @@ fn ambiguous_chunk_payload_is_unchanged_when_every_store_answered() {
         p["message"],
         "chunk_id 123 exists in multiple repositories. Specify which one."
     );
+}
+
+#[test]
+fn ambiguous_chunk_payload_ignores_routing_notes_for_completeness() {
+    // A cwd/project mismatch says nothing about which stores answered, so it
+    // must not declare the candidate list incomplete — same conflation class
+    // the empty-result qualification shed.
+    let notes = vec![super::as_routing_note(
+        "working directory /repos/demo has its own index 'main'; you queried 'wt'".to_string(),
+    )];
+    let p = super::ambiguous_chunk_payload(123, &["akeneo", "custom-kb"], &notes);
+    let msg = p["message"].as_str().unwrap();
+    assert!(
+        !msg.contains("incomplete"),
+        "a routing note must not declare the list incomplete: {msg}"
+    );
+    assert_eq!(p["warnings"][0], notes[0].as_str());
 }
 
 #[test]
@@ -3941,4 +4019,183 @@ fn single_index_status_reports_building_while_a_rebuild_runs() {
     }
     let (_, message) = super::single_index_status(403, true, true);
     assert!(message.contains("rebuild"), "got: {message}");
+}
+
+// === Session-root project resolution (todo #270) ===
+//
+// Pure matching rules: a session root picks a registered project only on an
+// exact normalized match (separators unified, case-insensitive on Windows),
+// zero-or-multiple matches stay unresolved, and an explicit project that
+// differs from the root project yields the routing warning.
+
+use std::path::PathBuf;
+
+fn root_repos_config() -> crate::db_discovery::repos::ReposConfig {
+    // Registered project paths look platform-native, like repos.json holds them.
+    let (main, wt, other) = if cfg!(windows) {
+        (
+            "C:/repos/demo",
+            "C:/repos/demo.worktrees/wt",
+            "C:/repos/other",
+        )
+    } else {
+        ("/repos/demo", "/repos/demo.worktrees/wt", "/repos/other")
+    };
+    crate::db_discovery::repos::ReposConfig {
+        repos: [("main", main), ("wt", wt), ("other", other)]
+            .iter()
+            .map(|(alias, path)| (alias.to_string(), PathBuf::from(path)))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_root_uri_to_path_parses_file_uris() {
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            super::root_uri_to_path("file:///C:/repos/demo"),
+            Some(PathBuf::from("C:/repos/demo"))
+        );
+        // Two-slash form some clients emit.
+        assert_eq!(
+            super::root_uri_to_path("file://C:/repos/demo"),
+            Some(PathBuf::from("C:/repos/demo"))
+        );
+        // Not a Windows drive root — rejected rather than guessed at.
+        assert_eq!(super::root_uri_to_path("file:///repos/demo"), None);
+        // Percent-escaped space.
+        assert_eq!(
+            super::root_uri_to_path("file:///C:/Work%20Area/repo"),
+            Some(PathBuf::from("C:/Work Area/repo"))
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(
+            super::root_uri_to_path("file:///repos/demo"),
+            Some(PathBuf::from("/repos/demo"))
+        );
+    }
+    // Non-file URIs never become paths.
+    assert_eq!(super::root_uri_to_path("https://example.com/x"), None);
+}
+
+#[test]
+fn test_file_uri_round_trip() {
+    let p = if cfg!(windows) {
+        PathBuf::from(r"C:\repos\demo")
+    } else {
+        PathBuf::from("/repos/demo")
+    };
+    let uri = super::runtime::file_uri_from_path(&p);
+    assert!(uri.starts_with("file://"));
+    assert_eq!(super::root_uri_to_path(&uri), Some(p));
+}
+
+#[cfg(windows)]
+#[test]
+fn test_normalize_root_key_windows_case_and_separators() {
+    assert_eq!(
+        super::normalize_root_key(std::path::Path::new(r"C:\Repos\Demo")),
+        super::normalize_root_key(std::path::Path::new("c:/repos/demo"))
+    );
+}
+
+#[test]
+fn test_resolve_root_project_exact_match_only() {
+    let cfg = root_repos_config();
+    let (main_path, wt_path) = if cfg!(windows) {
+        (r"C:\repos\demo", r"C:\repos\demo.worktrees\wt")
+    } else {
+        ("/repos/demo", "/repos/demo.worktrees/wt")
+    };
+    // Exact match.
+    assert_eq!(
+        super::resolve_root_project_in(&[PathBuf::from(main_path)], &cfg),
+        Some("main".to_string())
+    );
+    // No match → None.
+    assert_eq!(
+        super::resolve_root_project_in(&[PathBuf::from("/nowhere")], &cfg),
+        None
+    );
+    // Two roots matching two projects → ambiguous → None.
+    assert_eq!(
+        super::resolve_root_project_in(&[PathBuf::from(main_path), PathBuf::from(wt_path)], &cfg),
+        None
+    );
+    // Empty roots → None (no roots, no resolution).
+    assert_eq!(super::resolve_root_project_in(&[], &cfg), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn test_resolve_root_project_case_and_separator_insensitive() {
+    let cfg = root_repos_config();
+    // Registered as /repos/demo; the client may report any casing/separator.
+    assert_eq!(
+        super::resolve_root_project_in(&[PathBuf::from(r"C:\REPOS\DEMO")], &cfg),
+        Some("main".to_string())
+    );
+}
+
+#[test]
+fn test_root_mismatch_warns_only_on_different_project() {
+    let cfg = root_repos_config();
+    let main_path = if cfg!(windows) {
+        PathBuf::from(r"C:\repos\demo")
+    } else {
+        PathBuf::from("/repos/demo")
+    };
+    // Root project differs from the queried alias → warning names both.
+    let warning = super::root_mismatch_in(&[main_path], &cfg, "wt");
+    let warning = warning.expect("mismatch must warn");
+    assert!(warning.contains("'main'"), "got: {warning}");
+    assert!(warning.contains("'wt'"), "got: {warning}");
+    assert!(warning.contains("working directory"), "got: {warning}");
+    // Queried alias IS the root project → no warning.
+    let main_path2 = if cfg!(windows) {
+        PathBuf::from(r"C:\repos\demo")
+    } else {
+        PathBuf::from("/repos/demo")
+    };
+    assert_eq!(super::root_mismatch_in(&[main_path2], &cfg, "main"), None);
+    // No roots → no warning (unchanged behaviour).
+    assert_eq!(super::root_mismatch_in(&[], &cfg, "wt"), None);
+}
+
+// === cwd-based scoping (remote-MCP worktree safety) ===
+
+#[test]
+fn test_effective_scoping_roots_precedence() {
+    let session = [PathBuf::from("/repos/demo")];
+    // Session roots win over the agent-supplied cwd.
+    assert_eq!(
+        super::effective_scoping_roots(&session, Some("C:/other")),
+        vec![PathBuf::from("/repos/demo")]
+    );
+    // No roots -> the cwd is the synthetic root.
+    assert_eq!(
+        super::effective_scoping_roots(&[], Some("/repos/demo")),
+        vec![PathBuf::from("/repos/demo")]
+    );
+    // No roots, no cwd -> empty (historical scope_required behaviour).
+    assert!(super::effective_scoping_roots(&[], None).is_empty());
+}
+
+#[test]
+fn test_extract_tool_cwd() {
+    use rmcp::model::JsonObject;
+    let mut args = JsonObject::new();
+    assert_eq!(super::extract_tool_cwd(&None), None);
+    assert_eq!(super::extract_tool_cwd(&Some(args.clone())), None);
+    args.insert("cwd".into(), serde_json::json!("  C:/repo  "));
+    assert_eq!(
+        super::extract_tool_cwd(&Some(args.clone())),
+        Some("C:/repo".to_string())
+    );
+    args.insert("cwd".into(), serde_json::json!("   "));
+    assert_eq!(super::extract_tool_cwd(&Some(args)), None);
 }

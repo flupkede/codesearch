@@ -119,6 +119,7 @@ interface CodeSearchSettings {
     rescue: boolean
     rescueLimit: number
     rescueTimeoutMs: number
+    rebuildWaitMs: number
   }
   health: {
     enabled: boolean
@@ -191,6 +192,7 @@ const DEFAULTS: CodeSearchSettings = {
     rescue: true,
     rescueLimit: 5,
     rescueTimeoutMs: 3000,
+    rebuildWaitMs: 120_000,
   },
   health: {
     enabled: true,
@@ -532,6 +534,12 @@ function resolveSettings(ctx: PluginContext): CodeSearchSettings {
   if (env.CODESEARCH_PLUGIN_COMMANDS) settings.commands.enabled = bool(env.CODESEARCH_PLUGIN_COMMANDS, settings.commands.enabled)
   if (env.CODESEARCH_PLUGIN_SKILL) settings.skill.enabled = bool(env.CODESEARCH_PLUGIN_SKILL, settings.skill.enabled)
   if (env.CODESEARCH_PLUGIN_HEALTH) settings.health.enabled = bool(env.CODESEARCH_PLUGIN_HEALTH, settings.health.enabled)
+
+  const rebuildWaitEnv = env.CODESEARCH_PLUGIN_REBUILD_WAIT_MS ?? env.CODESEARCH_GREP_GUARD_WAIT_MS
+  if (rebuildWaitEnv) {
+    const parsed = Number.parseInt(rebuildWaitEnv, 10)
+    if (Number.isInteger(parsed) && parsed >= 0) settings.guards.rebuildWaitMs = parsed
+  }
 
   if (!["off", "nudge", "prune", "block"].includes(settings.guards.mode)) settings.guards.mode = "nudge"
   if (!["session", "message", "off"].includes(settings.scope.inject)) settings.scope.inject = "session"
@@ -1108,6 +1116,58 @@ export class HealthRunner {
  * Guard helpers
  * ------------------------------------------------------------------ */
 
+/**
+ * Wait out a mid-rebuild index before the guard denies a grep. Polls
+ * GET /indexing?path=<target> with a short deadline per probe and returns true
+ * the moment the repo will answer codesearch queries (settled, unregistered,
+ * or a 404 on an older serve without the endpoint); false when the rebuild is
+ * still running at `waitMs` — grep is genuinely all you have. `waitMs <= 0`
+ * settles immediately, preserving the pre-wait deny behavior. Probe failures
+ * and non-404 HTTP errors do not settle: they mean "no fresh signal", so
+ * polling continues until the cap (mirrors the Claude grep-guard hook twins).
+ * Exported for test/unit.ts.
+ */
+export async function waitRebuildSettled(opts: {
+  base: string
+  target: string
+  waitMs: number
+  pollMs?: number
+  token?: string
+  fetchImpl?: typeof fetch
+}): Promise<boolean> {
+  const { base, target, waitMs, pollMs = 3000, token, fetchImpl = fetch } = opts
+  if (waitMs <= 0 || !base || !target) return true
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 5000)
+      let settled = false
+      try {
+        const headers: Record<string, string> = {}
+        if (token) headers.authorization = `Bearer ${token}`
+        const res = await fetchImpl(`${base}/indexing?path=${encodeURIComponent(target)}`, {
+          signal: controller.signal,
+          headers,
+        })
+        if (res.status === 404) settled = true
+        else if (res.ok) {
+          const info = (await res.json()) as Loose
+          settled = info?.covered === false || !info?.indexing
+        }
+      } finally {
+        clearTimeout(timer)
+      }
+      if (settled) return true
+    } catch {
+      /* transient probe failure mid-wait: keep polling until the cap */
+    }
+    const rest = deadline - Date.now()
+    if (rest <= 0) return false
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, rest)))
+  }
+}
+
 /** grep-family commands a bash tool call can smuggle past the native-tool guards. */
 const BASH_GREP_WORDS = new Set(["grep", "egrep", "fgrep", "zgrep", "rg"])
 
@@ -1303,6 +1363,24 @@ export default {
 
     // Startup probe + first status refresh, off the critical path.
     void health.probe().then(() => void refreshStatus())
+
+    /* ---------------- rebuild-wait (guard gap fix) ---------------- */
+
+    // A rebuild keeps /healthz green while codesearch queries time out, so
+    // whether to wait is decided here, never by the model.
+    async function guardRebuildSettled(): Promise<boolean> {
+      const scope = resolveScope()
+      const settled = await waitRebuildSettled({
+        base: url.replace(/\/mcp\/?$/i, ""),
+        target: scope.projectPath || scope.directory,
+        waitMs: settings.guards.rebuildWaitMs,
+        token,
+      })
+      if (!settled) {
+        logGuard(`rebuild still running after ${settings.guards.rebuildWaitMs}ms; opening the grep escape hatch`)
+      }
+      return settled
+    }
 
     /* ---------------- freshness (file edits) ---------------- */
 
@@ -1550,6 +1628,7 @@ export default {
           if (!bashCommandGrep(command)) return
           if (!coveredAlias()) return
           if (health.state !== "ok") return // fail open unless the hub is confirmed up
+          if (!(await guardRebuildSettled())) return // still rebuilding at the cap: grep is all you have
           blocked = new Error(bashBlockMessage(resolveScope(), command))
         } else {
           if (settings.guards.mode !== "block") return
@@ -1557,6 +1636,7 @@ export default {
           const alias = coveredAlias()
           if (!alias) return
           if (health.state !== "ok") return // fail open unless the hub is confirmed up
+          if (!(await guardRebuildSettled())) return // still rebuilding at the cap: grep is all you have
           const astGrep = astGrepBySession.get(String(event?.sessionID ?? "")) ?? []
           blocked = new Error(blockMessage(tool, resolveScope(), astGrep))
         }

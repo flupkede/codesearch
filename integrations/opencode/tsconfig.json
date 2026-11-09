@@ -13,5 +13,5 @@
     "noUnusedLocals": true,
     "noUnusedParameters": false
   },
-  "include": ["codesearch.ts", "test/smoke.ts"]
+  "include": ["codesearch.ts", "test/smoke.ts", "test/unit.ts"]
 }

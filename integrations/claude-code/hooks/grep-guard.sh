@@ -17,9 +17,11 @@
 # used to slip through this very test). Coverage is decided by REGISTRATION
 # with the local serve hub (repos.json), not by a .codesearch.db directory
 # (#199). When the target repo is covered and LIVE but MID-REINDEX
-# (branch-switch full refresh, #55), the deny is a WAIT-AND-RETRY
-# instruction instead: searching a mid-rebuild index returns stale/empty
-# results and must not degrade into a manual grep approval on every checkout.
+# (branch-switch full refresh, #55), the hook WAITS out the rebuild — polling
+# /indexing for up to CODESEARCH_GREP_GUARD_WAIT_MS (default 120s, 0 = legacy
+# instant WAIT message) — then denies with "retry codesearch now"; past the
+# cap grep opens. Denying grep while every codesearch call times out
+# deadlocks the session (the DRM-29395 report).
 #
 # Install: see ../README.md (or run ../install.sh to wire this up automatically).
 
@@ -127,6 +129,22 @@ if ! curl -sS --max-time 2 "${base}/healthz" >/dev/null 2>&1; then
     exit 0  # codesearch is DOWN -> grep is genuinely all you have, let it through
 fi
 
+# Wait-cap for an in-flight rebuild (parity with the opencode grep-guard
+# plugin and the ps1 twin). 0 = legacy behaviour: instant WAIT-AND-RETRY deny.
+wait_cap_ms=120000
+case "${CODESEARCH_GREP_GUARD_WAIT_MS:-}" in
+    ''|*[!0-9]*) ;;  # not a plain non-negative integer: keep the default
+    *) wait_cap_ms=$CODESEARCH_GREP_GUARD_WAIT_MS ;;
+esac
+
+# /indexing probe auth: a network-bound serve with require_auth_for_network
+# needs the bearer key; a local hub ignores the header entirely. The empty-
+# array guard keeps macOS's bash 3.2 + `set -u` from choking on it.
+probe_auth=()
+if [ -n "${CODESEARCH_API_KEY:-}" ]; then
+    probe_auth=(-H "Authorization: Bearer $CODESEARCH_API_KEY")
+fi
+
 # ------------------------------------------------------------------
 # 3.5 Is the TARGET repo mid-reindex right now? (Freshness probe, #55.)
 #
@@ -136,8 +154,9 @@ fi
 # results — which used to push the agent into a manual grep approval on
 # every routine checkout. GET /indexing?path=<repo root> resolves the
 # target to its registered repo and reports an active reindex. When one is
-# in flight, deny with a WAIT-AND-RETRY instruction: the tree did not
-# change, the index is just catching up — waiting beats grepping.
+# in flight, the hook waits it out — polling up to CODESEARCH_GREP_GUARD_WAIT_MS
+# (default 120s, 0 = legacy instant WAIT deny) — then denies with a
+# retry-codesearch instruction; past the cap grep opens.
 #
 # Backward compat: an older serve without this endpoint answers 404; the
 # probe is skipped and behaviour is exactly the pre-#55 deny. The ?path=
@@ -146,11 +165,12 @@ fi
 # WRONG repo prefix, silently disabling the wait-and-retry path.
 # ------------------------------------------------------------------
 enc=$(printf '%s' "$target_root" | jq -sRr @uri)
-if fresh_json=$(curl -sS --max-time 2 "${base}/indexing?path=${enc}" 2>/dev/null); then
+if fresh_json=$(curl -sS --max-time 2 ${probe_auth[@]+"${probe_auth[@]}"} "${base}/indexing?path=${enc}" 2>/dev/null); then
     covered=$(echo "$fresh_json" | jq -r '.covered // false' 2>/dev/null || echo false)
     indexing=$(echo "$fresh_json" | jq -r '.indexing // false' 2>/dev/null || echo false)
     if [ "$covered" = "true" ] && [ "$indexing" = "true" ]; then
-        msg=$(cat <<'EOF'
+        if [ "$wait_cap_ms" -le 0 ]; then
+            msg=$(cat <<'EOF'
 codesearch is LIVE, but THIS repo's index is being rebuilt right now (a
 branch switch or file change fired the serve watcher's full refresh).
 Searching immediately would return stale or empty results — that is the
@@ -165,14 +185,46 @@ call anyway (a partially fresh index still beats grep) or ask the user how
 to proceed.
 EOF
 )
-        jq -n --arg msg "$msg" '{
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "deny",
-            permissionDecisionReason: $msg
-          }
-        }'
-        exit 0
+            jq -n --arg msg "$msg" '{
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "deny",
+                permissionDecisionReason: $msg
+              }
+            }'
+            exit 0
+        fi
+        # A big-repo rebuild outlasts any polite WAIT message, so the hook
+        # waits itself and only denies once queries will actually answer —
+        # or opens grep when the cap expires, the one state where grep is
+        # genuinely all you have (parity with the ps1 twin / opencode plugin).
+        # Second-granularity clock: millis are not portable (BSD date has no
+        # %3N), and the cap only needs "at least this long" semantics.
+        deadline=$(( $(date +%s) + (wait_cap_ms + 999) / 1000 ))
+        while :; do
+            now=$(date +%s)
+            rest=$(( deadline - now ))
+            [ "$rest" -le 0 ] && exit 0  # still rebuilding at the cap: grep is all you have
+            if [ "$rest" -gt 3 ]; then sleep 3; else sleep 1; fi
+            if fresh_json=$(curl -sS --max-time 5 ${probe_auth[@]+"${probe_auth[@]}"} "${base}/indexing?path=${enc}" 2>/dev/null); then
+                covered=$(echo "$fresh_json" | jq -r '.covered // false' 2>/dev/null || echo false)
+                indexing=$(echo "$fresh_json" | jq -r '.indexing // false' 2>/dev/null || echo false)
+                if [ "$covered" != "true" ] || [ "$indexing" != "true" ]; then
+                    msg="codesearch rebuild on this repo landed while the guard waited
+(CODESEARCH_GREP_GUARD_WAIT_MS=${wait_cap_ms}ms). Retry your codesearch call
+now — it will answer normally. Do NOT grep."
+                    jq -n --arg msg "$msg" '{
+                      hookSpecificOutput: {
+                        hookEventName: "PreToolUse",
+                        permissionDecision: "deny",
+                        permissionDecisionReason: $msg
+                      }
+                    }'
+                    exit 0
+                fi
+            fi
+            # probe failure mid-wait: keep polling until the cap
+        done
     fi
 fi
 
@@ -183,8 +235,8 @@ msg=$(cat <<'EOF'
 codesearch is LIVE for this repo (its /healthz probe just answered) — use it,
 do NOT fall back to Grep, and do NOT work around this via a shell grep/rg in
 the Bash tool: the same guard denies that too. Grep on an indexed internal
-path is only auto-allowed when the codesearch serve hub is actually DOWN,
-which it is not right now.
+path is only auto-allowed when the hub is DOWN or this repo's index is stuck
+mid-rebuild past the guard's wait cap — neither is the case right now.
 
 IMPORTANT: a low-confidence or EMPTY codesearch result is a SUCCESSFUL call that
 means "reformulate your query" — it does NOT mean codesearch is down and it will

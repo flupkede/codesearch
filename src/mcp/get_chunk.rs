@@ -101,8 +101,9 @@ impl CodesearchService {
         // Stores that failed while looking up this chunk. get_chunk previously
         // collapsed every `Err` into "not found", so during the read-only
         // incident it would have reported every chunk in every vendor repo as
-        // missing — a confident, wrong answer.
-        let mut chunk_warnings: Vec<String> = Vec::new();
+        // missing — a confident, wrong answer. Seeded from the routing
+        // warnings so a project/root mismatch rides every answer shape.
+        let mut chunk_warnings: Vec<String> = ctx.routing_warnings.clone();
 
         // Look up chunk — multi-store: smart candidate detection for chunk_id collision.
         // chunk_ids are local per database, not globally unique. When no project is specified

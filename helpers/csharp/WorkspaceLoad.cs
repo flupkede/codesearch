@@ -29,4 +29,49 @@ internal static class WorkspaceLoad
         { "WarningsAsErrors", "" },
         { "MSBuildTreatWarningsAsErrors", "false" },
     };
+
+    /// <summary>
+    /// Delete stale filtered-solution leftovers (`<c>base-filtered-*.sln</c>`,
+    /// case-insensitive) from earlier runs whose process died before the
+    /// best-effort finally-delete in Program.OpenSolutionFilteredAsync.
+    /// Hygiene only — the watcher never sees them — so every failure is
+    /// swallowed; returns the deleted count. Lives here, not in Program.cs,
+    /// so the test assembly can compile it in.
+    /// </summary>
+    internal static int CleanupStaleFilteredSolutions(string solutionDir, string solutionBaseName)
+    {
+        try
+        {
+            var prefix = solutionBaseName + "-filtered-";
+            var stale = System.IO.Directory
+                .EnumerateFiles(solutionDir, "*.sln")
+                .Where(f => System.IO.Path.GetFileName(f)
+                    .StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            var deleted = 0;
+            foreach (var path in stale)
+            {
+                try
+                {
+                    System.IO.File.Delete(path);
+                    deleted++;
+                }
+                catch (Exception)
+                {
+                    // Locked or vanished — the next run retries.
+                }
+            }
+            if (deleted > 0)
+            {
+                Console.Error.WriteLine(
+                    $"[INFO] Deleted {deleted} stale filtered solution(s) left by a previous run");
+            }
+            return deleted;
+        }
+        catch (Exception)
+        {
+            // Scanning must never break the workspace load.
+            return 0;
+        }
+    }
 }

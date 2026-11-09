@@ -173,7 +173,7 @@ impl CodesearchService {
         // Repos that failed during this search. Reported to the caller: an
         // agent that never sees the server log cannot otherwise distinguish a
         // broken store from a repo that holds no match.
-        let mut literal_warnings: Vec<String> = Vec::new();
+        let mut literal_warnings: Vec<String> = ctx.routing_warnings.clone();
 
         // Auto-regex promotion: detect code patterns that BM25 would destroy
         let user_set_regex = request.regex.unwrap_or(false);

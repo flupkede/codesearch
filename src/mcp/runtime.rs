@@ -12,6 +12,53 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+/// Upstream client handler for the stdio proxy (`codesearch mcp` in auto/client
+/// mode): answers the hub's `roots/list` with this process's own working
+/// directory.
+///
+/// The proxy is spawned by the MCP client (Claude Code, opencode) in the
+/// client's project directory, so its cwd IS the client's working directory.
+/// Real clients connect direct-HTTP without advertising the MCP `roots`
+/// capability (measured: Claude Code and opencode both send `roots: None`),
+/// so this shim is what makes worktree-safe project resolution work end to
+/// end: the hub fetches roots on the first tool call and the proxy answers
+/// with its cwd as a `file://` root.
+#[derive(Clone, Copy, Default)]
+struct CwdRootsClientHandler;
+
+#[allow(deprecated)] // roots is deprecated by SEP-2577; still the only mechanism this SDK ships
+impl rmcp::handler::client::ClientHandler for CwdRootsClientHandler {
+    fn get_info(&self) -> rmcp::model::ClientConfig {
+        rmcp::model::ClientConfig::new(
+            rmcp::model::ClientCapabilities::builder()
+                .enable_roots()
+                .build(),
+            rmcp::model::Implementation::new("codesearch-proxy", env!("CARGO_PKG_VERSION")),
+        )
+    }
+
+    async fn list_roots(
+        &self,
+        _context: rmcp::service::RequestContext<rmcp::RoleClient>,
+    ) -> std::result::Result<rmcp::model::ListRootsResult, rmcp::ErrorData> {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        tracing::info!("MCP proxy: answering roots/list with cwd {}", cwd.display());
+        Ok(rmcp::model::ListRootsResult::new(vec![
+            rmcp::model::Root::new(file_uri_from_path(&cwd)),
+        ]))
+    }
+}
+
+/// Build a `file://` URI from an absolute path (`C:\repo` → `file:///C:/repo`).
+pub(crate) fn file_uri_from_path(path: &Path) -> String {
+    let normalized = crate::cache::normalize_path(path);
+    if normalized.starts_with('/') {
+        format!("file://{normalized}")
+    } else {
+        format!("file:///{normalized}")
+    }
+}
+
 // === Server Entry Point ===
 
 /// Run the MCP server using stdio transport with file watching for live index updates.
@@ -498,8 +545,8 @@ async fn connect_to_serve(
         StreamableHttpClientWorker::new(reqwest::Client::new(), config)
     };
 
-    let http_client: rmcp::service::RunningService<RoleClient, ()> =
-        ().serve(transport).await.map_err(|e| {
+    let http_client: rmcp::service::RunningService<RoleClient, CwdRootsClientHandler> =
+        CwdRootsClientHandler.serve(transport).await.map_err(|e| {
             anyhow::anyhow!(
                 "Failed to connect to codesearch serve at {}.\n\
                  Error: {}\n\

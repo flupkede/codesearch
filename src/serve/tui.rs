@@ -1029,11 +1029,22 @@ fn cpu_usage_str(sys_system: &mut Option<sysinfo::System>) -> String {
     };
 
     // Create System instance on first call, reuse on subsequent calls.
-    let sys = sys_system.get_or_insert_with(|| {
-        let mut s = System::new();
-        s.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
-        s
-    });
+    // sysinfo 0.40's constructor is fallible; a failed construction renders
+    // this metric unavailable (same as the Err arm above).
+    let sys = match sys_system {
+        Some(s) => s,
+        None => {
+            let mut s = match System::new() {
+                Ok(s) => s,
+                Err(_) => return "—".into(),
+            };
+            s.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
+            *sys_system = Some(s);
+            sys_system
+                .as_mut()
+                .expect("System was just inserted into the cache")
+        }
+    };
 
     // Refresh only our process (cpu)
     sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);

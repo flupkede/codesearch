@@ -281,8 +281,9 @@ impl CodesearchService {
         // Failures on this single-store path. The group fan-out has carried a
         // warnings channel since the read-only incident; without the same thing
         // here, `project=<alias>` — the form an agent uses most — still reports
-        // a broken store as an ordinary empty result.
-        let mut single_warnings: Vec<String> = Vec::new();
+        // a broken store as an ordinary empty result. Seeded from the routing
+        // warnings so a project/root mismatch rides every answer shape.
+        let mut single_warnings: Vec<String> = ctx.routing_warnings.clone();
         // Surface the assumed-model warning even when the store read succeeds:
         // mismatched vector spaces do not error, they just rank wrongly.
         if let Some(warning) = model_resolution.assumed_warning {

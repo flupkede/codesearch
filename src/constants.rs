@@ -317,6 +317,11 @@ pub const DEFAULT_SERVE_PORT: u16 = 39725;
 /// Environment variable to override the serve port.
 pub const SERVE_PORT_ENV: &str = "CODESEARCH_SERVE_PORT";
 
+/// Environment variable overriding the file-watcher text-batch quiet gate in
+/// milliseconds (default 5000, floor 250). Higher = fewer, larger embedding
+/// flushes under continuous editing.
+pub const FSW_TEXT_QUIET_MS_ENV: &str = "CODESEARCH_FSW_TEXT_QUIET_MS";
+
 /// Resolve the effective serve host from env or default.
 /// Returns owned `String` because env vars are runtime values.
 /// Used by CLI delegation, MCP client, and serve startup to construct URLs.

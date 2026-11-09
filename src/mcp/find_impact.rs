@@ -499,14 +499,17 @@ impl CodesearchService {
             Ok((resolution, index_warnings)) => (Ok(resolution), index_warnings),
             Err(e) => (Err(e), Vec::new()),
         };
-        // Warnings assembled per answer path: persisted per-symbol warnings
-        // (set at the lookup sites) + index-level rebuild warnings. The
-        // missing-index self-heal warning does NOT belong here — a successful
-        // resolution proves usable data exists (see the NotFound arm, the
-        // only payload that carries it).
+        // Warnings assembled per answer path: routing warnings (an explicit
+        // project that differs from the session root's own index) + persisted
+        // per-symbol warnings (set at the lookup sites) + index-level rebuild
+        // warnings. The missing-index self-heal warning does NOT belong here —
+        // a successful resolution proves usable data exists (see the NotFound
+        // arm, the only payload that carries it).
         let answer_warnings = |mut persisted: Vec<String>| -> Vec<String> {
-            persisted.extend(index_warnings.iter().cloned());
-            persisted
+            let mut warnings = ctx.routing_warnings.clone();
+            warnings.append(&mut persisted);
+            warnings.extend(index_warnings.iter().cloned());
+            warnings
         };
 
         let canonical = match resolution {

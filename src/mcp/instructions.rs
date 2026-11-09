@@ -36,7 +36,7 @@ RULES:
   - search(semantic) is the DEFAULT for code lookup. Don't skip it.
   - For "who calls X" / impact analysis, try find_impact first; fall back to find(kind="usages") only if find_impact reports no backend.
   - NEVER use literal as first search unless you need exact syntax.
-  - project or group is REQUIRED in multi-repo mode.
+  - project or group is REQUIRED in multi-repo mode — EXCEPT when you pass cwd="<your absolute working directory>": the hub then scopes to that directory's own index automatically (worktree-safe). Pass cwd on every tool call when working in a worktree.
 
 Mode: {mode}
 Project: {project}

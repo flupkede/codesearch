@@ -94,6 +94,7 @@ async fn get_chunk_routes_mounted_remote_projects_through_federation() {
         context_lines: None,
         project: Some("cloud/bynder".to_string()),
         group: None,
+        cwd: None,
     };
     let res = service
         .get_chunk(rmcp::handler::server::wrapper::Parameters(req))
@@ -4492,6 +4493,100 @@ fn indexing_labels_are_owner_scoped_in_status() {
     state.end_indexing("langrepo", IndexingOwner::Symbol);
 }
 
+/// The "Indexing" display hold: a live text marker wins outright; after the
+/// marker clears, the hold window since the last watcher stamp keeps the
+/// label lit — the status snapshot samples every ~2 s, so a 1-2 s flush can
+/// otherwise land entirely between samples and read "Idle" mid-embed.
+#[test]
+fn indexing_display_hold_table() {
+    let now = Instant::now();
+    let hold = Duration::from_secs(INDEXING_DISPLAY_HOLD_SECS);
+    let cases = [
+        ("live marker wins even with no stamp", true, None, now, true),
+        (
+            "live marker beats an ancient stamp",
+            true,
+            Some(now - hold * 10),
+            now,
+            true,
+        ),
+        (
+            "just-cleared stamp inside the hold stays lit",
+            false,
+            Some(now - hold + Duration::from_millis(500)),
+            now,
+            true,
+        ),
+        (
+            "exact hold boundary is still lit",
+            false,
+            Some(now - hold),
+            now,
+            true,
+        ),
+        (
+            "one tick past the hold goes dark",
+            false,
+            Some(now - hold - Duration::from_millis(1)),
+            now,
+            false,
+        ),
+        ("no stamp and no marker is dark", false, None, now, false),
+    ];
+    for (why, marker, last_active, now, expected) in cases {
+        assert_eq!(
+            text_label_indexing(marker, last_active, now),
+            expected,
+            "{why}"
+        );
+    }
+}
+
+/// Wiring: a completed watcher flush (marker on, then off) keeps the general
+/// label on Indexing through the hold; backdating the stamp past the hold
+/// returns the label to its resting state — and `begin_indexing` stays free
+/// the whole time, proving the hold is display-only (the 409 guard reads
+/// `active_reindexes` exclusively).
+#[test]
+fn completed_flush_stays_indexing_through_display_hold() {
+    let (_tmp, _path, bare) = state_with_repo("holdrepo");
+    let state = std::sync::Arc::new(bare);
+    let cb = state.make_indexing_status_callback("holdrepo");
+    cb(true);
+    cb(false);
+
+    let label = || {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "holdrepo")
+            .expect("holdrepo row")
+            .1
+            .status
+    };
+    assert_eq!(
+        label(),
+        RepoStateLabel::Indexing,
+        "the flush-end stamp must hold the label after the marker clears"
+    );
+
+    state.indexing_last_active.insert(
+        "holdrepo".to_string(),
+        Instant::now() - Duration::from_secs(INDEXING_DISPLAY_HOLD_SECS * 2),
+    );
+    assert_eq!(
+        label(),
+        RepoStateLabel::NoIndex,
+        "past the hold the label returns to the fixture's resting state"
+    );
+
+    assert!(
+        state.begin_indexing("holdrepo", IndexingOwner::Reindex),
+        "the display hold must never block the 409 guard"
+    );
+    state.end_indexing("holdrepo", IndexingOwner::Reindex);
+}
+
 /// TS twin of the owner-scoping test above: with a resolvable helper env
 /// override, a SYMBOL marker lights the TS column while the general label
 /// rests; a TEXT reindex never lights the TS column, tsconfig or not.
@@ -5159,6 +5254,7 @@ async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
         language: Some("csharp".to_string()),
         project: Some("healrepo".to_string()),
         group: None,
+        cwd: None,
     };
     // The REST mirror builds its own serve-mode service from the state —
     // the same path the MCP tool takes for a project-scoped query.
@@ -5809,6 +5905,7 @@ async fn group_find_definition_attributes_hit_to_origin_repo_on_id_collision() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     let res = service
         .find(Parameters(request))
@@ -5955,6 +6052,7 @@ async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
         context_lines: Some(2),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     let res = service
         .get_chunk(Parameters(req))
@@ -6070,6 +6168,7 @@ async fn get_chunk_reports_the_real_chunker_editor_line_unchanged() {
         context_lines: Some(1),
         project: None,
         group: None,
+        cwd: None,
     };
     let res = service
         .get_chunk(Parameters(req))
@@ -6168,6 +6267,7 @@ async fn get_chunk_notes_stale_source_newer_than_last_indexing_write() {
         context_lines: None,
         project: None,
         group: None,
+        cwd: None,
     };
     let res = service
         .get_chunk(Parameters(req))
@@ -6245,6 +6345,7 @@ async fn semantic_search_refuses_when_the_model_is_not_cached() {
         limit: None,
         project: Some("solo".to_string()),
         group: None,
+        cwd: None,
     };
     let res = service
         .search(Parameters(req))
@@ -6279,6 +6380,7 @@ async fn group_find_skips_a_write_locked_store_instead_of_waiting() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     service
         .find(Parameters(prime))
@@ -6297,6 +6399,7 @@ async fn group_find_skips_a_write_locked_store_instead_of_waiting() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     let res = service
         .find(Parameters(request))
@@ -6343,6 +6446,7 @@ async fn group_get_chunk_skips_a_write_locked_candidate_repo() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     service
         .find(Parameters(prime))
@@ -6362,6 +6466,7 @@ async fn group_get_chunk_skips_a_write_locked_candidate_repo() {
         context_lines: None,
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     let res = service
         .get_chunk(Parameters(req))
@@ -6397,6 +6502,7 @@ async fn group_similar_skips_a_write_locked_store_instead_of_waiting() {
         limit: Some(5),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
     service
         .explore(Parameters(prime))
@@ -6681,6 +6787,7 @@ async fn group_semantic_search_min_score_refuses_instead_of_returning_noise() {
         limit: Some(10),
         project: None,
         group: Some("uvz".to_string()),
+        cwd: None,
     };
 
     // An unreachable threshold must refuse with an explanation, not return

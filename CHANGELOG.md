@@ -14,6 +14,54 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.6]
+
+### Added
+
+- **The serve hub resolves `project` from the client's working directory (worktree-safe scoping).** On the first tool call the hub asks the MCP client for its roots and maps a root that exactly matches one registered `project_path` to that index (case-insensitive on Windows, unified separators; zero or multiple matches keep the `scope_required` behaviour). An explicit `project` that differs from the working directory's own index is served with a `warnings` entry naming both aliases, so an agent reasoning over the wrong checkout gets told instead of misled. Because real clients (Claude Code, opencode) send no roots over direct HTTP, the stdio proxy (`codesearch mcp`) now advertises the roots capability and answers `roots/list` with its own working directory — clients configured through the shim get correct worktree scoping automatically. `get_chunk` narrows its fan-out via roots (touch=false preserved); status keeps the full hub overview.
+
+### Changed
+
+- **Worktree-safe scoping now also works for remote-HTTP clients: every scopeable tool accepts a `cwd` argument.** Real MCP clients never send roots over direct HTTP, so root-based resolution alone could not help the common topology. An agent now passes its absolute working directory on search/find/find_impact/explore/get_chunk and the hub scopes to that directory's own registered index (exact normalized match; precedence: explicit `project`/`group` wins, then roots, then `cwd`). Querying an explicit project that differs from the working directory surfaces the mismatch as a `warnings` entry.
+
+## [1.7.10]
+
+### Fixed
+
+- **Cross-project not-found answers no longer claim "store(s) in scope failed" for advisory routing notes.** The project/root mismatch note rode the same warnings vec the empty-result qualification counts, so every miss from a session whose working directory has its own index read as "not trustworthy — 1 store(s) in scope failed" while every store had answered — and `retry_hint` suppressed legitimate tool hints on it. Routing warnings are now marked and rendered as plain `Note:` lines; only real store failures produce the trustworthiness warning (`ambiguous_chunk_payload`'s "candidate list is incomplete" claim got the same treatment).
+- **The grep-guard hooks (Claude Code, both Windows and macOS/Linux twins) now wait out a mid-rebuild index instead of deadlocking the session.** A full refresh keeps `/healthz` green while every codesearch call times out, so denying grep in that exact window blocked the only working tool. The hooks poll `GET /indexing?path=<repo>` until the rebuild lands (then deny with "retry codesearch now"), and open grep past `CODESEARCH_GREP_GUARD_WAIT_MS` (default 120s, `0` = the legacy instant wait-and-retry instruction). The `/indexing` probes forward the bearer key on network-bound serves.
+
+### Changed
+
+- **The OpenCode plugin's guards apply the same rebuild wait** before denying `grep`/`glob`/shell-grep: configurable via `guards.rebuildWaitMs` (default 120000 ms) or `CODESEARCH_PLUGIN_REBUILD_WAIT_MS` / `CODESEARCH_GREP_GUARD_WAIT_MS`; older serves without the endpoint deny immediately as before. See `integrations/opencode/README.md`.
+- **Version suffix now dates builds:** `+<count>` became `+<count>.<YYYYMMDD>` of the HEAD commit (source-dating, not wall-clock), so a week-old install reads as a week old: `codesearch 1.7.10+1724.20261107`.
+
+## [1.7.9]
+
+### Fixed
+
+- **Migrated to the sysinfo 0.40 fallible `System` constructors.** sysinfo 0.40 removed the infallible `System::new()`/`new_with_specifics()` in favour of `try_new()` variants; all call sites now handle construction failure explicitly instead of relying on removed APIs.
+
+### Changed
+
+- **Dependency bumps: sysinfo 0.39.6→0.40.1, tree-sitter-dart 0.2.0→0.3.0, and a cargo minor-and-patch group update (4 crates) — no API changes on our call sites beyond the sysinfo migration above.**
+
+## [1.7.5]
+
+### Changed
+
+- **File-watcher text indexing no longer flushes on every brief editing pause: the batch quiet gate rose from 2 s to 5 s (env `CODESEARCH_FSW_TEXT_QUIET_MS`, floor 250 ms).** Under continuous editing every pause of 2 s or more closed the gate, and each flush cost an embedding burst on all cores plus a FTS/vector commit — a busy editing session pinned the serve process at ~10 cores. Flushes now fire only after 5 s of true quiet: a measured edit storm (12 bursts) dropped from 12 embedding waves to a single end-of-session flush.
+
+- **Symbol rebuilds coalesce instead of stacking.** Watcher flushes (C# incremental, TypeScript, restore-input FULL, branch-change FULL) that land while a rebuild is already running now merge into one follow-up pass per repo instead of queueing duplicate rebuilds behind the guard. A restore-input FULL absorbs pending C# work, a branch-change FULL absorbs everything, and pending TypeScript work is never absorbed by a C#-only restore FULL (it runs as its own pass right after).
+
+### Added
+
+- **The serve status keeps a repo at "Indexing" for 5 s after watcher activity ends.** The status snapshot samples every ~2 s, so a 1–2 s flush landed between samples and an actively-edited repo read "Idle" while embedding burned CPU. Display-only: the reindex 409 guard still reads the live markers exclusively.
+
+### Fixed
+
+- **scip-csharp cleans up stale filtered-solution leftovers.** Every solution load writes a `<name>-filtered-<guid>.sln` next to the real solution and deletes it afterwards — but a crash before that delete left it behind in the repo. Creating a new filtered solution now sweeps older `<name>-filtered-*.sln` leftovers first (case-insensitive, best-effort, count to stderr).
+
 ## [1.7.4] - 2026-10-28
 
 ### Added
