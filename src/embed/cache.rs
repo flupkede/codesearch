@@ -91,7 +91,12 @@ impl EmbeddingCache {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             max_memory_mb: self.max_memory_mb,
-            max_entries: (self.max_memory_mb * 1024 * 1024) / (384 * std::mem::size_of::<f32>()),
+            max_entries: if self.cache.weighted_size() == 0 {
+                0
+            } else {
+                (self.max_memory_mb as u64 * 1024 * 1024 * self.cache.entry_count()
+                    / self.cache.weighted_size()) as usize
+            },
         }
     }
 
@@ -767,9 +772,10 @@ impl PersistentCacheStats {
         self.file_size_bytes as f64 / (1024.0 * 1024.0)
     }
 
-    /// Get estimated memory size in MB (entries × 1.5KB)
-    pub fn estimated_memory_mb(&self) -> f64 {
-        self.entries as f64 * 1.536 / 1024.0
+    /// Estimate vector payload memory using the caller's runtime dimension.
+    pub fn estimated_memory_mb(&self, dimensions: usize) -> f64 {
+        self.entries as f64 * dimensions as f64 * std::mem::size_of::<f32>() as f64
+            / (1024.0 * 1024.0)
     }
 }
 

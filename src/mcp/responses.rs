@@ -1,5 +1,5 @@
 use super::helpers::{prefix_path_with_alias, SourcedResult};
-use crate::embed::ModelType;
+use crate::embed::EmbeddingModel;
 use crate::index::SharedStores;
 use crate::vectordb::VectorStore;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -23,7 +23,7 @@ pub(crate) fn read_model_metadata(db_path: &Path) -> (String, usize) {
             let dims = if dims > 0 {
                 dims
             } else {
-                ModelType::parse(&model_name)
+                EmbeddingModel::parse(&model_name)
                     .map(|m| m.dimensions())
                     .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS)
             };

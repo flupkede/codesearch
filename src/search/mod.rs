@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::cache::FileMetaStore;
 use crate::chunker::SemanticChunker;
-use crate::embed::{EmbeddingService, ModelType};
+use crate::embed::{EmbeddingModel, EmbeddingService};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
 use crate::rerank::{rrf_fusion, vector_only, FusedResult, NeuralReranker, DEFAULT_RRF_K};
@@ -431,7 +431,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
         .model_override
         .as_deref()
         .map(|name| {
-            ModelType::parse(name)
+            EmbeddingModel::parse(name)
                 .ok_or_else(|| anyhow::anyhow!("Unknown embedding model override '{name}'"))
         })
         .transpose()?;
@@ -464,59 +464,21 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
     }
 
     // Read model metadata from database FIRST (needed for sync)
-    let (model_type, dimensions, primary_language) =
-        if let Some((model_name, dims, lang)) = read_metadata(&db_path) {
-            // Use model from metadata
-            if let Some(mt) = ModelType::parse(&model_name) {
-                if let Some(requested) = requested_model {
-                    if requested != mt {
-                        anyhow::bail!(
-                            "Index uses embedding model '{}', but '--model {}' was requested. \
-                             Rebuild the index with `codesearch --model {} index {} --force` \
-                             before searching.",
-                            mt.short_name(),
-                            requested.short_name(),
-                            requested.short_name(),
-                            project_path.display()
-                        );
-                    }
-                }
-                (mt, dims, lang)
-            } else {
-                if let Some(requested) = requested_model {
-                    anyhow::bail!(
-                        "Index metadata names unknown embedding model '{}', so '--model {}' \
-                         cannot be verified. Rebuild the index with \
-                         `codesearch --model {} index {} --force`.",
-                        model_name,
-                        requested.short_name(),
-                        requested.short_name(),
-                        project_path.display()
-                    );
-                }
-                // Model name not recognized, fall back to default
-                tracing::warn!(
-                    "Unrecognized model '{}' in database metadata, falling back to default model",
-                    model_name
-                );
-                warn_print!(
-                    "{}",
-                    "⚠️  Unknown model in metadata, using default".yellow()
-                );
-                (ModelType::default(), 384, None)
-            }
-        } else if let Some(requested) = requested_model {
-            anyhow::bail!(
-                "Cannot verify '--model {}' because the index metadata is missing or invalid. \
-                 Rebuild the index with `codesearch --model {} index {} --force`.",
-                requested.short_name(),
-                requested.short_name(),
-                project_path.display()
-            );
-        } else {
-            // No metadata, fall back to default
-            (ModelType::default(), 384, None)
-        };
+    let model_type = EmbeddingModel::resolve_index(&db_path).map_err(|error| {
+        let requested = requested_model
+            .map(|model| model.short_name().to_owned())
+            .unwrap_or_else(|| "active strategy".into());
+        anyhow::anyhow!("Cannot use requested embedding model '{requested}': {error:#}")
+    })?;
+    if requested_model.is_some_and(|requested| requested != model_type) {
+        anyhow::bail!(
+            "Index uses embedding model '{}', but '{}' was requested; rebuild with --force",
+            model_type.short_name(),
+            requested_model.unwrap().short_name()
+        );
+    }
+    let dimensions = model_type.try_dimensions()?;
+    let primary_language = read_metadata(&db_path).and_then(|(_, _, lang)| lang);
 
     // Perform incremental sync if requested (after we know the model)
     if options.sync {
@@ -1126,7 +1088,7 @@ pub async fn search(query: &str, path: Option<PathBuf>, options: SearchOptions) 
 }
 
 /// Sync database by re-indexing changed files
-fn sync_database(db_path: &Path, model_type: ModelType) -> Result<()> {
+fn sync_database(db_path: &Path, model_type: EmbeddingModel) -> Result<()> {
     let project_path = db_path.parent().unwrap_or(std::path::Path::new("."));
 
     // Load file metadata store

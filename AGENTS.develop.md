@@ -241,6 +241,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — optional OpenAI-compatible remote embeddings: one active strategy, runtime dimensions, provider-aware setup/doctor, cache isolation and failure-safe incremental replacement; switching requires `--force`
+
 - **v1.7.6 (pending)** — serve hub resolves `project` from the client working directory: MCP roots when the client sends them, plus an agent-supplied `cwd` argument on every scopeable tool (remote-HTTP clients never send roots) — worktree-safe scoping; explicit-project mismatch surfaces as a `warnings` entry
 
 - **v1.7.5 (pending)** — FSW text quiet-gate 2s→5s (env `CODESEARCH_FSW_TEXT_QUIET_MS`) + symbol-rebuild coalescing end the per-edit CPU storms; repo status holds "Indexing" 5s after activity; scip-csharp sweeps stale filtered-.sln leftovers

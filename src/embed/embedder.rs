@@ -253,6 +253,7 @@ impl ModelType {
     /// fails with a dimension mismatch or silently compares incomparable vector
     /// spaces. Multi-repo serve mode is where this matters most, because one
     /// hub can hold indexes built with different models.
+    #[allow(dead_code)] // Legacy local metadata reader and compatibility tests
     pub fn from_index_metadata(db_path: &std::path::Path) -> Option<Self> {
         let content = std::fs::read_to_string(db_path.join("metadata.json")).ok()?;
         let json: serde_json::Value = serde_json::from_str(&content).ok()?;

@@ -1,4 +1,5 @@
-use super::embedder::{FastEmbedder, ModelType};
+use super::embedder::ModelType;
+use super::Embedder;
 use crate::chunker::Chunk;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
@@ -58,13 +59,13 @@ impl EmbeddedChunk {
 
 /// Batch processor for embedding chunks efficiently
 pub struct BatchEmbedder {
-    pub embedder: Arc<Mutex<FastEmbedder>>,
+    pub embedder: Arc<Mutex<Box<dyn Embedder>>>,
     batch_size: usize,
 }
 
 impl BatchEmbedder {
     /// Create a new batch embedder
-    pub fn new(embedder: Arc<Mutex<FastEmbedder>>) -> Self {
+    pub fn new(embedder: Arc<Mutex<Box<dyn Embedder>>>) -> Self {
         Self {
             embedder,
             batch_size: 32, // Default batch size
@@ -73,7 +74,7 @@ impl BatchEmbedder {
 
     /// Create with custom batch size
     #[allow(dead_code)] // Reserved for custom batch configuration
-    pub fn with_batch_size(embedder: Arc<Mutex<FastEmbedder>>, batch_size: usize) -> Self {
+    pub fn with_batch_size(embedder: Arc<Mutex<Box<dyn Embedder>>>, batch_size: usize) -> Self {
         Self {
             embedder,
             batch_size,
@@ -93,7 +94,8 @@ impl BatchEmbedder {
             .embedder
             .lock()
             .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?
-            .model_type();
+            .local_model()
+            .unwrap_or_default();
 
         // Process in batches
         for chunk_batch in chunks.chunks(self.batch_size) {
@@ -126,7 +128,7 @@ impl BatchEmbedder {
             .embedder
             .lock()
             .map_err(|e| anyhow::anyhow!("Embedder mutex poisoned: {}", e))?;
-        let text = Self::prepare_text(&chunk, embedder.model_type());
+        let text = Self::prepare_text(&chunk, embedder.local_model().unwrap_or_default());
         let embedding = embedder
             .embed_documents(vec![text])?
             .into_iter()
@@ -245,6 +247,7 @@ fn clean_docstring(doc: &str) -> String {
 mod tests {
     use super::*;
     use crate::chunker::ChunkKind;
+    use crate::embed::FastEmbedder;
 
     #[test]
     fn test_embedding_stats() {
@@ -341,13 +344,13 @@ mod tests {
     #[test]
     #[ignore] // Requires model
     fn test_batch_embedder() {
-        let embedder = Arc::new(Mutex::new(
+        let embedder: Arc<Mutex<Box<dyn Embedder>>> = Arc::new(Mutex::new(Box::new(
             FastEmbedder::with_cache_dir(
                 crate::embed::ModelType::default(),
                 Some(&test_cache_dir()),
             )
             .unwrap(),
-        ));
+        )));
         let mut batch = BatchEmbedder::new(embedder);
 
         let chunks = vec![

@@ -4,6 +4,27 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+fn isolated_cli(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codesearch"));
+    command
+        .env("CODESEARCH_HOME", home)
+        .env("CODESEARCH_EMBED_PROVIDER", "fastembed");
+    for variable in [
+        "BASE_URL",
+        "DIMENSIONS",
+        "BATCH_SIZE",
+        "TIMEOUT_SECS",
+        "CONCURRENCY",
+        "QUERY_PREFIX",
+        "DOCUMENT_PREFIX",
+        "MAX_INPUT_BYTES",
+        "API_KEY",
+    ] {
+        command.env_remove(format!("CODESEARCH_EMBED_{variable}"));
+    }
+    command
+}
+
 fn write_index_markers(project: &Path, model: &str, dimensions: usize) {
     let db = project.join(".codesearch.db");
     fs::create_dir_all(db.join("fts")).expect("database directories should be created");
@@ -21,7 +42,8 @@ fn write_index_markers(project: &Path, model: &str, dimensions: usize) {
 
 #[test]
 fn unknown_model_error_lists_every_supported_model() {
-    let output = Command::new(env!("CARGO_BIN_EXE_codesearch"))
+    let home = tempfile::tempdir().unwrap();
+    let output = isolated_cli(home.path())
         .args(["--model", "not-a-model", "search", "query"])
         .output()
         .expect("codesearch should start");
@@ -43,7 +65,8 @@ fn search_rejects_a_model_that_does_not_match_the_index() {
     let project = tempfile::tempdir().expect("temporary project should be created");
     write_index_markers(project.path(), "minilm-l6-q", 384);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_codesearch"))
+    let home = tempfile::tempdir().unwrap();
+    let output = isolated_cli(home.path())
         .args(["--model", "embeddinggemma-q4", "search", "query", "--path"])
         .arg(project.path())
         .arg("--create-index=false")
@@ -62,7 +85,8 @@ fn search_rejects_an_override_when_the_index_model_is_unknown() {
     let project = tempfile::tempdir().expect("temporary project should be created");
     write_index_markers(project.path(), "future-model", 768);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_codesearch"))
+    let home = tempfile::tempdir().unwrap();
+    let output = isolated_cli(home.path())
         .args([
             "--model",
             "embeddinggemma-q4",
