@@ -15,7 +15,7 @@
 //!
 #![allow(dead_code)]
 
-use crate::cache::{normalize_path, normalize_path_str};
+use crate::cache::normalize_path_str;
 use crate::constants::{
     DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
     SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS, WRITER_LOCK_FILE,
@@ -917,8 +917,6 @@ impl IndexManager {
         heartbeat: Option<&IndexingHeartbeat>,
     ) -> Result<()> {
         use crate::cache::FileMetaStore;
-        use crate::chunker::SemanticChunker;
-        use crate::embed::EmbeddingService;
         use crate::file::FileWalker;
 
         info!("🔄 Performing incremental refresh with shared stores...");
@@ -1095,274 +1093,18 @@ impl IndexManager {
         // poor memory proxy when a few files can produce tens of thousands of
         // chunks.
         if !changed_files.is_empty() {
-            let batch_size = std::env::var(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE_ENV)
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE);
-            let max_chunks = crate::limits::max_chunks_per_batch();
-            let embed_pause = crate::limits::embed_pause();
-            // Upper-bound estimate for the log line; the chunk cap can split
-            // this into more batches than the file count alone implies.
-            let estimated_batches = changed_files.len().div_ceil(batch_size);
-            info!(
-                "🔄 Processing {} changed files in ~{} batch(es) of up to {} file(s) each \
-                 (chunk cap per batch: {})...",
-                changed_files.len(),
-                estimated_batches,
-                batch_size,
-                if max_chunks == 0 {
-                    "none".to_string()
-                } else {
-                    max_chunks.to_string()
-                }
-            );
-
-            let cache_dir = crate::constants::get_global_models_cache_dir()?;
-            let mut total_indexed = 0usize;
-            let mut cursor = 0usize;
-            let mut batch_idx = 0usize;
-
-            while cursor < changed_files.len() {
-                let take = (changed_files.len() - cursor).min(batch_size);
-                let files_for_embed = changed_files[cursor..cursor + take].to_vec();
-                // Abort between batches if the repo was removed mid-index.
-                Self::ensure_indexing_active(cancel_token)?;
-                // A batch of a large delta can run for minutes — renew the
-                // caller's indexing marker so it survives past the stale
-                // threshold while real progress is being made.
-                if let Some(hb) = heartbeat {
-                    hb();
-                }
-
-                // Read + chunk + embed is synchronous, CPU/I/O-heavy work
-                // (file reads, tree-sitter parsing, fastembed/ONNX inference that
-                // saturates all cores). Offload the whole block to `spawn_blocking`
-                // so it never runs on a tokio worker thread. The `EmbeddingService`
-                // and `SemanticChunker` are built inside the closure because they
-                // are not needed on the async side and may not be `Send`.
-                //
-                // The closure consumes as many of the offered files as fit the
-                // chunk cap (always at least one, so every iteration makes
-                // progress) and reports how many it took, so the outer loop's
-                // bookkeeping covers exactly the files that were processed.
-                let cache_dir_for_batch = cache_dir.clone();
-                let root_for_batch = codebase_path.to_path_buf();
-                // Clone the token into the blocking closure so a cancel arriving
-                // DURING the (long, core-saturating) embed pass is observed
-                // per-file, not only once the whole batch returns.
-                let batch_cancel = cancel_token.clone();
-                let embed_source = embed_service_choice(embedding_pool);
-                let (embedded_chunks, consumed) = tokio::task::spawn_blocking(
-                    move || -> Result<(Vec<crate::embed::EmbeddedChunk>, usize)> {
-                        let mut chunker = SemanticChunker::new(100, 2000, 10);
-                        let mut all_chunks = Vec::new();
-                        let mut consumed = 0usize;
-
-                        for file in &files_for_embed {
-                            // Stop once this batch has reached its chunk budget.
-                            // `consumed > 0` guarantees at least one file per
-                            // iteration even if that one file alone exceeds the
-                            // cap, so the outer loop always advances.
-                            if chunk_cap_reached(consumed, all_chunks.len(), max_chunks) {
-                                break;
-                            }
-                            // Mid-embed cancellation point: abort inside the
-                            // spawn_blocking task so we stop reading/chunking/
-                            // embedding further files in this batch promptly.
-                            if batch_cancel.is_cancelled() {
-                                return Err(anyhow::anyhow!("indexing cancelled"));
-                            }
-                            // Count the file before the read: a read failure
-                            // still advances the outer cursor, so the loop can
-                            // never stall on an unreadable file.
-                            consumed += 1;
-                            let content = match std::fs::read_to_string(&file.path) {
-                                Ok(c) => c,
-                                Err(error) => return Err(error.into()),
-                            };
-                            // Chunk under the project-relative storage key so
-                            // chunk metadata stays machine-portable.
-                            let rel = std::path::PathBuf::from(crate::cache::storage_key(
-                                &file.path,
-                                &root_for_batch,
-                            ));
-                            let chunks = chunker.chunk_semantic(file.language, &rel, &content)?;
-                            all_chunks.extend(chunks);
-                        }
-
-                        if all_chunks.is_empty() {
-                            return Ok((Vec::new(), consumed));
-                        }
-
-                        // Serve process: the pool already holds the persistent
-                        // cache's LMDB env open — a fresh `EmbeddingService`
-                        // here is refused by the process-global registry and
-                        // would re-embed everything without cache.
-                        //
-                        // `embed_chunks_yielding` holds the per-model lock for
-                        // one ONNX mini-batch at a time (plus the configured
-                        // pause), so an interactive query embedding is not stuck
-                        // behind this whole file batch.
-                        let embedded = match embed_source {
-                            EmbeddingSource::Pool(pool) => {
-                                pool.embed_chunks_yielding(embed_model, all_chunks, embed_pause)?
-                            }
-                            EmbeddingSource::Fresh => {
-                                let mut embedding_service = EmbeddingService::with_cache_dir(
-                                    embed_model,
-                                    Some(cache_dir_for_batch.as_path()),
-                                )?;
-                                embedding_service.embed_chunks(all_chunks)?
-                            }
-                        };
-                        Ok((embedded, consumed))
-                    },
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("chunk+embed task panicked (batch {}): {}", batch_idx + 1, e)
-                })??;
-
-                // The closure always consumes at least one file; guard the
-                // cursor arithmetic against a future regression that would
-                // otherwise spin forever.
-                debug_assert!(consumed > 0, "refresh batch made no progress");
-                let file_batch = &changed_files[cursor..cursor + consumed];
-                cursor += consumed;
-                batch_idx += 1;
-
-                // A cancel arriving after embed completed but before we commit
-                // the batch to the stores must skip the insert + the final
-                // build_index, so a removed repo never receives fresh data.
-                Self::ensure_indexing_active(cancel_token)?;
-
-                // Delete old chunks for changed files
-                for file in file_batch {
-                    let key = crate::cache::storage_key(&file.path, codebase_path);
-                    let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
-                    if !old_chunk_ids.is_empty() {
-                        debug!(
-                            "🔄 Deleting {} old chunks for: {}",
-                            old_chunk_ids.len(),
-                            file.path.display()
-                        );
-
-                        // Delete from vector store
-                        {
-                            let mut store = stores.vector_store.write().await;
-                            store.delete_chunks(&old_chunk_ids)?;
-                        }
-
-                        // Delete from FTS
-                        {
-                            let mut fts_store = stores.fts_store.write().await;
-                            for chunk_id in &old_chunk_ids {
-                                fts_store.delete_chunk(*chunk_id)?;
-                            }
-                        }
-                    }
-                }
-
-                if !embedded_chunks.is_empty() {
-                    info!(
-                        "📦 Batch {}: embedding {} chunks with model {}...",
-                        batch_idx,
-                        embedded_chunks.len(),
-                        embed_model.short_name()
-                    );
-
-                    // Insert into vector store. `build_index()` (HNSW graph
-                    // construction) is deliberately deferred until ALL batches
-                    // are inserted — it rebuilds the whole graph from current
-                    // storage, so doing it once at the end avoids O(batches)
-                    // redundant rebuilds.
-                    let chunk_ids = {
-                        let mut store = stores.vector_store.write().await;
-                        store.insert_chunks_with_ids(embedded_chunks.clone())?
-                    };
-
-                    // Insert into FTS
-                    {
-                        let mut fts_store = stores.fts_store.write().await;
-                        for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-                            let path_str = chunk.chunk.path.to_string();
-                            let signature = chunk.chunk.signature.as_deref();
-                            let kind = format!("{:?}", chunk.chunk.kind);
-                            fts_store.add_chunk(
-                                *chunk_id,
-                                &chunk.chunk.content,
-                                &path_str,
-                                signature,
-                                &kind,
-                            )?;
-                        }
-                        fts_store.commit()?;
-                    }
-
-                    // Update file metadata for this batch's files.
-                    // Group chunks by file path (normalize for consistent lookup)
-                    let mut chunks_by_file: std::collections::HashMap<String, Vec<u32>> =
-                        std::collections::HashMap::new();
-                    for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-                        chunks_by_file
-                            .entry(normalize_path_str(&chunk.chunk.path))
-                            .or_default()
-                            .push(*chunk_id);
-                    }
-
-                    for file in file_batch {
-                        let path_str = crate::cache::storage_key(&file.path, codebase_path);
-                        if let Some(ids) = chunks_by_file.get(&path_str) {
-                            file_meta_store.update_file(&file.path, &path_str, ids.clone())?;
-                        } else {
-                            // File was processed but produced 0 chunks (e.g. minified JS,
-                            // empty file). Track it with empty chunk list so it is not
-                            // re-processed on every run and doctor doesn't flag it.
-                            file_meta_store.update_file(&file.path, &path_str, vec![])?;
-                        }
-                    }
-
-                    total_indexed += embedded_chunks.len();
-                } else {
-                    // ALL files in this batch produced 0 chunks — still track
-                    // them so they are not flagged as unindexed on every
-                    // subsequent run.
-                    for file in file_batch {
-                        let key = crate::cache::storage_key(&file.path, codebase_path);
-                        file_meta_store.update_file(&file.path, &key, vec![])?;
-                    }
-                }
-
-                // Persist per batch: vector and FTS already commit per batch,
-                // so the meta must follow or a crash/restart mid-pass leaves
-                // meta empty while chunks exist — the next open then wipes
-                // the whole store (the B1 guard) and re-embeds everything.
-                file_meta_store.save(db_path)?;
-                // Remote failures can end the pass at any batch; completed files
-                // must remain searchable even when the next request fails.
-                if embed_model == EmbeddingModel::ActiveRemote {
-                    stores.vector_store.write().await.build_index()?;
-                }
-            }
-
-            // Build the HNSW index once, after every batch has been inserted.
-            if total_indexed > 0 {
-                // Don't rebuild the graph for a repo that was removed mid-index.
-                Self::ensure_indexing_active(cancel_token)?;
-                let vector_store = Arc::clone(&stores.vector_store);
-                tokio::task::spawn_blocking(move || {
-                    let mut store = vector_store.blocking_write();
-                    store.build_index()
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
-            }
-
-            info!(
-                "✅ Indexed {} chunks across {} batch(es)",
-                total_indexed, batch_idx
-            );
+            Self::index_files_in_batches(
+                codebase_path,
+                db_path,
+                stores,
+                &changed_files,
+                &mut file_meta_store,
+                embed_model,
+                cancel_token,
+                embedding_pool,
+                heartbeat,
+            )
+            .await?;
         }
 
         // Save file metadata
@@ -1382,17 +1124,6 @@ impl IndexManager {
             elapsed.as_secs_f64()
         );
 
-        // Persist the resolved model AND the chunk/file counts in metadata.json.
-        //
-        // Writing the model here (mirroring the CLI `index_with_options` path,
-        // which stamps it unconditionally) unifies the two index-creation paths:
-        // an index built via the serve/git-hook path — which may have started
-        // from a model-less metadata.json pre-created by `ensure_schema_version`
-        // — now always ends up with a resolvable `model_short_name`. This is the
-        // structural half of the "model: unknown" fix: it guarantees the model
-        // is recorded regardless of who created the file, so it can never regress
-        // to `unknown` (which also disables the empty-index fallback). Best-effort
-        // — a failed write only affects display/status, not searchability.
         {
             if let Err(e) = crate::vectordb::merge_metadata_atomic(db_path, |obj| {
                 embed_model.write_metadata_fields(obj);
@@ -1407,6 +1138,358 @@ impl IndexManager {
         }
 
         Ok(())
+    }
+
+    /// Chunk + embed + publish `changed_files` in bounded batches — the ONE
+    /// indexing mechanism, shared by the serve refresh pass, the FSW event
+    /// batch and the branch refresh. The former per-file path
+    /// (`index_single_file`: embed + meta load/save + vector insert + HNSW
+    /// build + FTS commit per FILE) did all O(repo-size) work per file.
+    ///
+    /// Per batch: one spawn_blocking chunk+embed pass (bounded by file count
+    /// and the chunk cap), stale-chunk deletion for the batch's files, one
+    /// vector insert, one FTS commit, one `FileMetaStore` update + save.
+    /// `build_index` runs once after the last batch (per batch for remote
+    /// models — a remote failure can end the pass between batches).
+    ///
+    /// Caller holds the job permit and has already resolved `embed_model`.
+    /// A file whose read fails is warned and skipped (its meta entry stays —
+    /// the next pass reprocesses it). A publish failure rolls the batch's
+    /// fresh vector ids back; `file_meta` still names the previous
+    /// generation, so the next pass heals cleanly. Returns chunks indexed.
+    #[allow(clippy::too_many_arguments)]
+    async fn index_files_in_batches(
+        codebase_path: &Path,
+        db_path: &Path,
+        stores: &SharedStores,
+        changed_files: &[crate::file::FileInfo],
+        file_meta_store: &mut crate::cache::FileMetaStore,
+        embed_model: EmbeddingModel,
+        cancel_token: &CancellationToken,
+        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
+        heartbeat: Option<&IndexingHeartbeat>,
+    ) -> Result<usize> {
+        use crate::chunker::SemanticChunker;
+        use crate::embed::EmbeddingService;
+
+        if changed_files.is_empty() {
+            return Ok(0);
+        }
+        let batch_size = std::env::var(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE_ENV)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(crate::constants::INCREMENTAL_REFRESH_BATCH_SIZE);
+        let max_chunks = crate::limits::max_chunks_per_batch();
+        let embed_pause = crate::limits::embed_pause();
+        // Upper-bound estimate for the log line; the chunk cap can split
+        // this into more batches than the file count alone implies.
+        let estimated_batches = changed_files.len().div_ceil(batch_size);
+        info!(
+            "🔄 Processing {} changed files in ~{} batch(es) of up to {} file(s) each \
+                 (chunk cap per batch: {})...",
+            changed_files.len(),
+            estimated_batches,
+            batch_size,
+            if max_chunks == 0 {
+                "none".to_string()
+            } else {
+                max_chunks.to_string()
+            }
+        );
+
+        let cache_dir = crate::constants::get_global_models_cache_dir()?;
+        let mut total_indexed = 0usize;
+        let mut cursor = 0usize;
+        let mut batch_idx = 0usize;
+
+        while cursor < changed_files.len() {
+            let take = (changed_files.len() - cursor).min(batch_size);
+            let files_for_embed = changed_files[cursor..cursor + take].to_vec();
+            // Abort between batches if the repo was removed mid-index.
+            Self::ensure_indexing_active(cancel_token)?;
+            // A batch of a large delta can run for minutes — renew the
+            // caller's indexing marker so it survives past the stale
+            // threshold while real progress is being made.
+            if let Some(hb) = heartbeat {
+                hb();
+            }
+
+            // Read + chunk + embed is synchronous, CPU/I/O-heavy work
+            // (file reads, tree-sitter parsing, fastembed/ONNX inference that
+            // saturates all cores). Offload the whole block to `spawn_blocking`
+            // so it never runs on a tokio worker thread. The `EmbeddingService`
+            // and `SemanticChunker` are built inside the closure because they
+            // are not needed on the async side and may not be `Send`.
+            //
+            // The closure consumes as many of the offered files as fit the
+            // chunk cap (always at least one, so every iteration makes
+            // progress) and reports how many it took, so the outer loop's
+            // bookkeeping covers exactly the files that were processed.
+            let cache_dir_for_batch = cache_dir.clone();
+            let root_for_batch = codebase_path.to_path_buf();
+            // Clone the token into the blocking closure so a cancel arriving
+            // DURING the (long, core-saturating) embed pass is observed
+            // per-file, not only once the whole batch returns.
+            let batch_cancel = cancel_token.clone();
+            let embed_source = embed_service_choice(embedding_pool);
+            let (embedded_chunks, consumed, skipped_keys) = tokio::task::spawn_blocking(
+                move || -> Result<(Vec<crate::embed::EmbeddedChunk>, usize, Vec<String>)> {
+                    let mut chunker = SemanticChunker::new(100, 2000, 10);
+                    let mut all_chunks = Vec::new();
+                    let mut consumed = 0usize;
+                    let mut skipped_keys = Vec::new();
+
+                    for file in &files_for_embed {
+                        // Stop once this batch has reached its chunk budget.
+                        // `consumed > 0` guarantees at least one file per
+                        // iteration even if that one file alone exceeds the
+                        // cap, so the outer loop always advances.
+                        if chunk_cap_reached(consumed, all_chunks.len(), max_chunks) {
+                            break;
+                        }
+                        // Mid-embed cancellation point: abort inside the
+                        // spawn_blocking task so we stop reading/chunking/
+                        // embedding further files in this batch promptly.
+                        if batch_cancel.is_cancelled() {
+                            return Err(anyhow::anyhow!("indexing cancelled"));
+                        }
+                        // Count the file before the read: a read failure
+                        // still advances the outer cursor, so the loop can
+                        // never stall on an unreadable file.
+                        consumed += 1;
+                        let content = match std::fs::read_to_string(&file.path) {
+                            Ok(c) => c,
+                            // One unreadable file must not fail the whole
+                            // batch: warn + skip, its meta entry stays so
+                            // the next pass reprocesses it.
+                            Err(error) => {
+                                skipped_keys
+                                    .push(crate::cache::storage_key(&file.path, &root_for_batch));
+                                warn!("⚠️  Failed to read {}: {error}", file.path.display());
+                                continue;
+                            }
+                        };
+                        // Chunk under the project-relative storage key so
+                        // chunk metadata stays machine-portable.
+                        let rel = std::path::PathBuf::from(crate::cache::storage_key(
+                            &file.path,
+                            &root_for_batch,
+                        ));
+                        let chunks = chunker.chunk_semantic(file.language, &rel, &content)?;
+                        all_chunks.extend(chunks);
+                    }
+
+                    if all_chunks.is_empty() {
+                        return Ok((Vec::new(), consumed, skipped_keys));
+                    }
+
+                    // Serve process: the pool already holds the persistent
+                    // cache's LMDB env open — a fresh `EmbeddingService`
+                    // here is refused by the process-global registry and
+                    // would re-embed everything without cache.
+                    //
+                    // `embed_chunks_yielding` holds the per-model lock for
+                    // one ONNX mini-batch at a time (plus the configured
+                    // pause), so an interactive query embedding is not stuck
+                    // behind this whole file batch.
+                    let embedded = match embed_source {
+                        EmbeddingSource::Pool(pool) => {
+                            pool.embed_chunks_yielding(embed_model, all_chunks, embed_pause)?
+                        }
+                        EmbeddingSource::Fresh => {
+                            let mut embedding_service = EmbeddingService::with_cache_dir(
+                                embed_model,
+                                Some(cache_dir_for_batch.as_path()),
+                            )?;
+                            embedding_service.embed_chunks(all_chunks)?
+                        }
+                    };
+                    Ok((embedded, consumed, skipped_keys))
+                },
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("chunk+embed task panicked (batch {}): {}", batch_idx + 1, e)
+            })??;
+
+            // The closure always consumes at least one file; guard the
+            // cursor arithmetic against a future regression that would
+            // otherwise spin forever.
+            debug_assert!(consumed > 0, "refresh batch made no progress");
+            let file_batch = &changed_files[cursor..cursor + consumed];
+            cursor += consumed;
+            batch_idx += 1;
+
+            // A cancel arriving after embed completed but before we commit
+            // the batch to the stores must skip the insert + the final
+            // build_index, so a removed repo never receives fresh data.
+            Self::ensure_indexing_active(cancel_token)?;
+
+            // Delete old chunks for changed files. Files the read step
+            // skipped (unreadable) are left alone entirely: their meta must
+            // stay untouched, and stats on them can fail (a directory
+            // read EISDIRs on Linux, where get_mtime's second granularity
+            // hid this flake before).
+            let skipped: std::collections::HashSet<&str> =
+                skipped_keys.iter().map(|s| s.as_str()).collect();
+            for file in file_batch {
+                let key = crate::cache::storage_key(&file.path, codebase_path);
+                if skipped.contains(key.as_str()) {
+                    continue;
+                }
+                let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
+                if !old_chunk_ids.is_empty() {
+                    debug!(
+                        "🔄 Deleting {} old chunks for: {}",
+                        old_chunk_ids.len(),
+                        file.path.display()
+                    );
+
+                    // Delete from vector store
+                    {
+                        let mut store = stores.vector_store.write().await;
+                        store.delete_chunks(&old_chunk_ids)?;
+                    }
+
+                    // Delete from FTS
+                    {
+                        let mut fts_store = stores.fts_store.write().await;
+                        for chunk_id in &old_chunk_ids {
+                            fts_store.delete_chunk(*chunk_id)?;
+                        }
+                    }
+                }
+            }
+
+            if !embedded_chunks.is_empty() {
+                info!(
+                    "📦 Batch {}: embedding {} chunks with model {}...",
+                    batch_idx,
+                    embedded_chunks.len(),
+                    embed_model.short_name()
+                );
+
+                // Insert into vector store + FTS add + commit — ONE commit
+                // per batch. `build_index()` (HNSW graph construction) is
+                // deliberately deferred until ALL batches are inserted —
+                // it rebuilds the whole graph from current storage, so
+                // doing it once at the end avoids O(batches) redundant
+                // rebuilds. Any publish failure rolls the batch's fresh
+                // vector ids back: file_meta never named them, so the
+                // orphans cannot outlive this call.
+                let chunk_ids = Self::publish_embedded_batch(stores, &embedded_chunks).await?;
+
+                // Update file metadata for this batch's files.
+                // Group chunks by file path (normalize for consistent lookup)
+                let mut chunks_by_file: std::collections::HashMap<String, Vec<u32>> =
+                    std::collections::HashMap::new();
+                for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
+                    chunks_by_file
+                        .entry(normalize_path_str(&chunk.chunk.path))
+                        .or_default()
+                        .push(*chunk_id);
+                }
+
+                for file in file_batch {
+                    let path_str = crate::cache::storage_key(&file.path, codebase_path);
+                    if skipped_keys.contains(&path_str) {
+                        continue;
+                    }
+                    if let Some(ids) = chunks_by_file.get(&path_str) {
+                        file_meta_store.update_file(&file.path, &path_str, ids.clone())?;
+                    } else {
+                        // File was processed but produced 0 chunks (e.g. minified JS,
+                        // empty file). Track it with empty chunk list so it is not
+                        // re-processed on every run and doctor doesn't flag it.
+                        file_meta_store.update_file(&file.path, &path_str, vec![])?;
+                    }
+                }
+
+                total_indexed += embedded_chunks.len();
+            } else {
+                // ALL files in this batch produced 0 chunks — still track
+                // them so they are not flagged as unindexed on every
+                // subsequent run.
+                for file in file_batch {
+                    let key = crate::cache::storage_key(&file.path, codebase_path);
+                    if skipped_keys.contains(&key) {
+                        continue;
+                    }
+                    file_meta_store.update_file(&file.path, &key, vec![])?;
+                }
+            }
+
+            // Persist per batch: vector and FTS already commit per batch,
+            // so the meta must follow or a crash/restart mid-pass leaves
+            // meta empty while chunks exist — the next open then wipes
+            // the whole store (the B1 guard) and re-embeds everything.
+            file_meta_store.save(db_path)?;
+            // Remote failures can end the pass at any batch; completed files
+            // must remain searchable even when the next request fails.
+            if embed_model == EmbeddingModel::ActiveRemote {
+                stores.vector_store.write().await.build_index()?;
+            }
+        }
+
+        // Build the HNSW index once, after every batch has been inserted.
+        if total_indexed > 0 {
+            // Don't rebuild the graph for a repo that was removed mid-index.
+            Self::ensure_indexing_active(cancel_token)?;
+            let vector_store = Arc::clone(&stores.vector_store);
+            tokio::task::spawn_blocking(move || {
+                let mut store = vector_store.blocking_write();
+                store.build_index()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("build_index task panicked: {}", e))??;
+        }
+
+        info!(
+            "✅ Indexed {} chunks across {} batch(es)",
+            total_indexed, batch_idx
+        );
+
+        Ok(total_indexed)
+    }
+
+    /// One batch's store publish: vector insert, FTS add + commit. On any
+    /// failure the batch's fresh vector ids are rolled back (they were never
+    /// recorded in `file_meta`, so no later pass could find them); the caller
+    /// redrives the whole pass or the next pass heals cleanly.
+    async fn publish_embedded_batch(
+        stores: &SharedStores,
+        embedded_chunks: &[crate::embed::EmbeddedChunk],
+    ) -> Result<Vec<u32>> {
+        let chunk_ids = {
+            let mut store = stores.vector_store.write().await;
+            store.insert_chunks_with_ids(embedded_chunks.to_vec())?
+        };
+
+        let fts_result: Result<()> = {
+            let mut fts_store = stores.fts_store.write().await;
+            for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
+                let path_str = chunk.chunk.path.to_string();
+                let signature = chunk.chunk.signature.as_deref();
+                let kind = format!("{:?}", chunk.chunk.kind);
+                fts_store.add_chunk(
+                    *chunk_id,
+                    &chunk.chunk.content,
+                    &path_str,
+                    signature,
+                    &kind,
+                )?;
+            }
+            fts_store.commit()?;
+            Ok(())
+        };
+
+        if let Err(e) = fts_result {
+            Self::rollback_vector_insert(stores, &chunk_ids).await;
+            return Err(e);
+        }
+
+        Ok(chunk_ids)
     }
 
     /// Force a full reindex using the already-open stores.
@@ -2704,106 +2787,80 @@ impl IndexManager {
         // Enable quiet mode during FSW batch processing to suppress verbose embedding output
         set_quiet(true);
 
-        // First, remove deleted files
-        for file_path in &files_to_remove {
-            debug!("🗑️  Removing: {}", file_path.display());
-            if let Err(e) =
-                Self::remove_file_from_index_with_stores(codebase_path, db_path, stores, file_path)
-                    .await
+        // First, remove deleted files — batched: one FileMetaStore load, one
+        // vector delete, one FTS commit and one save for the whole wave. The
+        // old per-file loop paid that metadata I/O and one LMDB transaction
+        // PER CHUNK on every file (35-87s per removal batch under load).
+        // Failures warn + continue; the next pass re-removes whatever stayed.
+        if !files_to_remove.is_empty() {
+            if let Err(e) = Self::remove_files_from_index_batched(
+                codebase_path,
+                db_path,
+                stores,
+                &files_to_remove,
+            )
+            .await
             {
-                warn!("⚠️  Failed to remove {}: {}", file_path.display(), e);
-            }
-
-            // Also handle directory deletion: on Windows, rm -rf of a directory may only
-            // produce a Remove event for the directory itself, not for individual files.
-            // Find all tracked files under this path prefix and remove them too.
-            {
-                use crate::cache::FileMetaStore;
-
-                // Load FileMetaStore from disk to query tracked files
-                let metadata_path = db_path.join("metadata.json");
-                if metadata_path.exists() {
-                    if let Ok(metadata_str) = std::fs::read_to_string(&metadata_path) {
-                        if let Ok(metadata) =
-                            serde_json::from_str::<serde_json::Value>(&metadata_str)
-                        {
-                            let dimensions =
-                                metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-                            let model_name = metadata["model_short_name"]
-                                .as_str()
-                                .unwrap_or("minilm-l6-q");
-
-                            if let Ok(file_meta_store) =
-                                FileMetaStore::load_or_create(db_path, model_name, dimensions)
-                            {
-                                // Normalize the directory prefix for consistent matching
-                                // (tracked files are normalized to forward slashes)
-                                let dir_prefix = normalize_path(file_path);
-                                let dir_prefix_slash = if dir_prefix.ends_with('/') {
-                                    dir_prefix.clone()
-                                } else {
-                                    format!("{}/", dir_prefix)
-                                };
-
-                                let files_under_dir: Vec<String> = file_meta_store
-                                    .tracked_files()
-                                    .filter(|f| f.starts_with(&dir_prefix_slash))
-                                    .cloned()
-                                    .collect();
-
-                                if !files_under_dir.is_empty() {
-                                    info!(
-                                        "🗑️  Directory deleted: {} ({} files under it)",
-                                        file_path.display(),
-                                        files_under_dir.len()
-                                    );
-                                    for tracked_file in &files_under_dir {
-                                        let tracked_path = PathBuf::from(tracked_file);
-                                        if let Err(e) = Self::remove_file_from_index_with_stores(
-                                            codebase_path,
-                                            db_path,
-                                            stores,
-                                            &tracked_path,
-                                        )
-                                        .await
-                                        {
-                                            warn!(
-                                                "⚠️  Failed to remove {}: {}",
-                                                tracked_path.display(),
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                warn!(
+                    "⚠️  Batched removal of {} path(s) failed: {e:#}",
+                    files_to_remove.len()
+                );
             }
         }
 
         // Rebuild vector index after removals so deleted chunks are excluded from search results.
-        // index_single_file_with_stores already calls build_index() per file, but when a batch
-        // contains ONLY removals (no additions), the index would never be rebuilt without this.
-        if !files_to_remove.is_empty() {
+        // The batched index pass below builds the index once at its end — after the
+        // deletions are already applied to storage — so a build here is only needed
+        // when the batch contains ONLY removals (no additions).
+        if !files_to_remove.is_empty() && files_to_index.is_empty() {
             let mut store = stores.vector_store.write().await;
             store.build_index()?;
         }
 
-        // Then, index modified/new files
-        // Abort before the per-file index loop if cancellation landed during the
+        // Then, index modified/new files — the SAME batched mechanism as the
+        // serve refresh pass: one embed/insert/FTS-commit/file_meta save per
+        // batch and a single HNSW build at the end, instead of one of each
+        // per file (the old per-file path did O(repo-size) work per file).
+        // Abort before the index pass if cancellation landed during the
         // removal phase above.
         Self::ensure_indexing_active(cancel_token)?;
-        for file_path in &files_to_index {
-            debug!("📄 Indexing: {}", file_path.display());
-            // Redrive the per-file attempt on the transient Windows FTS
-            // commit race — the same protection force reindex already has.
-            if let Err(e) = Self::retry_on_transient_fts(&Self::FTS_TRANSIENT_BACKOFFS, || async {
-                Self::index_single_file(codebase_path, file_path, stores, embedding_pool).await
-            })
-            .await
-            {
-                warn!("⚠️  Failed to index {}: {}", file_path.display(), e);
+        if !files_to_index.is_empty() {
+            // Warn + continue, never `?`: a model-resolution or embed failure
+            // must not abort the batch (the old per-file loop degraded the
+            // same way), and an early return here would leave quiet mode on.
+            let batch = async {
+                let (embed_model, dims) = Self::resolve_embed_model(db_path)?;
+                let mut file_meta_store = crate::cache::FileMetaStore::load_or_create(
+                    db_path,
+                    embed_model.short_name(),
+                    dims,
+                )?;
+                let file_infos: Vec<crate::file::FileInfo> = files_to_index
+                    .iter()
+                    .map(|p| crate::file::FileInfo {
+                        path: p.clone(),
+                        language: crate::file::Language::from_path(p),
+                        size: 0,
+                    })
+                    .collect();
+                Self::index_files_in_batches(
+                    codebase_path,
+                    db_path,
+                    stores,
+                    &file_infos,
+                    &mut file_meta_store,
+                    embed_model,
+                    cancel_token,
+                    embedding_pool,
+                    None,
+                )
+                .await
+            };
+            if let Err(e) = batch.await {
+                warn!(
+                    "⚠️  Failed to index {} file(s): {e:#}",
+                    files_to_index.len()
+                );
             }
         }
 
@@ -3044,8 +3101,9 @@ impl IndexManager {
                 file_meta_store.remove_file(file_path);
             }
 
-            // Save metadata after deletions (before re-indexing, since
-            // index_single_file loads its own fresh copy per file)
+            // Persist deletions before re-indexing: a crash mid-pass must not
+            // lose them. The batched pass then updates + saves this same
+            // in-memory store once per batch.
             file_meta_store.save(db_path)?;
 
             // Rebuild vector index after FileMetaStore-based deletions.
@@ -3122,22 +3180,46 @@ impl IndexManager {
                 }
             }
 
-            // Phase 4: Re-index changed/new files
-            // Abort before the per-file re-index loop if cancellation arrived
-            // during the deletion/orphan-cleanup phases above.
+            // Phase 4: Re-index changed/new files — the same batched
+            // mechanism as the serve refresh pass (one embed/insert/FTS
+            // commit/file_meta save per batch, one HNSW build at the end).
+            // Abort before the re-index pass if cancellation arrived during
+            // the deletion/orphan-cleanup phases above.
             Self::ensure_indexing_active(cancel_token)?;
             let reindex_count = files_to_reindex.len();
-            for file_path in &files_to_reindex {
-                // Redrive on the transient Windows FTS commit race — the
-                // same protection force reindex already has.
-                if let Err(e) =
-                    Self::retry_on_transient_fts(&Self::FTS_TRANSIENT_BACKOFFS, || async {
-                        Self::index_single_file(codebase_path, file_path, stores, embedding_pool)
-                            .await
-                    })
+            if !files_to_reindex.is_empty() {
+                // Warn + continue (not `?`): the old per-file loop degraded
+                // gracefully when the model was unavailable or unresolvable,
+                // and a failed batch must not turn the whole refresh into an
+                // error — the healed deletions above are already durable.
+                let batch = async {
+                    let (refresh_model, _refresh_dims) = Self::resolve_embed_model(db_path)?;
+                    let reindex_infos: Vec<crate::file::FileInfo> = files_to_reindex
+                        .iter()
+                        .map(|p| crate::file::FileInfo {
+                            path: p.clone(),
+                            language: crate::file::Language::from_path(p),
+                            size: 0,
+                        })
+                        .collect();
+                    Self::index_files_in_batches(
+                        codebase_path,
+                        db_path,
+                        stores,
+                        &reindex_infos,
+                        &mut file_meta_store,
+                        refresh_model,
+                        cancel_token,
+                        embedding_pool,
+                        None,
+                    )
                     .await
-                {
-                    warn!("⚠️  Failed to re-index {}: {}", file_path.display(), e);
+                };
+                if let Err(e) = batch.await {
+                    warn!(
+                        "⚠️  Batched re-index of {} file(s) failed: {e:#}",
+                        reindex_count
+                    );
                 }
             }
 
@@ -3228,168 +3310,11 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Index a single file (for FSW events).
-    /// This is much faster than a full incremental refresh.
-    async fn index_single_file(
-        codebase_path: &Path,
-        file_path: &Path,
-        stores: &SharedStores,
-        embedding_pool: Option<&Arc<EmbeddingServicePool>>,
-    ) -> Result<()> {
-        use crate::cache::FileMetaStore;
-        use crate::chunker::{Chunker, SemanticChunker};
-        use crate::embed::EmbeddingService;
-        use crate::file::Language;
-
-        let db_path = codebase_path.join(DB_DIR_NAME);
-
-        // Check if file exists and is indexable
-        if !file_path.exists() {
-            debug!("File no longer exists, skipping: {}", file_path.display());
-            return Ok(());
-        }
-
-        let language = Language::from_path(file_path);
-        if !language.is_indexable() {
-            debug!("File not indexable, skipping: {}", file_path.display());
-            return Ok(());
-        }
-
-        // Read file content
-        let content = match std::fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to read file {}: {}", file_path.display(), e);
-                return Ok(());
-            }
-        };
-
-        // Chunk the file under its project-relative storage key so chunk
-        // metadata stays machine-portable.
-        let chunker = SemanticChunker::new(100, 4000, 2);
-        let rel_key = crate::cache::storage_key(file_path, codebase_path);
-        let chunks = chunker.chunk_file(std::path::Path::new(&rel_key), &content)?;
-
-        if chunks.is_empty() {
-            debug!("No chunks created for file: {}", file_path.display());
-            return Ok(());
-        }
-
-        debug!(
-            "Created {} chunks for file: {}",
-            chunks.len(),
-            file_path.display()
-        );
-
-        // Resolve the embedding model recorded for this index BEFORE embedding.
-        // The live watcher path must re-embed changed files with the SAME model
-        // the index was created with — using the hardcoded default here would
-        // write 384d vectors into a non-384d index and corrupt it.
-        let (embed_model, dimensions) = Self::resolve_embed_model(&db_path)?;
-        let model_name = embed_model.short_name();
-
-        // Generate embeddings. Reuse the serve pool's service when available:
-        // the pool already holds the persistent cache's LMDB env open, so a
-        // fresh EmbeddingService here is refused by the process-global
-        // registry and would degrade this path to cache-less re-embedding.
-        let embedded_chunks = match embed_service_choice(embedding_pool) {
-            EmbeddingSource::Pool(pool) => {
-                // The FSW paths hold a job permit (`process_batch_with_stores`
-                // / `refresh_index_with_stores`); interleave the model lock per
-                // mini-batch so a concurrent query embedding is not stuck
-                // behind this file.
-                pool.embed_chunks_yielding(embed_model, chunks, std::time::Duration::ZERO)?
-            }
-            EmbeddingSource::Fresh => {
-                let cache_dir = crate::constants::get_global_models_cache_dir()?;
-                let mut embedding_service =
-                    EmbeddingService::with_cache_dir(embed_model, Some(cache_dir.as_path()))?;
-                embedding_service.embed_chunks(chunks)?
-            }
-        };
-
-        // ── Delete stale chunks for this file BEFORE inserting new ones ──
-        // When a file is re-indexed (e.g. after a content change), the old
-        // chunk_ids must be removed from both VectorStore and FTSStore to
-        // prevent orphaned duplicates.  FileMetaStore.remove_file gives us
-        // the previous chunk_ids (if any) and atomically clears them so that
-        // update_file below can store the fresh set.
-        {
-            let mut file_meta_store =
-                FileMetaStore::load_or_create(&db_path, model_name, dimensions)?;
-            if let Some(old_meta) = file_meta_store.remove_file(&rel_key) {
-                let old_ids = old_meta.chunk_ids;
-                if !old_ids.is_empty() {
-                    debug!(
-                        "Removing {} stale chunks before re-index: {}",
-                        old_ids.len(),
-                        file_path.display()
-                    );
-                    // Vector store — batch delete
-                    {
-                        let mut store = stores.vector_store.write().await;
-                        store.delete_chunks(&old_ids)?;
-                    }
-                    // FTS store — per-chunk delete + commit
-                    {
-                        let mut fts_store = stores.fts_store.write().await;
-                        for id in &old_ids {
-                            fts_store.delete_chunk(*id)?;
-                        }
-                        fts_store.commit()?;
-                    }
-                }
-                // Persist the removal so the stale ids are gone from metadata
-                file_meta_store.save(&db_path)?;
-            }
-        }
-
-        // Use shared stores with write lock
-        let chunk_ids = {
-            let mut store = stores.vector_store.write().await;
-            let chunk_ids = store.insert_chunks_with_ids(embedded_chunks.clone())?;
-            // Rebuild the vector index after inserting new chunks
-            store.build_index()?;
-            chunk_ids
-        };
-
-        // FTS insert + commit + file_meta update. On ANY failure here the
-        // vector insert above must be rolled back: the failed attempt's ids
-        // would otherwise never reach file_meta, so no later pass could find
-        // and clean them — orphaned vector chunks next to lingering old FTS
-        // chunks = mixed generations (the field-reported stale-index symptom).
-        // file_meta is deliberately left untouched: it still names the old
-        // generation, so the next pass (redrive or refresh) heals cleanly.
-        if let Err(e) = Self::publish_file_chunks(
-            &db_path,
-            file_path,
-            stores,
-            &rel_key,
-            &embedded_chunks,
-            &chunk_ids,
-            model_name,
-            dimensions,
-        )
-        .await
-        {
-            Self::rollback_vector_insert(stores, &chunk_ids).await;
-            return Err(e);
-        }
-
-        info!(
-            "✅ Indexed {} ({} chunks)",
-            file_path.display(),
-            embedded_chunks.len()
-        );
-
-        Ok(())
-    }
-
     /// Best-effort removal of a failed attempt's fresh chunk_ids from both
-    /// stores. Called when [`Self::publish_file_chunks`] failed after the
-    /// vector insert: without this the ids are orphaned (never in file_meta,
-    /// so no later pass can find them). file_meta is deliberately untouched —
-    /// it still names the previous generation, so the next pass heals clean.
+    /// stores. Called when a batch publish failed after the vector insert:
+    /// without this the ids are orphaned (never in file_meta, so no later
+    /// pass can find them). file_meta is deliberately untouched — it still
+    /// names the previous generation, so the next pass heals clean.
     async fn rollback_vector_insert(stores: &SharedStores, chunk_ids: &[u32]) {
         {
             let mut store = stores.vector_store.write().await;
@@ -3404,62 +3329,31 @@ impl IndexManager {
         }
     }
 
-    /// FTS insert + commit + file_meta update for one file's fresh chunks —
-    /// split from [`Self::index_single_file`] so the caller can roll the
-    /// vector insert back when any of these steps fails.
-    #[allow(clippy::too_many_arguments)]
-    async fn publish_file_chunks(
-        db_path: &Path,
-        file_path: &Path,
-        stores: &SharedStores,
-        rel_key: &str,
-        embedded_chunks: &[crate::embed::EmbeddedChunk],
-        chunk_ids: &[u32],
-        model_name: &str,
-        dimensions: usize,
-    ) -> Result<()> {
-        // Add to FTS with write lock
-        {
-            let mut fts_store = stores.fts_store.write().await;
-            for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
-                let path_str = chunk.chunk.path.to_string();
-                let signature = chunk.chunk.signature.as_deref();
-                let kind = format!("{:?}", chunk.chunk.kind);
-                fts_store.add_chunk(
-                    *chunk_id,
-                    &chunk.chunk.content,
-                    &path_str,
-                    signature,
-                    &kind,
-                )?;
-            }
-            fts_store.commit()?;
-        }
-
-        // Update file metadata (separate store, not shared)
-        let mut file_meta_store =
-            crate::cache::FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
-        file_meta_store.update_file(file_path, rel_key, chunk_ids.to_vec())?;
-        file_meta_store.save(db_path)?;
-
-        Ok(())
-    }
-
-    /// Remove a file from the index using shared stores (for FSW delete events).
-    /// This version uses the shared stores to avoid LMDB conflicts.
-    async fn remove_file_from_index_with_stores(
+    /// Batched removal for the FSW delete wave: ONE `FileMetaStore` load,
+    /// ONE vector delete, ONE FTS delete+commit and ONE save for the whole
+    /// wave. The old per-file path paid ~2 MB of metadata I/O plus one LMDB
+    /// transaction PER CHUNK on every file (35-87s per removal batch under
+    /// load, serve log 10/11).
+    ///
+    /// A removed path may be a directory: tracked files under its normalized
+    /// prefix are removed with it (the Windows `rm -rf` shape, which emits a
+    /// single Remove event for the directory itself). Not-tracked paths are
+    /// skipped; an entry whose ids were already gone still gets cleared and
+    /// persisted. Returns the number of tracked entries removed.
+    async fn remove_files_from_index_batched(
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
-        file_path: &Path,
-    ) -> Result<()> {
+        files_to_remove: &[PathBuf],
+    ) -> Result<usize> {
         use crate::cache::FileMetaStore;
+        use std::collections::HashSet;
 
-        // Load metadata to get dimensions and model
+        // Model identity from metadata.json, read ONCE for the whole wave.
         let metadata_path = db_path.join("metadata.json");
         if !metadata_path.exists() {
             debug!("No metadata found, skipping removal");
-            return Ok(());
+            return Ok(0);
         }
         let metadata: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
@@ -3468,59 +3362,66 @@ impl IndexManager {
             .as_str()
             .unwrap_or("minilm-l6-q");
 
-        // Load file metadata to get chunk IDs
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
 
-        // Get chunk IDs from file metadata directly (not check_file which reads from disk)
-        // The file is already deleted, so we can't read mtime/size/hash
-        let key = crate::cache::storage_key(file_path, codebase_path);
-        let meta = file_meta_store.remove_file(&key);
-        let chunk_ids = match meta {
-            Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
-            Some(_) => {
-                debug!("No chunks to remove for file: {}", file_path.display());
-                file_meta_store.save(db_path)?;
-                return Ok(());
+        // Collect every removal target: the given paths, plus tracked files
+        // under any of them that acts as a directory prefix.
+        let mut keys: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for file_path in files_to_remove {
+            let key = crate::cache::storage_key(file_path, codebase_path);
+            if seen.insert(key.clone()) {
+                keys.push(key);
             }
-            None => {
-                debug!("No metadata found for file: {}", file_path.display());
-                return Ok(());
-            }
-        };
-
-        debug!(
-            "Removing {} chunks for file: {}",
-            chunk_ids.len(),
-            file_path.display()
-        );
-
-        // Delete chunks from vector store with write lock
-        {
-            let mut store = stores.vector_store.write().await;
-            for chunk_id in &chunk_ids {
-                store.delete_chunks(&[*chunk_id])?;
+            // The prefix must be PROJECT-RELATIVE: tracked keys are relative
+            // keys, and the FSW hands us absolute paths — the old loop
+            // prefixed with the absolute path, so directory removals never
+            // found their children (the rm -rf wave left them indexed).
+            let dir_prefix = format!("{}/", crate::cache::storage_key(file_path, codebase_path));
+            for tracked in file_meta_store.tracked_files() {
+                if tracked.starts_with(&dir_prefix) && seen.insert(tracked.clone()) {
+                    keys.push(tracked.clone());
+                }
             }
         }
 
-        // Delete from FTS with write lock
-        {
-            let mut fts_store = stores.fts_store.write().await;
-            for chunk_id in &chunk_ids {
-                fts_store.delete_chunk(*chunk_id)?;
+        // remove_file returns the previous chunk ids per key and clears the
+        // entry in memory; the store is persisted once below.
+        let mut stale_ids: Vec<u32> = Vec::new();
+        let mut mutated = false;
+        let mut removed = 0usize;
+        for key in &keys {
+            if let Some(meta) = file_meta_store.remove_file(key) {
+                mutated = true;
+                stale_ids.extend(meta.chunk_ids);
+                removed += 1;
             }
-            fts_store.commit()?;
         }
 
-        // Save file metadata (remove_file was already called above)
-        file_meta_store.save(db_path)?;
+        if mutated {
+            if !stale_ids.is_empty() {
+                debug!(
+                    "Removing {} stale chunk(s) for {} file(s)",
+                    stale_ids.len(),
+                    removed
+                );
+                {
+                    let mut store = stores.vector_store.write().await;
+                    store.delete_chunks(&stale_ids)?;
+                }
+                {
+                    let mut fts_store = stores.fts_store.write().await;
+                    for id in &stale_ids {
+                        fts_store.delete_chunk(*id)?;
+                    }
+                    fts_store.commit()?;
+                }
+            }
+            file_meta_store.save(db_path)?;
+            info!("🗑️  Removed {} file(s) from the index", removed);
+        }
 
-        info!(
-            "✅ Removed {} chunks for {}",
-            chunk_ids.len(),
-            file_path.display()
-        );
-
-        Ok(())
+        Ok(removed)
     }
 }
 
@@ -5031,6 +4932,299 @@ mod tests {
             remaining.is_empty(),
             "rolled-back ids must be gone from the vector store, got: {remaining:?}"
         );
+    }
+
+    /// The batched publish path writes fresh chunks into BOTH stores and
+    /// returns the ids it consumed — the per-batch commit point shared by the
+    /// serve refresh pass, the FSW event batch and the branch refresh.
+    #[tokio::test]
+    async fn publish_embedded_batch_round_trips_into_both_stores() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        let stores = create_test_stores(&db_path, 4).await;
+
+        let chunk = |path: &str| {
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn f() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )
+        };
+        let chunks = vec![chunk("a.rs"), chunk("b.rs")];
+
+        let ids = IndexManager::publish_embedded_batch(&stores, &chunks)
+            .await
+            .unwrap();
+
+        assert_eq!(ids.len(), 2);
+        let by_file = {
+            stores
+                .vector_store
+                .read()
+                .await
+                .get_chunks_by_file()
+                .unwrap()
+        };
+        assert_eq!(by_file.get("a.rs").map(Vec::len), Some(1));
+        assert_eq!(by_file.get("b.rs").map(Vec::len), Some(1));
+        // The FTS side must be COMMITTED — a reader (fresh txn) sees the docs.
+        let hits = {
+            stores
+                .fts_store
+                .read()
+                .await
+                .search_relaxed("fn f", 10)
+                .unwrap()
+        };
+        assert!(
+            hits.len() >= 2,
+            "FTS must contain the published chunks, got {hits:?}"
+        );
+    }
+
+    /// A batch whose files all fail (one unreadable, one yielding no chunks)
+    /// must end Ok(0): the unreadable file is skipped WITHOUT stamping its
+    /// meta entry — a vec![] stamp after its stale chunks were already
+    /// deleted would silently drop it from the index — while the 0-chunk
+    /// file is recorded as processed. CI-safe: the embed list stays empty,
+    /// so the pool never loads a model (embed_chunks_yielding returns early).
+    #[tokio::test]
+    async fn index_files_in_batches_skips_unreadable_and_records_zero_chunk_files() {
+        use crate::embed::EmbeddingServicePool;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = temp.path().join("db");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let readable_empty = codebase_path.join("empty.rs");
+        std::fs::write(&readable_empty, "").unwrap();
+        // A directory: read_to_string on it always fails.
+        let unreadable = codebase_path.join("blocked.rs");
+        std::fs::create_dir_all(&unreadable).unwrap();
+
+        let stores = create_test_stores(&db_path, 4).await;
+        let mut seeded = FileMetaStore::new("test-model".to_string(), 4);
+        // The hash anchor is only read for mtime/size/hash; the stored key is
+        // blocked.rs (update_file would fail hashing the directory itself).
+        seeded
+            .update_file(&readable_empty, "blocked.rs", vec![7, 8])
+            .unwrap();
+        seeded.save(&db_path).unwrap();
+
+        let files = vec![
+            crate::file::FileInfo {
+                path: unreadable.clone(),
+                language: crate::file::Language::from_path(&unreadable),
+                size: 0,
+            },
+            crate::file::FileInfo {
+                path: readable_empty.clone(),
+                language: crate::file::Language::from_path(&readable_empty),
+                size: 0,
+            },
+        ];
+        let pool = Arc::new(EmbeddingServicePool::new(Some(temp.path().join("models"))));
+        let mut file_meta = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        let result = IndexManager::index_files_in_batches(
+            &codebase_path,
+            &db_path,
+            &stores,
+            &files,
+            &mut file_meta,
+            crate::embed::EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q),
+            &CancellationToken::new(),
+            Some(&pool),
+            None,
+        )
+        .await;
+
+        let result = match result {
+            Ok(n) => n,
+            Err(e) => panic!("batch must not fail: {e:#}"),
+        };
+        assert_eq!(result, 0, "no embeddable chunks: nothing indexed");
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        assert_eq!(
+            reloaded.file_chunk_ids("blocked.rs"),
+            Some(vec![7, 8]),
+            "skipped file's meta must stay untouched, not stamped empty"
+        );
+        assert_eq!(
+            reloaded.file_chunk_ids("empty.rs"),
+            Some(vec![]),
+            "0-chunk file must be recorded as processed"
+        );
+    }
+
+    /// A removals-only FSW batch clears the tracked entries AND their chunks
+    /// from the vector store, without any embedding (no additions in the
+    /// batch) — the batched removal path's happy shape.
+    #[tokio::test]
+    async fn process_batch_removals_only_clears_meta_and_chunks() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = codebase_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let files: Vec<PathBuf> = ["a.rs", "b.rs"]
+            .iter()
+            .map(|n| {
+                let p = codebase_path.join(n);
+                std::fs::write(&p, "fn x() {}").unwrap();
+                p
+            })
+            .collect();
+        let stores = create_test_stores(&db_path, 4).await;
+        let chunk = |path: &str| {
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn f() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )
+        };
+        let mut meta = FileMetaStore::new("test-model".to_string(), 4);
+        for f in &files {
+            let key = crate::cache::storage_key(f, &codebase_path);
+            let ids = {
+                let mut vs = stores.vector_store.write().await;
+                vs.insert_chunks_with_ids(vec![chunk(&key)]).unwrap()
+            };
+            meta.update_file(f, &key, ids).unwrap();
+        }
+        meta.save(&db_path).unwrap();
+
+        IndexManager::process_batch_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            Vec::new(),
+            files.clone(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let remaining = {
+            stores
+                .vector_store
+                .read()
+                .await
+                .get_chunks_by_file()
+                .unwrap()
+        };
+        assert!(
+            remaining.is_empty(),
+            "chunks must be gone, got {remaining:?}"
+        );
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        for f in &files {
+            let key = crate::cache::storage_key(f, &codebase_path);
+            assert!(
+                reloaded.file_chunk_ids(&key).is_none(),
+                "{key} must be untracked after the removal batch"
+            );
+        }
+    }
+
+    /// Removing a DIRECTORY path must take every tracked file under its
+    /// prefix with it (the Windows `rm -rf` shape: one Remove event for the
+    /// directory itself).
+    #[tokio::test]
+    async fn process_batch_directory_removal_takes_tracked_children() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = codebase_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let anchor = codebase_path.join("anchor.rs");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::write(&anchor, "fn a() {}").unwrap();
+        let dir = codebase_path.join("dir");
+
+        let stores = create_test_stores(&db_path, 4).await;
+        let chunk = |path: &str| {
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn f() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![0.0, 1.0, 0.0, 0.0],
+            )
+        };
+        let mut meta = FileMetaStore::new("test-model".to_string(), 4);
+        // Child files need not exist on disk — the removal is metadata-driven
+        // (update_file hashes the anchor; the stored keys are the children).
+        for child in ["dir/sub.rs", "dir/deep/leaf.rs"] {
+            let ids = {
+                let mut vs = stores.vector_store.write().await;
+                vs.insert_chunks_with_ids(vec![chunk(child)]).unwrap()
+            };
+            meta.update_file(&anchor, child, ids).unwrap();
+        }
+        meta.save(&db_path).unwrap();
+
+        IndexManager::process_batch_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            Vec::new(),
+            vec![dir],
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let remaining = {
+            stores
+                .vector_store
+                .read()
+                .await
+                .get_chunks_by_file()
+                .unwrap()
+        };
+        assert!(
+            remaining.is_empty(),
+            "child chunks must be gone, got {remaining:?}"
+        );
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        for child in ["dir/sub.rs", "dir/deep/leaf.rs"] {
+            assert!(
+                reloaded.file_chunk_ids(child).is_none(),
+                "{child} must be untracked after the directory removal"
+            );
+        }
     }
 
     /// Phase 3.6: vector chunks not tracked by file_meta are deleted on the

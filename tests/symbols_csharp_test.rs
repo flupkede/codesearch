@@ -5,6 +5,7 @@
 //!
 //! Integration tests that invoke the helper subprocess are gated behind
 //! the `csharp_helper_integration` cargo feature.
+mod common;
 
 use std::path::PathBuf;
 

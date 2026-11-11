@@ -22,6 +22,7 @@
 //!
 //! Scope: `src/` sources. Comments, raw strings and byte strings are excluded —
 //! see `scan_source` for why each is handled the way it is.
+mod common;
 
 use std::path::{Path, PathBuf};
 

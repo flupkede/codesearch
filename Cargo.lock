@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "codesearch"
-version = "1.7.11"
+version = "1.7.13"
 dependencies = [
  "anyhow",
  "arroy",
@@ -754,6 +754,7 @@ dependencies = [
  "colored",
  "criterion",
  "crossterm",
+ "ctor",
  "ctrlc",
  "dashmap",
  "dirs 7.0.0",

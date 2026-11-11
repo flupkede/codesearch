@@ -106,3 +106,4 @@ fn search_rejects_an_override_when_the_index_model_is_unknown() {
     assert!(stderr.contains("embeddinggemma-q4"), "{stderr}");
     assert!(stderr.contains("--force"), "{stderr}");
 }
+mod common;

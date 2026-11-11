@@ -53,7 +53,14 @@ pub const DEFAULT_INDEX_JOBS: usize = 1;
 
 const DEFAULT_EMBED_PAUSE_MS: u64 = 0;
 const DEFAULT_MIN_FREE_MB: u64 = 0;
-const DEFAULT_MAX_CHUNKS_PER_BATCH: usize = 0;
+/// Default bound on chunks held in memory per refresh batch. 0 would disable
+/// the cap, but that is how one 13k-chunk ImportData file pushed a whole
+/// build against MDB_MAP_FULL twice (serve log 10/11, survived on the final
+/// insert retry). 4096 chunks is a few MB of text plus vectors — large
+/// enough that ordinary waves are a single batch, small enough that peak
+/// memory stays bounded; a single file larger than the cap still makes
+/// progress (it is inserted whole, relying on the insert's resize retry).
+const DEFAULT_MAX_CHUNKS_PER_BATCH: usize = 4096;
 
 /// How often the memory admission check re-reads available memory.
 const MEMORY_POLL_INTERVAL: Duration = Duration::from_millis(500);

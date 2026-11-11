@@ -14,7 +14,7 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.7.11]
+## [1.7.13]
 
 ### Fixed
 
@@ -26,6 +26,23 @@ finalized in place with a date — no renaming/migration step needed.
 ### Added
 
 - **Registering an umbrella directory warns about the git repos below it.** `codesearch index add` on a parent that contains nested git roots now lists them and suggests registering each child (plus a group for cross-repo search); the OpenCode plugin's scope block calls out a session that sits in its own git repo but is covered only as part of a parent project. Both address the `kcharts` registration shape: the parent index silently covers a child's files under the parent's ignore rules and alias.
+
+## [1.7.12]
+
+### Added
+
+- **Worktree registration seeds its parent index.** `POST /repos` for a git worktree of a registered main checkout now builds the parent index first when the parent has no usable one. The persistent embedding cache is global and content-hash keyed, so the parent's embeddings make the worktree's unchanged chunks cache hits instead of fresh ONNX runs — a fresh worktree no longer re-embeds the whole tree. Parent failures never block the child, and an already-usable parent index is left alone.
+
+### Changed
+
+- **FSW removal waves are batched.** Deleting files used to cost a ~1 MB `FileMetaStore` load+save, one LMDB transaction per chunk, and a tantivy commit per file (35–87s per removal batch under build contention, serve log 10/11). The watcher now removes the whole wave in one metadata load/save, one vector delete and one FTS commit. Directory removals also work for real: the prefix was matched against tracked keys with the absolute path, so `rm -rf` waves never removed their tracked children.
+- **Refresh batches default to a 4096-chunk cap** (`CODESEARCH_MAX_CHUNKS_PER_BATCH`, previously 0 = uncapped). One 13k-chunk ImportData file rode a whole build against `MDB_MAP_FULL` twice and survived only on its final insert retry; the cap bounds per-batch peak memory while oversized single files still insert whole via the insert's resize retry. `0` keeps disabling it.
+
+## [1.7.11]
+
+### Changed
+
+- **FSW event batches and branch refreshes re-index through the serve build path's bounded batch loop.** Changed files used to be re-indexed one by one — per file an embed call, two ~1 MB `FileMetaStore` load+save cycles, a tantivy commit and an O(repo-size) arroy graph rebuild inline on the async executor — ~3s per file on a 41k-chunk repo and far worse while other builds compete. All three callers (serve incremental refresh, the watcher event batch, the branch refresh) now share `index_files_in_batches`: one embed pass, one vector insert, one FTS commit and one metadata save per bounded batch, with a single HNSW build after the last batch. Unreadable files are skipped with their metadata untouched, model unavailability degrades to warn-and-continue as before, and a failed batch publish rolls the batch's fresh vector ids back.
 
 ## [1.7.6]
 

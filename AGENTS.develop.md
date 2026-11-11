@@ -241,6 +241,14 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — FSW removal waves batched: one metadata load/save, one vector delete and one FTS commit per wave instead of per chunk/per file; directory removals now actually take their tracked children (the absolute-prefix bug).
+
+- **Pending** — refresh batches default to a 4096-chunk cap (was uncapped), bounding per-batch peak memory; oversized single files still insert whole via the map-full resize retry.
+
+- **Pending** — registering a git worktree of a registered main checkout builds the parent index first when unusable, seeding the global embedding cache so the worktree's unchanged chunks are cache hits.
+
+- **Pending** — FSW + branch-refresh re-index batched: one embed/FTS-commit/metadata-save per bounded batch and a single HNSW build per wave, replacing the per-file embed + save + commit + O(repo-size) graph-rebuild path (~3s/file at 41k chunks, minutes under build contention).
+
 - **Pending** — optional OpenAI-compatible remote embeddings: one active strategy, runtime dimensions, provider-aware setup/doctor, cache isolation and failure-safe incremental replacement; switching requires `--force`
 
 - **v1.7.6 (pending)** — serve hub resolves `project` from the client working directory: MCP roots when the client sends them, plus an agent-supplied `cwd` argument on every scopeable tool (remote-HTTP clients never send roots) — worktree-safe scoping; explicit-project mismatch surfaces as a `warnings` entry
