@@ -15,7 +15,7 @@
 //!
 #![allow(dead_code)]
 
-use crate::cache::{normalize_path, normalize_path_str};
+use crate::cache::normalize_path_str;
 use crate::constants::{
     DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
     SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS, WRITER_LOCK_FILE,
@@ -2778,88 +2778,32 @@ impl IndexManager {
         // Enable quiet mode during FSW batch processing to suppress verbose embedding output
         set_quiet(true);
 
-        // First, remove deleted files
-        for file_path in &files_to_remove {
-            debug!("🗑️  Removing: {}", file_path.display());
-            if let Err(e) =
-                Self::remove_file_from_index_with_stores(codebase_path, db_path, stores, file_path)
-                    .await
+        // First, remove deleted files — batched: one FileMetaStore load, one
+        // vector delete, one FTS commit and one save for the whole wave. The
+        // old per-file loop paid that metadata I/O and one LMDB transaction
+        // PER CHUNK on every file (35-87s per removal batch under load).
+        // Failures warn + continue; the next pass re-removes whatever stayed.
+        if !files_to_remove.is_empty() {
+            if let Err(e) = Self::remove_files_from_index_batched(
+                codebase_path,
+                db_path,
+                stores,
+                &files_to_remove,
+            )
+            .await
             {
-                warn!("⚠️  Failed to remove {}: {}", file_path.display(), e);
-            }
-
-            // Also handle directory deletion: on Windows, rm -rf of a directory may only
-            // produce a Remove event for the directory itself, not for individual files.
-            // Find all tracked files under this path prefix and remove them too.
-            {
-                use crate::cache::FileMetaStore;
-
-                // Load FileMetaStore from disk to query tracked files
-                let metadata_path = db_path.join("metadata.json");
-                if metadata_path.exists() {
-                    if let Ok(metadata_str) = std::fs::read_to_string(&metadata_path) {
-                        if let Ok(metadata) =
-                            serde_json::from_str::<serde_json::Value>(&metadata_str)
-                        {
-                            let dimensions =
-                                metadata["dimensions"].as_u64().unwrap_or(384) as usize;
-                            let model_name = metadata["model_short_name"]
-                                .as_str()
-                                .unwrap_or("minilm-l6-q");
-
-                            if let Ok(file_meta_store) =
-                                FileMetaStore::load_or_create(db_path, model_name, dimensions)
-                            {
-                                // Normalize the directory prefix for consistent matching
-                                // (tracked files are normalized to forward slashes)
-                                let dir_prefix = normalize_path(file_path);
-                                let dir_prefix_slash = if dir_prefix.ends_with('/') {
-                                    dir_prefix.clone()
-                                } else {
-                                    format!("{}/", dir_prefix)
-                                };
-
-                                let files_under_dir: Vec<String> = file_meta_store
-                                    .tracked_files()
-                                    .filter(|f| f.starts_with(&dir_prefix_slash))
-                                    .cloned()
-                                    .collect();
-
-                                if !files_under_dir.is_empty() {
-                                    info!(
-                                        "🗑️  Directory deleted: {} ({} files under it)",
-                                        file_path.display(),
-                                        files_under_dir.len()
-                                    );
-                                    for tracked_file in &files_under_dir {
-                                        let tracked_path = PathBuf::from(tracked_file);
-                                        if let Err(e) = Self::remove_file_from_index_with_stores(
-                                            codebase_path,
-                                            db_path,
-                                            stores,
-                                            &tracked_path,
-                                        )
-                                        .await
-                                        {
-                                            warn!(
-                                                "⚠️  Failed to remove {}: {}",
-                                                tracked_path.display(),
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                warn!(
+                    "⚠️  Batched removal of {} path(s) failed: {e:#}",
+                    files_to_remove.len()
+                );
             }
         }
 
         // Rebuild vector index after removals so deleted chunks are excluded from search results.
-        // The batched index pass below builds the index once at its end, but when a batch
-        // contains ONLY removals (no additions), the index would never be rebuilt without this.
-        if !files_to_remove.is_empty() {
+        // The batched index pass below builds the index once at its end — after the
+        // deletions are already applied to storage — so a build here is only needed
+        // when the batch contains ONLY removals (no additions).
+        if !files_to_remove.is_empty() && files_to_index.is_empty() {
             let mut store = stores.vector_store.write().await;
             store.build_index()?;
         }
@@ -3376,21 +3320,31 @@ impl IndexManager {
         }
     }
 
-    /// Remove a file from the index using shared stores (for FSW delete events).
-    /// This version uses the shared stores to avoid LMDB conflicts.
-    async fn remove_file_from_index_with_stores(
+    /// Batched removal for the FSW delete wave: ONE `FileMetaStore` load,
+    /// ONE vector delete, ONE FTS delete+commit and ONE save for the whole
+    /// wave. The old per-file path paid ~2 MB of metadata I/O plus one LMDB
+    /// transaction PER CHUNK on every file (35-87s per removal batch under
+    /// load, serve log 10/11).
+    ///
+    /// A removed path may be a directory: tracked files under its normalized
+    /// prefix are removed with it (the Windows `rm -rf` shape, which emits a
+    /// single Remove event for the directory itself). Not-tracked paths are
+    /// skipped; an entry whose ids were already gone still gets cleared and
+    /// persisted. Returns the number of tracked entries removed.
+    async fn remove_files_from_index_batched(
         codebase_path: &Path,
         db_path: &Path,
         stores: &SharedStores,
-        file_path: &Path,
-    ) -> Result<()> {
+        files_to_remove: &[PathBuf],
+    ) -> Result<usize> {
         use crate::cache::FileMetaStore;
+        use std::collections::HashSet;
 
-        // Load metadata to get dimensions and model
+        // Model identity from metadata.json, read ONCE for the whole wave.
         let metadata_path = db_path.join("metadata.json");
         if !metadata_path.exists() {
             debug!("No metadata found, skipping removal");
-            return Ok(());
+            return Ok(0);
         }
         let metadata: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
@@ -3399,59 +3353,66 @@ impl IndexManager {
             .as_str()
             .unwrap_or("minilm-l6-q");
 
-        // Load file metadata to get chunk IDs
         let mut file_meta_store = FileMetaStore::load_or_create(db_path, model_name, dimensions)?;
 
-        // Get chunk IDs from file metadata directly (not check_file which reads from disk)
-        // The file is already deleted, so we can't read mtime/size/hash
-        let key = crate::cache::storage_key(file_path, codebase_path);
-        let meta = file_meta_store.remove_file(&key);
-        let chunk_ids = match meta {
-            Some(m) if !m.chunk_ids.is_empty() => m.chunk_ids,
-            Some(_) => {
-                debug!("No chunks to remove for file: {}", file_path.display());
-                file_meta_store.save(db_path)?;
-                return Ok(());
+        // Collect every removal target: the given paths, plus tracked files
+        // under any of them that acts as a directory prefix.
+        let mut keys: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for file_path in files_to_remove {
+            let key = crate::cache::storage_key(file_path, codebase_path);
+            if seen.insert(key.clone()) {
+                keys.push(key);
             }
-            None => {
-                debug!("No metadata found for file: {}", file_path.display());
-                return Ok(());
-            }
-        };
-
-        debug!(
-            "Removing {} chunks for file: {}",
-            chunk_ids.len(),
-            file_path.display()
-        );
-
-        // Delete chunks from vector store with write lock
-        {
-            let mut store = stores.vector_store.write().await;
-            for chunk_id in &chunk_ids {
-                store.delete_chunks(&[*chunk_id])?;
+            // The prefix must be PROJECT-RELATIVE: tracked keys are relative
+            // keys, and the FSW hands us absolute paths — the old loop
+            // prefixed with the absolute path, so directory removals never
+            // found their children (the rm -rf wave left them indexed).
+            let dir_prefix = format!("{}/", crate::cache::storage_key(file_path, codebase_path));
+            for tracked in file_meta_store.tracked_files() {
+                if tracked.starts_with(&dir_prefix) && seen.insert(tracked.clone()) {
+                    keys.push(tracked.clone());
+                }
             }
         }
 
-        // Delete from FTS with write lock
-        {
-            let mut fts_store = stores.fts_store.write().await;
-            for chunk_id in &chunk_ids {
-                fts_store.delete_chunk(*chunk_id)?;
+        // remove_file returns the previous chunk ids per key and clears the
+        // entry in memory; the store is persisted once below.
+        let mut stale_ids: Vec<u32> = Vec::new();
+        let mut mutated = false;
+        let mut removed = 0usize;
+        for key in &keys {
+            if let Some(meta) = file_meta_store.remove_file(key) {
+                mutated = true;
+                stale_ids.extend(meta.chunk_ids);
+                removed += 1;
             }
-            fts_store.commit()?;
         }
 
-        // Save file metadata (remove_file was already called above)
-        file_meta_store.save(db_path)?;
+        if mutated {
+            if !stale_ids.is_empty() {
+                debug!(
+                    "Removing {} stale chunk(s) for {} file(s)",
+                    stale_ids.len(),
+                    removed
+                );
+                {
+                    let mut store = stores.vector_store.write().await;
+                    store.delete_chunks(&stale_ids)?;
+                }
+                {
+                    let mut fts_store = stores.fts_store.write().await;
+                    for id in &stale_ids {
+                        fts_store.delete_chunk(*id)?;
+                    }
+                    fts_store.commit()?;
+                }
+            }
+            file_meta_store.save(db_path)?;
+            info!("🗑️  Removed {} file(s) from the index", removed);
+        }
 
-        info!(
-            "✅ Removed {} chunks for {}",
-            chunk_ids.len(),
-            file_path.display()
-        );
-
-        Ok(())
+        Ok(removed)
     }
 }
 
@@ -5096,6 +5057,165 @@ mod tests {
             Some(vec![]),
             "0-chunk file must be recorded as processed"
         );
+    }
+
+    /// A removals-only FSW batch clears the tracked entries AND their chunks
+    /// from the vector store, without any embedding (no additions in the
+    /// batch) — the batched removal path's happy shape.
+    #[tokio::test]
+    async fn process_batch_removals_only_clears_meta_and_chunks() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = codebase_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let files: Vec<PathBuf> = ["a.rs", "b.rs"]
+            .iter()
+            .map(|n| {
+                let p = codebase_path.join(n);
+                std::fs::write(&p, "fn x() {}").unwrap();
+                p
+            })
+            .collect();
+        let stores = create_test_stores(&db_path, 4).await;
+        let chunk = |path: &str| {
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn f() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![1.0, 0.0, 0.0, 0.0],
+            )
+        };
+        let mut meta = FileMetaStore::new("test-model".to_string(), 4);
+        for f in &files {
+            let key = crate::cache::storage_key(f, &codebase_path);
+            let ids = {
+                let mut vs = stores.vector_store.write().await;
+                vs.insert_chunks_with_ids(vec![chunk(&key)]).unwrap()
+            };
+            meta.update_file(f, &key, ids).unwrap();
+        }
+        meta.save(&db_path).unwrap();
+
+        IndexManager::process_batch_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            Vec::new(),
+            files.clone(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let remaining = {
+            stores
+                .vector_store
+                .read()
+                .await
+                .get_chunks_by_file()
+                .unwrap()
+        };
+        assert!(
+            remaining.is_empty(),
+            "chunks must be gone, got {remaining:?}"
+        );
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        for f in &files {
+            let key = crate::cache::storage_key(f, &codebase_path);
+            assert!(
+                reloaded.file_chunk_ids(&key).is_none(),
+                "{key} must be untracked after the removal batch"
+            );
+        }
+    }
+
+    /// Removing a DIRECTORY path must take every tracked file under its
+    /// prefix with it (the Windows `rm -rf` shape: one Remove event for the
+    /// directory itself).
+    #[tokio::test]
+    async fn process_batch_directory_removal_takes_tracked_children() {
+        use crate::chunker::{Chunk, ChunkKind};
+        use crate::embed::EmbeddedChunk;
+
+        let temp = tempdir().unwrap();
+        let codebase_path = temp.path().join("codebase");
+        let db_path = codebase_path.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::create_dir_all(&db_path).unwrap();
+        create_metadata_json(&db_path, 4);
+
+        let anchor = codebase_path.join("anchor.rs");
+        std::fs::create_dir_all(&codebase_path).unwrap();
+        std::fs::write(&anchor, "fn a() {}").unwrap();
+        let dir = codebase_path.join("dir");
+
+        let stores = create_test_stores(&db_path, 4).await;
+        let chunk = |path: &str| {
+            EmbeddedChunk::new(
+                Chunk::new(
+                    "fn f() {}".to_string(),
+                    0,
+                    1,
+                    ChunkKind::Function,
+                    path.to_string(),
+                ),
+                vec![0.0, 1.0, 0.0, 0.0],
+            )
+        };
+        let mut meta = FileMetaStore::new("test-model".to_string(), 4);
+        // Child files need not exist on disk — the removal is metadata-driven
+        // (update_file hashes the anchor; the stored keys are the children).
+        for child in ["dir/sub.rs", "dir/deep/leaf.rs"] {
+            let ids = {
+                let mut vs = stores.vector_store.write().await;
+                vs.insert_chunks_with_ids(vec![chunk(child)]).unwrap()
+            };
+            meta.update_file(&anchor, child, ids).unwrap();
+        }
+        meta.save(&db_path).unwrap();
+
+        IndexManager::process_batch_with_stores(
+            &codebase_path,
+            &db_path,
+            &stores,
+            Vec::new(),
+            vec![dir],
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let remaining = {
+            stores
+                .vector_store
+                .read()
+                .await
+                .get_chunks_by_file()
+                .unwrap()
+        };
+        assert!(
+            remaining.is_empty(),
+            "child chunks must be gone, got {remaining:?}"
+        );
+        let reloaded = FileMetaStore::load_or_create(&db_path, "test-model", 4).unwrap();
+        for child in ["dir/sub.rs", "dir/deep/leaf.rs"] {
+            assert!(
+                reloaded.file_chunk_ids(child).is_none(),
+                "{child} must be untracked after the directory removal"
+            );
+        }
     }
 
     /// Phase 3.6: vector chunks not tracked by file_meta are deleted on the
