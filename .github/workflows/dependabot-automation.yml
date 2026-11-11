@@ -1,0 +1,47 @@
+# Dependabot PRs: auto-label + auto-merge for non-major bumps.
+#
+# These PRs historically arrived with a failing require-changelog (dependency
+# bumps never touch CHANGELOG.md), no ci.yml run (dependabot/** fell outside
+# the push allowlist — fixed there), and a required approval nobody was
+# waiting for. This workflow removes the toil:
+#   - `no-changelog` label: the documented bypass in changelog-check.yml.
+#   - auto-merge: the PR merges itself once required checks pass and an
+#     approval lands. Enable "Allow auto-merge" in repo settings; major bumps
+#     deliberately still wait for a human.
+#
+# pull_request_target (not pull_request) so the label and auto-merge flag land
+# even when the PR itself would change workflows; safe here because this
+# workflow never checks out the PR's code.
+name: dependabot-automation
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  automate:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Label no-changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label no-changelog
+
+      - name: Enable auto-merge (minor and patch only)
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto --merge
