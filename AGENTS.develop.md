@@ -241,6 +241,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — edit-guard gates code files only: docs/markup/config edits in a registered repo pass without a codesearch consultation (the `.md` misfire); other source code incl. `.sql`, `.ipynb` cells and `.razor`/`.cshtml` still requires `find_impact`/`find kind="usages"` per the SCIP split.
+
 - **Pending** — refs-coverage enforced: a `lazy` stamp (full-scope rebuild without references) reads as stale and gets one symbol rebuild, so indexes converge to precomputed references; the hours-long lazy batch-find-refs pre-warm is removed, and project-scoped rebuilds stamp a new `incremental` coverage (fresh, on-demand misses).
 
 - **Pending** — phase-1 warmup orders most-recently-used first (persisted `access_times.json` sidecar) instead of effectively random registry order, so the repos an agent actively uses are warm right after a restart.
