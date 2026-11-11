@@ -141,7 +141,7 @@ pub(crate) fn is_transient_rename_error(e: &std::io::Error) -> bool {
 pub(crate) const RENAME_RETRY_ATTEMPTS: u32 = 5;
 pub(crate) const RENAME_RETRY_DELAY_MS: u64 = 20;
 
-fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
+pub(crate) fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
     use std::io::Write;
 
     static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

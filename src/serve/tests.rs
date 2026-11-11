@@ -7409,3 +7409,83 @@ async fn scope_error_lists_worktree_families_and_clean_projects() {
         "machine-readable payload must stay flat: {payload}"
     );
 }
+
+#[test]
+fn warmup_order_most_recently_used_first() {
+    // Table: (aliases, access map, expected order). Recency descending,
+    // never-used aliases last, ties break on alias for a deterministic order.
+    type OrderCase = (
+        Vec<&'static str>,
+        Vec<(&'static str, u64)>,
+        Vec<&'static str>,
+    );
+    let cases: Vec<OrderCase> = vec![
+        (
+            vec!["a", "b", "c"],
+            vec![("a", 100), ("c", 300)],
+            vec!["c", "a", "b"],
+        ),
+        (vec!["b", "a"], vec![("a", 5), ("b", 5)], vec!["a", "b"]),
+        (vec!["z", "a"], vec![], vec!["a", "z"]),
+        (vec!["only"], vec![], vec!["only"]),
+    ];
+    for (aliases, access, expected) in cases {
+        let aliases: Vec<String> = aliases.into_iter().map(str::to_string).collect();
+        let map: std::collections::HashMap<String, u64> = access
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        assert_eq!(ServeState::warmup_order(aliases, &map), expected);
+    }
+}
+
+#[test]
+fn access_times_sidecar_round_trip_and_corruption_tolerance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("access_times.json");
+
+    // Missing file: empty map, never an error.
+    assert!(ServeState::load_access_times_from(&path).is_empty());
+
+    // Persist → load round trip preserves entries and drives the order.
+    let payload = serde_json::json!({"a": 100u64, "b": 300u64});
+    crate::vectordb::store::atomic_write_json(&path, &payload).unwrap();
+    let loaded = ServeState::load_access_times_from(&path);
+    assert_eq!(loaded.get("a"), Some(&100u64));
+    assert_eq!(loaded.get("b"), Some(&300u64));
+    let order = ServeState::warmup_order(vec!["a".to_string(), "b".to_string()], &loaded);
+    assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
+
+    // Corrupt sidecar: empty map (registry-order fallback), not a panic.
+    std::fs::write(&path, "not json").unwrap();
+    assert!(ServeState::load_access_times_from(&path).is_empty());
+}
+
+#[test]
+fn touch_access_feeds_persisted_warmup_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = ReposConfig::default();
+    for alias in ["a", "b"] {
+        let dir = tmp.path().join(alias);
+        std::fs::create_dir(&dir).unwrap();
+        config
+            .register_with_alias(dir, Some(alias.to_string()))
+            .unwrap();
+    }
+    let state = state_with_config(config);
+
+    state.touch_access("a");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    state.touch_access("b");
+    // An unregistered alias sits in memory but must be pruned on persist.
+    state.touch_access("ghost");
+
+    let path = tmp.path().join("access_times.json");
+    state.persist_access_times_to(&path);
+    let loaded = ServeState::load_access_times_from(&path);
+    assert_eq!(loaded.len(), 2, "unregistered aliases are pruned");
+    assert!(loaded["b"] > loaded["a"], "later touch is more recent");
+    let order = ServeState::warmup_order(vec!["a".to_string(), "b".to_string()], &loaded);
+    assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
+}
