@@ -939,7 +939,7 @@ pub const INCREMENTAL_REFRESH_BATCH_SIZE_ENV: &str = "CODESEARCH_INCREMENTAL_BAT
 /// This is virtual address space, not physical memory. On POSIX and Windows the
 /// OS only faults in pages that are actually written, so 512 MB has no RAM cost
 /// on typical repos. Enterprise C# repos with thousands of symbols and their
-/// reference caches (Phase 3) can push past the old 64 MB limit.
+/// reference caches can push past the old 64 MB limit.
 ///
 /// Override at runtime with `CODESEARCH_SCIP_LMDB_MAP_MB` (integer, in MB).
 pub const SCIP_LMDB_DEFAULT_MAP_SIZE_MB: usize = 512;
