@@ -7179,6 +7179,51 @@ async fn backfill_group_identities_fills_missing_and_persists() {
     );
 }
 
+#[test]
+#[serial]
+fn registered_worktree_parent_matches_via_worktree_git_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    {
+        let _l = crate::db_discovery::repos::test_support::git_serial_lock();
+        crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
+    }
+    let wt = tmp.path().join("wt");
+    let o = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "seed-branch"])
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "worktree add failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let mut config = ReposConfig::default();
+    let main_alias = config.register(main.clone());
+    let child_alias = config.register(wt.clone());
+    assert_ne!(child_alias, main_alias);
+
+    // The worktree's .git FILE points at the main's worktrees dir: the
+    // registered main alias must be found as the seeding parent.
+    let found = super::registered_worktree_parent(&wt, &config);
+    assert_eq!(
+        found.as_ref().map(|(a, p)| (a.as_str(), p.as_path())),
+        Some((main_alias.as_str(), main.as_path())),
+        "worktree must seed from its registered main checkout"
+    );
+
+    // A regular repo (.git directory) never seeds.
+    assert!(super::registered_worktree_parent(&main, &config).is_none());
+
+    // A worktree whose main is not registered does not seed.
+    let empty = ReposConfig::default();
+    assert!(super::registered_worktree_parent(&wt, &empty).is_none());
+}
+
 #[tokio::test]
 #[serial]
 async fn backfill_all_missing_identities_fills_every_repo() {
