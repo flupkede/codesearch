@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.11]
+
+### Changed
+
+- **FSW event batches and branch refreshes re-index through the serve build path's bounded batch loop.** Changed files used to be re-indexed one by one — per file an embed call, two ~1 MB `FileMetaStore` load+save cycles, a tantivy commit and an O(repo-size) arroy graph rebuild inline on the async executor — ~3s per file on a 41k-chunk repo and far worse while other builds compete. All three callers (serve incremental refresh, the watcher event batch, the branch refresh) now share `index_files_in_batches`: one embed pass, one vector insert, one FTS commit and one metadata save per bounded batch, with a single HNSW build after the last batch. Unreadable files are skipped with their metadata untouched, model unavailability degrades to warn-and-continue as before, and a failed batch publish rolls the batch's fresh vector ids back.
+
 ## [1.7.6]
 
 ### Added
