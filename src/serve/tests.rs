@@ -4804,8 +4804,8 @@ fn note_add_index_failure_keeps_the_repo_registered() {
 #[serial]
 fn symbol_index_status_reflects_the_on_disk_meta() {
     use crate::constants::{
-        SCIP_INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_REFS_COVERAGE_KEY,
-        SCIP_REFS_COVERAGE_LAZY,
+        SCIP_INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_REFS_COVERAGE_COMPLETE,
+        SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_LAZY,
     };
 
     let (_tmp, repo_path, state) = state_with_repo("syminfo");
@@ -4847,7 +4847,7 @@ fn symbol_index_status_reflects_the_on_disk_meta() {
         &db,
         &[
             (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
-            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_LAZY),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_COMPLETE),
         ],
     );
     let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
@@ -4857,11 +4857,30 @@ fn symbol_index_status_reflects_the_on_disk_meta() {
     assert_eq!(csharp.state, "ready", "{csharp:?}");
     assert!(!csharp.not_applicable);
 
-    // Survived build failures in meta: degraded — serving but incomplete.
+    // A `lazy` coverage stamp marks an index built WITHOUT precomputed
+    // references (the old filtered-run shape): stale, so the serve rebuilds
+    // it once and the hours-long lazy pre-warm never recurs.
     seed_scip_meta(
         &db,
         &[
             (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_LAZY),
+        ],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "stale", "{csharp:?}");
+
+    // Survived build failures in meta: degraded — serving but incomplete.
+    // Coverage must be stamped (complete): without it the index reads stale
+    // before the warnings check ever runs.
+    seed_scip_meta(
+        &db,
+        &[
+            (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_COMPLETE),
             (
                 crate::constants::SCIP_INDEX_WARNINGS_KEY,
                 r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
@@ -5381,7 +5400,7 @@ const CURRENT_BUILD_META: &[(&str, &str)] = &[
     ),
     (
         crate::constants::SCIP_REFS_COVERAGE_KEY,
-        crate::constants::SCIP_REFS_COVERAGE_LAZY,
+        crate::constants::SCIP_REFS_COVERAGE_COMPLETE,
     ),
 ];
 

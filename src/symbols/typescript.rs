@@ -807,10 +807,6 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
     fn applicability_hint(&self) -> &'static str {
         "the scip-typescript adapter requires a top-level tsconfig.json (monorepo layouts are not resolved yet)"
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 #[cfg(test)]

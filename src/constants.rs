@@ -838,6 +838,15 @@ pub const SCIP_REFS_COVERAGE_PARTIAL: &str = "partial";
 /// Nothing was precomputed; every reference lookup resolves lazily.
 pub const SCIP_REFS_COVERAGE_LAZY: &str = "lazy";
 
+/// Coverage stamp written by a PROJECT-SCOPED run (`RebuildScope::Files`
+/// incrementals and `RebuildScope::Project` rebuilds both pass
+/// `project=Some`, so their references are project-local and can never
+/// claim solution-wide truth). Accepted as fresh: it is the steady state
+/// between incrementals, and queries resolve any cache miss on demand.
+/// Distinct from `lazy`, which marks a FULL-scope run that produced no
+/// references at all (pre-2.1 helpers) and must rebuild once.
+pub const SCIP_REFS_COVERAGE_INCREMENTAL: &str = "incremental";
+
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
 pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";
@@ -853,7 +862,7 @@ pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
 pub const SCIP_REF_CACHE_DB_NAME: &str = "scip_ref_cache";
 
 /// LMDB table caching per-symbol completeness warnings from on-demand
-/// reference resolution (`scip-csharp find-refs` / `batch-find-refs`).
+/// reference resolution (`scip-csharp find-refs`).
 /// Key: full SCIP symbol key. Value: `[v1, bincode(Vec<String>)]` (same wire
 /// format as the key lists). Non-empty means the cached references may be
 /// INCOMPLETE — a helper failure was survived rather than fatal. Empty
@@ -904,16 +913,6 @@ pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";
 /// is also expected to live within that range.
 pub const CSHARP_SCIP_CONCURRENCY_DEFAULT: usize = 2;
 
-/// Environment variable controlling Phase 3 pre-warm of reference cache.
-/// When "true" (default), `run_phase_3_prewarm()` batch-resolves all uncached
-/// symbol references after Phase 2 completes. Set to "false" on memory-constrained
-/// machines to skip the workspace-open cost.
-pub const CSHARP_PREWARM_ENABLED_ENV: &str = "CSHARP_PREWARM_ENABLED";
-
-/// Maximum number of symbols to resolve per repo in Phase 3 pre-warm.
-/// Limits the batch size to avoid excessive memory usage on large solutions.
-pub const CSHARP_PREWARM_MAX_SYMBOLS: usize = 5000;
-
 /// Maximum number of changed files chunked + embedded in a single in-memory
 /// batch during `IndexManager::perform_incremental_refresh_with_stores`.
 ///
@@ -940,7 +939,7 @@ pub const INCREMENTAL_REFRESH_BATCH_SIZE_ENV: &str = "CODESEARCH_INCREMENTAL_BAT
 /// This is virtual address space, not physical memory. On POSIX and Windows the
 /// OS only faults in pages that are actually written, so 512 MB has no RAM cost
 /// on typical repos. Enterprise C# repos with thousands of symbols and their
-/// reference caches (Phase 3) can push past the old 64 MB limit.
+/// reference caches can push past the old 64 MB limit.
 ///
 /// Override at runtime with `CODESEARCH_SCIP_LMDB_MAP_MB` (integer, in MB).
 pub const SCIP_LMDB_DEFAULT_MAP_SIZE_MB: usize = 512;

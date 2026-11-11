@@ -26,13 +26,7 @@
 //! - Merges the result: updates symbols and positions for affected files only;
 //!   symbols from other projects are preserved.
 //! - Rebuilds `scip_simple_names` from all current `scip_symbols` entries.
-//! - Clears `scip_ref_cache`; references then resolve lazily.
-//!
-//! ## Phase 3 pre-warm (background ref cache filling)
-//!
-//! For an index without precomputed references (`refs_coverage` = lazy),
-//! Phase 3 runs `scip-csharp batch-find-refs` to resolve references for all
-//! symbols in one workspace session, amortizing the workspace open cost.
+//! - Clears `scip_ref_cache`; references then resolve lazily on demand.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -49,10 +43,7 @@ use heed::Database;
 use serde::{Deserialize, Serialize};
 
 use super::scip_parse;
-use super::{
-    ImpactQuery, KeyMatch, PrewarmSummary, RebuildScope, RebuildSummary, SymbolIndexer,
-    SymbolReference,
-};
+use super::{ImpactQuery, KeyMatch, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
 // ── Helper stderr routing ─────────────────────────────────────────
 
@@ -152,16 +143,6 @@ pub(crate) fn refs_coverage_for(precomputed: bool, clean: bool) -> &'static str 
         (true, true) => crate::constants::SCIP_REFS_COVERAGE_COMPLETE,
         (true, false) => crate::constants::SCIP_REFS_COVERAGE_PARTIAL,
     }
-}
-
-/// Whether the Phase 3 batch prewarm still has work: only a lazy (or
-/// unstamped) index lacks precomputed references.
-pub(crate) fn ref_prewarm_needed(refs_coverage: Option<&str>) -> bool {
-    !matches!(
-        refs_coverage,
-        Some(crate::constants::SCIP_REFS_COVERAGE_COMPLETE)
-            | Some(crate::constants::SCIP_REFS_COVERAGE_PARTIAL)
-    )
 }
 
 /// The stored form of the summarized warnings: a stand-alone summary entry
@@ -621,8 +602,8 @@ impl Default for CSharpSymbolIndexer {
     }
 }
 
-/// PIDs of live one-shot scip-csharp helper children (index, find-refs,
-/// batch-find-refs). serve shutdown kills whatever is still registered: a
+/// PIDs of live one-shot scip-csharp helper children (index, find-refs).
+/// serve shutdown kills whatever is still registered: a
 /// rebuild outliving its host holds the helper exe locked for minutes (the
 /// deploy blocker) and keeps computing for a dead client.
 static LIVE_HELPER_PIDS: std::sync::LazyLock<std::sync::Mutex<HashSet<u32>>> =
@@ -1455,361 +1436,6 @@ impl CSharpSymbolIndexer {
             .flatten()
             .map(str::to_string)
     }
-
-    /// Collect all symbol keys that do NOT already have cached references.
-    ///
-    /// Used by Phase 3 to skip symbols whose refs are already in the cache.
-    pub fn collect_uncached_symbol_keys(&self, db_path: &Path) -> Result<Vec<String>> {
-        let env = self.open_scip_env(db_path)?;
-        // Open the named DBs before the read txn: each open commits its own
-        // txn, and a rtxn started earlier would not know the handles.
-        let symbols_db: Database<'static, Str, Bytes> =
-            open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)?
-                .ok_or_else(|| anyhow::anyhow!("scip_symbols database not found"))?;
-
-        let ref_cache_db: Option<Database<'static, Str, Bytes>> =
-            open_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?;
-        let rtxn = env.read_txn()?;
-
-        let mut uncached = Vec::new();
-        let iter = symbols_db.iter(&rtxn)?;
-        for result in iter {
-            let (key, _) = result?;
-            let cached = match ref_cache_db {
-                Some(db) => db.get(&rtxn, key)?.is_some(),
-                None => false,
-            };
-            if !cached {
-                uncached.push(key.to_string());
-            }
-        }
-
-        Ok(uncached)
-    }
-
-    /// Pre-warm the reference cache by batch-resolving all uncached symbols.
-    ///
-    /// Invokes `scip-csharp batch-find-refs` with the uncached symbol keys.
-    /// The helper opens the workspace once, resolves all symbols, and writes
-    /// results to a temp JSON file. We then parse and cache each result.
-    ///
-    /// Returns the number of symbols resolved and cached.
-    pub fn prewarm_ref_cache(
-        &self,
-        repo_path: &Path,
-        db_path: &Path,
-        max_symbols: usize,
-    ) -> Result<PrewarmSummary> {
-        let helper = match self.detect_helper() {
-            Some(h) => h,
-            None => {
-                return Ok(PrewarmSummary {
-                    total_symbols: 0,
-                    resolved: 0,
-                    cached: 0,
-                    duration_ms: 0,
-                });
-            }
-        };
-
-        let solution = match Self::find_solution(repo_path) {
-            Some(s) => s,
-            None => {
-                tracing::debug!("prewarm: no .sln found under {}", repo_path.display());
-                return Ok(PrewarmSummary {
-                    total_symbols: 0,
-                    resolved: 0,
-                    cached: 0,
-                    duration_ms: 0,
-                });
-            }
-        };
-
-        let start = std::time::Instant::now();
-
-        // Collect uncached symbols
-        let uncached = self.collect_uncached_symbol_keys(db_path)?;
-        if uncached.is_empty() {
-            tracing::info!("prewarm: all symbols already cached, nothing to do");
-            return Ok(PrewarmSummary {
-                total_symbols: 0,
-                resolved: 0,
-                cached: 0,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        let total_available = uncached.len();
-        let symbols_to_resolve = if uncached.len() > max_symbols {
-            tracing::info!(
-                "prewarm: limiting to {} of {} uncached symbols",
-                max_symbols,
-                total_available
-            );
-            uncached[..max_symbols].to_vec()
-        } else {
-            uncached
-        };
-
-        tracing::info!(
-            "prewarm: resolving {} symbols (of {} total uncached) for {}",
-            symbols_to_resolve.len(),
-            total_available,
-            repo_path.file_name().unwrap_or_default().to_string_lossy()
-        );
-
-        // Write symbol keys to temp file for batch-find-refs
-        // Use a single nonce for both temp files to avoid a race between two
-        // start.elapsed() calls that produce different values.
-        let nonce = start.elapsed().as_nanos();
-        let temp_dir = std::env::temp_dir().join("codesearch-scip");
-        std::fs::create_dir_all(&temp_dir)?;
-        let symbols_file = temp_dir.join(format!(
-            "symbols-{}-{:x}.txt",
-            repo_path.file_name().unwrap_or_default().to_string_lossy(),
-            nonce
-        ));
-        // Filter symbols: SCIP keys must not contain newlines (they're used as the line separator).
-        // Defensive — Roslyn-derived keys are always single-line, but guard against edge cases.
-        let clean_symbols: Vec<&str> = symbols_to_resolve
-            .iter()
-            .map(|s| s.as_str())
-            .filter(|s| !s.contains('\n'))
-            .collect();
-        std::fs::write(&symbols_file, clean_symbols.join("\n"))?;
-        // Guard ensures cleanup on all exit paths (success, early-? returns, panics).
-        let _symbols_guard = TempFileGuard(symbols_file.clone());
-
-        let output_path = temp_dir.join(format!(
-            "batch-refs-{}-{:x}.json",
-            std::process::id(),
-            nonce
-        ));
-        let _output_guard = TempFileGuard(output_path.clone());
-
-        // Invoke batch-find-refs — symbols_file and output_path are cleaned up by guards
-        if let Err(e) =
-            self.invoke_batch_find_refs_helper(&helper, &solution, &symbols_file, &output_path)
-        {
-            if is_restore_pending(&e) {
-                // Prewarm is best-effort: skip this round, cache nothing.
-                // The next prewarm (or any lazy lookup) retries after the
-                // restore finished (issue #225).
-                tracing::warn!(
-                    "prewarm skipped for '{}': dotnet restore still running (restore pending)",
-                    solution.display()
-                );
-                return Ok(PrewarmSummary {
-                    total_symbols: total_available,
-                    resolved: 0,
-                    cached: 0,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-            }
-            return Err(e);
-        }
-
-        // Parse and cache results
-        let cached = self.parse_and_cache_batch_refs(db_path, &output_path)?;
-        // Guards drop here (or on early-? return above) and delete both temp files.
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-        tracing::info!(
-            "prewarm: resolved {} symbols, cached {} refs in {}ms",
-            symbols_to_resolve.len(),
-            cached,
-            duration_ms
-        );
-
-        Ok(PrewarmSummary {
-            total_symbols: total_available,
-            resolved: symbols_to_resolve.len(),
-            cached,
-            duration_ms,
-        })
-    }
-
-    /// Invoke `scip-csharp batch-find-refs` to resolve multiple symbols in one session.
-    fn invoke_batch_find_refs_helper(
-        &self,
-        helper: &Path,
-        solution: &Path,
-        symbols_file: &Path,
-        output_path: &Path,
-    ) -> Result<()> {
-        let solution_short = solution
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| solution.display().to_string());
-
-        let mut cmd = Command::new(helper);
-        cmd.arg("batch-find-refs")
-            .arg("--solution")
-            .arg(solution)
-            .arg("--symbols-file")
-            .arg(symbols_file)
-            .arg("--output")
-            .arg(output_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        tracing::info!(
-            "scip-csharp batch-find-refs: resolving symbols from {}",
-            symbols_file.display()
-        );
-
-        let mut child = cmd.spawn().with_context(|| {
-            format!(
-                "Failed to spawn scip-csharp batch-find-refs at {}",
-                helper.display()
-            )
-        })?;
-        let _live_helper = LiveHelperChild::register(&child);
-
-        let stderr_handle = child.stderr.take().map(|stderr| {
-            let label = solution_short.clone();
-            thread::spawn(move || {
-                drain_pipe_to_tracing(stderr, |line| {
-                    if !line.is_empty() {
-                        emit_helper_stderr_line("scip-csharp batch-find-refs", &label, line);
-                    }
-                });
-            })
-        });
-
-        let stdout_handle = child.stdout.take().map(|stdout| {
-            let label = solution_short.clone();
-            thread::spawn(move || {
-                drain_pipe_to_tracing(stdout, |line| {
-                    if !line.is_empty() {
-                        tracing::debug!("[scip-csharp batch-find-refs:{}] {}", label, line);
-                    }
-                });
-            })
-        });
-
-        let status = child
-            .wait()
-            .with_context(|| "Failed to wait for scip-csharp batch-find-refs")?;
-
-        if let Some(h) = stderr_handle {
-            let _ = h.join();
-        }
-        if let Some(h) = stdout_handle {
-            let _ = h.join();
-        }
-
-        if status.code() == Some(HELPER_RESTORE_PENDING_EXIT) {
-            // Typed restore-pending outcome: no output file exists to parse
-            // and nothing may be cached from this run (issue #225).
-            return Err(anyhow::Error::new(RestorePendingError));
-        }
-
-        if !status.success() {
-            tracing::warn!(
-                "scip-csharp batch-find-refs exited with {} for {}",
-                super::exit_status_text(&status),
-                solution_short
-            );
-            // Don't bail — partial output is acceptable
-        }
-
-        Ok(())
-    }
-
-    /// Parse batch-find-refs output and cache results in LMDB.
-    ///
-    /// Returns the number of symbols that had their refs cached.
-    fn parse_and_cache_batch_refs(&self, db_path: &Path, output_path: &Path) -> Result<usize> {
-        let content = std::fs::read_to_string(output_path).with_context(|| {
-            format!(
-                "Failed to read batch-find-refs output: {}",
-                output_path.display()
-            )
-        })?;
-
-        #[derive(serde::Deserialize)]
-        struct BatchOutput {
-            version: String,
-            results: Vec<SymbolResult>,
-        }
-
-        #[derive(serde::Deserialize)]
-        struct SymbolResult {
-            symbol: String,
-            references: Vec<RefEntry>,
-            /// Absent in helper output from before warnings existed —
-            /// default to empty so old binaries keep parsing as "complete".
-            #[serde(default)]
-            warnings: Vec<String>,
-        }
-
-        #[derive(serde::Deserialize)]
-        struct RefEntry {
-            file: String,
-            #[serde(rename = "start_line")]
-            start_line: u32,
-            #[serde(rename = "end_line")]
-            end_line: u32,
-            kind: String,
-        }
-
-        let batch: BatchOutput = serde_json::from_str(&content)
-            .with_context(|| "Failed to parse batch-find-refs output")?;
-
-        // Reject outputs from unknown helper versions to avoid silently misinterpreting
-        // a changed schema (same contract enforced on index and find-refs paths).
-        if batch.version != scip_parse::SUPPORTED_INDEX_VERSION {
-            anyhow::bail!(
-                "Unsupported batch-find-refs version: '{}' (expected '{}'). \
-                 Update codesearch and scip-csharp together.",
-                batch.version,
-                scip_parse::SUPPORTED_INDEX_VERSION
-            );
-        }
-
-        let env = self.open_scip_env(db_path)?;
-        let ref_cache_db = create_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)?;
-        let warnings_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)?
-            .ok_or_else(|| anyhow::anyhow!("scip_ref_warnings database not found"))?;
-        let mut wtxn = env.write_txn()?;
-
-        let mut cached_count = 0usize;
-        for result in &batch.results {
-            // Filter: only cache "reference" kind (defensive against definitions)
-            let refs: Vec<StoredReference> = result
-                .references
-                .iter()
-                .filter(|r| r.kind == "reference")
-                .map(|r| StoredReference {
-                    file: PathBuf::from(&r.file),
-                    start_line: r.start_line,
-                    end_line: r.end_line,
-                    kind: r.kind.clone(),
-                })
-                .collect();
-
-            // Over the LMDB key limit: skip rather than fail the batch, same
-            // rule as the rebuild's write loop.
-            if result.symbol.len() > env.max_key_size() {
-                continue;
-            }
-            // Cache even if empty — symbols with 0 references must be marked as
-            // "resolved" so collect_uncached_symbol_keys() won't retry them forever.
-            let bytes = serialize_refs(&refs)
-                .with_context(|| format!("Failed to serialize batch refs for {}", result.symbol))?;
-            ref_cache_db
-                .put(&mut wtxn, result.symbol.as_str(), &bytes)
-                .with_context(|| put_ctx(SCIP_REF_CACHE_DB_NAME, &result.symbol, bytes.len()))?;
-            // Same txn as the refs: cached-partial and its warnings are one
-            // atomic fact. Empty warnings remove any stale entry.
-            store_ref_warnings(&warnings_db, &mut wtxn, &result.symbol, &result.warnings)?;
-            cached_count += 1;
-        }
-
-        wtxn.commit()?;
-        Ok(cached_count)
-    }
 }
 
 /// Convert a `StoredReference` to the public `SymbolReference` type.
@@ -1965,13 +1591,21 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             definitions: index,
             references,
         } = scip_parse::parse_json_index(&index_data)?;
-        // Only a full-scope run resolves references solution-wide; a filtered
-        // run's list would cache project-local answers as the whole truth.
+        // Project-scoped runs (incrementals, single-project rebuilds) see
+        // only their own project's symbols: their references can never be
+        // cached as solution-wide truth, so they stamp `incremental` —
+        // fresh, with queries resolving misses on demand. Only a FULL-scope
+        // run answers whether the helper produced solution-wide references
+        // (precomputed) or not (lazy — a pre-2.1 helper, rebuilt once).
         let precomputed_refs = references.filter(|_| project.is_none());
-        let refs_coverage = refs_coverage_for(
-            precomputed_refs.is_some(),
-            index_warnings_stored(&index_warnings).is_empty(),
-        );
+        let refs_coverage = if project.is_some() {
+            crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL
+        } else {
+            refs_coverage_for(
+                precomputed_refs.is_some(),
+                index_warnings_stored(&index_warnings).is_empty(),
+            )
+        };
 
         // Open LMDB (all named DBs pre-created by open_scip_env)
         let env = self.open_scip_env(db_path)?;
@@ -2558,6 +2192,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     /// not stamp at all — hence the override, not the trait default).
     /// A missing `refs_coverage` stamp is stale too: such an index predates
     /// precomputed references, and only a rebuild produces them.
+    /// A `lazy` stamp is stale as well: it marks a FULL-scope run that
+    /// produced no references (pre-2.1 helpers), which would otherwise
+    /// leave find_impact on slow per-query on-demand resolution forever.
+    /// Serve full rebuilds are always full-scope with the current helper,
+    /// so one rebuild stamps `complete`/`partial` and lazy never recurs.
+    /// `incremental` stays fresh: it is the honest stamp of a project-scoped
+    /// run between incrementals (cache cleared, queries resolve on demand).
     fn index_matches_builder(&self, db_path: &Path) -> bool {
         self.index_builder_version(db_path).as_deref()
             == Some(crate::constants::SCIP_INDEX_BUILDER_VERSION)
@@ -2566,7 +2207,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 Some(
                     crate::constants::SCIP_REFS_COVERAGE_COMPLETE
                         | crate::constants::SCIP_REFS_COVERAGE_PARTIAL
-                        | crate::constants::SCIP_REFS_COVERAGE_LAZY
+                        | crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL
                 )
             )
     }
@@ -2621,10 +2262,6 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
     fn applicability_hint(&self) -> &'static str {
         "the scip-csharp adapter requires a .sln file in the repository root"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -3073,9 +2710,8 @@ mod tests {
     // ── B3 warnings: producer-side coverage (the sites that WRITE) ──
     //
     // Every test above hand-populates the warnings store (the consumer
-    // half). These two drive the real producer sites instead, so deleting
-    // the store_ref_warnings call in parse_and_cache_batch_refs or in the
-    // lazy write phase fails here.
+    // half). This one drives the real producer site instead, so deleting
+    // the store_ref_warnings call in the lazy write phase fails here.
 
     /// A real helper executable, built with the test run's own rustc.
     ///
@@ -3201,74 +2837,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_parse_persists_helper_warnings_alongside_the_cached_refs() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db = dir.path().join("db");
-        let key = "csharp Ns . V#Validate().";
-
-        // Batch-find-refs output exactly as the helper writes it: version
-        // 1.0, one resolved symbol, a `warnings` array reporting what it
-        // survived.
-        let output_path = dir.path().join("batch-refs.json");
-        let doc = serde_json::json!({
-            "version": scip_parse::SUPPORTED_INDEX_VERSION,
-            "results": [{
-                "symbol": key,
-                "references": [
-                    {"file": "src/generated.cs", "start_line": 11, "end_line": 11, "kind": "reference"},
-                ],
-                "warnings": [
-                    "could not compile project 'Broken' — its symbols are missing from the map",
-                ],
-            }],
-        });
-        std::fs::write(&output_path, doc.to_string()).unwrap();
-
-        let indexer = CSharpSymbolIndexer::new();
-        let cached = indexer
-            .parse_and_cache_batch_refs(&db, &output_path)
-            .unwrap();
-        assert_eq!(cached, 1, "the one result must be cached");
-
-        // The refs landed in the cache...
-        let refs = indexer.find_references_for_key(&db, key).unwrap();
-        assert!(
-            refs.iter()
-                .any(|r| r.file == Path::new("src/generated.cs") && r.kind == "reference"),
-            "the batch refs must be cached, got {refs:?}"
-        );
-        // ...and the warning the helper reported must be persisted WITH
-        // them — the cached-partial fact is one atomic fact.
-        let warnings = indexer.lookup_warnings(&db, key);
-        assert_eq!(warnings.len(), 1, "the batch warning must be persisted");
-        assert!(
-            warnings[0].contains("could not compile project 'Broken'"),
-            "warning text must round-trip, got: {}",
-            warnings[0]
-        );
-
-        // A later batch run WITHOUT the warnings field (an old helper) must
-        // clear the stale warning: absence = complete, so a clean
-        // re-resolution stops claiming partiality.
-        let clean_path = dir.path().join("batch-refs-clean.json");
-        let clean = serde_json::json!({
-            "version": scip_parse::SUPPORTED_INDEX_VERSION,
-            "results": [{
-                "symbol": key,
-                "references": [],
-            }],
-        });
-        std::fs::write(&clean_path, clean.to_string()).unwrap();
-        indexer
-            .parse_and_cache_batch_refs(&db, &clean_path)
-            .unwrap();
-        assert!(
-            indexer.lookup_warnings(&db, key).is_empty(),
-            "a warnings-free batch result must clear the stale warning"
-        );
-    }
-
-    #[test]
     #[serial_test::serial]
     fn lazy_cache_miss_persists_helper_warnings_alongside_the_cached_refs() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3359,7 +2927,7 @@ mod tests {
             wtxn.commit().unwrap();
         }
         let helper_dir = dir.join("helper");
-        std::fs::create_dir(&helper_dir).unwrap();
+        std::fs::create_dir_all(&helper_dir).unwrap();
         let helper = build_fake_csharp_helper(&helper_dir);
         let marker = dir.join("non-index-calls.txt");
         let guard = crate::testing::EnvRestore::set(&[
@@ -3467,6 +3035,42 @@ mod tests {
                 .lookup_warnings(&run.db, FAKE_REFERENCED)
                 .is_empty(),
             "a warning from before the rebuild must not replay against the new cache"
+        );
+    }
+
+    /// An incremental rebuild clears the WHOLE precomputed ref cache —
+    /// including entries for symbols untouched by the changed files — so
+    /// no stale pre-change entry can survive an unrelated file's rebuild.
+    /// This is the pin that moved here from the deleted
+    /// `test_incremental_rebuild_clears_the_reference_cache` (its probe
+    /// `collect_uncached_symbol_keys` was removed with the lazy pre-warm).
+    #[test]
+    #[serial_test::serial]
+    fn incremental_rebuild_clears_the_precomputed_ref_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let full = rebuild_with_fake_index(dir.path(), "2.1", RebuildScope::Full);
+        assert_eq!(full.summary.references_stored, 4);
+        assert_eq!(ref_cache_keys(&full.db).len(), 2);
+
+        let run = rebuild_with_fake_index(
+            dir.path(),
+            "2.1",
+            RebuildScope::Files {
+                changed: vec![PathBuf::from("src/Unrelated.cs")],
+                deleted: vec![],
+            },
+        );
+        assert!(
+            ref_cache_keys(&run.db).is_empty(),
+            "an incremental rebuild must clear scip_ref_cache in full, got {:?}",
+            ref_cache_keys(&run.db)
+        );
+        // The cleared cache stamps `incremental`: fresh (project-scoped
+        // truth, queries resolve misses on demand) — NOT lazy, which is
+        // reserved for full-scope runs without references and reads stale.
+        assert_eq!(
+            run.indexer.refs_coverage(&run.db).as_deref(),
+            Some(crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL)
         );
     }
 
@@ -3578,19 +3182,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn rebuild_without_solution_wide_references_stays_lazy() {
-        for (flavour, scope) in [
-            ("2.0", RebuildScope::Full),
-            ("2.1-null", RebuildScope::Full),
-            (
-                "2.1",
-                RebuildScope::Files {
-                    changed: vec![PathBuf::from("src/A.cs")],
-                    deleted: vec![],
-                },
-            ),
-        ] {
+        // Full-scope runs without solution-wide references (pre-2.1 helper
+        // flavours) stamp lazy: the rebuild gate reads that as stale, so
+        // serve rebuilds once with the current helper.
+        for flavour in ["2.0", "2.1-null"] {
             let dir = tempfile::TempDir::new().unwrap();
-            let run = rebuild_with_fake_index(dir.path(), flavour, scope);
+            let run = rebuild_with_fake_index(dir.path(), flavour, RebuildScope::Full);
             assert_eq!(
                 run.indexer.refs_coverage(&run.db).as_deref(),
                 Some(crate::constants::SCIP_REFS_COVERAGE_LAZY),
@@ -3599,6 +3196,29 @@ mod tests {
             assert!(ref_cache_keys(&run.db).is_empty(), "flavour {flavour}");
             assert_eq!(run.summary.references_stored, 2, "flavour {flavour}");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn project_scoped_rebuild_stamps_incremental() {
+        // A Files-scope incremental passes project=Some: its references are
+        // project-local and stamp `incremental` — fresh, NOT lazy.
+        let dir = tempfile::TempDir::new().unwrap();
+        let run = rebuild_with_fake_index(
+            dir.path(),
+            "2.1",
+            RebuildScope::Files {
+                changed: vec![PathBuf::from("src/A.cs")],
+                deleted: vec![],
+            },
+        );
+        assert_eq!(
+            run.indexer.refs_coverage(&run.db).as_deref(),
+            Some(crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL),
+            "a project-scoped run must not read as lazy"
+        );
+        assert!(ref_cache_keys(&run.db).is_empty());
+        assert_eq!(run.summary.references_stored, 2);
     }
 
     // ── Restore gate (issue #225): producer-side coverage ───────────
@@ -3642,19 +3262,6 @@ mod tests {
         assert!(
             is_restore_pending(&err),
             "find-refs exit 75 must map to the typed outcome, got: {err:#}"
-        );
-
-        let err = indexer
-            .invoke_batch_find_refs_helper(
-                &helper,
-                &solution,
-                &dir.path().join("symbols.txt"),
-                &output,
-            )
-            .unwrap_err();
-        assert!(
-            is_restore_pending(&err),
-            "batch exit 75 must map to the typed outcome, got: {err:#}"
         );
     }
 

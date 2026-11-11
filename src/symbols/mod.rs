@@ -431,20 +431,6 @@ pub struct RebuildSummary {
     pub index_warnings: Vec<String>,
 }
 
-/// Summary returned after a Phase 3 pre-warm completes.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct PrewarmSummary {
-    /// Total number of uncached symbols available.
-    pub total_symbols: usize,
-    /// Number of symbols resolved (may be less than total if capped).
-    pub resolved: usize,
-    /// Number of symbols successfully cached.
-    pub cached: usize,
-    /// Wall-clock duration in milliseconds.
-    pub duration_ms: u64,
-}
-
 // ── Trait ─────────────────────────────────────────────────────────
 
 /// Per-language symbol indexer.
@@ -576,13 +562,6 @@ pub trait SymbolIndexer: Send + Sync {
     fn applicability_hint(&self) -> &'static str {
         "the repository has no entrypoint this symbol indexer recognizes"
     }
-
-    /// Downcast to `Any` for concrete-type method access (e.g. `prewarm_ref_cache`).
-    ///
-    /// This is needed because some adapter-specific methods (like Phase 3 pre-warm)
-    /// don't belong on the generic trait but still need to be called from serve code
-    /// that holds a `&dyn SymbolIndexer`.
-    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 // ── Language dispatch ─────────────────────────────────────────────
