@@ -7,6 +7,7 @@
 //! feature AND requires Node + `scip-typescript` to be resolvable (either
 //! via `npx` on `$PATH`, or `CODESEARCH_SCIP_TYPESCRIPT` pointing at a
 //! direct binary).
+mod common;
 
 use std::path::PathBuf;
 

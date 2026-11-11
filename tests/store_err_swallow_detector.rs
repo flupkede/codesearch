@@ -23,6 +23,7 @@
 //! A call wrapped across lines so the `.ok()` lands on the next line escapes
 //! Rule A; the compliant population is written on one line and rustfmt keeps
 //! it that way at these widths.
+mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
