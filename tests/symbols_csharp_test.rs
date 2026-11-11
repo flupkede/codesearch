@@ -12,6 +12,27 @@ use std::path::PathBuf;
 use codesearch::constants::{SCIP_LMDB_DEFAULT_MAP_SIZE_MB, SCIP_LMDB_MAP_SIZE_MB_ENV};
 use codesearch::symbols::csharp::CSharpSymbolIndexer;
 use codesearch::symbols::scip_parse;
+
+/// Locate the scip-csharp helper: `CODESEARCH_SCIP_CSHARP` env var, else the
+/// `dotnet publish` output under `helpers/csharp/bin/Release/net10.0/`. The
+/// extension-less name is the Linux publish form; the Windows publish emits
+/// `scip-csharp.exe`, so both spellings are probed.
+fn locate_scip_helper() -> Option<PathBuf> {
+    if let Ok(from_env) = std::env::var("CODESEARCH_SCIP_CSHARP") {
+        return Some(PathBuf::from(from_env));
+    }
+    let mut candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("helpers/csharp/bin/Release/net10.0")
+        .join("scip-csharp");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    candidate.set_extension("exe");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
+}
 use codesearch::symbols::{ImpactQuery, KeyMatch, RebuildScope, SymbolIndexer};
 use tempfile::TempDir;
 
@@ -328,21 +349,10 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
     );
 
     // Locate helper binary
-    let helper = std::env::var("CODESEARCH_SCIP_CSHARP")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("helpers/csharp/bin/Release/net10.0/scip-csharp");
-            if candidate.exists() {
-                Ok(candidate)
-            } else {
-                Err(())
-            }
-        })
-        .expect(
-            "scip-csharp helper not found. Set CODESEARCH_SCIP_CSHARP env var \
-             or build the helper via `dotnet publish`.",
-        );
+    let helper = locate_scip_helper().expect(
+        "scip-csharp helper not found. Set CODESEARCH_SCIP_CSHARP env var \
+         or build the helper via `dotnet publish`.",
+    );
     std::env::set_var("CODESEARCH_SCIP_CSHARP", &helper);
 
     // Setup tempdir for LMDB
@@ -484,18 +494,7 @@ fn test_csharp_pipeline_smallsolution_roundtrip() {
 fn test_incremental_rebuild_clears_the_reference_cache() {
     let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("helpers/csharp/tests/Fixtures/SmallSolution");
-    let helper = std::env::var("CODESEARCH_SCIP_CSHARP")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("helpers/csharp/bin/Release/net10.0/scip-csharp");
-            if candidate.exists() {
-                Ok(candidate)
-            } else {
-                Err(())
-            }
-        })
-        .expect("scip-csharp helper not found");
+    let helper = locate_scip_helper().expect("scip-csharp helper not found");
     std::env::set_var("CODESEARCH_SCIP_CSHARP", &helper);
 
     let tmp = tempfile::tempdir().unwrap();

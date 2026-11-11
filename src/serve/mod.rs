@@ -312,6 +312,14 @@ pub(crate) struct ServeState {
     /// Repo alias → timestamp of last query that touched this repo.
     /// Used by the idle-reaper to evict repos after `REPO_IDLE_TIMEOUT_SECS`.
     last_access: DashMap<String, std::time::Instant>,
+    /// Repo alias → last-use time as unix millis (wall clock), updated by
+    /// `touch_access` alongside `last_access`. `Instant` is monotonic and
+    /// cannot be persisted, so this parallel map is what
+    /// `persist_access_times` writes to the `access_times.json` sidecar for
+    /// the next boot's phase-1 warmup order. Usage history, NOT the idle
+    /// clock: never cleared on idle eviction; `persist_access_times` prunes
+    /// unregistered aliases so the sidecar cannot outgrow the registry.
+    last_access_wall: DashMap<String, u64>,
     /// Repo alias → cold-open single-flight lock (see [`Self::open_lock`]).
     ///
     /// A cold open (fast-path miss → `try_open_stores` → insert) must never run
@@ -550,6 +558,7 @@ impl ServeState {
         Self {
             repos: DashMap::new(),
             last_access: DashMap::new(),
+            last_access_wall: DashMap::new(),
             open_locks: DashMap::new(),
             fsw_tasks: DashMap::new(),
             index_tasks: DashMap::new(),
@@ -1835,11 +1844,21 @@ impl ServeState {
     /// Phase 1: warm all repos sequentially, awaiting incremental refresh per repo.
     /// Stale entries (database missing or repo path gone) are auto-pruned from repos.json.
     pub(crate) async fn run_phase_1_warmup_all(self: &Arc<Self>) {
-        let aliases = self.aliases();
+        // Order by persisted last use: the repos an agent actively queried
+        // before the restart warm first. Registry order was effectively random
+        // (HashMap keys), so the working set reliably warmed last. A repo with
+        // no recorded use warms last; ties break on alias.
+        let access = self.load_access_times();
+        let aliases = Self::warmup_order(self.aliases(), &access);
         if aliases.is_empty() {
             return;
         }
-        info!("🔥 Phase 1 warmup: {} repos (no FSW)", aliases.len());
+        let head: Vec<String> = aliases.iter().take(5).cloned().collect();
+        info!(
+            "🔥 Phase 1 warmup: {} repos (no FSW), most recently used first (top: {})",
+            aliases.len(),
+            head.join(", ")
+        );
 
         let mut pruned: Vec<String> = Vec::new();
 
@@ -3956,6 +3975,97 @@ impl ServeState {
     pub(crate) fn touch_access(&self, alias: &str) {
         self.last_access
             .insert(alias.to_string(), std::time::Instant::now());
+        self.last_access_wall
+            .insert(alias.to_string(), Self::unix_now_ms());
+    }
+
+    fn unix_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn access_times_path() -> Option<std::path::PathBuf> {
+        crate::constants::codesearch_home()
+            .ok()
+            .map(|home| home.join("access_times.json"))
+    }
+
+    /// Most-recently-used first. Never-used aliases go last; ties break on
+    /// alias so the order is deterministic across boots.
+    fn warmup_order(
+        aliases: Vec<String>,
+        access: &std::collections::HashMap<String, u64>,
+    ) -> Vec<String> {
+        let mut order: Vec<(String, u64)> = aliases
+            .into_iter()
+            .map(|alias| {
+                let ts = access.get(&alias).copied().unwrap_or(0);
+                (alias, ts)
+            })
+            .collect();
+        order.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        order.into_iter().map(|(alias, _)| alias).collect()
+    }
+
+    /// Write the wall-clock last-use map to `path` (atomic temp+rename via
+    /// `atomic_write_json`). Prunes aliases no longer registered so the
+    /// sidecar cannot outgrow the registry. Best-effort: a failed write only
+    /// costs warmup-order fidelity, never functionality.
+    fn persist_access_times_to(&self, path: &std::path::Path) {
+        // Snapshot first: `touch_access` may insert into the map mid-iteration
+        // (same shard-lock deadlock the reaper's snapshot avoids).
+        let snapshot: Vec<(String, u64)> = self
+            .last_access_wall
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
+        let registered: std::collections::HashSet<String> = self.aliases().into_iter().collect();
+        let mut map = serde_json::Map::new();
+        for (alias, ts) in snapshot {
+            if registered.contains(&alias) {
+                map.insert(alias, serde_json::json!(ts));
+            }
+        }
+        let payload = serde_json::Value::Object(map);
+        if let Err(e) = crate::vectordb::store::atomic_write_json(path, &payload) {
+            tracing::debug!(
+                "persist_access_times: write to {} failed: {e:#}",
+                path.display()
+            );
+        }
+    }
+
+    /// Persist to the default sidecar (`<codesearch_home>/access_times.json`).
+    fn persist_access_times(&self) {
+        match Self::access_times_path() {
+            Some(path) => self.persist_access_times_to(&path),
+            None => tracing::debug!("persist_access_times: no codesearch home, skipped"),
+        }
+    }
+
+    /// Read a persisted last-use map. Missing/corrupt sidecar = empty map =
+    /// warmup falls back to alias-sorted registry order, never an error.
+    fn load_access_times_from(path: &std::path::Path) -> std::collections::HashMap<String, u64> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return std::collections::HashMap::new();
+        };
+        serde_json::from_str(&text).unwrap_or_else(|e| {
+            tracing::warn!(
+                "access_times sidecar {} unreadable ({}); warmup order falls back to registry order",
+                path.display(),
+                e
+            );
+            std::collections::HashMap::new()
+        })
+    }
+
+    fn load_access_times(&self) -> std::collections::HashMap<String, u64> {
+        match Self::access_times_path() {
+            Some(path) => Self::load_access_times_from(&path),
+            None => std::collections::HashMap::new(),
+        }
     }
 
     /// Record a tool call for a specific repo (for dashboard display).
@@ -7619,6 +7729,9 @@ pub async fn run_serve(
                     _ = tokio::time::sleep(interval) => {
                         reaper_state.evict_idle_repos();
                         reaper_state.sweep_index_tasks();
+                        // Persist last-use times (unix-ms sidecar) so the next
+                        // boot's phase-1 warmup orders most-recently-used first.
+                        reaper_state.persist_access_times();
                         // Dashboard refresh handled by TUI auto-refresh (TTY) or not needed (non-TTY)
                     }
                     _ = reaper_cancel.cancelled() => {
@@ -7797,6 +7910,10 @@ pub async fn run_serve(
     if let Some(handle) = tui_handle {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
     }
+
+    // Persist last-use times so the next boot's phase-1 warmup orders
+    // most-recently-used repos first (the reaper cadence bounds loss to 5 min).
+    serve_state.persist_access_times();
 
     // Clean up serve_url file on shutdown
     if let Ok(dir) = config_dir() {

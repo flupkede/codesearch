@@ -241,6 +241,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — phase-1 warmup orders most-recently-used first (persisted `access_times.json` sidecar) instead of effectively random registry order, so the repos an agent actively uses are warm right after a restart.
+
 - **Pending** — FSW removal waves batched: one metadata load/save, one vector delete and one FTS commit per wave instead of per chunk/per file; directory removals now actually take their tracked children (the absolute-prefix bug).
 
 - **Pending** — refresh batches default to a 4096-chunk cap (was uncapped), bounding per-batch peak memory; oversized single files still insert whole via the map-full resize retry.

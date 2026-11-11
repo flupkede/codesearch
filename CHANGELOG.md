@@ -27,6 +27,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 - **Registering an umbrella directory warns about the git repos below it.** `codesearch index add` on a parent that contains nested git roots now lists them and suggests registering each child (plus a group for cross-repo search); the OpenCode plugin's scope block calls out a session that sits in its own git repo but is covered only as part of a parent project. Both address the `kcharts` registration shape: the parent index silently covers a child's files under the parent's ignore rules and alias.
 
+### Changed
+
+- **Phase-1 warmup orders by last use, not registry order.** After a restart `codesearch serve` walked registered repos in effectively random (HashMap) order, so the repos an agent was actively querying reliably warmed last and sat Idle while unused ones warmed first. `touch_access` now also records wall-clock last-use in a persisted sidecar (`~/.codesearch/access_times.json`, written on the 5-min reaper cadence and at shutdown via the atomic JSON writer, pruned to registered aliases); phase-1 sorts most-recently-used first, with never-used aliases last and alias-ascending ties. A first query on any repo still opens it on demand — the order only decides what is ready before you ask.
+
 ## [1.7.12]
 
 ### Added
