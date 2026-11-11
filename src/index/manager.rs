@@ -1326,9 +1326,18 @@ impl IndexManager {
             // build_index, so a removed repo never receives fresh data.
             Self::ensure_indexing_active(cancel_token)?;
 
-            // Delete old chunks for changed files
+            // Delete old chunks for changed files. Files the read step
+            // skipped (unreadable) are left alone entirely: their meta must
+            // stay untouched, and stats on them can fail (a directory
+            // read EISDIRs on Linux, where get_mtime's second granularity
+            // hid this flake before).
+            let skipped: std::collections::HashSet<&str> =
+                skipped_keys.iter().map(|s| s.as_str()).collect();
             for file in file_batch {
                 let key = crate::cache::storage_key(&file.path, codebase_path);
+                if skipped.contains(key.as_str()) {
+                    continue;
+                }
                 let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
                 if !old_chunk_ids.is_empty() {
                     debug!(
