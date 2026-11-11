@@ -1525,12 +1525,27 @@ function parseGrepArgs(args: string[]): { recursive: boolean; operands: string[]
   return { recursive, operands }
 }
 
-/** Resolve a shell operand to an absolute, lexically normalized path. */
+/**
+ * Resolve a shell operand to an absolute, lexically normalized path.
+ *
+ * Case is preserved: `normalizePath` lowercases on win32 for comparisons, but
+ * these targets are shown to the user and unit-asserted verbatim, so coverage
+ * matching normalizes both sides again instead.
+ */
 function resolveShellPath(operand: string, baseDir: string): string {
-  let value = operand.trim()
+  let value = operand.trim().replace(/^\\\\\?\\/, "")
   if (!value) return ""
   if (value === "~" || value.startsWith("~/")) {
     value = `${process.env.HOME ?? process.env.USERPROFILE ?? ""}${value.slice(1)}`
+  }
+  // Windows mount forms name the same files as `C:/...`: Git Bash writes
+  // `/c/dir`, and WSL-style literals reach a Windows shell as `/mnt/c/dir`.
+  // Left POSIX-absolute they never match a drive-letter registry root, which
+  // is a fail-open hole in `guards.mode: "block"`. Only on win32 — on a POSIX
+  // host both are real absolute paths that the registry also stores as such.
+  if (process.platform === "win32") {
+    const mount = /^\/mnt\/([A-Za-z])(\/|$)/.exec(value) ?? /^\/([A-Za-z])(\/|$)/.exec(value)
+    if (mount) value = `${mount[1].toUpperCase()}:/${value.slice(mount[0].length)}`
   }
   const absolute = /^([A-Za-z]:[\\/]|[\\/])/.test(value)
   const joined = absolute ? value : `${baseDir}/${value}`
@@ -1546,7 +1561,9 @@ function resolveShellPath(operand: string, baseDir: string): string {
     }
     out.push(part)
   }
-  return normalizePath(`${drive ? `${drive}/` : unc ? "//" : "/"}${out.join("/")}`)
+  const root = drive ? `${drive}/` : unc ? "//" : "/"
+  const tail = out.join("/")
+  return tail ? `${root}${tail}` : root
 }
 
 function resultOfToolEvent(event: Loose): { output?: string; metadata?: Loose } {

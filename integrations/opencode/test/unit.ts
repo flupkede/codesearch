@@ -291,6 +291,40 @@ function testShellGrepTargets(): void {
   for (const [command, expected] of cases) {
     assert.deepEqual(shellGrepTargets(command, "/repo"), expected, `targets for: ${command}`)
   }
+  // Only `win32` treats mount forms as drives; on a POSIX host both are real
+  // absolute paths the registry also stores as such.
+  if (process.platform !== "win32") {
+    assert.deepEqual(shellGrepTargets("grep -rn x /c/WorkArea/app/src", "/repo"), ["/c/WorkArea/app/src"])
+    assert.deepEqual(shellGrepTargets("grep -rn x /mnt/c/WorkArea/app", "/repo"), ["/mnt/c/WorkArea/app"])
+  }
+}
+
+/** The win32-only resolution rules, exercised on any host by pinning the
+ * platform: case-preserving targets (review finding 1) and Git Bash / WSL
+ * mount forms resolving to the drive they name (finding 2). */
+function testShellGrepTargetsWin32(): void {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true })
+  try {
+    const cases: Array<[string, string, string[]]> = [
+      // Targets keep their case; they are shown to the user and asserted here.
+      ["grep -n x C:/other/f.cs", "C:/WorkArea/app", ["C:/other/f.cs"]],
+      ["grep -rn TODO src/", "C:/WorkArea/App", ["C:/WorkArea/App/src"]],
+      // Git Bash mount form.
+      ["grep -rn x /c/WorkArea/app/src", "C:/WorkArea/app", ["C:/WorkArea/app/src"]],
+      // The Windows extended-length prefix is stripped before resolution.
+      ["grep -rn x '\\\\?\\C:/WorkArea/app'", "C:/WorkArea/app", ["C:/WorkArea/app"]],
+      // WSL-style literal reaching a Windows shell.
+      ["grep -rn x /mnt/d/WorkArea/app", "C:/WorkArea/app", ["D:/WorkArea/app"]],
+      // A `cd` into a mount form moves the base the same way.
+      ["cd /c/WorkArea/app && grep -n kafka docs.md", "C:/elsewhere", ["C:/WorkArea/app/docs.md"]],
+    ]
+    for (const [command, base, expected] of cases) {
+      assert.deepEqual(shellGrepTargets(command, base), expected, `win32 targets for: ${command}`)
+    }
+  } finally {
+    if (original) Object.defineProperty(process, "platform", original)
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -373,6 +407,7 @@ async function main(): Promise<void> {
   testStripJsonc()
   testAstGrepToolNames()
   testShellGrepTargets()
+  testShellGrepTargetsWin32()
   await testWaitRebuildSettled()
   await testHealthRunner()
   console.log("unit: OK")
