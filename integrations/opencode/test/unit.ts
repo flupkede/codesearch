@@ -297,6 +297,7 @@ function testShellGrepTargets(): void {
     assert.deepEqual(shellGrepTargets("grep -rn x /c/WorkArea/app/src", "/repo"), ["/c/WorkArea/app/src"])
     assert.deepEqual(shellGrepTargets("grep -rn x /mnt/c/WorkArea/app", "/repo"), ["/mnt/c/WorkArea/app"])
   }
+  assert.deepEqual(shellGrepTargets("grep -rn x", ""), [], "no working directory means no base target")
 }
 
 /** The win32-only resolution rules, exercised on any host by pinning the
@@ -310,6 +311,8 @@ function testShellGrepTargetsWin32(): void {
       // Targets keep their case; they are shown to the user and asserted here.
       ["grep -n x C:/other/f.cs", "C:/WorkArea/app", ["C:/other/f.cs"]],
       ["grep -rn TODO src/", "C:/WorkArea/App", ["C:/WorkArea/App/src"]],
+      // No operand: the printed target is the base, also case-intact.
+      ["grep -rn TODO", "C:/WorkArea/App", ["C:/WorkArea/App"]],
       // Git Bash mount form.
       ["grep -rn x /c/WorkArea/app/src", "C:/WorkArea/app", ["C:/WorkArea/app/src"]],
       // The Windows extended-length prefix is stripped before resolution.

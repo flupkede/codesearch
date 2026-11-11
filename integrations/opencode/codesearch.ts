@@ -1471,7 +1471,8 @@ export function shellGrepTargets(command: string, baseDir: string): string[] {
         // No operand and no stream: a recursive grep walks the base dir, a
         // bare `grep PATTERN` would read stdin, and `xargs` supplies the file
         // list. A grep that reads a pipe or a `< file` reads no repo files.
-        targets.push(normalizePath(base))
+        // Resolve like an operand so the printed target keeps its case.
+        if (base) targets.push(resolveShellPath(".", base))
       }
       // Otherwise: a stream filter. Nothing on disk is read.
     }
