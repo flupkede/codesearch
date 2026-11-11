@@ -16,6 +16,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.7.13]
 
+### Changed
+
+- **Precomputed references are enforced; the lazy pre-warm path is removed.** A `lazy` refs-coverage stamp — a full-scope rebuild that produced no references (pre-2.1 `scip-csharp` helpers) — now reads as stale, so serve rebuilds such an index once with the current helper instead of running the hours-long `batch-find-refs` pre-warm after every start (measured ~38 min per 5000 symbols on BOIN.Aprimo-sized repos). Project-scoped rebuilds (file incrementals, single-project) stamp a new `incremental` coverage that stays fresh: queries resolve cache misses on demand as before. `CSHARP_PREWARM_ENABLED` and the whole phase-3 pre-warm machinery are gone.
+
 ### Fixed
 
 - **The grep guards scope by the command's target, not by the session directory.** Reported live: a session inside the indexed `kcharts` project had every shell `grep` denied, including one run in `/tmp` over freshly downloaded docs and one in a *different* indexed repo (`platform/audits`), with a message telling it to search `kcharts`. The OpenCode plugin's bash guard now parses the command into pipeline segments, resolves each grep's path operands against the tool's `workdir` and any leading `cd DIR &&`, and only acts when a target lands inside a registered repo — naming that repo's alias and root path in the message. The native `grep`/`glob` guards follow the same rule from their own `path` input. Both Claude Code hook twins (`grep-guard.sh`, `grep-guard.ps1`) resolve a Bash grep's operands the same way instead of assuming the session cwd; with no operand the old cwd behaviour stands.
