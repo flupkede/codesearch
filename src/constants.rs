@@ -862,7 +862,7 @@ pub const SCIP_SIMPLE_NAMES_DB_NAME: &str = "scip_simple_names";
 pub const SCIP_REF_CACHE_DB_NAME: &str = "scip_ref_cache";
 
 /// LMDB table caching per-symbol completeness warnings from on-demand
-/// reference resolution (`scip-csharp find-refs` / `batch-find-refs`).
+/// reference resolution (`scip-csharp find-refs`).
 /// Key: full SCIP symbol key. Value: `[v1, bincode(Vec<String>)]` (same wire
 /// format as the key lists). Non-empty means the cached references may be
 /// INCOMPLETE — a helper failure was survived rather than fatal. Empty

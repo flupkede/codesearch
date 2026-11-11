@@ -96,7 +96,7 @@ mod roles {
     pub const IMPLEMENTATION: u32 = 256;
 }
 
-/// The scip-csharp `find-refs` / `batch-find-refs` output version this parser
+/// The scip-csharp `find-refs` output version this parser
 /// understands; `index` versions are [`crate::constants::SCIP_CSHARP_INDEX_VERSIONS`].
 /// Bump together with the helper whenever either JSON schema changes.
 pub const SUPPORTED_INDEX_VERSION: &str = "2.0";

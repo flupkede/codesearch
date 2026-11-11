@@ -26,13 +26,7 @@
 //! - Merges the result: updates symbols and positions for affected files only;
 //!   symbols from other projects are preserved.
 //! - Rebuilds `scip_simple_names` from all current `scip_symbols` entries.
-//! - Clears `scip_ref_cache`; references then resolve lazily.
-//!
-//! ## Phase 3 pre-warm (background ref cache filling)
-//!
-//! For an index without precomputed references (`refs_coverage` = lazy),
-//! Phase 3 runs `scip-csharp batch-find-refs` to resolve references for all
-//! symbols in one workspace session, amortizing the workspace open cost.
+//! - Clears `scip_ref_cache`; references then resolve lazily on demand.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -608,8 +602,8 @@ impl Default for CSharpSymbolIndexer {
     }
 }
 
-/// PIDs of live one-shot scip-csharp helper children (index, find-refs,
-/// batch-find-refs). serve shutdown kills whatever is still registered: a
+/// PIDs of live one-shot scip-csharp helper children (index, find-refs).
+/// serve shutdown kills whatever is still registered: a
 /// rebuild outliving its host holds the helper exe locked for minutes (the
 /// deploy blocker) and keeps computing for a dead client.
 static LIVE_HELPER_PIDS: std::sync::LazyLock<std::sync::Mutex<HashSet<u32>>> =
@@ -2716,9 +2710,8 @@ mod tests {
     // ── B3 warnings: producer-side coverage (the sites that WRITE) ──
     //
     // Every test above hand-populates the warnings store (the consumer
-    // half). These two drive the real producer sites instead, so deleting
-    // the store_ref_warnings call in parse_and_cache_batch_refs or in the
-    // lazy write phase fails here.
+    // half). This one drives the real producer site instead, so deleting
+    // the store_ref_warnings call in the lazy write phase fails here.
 
     /// A real helper executable, built with the test run's own rustc.
     ///
