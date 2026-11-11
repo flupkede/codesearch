@@ -34,15 +34,20 @@ that make the preference *structural* instead of advisory:
   call against an indexed repo *for as long as the codesearch serve hub
   is reachable*, with a message telling the model exactly how to load and
   call codesearch instead. The `Bash` matcher closes the shell escape hatch:
-  a Bash tool command invoking `grep`/`egrep`/`fgrep`/`zgrep`/`rg` is guarded
-  identically (quoted mentions like `echo "grep"` are not invocations; the
-  target repo is the session cwd). The guarded repo is resolved from the **grep
-  target itself** — the git root of the path being searched, not the
-  hook's working directory — so an absolute-path Grep into a different
-  indexed repo is guarded too (a cwd-based check used to let those
-  through, and until #199 the absolute-path test itself only recognized
-  Windows-style roots, so POSIX absolute paths were still resolved
-  against the cwd). Coverage is decided by **registration**: the target's
+  a Bash tool command that greps FILES inside an indexed repo is guarded
+  identically (quoted mentions like `echo "grep"` are not invocations, and a
+  pure stream filter such as `find . | grep -v '^./.git/'` reads no files, so
+  it is not guarded). The guarded repo is resolved from the **grep target
+  itself** — the git root of the path being searched, not the hook's working
+  directory — so an absolute-path Grep into a different indexed repo is
+  guarded too (a cwd-based check used to let those through, and until #199 the
+  absolute-path test itself only recognized Windows-style roots, so POSIX
+  absolute paths were still resolved against the cwd). For a Bash grep the
+  target is the command's own operand (absolute, relative to the shell cwd, or
+  after a leading `cd DIR &&`), so a grep aimed at `/tmp` or at an
+  unregistered clone is allowed; that fixed the reported misfire where a
+  session inside an indexed repo denied greps that never touched it.
+  Coverage is decided by **registration**: the target's
   git root must be one of the repos in the hub's `~/.codesearch/repos.json`
   (honoring `CODESEARCH_REPOS_CONFIG`; `CODESEARCH_HOME` relocates the
   root), which also carves out nested

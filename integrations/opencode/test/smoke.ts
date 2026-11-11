@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict"
 import http from "node:http"
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "../codesearch.ts"
@@ -282,11 +282,17 @@ async function main(): Promise<void> {
   const mock = await startMockServer()
   const tmp = mkdtempSync(join(tmpdir(), "codesearch-plugin-smoke-"))
 
+  // Umbrella registration fixture: a registered PARENT with a nested git repo
+  // under it (the kcharts registration shape).
+  const nestedParent = mkdtempSync(join(tmpdir(), "codesearch-plugin-nested-"))
+  const nestedChild = join(nestedParent, "druid")
+  mkdirSync(join(nestedChild, ".git"), { recursive: true })
+
   const reposPath = join(tmp, "repos.json")
   writeFileSync(
     reposPath,
     JSON.stringify({
-      repos: { "my-service": "/work/my-service", "sibling-api": "/work/sibling-api" },
+      repos: { "my-service": "/work/my-service", "sibling-api": "/work/sibling-api", "nested-parent": nestedParent },
       groups: { platform: ["my-service", "sibling-api"] },
     }),
   )
@@ -350,6 +356,19 @@ async function main(): Promise<void> {
   assert.match(astGrepGuidance, /ast_grep_search/, "guidance names ast-grep tools when the host exposes them")
   assert.match(astGrepGuidance, /ast_grep_edit/, "guidance names the rewrite tool too")
 
+  // A nested git repo under a registered umbrella project: the session must be
+  // told that the index belongs to the parent and that a repo-local add fixes
+  // it. This is the kcharts/druid registration mistake (parent indexed, child
+  // repos below it).
+  const nested = await setupPlugin(nestedChild)
+  const nestedMsg = userMessage("s-nested", "n1", "Where are the Druid ingestion specs?")
+  await nested.app.hooks.context[0](nestedMsg)
+  const nestedInjected = nestedMsg.system.map((p: Loose) => p.text).join("\n")
+  assert.match(nestedInjected, /project "nested-parent"/, "the umbrella alias still covers the child")
+  assert.match(nestedInjected, /its own git repository/, "child git repo under an umbrella is called out")
+  assert.match(nestedInjected, /codesearch index add \./, "the warning names the repo-local fix")
+  await nested.cleanup()
+
   // Zero-hit rescue turns an empty grep into codesearch hits.
   const rescueEvent: Loose = {
     tool: "grep",
@@ -395,6 +414,37 @@ async function main(): Promise<void> {
   assert.match(bashThrew, /project "my-service"/, "bash denial names the project scope to use")
   await bashBefore({ tool: "bash", input: { command: "cargo build --release" }, sessionID: "s1" })
   await bashBefore({ tool: "read", input: { path: "x.ts" }, sessionID: "s1" })
+
+  // Scope follows the COMMAND, not the session: a pipe filter reads no files,
+  // and a grep aimed outside every index (or at another indexed repo) must not
+  // be blamed on the session's project. This is the kcharts/druid misfire.
+  await bashBefore({
+    tool: "bash",
+    input: { command: "find . -type f | grep -v '^./.git/' | sort" },
+    sessionID: "s1",
+  })
+  await bashBefore({
+    tool: "bash",
+    input: { command: 'grep -rn "image:" docs/', workdir: "/tmp/opencode/codesearch-docs" },
+    sessionID: "s1",
+  })
+  await bashBefore({
+    tool: "bash",
+    input: { command: "cd /tmp/opencode/codesearch-docs && grep -n kafka configuration.md" },
+    sessionID: "s1",
+  })
+  let crossThrew = ""
+  try {
+    await bashBefore({
+      tool: "bash",
+      input: { command: 'grep -rn "image:" .', workdir: "/work/sibling-api" },
+      sessionID: "s1",
+    })
+  } catch (err) {
+    crossThrew = String(err)
+  }
+  assert.match(crossThrew, /sibling-api/, "denial names the repo the command targets, not the session repo")
+  assert.match(crossThrew, /\/work\/sibling-api/, "denial prints the target path that resolved to a project")
 
   // Kill switch: CODESEARCH_PLUGIN_BASH_GUARD=0 re-allows shell grep and the tip.
   // Ordering matters: without resolveSettings' structuredClone(DEFAULTS), the
@@ -503,6 +553,18 @@ async function main(): Promise<void> {
   assert.match(threw, /codesearch/, "block mode denies grep once the hub is reachable")
   assert.match(threw, /project "my-service"/, "denial names the project scope to use")
   assert.doesNotMatch(threw, /ast[-_]grep/, "denial omits ast-grep when the session never exposed it")
+
+  // Native Grep follows its own path operand, exactly like the bash guard:
+  // another indexed repo is denied by ITS alias, and a path outside every
+  // index is allowed even though the session sits in a covered repo.
+  let nativeThrew = ""
+  try {
+    await before({ tool: "grep", input: { pattern: "x", path: "/work/sibling-api/src" }, sessionID: "s3" })
+  } catch (err) {
+    nativeThrew = String(err)
+  }
+  assert.match(nativeThrew, /sibling-api/, "native grep denial names the target repo, not the session repo")
+  await before({ tool: "grep", input: { pattern: "x", path: "/tmp/opencode/codesearch-docs" }, sessionID: "s3" })
 
   // The same denial names ast-grep once the session's tool map has it.
   const astBlocked = await setupPlugin("/work/my-service")

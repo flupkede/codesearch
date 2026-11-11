@@ -12,7 +12,7 @@
 import assert from "node:assert/strict"
 import http from "node:http"
 import type { AddressInfo } from "node:net"
-import { astGrepToolNames, bashCommandGrep, HealthRunner, stripJsonc, waitRebuildSettled } from "../codesearch.ts"
+import { astGrepToolNames, HealthRunner, shellGrepTargets, stripJsonc, waitRebuildSettled } from "../codesearch.ts"
 
 type Loose = Record<string, any>
 
@@ -238,24 +238,52 @@ async function testHealthRunner(): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ *
- * bashCommandGrep — the shell-tool escape hatch detector
+ * shellGrepTargets — which files a shell grep will read, if any
  * ------------------------------------------------------------------ */
 
-function testBashCommandGrep(): void {
-  assert.equal(bashCommandGrep('grep -rn "new Uri" --include="*.cs" .'), true, "plain grep")
-  assert.equal(bashCommandGrep("rg pattern src/"), true, "ripgrep")
-  assert.equal(bashCommandGrep("egrep -i foo bar.txt"), true, "egrep")
-  assert.equal(bashCommandGrep("cat f | grep -i bar"), true, "piped grep")
-  assert.equal(bashCommandGrep("git grep -n TODO"), true, "git grep")
-  assert.equal(bashCommandGrep("/usr/bin/grep -i x file"), true, "absolute-path grep")
-  assert.equal(bashCommandGrep("C:/tools/grep.exe -i x"), true, "windows grep.exe")
-  assert.equal(bashCommandGrep("timeout 5 grep -r x ."), true, "grep behind another command")
-  assert.equal(bashCommandGrep("echo `grep -rn foo src/`"), true, "backtick substitution is an invocation")
-  assert.equal(bashCommandGrep('echo "grep is slow, use codesearch"'), false, "grep mentioned in quotes is not an invocation")
-  assert.equal(bashCommandGrep("cargo build --release"), false, "unrelated command")
-  assert.equal(bashCommandGrep("progress --all"), false, "word boundary: progress is not grep")
-  assert.equal(bashCommandGrep("rgx = /ab/"), false, "word boundary: rgx is not rg")
-  assert.equal(bashCommandGrep(""), false, "empty command")
+function testShellGrepTargets(): void {
+  const cases: Array<[string, string[]]> = [
+    // A real code search over the working directory.
+    ['grep -rn "new Uri" --include="*.cs" .', ["/repo"]],
+    ["rg pattern src/", ["/repo/src"]],
+    ["egrep -i foo bar.txt", ["/repo/bar.txt"]],
+    ["git grep -n TODO", ["/repo"]],
+    ["/usr/bin/grep -i x file", ["/repo/file"]],
+    ["timeout 5 grep -r x .", ["/repo"]],
+    ["sudo grep -rn x .", ["/repo"]],
+    ["env FOO=1 grep -n x f", ["/repo/f"]],
+    ["grep --include=*.yaml -rn image", ["/repo"]],
+    ["grep -e foo -e bar src/", ["/repo/src"]],
+    ["grep -f patterns.txt src/", ["/repo/src"]],
+    ["grep -rn \"two words\" src/", ["/repo/src"]],
+    ["grep -r foo ../other/src", ["/other/src"]],
+    ["git -C sub grep todo", ["/repo"]],
+    ["grep -n x C:/other/f.cs", ["C:/other/f.cs"]],
+    ["for k in a b; do grep -n \"$k\" docs.md; done", ["/repo/docs.md"]],
+    ["wc -l a && grep -rn \"is_(None)\" audits/", ["/repo/audits"]],
+    ["cd /tmp/x && grep -n kafka docs.md", ["/tmp/x/docs.md"]],
+    ["echo `grep -rn foo src/`", ["/repo/src"]],
+    ["echo $(grep -rn foo src/)", ["/repo/src"]],
+    ['echo "$(grep -rn foo src/)"', ["/repo/src"]],
+    // grep behind xargs: stdin becomes file arguments, so this DOES read files.
+    ["find . -name '*.cs' | xargs grep -n foo", ["/repo"]],
+    // A bare grep with no operand reads stdin, but the intent is the base dir.
+    ["grep -v x", ["/repo"]],
+    // Pure stream filters: nothing on disk is read, so nothing is a target.
+    ["cat f | grep -i bar", []],
+    ["find . -type f | grep -v '^./.git/' | sort", []],
+    ["git log --oneline | grep -i fix", []],
+    ["echo hi | grep -q x && true", []],
+    // Not grep invocations at all.
+    ['echo "grep is slow, use codesearch"', []],
+    ["cargo build --release", []],
+    ["progress --all", []],
+    ["rgx = /ab/", []],
+    ["", []],
+  ]
+  for (const [command, expected] of cases) {
+    assert.deepEqual(shellGrepTargets(command, "/repo"), expected, `targets for: ${command}`)
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -337,7 +365,7 @@ async function testWaitRebuildSettled(): Promise<void> {
 async function main(): Promise<void> {
   testStripJsonc()
   testAstGrepToolNames()
-  testBashCommandGrep()
+  testShellGrepTargets()
   await testWaitRebuildSettled()
   await testHealthRunner()
   console.log("unit: OK")

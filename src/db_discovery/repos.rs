@@ -1607,6 +1607,29 @@ fn is_skippable_scan_dir(path: &Path) -> bool {
         )
 }
 
+/// Git roots directly under `dir` (one level, skipping build/vendor dirs).
+///
+/// A parent directory registered as ONE project hides the repos beneath it:
+/// their files are indexed through the parent's ignore rules, and a session
+/// in a child resolves to the parent's alias. Used to warn at registration.
+pub fn nested_git_roots(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if !child.is_dir() || is_skippable_scan_dir(&child) {
+            continue;
+        }
+        if child.join(".git").exists() {
+            out.push(safe_canonicalize(&child).unwrap_or_else(|_| normalize_user_path(&child)));
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Recursively collect git roots under `dir` (bounded by `depth`) whose
 /// `remote.origin.url` matches `target_remote`. A matching git root is recorded
 /// and not descended into (nested repos below it are ignored).

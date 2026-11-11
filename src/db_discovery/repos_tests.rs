@@ -1659,3 +1659,27 @@ fn family_note_covers_both_arms() {
     );
     assert_eq!(family_note(&family_map, &counts, "solo").as_deref(), None);
 }
+
+/// Registering an umbrella directory hides the repos beneath it. The scan
+/// that feeds the registration warning must find direct child git roots and
+/// skip build/vendor directories (a `node_modules` dep is not a project).
+#[test]
+fn nested_git_roots_finds_direct_children_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for child in ["druid", "superset"] {
+        std::fs::create_dir_all(root.join(child).join(".git")).unwrap();
+    }
+    std::fs::create_dir_all(root.join("plain").join("sub")).unwrap();
+    std::fs::create_dir_all(root.join("node_modules").join("dep").join(".git")).unwrap();
+
+    let names: Vec<String> = nested_git_roots(root)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names, vec!["druid", "superset"]);
+    assert!(
+        nested_git_roots(&root.join("druid")).is_empty(),
+        "a leaf repo has no nested repositories"
+    );
+}

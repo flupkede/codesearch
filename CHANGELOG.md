@@ -14,6 +14,17 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.11]
+
+### Fixed
+
+- **The grep guards scope by the command's target, not by the session directory.** Reported live: a session inside the indexed `kcharts` project had every shell `grep` denied, including one run in `/tmp` over freshly downloaded docs and one in a *different* indexed repo (`platform/audits`), with a message telling it to search `kcharts`. The OpenCode plugin's bash guard now parses the command into pipeline segments, resolves each grep's path operands against the tool's `workdir` and any leading `cd DIR &&`, and denies only when a target lands inside a registered repo — naming that repo's alias and root path in the message. The native `grep`/`glob` guards follow the same rule from their own `path` input. Both Claude Code hook twins (`grep-guard.sh`, `grep-guard.ps1`) resolve a Bash grep's operands the same way instead of assuming the session cwd; with no operand the old cwd behaviour stands.
+- **A shell grep used as a stream filter is no longer denied.** `find . -type f | grep -v '^./.git/'` and `git log | grep -i fix` read no files: they cannot be the code-search workload the guard exists to reroute, so they pass in every mode. Grep that does read files (a path operand, `-r`/`-R`, behind `xargs`, or no stdin and no operand) is still denied inside an indexed project. Quoted pattern mentions are still not invocations.
+
+### Added
+
+- **Registering an umbrella directory warns about the git repos below it.** `codesearch index add` on a parent that contains nested git roots now lists them and suggests registering each child (plus a group for cross-repo search); the OpenCode plugin's scope block calls out a session that sits in its own git repo but is covered only as part of a parent project. Both address the `kcharts` registration shape: the parent index silently covers a child's files under the parent's ignore rules and alias.
+
 ## [1.7.6]
 
 ### Added

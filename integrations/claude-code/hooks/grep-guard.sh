@@ -38,12 +38,33 @@ tool=$(echo "$raw" | jq -r '.tool_name // empty' | jq_str)
 
 # Bash escape hatch: a Bash tool command invoking the grep family is guarded
 # exactly like the Grep tool — the shell tool is otherwise a clean way around
-# the Grep denial. A shell grep has no path parameter; it runs in the session
-# cwd, so the target repo resolves as for an empty/relative path (cwd repo).
+# the Grep denial. A shell grep has no `path` parameter, so coverage follows
+# the command's OWN operands (`command_grep_targets`: absolute paths, relative
+# paths against the shell's cwd, and a leading `cd DIR &&` base). With no
+# operand at all, grep walks the cwd, and the cwd repo is the target.
 path=""
+target_root=""
 if [ "$tool" = "Bash" ]; then
     shell_cmd=$(echo "$raw" | jq -r '.tool_input.command // empty' | jq_str)
     command_grep_family "$shell_cmd" || exit 0
+    bash_targets="$(command_grep_targets "$shell_cmd")"
+    if [ -n "$bash_targets" ]; then
+        while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            root="$(resolve_target_git_root "$candidate")"
+            if [ -n "$root" ] && target_registered "$root"; then
+                target_root="$root"
+                break
+            fi
+        done <<EOF
+$bash_targets
+EOF
+        # Every operand is outside every indexed repo (or not in git at all):
+        # this grep is not a code search of an indexed project.
+        [ -n "$target_root" ] || exit 0
+    else
+        target_root="$(resolve_target_git_root "")"
+    fi
 else
     [ "$tool" = "Grep" ] || exit 0
     path=$(echo "$raw" | jq -r '.tool_input.path // empty' | jq_str)
@@ -86,7 +107,10 @@ fi
 # is a URL override rather than a coverage signal — to be reworked
 # separately).
 # ------------------------------------------------------------------
-target_root="$(resolve_target_git_root "$path")"
+# Grep tool: resolve coverage from the tool's own `path` input. The Bash
+# branch above already resolved the command's operands (and exited when none
+# of them is an indexed repo), so it must not be re-resolved from `path=""`.
+[ "$tool" = "Bash" ] || target_root="$(resolve_target_git_root "$path")"
 
 # Not inside any git repo (or git unusable) -> external target: grep is right.
 [ -z "$target_root" ] && exit 0
