@@ -5885,6 +5885,46 @@ fn should_adopt_existing_index(
 /// then spawns the indexing work in the background: an incremental refresh when
 /// an index already exists (adopted), a full reindex otherwise. Returns 202
 /// Accepted immediately.
+/// If `path` is a git worktree of a repo registered under another alias,
+/// return that parent's `(alias, main path)`.
+///
+/// A worktree's `.git` is a FILE: `gitdir: <main>/.git/worktrees/<name>` —
+/// the main checkout is the common dir minus the final `.git` component.
+/// Only cross-alias pairs count: adding the main itself never self-seeds.
+fn registered_worktree_parent(
+    path: &Path,
+    config: &crate::db_discovery::repos::ReposConfig,
+) -> Option<(String, PathBuf)> {
+    let marker = path.join(".git");
+    if !marker.is_file() {
+        // A regular repo's .git is a directory; a non-repo has none.
+        return None;
+    }
+    let content = std::fs::read_to_string(&marker).ok()?;
+    let gitdir = content.lines().next()?.strip_prefix("gitdir:")?.trim();
+    let gitdir = if std::path::Path::new(gitdir).is_absolute() {
+        std::path::PathBuf::from(gitdir)
+    } else {
+        path.join(gitdir)
+    };
+    let worktrees = gitdir.parent()?;
+    if worktrees.file_name()?.to_str()? != "worktrees" {
+        return None;
+    }
+    let dot_git = worktrees.parent()?;
+    if dot_git.file_name()?.to_str()? != ".git" {
+        return None;
+    }
+    let main = dot_git.parent()?.to_path_buf();
+    let main_norm = crate::cache::normalize_path(&main);
+    for (alias, registered) in &config.repos {
+        if crate::cache::normalize_path(registered) == main_norm {
+            return Some((alias.clone(), main));
+        }
+    }
+    None
+}
+
 async fn add_repo_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
     axum::extract::Json(body): axum::extract::Json<AddRepoRequest>,
@@ -6122,6 +6162,17 @@ async fn add_repo_handler(
     // removed repo's DB dir can be cleaned up after the task exits.
     let task_db_path = db_path.clone();
 
+    // Worktree seeding: when the added repo is a worktree of a REGISTERED
+    // main checkout whose own index is not usable yet, build the parent
+    // first. The embedding cache is global and content-hash keyed, so the
+    // parent's embeddings turn the worktree's unchanged chunks into cache
+    // hits instead of fresh ONNX runs (a fresh worktree build used to
+    // re-embed the whole tree). Parent failures never block the child.
+    let parent_seed = match state.config.read() {
+        Ok(config) => registered_worktree_parent(&canonical_path, &config),
+        Err(_) => None,
+    };
+
     let index_handle = tokio::spawn(async move {
         if adopt_existing {
             tracing::info!(
@@ -6138,6 +6189,94 @@ async fn add_repo_handler(
         }
 
         let pool = state_bg.embedding_pool();
+
+        // ── Worktree seeding: parent index first (see parent_seed above). ──
+        if let Some((parent_alias, parent_path)) = parent_seed {
+            let parent_db = parent_path.join(DB_DIR_NAME);
+            let parent_meta = parent_db.join("metadata.json");
+            let parent_usable = parent_meta.exists()
+                && parent_db.join(crate::constants::FILE_META_DB_NAME).exists();
+            if parent_usable {
+                tracing::info!(
+                    "'{}' is a worktree of registered repo '{}' whose index is usable — \
+                     the shared embedding cache is already warm",
+                    alias_bg,
+                    parent_alias
+                );
+            } else {
+                let adopt_parent = parent_meta.exists();
+                tracing::info!(
+                    "'{}' is a worktree of registered repo '{}' (index {}); building the \
+                     parent first so the shared embedding cache serves the worktree's \
+                     unchanged chunks as hits",
+                    alias_bg,
+                    parent_alias,
+                    if adopt_parent { "stale" } else { "absent" }
+                );
+                match state_bg.try_open_stores(&parent_alias, &parent_db, true, false, None) {
+                    Ok(OpenedStores::Write(parent_stores)) => {
+                        let built = if adopt_parent {
+                            IndexManager::perform_incremental_refresh_with_stores(
+                                &parent_path,
+                                &parent_db,
+                                &parent_stores,
+                                &token_for_task,
+                                Some(&pool),
+                                None,
+                            )
+                            .await
+                        } else {
+                            IndexManager::force_reindex_with_stores(
+                                &parent_path,
+                                &parent_db,
+                                &parent_stores,
+                                None,
+                                &token_for_task,
+                                Some(&pool),
+                            )
+                            .await
+                        };
+                        // Register the parent as Warm so its stores are tracked
+                        // by the repo table: without an entry the idle reaper
+                        // can never evict them (the heed env stays cached for
+                        // the process lifetime) and `index rm <parent>` hits
+                        // the locked-DB class indefinitely. touch_access starts
+                        // the reaper's idle clock; a later query lazily
+                        // transitions Warm → Write.
+                        state_bg.repos.insert(
+                            parent_alias.clone(),
+                            RepoState::Warm {
+                                stores: parent_stores,
+                            },
+                        );
+                        state_bg.touch_access(&parent_alias);
+                        match built {
+                            Ok(()) => tracing::info!(
+                                "Parent index built for '{}' — seeding done for worktree '{}'",
+                                parent_alias,
+                                alias_bg
+                            ),
+                            Err(e) => tracing::warn!(
+                                "Parent build for '{}' failed — continuing with the \
+                                 worktree: {e:#}",
+                                parent_alias
+                            ),
+                        }
+                    }
+                    Ok(OpenedStores::Readonly(_)) => {
+                        tracing::warn!(
+                            "Parent '{}' stores are read-only — skipping seeding",
+                            parent_alias
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        "Could not open stores for parent '{}' — skipping seeding: {e:#}",
+                        parent_alias
+                    ),
+                }
+            }
+        }
+
         let indexed = if adopt_existing {
             // Incremental refresh: unchanged files stay in the index, only real
             // changes are re-chunked/re-embedded. Same heavy-job gate and

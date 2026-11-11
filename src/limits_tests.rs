@@ -27,7 +27,24 @@ fn defaults_are_conservative() {
     );
     assert_eq!(embed_pause(), Duration::ZERO);
     assert_eq!(min_free_mb(), 0, "memory floor is opt-in");
-    assert_eq!(max_chunks_per_batch(), 0, "chunk cap is opt-in");
+    assert_eq!(
+        max_chunks_per_batch(),
+        DEFAULT_MAX_CHUNKS_PER_BATCH,
+        "chunk cap defaults ON (4096) — the uncapped 13k-chunk file rode its \
+         last MDB_MAP_FULL retry (serve log 10/11)"
+    );
+    assert_eq!(DEFAULT_MAX_CHUNKS_PER_BATCH, 4096);
+}
+
+/// The chunk cap must stay env-overridable: `0` re-disables it for a machine
+/// where the whole-corpus single-batch behaviour is preferred.
+#[test]
+#[serial]
+fn max_chunks_per_batch_env_overrides_the_default() {
+    let _env = EnvRestore::set(&[(MAX_CHUNKS_PER_BATCH_ENV, "512")]);
+    assert_eq!(max_chunks_per_batch(), 512);
+    let _off = EnvRestore::set(&[(MAX_CHUNKS_PER_BATCH_ENV, "0")]);
+    assert_eq!(max_chunks_per_batch(), 0, "0 must keep the cap disabled");
 }
 
 #[test]
@@ -67,7 +84,11 @@ fn invalid_values_fall_back() {
     assert_eq!(embed_threads(), None, "0 threads means 'ONNX default'");
     assert_eq!(embed_pause(), Duration::ZERO);
     assert_eq!(min_free_mb(), 0);
-    assert_eq!(max_chunks_per_batch(), 0);
+    assert_eq!(
+        max_chunks_per_batch(),
+        DEFAULT_MAX_CHUNKS_PER_BATCH,
+        "invalid values fall back to the default cap"
+    );
 }
 
 #[tokio::test]

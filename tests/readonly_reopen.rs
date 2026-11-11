@@ -19,6 +19,7 @@
 //! different options, so a write-open followed by a read-only-open cannot both
 //! happen in one process. The test therefore re-executes its own binary to run
 //! the `build_db_child` helper.
+mod common;
 
 use codesearch::chunker::{Chunk, ChunkKind};
 use codesearch::embed::EmbeddedChunk;
