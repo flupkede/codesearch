@@ -562,13 +562,6 @@ pub trait SymbolIndexer: Send + Sync {
     fn applicability_hint(&self) -> &'static str {
         "the repository has no entrypoint this symbol indexer recognizes"
     }
-
-    /// Downcast to `Any` for concrete-type method access (e.g. `prewarm_ref_cache`).
-    ///
-    /// This is needed because some adapter-specific methods (like Phase 3 pre-warm)
-    /// don't belong on the generic trait but still need to be called from serve code
-    /// that holds a `&dyn SymbolIndexer`.
-    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 // ── Language dispatch ─────────────────────────────────────────────

@@ -838,6 +838,15 @@ pub const SCIP_REFS_COVERAGE_PARTIAL: &str = "partial";
 /// Nothing was precomputed; every reference lookup resolves lazily.
 pub const SCIP_REFS_COVERAGE_LAZY: &str = "lazy";
 
+/// Coverage stamp written by a PROJECT-SCOPED run (`RebuildScope::Files`
+/// incrementals and `RebuildScope::Project` rebuilds both pass
+/// `project=Some`, so their references are project-local and can never
+/// claim solution-wide truth). Accepted as fresh: it is the steady state
+/// between incrementals, and queries resolve any cache miss on demand.
+/// Distinct from `lazy`, which marks a FULL-scope run that produced no
+/// references at all (pre-2.1 helpers) and must rebuild once.
+pub const SCIP_REFS_COVERAGE_INCREMENTAL: &str = "incremental";
+
 /// LMDB table mapping `(file:line)` positions to `[symbol_keys]`.
 /// Used for O(1) position-based symbol lookup.
 pub const SCIP_POSITION_DB_NAME: &str = "scip_positions";

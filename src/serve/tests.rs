@@ -4874,10 +4874,13 @@ fn symbol_index_status_reflects_the_on_disk_meta() {
     assert_eq!(csharp.state, "stale", "{csharp:?}");
 
     // Survived build failures in meta: degraded — serving but incomplete.
+    // Coverage must be stamped (complete): without it the index reads stale
+    // before the warnings check ever runs.
     seed_scip_meta(
         &db,
         &[
             (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_COMPLETE),
             (
                 crate::constants::SCIP_INDEX_WARNINGS_KEY,
                 r#"["Broken.csproj: Msbuild failed when processing the file"]"#,

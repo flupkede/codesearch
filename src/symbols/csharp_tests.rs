@@ -365,12 +365,13 @@ fn index_matches_builder_mirrors_the_rebuild_gate() {
         "an index without a refs_coverage stamp must rebuild once"
     );
 
-    // A rebuild by THIS binary: the meta write stamps version and coverage.
-    // `lazy` no longer matches — it marks an index built without precomputed
-    // references, which must rebuild once so the stamp becomes real.
+    // This build's stamp with an `incremental` coverage stamp: fresh — the
+    // steady state between incrementals (project-scoped truth, on-demand
+    // misses), never a trigger for a full rebuild.
     for coverage in [
         crate::constants::SCIP_REFS_COVERAGE_COMPLETE,
         crate::constants::SCIP_REFS_COVERAGE_PARTIAL,
+        crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL,
     ] {
         let env = crate::symbols::get_shared_scip_env(&db).unwrap();
         let meta_db = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(

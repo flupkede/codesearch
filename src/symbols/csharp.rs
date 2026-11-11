@@ -1597,13 +1597,21 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             definitions: index,
             references,
         } = scip_parse::parse_json_index(&index_data)?;
-        // Only a full-scope run resolves references solution-wide; a filtered
-        // run's list would cache project-local answers as the whole truth.
+        // Project-scoped runs (incrementals, single-project rebuilds) see
+        // only their own project's symbols: their references can never be
+        // cached as solution-wide truth, so they stamp `incremental` —
+        // fresh, with queries resolving misses on demand. Only a FULL-scope
+        // run answers whether the helper produced solution-wide references
+        // (precomputed) or not (lazy — a pre-2.1 helper, rebuilt once).
         let precomputed_refs = references.filter(|_| project.is_none());
-        let refs_coverage = refs_coverage_for(
-            precomputed_refs.is_some(),
-            index_warnings_stored(&index_warnings).is_empty(),
-        );
+        let refs_coverage = if project.is_some() {
+            crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL
+        } else {
+            refs_coverage_for(
+                precomputed_refs.is_some(),
+                index_warnings_stored(&index_warnings).is_empty(),
+            )
+        };
 
         // Open LMDB (all named DBs pre-created by open_scip_env)
         let env = self.open_scip_env(db_path)?;
@@ -2190,11 +2198,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     /// not stamp at all — hence the override, not the trait default).
     /// A missing `refs_coverage` stamp is stale too: such an index predates
     /// precomputed references, and only a rebuild produces them.
-    /// A `lazy` stamp is stale as well: it marks an index built WITHOUT
-    /// precomputed references, which would otherwise re-run the hours-long
-    /// lazy batch-find-refs pre-warm on every serve start. Serve rebuilds
-    /// are always full-scope, so one rebuild stamps `complete`/`partial`
-    /// and the lazy state never recurs.
+    /// A `lazy` stamp is stale as well: it marks a FULL-scope run that
+    /// produced no references (pre-2.1 helpers), which would otherwise
+    /// leave find_impact on slow per-query on-demand resolution forever.
+    /// Serve full rebuilds are always full-scope with the current helper,
+    /// so one rebuild stamps `complete`/`partial` and lazy never recurs.
+    /// `incremental` stays fresh: it is the honest stamp of a project-scoped
+    /// run between incrementals (cache cleared, queries resolve on demand).
     fn index_matches_builder(&self, db_path: &Path) -> bool {
         self.index_builder_version(db_path).as_deref()
             == Some(crate::constants::SCIP_INDEX_BUILDER_VERSION)
@@ -2203,6 +2213,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 Some(
                     crate::constants::SCIP_REFS_COVERAGE_COMPLETE
                         | crate::constants::SCIP_REFS_COVERAGE_PARTIAL
+                        | crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL
                 )
             )
     }
@@ -2257,10 +2268,6 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
     fn applicability_hint(&self) -> &'static str {
         "the scip-csharp adapter requires a .sln file in the repository root"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -2927,7 +2934,7 @@ mod tests {
             wtxn.commit().unwrap();
         }
         let helper_dir = dir.join("helper");
-        std::fs::create_dir(&helper_dir).unwrap();
+        std::fs::create_dir_all(&helper_dir).unwrap();
         let helper = build_fake_csharp_helper(&helper_dir);
         let marker = dir.join("non-index-calls.txt");
         let guard = crate::testing::EnvRestore::set(&[
@@ -3035,6 +3042,42 @@ mod tests {
                 .lookup_warnings(&run.db, FAKE_REFERENCED)
                 .is_empty(),
             "a warning from before the rebuild must not replay against the new cache"
+        );
+    }
+
+    /// An incremental rebuild clears the WHOLE precomputed ref cache —
+    /// including entries for symbols untouched by the changed files — so
+    /// no stale pre-change entry can survive an unrelated file's rebuild.
+    /// This is the pin that moved here from the deleted
+    /// `test_incremental_rebuild_clears_the_reference_cache` (its probe
+    /// `collect_uncached_symbol_keys` was removed with the lazy pre-warm).
+    #[test]
+    #[serial_test::serial]
+    fn incremental_rebuild_clears_the_precomputed_ref_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let full = rebuild_with_fake_index(dir.path(), "2.1", RebuildScope::Full);
+        assert_eq!(full.summary.references_stored, 4);
+        assert_eq!(ref_cache_keys(&full.db).len(), 2);
+
+        let run = rebuild_with_fake_index(
+            dir.path(),
+            "2.1",
+            RebuildScope::Files {
+                changed: vec![PathBuf::from("src/Unrelated.cs")],
+                deleted: vec![],
+            },
+        );
+        assert!(
+            ref_cache_keys(&run.db).is_empty(),
+            "an incremental rebuild must clear scip_ref_cache in full, got {:?}",
+            ref_cache_keys(&run.db)
+        );
+        // The cleared cache stamps `incremental`: fresh (project-scoped
+        // truth, queries resolve misses on demand) — NOT lazy, which is
+        // reserved for full-scope runs without references and reads stale.
+        assert_eq!(
+            run.indexer.refs_coverage(&run.db).as_deref(),
+            Some(crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL)
         );
     }
 
@@ -3146,19 +3189,12 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn rebuild_without_solution_wide_references_stays_lazy() {
-        for (flavour, scope) in [
-            ("2.0", RebuildScope::Full),
-            ("2.1-null", RebuildScope::Full),
-            (
-                "2.1",
-                RebuildScope::Files {
-                    changed: vec![PathBuf::from("src/A.cs")],
-                    deleted: vec![],
-                },
-            ),
-        ] {
+        // Full-scope runs without solution-wide references (pre-2.1 helper
+        // flavours) stamp lazy: the rebuild gate reads that as stale, so
+        // serve rebuilds once with the current helper.
+        for flavour in ["2.0", "2.1-null"] {
             let dir = tempfile::TempDir::new().unwrap();
-            let run = rebuild_with_fake_index(dir.path(), flavour, scope);
+            let run = rebuild_with_fake_index(dir.path(), flavour, RebuildScope::Full);
             assert_eq!(
                 run.indexer.refs_coverage(&run.db).as_deref(),
                 Some(crate::constants::SCIP_REFS_COVERAGE_LAZY),
@@ -3167,6 +3203,29 @@ mod tests {
             assert!(ref_cache_keys(&run.db).is_empty(), "flavour {flavour}");
             assert_eq!(run.summary.references_stored, 2, "flavour {flavour}");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn project_scoped_rebuild_stamps_incremental() {
+        // A Files-scope incremental passes project=Some: its references are
+        // project-local and stamp `incremental` — fresh, NOT lazy.
+        let dir = tempfile::TempDir::new().unwrap();
+        let run = rebuild_with_fake_index(
+            dir.path(),
+            "2.1",
+            RebuildScope::Files {
+                changed: vec![PathBuf::from("src/A.cs")],
+                deleted: vec![],
+            },
+        );
+        assert_eq!(
+            run.indexer.refs_coverage(&run.db).as_deref(),
+            Some(crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL),
+            "a project-scoped run must not read as lazy"
+        );
+        assert!(ref_cache_keys(&run.db).is_empty());
+        assert_eq!(run.summary.references_stored, 2);
     }
 
     // ── Restore gate (issue #225): producer-side coverage ───────────
