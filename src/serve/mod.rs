@@ -36,14 +36,13 @@ use tracing::{info, warn};
 
 use crate::cache::safe_canonicalize;
 use crate::constants::{
-    ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_PREWARM_ENABLED_ENV,
-    CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
-    DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH,
-    FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_MARKER_HEARTBEAT_SECS, INDEXING_PATH,
-    LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH,
-    MCP_IDLE_SESSION_SECS, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH,
-    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
-    STATUS_PATH,
+    ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_SCIP_CONCURRENCY_DEFAULT,
+    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV,
+    EXPLORE_PATH, FIND_IMPACT_PATH, FIND_PATH, HEALTHZ_PATH, HEALTH_PATH,
+    INDEXING_MARKER_HEARTBEAT_SECS, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS,
+    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, MCP_IDLE_SESSION_SECS, PERSIST_DEBOUNCE_SECS,
+    REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH,
+    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, git_common_dir_for, ReposConfig};
 use crate::index::{
@@ -2080,175 +2079,6 @@ impl ServeState {
             let _ = handle.await;
         }
         info!("phase-2 complete");
-    }
-
-    /// Phase 3: background pre-warm of reference cache for C# repos.
-    ///
-    /// For each repo whose index carries no precomputed references
-    /// (`refs_coverage` lazy or absent), Phase 3 runs
-    /// `scip-csharp batch-find-refs` to resolve references
-    /// for all uncached symbols in a single workspace session.
-    /// This amortizes the 30-60s workspace open cost across thousands of
-    /// symbols, making subsequent `find_impact` calls instant (LMDB cache hit).
-    ///
-    /// Controlled by `CSHARP_PREWARM_ENABLED` env (default: "true").
-    /// Set to "false" to skip Phase 3 entirely (useful on memory-constrained machines).
-    pub(crate) async fn run_phase_3_prewarm(self: &Arc<Self>) {
-        let enabled = std::env::var(CSHARP_PREWARM_ENABLED_ENV)
-            .unwrap_or_else(|_| "true".to_string())
-            .parse::<bool>()
-            .unwrap_or(true);
-
-        if !enabled {
-            info!(
-                "phase-3: pre-warm disabled by {}=false",
-                CSHARP_PREWARM_ENABLED_ENV
-            );
-            return;
-        }
-
-        let aliases = self.aliases();
-        let mut candidates: Vec<String> = Vec::new();
-
-        for alias in &aliases {
-            let path = match self.config.read().ok().and_then(|c| c.resolve(alias)) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // Skip stale entries whose folder no longer exists.
-            if !path.exists() {
-                continue;
-            }
-
-            // Only pre-warm repos that have a ready C# index
-            let status = self
-                .csharp_index_status
-                .get(alias)
-                .map(|g| *g.value())
-                .unwrap_or(CSharpIndexStatus::None);
-
-            if !matches!(status, CSharpIndexStatus::Ready) {
-                info!("phase-3: skip '{}' — C# status is {:?}", alias, status);
-                continue;
-            }
-
-            // Check that the repo is applicable
-            let applies = self
-                .symbol_registry
-                .get(LANG_CSHARP)
-                .map(|i| i.applies_to(&path))
-                .unwrap_or(false);
-
-            if !applies {
-                continue;
-            }
-
-            let coverage = self.symbol_registry.get(LANG_CSHARP).and_then(|i| {
-                i.as_any()
-                    .downcast_ref::<csharp::CSharpSymbolIndexer>()
-                    .and_then(|c| c.refs_coverage(&path.join(DB_DIR_NAME)))
-            });
-            if !csharp::ref_prewarm_needed(coverage.as_deref()) {
-                info!(
-                    "phase-3: skip '{}' — references precomputed at index (coverage={})",
-                    alias,
-                    coverage.as_deref().unwrap_or_default()
-                );
-                continue;
-            }
-
-            candidates.push(alias.clone());
-        }
-
-        if candidates.is_empty() {
-            info!("phase-3: 0 candidates for pre-warm");
-            return;
-        }
-
-        info!("phase-3: pre-warming {} repo(s)", candidates.len());
-
-        let concurrency = Self::csharp_scip_concurrency();
-        let sem = Arc::new(Semaphore::new(concurrency));
-        let mut handles = Vec::with_capacity(candidates.len());
-
-        for alias in candidates {
-            let sem = sem.clone();
-            let state = self.clone();
-            handles.push(tokio::spawn(async move {
-                let _permit = match sem.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-
-                info!("phase-3: pre-warming '{}'", alias);
-
-                let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
-                    Some(p) => p,
-                    None => return,
-                };
-                let db_path = path.join(DB_DIR_NAME);
-
-                let registry = state.symbol_registry.clone();
-                let alias_owned = alias.clone();
-
-                // Signal TUI: C# ref-cache pre-warm is in progress.
-                // We set csharp_index_status → Indexing so the C# column shows "C#…"
-                // without touching active_reindexes — pre-warm does not block HTTP
-                // /reindex requests and should not override the repo label (Warm/Open).
-                state
-                    .csharp_index_status
-                    .insert(alias_owned.clone(), CSharpIndexStatus::Indexing);
-
-                match tokio::task::spawn_blocking(move || {
-                    let Some(indexer) = registry.get(LANG_CSHARP) else {
-                        return Err(anyhow::anyhow!("No C# indexer"));
-                    };
-                    // Downcast to CSharpSymbolIndexer to access prewarm_ref_cache
-                    let csharp_indexer = indexer
-                        .as_any()
-                        .downcast_ref::<csharp::CSharpSymbolIndexer>()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Failed to downcast to CSharpSymbolIndexer")
-                        })?;
-                    csharp_indexer.prewarm_ref_cache(&path, &db_path, CSHARP_PREWARM_MAX_SYMBOLS)
-                })
-                .await
-                {
-                    Ok(Ok(summary)) => {
-                        info!(
-                            "phase-3: pre-warm complete for '{}': {} resolved, {} cached in {}ms",
-                            alias_owned, summary.resolved, summary.cached, summary.duration_ms
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("phase-3: pre-warm failed for '{}': {}", alias_owned, e);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "phase-3: pre-warm task panicked for '{}': {}",
-                            alias_owned,
-                            e
-                        );
-                    }
-                }
-
-                // Restore Ready status regardless of pre-warm outcome: the SCIP
-                // definitions index (built in Phase 2) remains valid even if
-                // ref-cache pre-warm fails. TUI returns to "C#·" (ready).
-                // Not while a build runs: it sets the final status itself.
-                if !state.is_indexing(&alias_owned) {
-                    state
-                        .csharp_index_status
-                        .insert(alias_owned, CSharpIndexStatus::Ready);
-                }
-            }));
-        }
-
-        for handle in handles {
-            let _ = handle.await;
-        }
-        info!("phase-3 complete");
     }
 
     /// Build an actionable conflict error message.
@@ -7712,7 +7542,6 @@ pub async fn run_serve(
             }
             phase_state.run_phase_1_warmup_all().await;
             phase_state.run_phase_2_symbols().await;
-            phase_state.run_phase_3_prewarm().await;
         });
     }
 

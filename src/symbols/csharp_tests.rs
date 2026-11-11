@@ -366,10 +366,11 @@ fn index_matches_builder_mirrors_the_rebuild_gate() {
     );
 
     // A rebuild by THIS binary: the meta write stamps version and coverage.
+    // `lazy` no longer matches — it marks an index built without precomputed
+    // references, which must rebuild once so the stamp becomes real.
     for coverage in [
         crate::constants::SCIP_REFS_COVERAGE_COMPLETE,
         crate::constants::SCIP_REFS_COVERAGE_PARTIAL,
-        crate::constants::SCIP_REFS_COVERAGE_LAZY,
     ] {
         let env = crate::symbols::get_shared_scip_env(&db).unwrap();
         let meta_db = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(
@@ -388,6 +389,29 @@ fn index_matches_builder_mirrors_the_rebuild_gate() {
         );
         assert_eq!(indexer.refs_coverage(&db).as_deref(), Some(coverage));
     }
+
+    // This build's stamp with a `lazy` coverage stamp: stale.
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let meta_db = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Str>(
+        &env,
+        crate::constants::SCIP_META_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    super::csharp::CSharpSymbolIndexer::write_rebuild_meta(
+        &meta_db,
+        &mut wtxn,
+        &[],
+        crate::constants::SCIP_REFS_COVERAGE_LAZY,
+    )
+    .expect("meta write must succeed");
+    wtxn.commit().unwrap();
+    assert!(
+        !indexer.index_matches_builder(&db),
+        "a lazy coverage stamp must read as stale — only a rebuild produces \
+         precomputed references"
+    );
 }
 
 #[test]
@@ -695,6 +719,9 @@ fn shutdown_kills_registered_helper_children() {
     );
 }
 
+/// A `lazy` stamp still writes fine via `write_rebuild_meta` (the helper
+/// accepts any coverage value — filtered runs produce it), but the rebuild
+/// gate no longer accepts it as fresh: see `index_matches_builder`.
 #[test]
 fn refs_coverage_follows_precompute_and_index_warnings() {
     use super::csharp::refs_coverage_for;
@@ -711,27 +738,6 @@ fn refs_coverage_follows_precompute_and_index_warnings() {
             refs_coverage_for(precomputed, clean),
             expected,
             "precomputed={precomputed} clean={clean}"
-        );
-    }
-}
-
-#[test]
-fn ref_prewarm_runs_only_without_precomputed_references() {
-    use super::csharp::ref_prewarm_needed;
-    use crate::constants::{
-        SCIP_REFS_COVERAGE_COMPLETE, SCIP_REFS_COVERAGE_LAZY, SCIP_REFS_COVERAGE_PARTIAL,
-    };
-    for (coverage, needed) in [
-        (Some(SCIP_REFS_COVERAGE_COMPLETE), false),
-        (Some(SCIP_REFS_COVERAGE_PARTIAL), false),
-        (Some(SCIP_REFS_COVERAGE_LAZY), true),
-        (None, true),
-        (Some("unknown"), true),
-    ] {
-        assert_eq!(
-            ref_prewarm_needed(coverage),
-            needed,
-            "coverage={coverage:?}"
         );
     }
 }
