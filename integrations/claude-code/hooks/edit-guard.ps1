@@ -4,11 +4,13 @@
 #
 # When the edited file's repo is codesearch-registered (git root listed in
 # ~/.codesearch/repos.json, honoring CODESEARCH_REPOS_CONFIG / CODESEARCH_HOME,
-# or a CODESEARCH_SERVER opt-in), every touched file needs a marker proving the
-# agent consulted codesearch for exactly that path within the last 5
-# minutes: mcp__codesearch__find_impact for SCIP-backed languages
-# (.cs .ts .tsx .mts .cts), mcp__codesearch__find kind="usages" for
-# everything else. Markers are written by the edit-guard-post PostToolUse
+# or a CODESEARCH_SERVER opt-in), every touched code file needs a marker
+# proving the agent consulted codesearch for exactly that path within the
+# last 5 minutes: mcp__codesearch__find_impact for SCIP-backed languages
+# (.cs .ts .tsx .mts .cts), mcp__codesearch__find kind="usages" for other
+# source code. Docs/config/data files (.md, .json, ...) can never benefit
+# from a usages lookup, so they are never gated. Markers are written by the
+# edit-guard-post PostToolUse
 # companion into $env:TEMP\.codesearch-edit-guard-state.json.
 #
 # Lenient acceptance: ANY marker for the path within the window lets the
@@ -71,17 +73,33 @@ function Test-CheckedRecently {
     }
 }
 
+# Which consultation a path needs before editing: "impact" for SCIP-backed
+# languages, "usages" for other source code, $null for non-code files. The
+# list mirrors the code-bearing classes of codesearch's own extension map
+# (src/file/language.rs — incl. sql and ipynb, whose cells the indexer
+# extracts as code) plus razor/cshtml; docs/markup/config (.md .json .yaml
+# .css .html .xml ...) never gate. Keys on EXTENSION only: filename-mapped
+# code files (Dockerfile, Makefile, ...) pass too — rare refactor targets.
+function Get-EditGuardKind {
+    param([string]$Path)
+    $ext = [System.IO.Path]::GetExtension($Path).TrimStart('.').ToLowerInvariant()
+    if (@('cs', 'ts', 'tsx', 'mts', 'cts') -contains $ext) { return 'impact' }
+    if (@('js', 'mjs', 'cjs', 'jsx', 'py', 'pyw', 'pyi', 'go', 'rs', 'java', 'c', 'h', 'cpp', 'cc', 'cxx', 'hpp', 'hxx', 'rb', 'rake', 'php', 'swift', 'kt', 'kts', 'dart', 'sh', 'bash', 'zsh', 'sql', 'ipynb', 'proto', 'razor', 'cshtml') -contains $ext) { return 'usages' }
+    return $null
+}
+
 $failPath = $null
 $failTool = $null
 foreach ($p in $paths) {
+    $kind = Get-EditGuardKind $p
+    if (-not $kind) { continue }                    # non-code file -> allow (fail-open)
     $root = Resolve-TargetGitRoot $p
     if (-not $root) { continue }                    # outside any git repo -> allow
     if (-not (Test-CodesearchTargetRegistered $root)) { continue }  # unregistered -> fail-open
     $key = ConvertTo-StateKey $p
     if (Test-CheckedRecently $key) { continue }
     $failPath = $p
-    $ext = [System.IO.Path]::GetExtension($p).TrimStart('.').ToLowerInvariant()
-    if (@('cs', 'ts', 'tsx', 'mts', 'cts') -contains $ext) {
+    if ($kind -eq 'impact') {
         $failTool = 'mcp__codesearch__find_impact (SCIP-backed language)'
     } else {
         $failTool = 'mcp__codesearch__find(symbol, kind="usages")'
@@ -101,10 +119,11 @@ Any outcome counts: "no results" and "no SCIP backend" still prove you
 consulted codesearch for this file. Run the call, then retry the SAME
 edit — it stays allowed for 5 minutes.
 
-Why: find_impact (C#/TS) / find kind="usages" (other languages) before
-edits keeps refactors caller-aware; this guard makes that protocol
-structural for codesearch-registered repos. Unregistered repos, non-git
-paths and unparseable events fail open and are never blocked.
+Why: find_impact (C#/TS) / find kind="usages" (other code) before edits
+keeps refactors caller-aware; this guard makes that protocol structural
+for codesearch-registered repos — code files only. Docs, config and data
+files, unregistered repos, non-git paths and unparseable events fail open
+and are never blocked.
 "@
 
 $out = @{

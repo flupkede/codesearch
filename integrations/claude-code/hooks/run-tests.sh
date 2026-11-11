@@ -101,6 +101,26 @@ case_covered_py_needs_usages() {
     run_edit "$(edit_event "$REPO_A/p.py")"
     expect_deny "covered repo: Edit .py denied (find kind=usages required)" 'kind="usages"'
 }
+case_non_code_file_allows() {
+    # Docs/config/data can never benefit from a usages lookup: they pass
+    # without any consultation (the .md misfire this pins).
+    run_edit "$(edit_event "$REPO_A/docs/notes.md")"
+    expect_allow "covered repo: Edit .md allowed without consultation"
+    run_edit "$(edit_event "$REPO_A/config/settings.json")"
+    expect_allow "covered repo: Edit .json allowed without consultation"
+}
+case_razor_needs_usages() {
+    run_edit "$(edit_event "$REPO_A/Components/Counter.razor")"
+    expect_deny "covered repo: Edit .razor denied (find kind=usages required)" 'kind="usages"'
+}
+case_sql_needs_usages() {
+    run_edit "$(edit_event "$REPO_A/migrations/001_init.sql")"
+    expect_deny "covered repo: Edit .sql denied (find kind=usages required)" 'kind="usages"'
+}
+case_ipynb_needs_usages() {
+    run_edit "$(edit_event "$REPO_A/analysis/notebook.ipynb")"
+    expect_deny "covered repo: Edit .ipynb denied (find kind=usages required)" 'kind="usages"'
+}
 case_definition_does_not_mark() {
     run_post "$(post_find "$REPO_A/m.ts" "definition")"
     run_edit "$(edit_event "$REPO_A/m.ts")"
@@ -213,6 +233,10 @@ case_no_coverage_allows
 case_covered_cs_denied
 case_covered_ts_denied
 case_covered_py_needs_usages
+case_non_code_file_allows
+case_razor_needs_usages
+case_sql_needs_usages
+case_ipynb_needs_usages
 case_definition_does_not_mark
 case_find_impact_marker_allows
 case_empty_first_field_falls_through
