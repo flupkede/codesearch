@@ -18,7 +18,7 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Changed
 
-- **Precomputed references are enforced; the lazy pre-warm path is removed.** A `lazy` refs-coverage stamp — a full-scope rebuild that produced no references (pre-2.1 `scip-csharp` helpers) — now reads as stale, so serve rebuilds such an index once with the current helper instead of running the hours-long `batch-find-refs` pre-warm after every start (measured ~38 min per 5000 symbols on BOIN.Aprimo-sized repos). Project-scoped rebuilds (file incrementals, single-project) stamp a new `incremental` coverage that stays fresh: queries resolve cache misses on demand as before. `CSHARP_PREWARM_ENABLED` and the whole phase-3 pre-warm machinery are gone.
+- **Precomputed references are enforced; the lazy pre-warm path is removed.** A `lazy` refs-coverage stamp — a full-scope rebuild that produced no references (pre-2.1 `scip-csharp` helpers) — now reads as stale, so serve rebuilds such an index once with the current helper instead of running the hours-long `batch-find-refs` pre-warm after every start (measured ~38 min per 5000 symbols on large multi-project C# solutions). Project-scoped rebuilds (file incrementals, single-project) stamp a new `incremental` coverage that stays fresh: queries resolve cache misses on demand as before. `CSHARP_PREWARM_ENABLED` and the whole phase-3 pre-warm machinery are gone.
 
 ### Fixed
 
