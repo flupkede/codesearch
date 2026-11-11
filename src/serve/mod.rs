@@ -6236,6 +6236,20 @@ async fn add_repo_handler(
                             )
                             .await
                         };
+                        // Register the parent as Warm so its stores are tracked
+                        // by the repo table: without an entry the idle reaper
+                        // can never evict them (the heed env stays cached for
+                        // the process lifetime) and `index rm <parent>` hits
+                        // the locked-DB class indefinitely. touch_access starts
+                        // the reaper's idle clock; a later query lazily
+                        // transitions Warm → Write.
+                        state_bg.repos.insert(
+                            parent_alias.clone(),
+                            RepoState::Warm {
+                                stores: parent_stores,
+                            },
+                        );
+                        state_bg.touch_access(&parent_alias);
                         match built {
                             Ok(()) => tracing::info!(
                                 "Parent index built for '{}' — seeding done for worktree '{}'",

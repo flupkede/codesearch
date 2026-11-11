@@ -1290,9 +1290,32 @@ mod tests {
                 "{name} must be skipped as generated"
             );
         }
+
         // Real source must not match the suffix patterns.
         assert!(!ALWAYS_SKIP_FILENAME_SUFFIXES
             .iter()
             .any(|s| "program.cs".ends_with(s)));
+    }
+
+    /// The hermetic redirect (see `crate::testing::redirect_test_scratch`)
+    /// writes env vars under LITERAL names because its file is dual-compiled;
+    /// this pins those literals to the constants here. If a constant is
+    /// renamed, this test fails instead of every integration binary silently
+    /// losing its isolation (the wt*-registry-leak class).
+    #[test]
+    #[serial_test::serial]
+    fn redirect_test_scratch_targets_the_env_constants() {
+        crate::testing::redirect_test_scratch();
+        let cfg = std::env::var(REPOS_CONFIG_ENV)
+            .expect("CODESEARCH_REPOS_CONFIG must be set by the test redirect");
+        assert!(
+            cfg.ends_with("repos.json"),
+            "the redirect must isolate the registry, got {cfg}"
+        );
+        assert_eq!(
+            std::env::var(SERVE_PORT_ENV).as_deref(),
+            Ok("1"),
+            "the redirect must point delegation at a dead port"
+        );
     }
 }
