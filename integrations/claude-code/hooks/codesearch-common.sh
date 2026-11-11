@@ -86,6 +86,12 @@ command_grep_targets() {
     # whitespace would promote the first path operand to "pattern" and hide it.
     stripped=$(printf '%s' "$cmd" | sed -E 's/"(\\.|[^"\\])*"/__CS_Q__/g')
     stripped=$(printf '%s' "$stripped" | sed -E $'s/\'(\\\\.|[^\'\\\\])*\'/__CS_Q__/g')
+    # Redirections are not operands. `2>/dev/null` used to come through as a
+    # "path" and could be blamed on an unrelated project. Drop fd duplication
+    # (`2>&1`) first, then an operator with its target, attached or spaced.
+    stripped=$(printf '%s' "$stripped" | sed -E 's/[0-9]*>&[0-9-]+//g')
+    stripped=$(printf '%s' "$stripped" | sed -E 's/[0-9]*>>?[[:space:]]*[^[:space:];|&]+//g')
+    stripped=$(printf '%s' "$stripped" | sed -E 's/[0-9]*<[[:space:]]*[^[:space:];|&]+//g')
     stripped=$(printf '%s' "$stripped" | tr ';|&()`' '\n\n\n\n\n')
     while IFS= read -r seg; do
         [ -n "$seg" ] || continue

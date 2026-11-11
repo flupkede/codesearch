@@ -60,6 +60,11 @@ function Get-GrepTargetPaths {
     # The placeholder keeps the pattern's ARGUMENT POSITION.
     $stripped = [regex]::Replace($Cmd, '"(?:\\.|[^"\\])*"', '__CS_Q__')
     $stripped = [regex]::Replace($stripped, "'(?:\\.|[^'\\])*'", '__CS_Q__')
+    # Redirections are not operands: drop fd duplication (`2>&1`), then an
+    # operator with its target (attached or spaced), mirroring the .sh twin.
+    $stripped = [regex]::Replace($stripped, '[0-9]*>&[0-9-]+', ' ')
+    $stripped = [regex]::Replace($stripped, '[0-9]*>{1,2}\s*[^\s;|&]+', ' ')
+    $stripped = [regex]::Replace($stripped, '[0-9]*<\s*[^\s;|&]+', ' ')
     foreach ($seg in ($stripped -split '[;|&()`]+')) {
         $words = @($seg.Trim() -split '\s+' | Where-Object { $_ })
         if ($words.Count -eq 0) { continue }

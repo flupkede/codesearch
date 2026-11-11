@@ -1247,19 +1247,29 @@ export function tokenizeShellCommand(command: string, substitutions: string[]): 
   let word = ""
   let inWord = false
   let pendingPipe = false
+  let skipNextWord = false
+  let readsStdin = false
   let quote: '"' | "'" | "" = ""
 
   const pushWord = (): void => {
     if (!inWord) return
+    if (skipNextWord) {
+      // The word is a redirection target (`> out.txt`), not an argument.
+      skipNextWord = false
+      word = ""
+      inWord = false
+      return
+    }
     words.push(word)
     word = ""
     inWord = false
   }
   const endSegment = (pipeNext: boolean): void => {
     pushWord()
-    if (words.length) segments.push({ words, piped: pendingPipe })
+    if (words.length) segments.push({ words, piped: pendingPipe || readsStdin })
     words = []
     pendingPipe = pipeNext
+    readsStdin = false
   }
   /** End of a quoted or balanced substitution body starting at `from`. */
   const scanBalanced = (from: number, open: string, close: string): number => {
@@ -1338,6 +1348,31 @@ export function tokenizeShellCommand(command: string, substitutions: string[]): 
       // `||` is a command separator, not a pipe.
       endSegment(text[i + 1] !== "|")
       if (text[i + 1] === "|") i++
+      continue
+    }
+    if (ch === ">" || ch === "<") {
+      // Redirection, not an argument: `2>/dev/null`, `> out.txt`, `2>&1`,
+      // `>>/tmp/log`, `< input`. The operator and its target are dropped, so
+      // they can never be mistaken for grep's path operand (reported:
+      // `.../druid/2>/dev/null` resolved as a project target).
+      if (inWord && /^[0-9]+$/.test(word)) {
+        word = "" // file-descriptor prefix (`2>`)
+        inWord = false
+      }
+      pushWord()
+      i++
+      while (i < text.length && (text[i] === ">" || text[i] === "<")) i++
+      if (text[i] === "&") {
+        // fd duplication (`2>&1`, `>&2`): no file target follows.
+        i++
+        while (i < text.length && /[0-9-]/.test(text[i])) i++
+      } else {
+        // `< file` makes grep read a STREAM, exactly like `cat file | grep`:
+        // nothing on disk is a code-search target.
+        if (ch === "<") readsStdin = true
+        skipNextWord = true
+      }
+      i-- // the for-loop increment lands on the character after the operator
       continue
     }
     if (ch === ";" || ch === "&" || ch === "\n" || ch === "(" || ch === ")") {
@@ -1432,9 +1467,10 @@ export function shellGrepTargets(command: string, baseDir: string): string[] {
       const parsed = parseGrepArgs(segment.words.slice(index + 1))
       if (parsed.operands.length) {
         for (const operand of parsed.operands) targets.push(resolveShellPath(operand, base))
-      } else if (parsed.recursive || !segment.piped || viaXargs) {
-        // No operand: recursive grep walks the base dir, `xargs` supplies the
-        // file list, and a bare `grep PATTERN` would read stdin.
+      } else if (!segment.piped || viaXargs) {
+        // No operand and no stream: a recursive grep walks the base dir, a
+        // bare `grep PATTERN` would read stdin, and `xargs` supplies the file
+        // list. A grep that reads a pipe or a `< file` reads no repo files.
         targets.push(normalizePath(base))
       }
       // Otherwise: a stream filter. Nothing on disk is read.
@@ -1985,9 +2021,12 @@ export default {
         if (settings.guards.mode === "off") return
         const tool = String(event?.tool ?? "").toLowerCase()
         if (tool === "bash" || tool === "shell") {
-          // Shell grep is the escape hatch around the native grep/glob guards:
-          // denied in every mode except "off", because a shell grep is exactly
-          // the workaround the guards exist to stop. Kill switch: guards.bash=false.
+          // Shell grep is the escape hatch around the native grep/glob guards.
+          // In `nudge` (the default) it runs and the after-hook appends the
+          // one-time tip: the goal is "try codesearch first", not "block grep".
+          // `prune` and `block` still deny it, because allowing the shell
+          // bypass there would make hiding the native tools pointless.
+          // Kill switch: guards.bash=false.
           if (!settings.guards.bash) return
           const command = bashToolCommand(event)
           if (!command) return
@@ -1998,6 +2037,7 @@ export default {
           const workdir = bashToolWorkdir(event) || directory
           const covered = coveredGrepTargets(command, workdir)
           if (!covered.length) return
+          if (settings.guards.mode === "nudge") return
           if (health.state !== "ok") return // fail open unless the hub is confirmed up
           if (!(await guardRebuildSettled(covered[0].target))) return // still rebuilding at the cap: grep is all you have
           blocked = new Error(bashBlockMessage(command, covered))
@@ -2045,6 +2085,7 @@ export default {
     function maybeNudgeBashGrep(event: Loose, result: Loose): void {
       if (settings.guards.mode === "off") return
       if (!settings.guards.bash) return
+      if (health.state === "down") return // "grep is an acceptable fallback" while the hub is down
       const command = bashToolCommand(event)
       if (!command) return
       const covered = coveredGrepTargets(command, bashToolWorkdir(event) || directory)

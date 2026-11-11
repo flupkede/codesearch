@@ -182,6 +182,12 @@ case_bash_grep_targets() {
         'grep -rn "one/two" .' "$TMP_ROOT"
     case_grep_targets "bash grep: glob operand still names a path" \
         'grep -rn TODO src/*.rs' "$TMP_ROOT/src/*.rs"
+    case_grep_targets "bash grep: redirect target is not an operand" \
+        'grep -l "apache/druid" infra/superset/* 2>/dev/null' "$TMP_ROOT/infra/superset/*"
+    case_grep_targets "bash grep: output redirect and fd dup are dropped" \
+        'grep -rn TODO . > out.txt 2>&1' "$TMP_ROOT"
+    case_grep_targets "bash grep: input redirect is not an operand" \
+        'grep -n TODO < /tmp/input.txt' ""
     case_grep_targets "bash grep: no operand at all is the cwd repo's job" \
         'grep -rn image --include=*.yaml' ""
 }

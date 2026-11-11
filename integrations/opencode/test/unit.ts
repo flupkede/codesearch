@@ -262,6 +262,13 @@ function testShellGrepTargets(): void {
     ["for k in a b; do grep -n \"$k\" docs.md; done", ["/repo/docs.md"]],
     ["wc -l a && grep -rn \"is_(None)\" audits/", ["/repo/audits"]],
     ["cd /tmp/x && grep -n kafka docs.md", ["/tmp/x/docs.md"]],
+    // Redirections are not path operands: `2>/dev/null` used to be resolved
+    // as a target and blamed on a project that had nothing to do with it.
+    ['grep -l "apache/druid" /repo/superset/* 2>/dev/null', ["/repo/superset/*"]],
+    ["grep -rn x . > out.txt", ["/repo"]],
+    ["grep -rn x . >>/tmp/log 2>&1", ["/repo"]],
+    ["grep -rn x < /tmp/input.txt", []], // input redirect = a stream, like a pipe
+    ["grep -rn x . 2>&1 | head -3", ["/repo"]],
     ["echo `grep -rn foo src/`", ["/repo/src"]],
     ["echo $(grep -rn foo src/)", ["/repo/src"]],
     ['echo "$(grep -rn foo src/)"', ["/repo/src"]],
