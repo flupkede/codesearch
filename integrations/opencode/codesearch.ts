@@ -978,6 +978,20 @@ function buildScopePrelude(scope: ScopeInfo, extra: string[]): string {
     if (scope.groups.length) {
       lines.push(`- Project group${scope.groups.length > 1 ? "s" : ""}: ${scope.groups.map((g) => `"${g}"`).join(", ")} (use group= for cross-repo fan-out).`)
     }
+    // The session sits in a NESTED git repo that is only covered as part of a
+    // parent project: the index is the parent's, so the child's files may be
+    // missing or stale and searches here will feel wrong (reported: kcharts
+    // registered at the umbrella, sessions running in kcharts/druid).
+    if (
+      scope.hasGit &&
+      scope.projectPath &&
+      normalizePath(scope.directory) !== normalizePath(scope.projectPath)
+    ) {
+      lines.push(
+        `- This directory is its own git repository, but codesearch only covers it as part of "${scope.project}" (${scope.projectPath}). ` +
+          `For a complete, repo-local index run \`codesearch index add .\` here; add related repos to a group to search them together.`,
+      )
+    }
   } else if (scope.registered && scope.siblings.length) {
     lines.push(`- This workspace contains ${scope.siblings.length} registered codesearch project(s): ${scope.siblings.join(", ")}. Pass project= for one, or group= to fan out.`)
   } else if (scope.hasGit) {
@@ -1171,25 +1185,386 @@ export async function waitRebuildSettled(opts: {
 /** grep-family commands a bash tool call can smuggle past the native-tool guards. */
 const BASH_GREP_WORDS = new Set(["grep", "egrep", "fgrep", "zgrep", "rg"])
 
+/** Words between a separator and the real command (`do grep ...`, `! grep ...`). */
+const SHELL_PREFIX_WORDS = new Set(["do", "then", "else", "elif", "if", "while", "until", "!", "{", "}", "time"])
+
+/** Commands that run another command, so the wrapped word is the real command. */
+const SHELL_WRAPPERS = new Set(["sudo", "doas", "env", "nohup", "nice", "command", "exec", "busybox", "stdbuf"])
+
+/** Long grep options that take a value (`--include=X` or `--include X`). */
+const GREP_LONG_VALUE_OPTS = new Set([
+  "include", "exclude", "exclude-dir", "exclude-from", "regexp", "file", "label", "color", "colour",
+  "binary-files", "directories", "devices", "max-count", "after-context", "before-context", "context",
+  "group-separator", "type", "glob", "sort", "threads", "encoding", "engine", "pre", "pre-glob",
+  "field-separator",
+])
+
+/** Short grep options that take a value (`-A3`, `-e PATTERN`, `-f FILE`). */
+const GREP_SHORT_VALUE_OPTS = new Set(["e", "f", "m", "A", "B", "C", "d", "D", "t", "T", "j", "g"])
+
 function bashToolCommand(event: Loose): string {
   const input = isPlainObject(event?.input) ? event.input : undefined
   return typeof input?.command === "string" ? input.command : ""
 }
 
 /**
- * True when the command line invokes grep/egrep/fgrep/zgrep/rg. Quoted strings
- * are stripped first, so `echo "grep is slow"` is not an invocation; tokens are
- * compared whole (with `.exe` and path prefixes removed), so `progress` or
- * `rgx` never match.
+ * Working directory a bash tool call runs in. Hosts that expose a per-call
+ * `workdir`/`cwd` win; otherwise the command runs in the session directory.
  */
-export function bashCommandGrep(command: string): boolean {
-  const bare = String(command ?? "").replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, " ")
-  for (const raw of bare.split(/[\s;&|()`]+/)) {
-    if (!raw) continue
-    const word = raw.replace(/\.exe$/i, "").split(/[\\/]/).pop() ?? ""
-    if (BASH_GREP_WORDS.has(word.toLowerCase())) return true
+function bashToolWorkdir(event: Loose): string {
+  const input = isPlainObject(event?.input) ? event.input : undefined
+  for (const key of ["workdir", "cwd"]) {
+    const value = input?.[key]
+    if (typeof value === "string" && value.trim()) return value.trim()
   }
-  return false
+  return ""
+}
+
+/** Last path component, with a trailing `.exe` removed (Windows shells). */
+function commandWord(raw: string): string {
+  return (raw.replace(/\.exe$/i, "").split(/[\\/]/).pop() ?? "").toLowerCase()
+}
+
+interface ShellSegment {
+  words: string[]
+  /** Reads its stdin from the previous pipeline segment. */
+  piped: boolean
+}
+
+/**
+ * Split a shell command line into pipeline segments, one word list each.
+ *
+ * Quotes are resolved but preserved as single words, so argument POSITIONS
+ * survive: in `grep -n "image:" file` the pattern stays a distinct word and
+ * `file` is correctly the only path operand. Substitutions (`$(...)` and
+ * backticks) are extracted into `substitutions` and parsed as their own
+ * command lists by the caller.
+ */
+export function tokenizeShellCommand(command: string, substitutions: string[]): ShellSegment[] {
+  const text = String(command ?? "")
+  const segments: ShellSegment[] = []
+  let words: string[] = []
+  let word = ""
+  let inWord = false
+  let pendingPipe = false
+  let skipNextWord = false
+  let readsStdin = false
+  let quote: '"' | "'" | "" = ""
+
+  const pushWord = (): void => {
+    if (!inWord) return
+    if (skipNextWord) {
+      // The word is a redirection target (`> out.txt`), not an argument.
+      skipNextWord = false
+      word = ""
+      inWord = false
+      return
+    }
+    words.push(word)
+    word = ""
+    inWord = false
+  }
+  const endSegment = (pipeNext: boolean): void => {
+    pushWord()
+    if (words.length) segments.push({ words, piped: pendingPipe || readsStdin })
+    words = []
+    pendingPipe = pipeNext
+    readsStdin = false
+  }
+  /** End of a quoted or balanced substitution body starting at `from`. */
+  const scanBalanced = (from: number, open: string, close: string): number => {
+    let depth = 1
+    let q: '"' | "'" | "" = ""
+    for (let k = from; k < text.length; k++) {
+      const ch = text[k]
+      if (q) {
+        if (ch === "\\" && q === '"') k++
+        else if (ch === q) q = ""
+        continue
+      }
+      if (ch === "'" || ch === '"') q = ch
+      else if (ch === "\\") k++
+      else if (ch === open) depth++
+      else if (ch === close && --depth === 0) return k
+    }
+    return text.length
+  }
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (quote) {
+      // Command substitution is recognised INSIDE double quotes too
+      // (`echo "$(grep -rn foo src/)"`), and inside backticks.
+      if (quote === '"' && ch === "$" && text[i + 1] === "(") {
+        const end = scanBalanced(i + 2, "(", ")")
+        substitutions.push(text.slice(i + 2, end))
+        i = end
+        continue
+      }
+      if (quote === '"' && ch === "`") {
+        const end = text.indexOf("`", i + 1)
+        const stop = end < 0 ? text.length : end
+        substitutions.push(text.slice(i + 1, stop))
+        i = stop
+        continue
+      }
+      if (ch === "\\" && quote === '"' && i + 1 < text.length) {
+        word += text[++i]
+        inWord = true
+      } else if (ch === quote) {
+        quote = ""
+      } else {
+        word += ch
+        inWord = true
+      }
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      inWord = true // an empty quoted string is still an argument position
+      continue
+    }
+    if (ch === "\\" && i + 1 < text.length) {
+      word += text[++i]
+      inWord = true
+      continue
+    }
+    if (ch === "`") {
+      const end = text.indexOf("`", i + 1)
+      const stop = end < 0 ? text.length : end
+      substitutions.push(text.slice(i + 1, stop))
+      endSegment(false)
+      i = stop
+      continue
+    }
+    if (ch === "$" && text[i + 1] === "(") {
+      const end = scanBalanced(i + 2, "(", ")")
+      substitutions.push(text.slice(i + 2, end))
+      endSegment(false)
+      i = end
+      continue
+    }
+    if (ch === "|") {
+      // `||` is a command separator, not a pipe.
+      endSegment(text[i + 1] !== "|")
+      if (text[i + 1] === "|") i++
+      continue
+    }
+    if (ch === ">" || ch === "<") {
+      // Redirection, not an argument: `2>/dev/null`, `> out.txt`, `2>&1`,
+      // `>>/tmp/log`, `< input`. The operator and its target are dropped, so
+      // they can never be mistaken for grep's path operand (reported:
+      // `.../druid/2>/dev/null` resolved as a project target).
+      if (inWord && /^[0-9]+$/.test(word)) {
+        word = "" // file-descriptor prefix (`2>`)
+        inWord = false
+      }
+      pushWord()
+      i++
+      while (i < text.length && (text[i] === ">" || text[i] === "<")) i++
+      if (text[i] === "&") {
+        // fd duplication (`2>&1`, `>&2`): no file target follows.
+        i++
+        while (i < text.length && /[0-9-]/.test(text[i])) i++
+      } else {
+        // `< file` makes grep read a STREAM, exactly like `cat file | grep`:
+        // nothing on disk is a code-search target.
+        if (ch === "<") readsStdin = true
+        skipNextWord = true
+      }
+      i-- // the for-loop increment lands on the character after the operator
+      continue
+    }
+    if (ch === ";" || ch === "&" || ch === "\n" || ch === "(" || ch === ")") {
+      endSegment(false)
+      continue
+    }
+    if (/\s/.test(ch)) {
+      pushWord()
+      continue
+    }
+    word += ch
+    inWord = true
+  }
+  endSegment(false)
+  return segments
+}
+
+/** Index of the command word in a segment, skipping shell prefixes/wrappers. */
+function shellCommandIndex(words: string[]): number {
+  let i = 0
+  while (i < words.length) {
+    const word = words[i]
+    if (SHELL_PREFIX_WORDS.has(word)) {
+      i++
+      continue
+    }
+    const cmd = commandWord(word)
+    if (SHELL_WRAPPERS.has(cmd)) {
+      i++
+      // Wrapper arguments: `-u user`, `-n 5`, `VAR=value`.
+      while (i < words.length && (/^-/.test(words[i]) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]))) i++
+      continue
+    }
+    if (cmd === "timeout" || cmd === "time") {
+      i++
+      while (i < words.length && (/^-/.test(words[i]) || /^\d+(\.\d+)?[smhd]?$/.test(words[i]))) i++
+      continue
+    }
+    break
+  }
+  return i < words.length ? i : -1
+}
+
+/**
+ * Absolute paths a shell command will grep FILES under, resolved against the
+ * command's working directory (`cd X && ...` adjusts it).
+ *
+ * Deliberately empty for a pure stream filter (`git log | grep -i fix`,
+ * `find . | grep -v '^./.git/'`): the guard exists to reroute code search, and
+ * reading a pipe is not that workload. Anything that reads files — a path
+ * operand, `-r`/`-R`, grep behind `xargs`, or grep with no stdin and no
+ * operand — contributes its targets, and the caller decides whether those
+ * targets are inside a covered index.
+ */
+export function shellGrepTargets(command: string, baseDir: string): string[] {
+  const targets: string[] = []
+  const pending: Array<{ text: string; base: string }> = [{ text: String(command ?? ""), base: baseDir }]
+  let guard = 0
+  while (pending.length && guard++ < 32) {
+    const current = pending.shift()!
+    const substitutions: string[] = []
+    const segments = tokenizeShellCommand(current.text, substitutions)
+    for (const sub of substitutions) pending.push({ text: sub, base: current.base })
+    let base = current.base
+    for (const segment of segments) {
+      const start = shellCommandIndex(segment.words)
+      if (start < 0) continue
+      const cmd = commandWord(segment.words[start])
+      if (cmd === "cd") {
+        const dest = segment.words[start + 1]
+        if (dest && dest !== "-") base = resolveShellPath(dest, base)
+        continue
+      }
+      let index = -1
+      let viaXargs = false
+      if (BASH_GREP_WORDS.has(cmd)) {
+        index = start
+      } else if (cmd === "xargs") {
+        const rest = segment.words.slice(start + 1)
+        const at = rest.findIndex((w) => BASH_GREP_WORDS.has(commandWord(w)))
+        if (at >= 0) {
+          index = start + 1 + at
+          viaXargs = true // stdin becomes file arguments: it is not a filter
+        }
+      } else if (cmd === "git") {
+        // `git [-C dir] grep ...` — git grep always reads the work tree.
+        const rest = segment.words.slice(start + 1)
+        const at = rest.findIndex((w) => commandWord(w) === "grep")
+        if (at >= 0) index = start + 1 + at
+      }
+      if (index < 0) continue
+      const parsed = parseGrepArgs(segment.words.slice(index + 1))
+      if (parsed.operands.length) {
+        for (const operand of parsed.operands) targets.push(resolveShellPath(operand, base))
+      } else if (!segment.piped || viaXargs) {
+        // No operand and no stream: a recursive grep walks the base dir, a
+        // bare `grep PATTERN` would read stdin, and `xargs` supplies the file
+        // list. A grep that reads a pipe or a `< file` reads no repo files.
+        // Resolve like an operand so the printed target keeps its case.
+        if (base) targets.push(resolveShellPath(".", base))
+      }
+      // Otherwise: a stream filter. Nothing on disk is read.
+    }
+  }
+  return targets
+}
+
+/** Split grep arguments into the recursive flag and the path operands. */
+function parseGrepArgs(args: string[]): { recursive: boolean; operands: string[] } {
+  const operands: string[] = []
+  let recursive = false
+  let patternSeen = false
+  let endOfOptions = false
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (endOfOptions) {
+      if (!patternSeen) patternSeen = true
+      else operands.push(arg)
+      continue
+    }
+    if (arg === "--") {
+      endOfOptions = true
+      continue
+    }
+    if (arg.startsWith("--")) {
+      const eq = arg.indexOf("=")
+      const name = eq >= 0 ? arg.slice(2, eq) : arg.slice(2)
+      if (name === "recursive" || name === "dereference-recursive") recursive = true
+      if (GREP_LONG_VALUE_OPTS.has(name)) {
+        if (name === "regexp" || name === "file") patternSeen = true
+        if (eq < 0) i++ // consume the separate value token
+      }
+      continue
+    }
+    if (arg.length > 1 && arg[0] === "-") {
+      for (let k = 1; k < arg.length; k++) {
+        const flag = arg[k]
+        // `-rg` / `-rn` bundles are boolean; a value option ends the cluster.
+        if (flag === "r" || flag === "R") recursive = true
+        if (GREP_SHORT_VALUE_OPTS.has(flag)) {
+          if (flag === "e" || flag === "f") patternSeen = true
+          if (k === arg.length - 1) i++ // value is the next token
+          break
+        }
+      }
+      continue
+    }
+    if (!patternSeen) patternSeen = true
+    else operands.push(arg)
+  }
+  return { recursive, operands }
+}
+
+/**
+ * Resolve a shell operand to an absolute, lexically normalized path.
+ *
+ * Case is preserved: `normalizePath` lowercases on win32 for comparisons, but
+ * these targets are shown to the user and unit-asserted verbatim, so coverage
+ * matching normalizes both sides again instead.
+ */
+function resolveShellPath(operand: string, baseDir: string): string {
+  let value = operand.trim().replace(/^\\\\\?\\/, "")
+  if (!value) return ""
+  if (value === "~" || value.startsWith("~/")) {
+    value = `${process.env.HOME ?? process.env.USERPROFILE ?? ""}${value.slice(1)}`
+  }
+  // Windows mount forms name the same files as `C:/...`: Git Bash writes
+  // `/c/dir`, and WSL-style literals reach a Windows shell as `/mnt/c/dir`.
+  // Left POSIX-absolute they never match a drive-letter registry root, which
+  // is a fail-open hole in `guards.mode: "block"`. Only on win32 — on a POSIX
+  // host both are real absolute paths that the registry also stores as such.
+  if (process.platform === "win32") {
+    const mount = /^\/mnt\/([A-Za-z])(\/|$)/.exec(value) ?? /^\/([A-Za-z])(\/|$)/.exec(value)
+    if (mount) value = `${mount[1].toUpperCase()}:/${value.slice(mount[0].length)}`
+  }
+  const absolute = /^([A-Za-z]:[\\/]|[\\/])/.test(value)
+  const joined = absolute ? value : `${baseDir}/${value}`
+  const drive = /^([A-Za-z]:)[\\/]/.exec(joined)?.[1] ?? ""
+  const unc = !drive && /^[\\/]{2}/.test(joined)
+  const rest = drive ? joined.slice(2) : joined
+  const out: string[] = []
+  for (const part of rest.split(/[\\/]+/)) {
+    if (!part || part === ".") continue
+    if (part === "..") {
+      out.pop()
+      continue
+    }
+    out.push(part)
+  }
+  const root = drive ? `${drive}/` : unc ? "//" : "/"
+  const tail = out.join("/")
+  return tail ? `${root}${tail}` : root
 }
 
 function resultOfToolEvent(event: Loose): { output?: string; metadata?: Loose } {
@@ -1334,9 +1709,24 @@ export default {
       return value
     }
 
-    /** Repo alias coverage: for guards and rescue. Uses the plugin's location. */
-    function coveredAlias(): string | undefined {
-      return resolveScope().project
+    /** Repo alias covering `path`, from repos.json then the live status snapshot. */
+    function projectForPath(path: string): { alias: string; path: string } | undefined {
+      const target = normalizePath(path)
+      if (!target) return undefined
+      const fromRegistry = registry.projectFor(target)
+      if (fromRegistry) return fromRegistry
+      return status.isFresh ? status.projectFor(target) : undefined
+    }
+
+    /**
+     * Repo alias a native grep/glob call targets: its own `path` input when
+     * given (a Grep aimed into another indexed repo), else the session dir.
+     */
+    function projectForTool(event: Loose): { alias: string; path: string } | undefined {
+      const input = isPlainObject(event?.input) ? event.input : undefined
+      const target = typeof input?.path === "string" ? input.path.trim() : ""
+      if (target) return projectForPath(resolveShellPath(target, directory))
+      return projectForPath(directory)
     }
 
     /* ---------------- health + status refresh ---------------- */
@@ -1368,11 +1758,10 @@ export default {
 
     // A rebuild keeps /healthz green while codesearch queries time out, so
     // whether to wait is decided here, never by the model.
-    async function guardRebuildSettled(): Promise<boolean> {
-      const scope = resolveScope()
+    async function guardRebuildSettled(target?: string): Promise<boolean> {
       const settled = await waitRebuildSettled({
         base: url.replace(/\/mcp\/?$/i, ""),
-        target: scope.projectPath || scope.directory,
+        target: target || resolveScope().projectPath || resolveScope().directory,
         waitMs: settings.guards.rebuildWaitMs,
         token,
       })
@@ -1583,15 +1972,15 @@ export default {
 
     /* ---------------- tool hooks (guards, rescue, nudge) ---------------- */
 
-    function blockMessage(tool: string, scope: ScopeInfo, astGrep: string[] = []): string {
+    function blockMessage(tool: string, alias: string, projectPath: string, astGrep: string[] = []): string {
       const lines = [
-        `codesearch: ${tool} is disabled here — this repository is indexed as project "${scope.project}".`,
+        `codesearch: ${tool} is disabled here — the target is inside the indexed project "${alias}"${projectPath ? ` (${projectPath})` : ""}.`,
         `Use the codesearch MCP tools instead:`,
-        `  - search { project: "${scope.project}", query: "<concept>" }   (add mode: "literal", regex: true for exact syntax)`,
-        `  - find { project: "${scope.project}", symbol: "<name>", kind: "definition" | "usages" | "imports" | "dependents" }`,
-        `  - find_impact { project: "${scope.project}", symbol_name: "<name>" }  (C#/TypeScript call sites)`,
-        `  - explore { project: "${scope.project}", target: "<file>", kind: "outline" }`,
-        `  - get_chunk { project: "${scope.project}", chunk_id: <id> }`,
+        `  - search { project: "${alias}", query: "<concept>" }   (add mode: "literal", regex: true for exact syntax)`,
+        `  - find { project: "${alias}", symbol: "<name>", kind: "definition" | "usages" | "imports" | "dependents" }`,
+        `  - find_impact { project: "${alias}", symbol_name: "<name>" }  (C#/TypeScript call sites)`,
+        `  - explore { project: "${alias}", target: "<file>", kind: "outline" }`,
+        `  - get_chunk { project: "${alias}", chunk_id: <id> }`,
       ]
       if (astGrep.length > 0) {
         lines.push(`  - ${astGrep.join(" / ")} for syntax-shaped queries and multi-file rewrites (structure, not text)`)
@@ -1602,16 +1991,46 @@ export default {
       return lines.join("\n")
     }
 
-    function bashBlockMessage(scope: ScopeInfo, command: string): string {
+    interface CoveredTarget {
+      target: string
+      alias: string
+      projectPath: string
+    }
+
+    function bashBlockMessage(command: string, covered: CoveredTarget[]): string {
+      const shown = covered.slice(0, 3)
+      const targetLines = shown.map((c) => `  - ${c.target} → project "${c.alias}"${c.projectPath ? ` (${c.projectPath})` : ""}`)
+      if (covered.length > shown.length) targetLines.push(`  - … ${covered.length - shown.length} more`)
+      const alias = shown[0].alias
       return (
-        `codesearch: shell grep is blocked here — this repository is indexed as project "${scope.project}".\n` +
+        `codesearch: shell grep is blocked — the command searches files inside an indexed project.\n` +
+        `Target(s) resolved from the command's working directory, not the session directory:\n` +
+        `${targetLines.join("\n")}\n` +
         `Raw grep through the shell tool bypasses the grep/glob guards. Command: ${truncate(command.trim(), 120)}\n` +
         `Use the codesearch MCP tools instead:\n` +
-        `  - search { project: "${scope.project}", query: "<concept>" }   (add mode: "literal", regex: true for exact syntax)\n` +
-        `  - find { project: "${scope.project}", symbol: "<name>", kind: "definition" | "usages" | "imports" | "dependents" }\n` +
-        `  - get_chunk { project: "${scope.project}", chunk_id: <id> }\n` +
+        `  - search { project: "${alias}", query: "<concept>" }   (add mode: "literal", regex: true for exact syntax)\n` +
+        `  - find { project: "${alias}", symbol: "<name>", kind: "definition" | "usages" | "imports" | "dependents" }\n` +
+        `  - get_chunk { project: "${alias}", chunk_id: <id> }\n` +
+        `Stream filters (git log | grep -i fix) and greps outside every indexed project are not blocked.\n` +
         `If codesearch is genuinely unavailable, set "guards": { "bash": false } in ~/.config/opencode/codesearch.json (or CODESEARCH_PLUGIN_BASH_GUARD=0) and retry.`
       )
+    }
+
+    /**
+     * Map shell-grep targets to the registered repos that cover them. Empty
+     * when no target is inside an index, which is the "grep is right here"
+     * case: another repo, /tmp, or a pure stream filter.
+     */
+    function coveredGrepTargets(command: string, workdir: string): CoveredTarget[] {
+      const seen = new Set<string>()
+      const covered: CoveredTarget[] = []
+      for (const target of shellGrepTargets(command, workdir)) {
+        if (!target || seen.has(target)) continue
+        seen.add(target)
+        const repo = projectForPath(target)
+        if (repo) covered.push({ target, alias: repo.alias, projectPath: repo.path })
+      }
+      return covered
     }
 
     async function onToolBefore(event: Loose): Promise<void> {
@@ -1620,25 +2039,35 @@ export default {
         if (settings.guards.mode === "off") return
         const tool = String(event?.tool ?? "").toLowerCase()
         if (tool === "bash" || tool === "shell") {
-          // Shell grep is the escape hatch around the native grep/glob guards:
-          // denied in every mode except "off", because a shell grep is exactly
-          // the workaround the guards exist to stop. Kill switch: guards.bash=false.
+          // Shell grep is the escape hatch around the native grep/glob guards.
+          // In `nudge` (the default) it runs and the after-hook appends the
+          // one-time tip: the goal is "try codesearch first", not "block grep".
+          // `prune` and `block` still deny it, because allowing the shell
+          // bypass there would make hiding the native tools pointless.
+          // Kill switch: guards.bash=false.
           if (!settings.guards.bash) return
           const command = bashToolCommand(event)
-          if (!bashCommandGrep(command)) return
-          if (!coveredAlias()) return
+          if (!command) return
+          // Scope follows the COMMAND, not the session: a grep in /tmp or in a
+          // sibling repo must not be denied because the session happens to sit
+          // in an indexed one. This was the reported misfire (kcharts session,
+          // /tmp target, audits target) — see CHANGELOG.
+          const workdir = bashToolWorkdir(event) || directory
+          const covered = coveredGrepTargets(command, workdir)
+          if (!covered.length) return
+          if (settings.guards.mode === "nudge") return
           if (health.state !== "ok") return // fail open unless the hub is confirmed up
-          if (!(await guardRebuildSettled())) return // still rebuilding at the cap: grep is all you have
-          blocked = new Error(bashBlockMessage(resolveScope(), command))
+          if (!(await guardRebuildSettled(covered[0].target))) return // still rebuilding at the cap: grep is all you have
+          blocked = new Error(bashBlockMessage(command, covered))
         } else {
           if (settings.guards.mode !== "block") return
           if (!settings.guards.tools.includes(tool)) return
-          const alias = coveredAlias()
-          if (!alias) return
+          const repo = projectForTool(event)
+          if (!repo) return
           if (health.state !== "ok") return // fail open unless the hub is confirmed up
-          if (!(await guardRebuildSettled())) return // still rebuilding at the cap: grep is all you have
+          if (!(await guardRebuildSettled(repo.path))) return // still rebuilding at the cap: grep is all you have
           const astGrep = astGrepBySession.get(String(event?.sessionID ?? "")) ?? []
-          blocked = new Error(blockMessage(tool, resolveScope(), astGrep))
+          blocked = new Error(blockMessage(tool, repo.alias, repo.path, astGrep))
         }
       } catch (err) {
         if (settings.debug) warn(`execute.before error: ${err instanceof Error ? err.message : err}`)
@@ -1674,15 +2103,17 @@ export default {
     function maybeNudgeBashGrep(event: Loose, result: Loose): void {
       if (settings.guards.mode === "off") return
       if (!settings.guards.bash) return
-      if (!bashCommandGrep(bashToolCommand(event))) return
-      const scope = resolveScope()
-      if (!scope.project) return
+      if (health.state === "down") return // "grep is an acceptable fallback" while the hub is down
+      const command = bashToolCommand(event)
+      if (!command) return
+      const covered = coveredGrepTargets(command, bashToolWorkdir(event) || directory)
+      if (!covered.length) return
       const sessionID = String(event?.sessionID ?? "unknown")
       if (!markSeen(nudged, sessionID)) return
       const existing = typeof result.output === "string" ? result.output : ""
       result.output =
         existing +
-        `\n[codesearch] tip: raw shell grep bypasses the codesearch guards — this repository is indexed as project "${scope.project}". ` +
+        `\n[codesearch] tip: raw shell grep bypasses the codesearch guards — ${covered[0].target} is indexed as project "${covered[0].alias}". ` +
         `Prefer search (mode: "literal" for exact syntax) or find/get_chunk.`
       logGuard(`nudged session ${sessionID} after shell grep (bash tool)`)
     }

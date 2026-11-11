@@ -153,6 +153,45 @@ case_grep_guard_smoke() {
     fi
 }
 
+case_grep_targets() { # $1 = label, $2 = command, $3 = expected (newline-joined)
+    local out
+    out="$(cd "$TMP_ROOT" && command_grep_targets "$2")"
+    if [ "$out" = "$3" ]; then
+        ok "$1"
+    else
+        bad "$1 — expected: [$3] got: [$out]"
+    fi
+}
+
+case_bash_grep_targets() {
+    # The target is the command's own operand, never the session cwd: this is
+    # the kcharts/druid misfire (session in an indexed repo, grep in /tmp or
+    # in a sibling repo). `~` and absolute paths pass through; relative
+    # operands resolve against the shell cwd or a leading `cd`.
+    case_grep_targets "bash grep: relative operand resolves against the cwd" \
+        'grep -rn image src/' "$TMP_ROOT/src"
+    case_grep_targets "bash grep: absolute operand is kept" \
+        'grep -rn image /tmp/elsewhere/docs' "/tmp/elsewhere/docs"
+    case_grep_targets "bash grep: cd prefix moves the base" \
+        'cd /tmp/elsewhere && grep -n kafka docs.md' "/tmp/elsewhere/docs.md"
+    case_grep_targets "bash grep: operand in a second pipeline segment" \
+        'wc -l a && grep -rn "is_(None)" audits/' "$TMP_ROOT/audits"
+    case_grep_targets "bash grep: pure stream filter has no file target" \
+        "find . -type f | grep -v '^./.git/' | sort" ""
+    case_grep_targets "bash grep: quoted pattern is not a path" \
+        'grep -rn "one/two" .' "$TMP_ROOT"
+    case_grep_targets "bash grep: glob operand still names a path" \
+        'grep -rn TODO src/*.rs' "$TMP_ROOT/src/*.rs"
+    case_grep_targets "bash grep: redirect target is not an operand" \
+        'grep -l "apache/druid" infra/superset/* 2>/dev/null' "$TMP_ROOT/infra/superset/*"
+    case_grep_targets "bash grep: output redirect and fd dup are dropped" \
+        'grep -rn TODO . > out.txt 2>&1' "$TMP_ROOT"
+    case_grep_targets "bash grep: input redirect is not an operand" \
+        'grep -n TODO < /tmp/input.txt' ""
+    case_grep_targets "bash grep: no operand at all is the cwd repo's job" \
+        'grep -rn image --include=*.yaml' ""
+}
+
 case_covered_via_codesearch_home() {
     # Relocation pin: with REPOS_CONFIG unset, guards must resolve repos.json
     # from $CODESEARCH_HOME (mirrors constants.rs codesearch_home()) — and
@@ -181,6 +220,7 @@ case_multiedit_partial_marks_denied
 case_find_usages_marker_allows
 case_window_expiry_denies_again
 case_grep_guard_smoke
+case_bash_grep_targets
 case_covered_via_codesearch_home
 
 echo

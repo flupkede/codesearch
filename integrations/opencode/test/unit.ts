@@ -12,7 +12,7 @@
 import assert from "node:assert/strict"
 import http from "node:http"
 import type { AddressInfo } from "node:net"
-import { astGrepToolNames, bashCommandGrep, HealthRunner, stripJsonc, waitRebuildSettled } from "../codesearch.ts"
+import { astGrepToolNames, HealthRunner, shellGrepTargets, stripJsonc, waitRebuildSettled } from "../codesearch.ts"
 
 type Loose = Record<string, any>
 
@@ -238,24 +238,96 @@ async function testHealthRunner(): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ *
- * bashCommandGrep — the shell-tool escape hatch detector
+ * shellGrepTargets — which files a shell grep will read, if any
  * ------------------------------------------------------------------ */
 
-function testBashCommandGrep(): void {
-  assert.equal(bashCommandGrep('grep -rn "new Uri" --include="*.cs" .'), true, "plain grep")
-  assert.equal(bashCommandGrep("rg pattern src/"), true, "ripgrep")
-  assert.equal(bashCommandGrep("egrep -i foo bar.txt"), true, "egrep")
-  assert.equal(bashCommandGrep("cat f | grep -i bar"), true, "piped grep")
-  assert.equal(bashCommandGrep("git grep -n TODO"), true, "git grep")
-  assert.equal(bashCommandGrep("/usr/bin/grep -i x file"), true, "absolute-path grep")
-  assert.equal(bashCommandGrep("C:/tools/grep.exe -i x"), true, "windows grep.exe")
-  assert.equal(bashCommandGrep("timeout 5 grep -r x ."), true, "grep behind another command")
-  assert.equal(bashCommandGrep("echo `grep -rn foo src/`"), true, "backtick substitution is an invocation")
-  assert.equal(bashCommandGrep('echo "grep is slow, use codesearch"'), false, "grep mentioned in quotes is not an invocation")
-  assert.equal(bashCommandGrep("cargo build --release"), false, "unrelated command")
-  assert.equal(bashCommandGrep("progress --all"), false, "word boundary: progress is not grep")
-  assert.equal(bashCommandGrep("rgx = /ab/"), false, "word boundary: rgx is not rg")
-  assert.equal(bashCommandGrep(""), false, "empty command")
+function testShellGrepTargets(): void {
+  const cases: Array<[string, string[]]> = [
+    // A real code search over the working directory.
+    ['grep -rn "new Uri" --include="*.cs" .', ["/repo"]],
+    ["rg pattern src/", ["/repo/src"]],
+    ["egrep -i foo bar.txt", ["/repo/bar.txt"]],
+    ["git grep -n TODO", ["/repo"]],
+    ["/usr/bin/grep -i x file", ["/repo/file"]],
+    ["timeout 5 grep -r x .", ["/repo"]],
+    ["sudo grep -rn x .", ["/repo"]],
+    ["env FOO=1 grep -n x f", ["/repo/f"]],
+    ["grep --include=*.yaml -rn image", ["/repo"]],
+    ["grep -e foo -e bar src/", ["/repo/src"]],
+    ["grep -f patterns.txt src/", ["/repo/src"]],
+    ["grep -rn \"two words\" src/", ["/repo/src"]],
+    ["grep -r foo ../other/src", ["/other/src"]],
+    ["git -C sub grep todo", ["/repo"]],
+    ["grep -n x C:/other/f.cs", ["C:/other/f.cs"]],
+    ["for k in a b; do grep -n \"$k\" docs.md; done", ["/repo/docs.md"]],
+    ["wc -l a && grep -rn \"is_(None)\" audits/", ["/repo/audits"]],
+    ["cd /tmp/x && grep -n kafka docs.md", ["/tmp/x/docs.md"]],
+    // Redirections are not path operands: `2>/dev/null` used to be resolved
+    // as a target and blamed on a project that had nothing to do with it.
+    ['grep -l "apache/druid" /repo/superset/* 2>/dev/null', ["/repo/superset/*"]],
+    ["grep -rn x . > out.txt", ["/repo"]],
+    ["grep -rn x . >>/tmp/log 2>&1", ["/repo"]],
+    ["grep -rn x < /tmp/input.txt", []], // input redirect = a stream, like a pipe
+    ["grep -rn x . 2>&1 | head -3", ["/repo"]],
+    ["echo `grep -rn foo src/`", ["/repo/src"]],
+    ["echo $(grep -rn foo src/)", ["/repo/src"]],
+    ['echo "$(grep -rn foo src/)"', ["/repo/src"]],
+    // grep behind xargs: stdin becomes file arguments, so this DOES read files.
+    ["find . -name '*.cs' | xargs grep -n foo", ["/repo"]],
+    // A bare grep with no operand reads stdin, but the intent is the base dir.
+    ["grep -v x", ["/repo"]],
+    // Pure stream filters: nothing on disk is read, so nothing is a target.
+    ["cat f | grep -i bar", []],
+    ["find . -type f | grep -v '^./.git/' | sort", []],
+    ["git log --oneline | grep -i fix", []],
+    ["echo hi | grep -q x && true", []],
+    // Not grep invocations at all.
+    ['echo "grep is slow, use codesearch"', []],
+    ["cargo build --release", []],
+    ["progress --all", []],
+    ["rgx = /ab/", []],
+    ["", []],
+  ]
+  for (const [command, expected] of cases) {
+    assert.deepEqual(shellGrepTargets(command, "/repo"), expected, `targets for: ${command}`)
+  }
+  // Only `win32` treats mount forms as drives; on a POSIX host both are real
+  // absolute paths the registry also stores as such.
+  if (process.platform !== "win32") {
+    assert.deepEqual(shellGrepTargets("grep -rn x /c/WorkArea/app/src", "/repo"), ["/c/WorkArea/app/src"])
+    assert.deepEqual(shellGrepTargets("grep -rn x /mnt/c/WorkArea/app", "/repo"), ["/mnt/c/WorkArea/app"])
+  }
+  assert.deepEqual(shellGrepTargets("grep -rn x", ""), [], "no working directory means no base target")
+}
+
+/** The win32-only resolution rules, exercised on any host by pinning the
+ * platform: case-preserving targets (review finding 1) and Git Bash / WSL
+ * mount forms resolving to the drive they name (finding 2). */
+function testShellGrepTargetsWin32(): void {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true })
+  try {
+    const cases: Array<[string, string, string[]]> = [
+      // Targets keep their case; they are shown to the user and asserted here.
+      ["grep -n x C:/other/f.cs", "C:/WorkArea/app", ["C:/other/f.cs"]],
+      ["grep -rn TODO src/", "C:/WorkArea/App", ["C:/WorkArea/App/src"]],
+      // No operand: the printed target is the base, also case-intact.
+      ["grep -rn TODO", "C:/WorkArea/App", ["C:/WorkArea/App"]],
+      // Git Bash mount form.
+      ["grep -rn x /c/WorkArea/app/src", "C:/WorkArea/app", ["C:/WorkArea/app/src"]],
+      // The Windows extended-length prefix is stripped before resolution.
+      ["grep -rn x '\\\\?\\C:/WorkArea/app'", "C:/WorkArea/app", ["C:/WorkArea/app"]],
+      // WSL-style literal reaching a Windows shell.
+      ["grep -rn x /mnt/d/WorkArea/app", "C:/WorkArea/app", ["D:/WorkArea/app"]],
+      // A `cd` into a mount form moves the base the same way.
+      ["cd /c/WorkArea/app && grep -n kafka docs.md", "C:/elsewhere", ["C:/WorkArea/app/docs.md"]],
+    ]
+    for (const [command, base, expected] of cases) {
+      assert.deepEqual(shellGrepTargets(command, base), expected, `win32 targets for: ${command}`)
+    }
+  } finally {
+    if (original) Object.defineProperty(process, "platform", original)
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -337,7 +409,8 @@ async function testWaitRebuildSettled(): Promise<void> {
 async function main(): Promise<void> {
   testStripJsonc()
   testAstGrepToolNames()
-  testBashCommandGrep()
+  testShellGrepTargets()
+  testShellGrepTargetsWin32()
   await testWaitRebuildSettled()
   await testHealthRunner()
   console.log("unit: OK")

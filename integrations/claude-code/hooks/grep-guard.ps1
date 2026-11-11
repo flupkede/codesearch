@@ -66,12 +66,25 @@ $inp  = $data.tool_input
 
 # Bash escape hatch: a Bash tool command invoking the grep family is guarded
 # exactly like the Grep tool — the shell tool is otherwise a clean way around
-# the Grep denial. A shell grep has no path parameter; it runs in the session
-# cwd, so the target repo resolves as for an empty/relative path (cwd repo).
+# the Grep denial. A shell grep has no `path` parameter, so coverage follows
+# the command's OWN operands (Get-GrepTargetPaths). With no operand at all,
+# grep walks the cwd, and the cwd repo is the target (same as before).
 $path = ''
+$targetRoot = ''
 if ($tool -eq 'Bash') {
     $cmd = if ($null -ne $inp -and @($inp.PSObject.Properties.Name) -contains 'command') { [string]$inp.command } else { '' }
     if (-not (Test-GrepFamilyCommand $cmd)) { exit 0 }
+    $targets = @(Get-GrepTargetPaths $cmd)
+    if ($targets.Count -gt 0) {
+        foreach ($candidate in $targets) {
+            $root = Resolve-TargetGitRoot $candidate
+            if ($root -and (Test-CodesearchTargetRegistered $root)) { $targetRoot = $root; break }
+        }
+        # Every operand is outside every indexed repo: not an indexed search.
+        if (-not $targetRoot) { exit 0 }
+    } else {
+        $targetRoot = Resolve-TargetGitRoot ''
+    }
 } elseif ($tool -ne 'Grep') {
     exit 0
 } else {
@@ -88,7 +101,7 @@ if ($tool -eq 'Bash') {
 # relative -> the cwd repo) lives in codesearch-common.ps1 and is shared
 # with edit-guard. History (#54, #199): see codesearch-common.sh.
 # ------------------------------------------------------------------
-$targetRoot = Resolve-TargetGitRoot $path
+if ($tool -ne 'Bash') { $targetRoot = Resolve-TargetGitRoot $path }
 
 # Not inside any git repo (or git unusable) -> external target: grep is right.
 if (-not $targetRoot) { exit 0 }

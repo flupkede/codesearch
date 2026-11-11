@@ -41,6 +41,95 @@ command_grep_family() {
     return 1
 }
 
+# Absolute paths a Bash grep will read files from, one per line. Empty when
+# the command has no path operand at all (grep then walks the Bash tool's cwd).
+#
+# Why this exists: the Bash tool has no `path` parameter, so the guard used to
+# resolve coverage from the SESSION cwd. A grep aimed at /tmp or at a sibling
+# repo was then denied and blamed on the session's project (reported: a
+# kcharts session grepping /tmp docs and platform/audits). The Bash tool does
+# have a per-call cwd, and `cd X && grep ...` moves the operands with it, so
+# resolve the operands instead: a grep whose operands are all outside every
+# indexed repo is legitimate and must not be denied.
+#
+# Quoted spans are stripped first, exactly like command_grep_family, so a
+# pattern such as "^./.git/" is never mistaken for a path operand.
+command_grep_targets() {
+    local cmd="$1" base="${PWD}" first stripped seg tok i w
+    local -a words
+    [ -n "$cmd" ] || return 0
+    case "$cmd" in
+        cd\ *)
+            first="${cmd#cd }"
+            first="${first%%&&*}"
+            first="${first%%;*}"
+            first="${first%%|*}"
+            first="${first# }"
+            first="${first%"${first##*[! ]}"}"
+            case "$first" in
+                \"*\") first="${first#\"}"; first="${first%\"}" ;;
+                \'*\') first="${first#\'}"; first="${first%\'}" ;;
+            esac
+            case "$first" in
+                ''|-) ;;
+                *) base="$first" ;;
+            esac
+            ;;
+    esac
+    case "$base" in
+        [A-Za-z]:[\\/]*|/*|'~'*) ;;
+        *) base="${PWD%/}/$base" ;;
+    esac
+    # Quoted spans first (a pattern like "^./.git/" is not a path), then one
+    # pipeline SEGMENT per line so the pattern/operand split is per grep. The
+    # placeholder keeps the pattern's ARGUMENT POSITION: replacing it with
+    # whitespace would promote the first path operand to "pattern" and hide it.
+    stripped=$(printf '%s' "$cmd" | sed -E 's/"(\\.|[^"\\])*"/__CS_Q__/g')
+    stripped=$(printf '%s' "$stripped" | sed -E $'s/\'(\\\\.|[^\'\\\\])*\'/__CS_Q__/g')
+    # Redirections are not operands. `2>/dev/null` used to come through as a
+    # "path" and could be blamed on an unrelated project. Drop fd duplication
+    # (`2>&1`) first, then an operator with its target, attached or spaced.
+    stripped=$(printf '%s' "$stripped" | sed -E 's/[0-9]*>&[0-9-]+//g')
+    stripped=$(printf '%s' "$stripped" | sed -E 's/[0-9]*>>?[[:space:]]*[^[:space:];|&]+//g')
+    stripped=$(printf '%s' "$stripped" | sed -E 's/[0-9]*<[[:space:]]*[^[:space:];|&]+//g')
+    stripped=$(printf '%s' "$stripped" | tr ';|&()`' '\n\n\n\n\n')
+    while IFS= read -r seg; do
+        [ -n "$seg" ] || continue
+        read -r -a words <<<"$seg"
+        local gidx=-1 pattern_seen=0
+        for ((i = 0; i < ${#words[@]}; i++)); do
+            w=$(printf '%s' "${words[i]}" | tr '[:upper:]' '[:lower:]')
+            w="${w%.exe}"
+            w="${w##*[\\/]}"
+            case "$w" in
+                grep|egrep|fgrep|zgrep|rg) gidx=$i; break ;;
+            esac
+        done
+        [ "$gidx" -ge 0 ] || continue
+        for ((i = gidx + 1; i < ${#words[@]}; i++)); do
+            tok="${words[i]}"
+            case "$tok" in
+                -*) continue ;;  # flag (and its inline value)
+            esac
+            # The first bare word is grep's PATTERN; the rest are paths.
+            if [ "$pattern_seen" -eq 0 ]; then
+                pattern_seen=1
+                continue
+            fi
+            case "$tok" in
+                [A-Za-z]:[\\/]*|/*) ;;
+                '~'*) tok="${HOME:-}${tok#\~}" ;;
+                .) tok="$base" ;;
+                *) tok="${base%/}/${tok#./}" ;;
+            esac
+            [ "$tok" = "/" ] || tok="${tok%/}"
+            [ -n "$tok" ] && printf '%s\n' "$tok"
+        done
+    done <<EOF
+$stripped
+EOF
+}
+
 # repos.json location — mirrors src/db_discovery/repos.rs `config_path()`
 # and constants.rs `codesearch_home()`:
 # CODESEARCH_REPOS_CONFIG > $CODESEARCH_HOME/repos.json > ~/.codesearch/repos.json.
@@ -113,7 +202,7 @@ target_registered() {
 # the cwd by definition and resolve against it. Prints the root; empty when
 # the path is outside any git repo (or git is unusable).
 resolve_target_git_root() {
-    local p="$1" norm probe root=""
+    local p="$1" norm probe prev="" root=""
     norm="${p%/}"
     norm="${norm%\\}"
     case "$norm" in
@@ -122,6 +211,15 @@ resolve_target_git_root() {
         # paths on the cwd branch, #199).
         [A-Za-z]:[\\/]*|/*)
             probe="$norm"
+            # Walk up to the nearest EXISTING ancestor before asking git: a
+            # glob operand (`src/*.rs`) or a not-yet-created path has no git
+            # root of its own, and treating it as "not in a repo" would let a
+            # grep of an indexed repo through (the Bash guard now passes
+            # operand paths here).
+            while [ -n "$probe" ] && [ ! -e "$probe" ] && [ "$probe" != "$prev" ]; do
+                prev="$probe"
+                probe="$(dirname "$probe")"
+            done
             [ -f "$probe" ] && probe="$(dirname "$probe")"
             root=$(git -C "$probe" rev-parse --show-toplevel 2>/dev/null || true)
             ;;

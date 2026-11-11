@@ -35,6 +35,67 @@ function Test-GrepFamilyCommand {
     return $false
 }
 
+function Get-GrepTargetPaths {
+    # Absolute paths a Bash grep will read files from. Empty when the command
+    # has no path operand at all (grep then walks the Bash tool's cwd).
+    #
+    # Mirrors command_grep_targets in codesearch-common.sh: coverage follows the
+    # command's OWN operands (absolute, relative to the shell's cwd, or a
+    # leading `cd DIR &&`), never the session cwd. Reported misfire: a kcharts
+    # session grepping /tmp docs and platform/audits was denied and blamed on
+    # the session's project.
+    param([string]$Cmd)
+    $out = New-Object System.Collections.ArrayList
+    if ([string]::IsNullOrWhiteSpace($Cmd)) { return @() }
+    $base = (Get-Location).Path
+    if ($Cmd -match '^\s*cd\s+([^\s;&|]+)') {
+        $dest = $Matches[1].Trim('"', "'")
+        if ($dest -and $dest -ne '-') { $base = $dest }
+    }
+    if (-not ($base -match '^[A-Za-z]:[\\/]' -or $base -match '^[\\/]' -or $base -match '^~')) {
+        $base = (Get-Location).Path.TrimEnd('/') + '/' + $base
+    }
+    # Quoted spans first (a pattern like "^./.git/" is not a path), then one
+    # pipeline SEGMENT per element so the pattern/operand split is per grep.
+    # The placeholder keeps the pattern's ARGUMENT POSITION.
+    $stripped = [regex]::Replace($Cmd, '"(?:\\.|[^"\\])*"', '__CS_Q__')
+    $stripped = [regex]::Replace($stripped, "'(?:\\.|[^'\\])*'", '__CS_Q__')
+    # Redirections are not operands: drop fd duplication (`2>&1`), then an
+    # operator with its target (attached or spaced), mirroring the .sh twin.
+    $stripped = [regex]::Replace($stripped, '[0-9]*>&[0-9-]+', ' ')
+    $stripped = [regex]::Replace($stripped, '[0-9]*>{1,2}\s*[^\s;|&]+', ' ')
+    $stripped = [regex]::Replace($stripped, '[0-9]*<\s*[^\s;|&]+', ' ')
+    foreach ($seg in ($stripped -split '[;|&()`]+')) {
+        $words = @($seg.Trim() -split '\s+' | Where-Object { $_ })
+        if ($words.Count -eq 0) { continue }
+        $gidx = -1
+        for ($i = 0; $i -lt $words.Count; $i++) {
+            $w = $words[$i].ToLowerInvariant() -replace '\.exe$', '' -replace '^.*[\\/]', ''
+            if (@('grep', 'egrep', 'fgrep', 'zgrep', 'rg') -contains $w) { $gidx = $i; break }
+        }
+        if ($gidx -lt 0) { continue }
+        $patternSeen = $false
+        for ($i = $gidx + 1; $i -lt $words.Count; $i++) {
+            $tok = $words[$i]
+            if (-not $tok -or $tok.StartsWith('-')) { continue }
+            # The first bare word is grep's PATTERN; the rest are paths.
+            if (-not $patternSeen) { $patternSeen = $true; continue }
+            if ($tok -match '^[A-Za-z]:[\\/]' -or $tok -match '^[\\/]') {
+                $p = $tok
+            } elseif ($tok.StartsWith('~')) {
+                $p = $env:USERPROFILE + $tok.Substring(1)
+            } elseif ($tok -eq '.') {
+                $p = $base
+            } else {
+                $p = $base.TrimEnd('/') + '/' + ($tok -replace '^\./', '')
+            }
+            if ($p.Length -gt 1) { $p = $p.TrimEnd('/') }
+            if ($p) { [void]$out.Add($p) }
+        }
+    }
+    return $out.ToArray()
+}
+
 function ConvertTo-NormRepoPath {
     param([string]$P)
     $p = $P
@@ -81,6 +142,16 @@ function Resolve-TargetGitRoot {
         # OF THE TARGET, not of the hook's cwd.
         $probe = $norm
         try {
+            if (-not (Test-Path -LiteralPath $probe)) {
+                # Walk up to the nearest EXISTING ancestor: a glob operand
+                # (`src/*.rs`) has no git root of its own, and treating it as
+                # "not in a repo" would let a grep of an indexed repo through.
+                while ($probe -and -not (Test-Path -LiteralPath $probe)) {
+                    $parent = Split-Path -Parent $probe
+                    if (-not $parent -or $parent -eq $probe) { break }
+                    $probe = $parent
+                }
+            }
             if (Test-Path -LiteralPath $probe -PathType Leaf) { $probe = Split-Path -Parent $probe }
         } catch {}
         try {

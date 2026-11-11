@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict"
 import http from "node:http"
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "../codesearch.ts"
@@ -282,11 +282,17 @@ async function main(): Promise<void> {
   const mock = await startMockServer()
   const tmp = mkdtempSync(join(tmpdir(), "codesearch-plugin-smoke-"))
 
+  // Umbrella registration fixture: a registered PARENT with a nested git repo
+  // under it (the kcharts registration shape).
+  const nestedParent = mkdtempSync(join(tmpdir(), "codesearch-plugin-nested-"))
+  const nestedChild = join(nestedParent, "druid")
+  mkdirSync(join(nestedChild, ".git"), { recursive: true })
+
   const reposPath = join(tmp, "repos.json")
   writeFileSync(
     reposPath,
     JSON.stringify({
-      repos: { "my-service": "/work/my-service", "sibling-api": "/work/sibling-api" },
+      repos: { "my-service": "/work/my-service", "sibling-api": "/work/sibling-api", "nested-parent": nestedParent },
       groups: { platform: ["my-service", "sibling-api"] },
     }),
   )
@@ -350,6 +356,19 @@ async function main(): Promise<void> {
   assert.match(astGrepGuidance, /ast_grep_search/, "guidance names ast-grep tools when the host exposes them")
   assert.match(astGrepGuidance, /ast_grep_edit/, "guidance names the rewrite tool too")
 
+  // A nested git repo under a registered umbrella project: the session must be
+  // told that the index belongs to the parent and that a repo-local add fixes
+  // it. This is the kcharts/druid registration mistake (parent indexed, child
+  // repos below it).
+  const nested = await setupPlugin(nestedChild)
+  const nestedMsg = userMessage("s-nested", "n1", "Where are the Druid ingestion specs?")
+  await nested.app.hooks.context[0](nestedMsg)
+  const nestedInjected = nestedMsg.system.map((p: Loose) => p.text).join("\n")
+  assert.match(nestedInjected, /project "nested-parent"/, "the umbrella alias still covers the child")
+  assert.match(nestedInjected, /its own git repository/, "child git repo under an umbrella is called out")
+  assert.match(nestedInjected, /codesearch index add \./, "the warning names the repo-local fix")
+  await nested.cleanup()
+
   // Zero-hit rescue turns an empty grep into codesearch hits.
   const rescueEvent: Loose = {
     tool: "grep",
@@ -378,30 +397,63 @@ async function main(): Promise<void> {
   await one.app.toolHooks["execute.after"][0](nudgeAgain)
   assert.doesNotMatch(String(nudgeAgain.result.output), /tip:/, "the nudge fires once per session")
 
-  // Bash escape hatch: raw shell grep is denied in every mode except "off" —
-  // even nudge — on a covered, live repo. Poll for the startup probe first.
+  // Bash escape hatch in NUDGE mode: the grep runs and the after-hook appends
+  // the one-time tip. The guard's job here is "try codesearch first", not
+  // "block grep" — denying in the default mode was the reported friction.
   const bashBefore = one.app.toolHooks["execute.before"][0]
-  let bashThrew = ""
-  for (let i = 0; i < 30 && !bashThrew; i++) {
-    try {
-      await bashBefore({ tool: "bash", input: { command: 'grep -rn "new Uri" --include="*.cs" .' }, sessionID: "s1" })
-    } catch (err) {
-      bashThrew = String(err)
-    }
-    if (!bashThrew) await new Promise((r) => setTimeout(r, 100))
+  await bashBefore({ tool: "bash", input: { command: 'grep -rn "new Uri" --include="*.cs" .' }, sessionID: "s1-bash" })
+  const bashAfter: Loose = {
+    tool: "bash",
+    status: "completed",
+    sessionID: "s1-bash",
+    callID: "b2",
+    input: { command: 'grep -rn "new Uri" --include="*.cs" .' },
+    result: { output: "src/x.cs:12:new Uri(...)" },
   }
-  assert.match(bashThrew, /codesearch/, "bash grep is denied in nudge mode on a covered repo")
-  assert.match(bashThrew, /shell grep is blocked/, "bash denial names the escape hatch")
-  assert.match(bashThrew, /project "my-service"/, "bash denial names the project scope to use")
+  await one.app.toolHooks["execute.after"][0](bashAfter)
+  assert.match(String(bashAfter.result.output), /tip:/, "nudge mode allows the shell grep and appends the tip")
+  assert.match(String(bashAfter.result.output), /project "my-service"/, "the tip names the repo that covers the target")
+
+  // A tip aimed at another indexed repo names THAT repo, not the session's.
+  const crossAfter: Loose = {
+    tool: "bash",
+    status: "completed",
+    sessionID: "s1-bash-cross",
+    callID: "b3",
+    input: { command: 'grep -rn "image:" .', workdir: "/work/sibling-api" },
+    result: { output: "" },
+  }
+  await one.app.toolHooks["execute.after"][0](crossAfter)
+  assert.match(String(crossAfter.result.output), /sibling-api/, "the tip names the repo the command actually targets")
   await bashBefore({ tool: "bash", input: { command: "cargo build --release" }, sessionID: "s1" })
   await bashBefore({ tool: "read", input: { path: "x.ts" }, sessionID: "s1" })
 
-  // Kill switch: CODESEARCH_PLUGIN_BASH_GUARD=0 re-allows shell grep and the tip.
-  // Ordering matters: without resolveSettings' structuredClone(DEFAULTS), the
-  // env=0 mutation below poisons the shared DEFAULTS.guards for every LATER
-  // plugin in this process — so this section must stay BEFORE the hub-down
-  // section, whose nudge assertion is the canary that fails if the leak
-  // regresses (see maybeNudgeBashGrep's guards.bash gate).
+  // Scope follows the COMMAND, not the session: a pipe filter reads no files,
+  // and a grep aimed outside every index is not a code search of one. This is
+  // the kcharts/druid misfire. (These pass before any deny logic runs, so they
+  // hold in every mode.)
+  await bashBefore({
+    tool: "bash",
+    input: { command: "find . -type f | grep -v '^./.git/' | sort" },
+    sessionID: "s1",
+  })
+  await bashBefore({
+    tool: "bash",
+    input: { command: 'grep -rn "image:" docs/', workdir: "/tmp/opencode/codesearch-docs" },
+    sessionID: "s1",
+  })
+  await bashBefore({
+    tool: "bash",
+    input: { command: "cd /tmp/opencode/codesearch-docs && grep -n kafka configuration.md" },
+    sessionID: "s1",
+  })
+  await bashBefore({
+    tool: "bash",
+    input: { command: 'grep -l "apache/druid" /work/my-service/superset/* 2>/dev/null' },
+    sessionID: "s1",
+  })
+
+  // Kill switch: CODESEARCH_PLUGIN_BASH_GUARD=0 disables the tip.
   process.env.CODESEARCH_PLUGIN_BASH_GUARD = "0"
   const bashOff = await setupPlugin("/work/my-service")
   await bashOff.app.toolHooks["execute.before"][0]({ tool: "bash", input: { command: "grep -rn x ." }, sessionID: "sb1" })
@@ -417,6 +469,23 @@ async function main(): Promise<void> {
   assert.doesNotMatch(String(bashOffAfter.result.output), /tip:/, "kill switch disables the bash nudge too")
   await bashOff.cleanup()
   delete process.env.CODESEARCH_PLUGIN_BASH_GUARD
+
+  // Regression canary for the DEFAULTS leak: without resolveSettings'
+  // structuredClone(DEFAULTS), the env=0 mutation above poisons the shared
+  // DEFAULTS.guards for every LATER plugin in this process, silently killing
+  // the bash tip. A fresh plugin with the env var gone must still nudge.
+  const bashRestored = await setupPlugin("/work/my-service")
+  const restoredAfter: Loose = {
+    tool: "bash",
+    status: "completed",
+    sessionID: "sb2",
+    callID: "b2",
+    input: { command: "grep -rn x ." },
+    result: { output: "match" },
+  }
+  await bashRestored.app.toolHooks["execute.after"][0](restoredAfter)
+  assert.match(String(restoredAfter.result.output), /tip:/, "guards.bash is restored for later plugins (no DEFAULTS leak)")
+  await bashRestored.cleanup()
 
   // guards.mode "off" registers no tool hooks at all — bash denial included.
   process.env.CODESEARCH_PLUGIN_GUARDS = "off"
@@ -484,6 +553,15 @@ async function main(): Promise<void> {
   assert.equal(prunedEvent!.tools.glob, undefined, "prune removes glob")
   assert.ok(prunedEvent!.tools.read, "prune keeps unrelated tools")
   assert.match(prunedEvent!.system.map((p: Loose) => p.text).join("\n"), /intentionally unavailable/)
+  // Prune hides the native tools, so a shell grep is still denied: otherwise
+  // the shell is a trivial bypass of the hiding.
+  let pruneBash = ""
+  try {
+    await pruned.app.toolHooks["execute.before"][0]({ tool: "bash", input: { command: "grep -rn x ." }, sessionID: "s2" })
+  } catch (err) {
+    pruneBash = String(err)
+  }
+  assert.match(pruneBash, /shell grep is blocked/, "prune denies shell grep too (no bypass of the hiding)")
   await pruned.cleanup()
 
   /* ---------------- block mode (fail-open everywhere else) ---------------- */
@@ -503,6 +581,38 @@ async function main(): Promise<void> {
   assert.match(threw, /codesearch/, "block mode denies grep once the hub is reachable")
   assert.match(threw, /project "my-service"/, "denial names the project scope to use")
   assert.doesNotMatch(threw, /ast[-_]grep/, "denial omits ast-grep when the session never exposed it")
+
+  // Native Grep follows its own path operand, exactly like the bash guard:
+  // another indexed repo is denied by ITS alias, and a path outside every
+  // index is allowed even though the session sits in a covered repo.
+  let nativeThrew = ""
+  try {
+    await before({ tool: "grep", input: { pattern: "x", path: "/work/sibling-api/src" }, sessionID: "s3" })
+  } catch (err) {
+    nativeThrew = String(err)
+  }
+  assert.match(nativeThrew, /sibling-api/, "native grep denial names the target repo, not the session repo")
+  await before({ tool: "grep", input: { pattern: "x", path: "/tmp/opencode/codesearch-docs" }, sessionID: "s3" })
+
+  // Shell grep in block mode: denied for a covered target, denied by the
+  // TARGET's alias for another repo, allowed for filters and outside paths.
+  let bashBlocked = ""
+  try {
+    await before({ tool: "bash", input: { command: "grep -rn x ." }, sessionID: "s3" })
+  } catch (err) {
+    bashBlocked = String(err)
+  }
+  assert.match(bashBlocked, /shell grep is blocked/, "block mode denies shells grep on a covered target")
+  assert.match(bashBlocked, /project "my-service"/, "block-mode shell denial names the covering project")
+  let blockCross = ""
+  try {
+    await before({ tool: "bash", input: { command: 'grep -rn "image:" .', workdir: "/work/sibling-api" }, sessionID: "s3" })
+  } catch (err) {
+    blockCross = String(err)
+  }
+  assert.match(blockCross, /sibling-api/, "block-mode shell denial follows the target, not the session")
+  await before({ tool: "bash", input: { command: "find . -type f | grep -v x | sort" }, sessionID: "s3" })
+  await before({ tool: "bash", input: { command: "grep -rn x .", workdir: "/tmp/elsewhere" }, sessionID: "s3" })
 
   // The same denial names ast-grep once the session's tool map has it.
   const astBlocked = await setupPlugin("/work/my-service")
@@ -583,8 +693,9 @@ async function main(): Promise<void> {
     "guidance names the grep/glob fallback while the hub is down",
   )
 
-  // Bash escape hatch fails open while the hub is down, and the slip-through
-  // shell grep still gets the one-time tip on execute.after.
+  // Bash escape hatch fails open while the hub is down, and — matching the
+  // "grep is an acceptable fallback until it recovers" guidance — no tip is
+  // appended: suggesting codesearch when codesearch is unreachable is noise.
   const downBash: Loose = {
     tool: "bash",
     status: "completed",
@@ -595,10 +706,10 @@ async function main(): Promise<void> {
   }
   await downPrune.app.toolHooks["execute.before"][0](downBash)
   await downPrune.app.toolHooks["execute.after"][0](downBash)
-  assert.match(
+  assert.doesNotMatch(
     String(downBash.result.output),
     /tip: raw shell grep/,
-    "bash grep that slipped through while the hub was down is nudged",
+    "no tip while the hub is down (grep is the fallback then)",
   )
   await downPrune.cleanup()
   process.env.CODESEARCH_URL = mock.url

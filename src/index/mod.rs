@@ -1630,6 +1630,41 @@ pub async fn prune_index() -> Result<()> {
     Ok(())
 }
 
+/// Warn when the path being registered is an umbrella over separate git repos.
+///
+/// Registering a parent directory makes every child resolve to the parent's
+/// alias: a session in `kcharts/druid` searches the `kcharts` index, and the
+/// child's own ignore rules, history and freshness never apply. The failure is
+/// silent (the parent index just looks incomplete), so name the fix here.
+fn warn_nested_git_roots(project_path: &Path) {
+    let nested = crate::db_discovery::repos::nested_git_roots(project_path);
+    if nested.is_empty() {
+        return;
+    }
+    println!(
+        "{}",
+        format!(
+            "⚠️  {} nested git repositor{} under this path:",
+            nested.len(),
+            if nested.len() == 1 { "y" } else { "ies" }
+        )
+        .yellow()
+        .bold()
+    );
+    for path in nested.iter().take(5) {
+        println!("   - {}", path.display());
+    }
+    if nested.len() > 5 {
+        println!("   … and {} more", nested.len() - 5);
+    }
+    println!(
+        "   Registering the parent indexes them as ONE project: a session inside a\n   \
+         child resolves to the parent's alias and only the parent's ignore rules\n   \
+         apply. For a complete per-repo index register each child instead:\n   \
+         codesearch index add <child-path>   (and a group for cross-repo search)"
+    );
+}
+
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
@@ -1644,6 +1679,7 @@ pub async fn add_to_index(
     println!("{}", "➕ Add to Index".bright_green().bold());
     println!("{}", "=".repeat(60));
     println!("📂 Project: {}", canonical_path.display());
+    warn_nested_git_roots(&canonical_path);
 
     // Try delegating to a running serve instance first.
     // Serve handles: register in repos.json + create index + warmup.

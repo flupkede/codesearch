@@ -44,7 +44,7 @@ preference into behaviour:
 | **Scope resolution** | on | Maps the session directory to a registered project alias (and its groups), from `~/.codesearch/repos.json` (relocatable via `CODESEARCH_HOME`) or a live `status` snapshot. |
 | **Scope-aware guidance** | once per session | Injects a compact strategy block plus the resolved scope into system context, so the first tool call already knows `project=`. |
 | **Zero-hit rescue** | on | When `grep`/`glob` returns nothing in an indexed repo, runs a literal codesearch query and appends the index hits to the tool result. |
-| **Code-search-first guards** | `nudge` | `off`, `nudge` (one tip per session), `prune` (hide `grep`/`glob` from the model), or `block` (deny with the exact codesearch call to use). Raw shell `grep`/`rg` through the bash tool is denied in every mode except `off` (`guards.bash`, `CODESEARCH_PLUGIN_BASH_GUARD`). |
+| **Code-search-first guards** | `nudge` | `off`, `nudge` (one tip per session), `prune` (hide `grep`/`glob` from the model), or `block` (deny with the exact codesearch call to use). Raw shell `grep`/`rg` through the bash tool gets the same treatment (`guards.bash`, `CODESEARCH_PLUGIN_BASH_GUARD`): a tip in `nudge`, denied in `prune`/`block`, and only when the command's own target is inside an indexed project. |
 | **Hub health** | on | Probes `/healthz`, asks OpenCode to reload failed MCP servers, and can auto-start a local `codesearch serve` (opt-in). |
 | **Unindexed warning** | on | Flags a registered repo with an empty or model-less index, so "no results" is not mistaken for "not there". |
 | **Freshness note** | on | Tracks `file.edited` events and reminds the model that a just-edited file may lag the watcher's refresh. |
@@ -223,7 +223,7 @@ Precedence, lowest to highest:
 | `CODESEARCH_REPOS_CONFIG` | `$CODESEARCH_HOME/repos.json` (`~/.codesearch` when unset) | Registry path (shared with the hub and the Claude Code hooks). |
 | `CODESEARCH_MCP_SERVER` | `codesearch` | MCP entry name to mirror for URL/token. |
 | `CODESEARCH_PLUGIN_GUARDS` | `nudge` | `off` / `nudge` / `prune` / `block`. |
-| `CODESEARCH_PLUGIN_BASH_GUARD` | `true` | Shell-grep denial through the bash tool (`guards.bash`). `0` re-allows raw shell grep. |
+| `CODESEARCH_PLUGIN_BASH_GUARD` | `true` | Shell-grep handling through the bash tool (`guards.bash`): a tip in `nudge`, denied in `prune`/`block`, always scoped to the command's own target paths. `0` disables both. |
 | `CODESEARCH_PLUGIN_SCOPE` | `session` | `session` / `message` / `off`. |
 | `CODESEARCH_PLUGIN_RESCUE` | `true` | Zero-hit rescue on/off. |
 | `CODESEARCH_PLUGIN_RECALL` | `false` | Auto-recall on/off. |
@@ -282,12 +282,31 @@ deny immediately, as before.
 
 **Shell-grep closure** (independent of `guards.mode`, kill switch
 `guards.bash: false` / `CODESEARCH_PLUGIN_BASH_GUARD=0`): a bash tool command
-that invokes `grep`/`egrep`/`fgrep`/`zgrep`/`rg` is denied on covered, live
-repos in every mode except `off` — the shell tool is the escape hatch around
-the native-tool guards, and using it to grep is the workaround the guards
-exist to stop. Quoted mentions (`echo "grep"`) are not invocations. If a shell
-grep ran anyway (hub down at deny time), `execute.after` appends the one-time
-tip instead.
+that greps FILES inside an indexed project follows the guard mode. In the
+default `nudge` mode it RUNS and `execute.after` appends the one-time tip
+naming the covering project and the call to use instead: the point is "try
+codesearch first", not "block grep". In `prune` and `block` the command is
+denied — those modes hide or disable the native tools, and the shell would
+otherwise be a trivial bypass.
+
+Coverage follows the **command's own target**, not the session directory: the
+guard parses the command into pipeline segments, takes each grep's path
+operands (resolved against the tool's `workdir` and any leading `cd DIR &&`),
+and only inspects those. A grep aimed at `/tmp`, at an unregistered clone, or
+at a *different* indexed repo is resolved on its own terms — the tip/deny then
+names THAT repo, with its alias and root path. `find . | grep -v '^./.git/'`
+and `git log | grep -i fix` are pure stream filters: they read no files and
+are never blocked. Shell redirections (`2>/dev/null`, `> out.txt`, `2>&1`,
+`< file`) are operators, not operands, so they can never be mistaken for a
+target. Quoted mentions (`echo "grep"`) are not invocations.
+
+The native `grep`/`glob` guards follow the same rule: a call carrying its own
+`path` is resolved from that path, so a Grep aimed into another indexed repo is
+denied by that repo's alias, and a path outside every index is allowed.
+
+Registration note: a registered PARENT directory that contains nested git
+repos (the "umbrella" shape) also triggers a scope line telling the model to
+run `codesearch index add .` in the child for a complete repo-local index.
 
 **Zero-hit rescue** (part of `nudge` and `prune`, and independently
 controlled by `guards.rescue`) is the highest-value, lowest-risk piece: it

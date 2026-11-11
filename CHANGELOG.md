@@ -14,6 +14,19 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.7.13]
+
+### Fixed
+
+- **The grep guards scope by the command's target, not by the session directory.** Reported live: a session inside the indexed `kcharts` project had every shell `grep` denied, including one run in `/tmp` over freshly downloaded docs and one in a *different* indexed repo (`platform/audits`), with a message telling it to search `kcharts`. The OpenCode plugin's bash guard now parses the command into pipeline segments, resolves each grep's path operands against the tool's `workdir` and any leading `cd DIR &&`, and only acts when a target lands inside a registered repo — naming that repo's alias and root path in the message. The native `grep`/`glob` guards follow the same rule from their own `path` input. Both Claude Code hook twins (`grep-guard.sh`, `grep-guard.ps1`) resolve a Bash grep's operands the same way instead of assuming the session cwd; with no operand the old cwd behaviour stands.
+- **A shell grep used as a stream filter is no longer denied.** `find . -type f | grep -v '^./.git/'` and `git log | grep -i fix` read no files: they cannot be the code-search workload the guard exists to reroute, so they pass in every mode. Shell redirections (`2>/dev/null`, `> out.txt`, `2>&1`, `< file`) are parsed as operators, not path operands — a redirect target used to be resolved as a project path (reported: `.../druid/2>/dev/null` blamed on `kcharts`). Grep that does read files (a path operand, `-r`/`-R`, behind `xargs`, or no stdin and no operand) is still inspected inside an indexed project. Quoted pattern mentions are still not invocations.
+- **The shell-grep guard follows `guards.mode` instead of always denying.** In the default `nudge` mode a shell grep of an indexed project now RUNS and gets the one-time tip naming the covering project: the intent is "try codesearch first", not "block grep". `prune` and `block` still deny it, because those modes hide or disable the native tools and the shell would be a trivial bypass. The tip and the denial both follow the command's own target, so a grep in `/tmp` or in a sibling repo is never blamed on the session's project.
+- **Shell-grep targets keep their case and follow Windows mount forms.** `resolveShellPath` used the comparison normalizer, which lowercases on Windows, and the guard shows its targets to the user and asserts them in the unit table; it now normalizes lexically with the case intact (coverage matching normalizes both sides anyway) and strips a `\\?\` prefix. On Windows only, Git Bash (`/c/dir`) and WSL-style (`/mnt/c/dir`) operands resolve to the drive they name instead of staying POSIX-absolute, which had let an in-repo grep written in mount form slip past `guards.mode: "block"`; on a POSIX host both are real absolute paths the registry stores as such, so they are left alone.
+
+### Added
+
+- **Registering an umbrella directory warns about the git repos below it.** `codesearch index add` on a parent that contains nested git roots now lists them and suggests registering each child (plus a group for cross-repo search); the OpenCode plugin's scope block calls out a session that sits in its own git repo but is covered only as part of a parent project. Both address the `kcharts` registration shape: the parent index silently covers a child's files under the parent's ignore rules and alias.
+
 ## [1.7.12]
 
 ### Added
