@@ -132,6 +132,21 @@ cd codesearch
 cargo build --release
 ```
 
+#### CPUs without AVX2
+
+The default build links the prebuilt ONNX Runtime that the `ort` crate downloads at build time. On x86_64 those binaries require AVX2, so on older CPUs (for example Sandy Bridge / Ivy Bridge Xeons) codesearch stops with `SIGILL` (illegal instruction) as soon as it embeds. Microsoft's official ONNX Runtime releases pick their CPU code paths at runtime and run on these CPUs. Build with the `load-dynamic` feature to load such a release at runtime:
+
+```bash
+cargo build --release --no-default-features --features load-dynamic
+
+# ONNX Runtime 1.31.x or newer (the API version this build targets)
+curl -fsSLO https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz
+tar xzf onnxruntime-linux-x64-1.31.0.tgz
+export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so"
+```
+
+`ORT_DYLIB_PATH` points at the ONNX Runtime shared library; a relative path is tried against the codesearch binary's directory first. When it is unset, `libonnxruntime.so` (`libonnxruntime.dylib`, `onnxruntime.dll`) is looked up on the system library search path. A missing library, or one older than 1.31, makes codesearch exit with an error that names the path it tried.
+
 ### Index a repository
 
 ```bash
@@ -684,6 +699,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_MAX_CHUNKS_PER_BATCH` | Hard cap on chunks held in memory per refresh batch; splits the batch early (default: 0 = disabled) |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `CODESEARCH_EXTENSION_MAP` | Path to the extension→language map (default: `~/.codesearch/extensions.json`) — see [Extension map](#extension-map) |
+| `ORT_DYLIB_PATH` | `load-dynamic` builds only: path of the ONNX Runtime shared library (1.31 or newer) — see [CPUs without AVX2](#cpus-without-avx2) |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
 
 ### Indexing limits
