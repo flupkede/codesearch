@@ -30,6 +30,7 @@ finalized in place with a date — no renaming/migration step needed.
 ### Added
 
 - **Registering an umbrella directory warns about the git repos below it.** `codesearch index add` on a parent that contains nested git roots now lists them and suggests registering each child (plus a group for cross-repo search); the OpenCode plugin's scope block calls out a session that sits in its own git repo but is covered only as part of a parent project. Both address the `kcharts` registration shape: the parent index silently covers a child's files under the parent's ignore rules and alias.
+- **Opt-in `load-dynamic` build for CPUs without AVX2.** The prebuilt ONNX Runtime that `ort` downloads at build time requires AVX2 on x86_64, so codesearch died with `SIGILL` on older CPUs (reported on a Xeon E5-2640) the moment it embedded. `cargo build --release --no-default-features --features load-dynamic` builds a binary that loads ONNX Runtime at runtime from `ORT_DYLIB_PATH` instead, for example Microsoft's official 1.31.x release, which selects its CPU code paths at runtime. A missing or too-old library fails with an error that names the path and `ORT_DYLIB_PATH` rather than a panic inside `ort`. The default build is unchanged: the new `download-binaries` default feature enables the same `ort`/`fastembed` features as before. See README → *CPUs without AVX2*.
 
 ### Changed
 
