@@ -27,6 +27,7 @@ impl NeuralReranker {
 
     /// Create a neural reranker with a specific model
     pub fn with_model(model: RerankerModel) -> Result<Self> {
+        crate::embed::ensure_onnx_runtime()?;
         let model_name = model.to_string();
         info_print!("Loading reranker model: {}", model_name);
 

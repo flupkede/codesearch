@@ -298,53 +298,6 @@ impl ModelType {
     }
 }
 
-/// Environment variable `ort` reads the ONNX Runtime library path from when
-/// built with the `load-dynamic` feature.
-#[cfg(feature = "load-dynamic")]
-const ORT_DYLIB_PATH_ENV: &str = "ORT_DYLIB_PATH";
-
-/// Load the ONNX Runtime shared library (`load-dynamic` builds only).
-///
-/// `ort` would otherwise load it lazily on first use and panic when the
-/// library is missing or older than the API version it was built against.
-/// Loading it here first, from the same location `ort` would use
-/// (`ORT_DYLIB_PATH`, else the platform's `onnxruntime` library name on the
-/// loader search path), turns that into an error naming the fix. Later calls
-/// reuse the already-loaded library.
-#[cfg(feature = "load-dynamic")]
-fn load_onnx_runtime() -> Result<()> {
-    let path: std::path::PathBuf = match std::env::var(ORT_DYLIB_PATH_ENV) {
-        Ok(path) if !path.is_empty() => path.into(),
-        _ => format!(
-            "{}onnxruntime{}",
-            std::env::consts::DLL_PREFIX,
-            std::env::consts::DLL_SUFFIX
-        )
-        .into(),
-    };
-    // Only the library load matters here: the environment builder is dropped
-    // uncommitted, and fastembed's sessions use the default environment.
-    drop(ort::init_from(&path).map_err(|e| {
-        // libloading reports only "dlopen failed"; the loader's own reason
-        // (file not found, missing dependency, wrong architecture) is its
-        // source.
-        let reason = match &e {
-            ort::LoadDynamicError::Dlopen { error, .. } => std::error::Error::source(error)
-                .map(|source| format!(" ({source})"))
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
-        anyhow!(
-            "Failed to load ONNX Runtime: {e}{reason}. This codesearch build loads ONNX Runtime \
-             at runtime (`load-dynamic` feature): set {ORT_DYLIB_PATH_ENV} to the shared \
-             library of ONNX Runtime 1.{}.x or newer \
-             (https://github.com/microsoft/onnxruntime/releases)",
-            ort::MINOR_VERSION
-        )
-    })?);
-    Ok(())
-}
-
 /// Fast embedding model using fastembed library
 pub struct FastEmbedder {
     model: TextEmbedding,
@@ -388,8 +341,7 @@ impl FastEmbedder {
         cache_dir: Option<&std::path::Path>,
         show_download_progress: bool,
     ) -> Result<Self> {
-        #[cfg(feature = "load-dynamic")]
-        load_onnx_runtime()?;
+        super::ensure_onnx_runtime()?;
 
         // Set cache directory via environment variable if provided
         // Note: fastembed library uses FASTEMBED_CACHE_DIR (not FASTEMBED_CACHE_PATH)
@@ -643,35 +595,6 @@ pub fn is_model_in_cache(model: ModelType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A `load-dynamic` build without a loadable ONNX Runtime must fail with
-    /// an error that names the library path and `ORT_DYLIB_PATH`, not panic
-    /// inside `ort` on first use.
-    #[cfg(feature = "load-dynamic")]
-    #[test]
-    #[serial_test::serial]
-    fn missing_onnx_runtime_library_is_a_clear_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = tmp.path().join("libonnxruntime-missing.so");
-        let _env =
-            crate::testing::EnvRestore::set(&[(ORT_DYLIB_PATH_ENV, missing.to_str().unwrap())]);
-
-        let err = format!("{:#}", load_onnx_runtime().unwrap_err());
-        assert!(
-            err.contains(missing.to_str().unwrap()),
-            "error must name the path it tried: {err}"
-        );
-        assert!(
-            err.contains(ORT_DYLIB_PATH_ENV),
-            "error must name the variable to set: {err}"
-        );
-        // The loader's reason, not just libloading's bare "dlopen failed".
-        #[cfg(unix)]
-        assert!(
-            err.to_lowercase().contains("no such file"),
-            "error must carry the loader's reason: {err}"
-        );
-    }
 
     #[test]
     #[serial_test::serial]
