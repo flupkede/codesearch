@@ -69,6 +69,11 @@ jobs:
       - run: cargo test --test '*' -- --nocapture --skip ignore
       - run: cargo fmt -- --check
       - run: cargo clippy -- -D warnings
+      # The opt-in `load-dynamic` build (ONNX Runtime loaded at runtime, for
+      # CPUs without AVX2) links ONNX Runtime differently from the default
+      # build, so a check keeps it from rotting. Check-only: no ONNX Runtime
+      # library is needed and nothing is linked.
+      - run: cargo clippy --no-default-features --features load-dynamic --all-targets -- -D warnings
 
   test-windows:
     runs-on: windows-latest
