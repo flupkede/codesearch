@@ -10,6 +10,11 @@ description = "Shared library for codesearch: chunking, embeddings, retrieval, M
 name = "codesearch_core"
 path = "src/lib.rs"
 
+[features]
+# Forwarded by the CLI package's cuda/tensorrt features.
+cuda = ["ort/cuda"]
+tensorrt = ["ort/tensorrt"]
+
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -31,6 +36,20 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ML & Embeddings (embed/ + rerank/ moved in at stage 5)
+fastembed = "7.0"
+ort = { version = "2.0.0-rc.10", features = ["download-binaries", "copy-dylibs"] }
+clap = { version = "4.5", features = ["derive", "cargo", "env"] }
+# openai.rs embedding provider HTTP (same pinned spec as the CLI's)
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+httpdate = "1"
+
+# Retrieval stores
+arroy = "0.9"
+tantivy = "0.27"
+rand = "0.10"
+fs2 = "0.4"
 
 # Text processing & Parsing
 tree-sitter = "0.27"

@@ -7469,7 +7469,7 @@ fn access_times_sidecar_round_trip_and_corruption_tolerance() {
 
     // Persist → load round trip preserves entries and drives the order.
     let payload = serde_json::json!({"a": 100u64, "b": 300u64});
-    crate::vectordb::store::atomic_write_json(&path, &payload).unwrap();
+    crate::vectordb::atomic_write_json(&path, &payload).unwrap();
     let loaded = ServeState::load_access_times_from(&path);
     assert_eq!(loaded.get("a"), Some(&100u64));
     assert_eq!(loaded.get("b"), Some(&300u64));

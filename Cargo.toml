@@ -28,11 +28,8 @@ ctrlc = "3.4"
 anyhow = "1.0"
 thiserror = "2.0"
 
-# ML & Embeddings
-fastembed = "7.0"
-ort = { version = "2.0.0-rc.10", features = ["download-binaries", "copy-dylibs"] }
-ndarray = "0.17"
-hf-hub = "1.0"
+# ML & Embeddings — moved to codesearch-core with the embed/rerank stack (stage 5)
+# ndarray / hf-hub stay listed: zero direct uses found, kept for a later sweep
 
 # Vector DB (temporarily commented due to dep conflicts)
 # lancedb = "0.5"
@@ -62,13 +59,11 @@ ignore = "0.4"
 notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
 notify-debouncer-full = "0.7"
 walkdir = "2.5"
-fs2 = "0.4"  # Cross-platform file locking
 
 # Caching
 moka = { version = "0.12", features = ["sync"] }
 
-# Search & Ranking
-tantivy = "0.27"
+# Search & Ranking — tantivy moved to codesearch-core with fts/
 regex = "1.12"
 
 # Server
@@ -94,8 +89,7 @@ indicatif = "0.18"
 dirs = "7"
 num_cpus = "1.16"
 async-trait = "0.1"
-# Vector database
-arroy = "0.9"
+# Vector database — arroy moved to codesearch-core with vectordb/
 # `longer-keys` builds LMDB with MDB_MAXKEYSIZE=0, so the key limit is derived
 # from the page size (~1980 bytes on 4KB pages) instead of the 511-byte default.
 # C# SCIP symbols carry fully qualified parameter types and reach 900+ bytes;
@@ -109,7 +103,6 @@ bincode = { version = "2.0", features = ["serde"] }
 # Sourcegraph indexers (e.g. scip-typescript) for the TypeScript symbol adapter.
 scip = "0.10"
 protobuf = "3.7"
-rand = "0.10"
 # Aikido 34247111: 1.8.0 carries 5 advisories (CVE-2026-64684/317735/617985 + 2 more).
 # 3.x keeps legacy initialize/session behavior by default (ProtocolVersion::LATEST stays
 # V_2025_11_25); the 2026-07-28 stateless lifecycle is opt-in and NOT enabled here.
@@ -137,6 +130,9 @@ tempfile = "3.13"
 pretty_assertions = "1.4"
 serial_test = "4"
 ctor = "1.0"
+# start_paused time control in serve tests; was previously satisfied
+# transitively by a fastembed/hf-hub tokio feature, now pinned.
+tokio = { version = "1.40", features = ["test-util"] }
 
 # Benchmarks will be added later
 # [[bench]]
@@ -158,8 +154,9 @@ inherits = "release"
 
 [features]
 default = []
-cuda = ["ort/cuda"]        # Enable CUDA GPU acceleration (requires cuDNN)
-tensorrt = ["ort/tensorrt"] # Enable TensorRT acceleration (NVIDIA only)
+# GPU acceleration lives on codesearch-core (ort is a core dep); forwarded here
+cuda = ["codesearch-core/cuda"]        # Enable CUDA GPU acceleration (requires cuDNN)
+tensorrt = ["codesearch-core/tensorrt"] # Enable TensorRT acceleration (NVIDIA only)
 csharp_helper_integration = []  # Enable integration tests that require the scip-csharp helper binary
 typescript_helper_integration = []  # Enable integration tests that require scip-typescript (npx or CODESEARCH_SCIP_TYPESCRIPT)
 

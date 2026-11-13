@@ -1,7 +1,8 @@
 pub(crate) mod store;
 
 pub use store::{
-    merge_metadata_atomic, ChunkMetadata, SearchResult, StoreStats, VectorStore, PATH_REWRITE_BATCH,
+    atomic_write_json, merge_metadata_atomic, ChunkMetadata, SearchResult, StoreStats, VectorStore,
+    PATH_REWRITE_BATCH,
 };
 
 // Crash-atomic JSON writers outside this module (`FileMetaStore::save`)

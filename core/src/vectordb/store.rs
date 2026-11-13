@@ -116,7 +116,7 @@ fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
 /// combined with `rename` being atomic on the same filesystem, a reader always
 /// observes either the complete old or the complete new content.
 /// On failure the temp file is best-effort removed.
-pub(crate) fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
+pub fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
     use std::io::Write;
 
     static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

@@ -3859,7 +3859,7 @@ impl ServeState {
             }
         }
         let payload = serde_json::Value::Object(map);
-        if let Err(e) = crate::vectordb::store::atomic_write_json(path, &payload) {
+        if let Err(e) = crate::vectordb::atomic_write_json(path, &payload) {
             tracing::debug!(
                 "persist_access_times: write to {} failed: {e:#}",
                 path.display()

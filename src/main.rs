@@ -1,15 +1,11 @@
 mod bench;
 mod cli;
-mod embed;
 mod federation;
-mod fts;
 mod index;
 mod mcp;
-mod rerank;
 mod search;
 mod serve;
 mod symbols;
-mod vectordb;
 mod watch;
 
 use anyhow::Result;

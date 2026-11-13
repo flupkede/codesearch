@@ -35,7 +35,8 @@ Move-map (→ codesearch-core unless noted):
 - chunker/, file/, utils/, error.rs, constants.rs, limits.rs, logger/, cache/, lmdb_registry.rs,
   testing.rs (plain module, not cfg(test) — test-only items vanish in dependency builds), bench/,
   output.rs (rerank's info_print!/warn_print! macros need it in core) and db_discovery/ (both
-  pulled forward into the plumbing stage)
+  pulled forward into the plumbing stage). DEVIATION: bench/ stayed CLI (benches the public
+  `codesearch::` facade, no crate:: core refs) — drop from core move-map.
 - embed/ wholesale incl. local fastembed + openai + LMDB embedding cache (cohesive module; cache
   rides core lmdb_registry — coupling judged clean)
 - fts/, rerank/, vectordb/ (retrieval)
@@ -64,9 +65,11 @@ files rewrite `crate::` → `codesearch_core::`. Features cuda/tensorrt/csharp/t
 defined on core and forwarded by the CLI package. Core+server version 0.1.0, publish=false;
 the CLI keeps semver + auto-bump.
 
-Stages: 1 plan (this) · 2 workspace shell · 3 plumbing layer · 4 chunker · 5 embed ·
-6 retrieval + SharedStores split · 7 symbols/federation/db_discovery · 8 mcp + ServeHandle
-inversion · 9 dep inheritance + features + facade sweep · 10 full validation trio ·
-11 CI + Dockerfile + CHANGELOG + README + drop branch-local agent files · 12 push + PR
-(--base develop). Per-stage validation: cargo fmt --check + clippy -D warnings (background,
-output to file); full trio in stage 10.
+Stages: 1 plan (this) · 2 workspace shell · 3 plumbing layer · 4 chunker ·
+5 retrieval + embed stack + SharedStores split (merged 5+6: embed/cache.rs needs
+vectordb::merge_metadata_atomic AND vectordb/store.rs needs embed::EmbeddedChunk —
+mutual coupling, one stage or none) · 7 symbols/federation/db_discovery ·
+8 mcp + ServeHandle inversion · 9 dep inheritance + features + facade sweep ·
+10 full validation trio · 11 CI + Dockerfile + CHANGELOG + README + drop
+branch-local agent files · 12 push + PR (--base develop). Per-stage validation:
+cargo fmt --check + clippy -D warnings (background, output to file); full trio in stage 10.

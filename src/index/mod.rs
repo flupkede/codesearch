@@ -18,9 +18,13 @@ use crate::vectordb::{merge_metadata_atomic, VectorStore};
 // Index manager module
 mod manager;
 pub use manager::{
-    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingHeartbeat,
-    IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
+    CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback,
+    SymbolRebuildSignal,
 };
+// Store-open mechanics live in core; re-exported so `crate::index::` call
+// sites (serve, mcp, tests) stay valid. The lock fns are reachable directly
+// via codesearch_core::index; no crate-internal callers.
+pub use codesearch_core::index::{is_database_locked, SharedStores};
 
 mod build_log;
 pub use build_log::BuildLog;
