@@ -585,7 +585,7 @@ fn match_line_for_literal(
     query: &str,
     regex: Option<&Regex>,
 ) -> Option<(usize, String)> {
-    crate::search::literal::match_line_for_literal(content, query, regex)
+    crate::search::match_line_for_literal(content, query, regex)
 }
 
 /// Returns true when a regex pattern contains at least one run of three or more

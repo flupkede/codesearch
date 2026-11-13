@@ -19,6 +19,7 @@ tensorrt = ["ort/tensorrt"]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 colored = "3.1"
+regex = "1.12"
 dashmap = "6.1"
 dirs = "7"
 # `longer-keys` raises LMDB's 511-byte key cap (SCIP symbols reach 900+ bytes);

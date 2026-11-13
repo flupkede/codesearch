@@ -22,6 +22,7 @@ pub mod lmdb_registry;
 pub mod logger;
 pub mod output;
 pub mod rerank;
+pub mod search;
 pub mod symbols;
 pub mod testing;
 pub mod utils;
