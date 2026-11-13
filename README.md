@@ -464,6 +464,10 @@ codesearch index add /path/to/my-project
 # Remove a repo
 codesearch index rm /path/to/my-project
 
+# Remove AND tombstone the alias: re-registration via `index add` is
+# refused until explicitly cleared with `index add --force`
+codesearch index rm custom --forget
+
 # List registered repos
 codesearch index list
 
@@ -471,6 +475,10 @@ codesearch index list
 # serve also does this itself at startup and on every status refresh)
 codesearch index prune
 ```
+
+A tombstoned alias (written to `~/.codesearch/removed_aliases.json`) stays
+removed even when something tries to re-add it — the registration attempt is
+refused with the removal date named, and `index add --force` clears the marker.
 
 Serve reads `~/.codesearch/repos.json` on startup and manages all registered repos.
 

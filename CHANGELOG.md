@@ -30,6 +30,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Added
 
+- **`index rm --forget` tombstones an alias so it stays removed.** A removed repo that kept coming back (whatever re-adds it — a script, a hook, an unnoticed CLI) can now be buried: `codesearch index rm <alias> --forget` records the alias in `~/.codesearch/removed_aliases.json`, and every later re-registration attempt — serve `POST /repos` and the local `index add` build path alike — is refused with a conflict that names the removal date, instead of silently resurrecting hours of index work. `codesearch index add --force` overrides the guard and clears the marker as a side effect of the successful registration. Writing the tombstone file is panic-guarded under test the same way `ReposConfig::save` protects the real registry.
+
 - **Registering an umbrella directory warns about the git repos below it.** `codesearch index add` on a parent that contains nested git roots now lists them and suggests registering each child (plus a group for cross-repo search); the OpenCode plugin's scope block calls out a session that sits in its own git repo but is covered only as part of a parent project. Both address the `kcharts` registration shape: the parent index silently covers a child's files under the parent's ignore rules and alias.
 
 ### Changed

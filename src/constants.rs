@@ -154,6 +154,11 @@ pub const GLOBAL_CODESEARCHIGNORE_FILE: &str = ".codesearchignore";
 /// the ignore rules allow (the historical behavior).
 pub const CODESEARCHINCLUDE_FILE: &str = ".codesearchinclude";
 
+/// Tombstone registry for `index rm --forget`: aliases recorded here are
+/// refused by re-registration (`POST /repos`, `index add`) until cleared
+/// with an explicit force. Lives in `<codesearch_home>/`.
+pub const REMOVED_ALIASES_FILE: &str = "removed_aliases.json";
+
 /// Get the path to the global .codesearchignore file
 /// (`<codesearch_home>/.codesearchignore`).
 ///
@@ -167,6 +172,15 @@ pub fn global_codesearchignore_path() -> Option<PathBuf> {
     codesearch_home()
         .ok()
         .map(|root| root.join(GLOBAL_CODESEARCHIGNORE_FILE))
+}
+
+/// Path of the tombstone registry written by `index rm --forget`
+/// (`<codesearch_home>/removed_aliases.json`). Relocated wholesale via
+/// [`CODESEARCH_HOME_ENV`] like every other global path.
+pub fn removed_aliases_path() -> Option<PathBuf> {
+    codesearch_home()
+        .ok()
+        .map(|root| root.join(REMOVED_ALIASES_FILE))
 }
 
 /// The global whitelist file in ~/.codesearch/ (applies to every repo).

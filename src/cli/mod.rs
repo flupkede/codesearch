@@ -40,6 +40,10 @@ pub enum IndexCommands {
         /// When set, <path> is a path on the remote's filesystem.
         #[arg(long)]
         remote: Option<String>,
+
+        /// Override a `--forget` tombstone on this alias (clears it on success).
+        #[arg(short = 'f', long)]
+        force: bool,
     },
 
     /// Remove the index (local or global, auto-detected)
@@ -56,6 +60,11 @@ pub enum IndexCommands {
         /// Remove a repo from a remote peer. The positional arg is a remote alias.
         #[arg(long)]
         remote: Option<String>,
+
+        /// Record a tombstone: future `index add` re-registration of this
+        /// alias is refused until cleared with `index add --force`.
+        #[arg(long)]
+        forget: bool,
     },
 
     /// Show index status (local, global, or on a remote peer)
@@ -1156,6 +1165,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         local,
                         log_file: add_log_file,
                         remote,
+                        force: add_force,
                     } => {
                         if let Some(peer_name) = &remote {
                             run_remote_add(peer_name, add_path).await
@@ -1170,6 +1180,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                                 local,
                                 add_log_file,
                                 mt,
+                                add_force,
                                 cancel_token.clone(),
                             )
                             .await
@@ -1179,11 +1190,12 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         path: rm_path,
                         keep_config,
                         remote,
+                        forget,
                     } => {
                         if let Some(peer_name) = &remote {
                             run_remote_remove(peer_name, rm_path).await
                         } else {
-                            crate::index::remove_from_index(rm_path, keep_config).await
+                            crate::index::remove_from_index(rm_path, keep_config, forget).await
                         }
                     }
                     IndexCommands::List { remote, json } => {
@@ -1239,12 +1251,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         false,
                         log_file,
                         model_type,
+                        false,
                         cancel_token.clone(),
                     )
                     .await
                 } else if remove || is_rm_cmd {
                     let effective_path = if is_rm_cmd { None } else { path };
-                    crate::index::remove_from_index(effective_path, keep_config).await
+                    crate::index::remove_from_index(effective_path, keep_config, false).await
                 } else if list || is_list_cmd {
                     crate::index::list_index_status().await
                 } else if symbols {

@@ -1683,3 +1683,39 @@ fn nested_git_roots_finds_direct_children_only() {
         "a leaf repo has no nested repositories"
     );
 }
+
+/// `index rm --forget` tombstones: record, query, clear, absent-file behavior.
+/// CODESEARCH_HOME is relocated so the write hits the test dir (the save-path
+/// guard panics on the real home) — hence serial.
+#[test]
+#[serial_test::serial]
+fn tombstone_roundtrip_records_queries_and_clears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = crate::testing::EnvRestore::set(&[(
+        crate::constants::CODESEARCH_HOME_ENV,
+        tmp.path().to_str().unwrap(),
+    )]);
+
+    // No file yet: nothing tombstoned, and un-tombstoning is not an error.
+    assert!(
+        tombstone_date("custom").is_none(),
+        "absent tombstone file means no alias is tombstoned"
+    );
+    untombstone_alias("custom").expect("clearing an absent tombstone is a no-op");
+
+    tombstone_alias("custom").expect("tombstone write must succeed");
+    assert!(
+        tombstone_date("custom").is_some(),
+        "recorded alias must be tombstoned"
+    );
+    assert!(
+        tombstone_date("other").is_none(),
+        "only the recorded alias is tombstoned"
+    );
+
+    untombstone_alias("custom").expect("clear must succeed");
+    assert!(
+        tombstone_date("custom").is_none(),
+        "cleared alias is no longer tombstoned"
+    );
+}

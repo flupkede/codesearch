@@ -1128,6 +1128,7 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
             path: repo_path.clone(),
             alias: Some("brandnew".to_string()),
             model: None,
+            force: None,
         }),
     )
     .await;
@@ -1159,6 +1160,75 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
     );
 }
 
+/// `index rm --forget` records the alias; a later `POST /repos` for it must
+/// be refused (409) without touching repos.json — whatever re-adds a removed
+/// repo now fails loudly. `force=true` re-registers and clears the marker.
+#[tokio::test]
+#[serial]
+async fn add_repo_handler_refuses_tombstoned_alias_and_force_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("custom");
+    std::fs::create_dir(&repo_path).unwrap();
+    // Tombstone writes panic under test unless CODESEARCH_HOME is relocated.
+    let _home = crate::testing::EnvRestore::set(&[(
+        crate::constants::CODESEARCH_HOME_ENV,
+        tmp.path().to_str().unwrap(),
+    )]);
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
+    let state = Arc::new(state_with_config(ReposConfig::default()));
+
+    crate::db_discovery::repos::tombstone_alias("custom").unwrap();
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("custom".to_string()),
+            model: None,
+            force: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "tombstoned alias must be refused, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        !state.config_snapshot().repos.contains_key("custom"),
+        "tombstoned alias must NOT be registered"
+    );
+
+    // force=true re-registers and clears the marker.
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("custom".to_string()),
+            model: None,
+            force: Some(true),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "forced add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        state.config_snapshot().repos.contains_key("custom"),
+        "forced add must register the alias"
+    );
+    assert!(
+        crate::db_discovery::repos::tombstone_date("custom").is_none(),
+        "a successful forced add clears the tombstone"
+    );
+}
+
 /// `POST /repos` with no explicit `model` must create a brand-new index at the
 /// serve-wide default's dimension (`codesearch serve --model X`), not the
 /// built-in 384-dim default. This is the write-side counterpart of the per-repo
@@ -1186,6 +1256,7 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
             path: repo_path.clone(),
             alias: Some("defaulted".to_string()),
             model: None,
+            force: None,
         }),
     )
     .await;
@@ -1248,6 +1319,7 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
             path: repo_path.clone(),
             alias: Some("existing".to_string()),
             model: None,
+            force: None,
         }),
     )
     .await;
@@ -1351,6 +1423,7 @@ async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
             path: repo_path.clone(),
             alias: Some("adopted".to_string()),
             model: None,
+            force: None,
         }),
     )
     .await;
@@ -3080,7 +3153,7 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
         .expect("seeded config must contain the proj");
 
     // The CLI path — must delegate (serve is reachable) and succeed.
-    crate::index::remove_from_index(Some(proj.clone()), false)
+    crate::index::remove_from_index(Some(proj.clone()), false, false)
         .await
         .expect("delegated index rm must succeed");
 
@@ -3163,7 +3236,7 @@ async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
     );
 
     // The CLI path — delegated removal against a serve that HOLDS the env.
-    crate::index::remove_from_index(Some(proj.clone()), false)
+    crate::index::remove_from_index(Some(proj.clone()), false, false)
         .await
         .expect("delegated index rm must succeed while serve holds the env");
 

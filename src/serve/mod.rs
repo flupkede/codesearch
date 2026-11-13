@@ -5778,6 +5778,8 @@ struct AddRepoRequest {
     alias: Option<String>,
     /// Optional embedding model override (e.g., "bge-small", "nomic-v1.5").
     model: Option<String>,
+    /// Override a `--forget` tombstone for this alias (clears it on success).
+    force: Option<bool>,
 }
 
 /// Decide the embedding model a `POST /repos` add should index with.
@@ -5954,6 +5956,38 @@ async fn add_repo_handler(
     // asked for a different embedding model (the dimensions change).
     let adopt_existing = should_adopt_existing_index(recorded_model, model_override);
 
+    // Tombstone guard: an alias removed with `index rm --forget` stays
+    // removed. Whatever re-adds it (scripts, agents, an unnoticed CLI in
+    // some hook) now fails loudly here instead of silently resurrecting
+    // hours of index work. `force` bypasses the guard and clears the
+    // tombstone as a side effect of the successful registration below.
+    if !body.force.unwrap_or(false) {
+        let candidate_alias = body.alias.clone().unwrap_or_else(|| {
+            canonical_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+        if let Some(removed_at) = crate::db_discovery::repos::tombstone_date(&candidate_alias) {
+            warn!(
+                "Refused re-registration of tombstoned alias '{}' (removed {}) — pass force=true to override",
+                candidate_alias, removed_at
+            );
+            return (
+                StatusCode::CONFLICT,
+                axum::response::Json(json!({
+                    "error": format!(
+                        "Alias '{}' was removed with --forget on {}; refusing re-registration. Pass force=true to override.",
+                        candidate_alias, removed_at
+                    ),
+                    "status": "conflict",
+                    "alias": candidate_alias,
+                    "removed_at": removed_at,
+                })),
+            );
+        }
+    }
+
     // Register in repos.json
     let alias = {
         let mut config = match state.config.write() {
@@ -6002,6 +6036,14 @@ async fn add_repo_handler(
                     "status": "error"
                 })),
             );
+        }
+
+        // An explicit force that survived the tombstone guard clears the
+        // marker: the operator said "back for good".
+        if body.force == Some(true) {
+            if let Err(e) = crate::db_discovery::repos::untombstone_alias(&alias) {
+                tracing::warn!("Failed to clear tombstone for '{}': {}", alias, e);
+            }
         }
 
         alias
