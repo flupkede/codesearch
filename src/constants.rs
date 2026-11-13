@@ -353,6 +353,11 @@ pub fn resolve_serve_host() -> String {
 /// The key is validated against `Authorization: Bearer <key>` or `X-API-Key: <key>` headers.
 pub const SERVE_API_KEY_ENV: &str = "CODESEARCH_SERVE_API_KEY";
 
+/// Header every codesearch client attaches to mutating requests so the serve
+/// audit log can name the caller (`AUDIT`/request lines): the calling CLI's
+/// pid, parent pid and executable name. Non-codesearch callers simply omit it.
+pub const CLIENT_HEADER: &str = "X-Codesearch-Client";
+
 /// Environment variable to restrict which filesystem roots can be indexed.
 /// Semicolon-separated list of canonical directory paths. When set, `POST /repos`
 /// and `--register` paths must reside under one of the listed roots.

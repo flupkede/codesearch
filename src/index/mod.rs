@@ -2347,15 +2347,20 @@ fn build_serve_client(
 
 /// Inner, testable form of [`build_serve_client`]: build a client that attaches
 /// `Authorization: Bearer <key>` (when `key` is `Some`) as a default header, so
-/// every request — health probe, POST, DELETE — carries it automatically.
+/// every request — health probe, POST, DELETE — carries it automatically. Every
+/// client also identifies itself via `X-Codesearch-Client` (pid/parent/exe) so
+/// the serve's audit log can name who mutated a repo.
 pub(crate) fn build_serve_client_with_key(
     timeout: std::time::Duration,
     key: Option<&str>,
 ) -> std::result::Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(format!("codesearch-cli/{}", env!("CARGO_PKG_VERSION")));
+
+    let mut headers = reqwest::header::HeaderMap::new();
 
     if let Some(k) = key {
-        let mut headers = reqwest::header::HeaderMap::new();
         let auth_value =
             reqwest::header::HeaderValue::from_str(&format!("Bearer {}", k)).map_err(|e| {
                 format!(
@@ -2365,12 +2370,50 @@ pub(crate) fn build_serve_client_with_key(
                 )
             })?;
         headers.insert(reqwest::header::AUTHORIZATION, auth_value);
-        builder = builder.default_headers(headers);
     }
+
+    let name = reqwest::header::HeaderName::from_bytes(crate::constants::CLIENT_HEADER.as_bytes())
+        .map_err(|e| format!("invalid client header name: {}", e))?;
+    let value = reqwest::header::HeaderValue::from_str(&client_identification_header())
+        .map_err(|e| format!("invalid client identification header: {}", e))?;
+    headers.insert(name, value);
+    builder = builder.default_headers(headers);
 
     builder
         .build()
         .map_err(|e| format!("failed to build HTTP client: {}", e))
+}
+
+/// `X-Codesearch-Client` value identifying this CLI process: pid, parent pid
+/// (the process that spawned us — for codesearch children that is the caller,
+/// e.g. an MCP server or a script) and the executable name. Parent may be
+/// absent when the OS no longer records it; the exe name is stripped to
+/// visible ASCII because HTTP header values reject anything else.
+fn client_identification_header() -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let exe: String = exe.chars().filter(|c| c.is_ascii_graphic()).collect();
+
+    let parent = {
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+        // System::new() only fails when sysinfo cannot read /proc-style state
+        // at all; then no parent is knowable — the header just omits it.
+        (|| -> Option<u32> {
+            let mut sys = System::new().ok()?;
+            let pid = Pid::from_u32(std::process::id());
+            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+            sys.process(pid)
+                .and_then(|p| p.parent())
+                .map(|p| p.as_u32())
+        })()
+    };
+
+    match parent {
+        Some(p) => format!("cli pid={} parent={} exe={}", std::process::id(), p, exe),
+        None => format!("cli pid={} exe={}", std::process::id(), exe),
+    }
 }
 
 /// When the server returns 401, produce a friendly, actionable error pointing at
@@ -3016,10 +3059,18 @@ mod serve_probe_tests {
 
     // ---- build_serve_client_with_key (issue #132) ---------------------------
 
-    /// Spawn a server that records the `Authorization` header it receives on
-    /// `/health` into the shared slot. Returns `(base_url, captured)`.
-    async fn spawn_auth_echo_server() -> (String, Arc<Mutex<Option<String>>>) {
-        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    /// Headers the echo server saw on `/health`.
+    #[derive(Clone, Default)]
+    struct SeenHeaders {
+        auth: Option<String>,
+        client: Option<String>,
+    }
+
+    /// Spawn a server that records the `Authorization` and
+    /// `X-Codesearch-Client` headers it receives on `/health` into the shared
+    /// slot. Returns `(base_url, captured)`.
+    async fn spawn_auth_echo_server() -> (String, Arc<Mutex<SeenHeaders>>) {
+        let captured: Arc<Mutex<SeenHeaders>> = Arc::new(Mutex::new(SeenHeaders::default()));
         let captured_clone = captured.clone();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3027,9 +3078,15 @@ mod serve_probe_tests {
         let app = axum::Router::new().route(
             "/health",
             axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                let mut seen = captured_clone.lock().unwrap();
                 if let Some(v) = headers.get(reqwest::header::AUTHORIZATION) {
                     if let Ok(s) = v.to_str() {
-                        *captured_clone.lock().unwrap() = Some(s.to_string());
+                        seen.auth = Some(s.to_string());
+                    }
+                }
+                if let Some(v) = headers.get(crate::constants::CLIENT_HEADER) {
+                    if let Ok(s) = v.to_str() {
+                        seen.client = Some(s.to_string());
                     }
                 }
                 "ok"
@@ -3060,9 +3117,14 @@ mod serve_probe_tests {
 
         let seen = captured.lock().unwrap().clone();
         assert_eq!(
-            seen.as_deref(),
+            seen.auth.as_deref(),
             Some("Bearer hunter2"),
             "client built with a key must send Authorization: Bearer <key>"
+        );
+        let client = seen.client.as_deref().unwrap_or("");
+        assert!(
+            client.starts_with("cli pid=") && client.contains("exe="),
+            "client built with a key must identify itself via X-Codesearch-Client, got: {client:?}"
         );
     }
 
@@ -3083,8 +3145,14 @@ mod serve_probe_tests {
 
         let seen = captured.lock().unwrap().clone();
         assert!(
-            seen.is_none(),
-            "client built without a key must NOT send an Authorization header, got: {seen:?}"
+            seen.auth.is_none(),
+            "client built without a key must NOT send an Authorization header, got: {:?}",
+            seen.auth
+        );
+        let client = seen.client.as_deref().unwrap_or("");
+        assert!(
+            client.starts_with("cli pid=") && client.contains("exe="),
+            "client built WITHOUT a key must still identify itself via X-Codesearch-Client (the keyless local-dev serve is where the audit trail matters most), got: {client:?}"
         );
     }
 
@@ -3106,7 +3174,7 @@ mod serve_probe_tests {
             .expect("server must return 200");
         let seen = captured.lock().unwrap().clone();
         assert_eq!(
-            seen.as_deref(),
+            seen.auth.as_deref(),
             Some("Bearer any-value"),
             "inner builder attaches Bearer <key> verbatim; trimming is the caller's job"
         );

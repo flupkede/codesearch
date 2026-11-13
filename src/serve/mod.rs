@@ -5465,6 +5465,16 @@ async fn reindex_handler(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
+    // Audit: middleware logs caller+status, this records the flags — force
+    // clears the index, symbols adds the SCIP rebuild; both are worth a line.
+    tracing::info!(
+        target: "audit",
+        "AUDIT reindex alias='{}' force={} symbols={}",
+        alias,
+        force,
+        symbols
+    );
+
     // Resolve the project path for this alias
     let (project_path, read_only) = {
         let config = match state.config.read() {
@@ -5889,6 +5899,27 @@ async fn add_repo_handler(
             );
         }
     };
+
+    // Audit line: the middleware logs caller+status, this adds WHAT — the
+    // alias (body-supplied or the dir-name default the registration would use)
+    // and the exact path being indexed.
+    let audit_alias = body
+        .alias
+        .clone()
+        .or_else(|| {
+            canonical_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "-".to_string());
+    tracing::info!(
+        target: "audit",
+        "AUDIT add alias='{}' path={} model={} force={:?}",
+        audit_alias,
+        canonical_path.display(),
+        body.model.as_deref().unwrap_or("auto"),
+        body.force
+    );
 
     // Validate the path is within allowed roots (if configured)
     if let Err(e) = validate_path_within_allowed_roots(&canonical_path) {
@@ -6485,6 +6516,8 @@ async fn remove_repo_handler(
             // (transient search holder, 5-retry budget exhausted) the repo is
             // still functionally removed (config unregistered, evicted from
             // memory) but we say so honestly with a distinct status + reason.
+            // Audit: middleware logs caller+status, this records the outcome.
+            tracing::info!(target: "audit", "AUDIT remove alias='{}' db_deleted={}", alias, outcome.db_deleted);
             let (status, message) = if outcome.db_deleted {
                 (
                     "removed",
@@ -6770,6 +6803,11 @@ async fn require_auth_for_network(
 }
 
 /// Axum middleware: log MCP requests (method + path, skips /health spam).
+/// Mutating requests (POST/DELETE/PUT/PATCH) get a caller suffix appended —
+/// `X-Codesearch-Client`, User-Agent, peer socket — so the serve log doubles
+/// as an audit trail of who registered, removed or reindexed what. The peer
+/// socket is only present when serve was started with connect-info; tests and
+/// direct handler calls render it as `unknown`.
 async fn log_mcp_requests(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -6777,14 +6815,52 @@ async fn log_mcp_requests(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
+    let mutates = matches!(
+        method,
+        axum::http::Method::POST
+            | axum::http::Method::DELETE
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+    );
+    let caller = if mutates {
+        let peer = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0);
+        Some(caller_desc(req.headers(), peer))
+    } else {
+        None
+    };
+
     let response = next.run(req).await;
 
     if path != crate::constants::HEALTH_PATH && path != crate::constants::HEALTHZ_PATH {
         let status = response.status().as_u16();
-        tracing::info!("{} {} → {}", method, path, status);
+        match caller {
+            Some(c) => tracing::info!(target: "audit", "{} {} → {} {}", method, path, status, c),
+            None => tracing::info!("{} {} → {}", method, path, status),
+        }
     }
 
     response
+}
+
+/// One-line caller identity for the audit trail: the `X-Codesearch-Client`
+/// header (attached by codesearch CLI/federation clients), the User-Agent and
+/// the peer socket. Absent pieces render as `-` / `unknown`.
+fn caller_desc(headers: &axum::http::HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
+    let client = headers
+        .get(crate::constants::CLIENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let ua = headers
+        .get(reqwest::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let peer = peer
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("client=\"{}\" ua=\"{}\" peer={}", client, ua, peer)
 }
 
 /// Normalize a serve URL for comparison: trim trailing slashes and lowercase
@@ -7748,7 +7824,11 @@ pub async fn run_serve(
     // 3 seconds after the cancel_token is cancelled. This gives in-flight HTTP
     // requests time to complete while preventing a permanent hang on open sessions.
     let cancel_for_deadline = cancel_token.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         cancel_token.cancelled().await;
         info!("🛑 codesearch serve shutting down...");
     });
