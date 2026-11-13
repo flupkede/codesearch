@@ -1,0 +1,11 @@
+[package]
+name = "codesearch-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Shared library for codesearch: chunking, embeddings, retrieval, MCP protocol"
+
+[lib]
+name = "codesearch_core"
+path = "src/lib.rs"
