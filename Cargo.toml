@@ -19,6 +19,7 @@ name = "codesearch"
 path = "src/main.rs"
 
 [dependencies]
+codesearch-core = { path = "core" }
 # CLI & I/O
 clap = { version = "4.5", features = ["derive", "cargo", "env"] }
 tokio = { version = "1.40", features = ["full"] }

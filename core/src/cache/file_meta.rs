@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::constants::FILE_META_DB_NAME;
-use crate::vectordb::{is_transient_rename_error, RENAME_RETRY_ATTEMPTS, RENAME_RETRY_DELAY_MS};
+use crate::utils::rename_retry::{
+    is_transient_rename_error, RENAME_RETRY_ATTEMPTS, RENAME_RETRY_DELAY_MS,
+};
 
 // ─── CANONICAL PATH POLICY ────────────────────────────────────────────────────
 //

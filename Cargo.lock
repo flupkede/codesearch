@@ -751,6 +751,7 @@ dependencies = [
  "bincode 2.0.1",
  "chrono",
  "clap",
+ "codesearch-core",
  "colored",
  "criterion",
  "crossterm",
@@ -820,6 +821,29 @@ dependencies = [
 [[package]]
 name = "codesearch-core"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "colored",
+ "ctor",
+ "dashmap",
+ "dirs 7.0.0",
+ "heed",
+ "ignore",
+ "moka",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2 0.11.1",
+ "sysinfo 0.40.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "codesearch-server"

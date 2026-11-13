@@ -33,7 +33,9 @@ stays at the workspace root. Shared deps move to `[workspace.dependencies]`.
 
 Move-map (→ codesearch-core unless noted):
 - chunker/, file/, utils/, error.rs, constants.rs, limits.rs, logger/, cache/, lmdb_registry.rs,
-  testing.rs (cfg test), bench/
+  testing.rs (plain module, not cfg(test) — test-only items vanish in dependency builds), bench/,
+  output.rs (rerank's info_print!/warn_print! macros need it in core) and db_discovery/ (both
+  pulled forward into the plumbing stage)
 - embed/ wholesale incl. local fastembed + openai + LMDB embedding cache (cohesive module; cache
   rides core lmdb_registry — coupling judged clean)
 - fts/, rerank/, vectordb/ (retrieval)
@@ -42,10 +44,10 @@ Move-map (→ codesearch-core unless noted):
 - index/ SPLIT: SharedStores struct + inherent impls + store-open mechanics → core::index;
   IndexManager + lifecycle fns (add/remove/index/prune/stats/clear) + build_log + key_migration
   + find_git_root → CLI
-- symbols/, federation/ (+ build_serve_client_with_key moves in from index/mod.rs), db_discovery/
+- symbols/, federation/ (+ build_serve_client_with_key moves in from index/mod.rs)
 - mcp/ wholesale; the axum REST mirrors (tail of mcp/mod.rs, ServeState-extractor handlers)
   move to CLI serve/
-- Stay CLI: ServeState + serve/ orchestration (axum, TUI, reaper, warmup), watch/, output.rs,
+- Stay CLI: ServeState + serve/ orchestration (axum, TUI, reaper, warmup), watch/,
   cli/, main.rs, index lifecycle
 
 Documented deviation: mcp handlers hold `Arc<SharedStores>` and route multi-repo calls through

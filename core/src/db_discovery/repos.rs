@@ -1499,7 +1499,7 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
 /// filesystem-only fallback resolves the common dir from the `.git` entry
 /// (file → `gitdir:` → `commondir` climb), so a worktree registered on a
 /// machine without git still records its identity.
-pub(crate) fn git_common_dir_for(path: &Path) -> Option<String> {
+pub fn git_common_dir_for(path: &Path) -> Option<String> {
     const MAX_ATTEMPTS: u32 = 8;
     let mut output = None;
     for attempt in 0..MAX_ATTEMPTS {
@@ -1662,8 +1662,11 @@ fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<
 
 /// Shared git-spawning test helpers, used by this module's tests and by
 /// serve/tests.rs (backfill needs real repos with a shared worktree identity).
-#[cfg(test)]
-pub(crate) mod test_support {
+/// Not cfg(test)-gated: test-only items vanish in dependency builds, and the
+/// CLI's own test target compiles core as a dependency. Compiled inert in
+/// non-test builds, hence the allowance.
+#[allow(dead_code)]
+pub mod test_support {
     use std::path::Path;
 
     /// Process-wide lock serializing the git-spawning / directory-renaming
@@ -1674,14 +1677,14 @@ pub(crate) mod test_support {
 
     /// Acquire the serialization lock, recovering from a poisoned mutex (a
     /// panic in one test must not cascade-fail the rest).
-    pub(crate) fn git_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub fn git_serial_lock() -> std::sync::MutexGuard<'static, ()> {
         GIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Initialise a git repo at `dir` with one commit, so `git worktree add`
     /// has a HEAD to branch from. Same transient-spawn retry posture as the
     /// relocation tests' `init_git_remote`.
-    pub(crate) fn init_git_repo_with_commit(dir: &Path) {
+    pub fn init_git_repo_with_commit(dir: &Path) {
         let run = |args: &[&str]| {
             const MAX_ATTEMPTS: u64 = 8;
             for attempt in 0..MAX_ATTEMPTS {

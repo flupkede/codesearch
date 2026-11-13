@@ -93,7 +93,7 @@ pub struct FileWalker {
 /// first: an include can never resurrect an ignored file.
 ///
 /// Shared by the walker and the watcher so the two gates cannot drift.
-pub(crate) fn build_include_matcher(root: &Path) -> Option<Gitignore> {
+pub fn build_include_matcher(root: &Path) -> Option<Gitignore> {
     let mut builder = GitignoreBuilder::new(root);
     let mut added_any = false;
 
@@ -134,7 +134,7 @@ pub(crate) fn build_include_matcher(root: &Path) -> Option<Gitignore> {
 /// the file is included (the path itself or an ancestor matches an include
 /// rule; a `!`-whitelist rule inside the include file un-includes again —
 /// last match along the component chain wins, mirroring gitignore order).
-pub(crate) fn is_included(matcher: &Gitignore, root: &Path, path: &Path) -> bool {
+pub fn is_included(matcher: &Gitignore, root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let mut current = PathBuf::new();
     let mut included = false;

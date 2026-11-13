@@ -10,7 +10,9 @@ pub use identity::EmbeddingModel;
 pub use provider::Embedder;
 
 use anyhow::Result;
-pub use batch::{BatchEmbedder, EmbeddedChunk};
+#[allow(unused_imports)]
+// group_embedded_chunks_by_path unused in the bin target (lib facade consumes it)
+pub use batch::{group_embedded_chunks_by_path, BatchEmbedder, EmbeddedChunk};
 pub use cache::{
     CacheStats, CachedBatchEmbedder, PersistentCacheStats, PersistentEmbeddingCache, QueryCache,
     QueryCacheStats,

@@ -243,6 +243,33 @@ fn clean_docstring(doc: &str) -> String {
         .to_string()
 }
 
+/// Group embedded chunks by their file path
+///
+/// Specialized version for embedded chunks (which already contain the chunk data).
+///
+/// # Arguments
+/// * `embedded_chunks` - Slice of embedded chunks to group
+/// * `chunk_ids` - Slice of chunk IDs corresponding to the embedded chunks
+///
+/// # Returns
+/// * HashMap mapping file paths (as strings) to vectors of chunk IDs
+#[allow(dead_code)] // unused in the bin target (consumed via the lib facade re-export)
+pub fn group_embedded_chunks_by_path(
+    embedded_chunks: &[EmbeddedChunk],
+    chunk_ids: &[u32],
+) -> std::collections::HashMap<String, Vec<u32>> {
+    let capacity = embedded_chunks.len() / 10; // Estimate: ~10 chunks per file
+    let mut map: std::collections::HashMap<String, Vec<u32>> =
+        std::collections::HashMap::with_capacity(capacity.max(1));
+
+    for (chunk, chunk_id) in embedded_chunks.iter().zip(chunk_ids.iter()) {
+        map.entry(chunk.chunk.path.clone())
+            .or_default()
+            .push(*chunk_id);
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

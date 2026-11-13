@@ -6,3 +6,15 @@
 //! (fts, vectordb, rerank, search), symbols, federation, db_discovery, mcp,
 //! and the SharedStores handle. CLI wiring, serve orchestration, watch and the
 //! index lifecycle stay in the `codesearch` crate.
+
+pub mod cache;
+pub mod constants;
+pub mod db_discovery;
+pub mod error;
+pub mod file;
+pub mod limits;
+pub mod lmdb_registry;
+pub mod logger;
+pub mod output;
+pub mod testing;
+pub mod utils;

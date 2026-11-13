@@ -8,11 +8,14 @@ mod dedup;
 mod extractor;
 mod fallback;
 mod grammar;
+mod group_chunks;
 mod jupyter;
 mod parser;
 mod semantic;
 mod tree_sitter;
 
+#[allow(unused_imports)] // unused in the bin target (consumed via the lib facade re-export)
+pub use group_chunks::{group_chunks_by_path, group_chunks_by_path_with_capacity};
 pub use semantic::SemanticChunker;
 
 /// Default number of context lines before/after a chunk

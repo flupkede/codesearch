@@ -1,29 +1,20 @@
 mod bench;
-mod cache;
 mod chunker;
 mod cli;
-mod constants;
-mod db_discovery;
 mod embed;
 mod federation;
-mod file;
 mod fts;
 mod index;
-mod limits;
-mod lmdb_registry;
-mod logger;
 mod mcp;
-mod output;
 mod rerank;
 mod search;
 mod serve;
 mod symbols;
-#[cfg(test)]
-mod testing;
 mod vectordb;
 mod watch;
 
 use anyhow::Result;
+use codesearch::*;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -89,8 +80,13 @@ async fn run() -> Result<()> {
         // IMPORTANT: Use stderr — stdout is reserved for program output
         tracing_subscriber::registry()
             .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| format!("codesearch={}", log_level_str).into()),
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    format!(
+                        "codesearch={},codesearch_core={}",
+                        log_level_str, log_level_str
+                    )
+                    .into()
+                }),
             )
             .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
             .init();

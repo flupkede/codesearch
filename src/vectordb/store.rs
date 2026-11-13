@@ -11,6 +11,9 @@ use anyhow::{anyhow, Result};
 /// caller can trigger a rebuild.
 const SCHEMA_VERSION: u32 = 1;
 use crate::lmdb_registry::{create_named_db, open_named_db, TrackedEnv};
+use crate::utils::rename_retry::{
+    is_transient_rename_error, RENAME_RETRY_ATTEMPTS, RENAME_RETRY_DELAY_MS,
+};
 use arroy::distances::Cosine;
 use arroy::internals::{KeyCodec, NodeCodec};
 use arroy::{Database as ArroyDatabase, ItemId, Reader, Writer};
@@ -113,34 +116,6 @@ fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
 /// combined with `rename` being atomic on the same filesystem, a reader always
 /// observes either the complete old or the complete new content.
 /// On failure the temp file is best-effort removed.
-/// Windows-only classification for a transient handle-holder racing our
-/// rename: ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32),
-/// ERROR_LOCK_VIOLATION (33) — the same raw codes `ServeState::is_db_locked_error`
-/// (`src/serve/mod.rs`) retries on. On Windows, AV/Search-indexer momentarily
-/// opening a just-written small JSON file makes `MOVEFILE_REPLACE_EXISTING`
-/// fail with "Access is denied" purely from timing, not a real conflict —
-/// most visible under `cargo test --lib --bins` parallel load. Unix renames
-/// are atomic replace and never hit this path, so the retry is a no-op there.
-///
-/// `pub(crate)` so `FileMetaStore::save` can share the same classification
-/// for its rename step instead of growing a third copy of the raw-code list.
-pub(crate) fn is_transient_rename_error(e: &std::io::Error) -> bool {
-    if let Some(raw) = e.raw_os_error() {
-        if matches!(raw, 5 | 32 | 33) {
-            return true;
-        }
-    }
-    let msg = e.to_string();
-    msg.contains("being used") || msg.contains("is in use") || msg.contains("Access is denied")
-}
-
-/// Bounded retry budget for the rename step below: short, since a genuine
-/// conflict (not a transient handle) should surface quickly rather than
-/// stall the caller. Shared with `FileMetaStore::save`, which mirrors this
-/// tmp+fsync+rename pattern.
-pub(crate) const RENAME_RETRY_ATTEMPTS: u32 = 5;
-pub(crate) const RENAME_RETRY_DELAY_MS: u64 = 20;
-
 pub(crate) fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
     use std::io::Write;
 
