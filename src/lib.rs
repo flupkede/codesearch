@@ -1,19 +1,17 @@
 pub mod bench;
 pub mod cli;
-pub mod federation;
 pub mod index;
 pub mod mcp;
 pub mod search;
 pub mod serve;
-pub mod symbols;
 pub mod watch;
 
 // Shared library extracted to codesearch-core; re-exported under the old
 // paths so CLI-internal `crate::` references stay valid. `testing` is a plain
 // core module (not cfg(test)): test-only modules vanish in dependency builds.
 pub use codesearch_core::{
-    cache, chunker, constants, db_discovery, embed, error, file, fts, limits, lmdb_registry,
-    logger, output, rerank, testing, utils, vectordb,
+    cache, chunker, constants, db_discovery, embed, error, federation, file, fts, limits,
+    lmdb_registry, logger, output, rerank, symbols, testing, utils, vectordb,
 };
 // #[macro_export] macros live at the defining crate's root; re-exported so
 // CLI-internal `crate::info_print!` / `crate::warn_print!` keep resolving.

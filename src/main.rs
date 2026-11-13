@@ -1,11 +1,9 @@
 mod bench;
 mod cli;
-mod federation;
 mod index;
 mod mcp;
 mod search;
 mod serve;
-mod symbols;
 mod watch;
 
 use anyhow::Result;

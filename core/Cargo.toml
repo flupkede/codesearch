@@ -45,6 +45,15 @@ clap = { version = "4.5", features = ["derive", "cargo", "env"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 httpdate = "1"
 
+# Symbols (symbols/ moved in at stage 6)
+# Wire-compat: use config::legacy() only — bincode-1 bytes on disk, pinned
+# byte-exact by the golden tests in symbols/{csharp,typescript}.rs.
+bincode = { version = "2.0", features = ["serde"] }
+# SCIP symbol indexing — parses standard SCIP protobuf (.scip) emitted by
+# Sourcegraph indexers (e.g. scip-typescript) for the TypeScript symbol adapter.
+scip = "0.10"
+protobuf = "3.7"
+
 # Retrieval stores
 arroy = "0.9"
 tantivy = "0.27"
@@ -72,6 +81,8 @@ tree-sitter-dart = "0.3.0"
 tree-sitter-proto = "0.6"
 
 [dev-dependencies]
+# federation's tests spin real axum echo/health servers
+axum = "0.8"
 ctor = "1.0"
 serial_test = "4"
 tempfile = "3.13"

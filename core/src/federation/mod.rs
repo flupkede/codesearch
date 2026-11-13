@@ -18,11 +18,53 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::db_discovery::repos::RemotePeer;
-use crate::index::build_serve_client_with_key;
 
 // Per-peer request timeout when none is configured (`timeout_secs = None`).
 // Shared with the `remote` CLI command via constants (single source of truth).
 use crate::constants::DEFAULT_REMOTE_TIMEOUT_SECS as DEFAULT_TIMEOUT_SECS;
+
+/// Build a `reqwest::Client` configured for talking to a running `codesearch serve`
+/// instance with an explicit API key.
+///
+/// If `key` is `Some` (non-empty enforced by the caller), the key is attached as
+/// `Authorization: Bearer <key>` to *every* request the client makes. This is required:
+/// - when serve is bound to a non-localhost address (the `require_auth_for_network`
+///   middleware guards ALL endpoints, including `/health`), and
+/// - for management endpoints (`POST /repos`, `DELETE /repos/{alias}`,
+///   `POST /repos/{alias}/reindex`, `POST /reload`) when serve is bound to
+///   localhost with the key set.
+///
+/// Without this, delegation to a network-bound serve returns 401 and falls back
+/// to local indexing, risking LMDB file-lock conflicts. See issue #132.
+///
+/// The inner builder treats any `Some(key)` literally — it does NOT trim or
+/// filter empties. That filtering is the responsibility of the outer
+/// `build_serve_client` (which reads the env var, `.trim()`s, and filters
+/// empties before calling this function).
+pub fn build_serve_client_with_key(
+    timeout: std::time::Duration,
+    key: Option<&str>,
+) -> std::result::Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+
+    if let Some(k) = key {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let auth_value =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", k)).map_err(|e| {
+                format!(
+                    "invalid {} value: {}",
+                    crate::constants::SERVE_API_KEY_ENV,
+                    e
+                )
+            })?;
+        headers.insert(reqwest::header::AUTHORIZATION, auth_value);
+        builder = builder.default_headers(headers);
+    }
+
+    builder
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {}", e))
+}
 
 /// Whether an HTTP status from a remote peer is transient — likely a
 /// scale-to-zero cold start (503) or a short gateway hiccup (502/504) — and

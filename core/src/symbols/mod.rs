@@ -187,7 +187,7 @@ pub struct SymbolAmbiguity {
 /// fails. Non-fatal BY DESIGN: a transient Windows git failure (see the
 /// `GitHeadWatcher` note in `src/watch/mod.rs`) must never take down a
 /// response that only wanted the fingerprint.
-pub(crate) fn current_git_head(repo_root: &Path) -> Option<String> {
+pub fn current_git_head(repo_root: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_root)
@@ -360,7 +360,7 @@ pub enum RebuildScope {
 /// queries avoids per-operation open/close churn, which on Windows leaks two
 /// kernel mutex handles per `mdb_env_open`; deletion paths release it via
 /// `lmdb_registry::close_shared_envs_under`.
-pub(crate) fn get_shared_scip_env(
+pub fn get_shared_scip_env(
     db_path: &Path,
 ) -> Result<std::sync::Arc<crate::lmdb_registry::TrackedEnv>> {
     let scip_dir = db_path.join("scip");

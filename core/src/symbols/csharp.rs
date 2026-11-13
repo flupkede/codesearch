@@ -341,7 +341,7 @@ pub struct RestoreExhaustedError {
 }
 
 /// True when `e` is the typed restore-exhausted outcome.
-pub(crate) fn is_restore_exhausted(e: &anyhow::Error) -> bool {
+pub fn is_restore_exhausted(e: &anyhow::Error) -> bool {
     e.downcast_ref::<RestoreExhaustedError>().is_some()
 }
 
@@ -379,7 +379,7 @@ pub(super) fn restore_pending_flag_clear(db_path: &Path) {
 
 /// Caller-facing warning find_impact attaches to every answer from an index
 /// whose rebuild is waiting out a restore.
-pub(crate) const RESTORE_PENDING_INDEX_WARNING: &str =
+pub const RESTORE_PENDING_INDEX_WARNING: &str =
     "dotnet restore in progress — index refresh pending; this answer comes from the previous index.";
 
 /// Per-symbol warning persisted when a lazy find-refs is refused mid-restore:
@@ -636,7 +636,7 @@ impl Drop for LiveHelperChild {
 /// statics are not dropped at process exit, so the RAII guard alone cannot
 /// cover the 'q'/Ctrl-C path. A PID whose process already exited fails the
 /// kill harmlessly.
-pub(crate) fn kill_live_helper_children() {
+pub fn kill_live_helper_children() {
     let pids: Vec<u32> = match LIVE_HELPER_PIDS.lock() {
         Ok(mut set) => set.drain().collect(),
         Err(_) => return,

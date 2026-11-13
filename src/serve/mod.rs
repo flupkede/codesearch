@@ -6788,7 +6788,7 @@ pub async fn run_tui_standalone(serve_url: String, api_key_override: Option<Stri
 
     let api_key = api_key_override.or_else(|| resolve_api_key_for_url(&serve_url));
 
-    let client = match crate::index::build_serve_client_with_key(
+    let client = match crate::federation::build_serve_client_with_key(
         std::time::Duration::from_secs(10),
         api_key.as_deref(),
     ) {

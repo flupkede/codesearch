@@ -28,8 +28,8 @@ ctrlc = "3.4"
 anyhow = "1.0"
 thiserror = "2.0"
 
-# ML & Embeddings — moved to codesearch-core with the embed/rerank stack (stage 5)
-# ndarray / hf-hub stay listed: zero direct uses found, kept for a later sweep
+# ML & Embeddings — moved to codesearch-core with the embed/rerank stack (stage 5);
+# ndarray / hf-hub are gone from the root (transitive-only via fastembed)
 
 # Vector DB (temporarily commented due to dep conflicts)
 # lancedb = "0.5"
@@ -99,10 +99,8 @@ heed = { version = "0.23", features = ["longer-keys"] }
 # Wire-compat: use config::legacy() only — bincode-1 bytes on disk, pinned
 # byte-exact by the golden tests in symbols/{csharp,typescript}.rs.
 bincode = { version = "2.0", features = ["serde"] }
-# SCIP symbol indexing — parses standard SCIP protobuf (.scip) emitted by
-# Sourcegraph indexers (e.g. scip-typescript) for the TypeScript symbol adapter.
-scip = "0.10"
-protobuf = "3.7"
+# SCIP symbol indexing — moved to codesearch-core with symbols/
+# bincode stays root: mcp integration tests encode legacy bytes directly
 # Aikido 34247111: 1.8.0 carries 5 advisories (CVE-2026-64684/317735/617985 + 2 more).
 # 3.x keeps legacy initialize/session behavior by default (ProtocolVersion::LATEST stays
 # V_2025_11_25); the 2026-07-28 stateless lifecycle is opt-in and NOT enabled here.

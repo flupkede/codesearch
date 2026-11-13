@@ -270,7 +270,7 @@ struct PoolEntry {
     last_used: Instant,
 }
 
-pub(crate) struct WorkspacePool {
+pub struct WorkspacePool {
     /// Keyed by solution path (the workspace identity).
     entries: Mutex<HashMap<PathBuf, PoolEntry>>,
     /// Per-key spawn mutexes: two concurrent lookups on the SAME repo must
@@ -458,7 +458,7 @@ impl WorkspacePool {
     /// never dropped at process exit, so neither the [`ServeClient::Drop`]
     /// kill nor TTL reaping runs there; without this a `scip-csharp serve`
     /// child keeps waiting on its stdin pipe after the host is gone.
-    pub(crate) fn kill_all(&self) {
+    pub fn kill_all(&self) {
         let victims: Vec<Arc<dyn ClientLike>> = {
             let mut entries = self.entries.lock().expect("workspace pool poisoned");
             entries.drain().map(|(_, e)| e.client).collect()
@@ -565,24 +565,23 @@ fn env_resolved<T: std::str::FromStr>(env: &str, default: T) -> T {
 
 /// The process-global pool. Config comes from env at first use (same pattern
 /// as the find_impact budget resolver).
-pub(crate) static WORKSPACE_POOL: std::sync::LazyLock<WorkspacePool> =
-    std::sync::LazyLock::new(|| {
-        let spawn: SpawnFn = Box::new(|helper: &Path, solution: &Path, heap_cap: u64| {
-            Ok(Arc::new(ServeClient::spawn(helper, solution, heap_cap)?))
-        });
-        WorkspacePool::new(
-            env_resolved(
-                crate::constants::SCIP_MAX_RESIDENT_WORKSPACES_ENV,
-                crate::constants::DEFAULT_SCIP_MAX_RESIDENT_WORKSPACES,
-            ),
-            Duration::from_secs(env_resolved(
-                crate::constants::SCIP_WORKSPACE_IDLE_SECS_ENV,
-                crate::constants::DEFAULT_SCIP_WORKSPACE_IDLE_SECS,
-            )),
-            env_resolved(
-                crate::constants::SCIP_WORKSPACE_HEAP_CAP_ENV,
-                crate::constants::DEFAULT_SCIP_WORKSPACE_HEAP_CAP,
-            ),
-            spawn,
-        )
+pub static WORKSPACE_POOL: std::sync::LazyLock<WorkspacePool> = std::sync::LazyLock::new(|| {
+    let spawn: SpawnFn = Box::new(|helper: &Path, solution: &Path, heap_cap: u64| {
+        Ok(Arc::new(ServeClient::spawn(helper, solution, heap_cap)?))
     });
+    WorkspacePool::new(
+        env_resolved(
+            crate::constants::SCIP_MAX_RESIDENT_WORKSPACES_ENV,
+            crate::constants::DEFAULT_SCIP_MAX_RESIDENT_WORKSPACES,
+        ),
+        Duration::from_secs(env_resolved(
+            crate::constants::SCIP_WORKSPACE_IDLE_SECS_ENV,
+            crate::constants::DEFAULT_SCIP_WORKSPACE_IDLE_SECS,
+        )),
+        env_resolved(
+            crate::constants::SCIP_WORKSPACE_HEAP_CAP_ENV,
+            crate::constants::DEFAULT_SCIP_WORKSPACE_HEAP_CAP,
+        ),
+        spawn,
+    )
+});

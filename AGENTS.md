@@ -68,8 +68,9 @@ the CLI keeps semver + auto-bump.
 Stages: 1 plan (this) · 2 workspace shell · 3 plumbing layer · 4 chunker ·
 5 retrieval + embed stack + SharedStores split (merged 5+6: embed/cache.rs needs
 vectordb::merge_metadata_atomic AND vectordb/store.rs needs embed::EmbeddedChunk —
-mutual coupling, one stage or none) · 7 symbols/federation/db_discovery ·
-8 mcp + ServeHandle inversion · 9 dep inheritance + features + facade sweep ·
-10 full validation trio · 11 CI + Dockerfile + CHANGELOG + README + drop
-branch-local agent files · 12 push + PR (--base develop). Per-stage validation:
-cargo fmt --check + clippy -D warnings (background, output to file); full trio in stage 10.
+mutual coupling, one stage or none) · 6 symbols/federation (+ build_serve_client_with_key
+moves in from index/mod.rs; db_discovery already core since stage 3) · 7 mcp + ServeHandle
+inversion · 8 dep inheritance + features + facade sweep · 9 full validation trio ·
+10 CI + Dockerfile + CHANGELOG + README + drop branch-local agent files · 11 push + PR
+(--base develop). Per-stage validation: cargo fmt --check + clippy -D warnings (background,
+output to file); full trio in stage 9.
