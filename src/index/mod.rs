@@ -22,9 +22,9 @@ pub use manager::{
     SymbolRebuildSignal,
 };
 // Store-open mechanics live in core; re-exported so `crate::index::` call
-// sites (serve, mcp, tests) stay valid. The lock fns are reachable directly
+// sites (serve, mcp, tests) stay valid. The lock fn is reachable directly
 // via codesearch_core::index; no crate-internal callers.
-pub use codesearch_core::index::{is_database_locked, SharedStores};
+pub use codesearch_core::index::SharedStores;
 
 mod build_log;
 pub use build_log::BuildLog;

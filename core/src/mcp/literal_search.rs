@@ -154,7 +154,7 @@ impl CodesearchService {
         }
     }
 
-    pub(crate) async fn literal_search(
+    pub async fn literal_search(
         &self,
         Parameters(request): Parameters<LiteralSearchRequest>,
     ) -> Result<CallToolResult, McpError> {

@@ -14,10 +14,14 @@
 #[path = "tests.rs"]
 mod tests;
 
+pub mod serve_handle;
+pub use serve_handle::ServeHandle;
+pub mod status_snapshot;
+
 pub mod types;
 
 /// Resolve the serve base URL from env or default host/port.
-fn serve_url_from_env() -> String {
+pub fn serve_url_from_env() -> String {
     use crate::constants::resolve_serve_host;
     let host = resolve_serve_host();
     let port = std::env::var(crate::constants::SERVE_PORT_ENV)
@@ -25,6 +29,59 @@ fn serve_url_from_env() -> String {
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(crate::constants::DEFAULT_SERVE_PORT);
     format!("http://{}:{}", host, port)
+}
+
+/// Build a `file://` URI from an absolute path (`C:\repo` → `file:///C:/repo`).
+pub fn file_uri_from_path(path: &Path) -> String {
+    let normalized = crate::cache::normalize_path(path);
+    if normalized.starts_with('/') {
+        format!("file://{normalized}")
+    } else {
+        format!("file:///{normalized}")
+    }
+}
+
+/// MCP server mode: how `codesearch mcp` connects to the index backend.
+///
+/// - **Auto** — If `codesearch serve` is running, connect as an HTTP client;
+///   otherwise fall back to local stdio mode.
+/// - **Client** — Always connect to `codesearch serve` via HTTP; fail if not running.
+/// - **Local** — Always use local DB in stdio mode (classic behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpMode {
+    /// Connect to serve if available, otherwise local.
+    #[default]
+    Auto,
+    /// Always connect to serve; fail if unreachable.
+    Client,
+    /// Always use local DB (stdio).
+    Local,
+}
+
+impl std::fmt::Display for McpMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpMode::Auto => write!(f, "auto"),
+            McpMode::Client => write!(f, "client"),
+            McpMode::Local => write!(f, "local"),
+        }
+    }
+}
+
+impl std::str::FromStr for McpMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(McpMode::Auto),
+            "client" => Ok(McpMode::Client),
+            "local" => Ok(McpMode::Local),
+            other => Err(format!(
+                "invalid MCP mode '{}': must be 'auto', 'client', or 'local'",
+                other
+            )),
+        }
+    }
 }
 
 /// Configured vector-store lock wait for MCP handlers.
@@ -45,7 +102,7 @@ fn store_lock_wait() -> std::time::Duration {
 /// unbounded wait therefore pinned stores open long after the client gave
 /// up; the bound turns that into a retryable "store busy" error and lets
 /// eviction proceed.
-pub(crate) async fn bounded_vector_read(
+pub async fn bounded_vector_read(
     lock: &tokio::sync::RwLock<VectorStore>,
 ) -> Result<tokio::sync::RwLockReadGuard<'_, VectorStore>> {
     let wait = store_lock_wait();
@@ -61,7 +118,7 @@ pub(crate) async fn bounded_vector_read(
 /// Acquire the FTS-store read lock with a bounded wait — the same rationale
 /// as `bounded_vector_read`, mirrored for the other lock a live indexing
 /// batch holds for its duration.
-pub(crate) async fn bounded_fts_read(
+pub async fn bounded_fts_read(
     lock: &tokio::sync::RwLock<FtsStore>,
 ) -> Result<tokio::sync::RwLockReadGuard<'_, FtsStore>> {
     let wait = store_lock_wait();
@@ -163,11 +220,12 @@ use crate::symbols::SymbolIndexerRegistry;
 use crate::vectordb::VectorStore;
 use anyhow::{Context, Result};
 use regex::Regex;
+pub use rmcp::ErrorData as McpError;
 use rmcp::{
     handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
-    tool_handler, tool_router, ErrorData as McpError, ServerHandler,
+    tool_handler, tool_router, ServerHandler,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -185,22 +243,20 @@ mod graph;
 mod helpers;
 mod instructions;
 mod literal_search;
-mod proxy;
+pub mod proxy;
 mod responses;
-mod runtime;
 mod search;
 mod status;
 
 // Re-export the extracted modules' items so every existing path keeps working:
 // `super::X` from sibling test files and `crate::mcp::X` from serve/cli.
 pub(crate) use federation_helpers::*;
-pub(crate) use find_impact::rest_find_impact_handler;
 pub(crate) use helpers::*;
 pub(crate) use instructions::*;
 pub(crate) use responses::*;
-pub use runtime::*;
-/// The projects-measure pass for the serve status-snapshot background task.
-pub(crate) use status::compute_projects_snapshot;
+/// The projects-measure pass for the serve status-snapshot background task
+/// (serve calls it cross-crate via the facade).
+pub use status::compute_projects_snapshot;
 
 /// Re-order lexical `usages` hits so source-code paths come before everything
 /// else (docs, configs, markdown). Stable: score order is preserved within
@@ -282,7 +338,7 @@ pub struct CodesearchService {
     // Shared stores for concurrent access (optional - only set when running with IndexManager)
     shared_stores: Option<Arc<SharedStores>>,
     // Serve-mode state (set when running inside `codesearch serve`)
-    serve_state: Option<Arc<crate::serve::ServeState>>,
+    serve_state: Option<Arc<dyn ServeHandle>>,
     // Shared symbol indexer registry — reused across MCP sessions to preserve
     // helper-detection cache. In serve mode, cloned from ServeState; in
     // standalone mode, a locally owned Arc.
@@ -338,7 +394,7 @@ impl Drop for CodesearchService {
 /// Outcome of resolving the embedding model for a query target.
 ///
 /// See [`CodesearchService::resolve_query_model`].
-pub(crate) struct QueryModel {
+pub struct QueryModel {
     /// The model the query must be embedded with.
     pub model: EmbeddingModel,
     /// A caller-facing warning, set when the target index records no model and
@@ -1052,7 +1108,7 @@ impl CodesearchService {
     ///
     /// In serve mode, the service does not have a single local DB; instead
     /// it routes requests to the repo identified by `project`/`group`.
-    pub(crate) fn new_for_serve(serve_state: Arc<crate::serve::ServeState>) -> Result<Self> {
+    pub fn new_for_serve(serve_state: Arc<dyn ServeHandle>) -> Result<Self> {
         let symbol_registry = serve_state.symbol_registry();
         // Seed the service with the serve-wide default model (`serve --model`),
         // the same value `POST /repos` stamps into a newly created index, so the
@@ -1083,7 +1139,7 @@ impl CodesearchService {
     /// it calls `session_connected()` and then this. Per-request REST services
     /// built via `make_service` must NOT — they never increment the counter, so
     /// decrementing it on drop would underflow `active_sessions` to `u64::MAX`.
-    pub(crate) fn mark_session_tracked(&mut self) {
+    pub fn mark_session_tracked(&mut self) {
         self.tracks_session = true;
     }
 
@@ -1098,7 +1154,7 @@ impl CodesearchService {
     /// metadata in stdio mode, the serve default in serve mode (the scope-free
     /// status summary). Prefer [`Self::resolve_query_model`] when the caller can
     /// surface the unrecorded-model warning.
-    pub(crate) fn query_model(&self, alias: Option<&str>) -> EmbeddingModel {
+    pub fn query_model(&self, alias: Option<&str>) -> EmbeddingModel {
         self.resolve_query_model(alias).model
     }
 
@@ -1114,7 +1170,7 @@ impl CodesearchService {
     /// moment an operator set it (a 384-dim index queried with a 768-dim model
     /// fails, and a same-dimension model degrades rankings silently). The
     /// returned warning names the repo, the assumption, and the re-index command.
-    pub(crate) fn resolve_query_model(&self, alias: Option<&str>) -> QueryModel {
+    pub fn resolve_query_model(&self, alias: Option<&str>) -> QueryModel {
         if let (Some(state), Some(alias)) = (self.serve_state.as_ref(), alias) {
             if let Some(model) = state.model_for_alias(alias) {
                 return QueryModel {
@@ -1527,7 +1583,7 @@ impl CodesearchService {
     /// maps each worktree alias to its family's main-tree alias — searching a
     /// worktree alias means the main tree (and its siblings) answer through the
     /// same identity, and a group over the family collapses duplicate hits.
-    pub(crate) fn format_scope_error(&self) -> String {
+    pub fn format_scope_error(&self) -> String {
         let (projects, mut groups, project_groups, worktree_families) =
             if let Some(ref serve_state) = self.serve_state {
                 let cfg = serve_state.config_snapshot();
@@ -2313,138 +2369,6 @@ fn contains_symbol_as_word(sig: &str, symbol: &str) -> bool {
         }
     }
     false
-}
-
-// ════════════════════════════════════════════════════════════════
-// REST API handlers (federation-friendly HTTP+JSON mirror of MCP tools).
-//
-// Expose the same logic over plain HTTP so a remote codesearch serve can be
-// queried for federation WITHOUT an MCP session. Each handler constructs a
-// throwaway `CodesearchService` bound to the live `ServeState`, invokes the
-// existing `#[tool]` method, and returns the tool's JSON payload unwrapped
-// from `CallToolResult`. Protected by serve's `require_auth_for_network`
-// layer (same as /status, /mcp) — no separate auth code needed.
-// ════════════════════════════════════════════════════════════════
-use axum::extract::{Path as AxumPath, Query as AxumQuery, State as AxumState};
-use axum::http::StatusCode;
-use axum::response::Json as AxumJson;
-
-type RestResponse = AxumJson<serde_json::Value>;
-type RestError = (StatusCode, AxumJson<serde_json::Value>);
-
-/// Unwrap a `CallToolResult` into the JSON a federation client wants.
-///
-/// `CallToolResult` carries its payload as `ContentBlock::text(json_string)`. The
-/// normal case for search/find/explore/get_chunk is a single text item whose
-/// value parses as JSON, so we parse it back and return the structured value
-/// (clients get clean objects instead of a JSON-in-string). When the tool set
-/// `is_error` (e.g. a `scope_required` error) we still parse the body but mark
-/// it with `"_mcp_is_error": true` so a federation caller can distinguish tool
-/// errors from HTTP errors. Non-JSON payloads fall back to `{content, is_error}`.
-pub(crate) fn call_tool_result_to_json(result: CallToolResult) -> serde_json::Value {
-    let is_error = result.is_error.unwrap_or(false);
-    let val = serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({}));
-    let text = val
-        .get("content")
-        .and_then(|c| c.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(mut parsed) => {
-            if is_error {
-                if let Some(obj) = parsed.as_object_mut() {
-                    obj.insert("_mcp_is_error".into(), serde_json::json!(true));
-                }
-            }
-            parsed
-        }
-        Err(_) => serde_json::json!({ "content": text, "is_error": is_error }),
-    }
-}
-
-/// Build a per-request `CodesearchService` bound to the live serve state.
-fn make_service(
-    state: &std::sync::Arc<crate::serve::ServeState>,
-) -> Result<CodesearchService, RestError> {
-    CodesearchService::new_for_serve(state.clone()).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            AxumJson(serde_json::json!({"error": format!("failed to build service: {e}")})),
-        )
-    })
-}
-
-/// Map an MCP-layer error to an HTTP 500. `McpError` (= `rmcp::ErrorData`)
-/// derives `Serialize`, so round-trip it through a JSON value for the body.
-fn mcp_err_to_http(e: McpError) -> RestError {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        AxumJson(serde_json::json!({
-            "error": serde_json::to_value(&e).unwrap_or(serde_json::Value::Null)
-        })),
-    )
-}
-
-pub(crate) async fn rest_search_handler(
-    AxumState(state): AxumState<std::sync::Arc<crate::serve::ServeState>>,
-    AxumJson(req): AxumJson<SearchRequest>,
-) -> Result<RestResponse, RestError> {
-    let service = make_service(&state)?;
-    let result = service
-        .search(Parameters(req))
-        .await
-        .map_err(mcp_err_to_http)?;
-    Ok(AxumJson(call_tool_result_to_json(result)))
-}
-
-pub(crate) async fn rest_find_handler(
-    AxumState(state): AxumState<std::sync::Arc<crate::serve::ServeState>>,
-    AxumJson(req): AxumJson<FindRequest>,
-) -> Result<RestResponse, RestError> {
-    let service = make_service(&state)?;
-    let result = service
-        .find(Parameters(req))
-        .await
-        .map_err(mcp_err_to_http)?;
-    Ok(AxumJson(call_tool_result_to_json(result)))
-}
-
-pub(crate) async fn rest_explore_handler(
-    AxumState(state): AxumState<std::sync::Arc<crate::serve::ServeState>>,
-    AxumJson(req): AxumJson<ExploreRequest>,
-) -> Result<RestResponse, RestError> {
-    let service = make_service(&state)?;
-    let result = service
-        .explore(Parameters(req))
-        .await
-        .map_err(mcp_err_to_http)?;
-    Ok(AxumJson(call_tool_result_to_json(result)))
-}
-
-pub(crate) async fn rest_get_chunk_handler(
-    AxumState(state): AxumState<std::sync::Arc<crate::serve::ServeState>>,
-    AxumPath(chunk_id): AxumPath<u32>,
-    AxumQuery(params): AxumQuery<std::collections::HashMap<String, String>>,
-) -> Result<RestResponse, RestError> {
-    let req = GetChunkRequest {
-        chunk_id,
-        chunk_ref: params.get("chunk_ref").cloned(),
-        context_lines: params.get("context_lines").and_then(|s| s.parse().ok()),
-        project: params.get("project").cloned(),
-        cwd: None,
-        group: params.get("group").cloned(),
-    };
-    let service = make_service(&state)?;
-    let result = service
-        .get_chunk(Parameters(req))
-        .await
-        .map_err(mcp_err_to_http)?;
-    Ok(AxumJson(call_tool_result_to_json(result)))
 }
 
 impl CodesearchService {

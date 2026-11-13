@@ -16,7 +16,7 @@ impl CodesearchService {
         PathBuf::from(file.to_string_lossy().replace('\\', "/"))
     }
 
-    pub(crate) async fn find_imports(
+    pub async fn find_imports(
         &self,
         Parameters(request): Parameters<FindImportsRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -281,7 +281,7 @@ impl CodesearchService {
         })
     }
 
-    pub(crate) async fn find_dependents(
+    pub async fn find_dependents(
         &self,
         Parameters(request): Parameters<FindDependentsRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -548,7 +548,7 @@ impl CodesearchService {
     }
 
     /// Internal: find similar chunks, used by `explore(kind="similar")`.
-    pub(crate) async fn similar_chunks(
+    pub async fn similar_chunks(
         &self,
         Parameters(request): Parameters<SimilarChunksRequest>,
     ) -> Result<CallToolResult, McpError> {

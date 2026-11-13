@@ -20,6 +20,7 @@ pub mod index;
 pub mod limits;
 pub mod lmdb_registry;
 pub mod logger;
+pub mod mcp;
 pub mod output;
 pub mod rerank;
 pub mod search;

@@ -800,6 +800,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arroy",
+ "async-trait",
  "axum",
  "bincode 2.0.1",
  "chrono",
@@ -819,6 +820,8 @@ dependencies = [
  "rand 0.10.3",
  "regex",
  "reqwest 0.13.5",
+ "rmcp",
+ "schemars",
  "scip",
  "serde",
  "serde_json",

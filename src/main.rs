@@ -1,7 +1,6 @@
 mod bench;
 mod cli;
 mod index;
-mod mcp;
 mod search;
 mod serve;
 mod watch;

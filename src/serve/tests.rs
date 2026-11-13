@@ -2115,23 +2115,23 @@ async fn rest_routes_are_registered() {
         )
         .route(
             crate::constants::SEARCH_PATH,
-            axum::routing::post(crate::mcp::rest_search_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_search_handler),
         )
         .route(
             crate::constants::FIND_PATH,
-            axum::routing::post(crate::mcp::rest_find_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_find_handler),
         )
         .route(
             crate::constants::EXPLORE_PATH,
-            axum::routing::post(crate::mcp::rest_explore_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_explore_handler),
         )
         .route(
             crate::constants::CHUNK_PATH,
-            axum::routing::get(crate::mcp::rest_get_chunk_handler),
+            axum::routing::get(crate::serve::rest_mirrors::rest_get_chunk_handler),
         )
         .route(
             crate::constants::FIND_IMPACT_PATH,
-            axum::routing::post(crate::mcp::rest_find_impact_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_find_impact_handler),
         )
         .with_state(state);
 
@@ -5277,7 +5277,7 @@ async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
     };
     // The REST mirror builds its own serve-mode service from the state —
     // the same path the MCP tool takes for a project-scoped query.
-    let v = crate::mcp::rest_find_impact_handler(
+    let v = crate::serve::rest_mirrors::rest_find_impact_handler(
         axum::extract::State(state.clone()),
         axum::Json(request),
     )

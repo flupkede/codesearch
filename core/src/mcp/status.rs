@@ -20,9 +20,7 @@ const LOCK_STATUS_AVAILABLE: &str = "available";
 /// — the ONLY place these per-repo probes (metadata reads, try_read stats,
 /// lock detection) run. `list_projects` answers from the stored result and
 /// must never call this on the request path.
-pub(crate) fn compute_projects_snapshot(
-    serve_state: &crate::serve::ServeState,
-) -> (Vec<RepoInfo>, Vec<String>) {
+pub fn compute_projects_snapshot(serve_state: &dyn ServeHandle) -> (Vec<RepoInfo>, Vec<String>) {
     let config = serve_state.config_snapshot();
     let project_groups = config.project_groups();
     let mut repos_info = Vec::new();
@@ -124,7 +122,7 @@ impl CodesearchService {
         ),
         description = "Unified status/info tool. Set `kind` to choose the action:\n\n- `index` (default): get the status of the local search index (model info, chunk count, readiness)\n- `projects`: list all registered projects/repositories, groups, and their index status"
     )]
-    pub(crate) async fn status(
+    pub async fn status(
         &self,
         Parameters(request): Parameters<StatusRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -147,7 +145,7 @@ impl CodesearchService {
     /// The status `model` field used to be the service's own model — the
     /// hardcoded default in serve mode — so every repo read as `minilm-l6-q`
     /// even when indexed with EmbeddingGemma. See the serve query-model fix.
-    pub(crate) fn group_model_label(&self, aliases: &[String]) -> String {
+    pub fn group_model_label(&self, aliases: &[String]) -> String {
         let mut common: Option<EmbeddingModel> = None;
         for alias in aliases {
             let model = self.query_model(Some(alias));
@@ -208,15 +206,21 @@ impl CodesearchService {
                 let statuses = &snap.repos;
                 let open_count = statuses
                     .iter()
-                    .filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Open))
+                    .filter(|(_, r)| {
+                        matches!(r.status, super::status_snapshot::RepoStateLabel::Open)
+                    })
                     .count();
                 let warm_count = statuses
                     .iter()
-                    .filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Warm))
+                    .filter(|(_, r)| {
+                        matches!(r.status, super::status_snapshot::RepoStateLabel::Warm)
+                    })
                     .count();
                 let idle_count = statuses
                     .iter()
-                    .filter(|(_, r)| matches!(r.status, crate::serve::RepoStateLabel::Idle))
+                    .filter(|(_, r)| {
+                        matches!(r.status, super::status_snapshot::RepoStateLabel::Idle)
+                    })
                     .count();
                 // Counting logic lives in `aggregate_serve_index_status`
                 // (responses.rs): idle repos still have their index on disk

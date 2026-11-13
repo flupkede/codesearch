@@ -20,7 +20,7 @@ impl CodesearchService {
         ),
         description = "Retrieve the full content of a specific chunk by its ID, plus optional surrounding lines for context.\nUse this after search or explore to read the actual code without loading the whole file.\n\nUSE FOR: reading a specific function/class body after finding it via search.\nSet context_lines (default 0, max 20) to include lines before and after the chunk.\n\nIMPORTANT (multi-repo): chunk_ids are local to each repository and are NOT globally unique.\nWhen `project` is omitted in multi-repo mode, the tool scans all repositories for the chunk_id.\nIf found in exactly one repo, it is returned automatically. If found in multiple repos, an `ambiguous_chunk_id` error lists the candidates so you can retry with `project`."
     )]
-    pub(crate) async fn get_chunk(
+    pub async fn get_chunk(
         &self,
         Parameters(request): Parameters<GetChunkRequest>,
     ) -> Result<CallToolResult, McpError> {

@@ -5,6 +5,10 @@ use clap::{
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
+mod mcp_runtime;
+
+use mcp_runtime::{run_mcp_server, run_mcp_server_with_options, McpStartupOptions};
+
 use crate::constants::{
     DEFAULT_SERVE_URL, REPO_REINDEX_PATH_PREFIX, REPO_REINDEX_PATH_SUFFIX, SERVE_PORT_ENV,
 };
@@ -1380,9 +1384,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             // MCP stdio transport uses stdout for JSON-RPC — always force file-only
             // logging to keep the channel clean, regardless of the global --quiet flag.
             if readonly || require_ready {
-                crate::mcp::run_mcp_server_with_options(
+                run_mcp_server_with_options(
                     path,
-                    crate::mcp::McpStartupOptions {
+                    McpStartupOptions {
                         create_index,
                         readonly,
                         require_ready,
@@ -1394,8 +1398,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 )
                 .await
             } else {
-                crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token)
-                    .await
+                run_mcp_server(path, create_index, log_level, true, mode, cancel_token).await
             }
         }
         Commands::Cache { command } => match command {

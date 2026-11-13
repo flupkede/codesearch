@@ -65,7 +65,7 @@ fn restamp_complete_response(mut response: CallToolResponse) -> CallToolResponse
 /// instead of waiting for the failure-path reconnect cadence. The existing
 /// bounded retry-with-backoff remains the fallback if that connect does not land
 /// within the retry budget.
-pub(crate) struct McpProxyService {
+pub struct McpProxyService {
     /// Shared peer handle — hot-swapped on reconnect.
     /// `None` means we're reconnecting to serve; tool calls return a retry-able error.
     pub(crate) peer: std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>>,
@@ -99,6 +99,29 @@ pub(crate) struct McpProxyService {
     pub(crate) connect_failed: Arc<tokio::sync::Notify>,
 }
 
+impl McpProxyService {
+    /// Assemble from the main loop's shared handles (`run_mcp_client` in the
+    /// CLI crate owns the channels; the struct itself is core's).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        peer: std::sync::Arc<tokio::sync::RwLock<Option<rmcp::service::Peer<RoleClient>>>>,
+        disconnect_tx: tokio::sync::mpsc::Sender<()>,
+        connect_request_tx: tokio::sync::mpsc::Sender<()>,
+        last_activity: Arc<Mutex<std::time::Instant>>,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        connect_failed: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            peer,
+            disconnect_tx,
+            connect_request_tx,
+            last_activity,
+            in_flight,
+            connect_failed,
+        }
+    }
+}
+
 /// Keeps `McpProxyService::in_flight` incremented for its lifetime. A guard rather
 /// than paired add/sub calls because the forwarding loop has several early returns.
 struct InFlightGuard(Arc<std::sync::atomic::AtomicUsize>);
@@ -118,7 +141,7 @@ impl Drop for InFlightGuard {
 
 impl McpProxyService {
     #[allow(dead_code)]
-    fn new(peer: rmcp::service::Peer<RoleClient>) -> Self {
+    fn new_from_peer(peer: rmcp::service::Peer<RoleClient>) -> Self {
         // Direct constructor used by tests / single-shot scenarios.
         // No reconnect plumbing — the dummy channels are never read.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -297,7 +320,7 @@ const CONNECT_REFUSAL_GRACE: std::time::Duration =
 /// those pin how `await_peer_bounded` *reacts* to a notification, but nothing
 /// previously pinned that this call site still *fires* one: deleting this
 /// function's body left the full suite green.
-pub(crate) fn note_connect_failure(
+pub fn note_connect_failure(
     connect_failed: &tokio::sync::Notify,
     disconnect_tx: &tokio::sync::mpsc::Sender<()>,
 ) {
@@ -324,7 +347,7 @@ fn is_transport_error_msg(msg: &str) -> bool {
 }
 
 /// Reconnect-related constants for the MCP proxy.
-pub(crate) mod reconnect {
+pub mod reconnect {
     /// How long to wait between reconnect attempts.
     pub const INTERVAL_SECS: u64 = 3;
     /// Maximum total time to spend trying to reconnect before giving up.
@@ -332,7 +355,7 @@ pub(crate) mod reconnect {
 }
 
 /// Record the current instant as the proxy's most recent activity.
-pub(crate) fn mark_proxy_activity(last_activity: &Arc<Mutex<std::time::Instant>>) {
+pub fn mark_proxy_activity(last_activity: &Arc<Mutex<std::time::Instant>>) {
     if let Ok(mut slot) = last_activity.lock() {
         *slot = std::time::Instant::now();
     }
@@ -341,7 +364,7 @@ pub(crate) fn mark_proxy_activity(last_activity: &Arc<Mutex<std::time::Instant>>
 /// Resolve the MCP proxy idle-disconnect window: explicit value → env var →
 /// `DEFAULT_MCP_PROXY_IDLE_DISCONNECT_SECS`. Mirrors how `run_serve` resolves its
 /// own `idle_suspend_secs`. `0` means "never idle-disconnect".
-pub(crate) fn resolve_proxy_idle_disconnect_secs(explicit: Option<u64>) -> u64 {
+pub fn resolve_proxy_idle_disconnect_secs(explicit: Option<u64>) -> u64 {
     explicit
         .or_else(|| {
             std::env::var(crate::constants::MCP_PROXY_IDLE_DISCONNECT_SECS_ENV)
@@ -356,7 +379,7 @@ pub(crate) fn resolve_proxy_idle_disconnect_secs(explicit: Option<u64>) -> u64 {
 /// `threshold_secs == 0` disables idle-disconnect, so this always returns false.
 /// `now` is a parameter (rather than read from the clock) purely so this is unit
 /// testable without sleeping.
-pub(crate) fn is_idle(
+pub fn is_idle(
     last_activity: std::time::Instant,
     threshold_secs: u64,
     now: std::time::Instant,

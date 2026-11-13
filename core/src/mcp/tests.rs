@@ -29,7 +29,6 @@ fn test_mcp_no_raw_stdout_calls() {
         ("instructions.rs", include_str!("instructions.rs")),
         ("responses.rs", include_str!("responses.rs")),
         ("proxy.rs", include_str!("proxy.rs")),
-        ("runtime.rs", include_str!("runtime.rs")),
         ("types.rs", include_str!("types.rs")),
     ];
     let violations: Vec<(String, usize, &str)> = MCP_SOURCES
@@ -3623,116 +3622,6 @@ async fn shared_store_failure_preserves_original_error_without_reopening_lmdb() 
     );
 }
 
-#[test]
-fn prebuilt_index_health_requires_vector_and_full_text_data() {
-    let db_path = std::path::Path::new("/tmp/test-codesearch.db");
-    assert!(super::validate_prebuilt_index_health(db_path, 10, true, 10, false).is_ok());
-
-    for (chunks, indexed, fts_documents, partial) in [
-        (0, true, 10, false),
-        (10, false, 10, false),
-        (10, true, 0, false),
-        (10, true, 10, true),
-    ] {
-        let error =
-            super::validate_prebuilt_index_health(db_path, chunks, indexed, fts_documents, partial)
-                .expect_err("incomplete prebuilt index must fail");
-        assert!(error.to_string().contains("Run `codesearch index`"));
-    }
-}
-
-#[tokio::test]
-async fn require_ready_reads_live_stores_and_rejects_partial_metadata() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let db_path = root.path().join(".codesearch.db");
-    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
-    {
-        let mut vector_store = stores.vector_store.write().await;
-        let chunk = crate::chunker::Chunk::new(
-            "fn ready() {}".to_string(),
-            0,
-            0,
-            crate::chunker::ChunkKind::Function,
-            "src/lib.rs".to_string(),
-        );
-        vector_store
-            .insert_chunks(vec![crate::embed::EmbeddedChunk::new(
-                chunk,
-                vec![0.0, 1.0],
-            )])
-            .expect("insert vector chunk");
-        vector_store.build_index().expect("build vector index");
-    }
-    {
-        let mut fts_store = stores.fts_store.write().await;
-        fts_store
-            .add_chunk(0, "fn ready() {}", "src/lib.rs", None, "Function")
-            .expect("insert FTS document");
-        fts_store.commit().expect("commit FTS document");
-    }
-    std::fs::write(
-        db_path.join("metadata.json"),
-        r#"{"schema_version":1,"dimensions":2,"partial":false}"#,
-    )
-    .expect("complete metadata");
-
-    super::require_prebuilt_index_ready(&stores, &db_path)
-        .await
-        .expect("complete live stores must be ready");
-
-    std::fs::write(
-        db_path.join("metadata.json"),
-        r#"{"schema_version":1,"dimensions":2,"partial":true}"#,
-    )
-    .expect("partial metadata");
-    let error = super::require_prebuilt_index_ready(&stores, &db_path)
-        .await
-        .expect_err("partial index must not be ready");
-    assert!(error.to_string().contains("partial=true"));
-
-    std::fs::write(
-        db_path.join("metadata.json"),
-        r#"{"schema_version":1,"dimensions":2}"#,
-    )
-    .expect("metadata without readiness marker");
-    let error = super::require_prebuilt_index_ready(&stores, &db_path)
-        .await
-        .expect_err("missing partial marker must not be ready");
-    assert!(error
-        .to_string()
-        .contains("missing the partial readiness marker"));
-
-    std::fs::write(
-        db_path.join("metadata.json"),
-        r#"{"schema_version":1,"dimensions":2,"partial":"false"}"#,
-    )
-    .expect("malformed metadata");
-    let error = super::require_prebuilt_index_ready(&stores, &db_path)
-        .await
-        .expect_err("non-boolean partial marker must not be ready");
-    assert!(error.to_string().contains("partial must be a boolean"));
-}
-
-#[test]
-fn local_startup_flags_fail_in_modes_that_would_ignore_them() {
-    for mode in [super::McpMode::Auto, super::McpMode::Client] {
-        assert!(super::validate_local_startup_flags(mode, true, false).is_err());
-        assert!(super::validate_local_startup_flags(mode, false, true).is_err());
-    }
-    assert!(super::validate_local_startup_flags(super::McpMode::Local, true, true).is_ok());
-}
-
-#[test]
-fn readonly_or_require_ready_never_creates_a_missing_index() {
-    assert!(super::may_create_missing_index(true, false, false));
-    assert!(!super::may_create_missing_index(false, false, false));
-    assert!(!super::may_create_missing_index(true, true, false));
-    assert!(!super::may_create_missing_index(true, false, true));
-}
-
-/// Chunks without a built vector index are NOT searchable, and must not read as
-/// `ready`. Regression guard for a rebuild window (and the mixed-state hub the
-/// model migration exposed): `total_chunks > 0` used to be sufficient for
 /// "ready", so `status` said "Index is ready for searching" while every search
 /// failed with "Index not built. Call build_index() after inserting chunks."
 #[test]
@@ -4089,7 +3978,7 @@ fn test_file_uri_round_trip() {
     } else {
         PathBuf::from("/repos/demo")
     };
-    let uri = super::runtime::file_uri_from_path(&p);
+    let uri = super::file_uri_from_path(&p);
     assert!(uri.starts_with("file://"));
     assert_eq!(super::root_uri_to_path(&uri), Some(p));
 }

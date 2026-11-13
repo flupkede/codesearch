@@ -1,11 +1,11 @@
-use super::proxy::{
-    is_idle, mark_proxy_activity, note_connect_failure, reconnect,
-    resolve_proxy_idle_disconnect_secs, McpProxyService,
-};
-use super::{serve_url_from_env, CodesearchService};
 use crate::db_discovery::find_best_database;
 use crate::embed::EmbeddingModel;
 use crate::index::{IndexManager, SharedStores};
+use crate::mcp::proxy::{
+    is_idle, mark_proxy_activity, note_connect_failure, reconnect,
+    resolve_proxy_idle_disconnect_secs, McpProxyService,
+};
+use crate::mcp::{file_uri_from_path, serve_url_from_env, CodesearchService, McpMode};
 use anyhow::{Context, Result};
 use rmcp::RoleClient;
 use std::path::{Path, PathBuf};
@@ -49,63 +49,10 @@ impl rmcp::handler::client::ClientHandler for CwdRootsClientHandler {
     }
 }
 
-/// Build a `file://` URI from an absolute path (`C:\repo` → `file:///C:/repo`).
-pub(crate) fn file_uri_from_path(path: &Path) -> String {
-    let normalized = crate::cache::normalize_path(path);
-    if normalized.starts_with('/') {
-        format!("file://{normalized}")
-    } else {
-        format!("file:///{normalized}")
-    }
-}
-
 // === Server Entry Point ===
 
 /// Run the MCP server using stdio transport with file watching for live index updates.
 ///
-/// MCP server mode: how `codesearch mcp` connects to the index backend.
-///
-/// - **Auto** — If `codesearch serve` is running, connect as an HTTP client;
-///   otherwise fall back to local stdio mode.
-/// - **Client** — Always connect to `codesearch serve` via HTTP; fail if not running.
-/// - **Local** — Always use local DB in stdio mode (classic behavior).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum McpMode {
-    /// Connect to serve if available, otherwise local.
-    #[default]
-    Auto,
-    /// Always connect to serve; fail if unreachable.
-    Client,
-    /// Always use local DB (stdio).
-    Local,
-}
-
-impl std::fmt::Display for McpMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            McpMode::Auto => write!(f, "auto"),
-            McpMode::Client => write!(f, "client"),
-            McpMode::Local => write!(f, "local"),
-        }
-    }
-}
-
-impl std::str::FromStr for McpMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "auto" => Ok(McpMode::Auto),
-            "client" => Ok(McpMode::Client),
-            "local" => Ok(McpMode::Local),
-            other => Err(format!(
-                "invalid MCP mode '{}': must be 'auto', 'client', or 'local'",
-                other
-            )),
-        }
-    }
-}
-
 pub(crate) fn validate_local_startup_flags(
     mode: McpMode,
     readonly: bool,
@@ -303,14 +250,14 @@ async fn run_mcp_client(serve_url: &str, cancel_token: CancellationToken) -> Res
     // Step 1: Start stdio proxy for Claude Desktop.
     // This must happen first so Claude Desktop has something to talk to,
     // even before the serve connection is established.
-    let proxy = McpProxyService {
-        peer: peer_state.clone(),
-        disconnect_tx: disconnect_tx.clone(),
-        connect_request_tx: connect_request_tx.clone(),
-        last_activity: last_activity.clone(),
-        in_flight: in_flight.clone(),
-        connect_failed: connect_failed.clone(),
-    };
+    let proxy = McpProxyService::new(
+        peer_state.clone(),
+        disconnect_tx.clone(),
+        connect_request_tx.clone(),
+        last_activity.clone(),
+        in_flight.clone(),
+        connect_failed.clone(),
+    );
     let server = proxy
         .serve(stdio())
         .await
@@ -836,7 +783,7 @@ pub async fn run_mcp_server_with_options(
         Some(shared_stores.clone()),
     )?;
 
-    tracing::info!("🧠 Model: {}", service.model_type.name());
+    tracing::info!("🧠 Model: {}", service.query_model(None).name());
 
     // START MCP SERVER NOW - fixes timeout!
     tracing::info!(
@@ -945,4 +892,122 @@ pub async fn run_mcp_server_with_options(
 
     tracing::info!("✅ MCP server shut down cleanly");
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_startup_tests {
+
+    #[test]
+    fn prebuilt_index_health_requires_vector_and_full_text_data() {
+        let db_path = std::path::Path::new("/tmp/test-codesearch.db");
+        assert!(super::validate_prebuilt_index_health(db_path, 10, true, 10, false).is_ok());
+
+        for (chunks, indexed, fts_documents, partial) in [
+            (0, true, 10, false),
+            (10, false, 10, false),
+            (10, true, 0, false),
+            (10, true, 10, true),
+        ] {
+            let error = super::validate_prebuilt_index_health(
+                db_path,
+                chunks,
+                indexed,
+                fts_documents,
+                partial,
+            )
+            .expect_err("incomplete prebuilt index must fail");
+            assert!(error.to_string().contains("Run `codesearch index`"));
+        }
+    }
+
+    #[tokio::test]
+    async fn require_ready_reads_live_stores_and_rejects_partial_metadata() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join(".codesearch.db");
+        let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+        {
+            let mut vector_store = stores.vector_store.write().await;
+            let chunk = crate::chunker::Chunk::new(
+                "fn ready() {}".to_string(),
+                0,
+                0,
+                crate::chunker::ChunkKind::Function,
+                "src/lib.rs".to_string(),
+            );
+            vector_store
+                .insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+                    chunk,
+                    vec![0.0, 1.0],
+                )])
+                .expect("insert vector chunk");
+            vector_store.build_index().expect("build vector index");
+        }
+        {
+            let mut fts_store = stores.fts_store.write().await;
+            fts_store
+                .add_chunk(0, "fn ready() {}", "src/lib.rs", None, "Function")
+                .expect("insert FTS document");
+            fts_store.commit().expect("commit FTS document");
+        }
+        std::fs::write(
+            db_path.join("metadata.json"),
+            r#"{"schema_version":1,"dimensions":2,"partial":false}"#,
+        )
+        .expect("complete metadata");
+
+        super::require_prebuilt_index_ready(&stores, &db_path)
+            .await
+            .expect("complete live stores must be ready");
+
+        std::fs::write(
+            db_path.join("metadata.json"),
+            r#"{"schema_version":1,"dimensions":2,"partial":true}"#,
+        )
+        .expect("partial metadata");
+        let error = super::require_prebuilt_index_ready(&stores, &db_path)
+            .await
+            .expect_err("partial index must not be ready");
+        assert!(error.to_string().contains("partial=true"));
+
+        std::fs::write(
+            db_path.join("metadata.json"),
+            r#"{"schema_version":1,"dimensions":2}"#,
+        )
+        .expect("metadata without readiness marker");
+        let error = super::require_prebuilt_index_ready(&stores, &db_path)
+            .await
+            .expect_err("missing partial marker must not be ready");
+        assert!(error
+            .to_string()
+            .contains("missing the partial readiness marker"));
+
+        std::fs::write(
+            db_path.join("metadata.json"),
+            r#"{"schema_version":1,"dimensions":2,"partial":"false"}"#,
+        )
+        .expect("malformed metadata");
+        let error = super::require_prebuilt_index_ready(&stores, &db_path)
+            .await
+            .expect_err("non-boolean partial marker must not be ready");
+        assert!(error.to_string().contains("partial must be a boolean"));
+    }
+
+    #[test]
+    fn local_startup_flags_fail_in_modes_that_would_ignore_them() {
+        for mode in [crate::mcp::McpMode::Auto, crate::mcp::McpMode::Client] {
+            assert!(super::validate_local_startup_flags(mode, true, false).is_err());
+            assert!(super::validate_local_startup_flags(mode, false, true).is_err());
+        }
+        assert!(
+            super::validate_local_startup_flags(crate::mcp::McpMode::Local, true, true).is_ok()
+        );
+    }
+
+    #[test]
+    fn readonly_or_require_ready_never_creates_a_missing_index() {
+        assert!(super::may_create_missing_index(true, false, false));
+        assert!(!super::may_create_missing_index(false, false, false));
+        assert!(!super::may_create_missing_index(true, true, false));
+        assert!(!super::may_create_missing_index(true, false, true));
+    }
 }

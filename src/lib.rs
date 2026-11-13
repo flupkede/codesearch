@@ -1,7 +1,6 @@
 pub mod bench;
 pub mod cli;
 pub mod index;
-pub mod mcp;
 pub mod search;
 pub mod serve;
 pub mod watch;
@@ -11,7 +10,7 @@ pub mod watch;
 // core module (not cfg(test)): test-only modules vanish in dependency builds.
 pub use codesearch_core::{
     cache, chunker, constants, db_discovery, embed, error, federation, file, fts, limits,
-    lmdb_registry, logger, output, rerank, symbols, testing, utils, vectordb,
+    lmdb_registry, logger, mcp, output, rerank, symbols, testing, utils, vectordb,
 };
 // #[macro_export] macros live at the defining crate's root; re-exported so
 // CLI-internal `crate::info_print!` / `crate::warn_print!` keep resolving.

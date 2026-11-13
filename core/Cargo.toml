@@ -46,6 +46,12 @@ clap = { version = "4.5", features = ["derive", "cargo", "env"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 httpdate = "1"
 
+# MCP protocol layer (mcp/ moved in at stage 7): same specs as the CLI's.
+# rmcp resolves through the workspace-root [patch.crates-io] to vendor/rmcp.
+async-trait = "0.1"
+rmcp = { version = "3.3.0", features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros"] }
+schemars = { version = "1.1.0", features = ["derive"] }
+
 # Symbols (symbols/ moved in at stage 6)
 # Wire-compat: use config::legacy() only — bincode-1 bytes on disk, pinned
 # byte-exact by the golden tests in symbols/{csharp,typescript}.rs.

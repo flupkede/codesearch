@@ -31,7 +31,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 pub mod repos;
 
-use repos::ReposConfig;
+pub use repos::ReposConfig;
 
 /// Information about a discovered database
 #[derive(Debug, Clone, Serialize, Deserialize)]

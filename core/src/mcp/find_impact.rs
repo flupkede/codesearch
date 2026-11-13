@@ -43,7 +43,7 @@ pub(crate) enum ImpactLookupOutcome {
 /// hinted by the busy answer is served warm. `budget_secs == 0` disables the
 /// race entirely. Kept generic over the future so tests can plant a sleeping
 /// handler instead of a real SCIP helper.
-pub(crate) async fn find_impact_with_budget<F>(
+pub async fn find_impact_with_budget<F>(
     budget_secs: u64,
     state: String,
     lookup: F,
@@ -153,7 +153,7 @@ impl CodesearchService {
         ),
         description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nWARNINGS: a resolved answer may carry a `\"warnings\": [\"...\"]` array — non-empty means the reference list may be INCOMPLETE because a helper failure was survived rather than fatal (a project that failed to compile, an exception during reference resolution, a non-zero scip-typescript exit). Each entry names what failed. Treat warnings as a prompt to reindex the project (or cross-check with `find` `kind=\"usages\"`) before concluding \"no callers\" — absent or empty means the answer is as complete as the index knows.\n\nSYMBOL INDEX: resolved and empty answers carry `\"symbol_index\": [{\"language\", \"state\", \"age_seconds\", ...}]` — the state of the SCIP index that produced the answer (`ready` | `degraded` | `stale` | `restore-pending` | `absent`). Check it before trusting `references: []`: `absent`/`stale`/`restore-pending` means the empty answer reflects an unusable or outdated index, not verified absence of callers — trigger/await a reindex and re-call instead of concluding.\n\nLANGUAGE: if `language` is omitted, position lookups auto-detect it from the file extension; with several SCIP helpers installed the answer asks you to name one — pass `language` to avoid the round-trip.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
-    async fn find_impact(
+    pub async fn find_impact(
         &self,
         Parameters(request): Parameters<FindImpactRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -327,7 +327,7 @@ impl CodesearchService {
                 let alias_heal = alias.clone();
                 let lang_heal = indexer.language().to_string();
                 tokio::spawn(async move {
-                    crate::serve::heal_missing_symbol_index(&st, &alias_heal, &lang_heal).await;
+                    st.heal_missing_symbol_index(&alias_heal, &lang_heal).await;
                 });
             }
         }
@@ -742,23 +742,3 @@ mod find_impact_tests;
 // under src/mcp/find_impact/, and the file stays at src/mcp/.
 #[path = "find_impact_tracker.rs"]
 mod find_impact_tracker;
-
-// ── REST mirror ──
-// Defined here rather than beside the other rest_* handlers in the parent
-// module because it calls the #[tool] method above, which is private to
-// this module; the parent would need its visibility widened instead.
-
-/// REST mirror of the `find_impact` MCP tool: POST a `FindImpactRequest`
-/// body, receive the tool's JSON payload. Read-only, same auth class as
-/// the other REST mirrors (see `FIND_IMPACT_PATH`).
-pub(crate) async fn rest_find_impact_handler(
-    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::serve::ServeState>>,
-    axum::Json(req): axum::Json<FindImpactRequest>,
-) -> Result<axum::response::Json<serde_json::Value>, super::RestError> {
-    let service = super::make_service(&state)?;
-    let result = service
-        .find_impact(Parameters(req))
-        .await
-        .map_err(super::mcp_err_to_http)?;
-    Ok(axum::Json(super::call_tool_result_to_json(result)))
-}
