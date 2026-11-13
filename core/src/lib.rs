@@ -8,6 +8,7 @@
 //! index lifecycle stay in the `codesearch` crate.
 
 pub mod cache;
+pub mod chunker;
 pub mod constants;
 pub mod db_discovery;
 pub mod error;

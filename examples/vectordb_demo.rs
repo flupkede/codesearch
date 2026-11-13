@@ -24,7 +24,7 @@ fn print_section(title: &str) {
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_env_filter("codesearch=info")
+        .with_env_filter("codesearch=info,codesearch_core=info")
         .init();
 
     print_section("🚀 Codesearch Vector Store Demo");

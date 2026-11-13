@@ -1,5 +1,4 @@
 mod bench;
-mod chunker;
 mod cli;
 mod embed;
 mod federation;
