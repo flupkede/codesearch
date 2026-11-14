@@ -7229,9 +7229,19 @@ fn registered_worktree_parent_matches_via_worktree_git_file() {
     // The worktree's .git FILE points at the main's worktrees dir: the
     // registered main alias must be found as the seeding parent.
     let found = super::registered_worktree_parent(&wt, &config);
+    // canonicalize both sides: the discovered parent is stored in canonical
+    // form, while the tempdir here may be an 8.3 short-name path — comparing
+    // raw forms fails on Windows machines whose TEMP resolves through
+    // DEVELT~1-style names (same file, different path form).
+    let canon = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .display()
+            .to_string()
+    };
     assert_eq!(
-        found.as_ref().map(|(a, p)| (a.as_str(), p.as_path())),
-        Some((main_alias.as_str(), main.as_path())),
+        found.as_ref().map(|(a, p)| (a.as_str(), canon(p))),
+        Some((main_alias.as_str(), canon(&main))),
         "worktree must seed from its registered main checkout"
     );
 
