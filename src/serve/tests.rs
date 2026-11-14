@@ -7127,6 +7127,11 @@ async fn finish_force_reindex_starts_fsw_and_keeps_guard_contract() {
 #[tokio::test]
 #[serial]
 async fn backfill_group_identities_fills_missing_and_persists() {
+    // Hook context (GIT_DIR/GIT_INDEX_FILE) must not leak into the git
+    // subprocesses this test drives: under the pre-push QC gate the process
+    // env IS a hook context, and spawned `git -C <tmp>` would resolve the
+    // outer repo. #[serial] makes the process-env mutation safe.
+    let _hook_env = crate::db_discovery::repos::test_support::clear_hook_git_env();
     // The git-serialization lock must be dropped before the first .await
     // (clippy await_holding_lock): scope it around the synchronous git setup.
     // `tmp` lives for the whole test — the backfill's git spawns need the
@@ -7140,12 +7145,14 @@ async fn backfill_group_identities_fills_missing_and_persists() {
         std::fs::create_dir(&main).unwrap();
         crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
         let wt = tmp.path().join("wt");
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&main)
-            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
-            .output()
-            .unwrap();
+        let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+            &mut std::process::Command::new("git"),
+        )
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+        .output()
+        .unwrap();
         assert!(
             o.status.success(),
             "worktree add failed: {}",
@@ -7209,12 +7216,14 @@ fn registered_worktree_parent_matches_via_worktree_git_file() {
         crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
     }
     let wt = tmp.path().join("wt");
-    let o = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&main)
-        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "seed-branch"])
-        .output()
-        .unwrap();
+    let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+        &mut std::process::Command::new("git"),
+    )
+    .arg("-C")
+    .arg(&main)
+    .args(["worktree", "add", wt.to_str().unwrap(), "-b", "seed-branch"])
+    .output()
+    .unwrap();
     assert!(
         o.status.success(),
         "worktree add failed: {}",
@@ -7256,6 +7265,11 @@ fn registered_worktree_parent_matches_via_worktree_git_file() {
 #[tokio::test]
 #[serial]
 async fn backfill_all_missing_identities_fills_every_repo() {
+    // Hook context (GIT_DIR/GIT_INDEX_FILE) must not leak into the git
+    // subprocesses this test drives: under the pre-push QC gate the process
+    // env IS a hook context, and spawned `git -C <tmp>` would resolve the
+    // outer repo. #[serial] makes the process-env mutation safe.
+    let _hook_env = crate::db_discovery::repos::test_support::clear_hook_git_env();
     // Startup variant: no group involved — every registered repo missing an
     // identity gets one, so pre-capture mains join their worktree families.
     let tmp = tempfile::tempdir().unwrap();
@@ -7265,12 +7279,14 @@ async fn backfill_all_missing_identities_fills_every_repo() {
         std::fs::create_dir(&main).unwrap();
         crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
         let wt = tmp.path().join("wt");
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&main)
-            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
-            .output()
-            .unwrap();
+        let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+            &mut std::process::Command::new("git"),
+        )
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+        .output()
+        .unwrap();
         assert!(
             o.status.success(),
             "worktree add failed: {}",

@@ -1669,6 +1669,73 @@ fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<
 pub mod test_support {
     use std::path::Path;
 
+    const HOOK_ENV_VARS: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_QUARANTINE_PATH",
+        "GIT_PREFIX",
+    ];
+
+    /// Remove git's hook-context variables from a spawned command. git
+    /// exports these to hook processes, so a test binary running inside the
+    /// pre-push QC gate inherits them — and `git -C <tmp>` then resolves the
+    /// OUTER repo's index/objects regardless of `-C`. Production spawns keep
+    /// their env: codesearch itself legitimately runs inside hooks.
+    pub fn scrub_hook_git_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+        for var in HOOK_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        cmd
+    }
+
+    /// Run `f` with the hook-context variables removed from THIS process —
+    /// for tests that exercise production code spawning git (the production
+    /// fn builds its own Command). Mutates process env: callers must be
+    /// serialized (git_serial_lock or #[serial]).
+    pub fn with_hook_git_env_cleared<T>(f: impl FnOnce() -> T) -> T {
+        let saved: Vec<(&'static str, String)> = HOOK_ENV_VARS
+            .iter()
+            .filter_map(|v| std::env::var(v).ok().map(|val| (*v, val)))
+            .collect();
+        for var in HOOK_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        let out = f();
+        for (var, val) in saved {
+            std::env::set_var(var, val);
+        }
+        out
+    }
+
+    /// RAII variant of [`with_hook_git_env_cleared`] for async tests, where a
+    /// closure cannot wrap `.await` points. Same serialization requirement.
+    pub struct HookGitEnvGuard {
+        saved: Vec<(&'static str, String)>,
+    }
+
+    impl Drop for HookGitEnvGuard {
+        fn drop(&mut self) {
+            for (var, val) in &self.saved {
+                std::env::set_var(var, val);
+            }
+        }
+    }
+
+    pub fn clear_hook_git_env() -> HookGitEnvGuard {
+        let saved: Vec<(&'static str, String)> = HOOK_ENV_VARS
+            .iter()
+            .filter_map(|v| std::env::var(v).ok().map(|val| (*v, val)))
+            .collect();
+        for var in HOOK_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        HookGitEnvGuard { saved }
+    }
+
     /// Process-wide lock serializing the git-spawning / directory-renaming
     /// tests: on Windows the OS indexer / antivirus holds `.git` handles
     /// while scanning freshly-created trees, and concurrent git subprocesses
@@ -1688,7 +1755,7 @@ pub mod test_support {
         let run = |args: &[&str]| {
             const MAX_ATTEMPTS: u64 = 8;
             for attempt in 0..MAX_ATTEMPTS {
-                match std::process::Command::new("git")
+                match scrub_hook_git_env(&mut std::process::Command::new("git"))
                     .arg("-C")
                     .arg(dir)
                     .args(args)

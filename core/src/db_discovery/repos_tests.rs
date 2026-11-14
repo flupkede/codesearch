@@ -28,11 +28,13 @@ fn init_git_remote(dir: &Path, url: &str) {
     let run = |args: &[&str]| {
         const MAX_ATTEMPTS: u64 = 8;
         for attempt in 0..MAX_ATTEMPTS {
-            match std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
+            match crate::db_discovery::repos::test_support::scrub_hook_git_env(
+                &mut std::process::Command::new("git"),
+            )
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
             {
                 Ok(o) => return o,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1333,12 +1335,14 @@ fn captures_git_common_dir_on_register_and_links_worktrees() {
 
     let wt = tmp.path().join("wt");
     let run = |args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&main)
-            .args(args)
-            .output()
-            .unwrap();
+        let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+            &mut std::process::Command::new("git"),
+        )
+        .arg("-C")
+        .arg(&main)
+        .args(args)
+        .output()
+        .unwrap();
         assert!(
             o.status.success(),
             "git {args:?} failed: {}",
