@@ -28,8 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Cache dependencies separately from source for faster rebuilds.
+# Workspace members (core/, server/) must be present: cargo resolves the
+# whole workspace before building the root binary.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+COPY core ./core
+COPY server ./server
 # Hook scripts are embedded at compile time via include_str! in
 # src/cli/claude_hooks.rs (path ../../integrations/claude-code/hooks/*). They
 # MUST be present in the build context or the release compile fails with
