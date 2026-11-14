@@ -21,53 +21,25 @@ path = "src/main.rs"
 [dependencies]
 codesearch-core = { path = "core" }
 # CLI & I/O
-clap = { version = "4.5", features = ["derive", "cargo", "env"] }
-tokio = { version = "1.40", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
 ctrlc = "3.4"
-anyhow = "1.0"
-thiserror = "2.0"
+anyhow = { workspace = true }
 
 # ML & Embeddings — moved to codesearch-core with the embed/rerank stack (stage 5);
 # ndarray / hf-hub are gone from the root (transitive-only via fastembed)
 
-# Vector DB (temporarily commented due to dep conflicts)
-# lancedb = "0.5"
-
-# Text processing & Parsing
-tree-sitter = "0.27"
-tree-sitter-rust = "0.24.2"
-tree-sitter-python = "0.25"
-tree-sitter-javascript = "0.25"
-tree-sitter-typescript = "0.23.2"
-tree-sitter-c = "0.24.2"
-tree-sitter-cpp = "0.23.4"
-tree-sitter-c-sharp = "0.23.5"
-tree-sitter-go = "0.25"
-tree-sitter-java = "0.23.5"
-tree-sitter-bash = "0.25.1"
-tree-sitter-ruby = "0.23.1"
-tree-sitter-php = "0.25.1"
-tree-sitter-yaml = "0.7.2"
-tree-sitter-json = "0.24.8"
-tree-sitter-md = "0.5.3"
-tree-sitter-dart = "0.3.0"
-tree-sitter-proto = "0.6"
-
 # File handling
-ignore = "0.4"
+ignore = { workspace = true }
 notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
 notify-debouncer-full = "0.7"
-walkdir = "2.5"
-
-# Caching
-moka = { version = "0.12", features = ["sync"] }
 
 # Search & Ranking — tantivy moved to codesearch-core with fts/
-regex = "1.12"
+regex = { workspace = true }
 
 # Server
-axum = "0.8"
+axum = { workspace = true }
 
 # TUI
 ratatui = "0.30"
@@ -75,40 +47,59 @@ crossterm = "0.29"
 
 # Utilities
 rayon = "1.10"
-dashmap = "6.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
-sha2 = "0.11"
-uuid = { version = "1.11", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-colored = "3.1"
+dashmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+colored = { workspace = true }
 indicatif = "0.18"
-dirs = "7"
+dirs = { workspace = true }
 num_cpus = "1.16"
-async-trait = "0.1"
-# Vector database — arroy moved to codesearch-core with vectordb/
+async-trait = { workspace = true }
+sha2 = { workspace = true }
 # `longer-keys` builds LMDB with MDB_MAXKEYSIZE=0, so the key limit is derived
 # from the page size (~1980 bytes on 4KB pages) instead of the 511-byte default.
 # C# SCIP symbols carry fully qualified parameter types and reach 900+ bytes;
 # at 511 a single such method failed the whole symbol rebuild. Note: a build
 # WITHOUT this feature cannot read the long keys it writes.
+heed = { workspace = true }
+# Aikido 34247111: 1.8.0 carries 5 advisories (CVE-2026-64684/317735/617985 + 2 more).
+# 3.x keeps legacy initialize/session behavior by default (ProtocolVersion::LATEST stays
+# V_2025_11_25); the 2026-07-28 stateless lifecycle is opt-in and NOT enabled here.
+rmcp = { workspace = true }
+reqwest = { workspace = true }
+sysinfo = { workspace = true }
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "cargo", "env"] }
+colored = "3.1"
+ctor = "1.0"
+dashmap = "6.1"
+dirs = "7"
 heed = { version = "0.23", features = ["longer-keys"] }
-# Wire-compat: use config::legacy() only — bincode-1 bytes on disk, pinned
-# byte-exact by the golden tests in symbols/{csharp,typescript}.rs.
-bincode = { version = "2.0", features = ["serde"] }
-# SCIP symbol indexing — moved to codesearch-core with symbols/
-# bincode stays root: mcp integration tests encode legacy bytes directly
+ignore = "0.4"
+regex = "1.12"
 # Aikido 34247111: 1.8.0 carries 5 advisories (CVE-2026-64684/317735/617985 + 2 more).
 # 3.x keeps legacy initialize/session behavior by default (ProtocolVersion::LATEST stays
 # V_2025_11_25); the 2026-07-28 stateless lifecycle is opt-in and NOT enabled here.
 rmcp = { version = "3.3.0", features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros"] }
-schemars = { version = "1.1.0", features = ["derive"] }
-httpdate = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serial_test = "4"
+sha2 = "0.11"
 sysinfo = { version = "0.40", default-features = true }
+tempfile = "3.13"
+tokio = "1.40"
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [patch.crates-io]
 # Vendored copy of rmcp 3.5.0 with the [codesearch bridge] change in
@@ -124,13 +115,12 @@ libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-tempfile = "3.13"
-pretty_assertions = "1.4"
-serial_test = "4"
-ctor = "1.0"
+tempfile = { workspace = true }
+serial_test = { workspace = true }
+ctor = { workspace = true }
 # start_paused time control in serve tests; was previously satisfied
 # transitively by a fastembed/hf-hub tokio feature, now pinned.
-tokio = { version = "1.40", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 # Benchmarks will be added later
 # [[bench]]

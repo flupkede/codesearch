@@ -16,40 +16,40 @@ cuda = ["ort/cuda"]
 tensorrt = ["ort/tensorrt"]
 
 [dependencies]
-anyhow = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
-colored = "3.1"
-regex = "1.12"
-dashmap = "6.1"
-dirs = "7"
+anyhow = { workspace = true }
+chrono = { workspace = true }
+colored = { workspace = true }
+regex = { workspace = true }
+dashmap = { workspace = true }
+dirs = { workspace = true }
 # `longer-keys` raises LMDB's 511-byte key cap (SCIP symbols reach 900+ bytes);
 # a build without it cannot read the long keys it writes.
-heed = { version = "0.23", features = ["longer-keys"] }
-ignore = "0.4"
+heed = { workspace = true }
+ignore = { workspace = true }
 moka = { version = "0.12", features = ["sync"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.11"
-sysinfo = { version = "0.40", default-features = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sysinfo = { workspace = true }
 thiserror = "2.0"
-tokio = "1.40"
-tokio-util = { version = "0.7", features = ["rt"] }
-tracing = "0.1"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
 tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { workspace = true }
 
 # ML & Embeddings (embed/ + rerank/ moved in at stage 5)
 fastembed = "7.0"
 ort = { version = "2.0.0-rc.10", features = ["download-binaries", "copy-dylibs"] }
-clap = { version = "4.5", features = ["derive", "cargo", "env"] }
+clap = { workspace = true }
 # openai.rs embedding provider HTTP (same pinned spec as the CLI's)
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { workspace = true }
 httpdate = "1"
 
 # MCP protocol layer (mcp/ moved in at stage 7): same specs as the CLI's.
 # rmcp resolves through the workspace-root [patch.crates-io] to vendor/rmcp.
-async-trait = "0.1"
-rmcp = { version = "3.3.0", features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "macros"] }
+async-trait = { workspace = true }
+rmcp = { workspace = true }
 schemars = { version = "1.1.0", features = ["derive"] }
 
 # Symbols (symbols/ moved in at stage 6)
@@ -89,7 +89,7 @@ tree-sitter-proto = "0.6"
 
 [dev-dependencies]
 # federation's tests spin real axum echo/health servers
-axum = "0.8"
-ctor = "1.0"
-serial_test = "4"
-tempfile = "3.13"
+axum = { workspace = true }
+ctor = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }

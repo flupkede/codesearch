@@ -733,7 +733,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "bincode 2.0.1",
  "chrono",
  "clap",
  "codesearch-core",
@@ -745,53 +744,27 @@ dependencies = [
  "dashmap",
  "dirs 7.0.0",
  "heed",
- "httpdate",
  "ignore",
  "indicatif",
  "libc",
- "moka",
  "notify",
  "notify-debouncer-full",
  "num_cpus",
- "pretty_assertions",
  "ratatui",
  "rayon",
  "regex",
  "reqwest 0.13.5",
  "rmcp",
- "schemars",
  "serde",
  "serde_json",
  "serial_test",
  "sha2 0.11.1",
  "sysinfo",
  "tempfile",
- "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-appender",
  "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-dart",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-json",
- "tree-sitter-md",
- "tree-sitter-php",
- "tree-sitter-proto",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "tree-sitter-yaml",
- "uuid",
- "walkdir",
 ]
 
 [[package]]
@@ -1369,12 +1342,6 @@ dependencies = [
  "rustc_version",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "diff"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "digest"
@@ -3744,16 +3711,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
-]
-
-[[package]]
-name = "pretty_assertions"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
-dependencies = [
- "diff",
- "yansi",
 ]
 
 [[package]]
@@ -6710,12 +6667,6 @@ name = "y4m"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
-
-[[package]]
-name = "yansi"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yoke"
