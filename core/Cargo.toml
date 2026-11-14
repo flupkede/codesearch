@@ -1,0 +1,95 @@
+[package]
+name = "codesearch-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Shared library for codesearch: chunking, embeddings, retrieval, MCP protocol"
+
+[lib]
+name = "codesearch_core"
+path = "src/lib.rs"
+
+[features]
+# Forwarded by the CLI package's cuda/tensorrt features.
+cuda = ["ort/cuda"]
+tensorrt = ["ort/tensorrt"]
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+colored = { workspace = true }
+regex = { workspace = true }
+dashmap = { workspace = true }
+dirs = { workspace = true }
+# `longer-keys` raises LMDB's 511-byte key cap (SCIP symbols reach 900+ bytes);
+# a build without it cannot read the long keys it writes.
+heed = { workspace = true }
+ignore = { workspace = true }
+moka = { version = "0.12", features = ["sync"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sysinfo = { workspace = true }
+thiserror = "2.0"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = "0.2"
+tracing-subscriber = { workspace = true }
+
+# ML & Embeddings (embed/ + rerank/ moved in at stage 5)
+fastembed = "7.0"
+ort = { version = "2.0.0-rc.10", features = ["download-binaries", "copy-dylibs"] }
+clap = { workspace = true }
+# openai.rs embedding provider HTTP (same pinned spec as the CLI's)
+reqwest = { workspace = true }
+httpdate = "1"
+
+# MCP protocol layer (mcp/ moved in at stage 7): same specs as the CLI's.
+# rmcp resolves through the workspace-root [patch.crates-io] to vendor/rmcp.
+async-trait = { workspace = true }
+rmcp = { workspace = true }
+schemars = { version = "1.1.0", features = ["derive"] }
+
+# Symbols (symbols/ moved in at stage 6)
+# Wire-compat: use config::legacy() only — bincode-1 bytes on disk, pinned
+# byte-exact by the golden tests in symbols/{csharp,typescript}.rs.
+bincode = { version = "2.0", features = ["serde"] }
+# SCIP symbol indexing — parses standard SCIP protobuf (.scip) emitted by
+# Sourcegraph indexers (e.g. scip-typescript) for the TypeScript symbol adapter.
+scip = "0.10"
+protobuf = "3.7"
+
+# Retrieval stores
+arroy = "0.9"
+tantivy = "0.27"
+rand = "0.10"
+fs2 = "0.4"
+
+# Text processing & Parsing
+tree-sitter = "0.27"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23.5"
+tree-sitter-bash = "0.25.1"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-php = "0.25.1"
+tree-sitter-yaml = "0.7.2"
+tree-sitter-json = "0.24.8"
+tree-sitter-md = "0.5.3"
+tree-sitter-dart = "0.3.0"
+tree-sitter-proto = "0.6"
+
+[dev-dependencies]
+# federation's tests spin real axum echo/health servers
+axum = { workspace = true }
+ctor = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }

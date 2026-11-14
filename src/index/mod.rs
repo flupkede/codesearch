@@ -18,9 +18,13 @@ use crate::vectordb::{merge_metadata_atomic, VectorStore};
 // Index manager module
 mod manager;
 pub use manager::{
-    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingHeartbeat,
-    IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
+    CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback,
+    SymbolRebuildSignal,
 };
+// Store-open mechanics live in core; re-exported so `crate::index::` call
+// sites (serve, mcp, tests) stay valid. The lock fn is reachable directly
+// via codesearch_core::index; no crate-internal callers.
+pub use codesearch_core::index::SharedStores;
 
 mod build_log;
 pub use build_log::BuildLog;
@@ -2270,35 +2274,7 @@ fn build_serve_client(
         .ok()
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty());
-    build_serve_client_with_key(timeout, key.as_deref())
-}
-
-/// Inner, testable form of [`build_serve_client`]: build a client that attaches
-/// `Authorization: Bearer <key>` (when `key` is `Some`) as a default header, so
-/// every request — health probe, POST, DELETE — carries it automatically.
-pub(crate) fn build_serve_client_with_key(
-    timeout: std::time::Duration,
-    key: Option<&str>,
-) -> std::result::Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
-
-    if let Some(k) = key {
-        let mut headers = reqwest::header::HeaderMap::new();
-        let auth_value =
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", k)).map_err(|e| {
-                format!(
-                    "invalid {} value: {}",
-                    crate::constants::SERVE_API_KEY_ENV,
-                    e
-                )
-            })?;
-        headers.insert(reqwest::header::AUTHORIZATION, auth_value);
-        builder = builder.default_headers(headers);
-    }
-
-    builder
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {}", e))
+    codesearch_core::federation::build_serve_client_with_key(timeout, key.as_deref())
 }
 
 /// When the server returns 401, produce a friendly, actionable error pointing at
@@ -2835,7 +2811,8 @@ pub(crate) async fn try_delegate_rm_to_serve(
 
 #[cfg(test)]
 mod serve_probe_tests {
-    use super::{auth_failure_hint, build_serve_client_with_key, probe_serve_health, ServeProbe};
+    use super::{auth_failure_hint, probe_serve_health, ServeProbe};
+    use codesearch_core::federation::build_serve_client_with_key;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 

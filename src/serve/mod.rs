@@ -10,7 +10,7 @@
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
-mod status_snapshot;
+mod rest_mirrors;
 mod tui;
 mod tui_common;
 mod tui_remote;
@@ -24,6 +24,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use axum::response::{IntoResponse, Json as AxumJson};
 use colored::Colorize;
+
+use async_trait::async_trait;
+
+use crate::mcp::ServeHandle;
+
+// Status types live in core (the MCP `status` tool reads them); serve keeps
+// computing and rendering them, so re-export under the old paths.
+pub(crate) use crate::mcp::status_snapshot;
+pub(crate) use crate::mcp::status_snapshot::{CSharpIndexStatus, RepoStateLabel, RepoStatusInfo};
 use dashmap::{DashMap, DashSet};
 use rmcp::transport::{
     streamable_http_server::session::local::LocalSessionManager, StreamableHttpServerConfig,
@@ -73,38 +82,6 @@ struct NetworkAuthConfig {
 /// Check whether a host address is a localhost address.
 fn is_localhost_host(host: &str) -> bool {
     host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
-}
-
-/// Lightweight repo status label derived from DashMap state only (no DB opens).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RepoStateLabel {
-    Open,
-    Warm,
-    Readonly,
-    Idle,
-    Indexing,
-    Error,
-    NoIndex,
-}
-
-/// Status of the C# symbol index for a repo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CSharpIndexStatus {
-    /// No C# helper detected or no index built.
-    None,
-    /// Helper available and index built successfully.
-    Ready,
-    /// Index built, but degraded or stale: the helper survived
-    /// workspace/MSBuild failures (definitions present while cross-project
-    /// references may be missing), or a rebuild was abandoned because
-    /// `dotnet restore` never finished (the previous index stays live).
-    /// Rendered yellow (`C#⚠`) in the TUI; the failures are in the info
-    /// panel and on every find_impact answer from this index.
-    Partial,
-    /// Index exists but had errors or is stale.
-    Error,
-    /// Symbol index is currently being built.
-    Indexing,
 }
 
 /// Outcome of a SUCCESSFUL C# symbol rebuild, derived from the rebuild's
@@ -168,32 +145,6 @@ fn classify_symbol_rebuild_failure(
         SymbolRebuildFailureKind::LmdbCorruption
     } else {
         SymbolRebuildFailureKind::Generic
-    }
-}
-
-/// Lightweight repo status derived from DashMap state only (no DB opens).
-pub(crate) struct RepoStatusInfo {
-    pub(crate) status: RepoStateLabel,
-    pub(crate) changes: u64,
-    pub(crate) last_tool_call: Option<String>,
-    pub(crate) tool_call_count: u64,
-    pub(crate) csharp_index: CSharpIndexStatus,
-    pub(crate) csharp_error: Option<String>,
-    pub(crate) typescript_index: CSharpIndexStatus,
-}
-
-impl RepoStateLabel {
-    #[allow(dead_code)]
-    fn colored(&self) -> colored::ColoredString {
-        match self {
-            Self::Open => "Open".green().bold(),
-            Self::Warm => "Warm".yellow(),
-            Self::Readonly => "Readonly".cyan(),
-            Self::Idle => "Idle".dimmed(),
-            Self::Indexing => "Indexing".magenta().bold(),
-            Self::Error => "Error".red().bold(),
-            Self::NoIndex => "No Index".dimmed(),
-        }
     }
 }
 
@@ -3859,7 +3810,7 @@ impl ServeState {
             }
         }
         let payload = serde_json::Value::Object(map);
-        if let Err(e) = crate::vectordb::store::atomic_write_json(path, &payload) {
+        if let Err(e) = crate::vectordb::atomic_write_json(path, &payload) {
             tracing::debug!(
                 "persist_access_times: write to {} failed: {e:#}",
                 path.display()
@@ -4042,7 +3993,7 @@ impl ServeState {
 
     /// Compute one full status pass for the background snapshot task —
     /// the ONLY place that measures (filesystem probes, sysinfo refresh).
-    /// Runs on the blocking pool via [`status_snapshot::spawn`]; the
+    /// Runs on the blocking pool via [`spawn_status_refresher`]; the
     /// read endpoints answer from the stored result and must never call
     /// this on the request path.
     pub(crate) fn compute_status_snapshot(&self) -> status_snapshot::StatusSnapshot {
@@ -6788,7 +6739,7 @@ pub async fn run_tui_standalone(serve_url: String, api_key_override: Option<Stri
 
     let api_key = api_key_override.or_else(|| resolve_api_key_for_url(&serve_url));
 
-    let client = match crate::index::build_serve_client_with_key(
+    let client = match crate::federation::build_serve_client_with_key(
         std::time::Duration::from_secs(10),
         api_key.as_deref(),
     ) {
@@ -7313,7 +7264,7 @@ pub async fn run_serve(
     // endpoints (GET /status, MCP status) answer from its stored result,
     // so they respond in microseconds even while a rebuild wave starves
     // the machine — the failure mode that made /status itself time out.
-    status_snapshot::spawn(serve_state.clone());
+    spawn_status_refresher(serve_state.clone());
 
     // One line that answers "why is it slower / less parallel than before?"
     // without grepping the code: the effective heavy-work budget.
@@ -7467,23 +7418,23 @@ pub async fn run_serve(
         // construction (the underlying tools never mutate the index).
         .route(
             SEARCH_PATH,
-            axum::routing::post(crate::mcp::rest_search_handler),
+            axum::routing::post(rest_mirrors::rest_search_handler),
         )
         .route(
             FIND_PATH,
-            axum::routing::post(crate::mcp::rest_find_handler),
+            axum::routing::post(rest_mirrors::rest_find_handler),
         )
         .route(
             EXPLORE_PATH,
-            axum::routing::post(crate::mcp::rest_explore_handler),
+            axum::routing::post(rest_mirrors::rest_explore_handler),
         )
         .route(
             CHUNK_PATH,
-            axum::routing::get(crate::mcp::rest_get_chunk_handler),
+            axum::routing::get(rest_mirrors::rest_get_chunk_handler),
         )
         .route(
             FIND_IMPACT_PATH,
-            axum::routing::post(crate::mcp::rest_find_impact_handler),
+            axum::routing::post(rest_mirrors::rest_find_impact_handler),
         )
         .nest_service(MCP_ENDPOINT_PATH, mcp_service)
         .layer(axum::middleware::from_fn(require_admin_auth))
@@ -7751,6 +7702,124 @@ pub async fn run_serve(
     }
 
     Ok(())
+}
+
+/// Spawn the background status refresher (moved with the status types from
+/// core's status_snapshot module; it drives `ServeState` internals). One
+/// pass runs at a time: the sleep starts only after the previous pass
+/// completed, so under heavy load the cadence stretches (visible as a
+/// growing `snapshot_age_secs`) instead of piling measuring tasks onto a
+/// starved machine. The computation runs on the blocking pool — it is
+/// filesystem work, not async work.
+fn spawn_status_refresher(state: Arc<ServeState>) {
+    let handle = state.status_snapshot.clone();
+    let interval = crate::mcp::status_snapshot::refresh_interval();
+    tokio::spawn(async move {
+        loop {
+            let snap = tokio::task::spawn_blocking({
+                let state = state.clone();
+                move || state.compute_status_snapshot()
+            })
+            .await;
+            match snap {
+                Ok(snapshot) => handle.store(snapshot),
+                Err(err) => {
+                    // Join failure means the runtime is shutting down; the
+                    // next loop iteration would also fail, but sleeping
+                    // keeps shutdown semantics simple.
+                    tracing::debug!("status snapshot pass failed: {err}");
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+/// ServeState answers the core MCP surface through this impl; handlers keep
+/// calling the same method names on `Option<Arc<dyn ServeHandle>>`. UFCS is
+/// load-bearing: the inherent methods win method-resolution, the trait impl
+/// must forward to them explicitly.
+#[async_trait]
+impl ServeHandle for ServeState {
+    fn config_snapshot(&self) -> ReposConfig {
+        ServeState::config_snapshot(self)
+    }
+
+    async fn get_or_open_stores(
+        &self,
+        alias: &str,
+        touch: bool,
+    ) -> Result<Arc<SharedStores>, String> {
+        ServeState::get_or_open_stores(self, alias, touch).await
+    }
+
+    fn get_opened_stores(&self, alias: &str) -> Option<Arc<SharedStores>> {
+        ServeState::get_opened_stores(self, alias)
+    }
+
+    fn is_held_in_process(&self, alias: &str, db_path: &Path) -> bool {
+        ServeState::is_held_in_process(self, alias, db_path)
+    }
+
+    fn repo_lock_status(&self, alias: &str) -> Option<&'static str> {
+        ServeState::repo_lock_status(self, alias)
+    }
+
+    fn is_indexing(&self, alias: &str) -> bool {
+        ServeState::is_indexing(self, alias)
+    }
+
+    fn touch_access(&self, alias: &str) {
+        ServeState::touch_access(self, alias)
+    }
+
+    fn record_tool_call(&self, alias: &str, tool_name: &str) {
+        ServeState::record_tool_call(self, alias, tool_name)
+    }
+
+    fn record_remote_peer_activity(&self, peer_name: &str) {
+        ServeState::record_remote_peer_activity(self, peer_name)
+    }
+
+    fn session_disconnected(&self) {
+        ServeState::session_disconnected(self)
+    }
+
+    fn resolve_group_aliases(&self, group: &str) -> Result<Vec<String>, String> {
+        ServeState::resolve_group_aliases(self, group)
+    }
+
+    async fn backfill_group_identities(&self, group: &str) {
+        ServeState::backfill_group_identities(self, group).await
+    }
+
+    fn symbol_registry(&self) -> Arc<SymbolIndexerRegistry> {
+        ServeState::symbol_registry(self)
+    }
+
+    fn embedding_pool(&self) -> Arc<crate::embed::EmbeddingServicePool> {
+        ServeState::embedding_pool(self)
+    }
+
+    fn default_model(&self) -> Option<crate::embed::EmbeddingModel> {
+        ServeState::default_model(self)
+    }
+
+    fn model_for_alias(&self, alias: &str) -> Option<crate::embed::EmbeddingModel> {
+        ServeState::model_for_alias(self, alias)
+    }
+
+    fn mark_legacy_model_warned(&self, alias: &str) -> bool {
+        ServeState::mark_legacy_model_warned(self, alias)
+    }
+
+    fn latest_status_snapshot(&self) -> Option<Arc<status_snapshot::StatusSnapshot>> {
+        ServeState::latest_status_snapshot(self)
+    }
+
+    async fn heal_missing_symbol_index(self: Arc<Self>, alias: &str, lang: &str) {
+        heal_missing_symbol_index(&self, alias, lang).await
+    }
 }
 
 #[cfg(test)]
