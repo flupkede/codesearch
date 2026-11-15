@@ -18,9 +18,13 @@ use crate::vectordb::{merge_metadata_atomic, VectorStore};
 // Index manager module
 mod manager;
 pub use manager::{
-    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingHeartbeat,
-    IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
+    CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback,
+    SymbolRebuildSignal,
 };
+// Store-open mechanics live in core; re-exported so `crate::index::` call
+// sites (serve, mcp, tests) stay valid. The lock fn is reachable directly
+// via codesearch_core::index; no crate-internal callers.
+pub use codesearch_core::index::SharedStores;
 
 mod build_log;
 pub use build_log::BuildLog;
@@ -2342,78 +2346,7 @@ fn build_serve_client(
         .ok()
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty());
-    build_serve_client_with_key(timeout, key.as_deref())
-}
-
-/// Inner, testable form of [`build_serve_client`]: build a client that attaches
-/// `Authorization: Bearer <key>` (when `key` is `Some`) as a default header, so
-/// every request — health probe, POST, DELETE — carries it automatically. Every
-/// client also identifies itself via `X-Codesearch-Client` (pid/parent/exe) so
-/// the serve's audit log can name who mutated a repo.
-pub(crate) fn build_serve_client_with_key(
-    timeout: std::time::Duration,
-    key: Option<&str>,
-) -> std::result::Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(timeout)
-        .user_agent(format!("codesearch-cli/{}", env!("CARGO_PKG_VERSION")));
-
-    let mut headers = reqwest::header::HeaderMap::new();
-
-    if let Some(k) = key {
-        let auth_value =
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", k)).map_err(|e| {
-                format!(
-                    "invalid {} value: {}",
-                    crate::constants::SERVE_API_KEY_ENV,
-                    e
-                )
-            })?;
-        headers.insert(reqwest::header::AUTHORIZATION, auth_value);
-    }
-
-    let name = reqwest::header::HeaderName::from_bytes(crate::constants::CLIENT_HEADER.as_bytes())
-        .map_err(|e| format!("invalid client header name: {}", e))?;
-    let value = reqwest::header::HeaderValue::from_str(&client_identification_header())
-        .map_err(|e| format!("invalid client identification header: {}", e))?;
-    headers.insert(name, value);
-    builder = builder.default_headers(headers);
-
-    builder
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {}", e))
-}
-
-/// `X-Codesearch-Client` value identifying this CLI process: pid, parent pid
-/// (the process that spawned us — for codesearch children that is the caller,
-/// e.g. an MCP server or a script) and the executable name. Parent may be
-/// absent when the OS no longer records it; the exe name is stripped to
-/// visible ASCII because HTTP header values reject anything else.
-fn client_identification_header() -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "unknown".to_string());
-    let exe: String = exe.chars().filter(|c| c.is_ascii_graphic()).collect();
-
-    let parent = {
-        use sysinfo::{Pid, ProcessesToUpdate, System};
-        // System::new() only fails when sysinfo cannot read /proc-style state
-        // at all; then no parent is knowable — the header just omits it.
-        (|| -> Option<u32> {
-            let mut sys = System::new().ok()?;
-            let pid = Pid::from_u32(std::process::id());
-            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-            sys.process(pid)
-                .and_then(|p| p.parent())
-                .map(|p| p.as_u32())
-        })()
-    };
-
-    match parent {
-        Some(p) => format!("cli pid={} parent={} exe={}", std::process::id(), p, exe),
-        None => format!("cli pid={} exe={}", std::process::id(), exe),
-    }
+    codesearch_core::federation::build_serve_client_with_key(timeout, key.as_deref())
 }
 
 /// When the server returns 401, produce a friendly, actionable error pointing at
@@ -2954,7 +2887,8 @@ pub(crate) async fn try_delegate_rm_to_serve(
 
 #[cfg(test)]
 mod serve_probe_tests {
-    use super::{auth_failure_hint, build_serve_client_with_key, probe_serve_health, ServeProbe};
+    use super::{auth_failure_hint, probe_serve_health, ServeProbe};
+    use codesearch_core::federation::build_serve_client_with_key;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 

@@ -93,7 +93,7 @@ impl RepoInfo {
 /// Run the standalone remote TUI. Polls `GET {serve_url}/status` every second.
 ///
 /// `client` is a pre-built `reqwest::Client` (see
-/// [`crate::index::build_serve_client_with_key`]) that already carries the
+/// [`crate::federation::build_serve_client_with_key`]) that already carries the
 /// `Authorization: Bearer <key>` header for every request when the serve
 /// requires authentication; when no key is configured it behaves like a plain
 /// client, unchanged from today's local/no-auth behavior.
