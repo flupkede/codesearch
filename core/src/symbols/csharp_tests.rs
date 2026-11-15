@@ -659,7 +659,10 @@ fn symbol_index_status_reports_restore_pending_over_a_ready_index() {
 #[test]
 fn helper_restore_pending_exit_matches_csharp_exit_codes() {
     // A drifted exit code would demote restore-pending to a generic helper failure.
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/helpers/csharp/RestoreGate.cs");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../helpers/csharp/RestoreGate.cs"
+    );
     let source = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("cannot read {path} to check HELPER_RESTORE_PENDING_EXIT: {e}"));
     let line = source

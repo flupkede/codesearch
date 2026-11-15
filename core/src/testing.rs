@@ -32,9 +32,13 @@
 /// paths cannot resolve here. Keep in sync with `constants::REPOS_CONFIG_ENV`
 /// and `constants::SERVE_PORT_ENV` (a constants unit test pins the pair).
 pub fn redirect_test_scratch() {
-    // Beside `<manifest>/../target` (the `target-dir` pinned in
-    // `.cargo/config.toml`) — outside the checkout, name not excluded.
+    // Beside the `target-dir` pinned in `.cargo/config.toml` (`../target` from
+    // the workspace root) — outside the checkout, name not excluded. For the
+    // core crate that is TWO levels up: one `..` would land in `<repo>/`, and
+    // since the workspace split a scratch dir inside the worktree breaks the
+    // invariant below (the `current_git_head` fixture found the repo's HEAD).
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
         .join("..")
         .join("test-scratch");
     let _ = std::fs::create_dir_all(&base);
