@@ -45,10 +45,13 @@ pub fn build_serve_client_with_key(
     timeout: std::time::Duration,
     key: Option<&str>,
 ) -> std::result::Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(format!("codesearch-cli/{}", env!("CARGO_PKG_VERSION")));
+
+    let mut headers = reqwest::header::HeaderMap::new();
 
     if let Some(k) = key {
-        let mut headers = reqwest::header::HeaderMap::new();
         let auth_value =
             reqwest::header::HeaderValue::from_str(&format!("Bearer {}", k)).map_err(|e| {
                 format!(
@@ -58,12 +61,50 @@ pub fn build_serve_client_with_key(
                 )
             })?;
         headers.insert(reqwest::header::AUTHORIZATION, auth_value);
-        builder = builder.default_headers(headers);
     }
+
+    let name = reqwest::header::HeaderName::from_bytes(crate::constants::CLIENT_HEADER.as_bytes())
+        .map_err(|e| format!("invalid client header name: {}", e))?;
+    let value = reqwest::header::HeaderValue::from_str(&client_identification_header())
+        .map_err(|e| format!("invalid client identification header: {}", e))?;
+    headers.insert(name, value);
+    builder = builder.default_headers(headers);
 
     builder
         .build()
         .map_err(|e| format!("failed to build HTTP client: {}", e))
+}
+
+/// `X-Codesearch-Client` value identifying this CLI process: pid, parent pid
+/// (the process that spawned us — for codesearch children that is the caller,
+/// e.g. an MCP server or a script) and the executable name. Parent may be
+/// absent when the OS no longer records it; the exe name is stripped to
+/// visible ASCII because HTTP header values reject anything else.
+fn client_identification_header() -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let exe: String = exe.chars().filter(|c| c.is_ascii_graphic()).collect();
+
+    let parent = {
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+        // System::new() only fails when sysinfo cannot read /proc-style state
+        // at all; then no parent is knowable — the header just omits it.
+        (|| -> Option<u32> {
+            let mut sys = System::new().ok()?;
+            let pid = Pid::from_u32(std::process::id());
+            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+            sys.process(pid)
+                .and_then(|p| p.parent())
+                .map(|p| p.as_u32())
+        })()
+    };
+
+    match parent {
+        Some(p) => format!("cli pid={} parent={} exe={}", std::process::id(), p, exe),
+        None => format!("cli pid={} exe={}", std::process::id(), exe),
+    }
 }
 
 /// Whether an HTTP status from a remote peer is transient — likely a

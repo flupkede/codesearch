@@ -1789,6 +1789,83 @@ pub mod test_support {
     }
 }
 
+// ─── Removed-alias tombstones ──────────────────────────────────────────
+//
+// `index rm --forget` records the alias here; re-registration (serve
+// `POST /repos`, local `index add`) refuses a tombstoned alias unless the
+// caller passes force=true. This closes the "removed repo keeps coming
+// back" class: whatever re-adds it fails loudly instead of silently
+// resurrecting the index.
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RemovedAliases {
+    aliases: std::collections::BTreeMap<String, String>,
+}
+
+fn removed_aliases_file() -> Result<std::path::PathBuf> {
+    crate::constants::removed_aliases_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve the codesearch home dir"))
+}
+
+fn load_removed_aliases() -> Result<RemovedAliases> {
+    let path = removed_aliases_file()?;
+    if !path.exists() {
+        return Ok(RemovedAliases {
+            aliases: Default::default(),
+        });
+    }
+    let raw = fs::read_to_string(&path)?;
+    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("corrupt {}: {e}", path.display()))
+}
+
+fn save_removed_aliases(file: &RemovedAliases) -> Result<()> {
+    // Under cargo test, writing the REAL tombstone file is always a bug —
+    // same guard rationale as `ReposConfig::save` above.
+    #[cfg(test)]
+    {
+        let relocated = std::env::var(crate::constants::CODESEARCH_HOME_ENV)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if !relocated {
+            panic!(
+                "save_removed_aliases() under cargo test would write the real \
+                 removed_aliases.json. Set {} to a temp dir first.",
+                crate::constants::CODESEARCH_HOME_ENV
+            );
+        }
+    }
+    let path = removed_aliases_file()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(file)?)?;
+    fs::rename(&tmp, &path)
+        .map_err(|e| anyhow::anyhow!("rename {} → {}: {e}", tmp.display(), path.display()))
+}
+
+/// RFC3339 timestamp at which `alias` was tombstoned, if it currently is.
+pub fn tombstone_date(alias: &str) -> Option<String> {
+    load_removed_aliases().ok()?.aliases.get(alias).cloned()
+}
+
+/// Record `alias` in the tombstone registry (idempotent; refreshes the date).
+pub fn tombstone_alias(alias: &str) -> Result<()> {
+    let mut file = load_removed_aliases()?;
+    file.aliases
+        .insert(alias.to_string(), chrono::Utc::now().to_rfc3339());
+    save_removed_aliases(&file)
+}
+
+/// Clear `alias`'s tombstone. An absent alias is not an error.
+pub fn untombstone_alias(alias: &str) -> Result<()> {
+    let mut file = load_removed_aliases()?;
+    if file.aliases.remove(alias).is_some() {
+        save_removed_aliases(&file)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "repos_tests.rs"]
 mod tests;

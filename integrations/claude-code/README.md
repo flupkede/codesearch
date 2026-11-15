@@ -82,11 +82,13 @@ that make the preference *structural* instead of advisory:
   subagents at all, since they don't inherit `AGENTS.md` or MCP instructions.
 
 - **`edit-guard`** — a `PreToolUse` hook on `Edit`/`Write`/`MultiEdit`.
-  Blocks an edit to a file in a codesearch-registered repo until codesearch
-  was consulted for that exact path within the last 5 minutes:
+  Blocks an edit to a code file in a codesearch-registered repo until
+  codesearch was consulted for that exact path within the last 5 minutes:
   `mcp__codesearch__find_impact` for SCIP-backed languages
   (`.cs .ts .tsx .mts .cts`), `mcp__codesearch__find(kind="usages")` for
-  everything else — making the caller-aware-editing protocol structural.
+  other source code. Docs, markup and config files (`.md`, `.json`, ...)
+  are never gated — a usages lookup answers nothing there. Making the
+  caller-aware-editing protocol structural.
   Coverage uses the same registration model as grep-guard (shared
   `codesearch-common` helpers): the file's git root must be listed in
   `~/.codesearch/repos.json` (relocatable via `CODESEARCH_HOME`; or
@@ -240,7 +242,10 @@ whose commands point at `hooks/codesearch/`) from `settings.json`, and delete
   5 minutes and are pruned on write; missing or corrupt state counts as
   "not consulted" (deny on covered repos, allow everywhere else). Like
   the other guards it is per-machine, not per-repo: it only ever fires
-  on files whose git root is registered with the serve hub.
+  on files whose git root is registered with the serve hub. The gate keys
+  on extension: docs/markup/config (`.md`, `.json`, ...) pass without any
+  marker; filename-mapped code files (`Dockerfile`, `Makefile`) pass too —
+  rare refactor targets.
 - Both hooks are per-machine, not per-repo: install once at user scope and
   every project benefits, including ones not registered with the serve
   hub (the guard simply won't block Grep there, since coverage fails

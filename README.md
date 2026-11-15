@@ -348,7 +348,7 @@ OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies acr
 To make the preference **structural** instead of advisory, this repo ships five Claude Code hooks (four `PreToolUse` guards plus one `PostToolUse` companion):
 
 - **`grep-guard`** — on `Grep`. Blocks a grep against an in-repo path when codesearch covers that repo (the target repo — resolved from the grep target's own git root — is registered with the serve hub in `~/.codesearch/repos.json`, or a `CODESEARCH_SERVER` env var is set for remote-serve setups), with a message telling the model how to load and call codesearch instead. Grep is auto-allowed **only when the serve hub is genuinely down**, established by a live probe of the unauthenticated `/healthz` endpoint (`CODESEARCH_SERVER` > `127.0.0.1:$CODESEARCH_SERVE_PORT` > `127.0.0.1:39725`); only a connection-level failure counts as down. A low-confidence or empty codesearch result is a *successful* call meaning "reformulate the query", so it does **not** open the escape hatch — the deny message steers to `find`/`explore`/a single clean term instead. Greps outside any registered repo are never blocked, and the hook fails open (never traps the model).
-- **`edit-guard`** — on `Edit`/`Write`/`MultiEdit`. Blocks an edit to a file in a codesearch-registered repo until codesearch was consulted for that exact path within the last 5 minutes — `find_impact` for SCIP-backed languages (`.cs .ts .tsx .mts .cts`), `find(kind="usages")` for everything else — making the caller-aware-editing protocol structural. Its companion **`edit-guard-post`** (`PostToolUse`) records the markers on every `find_impact` call and every `find(kind="usages")`; any outcome counts ("no results" included), so the guard can never wedge. Unregistered repos, non-git paths and hook failures fail open.
+- **`edit-guard`** — on `Edit`/`Write`/`MultiEdit`. Blocks an edit to a code file in a codesearch-registered repo until codesearch was consulted for that exact path within the last 5 minutes — `find_impact` for SCIP-backed languages (`.cs .ts .tsx .mts .cts`), `find(kind="usages")` for other source code; docs, markup and config files (`.md`, `.json`, ...) are never gated, a usages lookup answers nothing there — making the caller-aware-editing protocol structural. Its companion **`edit-guard-post`** (`PostToolUse`) records the markers on every `find_impact` call and every `find(kind="usages")`; any outcome counts ("no results" included), so the guard can never wedge. Unregistered repos, non-git paths and hook failures fail open.
 - **`subagent-preamble`** — on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all — including the edit-guard protocol above.
 - **`web-guard`** — on `WebSearch`/`WebFetch`. When you have remote documentation projects mounted (`codesearch remote mount`, e.g. `cloud/inriver`, `cloud/example-dam`), it blocks the first web call with guidance to search those indexed mounts first — often more precise and current than the open web. Same 5-minute retry-escape; when no mounts are configured it does nothing.
 
@@ -492,6 +492,10 @@ codesearch index add /path/to/my-project
 # Remove a repo
 codesearch index rm /path/to/my-project
 
+# Remove AND tombstone the alias: re-registration via `index add` is
+# refused until explicitly cleared with `index add --force`
+codesearch index rm custom --forget
+
 # List registered repos
 codesearch index list
 
@@ -499,6 +503,10 @@ codesearch index list
 # serve also does this itself at startup and on every status refresh)
 codesearch index prune
 ```
+
+A tombstoned alias (written to `~/.codesearch/removed_aliases.json`) stays
+removed even when something tries to re-add it — the registration attempt is
+refused with the removal date named, and `index add --force` clears the marker.
 
 Serve reads `~/.codesearch/repos.json` on startup and manages all registered repos.
 
