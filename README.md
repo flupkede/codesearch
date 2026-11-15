@@ -147,7 +147,7 @@ cargo build --release
 
 #### CPUs without AVX2
 
-The default build links the prebuilt ONNX Runtime that the `ort` crate downloads at build time. On x86_64 those binaries require AVX2, so on older CPUs (for example Sandy Bridge / Ivy Bridge Xeons) codesearch stops with `SIGILL` (illegal instruction) as soon as it embeds. Microsoft's official ONNX Runtime releases pick their CPU code paths at runtime and run on these CPUs. Build with the `load-dynamic` feature to load such a release at runtime:
+The default build links the prebuilt ONNX Runtime that the `ort` crate downloads at build time. On x86_64 those binaries require AVX2, so on older CPUs (for example Sandy Bridge / Ivy Bridge Xeons) codesearch stops with an error naming the fix before it ever embeds — the prebuilt binaries would crash with `SIGILL` (illegal instruction) at first use. Microsoft's official ONNX Runtime releases pick their CPU code paths at runtime and run on these CPUs. Build with the `load-dynamic` feature to load such a release at runtime:
 
 ```bash
 cargo build --release --no-default-features --features load-dynamic
