@@ -2,7 +2,6 @@
 //! (the fastembed embedder and the neural reranker).
 
 use anyhow::Result;
-
 /// Environment variable `ort` reads the ONNX Runtime library path from when
 /// built with the `load-dynamic` feature.
 #[cfg(feature = "load-dynamic")]
@@ -19,9 +18,37 @@ const ORT_DYLIB_PATH_ENV: &str = "ORT_DYLIB_PATH";
 /// the loader search path), and turns a failure into an error naming the fix.
 /// Once loaded, later calls reuse the library.
 pub fn ensure_onnx_runtime() -> Result<()> {
+    #[cfg(all(
+        target_arch = "x86_64",
+        feature = "download-binaries",
+        not(feature = "load-dynamic")
+    ))]
+    prebuilt_avx2_gate()?;
     #[cfg(feature = "load-dynamic")]
     load_dynamic()?;
     Ok(())
+}
+
+/// x86_64, default build only: the prebuilt ONNX Runtime binaries `ort`
+/// downloads at build time require AVX2, and on an older CPU they die with
+/// SIGILL the moment they embed. Stop before that with the fix instead —
+/// the `load-dynamic` build loads an official release that picks its CPU
+/// code paths at runtime and does run there.
+#[cfg(all(
+    target_arch = "x86_64",
+    feature = "download-binaries",
+    not(feature = "load-dynamic")
+))]
+fn prebuilt_avx2_gate() -> Result<()> {
+    if is_x86_feature_detected!("avx2") {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "This CPU does not support AVX2, which the prebuilt ONNX Runtime binaries linked by this \
+         codesearch build require. Build with `--no-default-features --features load-dynamic` and \
+         set ORT_DYLIB_PATH to the shared library of ONNX Runtime 1.31.x or newer \
+         (https://github.com/microsoft/onnxruntime/releases) instead."
+    ))
 }
 
 #[cfg(feature = "load-dynamic")]
@@ -61,3 +88,29 @@ fn load_dynamic() -> Result<()> {
 #[cfg(all(test, feature = "load-dynamic"))]
 #[path = "onnx_runtime_tests.rs"]
 mod tests;
+
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    feature = "download-binaries",
+    not(feature = "load-dynamic")
+))]
+mod avx2_gate_tests {
+    use super::prebuilt_avx2_gate;
+
+    #[test]
+    fn gate_passes_on_avx2_and_names_the_fix_without_it() {
+        let r = prebuilt_avx2_gate();
+        if is_x86_feature_detected!("avx2") {
+            assert!(r.is_ok());
+        } else {
+            let msg = r.unwrap_err().to_string();
+            assert!(
+                msg.contains("AVX2")
+                    && msg.contains("load-dynamic")
+                    && msg.contains("ORT_DYLIB_PATH"),
+                "gate error must name the CPU limit and the fix: {msg}"
+            );
+        }
+    }
+}
