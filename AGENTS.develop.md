@@ -241,6 +241,10 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — `index rm --forget` tombstones an alias: re-registration via `POST /repos` or `index add` is refused (409, removal date named) until `index add --force` clears the marker; tombstones live in `~/.codesearch/removed_aliases.json`.
+
+- **Pending** — edit-guard gates code files only: docs/markup/config edits in a registered repo pass without a codesearch consultation (the `.md` misfire); other source code incl. `.sql`, `.ipynb` cells and `.razor`/`.cshtml` still requires `find_impact`/`find kind="usages"` per the SCIP split.
+
 - **Pending** — opt-in `load-dynamic` build (`--no-default-features --features load-dynamic`) loads ONNX Runtime from `ORT_DYLIB_PATH` at runtime, so codesearch runs on x86_64 CPUs without AVX2 (the prebuilt ORT dies there with SIGILL); the default build's feature set is unchanged.
 
 - **Pending** — refs-coverage enforced: a `lazy` stamp (full-scope rebuild without references) reads as stale and gets one symbol rebuild, so indexes converge to precomputed references; the hours-long lazy batch-find-refs pre-warm is removed, and project-scoped rebuilds stamp a new `incremental` coverage (fresh, on-demand misses).
