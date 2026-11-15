@@ -1,4 +1,4 @@
-#[path = "../src/testing.rs"]
+#[path = "../core/src/testing.rs"]
 mod testing;
 use codesearch::embed::{configure, EmbedConfig, EmbeddingModel, EmbeddingServicePool};
 use codesearch::index::{IndexManager, SharedStores};
