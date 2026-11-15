@@ -245,6 +245,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 - **Pending** — edit-guard gates code files only: docs/markup/config edits in a registered repo pass without a codesearch consultation (the `.md` misfire); other source code incl. `.sql`, `.ipynb` cells and `.razor`/`.cshtml` still requires `find_impact`/`find kind="usages"` per the SCIP split.
 
+- **Pending** — opt-in `load-dynamic` build (`--no-default-features --features load-dynamic`) loads ONNX Runtime from `ORT_DYLIB_PATH` at runtime, so codesearch runs on x86_64 CPUs without AVX2 (the prebuilt ORT dies there with SIGILL); the default build's feature set is unchanged.
+
 - **Pending** — refs-coverage enforced: a `lazy` stamp (full-scope rebuild without references) reads as stale and gets one symbol rebuild, so indexes converge to precomputed references; the hours-long lazy batch-find-refs pre-warm is removed, and project-scoped rebuilds stamp a new `incremental` coverage (fresh, on-demand misses).
 
 - **Pending** — phase-1 warmup orders most-recently-used first (persisted `access_times.json` sidecar) instead of effectively random registry order, so the repos an agent actively uses are warm right after a restart.

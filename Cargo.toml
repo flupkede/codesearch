@@ -1,6 +1,6 @@
 [package]
 name = "codesearch"
-version = "1.8.1"
+version = "1.8.2"
 edition = "2021"
 authors = ["codesearch contributors"]
 license = "Apache-2.0"
@@ -145,6 +145,9 @@ default = []
 # GPU acceleration lives on codesearch-core (ort is a core dep); forwarded here
 cuda = ["codesearch-core/cuda"]        # Enable CUDA GPU acceleration (requires cuDNN)
 tensorrt = ["codesearch-core/tensorrt"] # Enable TensorRT acceleration (NVIDIA only)
+# load-dynamic lives on codesearch-core too; forwarded so the documented
+# `--no-default-features --features load-dynamic` build command keeps working.
+load-dynamic = ["codesearch-core/load-dynamic"]
 csharp_helper_integration = []  # Enable integration tests that require the scip-csharp helper binary
 typescript_helper_integration = []  # Enable integration tests that require scip-typescript (npx or CODESEARCH_SCIP_TYPESCRIPT)
 

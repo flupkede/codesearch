@@ -3,6 +3,7 @@ mod cache;
 mod config;
 mod embedder;
 mod identity;
+mod onnx_runtime;
 mod openai;
 mod provider;
 pub use config::{active_config, configure, save_defaults, EmbedConfig};
@@ -18,6 +19,7 @@ pub use cache::{
     QueryCacheStats,
 };
 pub use embedder::{FastEmbedder, ModelType};
+pub use onnx_runtime::ensure_onnx_runtime;
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};

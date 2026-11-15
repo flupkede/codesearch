@@ -11,6 +11,14 @@ name = "codesearch_core"
 path = "src/lib.rs"
 
 [features]
+default = ["download-binaries"]
+# Link the prebuilt ONNX Runtime that `ort` downloads at build time. Those
+# binaries require AVX2 on x86_64.
+download-binaries = ["ort/download-binaries", "ort/copy-dylibs", "ort/tls-native", "fastembed/ort-download-binaries-native-tls"]
+# Load ONNX Runtime (>= 1.31) at runtime from `ORT_DYLIB_PATH` instead, e.g. an
+# official Microsoft release, which also runs on CPUs without AVX2. Build with
+# `--no-default-features --features load-dynamic`.
+load-dynamic = ["ort/load-dynamic", "fastembed/ort-load-dynamic"]
 # Forwarded by the CLI package's cuda/tensorrt features.
 cuda = ["ort/cuda"]
 tensorrt = ["ort/tensorrt"]
@@ -39,8 +47,13 @@ tracing-appender = "0.2"
 tracing-subscriber = { workspace = true }
 
 # ML & Embeddings (embed/ + rerank/ moved in at stage 5)
-fastembed = "7.0"
-ort = { version = "2.0.0-rc.10", features = ["download-binaries", "copy-dylibs"] }
+# How ONNX Runtime is linked is chosen by this crate's `download-binaries`
+# (default) / `load-dynamic` features above, so both crates opt out of their
+# default features. Every other default they enable is listed in
+# `download-binaries` so the default build resolves exactly the feature set
+# it had before the split.
+fastembed = { version = "7.0", default-features = false, features = ["hf-hub-native-tls", "image-models"] }
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "tracing", "api-31"] }
 clap = { workspace = true }
 # openai.rs embedding provider HTTP (same pinned spec as the CLI's)
 reqwest = { workspace = true }

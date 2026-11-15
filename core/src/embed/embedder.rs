@@ -341,6 +341,8 @@ impl FastEmbedder {
         cache_dir: Option<&std::path::Path>,
         show_download_progress: bool,
     ) -> Result<Self> {
+        super::ensure_onnx_runtime()?;
+
         // Set cache directory via environment variable if provided
         // Note: fastembed library uses FASTEMBED_CACHE_DIR (not FASTEMBED_CACHE_PATH)
         if let Some(cache_dir) = cache_dir {
