@@ -86,6 +86,19 @@ graph TB
     Router -->|client mode| ServeRouter
 ```
 
+### Repository layout
+
+The codebase is a Cargo workspace:
+
+| Crate | Path | Contents |
+|---|---|---|
+| `codesearch` | `src/` | CLI binary + commands, LMDB storage backend, serve orchestration (axum REST, TUI, file watching), index lifecycle |
+| `codesearch-core` | `core/` | Shared library: chunking, embeddings, retrieval (vector/BM25/RRF/rerank), SCIP symbols, federation, db-discovery, MCP protocol |
+| `codesearch-server` | `server/` | Placeholder for the upcoming standalone HTTP serve binary (GH #384) |
+
+The CLI re-exports the moved core modules under their historical `codesearch::` paths, so
+`use codesearch::chunker::Chunk;` and friends keep working.
+
 ## Quick Start
 
 ### Install

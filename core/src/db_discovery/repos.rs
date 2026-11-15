@@ -1,0 +1,1794 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::cache::{normalize_user_path, safe_canonicalize, strip_unc_prefix};
+use crate::constants::REPOS_CONFIG_FILE;
+
+/// A remote `codesearch serve` peer that can be queried for federation.
+///
+/// A group references a remote by listing `"@<peer_name>"` among its members
+/// (the leading `@` marks it as a remote reference rather than a local alias).
+/// Queries against such a group fan out to each remote peer over HTTP(S) and
+/// the results are merged with the local results.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RemotePeer {
+    /// Base URL of the remote serve instance, e.g. `https://codesearch.example.com`.
+    #[serde(alias = "base_url")]
+    pub url: String,
+    /// Bearer / `X-API-Key` shared secret accepted by the remote (required when
+    /// the remote is bound to a non-localhost address).
+    #[serde(default)]
+    pub api_key: String,
+    /// Group to query on the remote (in the remote's own `repos.json`).
+    /// When `None`, the remote's virtual `"all"` group is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Per-peer request timeout in seconds (default 15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// A resolved federation target — either a local repo or a remote peer.
+///
+/// Produced by [`ReposConfig::resolve_group_targets`]. Read-only tool handlers
+/// split their resolved targets into local and remote sets: local targets are
+/// served from the local LMDB stores as today; remote targets are queried over
+/// HTTP and their results merged in.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// A local repo, identified by alias and on-disk path.
+    Local { alias: String, path: PathBuf },
+    /// A remote peer, identified by the peer name under which it was declared
+    /// in `remotes`, together with its full connection config. Represents the
+    /// **whole peer** (its configured group) — produced by group federation.
+    Remote { peer_name: String, peer: RemotePeer },
+    /// A specific project on a remote peer, mounted locally as `<peer>/<alias>`.
+    /// Produced by single-project resolution
+    /// ([`ReposConfig::resolve_remote_project`]), never by group resolution.
+    /// `remote_alias` is the project's bare, un-namespaced name **on the peer** —
+    /// exactly what gets forwarded as `project=` to the peer's API.
+    RemoteProject {
+        peer_name: String,
+        peer: RemotePeer,
+        remote_alias: String,
+    },
+}
+
+/// Prefix that marks a group member as a reference to a remote peer rather than
+/// a local alias (e.g. `"@cloud"` → remote peer named `cloud`).
+pub const REMOTE_REF_PREFIX: &str = "@";
+
+/// Separator between a peer name and a remote project alias in a mounted remote
+/// project's namespaced local name (e.g. `cloud/vendor-a`). Both sides are
+/// guaranteed `/`-free: bare aliases are sanitized to `[A-Za-z0-9._-]` (see
+/// [`sanitize_alias`]), and peer names are validated to reject `/` in
+/// [`ReposConfig::add_remote`]. So the first `/` unambiguously splits
+/// `<peer>/<alias>`.
+pub const REMOTE_PROJECT_SEPARATOR: &str = "/";
+
+/// Build the namespaced local name for a remote project: `"<peer>/<alias>"`.
+pub fn remote_project_name(peer_name: &str, remote_alias: &str) -> String {
+    format!("{peer_name}{REMOTE_PROJECT_SEPARATOR}{remote_alias}")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ReposConfig {
+    pub repos: HashMap<String, PathBuf>,
+    #[serde(default)]
+    pub groups: HashMap<String, Vec<String>>,
+    /// Per-group behavior overrides. Absent entry = all defaults.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub groups_meta: HashMap<String, GroupMeta>,
+    #[serde(default)]
+    pub repos_meta: HashMap<String, RepoMeta>,
+    /// Per-repo read-only flag. Aliases mapped to `true` are opened **read-only**
+    /// by `codesearch serve`: the index is queried but never re-embedded/warmed
+    /// (no write open, no incremental refresh). Intended for large static corpora
+    /// on a memory-constrained replica where a separate job owns the heavy rebuild
+    /// (e.g. the cloud DOCS corpus on the 2 GiB serve replica). Writes/reindexes
+    /// against a read-only repo are rejected. Default: every repo is writable.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub repo_read_only: HashMap<String, bool>,
+    /// Remote `codesearch serve` peers reachable for federation. Group members
+    /// reference these via the `"@<peer_name>"` convention.
+    #[serde(default)]
+    pub remotes: HashMap<String, RemotePeer>,
+    /// Remote projects the user has explicitly mounted locally, as canonical
+    /// `"<peer>/<alias>"` names (opt-in allowlist). This list is the **single
+    /// source of truth**: only mounted projects are routable
+    /// (`project=<peer>/<alias>`), enumerable (`status` / `scope_required`),
+    /// shown in the TUI, and included in `@peer` group fan-out. Adding a remote
+    /// peer does NOT auto-mount anything — the user picks individual indexes via
+    /// `codesearch remote mount`. (Replaces the former opt-out `remote_hidden`.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_mounts: Vec<String>,
+    /// Optional local rename of a mounted remote project: canonical
+    /// `"<peer>/<alias>"` -> the custom local name shown/queried instead. The
+    /// underlying bare alias sent to the peer is unaffected.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub remote_alias_overrides: HashMap<String, String>,
+    /// Last-known remote project lists per peer, for offline fallback when a
+    /// peer is unreachable at startup. `peer_name` -> `[bare remote alias, ...]`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub remote_project_cache: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoMeta {
+    /// Unix timestamp (seconds) of last observed repo change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_changed_unix: Option<i64>,
+    /// Unix timestamp (seconds) of last successful SCIP index rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scip_indexed_unix: Option<i64>,
+    /// Git remote URL (`remote.origin.url`) captured at registration time.
+    /// Used to re-locate a repo whose folder was renamed/moved (best-effort).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
+    /// Git identity: canonical path of the repo's shared common dir
+    /// (`git rev-parse --git-common-dir`), captured at registration time.
+    /// Worktrees of one clone share this dir, so two registered repos with
+    /// the same value are family members (main tree + linked worktrees).
+    /// Persisted so a later deletion of the main tree keeps the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<String>,
+}
+
+/// Per-group behavior overrides (`groups_meta` in repos.json). An absent
+/// entry means every field takes its default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupMeta {
+    /// Expand group resolution with every registered repo sharing a member's
+    /// git identity (linked worktrees of the same clone). Default: true —
+    /// set `false` (`codesearch groups add --no-worktrees`) to keep a group
+    /// pointing at exactly the aliases it was created with.
+    #[serde(default = "default_true")]
+    pub expand_worktrees: bool,
+}
+
+impl Default for GroupMeta {
+    fn default() -> Self {
+        Self {
+            expand_worktrees: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyReposConfig(HashMap<String, serde_json::Value>);
+
+impl ReposConfig {
+    pub fn load() -> Result<Self> {
+        let path = config_path()?;
+        Self::load_from(&path).or_else(|e| {
+            tracing::warn!("{}. Returning empty config.", e);
+            Ok(Self::default())
+        })
+    }
+
+    /// Load from an explicit path (useful in tests).
+    pub fn load_from(path: &std::path::Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let content = fs::read_to_string(path)?;
+
+        // New format
+        if let Ok(mut config) = serde_json::from_str::<Self>(&content) {
+            config.reconcile();
+            return Ok(config);
+        }
+
+        // Legacy format: {"/abs/path": {...meta...}}
+        if let Ok(legacy) = serde_json::from_str::<LegacyReposConfig>(&content) {
+            let mut repos = HashMap::new();
+            for (project_path, _meta) in legacy.0 {
+                let path = PathBuf::from(&project_path);
+                let alias = unique_alias_for_path(&repos, &path);
+                repos.insert(alias, path);
+            }
+
+            let mut config = Self {
+                repos,
+                ..Default::default()
+            };
+            config.reconcile();
+            return Ok(config);
+        }
+
+        // Both parses failed — file is corrupt
+        Err(anyhow::anyhow!(
+            "repos.json is corrupt or unrecognised at: {}",
+            path.display()
+        ))
+    }
+
+    /// Harden an in-memory config loaded from disk so a hand-edited
+    /// `repos.json` can never crash the app. This is best-effort cleanup,
+    /// performed in memory only (no disk write here):
+    ///
+    /// 1. Drop repo entries whose alias key is empty/blank.
+    /// 2. Drop `repos_meta` entries that reference an unknown alias.
+    /// 3. Prune group members that reference unknown aliases; drop now-empty
+    ///    groups.
+    ///
+    /// Existing (non-empty) alias keys are never renamed — that would break
+    /// group references — so a merely "non-standard" hand-edited alias is
+    /// tolerated as-is.
+    pub(crate) fn reconcile(&mut self) {
+        // 1. Drop empty/blank alias keys.
+        let empty_keys: Vec<String> = self
+            .repos
+            .keys()
+            .filter(|alias| alias.trim().is_empty())
+            .cloned()
+            .collect();
+        for alias in empty_keys {
+            tracing::warn!("repos.json: dropping entry with empty alias key");
+            self.repos.remove(&alias);
+        }
+
+        // 2. Drop meta entries pointing at unknown aliases.
+        let orphan_meta: Vec<String> = self
+            .repos_meta
+            .keys()
+            .filter(|alias| !self.repos.contains_key(*alias))
+            .cloned()
+            .collect();
+        for alias in orphan_meta {
+            tracing::warn!("repos.json: dropping orphan metadata for '{}'", alias);
+            self.repos_meta.remove(&alias);
+        }
+
+        // 2b. Same for orphan read-only flags. `skip_serializing_if` only omits the
+        //     map when it is entirely empty, so a stale `repo_read_only["gone"]`
+        //     survives every round-trip — and an alias that is removed and later
+        //     re-added under the same name would silently inherit read-only.
+        let orphan_read_only: Vec<String> = self
+            .repo_read_only
+            .keys()
+            .filter(|alias| !self.repos.contains_key(*alias))
+            .cloned()
+            .collect();
+        for alias in orphan_read_only {
+            tracing::warn!("repos.json: dropping orphan read-only flag for '{}'", alias);
+            self.repo_read_only.remove(&alias);
+        }
+
+        // 3. Prune group members referencing unknown aliases OR unknown remote
+        //    peers; drop now-empty groups. A member starting with `@` is a
+        //    federation reference to a remote peer (`@cloud`), all others are
+        //    local aliases. Unknown references on both sides are dropped so a
+        //    hand-edited repos.json can never crash a later query.
+        let mut empty_groups: Vec<String> = Vec::new();
+        for (group, members) in self.groups.iter_mut() {
+            let before = members.len();
+            members.retain(|member| {
+                if let Some(peer_name) = member.strip_prefix(REMOTE_REF_PREFIX) {
+                    let known = self.remotes.contains_key(peer_name);
+                    if !known {
+                        tracing::warn!(
+                            "repos.json: pruned unknown remote reference '{}' from group '{}'",
+                            member,
+                            group
+                        );
+                    }
+                    known
+                } else {
+                    let known = self.repos.contains_key(member);
+                    if !known {
+                        tracing::warn!(
+                            "repos.json: pruned unknown alias '{}' from group '{}'",
+                            member,
+                            group
+                        );
+                    }
+                    known
+                }
+            });
+            if members.len() != before {
+                tracing::warn!(
+                    "repos.json: pruned {} unknown member(s) from group '{}'",
+                    before - members.len(),
+                    group
+                );
+            }
+            if members.is_empty() {
+                empty_groups.push(group.clone());
+            }
+        }
+        for group in empty_groups {
+            tracing::warn!("repos.json: dropping now-empty group '{}'", group);
+            self.groups.remove(&group);
+        }
+
+        // 3b. Same for orphan group overrides: a `groups_meta` entry whose
+        //     group no longer exists would survive every round-trip and
+        //     silently re-apply its opt-outs if the group name is reused.
+        let orphan_groups_meta: Vec<String> = self
+            .groups_meta
+            .keys()
+            .filter(|group| !self.groups.contains_key(*group))
+            .cloned()
+            .collect();
+        for group in orphan_groups_meta {
+            tracing::warn!("repos.json: dropping orphan group override for '{}'", group);
+            self.groups_meta.remove(&group);
+        }
+
+        // 4. Prune mounted remote projects whose peer is unknown or whose name
+        //    is malformed (no "<peer>/<alias>" split). A hand-edited or stale
+        //    `remote_mounts` entry must never make an un-routable name look
+        //    available.
+        self.remote_mounts.retain(|canonical| {
+            match canonical.split_once(REMOTE_PROJECT_SEPARATOR) {
+                Some((peer_name, remote_alias))
+                    if !peer_name.is_empty()
+                        && !remote_alias.is_empty()
+                        && self.remotes.contains_key(peer_name) =>
+                {
+                    true
+                }
+                _ => {
+                    tracing::warn!(
+                        "repos.json: pruned mounted remote project '{}' (unknown peer or malformed name)",
+                        canonical
+                    );
+                    false
+                }
+            }
+        });
+        // Drop rename overrides that no longer point at a mounted project —
+        // orphaned by the prune above OR by a hand-edited `remote_mounts`. An
+        // override is only ever consulted for an allowlisted entry, so a stale
+        // one is dead config; clearing it unconditionally also prevents a
+        // surprise rename resurfacing if the project is later re-mounted.
+        let mounted: std::collections::HashSet<&String> = self.remote_mounts.iter().collect();
+        self.remote_alias_overrides
+            .retain(|canonical, _| mounted.contains(canonical));
+
+        // 5. Drop cached remote-project lists for peers that no longer exist —
+        // a removed peer's last-known aliases are meaningless once the peer
+        // itself is gone (and would otherwise resurrect a stale peer name if
+        // it's later re-added under different projects).
+        self.remote_project_cache
+            .retain(|peer_name, _| self.remotes.contains_key(peer_name));
+    }
+
+    pub fn save(&self) -> Result<()> {
+        // Under cargo test, writing the REAL global repos.json is always a
+        // bug: every test must point CODESEARCH_REPOS_CONFIG at a temp file
+        // before anything on the save path runs. This guard exists because
+        // its absence once let a mis-ordered test seed overwrite a
+        // developer's entire registry (17 repos, groups, remotes — all of
+        // it) with a one-entry fixture, recovered only from serve logs.
+        #[cfg(test)]
+        {
+            let override_set = std::env::var(crate::constants::REPOS_CONFIG_ENV)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            let escape = std::env::var("CODESEARCH_TEST_ALLOW_GLOBAL_SAVE").is_ok();
+            if !override_set && !escape {
+                panic!(
+                    "ReposConfig::save() under cargo test would write the real global \
+                     repos.json. Set CODESEARCH_REPOS_CONFIG to a temp path first (or set \
+                     CODESEARCH_TEST_ALLOW_GLOBAL_SAVE if this is genuinely intended)."
+                );
+            }
+        }
+        let path = Self::path()?;
+        self.save_to(&path)
+    }
+
+    /// Save to an explicit path (useful in tests).
+    ///
+    /// Hardened after a real incident (see `save`'s test guard): the
+    /// previous plain `fs::write` was neither atomic nor recoverable.
+    /// This now (1) keeps one generation of the previous file as
+    /// `<path>.bak` — best-effort, a failed backup never blocks the save —
+    /// and (2) writes to a sibling temp file and renames it into place
+    /// with a bounded retry for transient Windows handle races (AV /
+    /// search indexer), mirroring `vectordb::store::atomic_write_json`.
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // (1) One-generation backup, best-effort.
+        if path.exists() {
+            let mut bak = path.as_os_str().to_os_string();
+            bak.push(".bak");
+            let _ = fs::copy(path, std::path::PathBuf::from(bak));
+        }
+
+        // (2) Atomic replace: temp file + rename over the target.
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".new");
+        let tmp_path = std::path::PathBuf::from(tmp);
+        let data = serde_json::to_string_pretty(self)?;
+        let write_result = (|| -> std::io::Result<()> {
+            let mut f = fs::File::create(&tmp_path)?;
+            f.write_all(data.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+
+        for attempt in 0..5 {
+            match fs::rename(&tmp_path, path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let transient = e
+                        .raw_os_error()
+                        .is_some_and(|raw| matches!(raw, 5 | 32 | 33))
+                        || {
+                            let msg = e.to_string();
+                            msg.contains("being used")
+                                || msg.contains("is in use")
+                                || msg.contains("Access is denied")
+                        };
+                    if transient && attempt < 4 {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(e.into());
+                }
+            }
+        }
+        unreachable!("retry loop always returns")
+    }
+
+    /// Return the path to the repos config file.
+    pub fn path() -> Result<PathBuf> {
+        config_path()
+    }
+
+    pub fn register(&mut self, path: PathBuf) -> String {
+        // safe_canonicalize strips \\?\ on success AND translates MSYS POSIX
+        // paths (`/c/...` → `C:/...`); the fallback re-applies both via
+        // normalize_user_path so a not-yet-existing path still enters the
+        // registry as `C:/...` instead of the raw `/c/...` (which Windows
+        // would later resolve to `<drive>:\c\...`, the path-pollution defect).
+        let canonical = safe_canonicalize(&path).unwrap_or_else(|_| normalize_user_path(&path));
+
+        if let Some((alias, _)) = self
+            .repos
+            .iter()
+            .find(|(_, p)| normalize_path_for_compare(p) == normalize_path_for_compare(&canonical))
+        {
+            return alias.clone();
+        }
+
+        let alias = unique_alias_for_path(&self.repos, &canonical);
+        if let Some(remote) = git_remote_url(&canonical) {
+            self.repos_meta.entry(alias.clone()).or_default().git_remote = Some(remote);
+        }
+        if let Some(common) = git_common_dir_for(&canonical) {
+            self.repos_meta
+                .entry(alias.clone())
+                .or_default()
+                .git_common_dir = Some(common);
+        }
+        self.repos.insert(alias.clone(), canonical);
+        alias
+    }
+
+    pub fn register_with_alias(&mut self, path: PathBuf, alias: Option<String>) -> Result<String> {
+        let canonical = safe_canonicalize(&path).unwrap_or_else(|_| normalize_user_path(&path));
+
+        if let Some((existing_alias, _)) = self
+            .repos
+            .iter()
+            .find(|(_, p)| normalize_path_for_compare(p) == normalize_path_for_compare(&canonical))
+        {
+            return Ok(existing_alias.clone());
+        }
+
+        let final_alias = match alias {
+            Some(raw) => {
+                let cleaned = sanitize_alias(&raw);
+                if cleaned.is_empty() {
+                    return Err(anyhow::anyhow!("Alias '{}' is invalid", raw));
+                }
+                if self.repos.contains_key(&cleaned) {
+                    return Err(anyhow::anyhow!("Alias '{}' already exists", cleaned));
+                }
+                cleaned
+            }
+            None => unique_alias_for_path(&self.repos, &canonical),
+        };
+
+        if let Some(remote) = git_remote_url(&canonical) {
+            self.repos_meta
+                .entry(final_alias.clone())
+                .or_default()
+                .git_remote = Some(remote);
+        }
+        if let Some(common) = git_common_dir_for(&canonical) {
+            self.repos_meta
+                .entry(final_alias.clone())
+                .or_default()
+                .git_common_dir = Some(common);
+        }
+        self.repos.insert(final_alias.clone(), canonical);
+        Ok(final_alias)
+    }
+
+    pub fn unregister_alias(&mut self, alias: &str) -> bool {
+        if self.repos.remove(alias).is_none() {
+            return false;
+        }
+
+        self.repos_meta.remove(alias);
+
+        for aliases in self.groups.values_mut() {
+            aliases.retain(|a| a != alias);
+        }
+        self.groups.retain(|_, aliases| !aliases.is_empty());
+        true
+    }
+
+    /// Auto-discover repos when the config is empty.
+    ///
+    /// Scans the current working directory for a `.codesearch.db` database.
+    /// If found and the repo list is empty, registers the CWD as a repo.
+    /// Returns the number of newly discovered repos (0 or 1).
+    pub fn auto_discover_from_cwd(&mut self) -> usize {
+        if !self.repos.is_empty() {
+            return 0;
+        }
+
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let db_path = cwd.join(crate::constants::DB_DIR_NAME);
+
+        if crate::db_discovery::is_valid_database(&db_path) {
+            let alias = self.register(cwd);
+            tracing::info!("🔍 Auto-discovered repo '{}' from CWD", alias);
+            return 1;
+        }
+
+        0
+    }
+
+    pub fn unregister_path(&mut self, path: &Path) -> bool {
+        // normalize_user_path on the fallback keeps register/unregister
+        // symmetry: if `register("/c/Users/foo")` stored `C:\Users\foo`, then
+        // `unregister_path("/c/Users/foo")` must match it even when the dir
+        // no longer exists (canonicalize fails) — see AGENTS.md "structural
+        // fix" rule for the warnings-channel class defect this mirrors.
+        let canonical = safe_canonicalize(path).unwrap_or_else(|_| normalize_user_path(path));
+        let to_remove = self
+            .repos
+            .iter()
+            .find(|(_, p)| normalize_path_for_compare(p) == normalize_path_for_compare(&canonical))
+            .map(|(alias, _)| alias.clone());
+
+        if let Some(alias) = to_remove {
+            return self.unregister_alias(&alias);
+        }
+
+        false
+    }
+
+    pub fn resolve(&self, project: &str) -> Option<PathBuf> {
+        self.repos.get(project).cloned()
+    }
+
+    /// Metadata for an alias. Returns default metadata when absent.
+    pub fn meta(&self, alias: &str) -> RepoMeta {
+        self.repos_meta.get(alias).cloned().unwrap_or_default()
+    }
+
+    /// Mutable metadata entry for an alias, creating it if needed.
+    pub fn meta_mut(&mut self, alias: &str) -> &mut RepoMeta {
+        self.repos_meta.entry(alias.to_string()).or_default()
+    }
+
+    /// Update `last_changed_unix` only when `ts` is newer.
+    /// Returns true when metadata changed.
+    pub fn touch_last_changed(&mut self, alias: &str, ts: i64) -> bool {
+        let meta = self.meta_mut(alias);
+        match meta.last_changed_unix {
+            Some(existing) if ts <= existing => false,
+            _ => {
+                meta.last_changed_unix = Some(ts);
+                true
+            }
+        }
+    }
+
+    /// Mark last successful SCIP rebuild timestamp.
+    pub fn touch_last_scip(&mut self, alias: &str, ts: i64) {
+        let meta = self.meta_mut(alias);
+        meta.last_scip_indexed_unix = Some(ts);
+    }
+
+    #[allow(dead_code)] // Used in tests only — dead in bin targets
+    pub fn resolve_group(&self, group: &str) -> Vec<(String, PathBuf)> {
+        // Virtual "all" group: resolves to every registered repo, never stored.
+        if group == crate::constants::ALL_GROUP_NAME {
+            return self
+                .repos
+                .iter()
+                .map(|(a, p)| (a.clone(), p.clone()))
+                .collect();
+        }
+        let Some(aliases) = self.groups.get(group) else {
+            return Vec::new();
+        };
+
+        aliases
+            .iter()
+            .filter_map(|alias| self.repos.get(alias).map(|p| (alias.clone(), p.clone())))
+            .collect()
+    }
+
+    /// Per-group opt-out switch for worktree expansion. Absent
+    /// `groups_meta` entry = expansion on (the default).
+    pub fn group_expands_worktrees(&self, group: &str) -> bool {
+        self.groups_meta
+            .get(group)
+            .map(|g| g.expand_worktrees)
+            .unwrap_or(true)
+    }
+
+    /// Expand a group's member list with every registered repo sharing a
+    /// member's git identity (linked worktrees of the same clone).
+    ///
+    /// The original members keep their order (de-duplicated); discovered
+    /// extras are appended sorted, so fan-out order stays deterministic.
+    /// `@peer` refs and unknown aliases pass through untouched — identity is
+    /// a local-repo concept. Uses only the recorded `repos_meta` identities:
+    /// no git spawn, so a deleted main tree still expands from its persisted
+    /// identity. Opt out per group via `groups_meta[group].expand_worktrees`.
+    pub fn expand_group_members(&self, group: &str, members: &[String]) -> Vec<String> {
+        if !self.group_expands_worktrees(group) {
+            return members.to_vec();
+        }
+        let mut out: Vec<String> = Vec::with_capacity(members.len());
+        for m in members {
+            if !out.contains(m) {
+                out.push(m.clone());
+            }
+        }
+        // Identity index for registered locals.
+        let identity_of: std::collections::HashMap<&str, &str> = self
+            .repos_meta
+            .iter()
+            .filter_map(|(alias, meta)| {
+                meta.git_common_dir
+                    .as_deref()
+                    .map(|id| (alias.as_str(), id))
+            })
+            .collect();
+        let member_identities: std::collections::HashSet<&str> = out
+            .iter()
+            .filter_map(|m| identity_of.get(m.as_str()).copied())
+            .collect();
+        let mut extras: Vec<&str> = identity_of
+            .iter()
+            .filter(|(alias, id)| {
+                member_identities.contains(**id) && !out.iter().any(|m| m.as_str() == **alias)
+            })
+            .map(|(alias, _)| *alias)
+            .collect();
+        extras.sort_unstable();
+        for extra in extras {
+            out.push(extra.to_string());
+        }
+        out
+    }
+
+    /// Federation-aware group resolution.
+    ///
+    /// Like [`resolve_group`](Self::resolve_group) but also expands `"@<peer>"`
+    /// members into [`Target::Remote`] entries. The virtual `"all"` group is
+    /// **always local-only** — it never federates (it expands to every local
+    /// repo, exactly as `resolve_group` does), so an `"all"` query can never
+    /// accidentally leak to a remote peer.
+    ///
+    /// Unknown remote references (`@ghost` with no matching `remotes` entry)
+    /// are skipped with a warning rather than failing — `reconcile` already
+    /// prunes them at load time, this is a defensive double-check for configs
+    /// built in-memory.
+    pub fn resolve_group_targets(&self, group: &str) -> Vec<Target> {
+        // Virtual "all" group: resolves to every registered LOCAL repo, never
+        // stored and never federated.
+        if group == crate::constants::ALL_GROUP_NAME {
+            return self
+                .repos
+                .iter()
+                .map(|(a, p)| Target::Local {
+                    alias: a.clone(),
+                    path: p.clone(),
+                })
+                .collect();
+        }
+        let Some(members) = self.groups.get(group) else {
+            return Vec::new();
+        };
+        // Worktree expansion: every registered repo sharing a member's git
+        // identity joins the fan-out (default on, per-group opt-out). The
+        // virtual "all" group early-returned above and never expands.
+        let members = self.expand_group_members(group, members);
+
+        let mut out = Vec::new();
+        for member in &members {
+            if let Some(peer_name) = member.strip_prefix(REMOTE_REF_PREFIX) {
+                match self.remotes.get(peer_name) {
+                    Some(peer) => out.push(Target::Remote {
+                        peer_name: peer_name.to_string(),
+                        peer: peer.clone(),
+                    }),
+                    None => tracing::warn!(
+                        "group '{}' references unknown remote peer '{}'; skipped",
+                        group,
+                        peer_name
+                    ),
+                }
+            } else if let Some(path) = self.repos.get(member) {
+                out.push(Target::Local {
+                    alias: member.clone(),
+                    path: path.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Convenience: split a group's targets into local aliases (with paths) and
+    /// remote peers. Useful for handlers that fan out local stores and remote
+    /// peers separately.
+    #[allow(clippy::type_complexity)]
+    pub fn split_group_targets(
+        &self,
+        group: &str,
+    ) -> (Vec<(String, PathBuf)>, Vec<(String, RemotePeer)>) {
+        let mut locals = Vec::new();
+        let mut remotes = Vec::new();
+        for t in self.resolve_group_targets(group) {
+            match t {
+                Target::Local { alias, path } => locals.push((alias, path)),
+                Target::Remote { peer_name, peer } => remotes.push((peer_name, peer)),
+                // Group resolution never yields RemoteProject today, but keep the
+                // match exhaustive: a mounted project maps to its peer.
+                Target::RemoteProject {
+                    peer_name, peer, ..
+                } => remotes.push((peer_name, peer)),
+            }
+        }
+        (locals, remotes)
+    }
+
+    /// Produce the user's explicitly mounted remote projects as
+    /// `(local_name, Target::RemoteProject)` pairs, derived purely from the
+    /// opt-in [`remote_mounts`](Self::remote_mounts) allowlist.
+    ///
+    /// - Each entry is a canonical `<peer>/<alias>` name; the pair carries the
+    ///   bare `remote_alias` (un-namespaced) forwarded to the peer.
+    /// - Skips entries whose peer is not in [`remotes`](Self::remotes) or that
+    ///   are malformed (no `/`).
+    /// - Applies [`remote_alias_overrides`](Self::remote_alias_overrides) so
+    ///   `local_name` is the user's chosen rename.
+    ///
+    /// Live peer discovery is deliberately NOT consulted: mounts are defined by
+    /// config, so they resolve even while a peer is unreachable. Result is
+    /// de-duplicated and sorted by `local_name` for stable display/ordering.
+    pub fn mounted_remote_projects(&self) -> Vec<(String, Target)> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for canonical in &self.remote_mounts {
+            if !seen.insert(canonical.as_str()) {
+                continue;
+            }
+            let Some((peer_name, remote_alias)) = canonical.split_once(REMOTE_PROJECT_SEPARATOR)
+            else {
+                continue;
+            };
+            if peer_name.is_empty() || remote_alias.is_empty() {
+                continue;
+            }
+            let Some(peer) = self.remotes.get(peer_name) else {
+                continue;
+            };
+            let local_name = self
+                .remote_alias_overrides
+                .get(canonical)
+                .cloned()
+                .unwrap_or_else(|| canonical.clone());
+            out.push((
+                local_name,
+                Target::RemoteProject {
+                    peer_name: peer_name.to_string(),
+                    peer: peer.clone(),
+                    remote_alias: remote_alias.to_string(),
+                },
+            ));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Resolve a project name to a [`Target::RemoteProject`], if it names a
+    /// **mounted** remote project.
+    ///
+    /// Accepts either the canonical `"<peer>/<alias>"` form or a user rename
+    /// declared in [`remote_alias_overrides`](Self::remote_alias_overrides).
+    /// Returns `None` for local aliases, unknown peers, and — crucially — any
+    /// name that is not in the opt-in [`remote_mounts`](Self::remote_mounts)
+    /// allowlist. The allowlist is the single source of truth: an un-mounted
+    /// `<peer>/<alias>` is unroutable even if the peer exposes it.
+    ///
+    /// **Precedence:** this method does not consult local repos, so a rename
+    /// override whose custom value equals a local alias would resolve here to a
+    /// remote target. Callers (MCP dispatch, Stage 2) MUST resolve local aliases
+    /// first and only fall back to this, so local repos always win a name clash.
+    pub fn resolve_remote_project(&self, name: &str) -> Option<Target> {
+        // A rename override maps a custom local name back to its canonical
+        // "<peer>/<alias>" key; fall back to treating `name` as canonical.
+        let canonical: &str = self
+            .remote_alias_overrides
+            .iter()
+            .find(|(_, custom)| custom.as_str() == name)
+            .map(|(canonical, _)| canonical.as_str())
+            .unwrap_or(name);
+
+        // Opt-in allowlist gate: only explicitly mounted projects resolve.
+        if !self.remote_mounts.iter().any(|m| m == canonical) {
+            return None;
+        }
+        let (peer_name, remote_alias) = canonical.split_once(REMOTE_PROJECT_SEPARATOR)?;
+        let peer = self.remotes.get(peer_name)?;
+        Some(Target::RemoteProject {
+            peer_name: peer_name.to_string(),
+            peer: peer.clone(),
+            remote_alias: remote_alias.to_string(),
+        })
+    }
+
+    /// Expand a group's `@peer` references into the **mounted** remote projects
+    /// belonging to those peers, as `(peer_name, peer, remote_alias)` tuples.
+    ///
+    /// This is the remote counterpart of [`resolve_group`](Self::resolve_group):
+    /// a group that references `@cloud` fans out only to the individual
+    /// `cloud/<alias>` indexes the user has mounted (opt-in
+    /// [`remote_mounts`](Self::remote_mounts)) — NOT to the whole peer. A
+    /// referenced peer with zero mounts contributes nothing. The virtual "all"
+    /// group never federates, so it yields an empty list.
+    pub fn group_remote_projects(&self, group: &str) -> Vec<(String, RemotePeer, String)> {
+        if group == crate::constants::ALL_GROUP_NAME {
+            return Vec::new();
+        }
+        let Some(members) = self.groups.get(group) else {
+            return Vec::new();
+        };
+        // Peers referenced by this group via "@peer" (that actually exist).
+        let referenced: std::collections::HashSet<&str> = members
+            .iter()
+            .filter_map(|m| m.strip_prefix(REMOTE_REF_PREFIX))
+            .filter(|p| self.remotes.contains_key(*p))
+            .collect();
+        if referenced.is_empty() {
+            return Vec::new();
+        }
+        self.mounted_remote_projects()
+            .into_iter()
+            .filter_map(|(_local, target)| match target {
+                Target::RemoteProject {
+                    peer_name,
+                    peer,
+                    remote_alias,
+                } if referenced.contains(peer_name.as_str()) => {
+                    Some((peer_name, peer, remote_alias))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Opt-in mount a remote project by its canonical `<peer>/<alias>` name.
+    /// Validates the name is well-formed and the peer exists. Idempotent; keeps
+    /// [`remote_mounts`](Self::remote_mounts) sorted.
+    pub fn mount_remote_project(&mut self, canonical: &str) -> Result<()> {
+        let (peer_name, remote_alias) =
+            canonical
+                .split_once(REMOTE_PROJECT_SEPARATOR)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid remote project name '{}': expected '<peer>{}<alias>'",
+                        canonical,
+                        REMOTE_PROJECT_SEPARATOR
+                    )
+                })?;
+        if peer_name.is_empty() || remote_alias.is_empty() {
+            return Err(anyhow::anyhow!(
+                "invalid remote project name '{}': peer and alias must be non-empty",
+                canonical
+            ));
+        }
+        if !self.remotes.contains_key(peer_name) {
+            return Err(anyhow::anyhow!(
+                "unknown remote peer '{}'; add it first with `codesearch remote add`",
+                peer_name
+            ));
+        }
+        if !self.remote_mounts.iter().any(|m| m == canonical) {
+            self.remote_mounts.push(canonical.to_string());
+            self.remote_mounts.sort();
+        }
+        Ok(())
+    }
+
+    /// Remove a mounted remote project (canonical `<peer>/<alias>`). Also drops
+    /// any now-orphaned rename override. Returns `true` if it was mounted.
+    pub fn unmount_remote_project(&mut self, canonical: &str) -> bool {
+        let before = self.remote_mounts.len();
+        self.remote_mounts.retain(|m| m != canonical);
+        let removed = self.remote_mounts.len() != before;
+        if removed {
+            self.remote_alias_overrides.remove(canonical);
+        }
+        removed
+    }
+
+    /// Write-through cache: record the alias list a peer's `/status` just
+    /// reported, so [`cached_remote_project_aliases`](Self::cached_remote_project_aliases)
+    /// can serve a "last known" answer the next time that peer is unreachable.
+    /// Sorted + deduped for stable, diff-friendly `repos.json` output.
+    pub fn cache_remote_projects(&mut self, peer_name: &str, mut aliases: Vec<String>) {
+        aliases.sort();
+        aliases.dedup();
+        self.remote_project_cache
+            .insert(peer_name.to_string(), aliases);
+    }
+
+    /// Last-known alias list for `peer_name`, if any was ever cached via
+    /// [`cache_remote_projects`](Self::cache_remote_projects). Used as an
+    /// offline fallback when the peer's `/status` can't be reached live.
+    pub fn cached_remote_project_aliases(&self, peer_name: &str) -> Option<&[String]> {
+        self.remote_project_cache
+            .get(peer_name)
+            .map(|v| v.as_slice())
+    }
+
+    pub fn add_group(&mut self, name: String, aliases: Vec<String>) -> Result<()> {
+        if name == crate::constants::ALL_GROUP_NAME {
+            return Err(anyhow::anyhow!(
+                "Group name '{}' is reserved — it always resolves to all registered repos automatically.",
+                name
+            ));
+        }
+        if aliases.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Group '{}' must contain at least one alias",
+                name
+            ));
+        }
+
+        for alias in &aliases {
+            if !self.repos.contains_key(alias) {
+                return Err(anyhow::anyhow!(
+                    "Unknown alias '{}' for group '{}'",
+                    alias,
+                    name
+                ));
+            }
+        }
+
+        let mut deduped = Vec::new();
+        for alias in aliases {
+            if !deduped.contains(&alias) {
+                deduped.push(alias);
+            }
+        }
+
+        self.groups.insert(name, deduped);
+        Ok(())
+    }
+
+    /// Return a groups map that includes the virtual `ALL_GROUP_NAME` group
+    /// (mapping to every registered alias), for display/discoverability surfaces
+    /// such as the `status` tool. The returned map is a clone — `self.groups` is
+    /// untouched and "all" is never persisted to `repos.json`.
+    pub fn groups_with_virtual_all(&self) -> std::collections::HashMap<String, Vec<String>> {
+        let mut out = self.groups.clone();
+        if !self.repos.is_empty() {
+            let mut all: Vec<String> = self.repos.keys().cloned().collect();
+            all.sort();
+            out.insert(crate::constants::ALL_GROUP_NAME.to_string(), all);
+        }
+        out
+    }
+
+    /// Inverse index: map each registered repo alias to the **named** group(s)
+    /// it belongs to (sorted, de-duplicated). Used by discoverability surfaces
+    /// (`status`, the `scope_required` error) so an agent can tell that, e.g.,
+    /// `"repo-a"` is a member of group `"group-a"` and prefer a cross-repo
+    /// `group=` query over a single-repo `project=` query.
+    ///
+    /// Deliberate exclusions:
+    /// - The virtual `"all"` group is never included — every repo belongs to it,
+    ///   so it would be pure noise and drown the high-signal membership. (This
+    ///   exclusion is *implicit*: `"all"` is never persisted in `self.groups`
+    ///   — it is synthesized on demand by `groups_with_virtual_all` /
+    ///   `resolve_group` — so iterating `self.groups` simply never sees it. A
+    ///   future change that starts persisting `"all"` would need to filter it
+    ///   here explicitly.)
+    /// - `"@remote"` group members are skipped — they are federation peers, not
+    ///   local project aliases.
+    /// - Aliases that belong to no named group are omitted entirely (no empty
+    ///   entries).
+    pub fn project_groups(&self) -> std::collections::HashMap<String, Vec<String>> {
+        let mut out: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (group, members) in &self.groups {
+            for member in members {
+                // Skip federation references ("@peer") — not local projects.
+                if member.starts_with(REMOTE_REF_PREFIX) {
+                    continue;
+                }
+                // Only map known local aliases.
+                if self.repos.contains_key(member) {
+                    out.entry(member.clone()).or_default().push(group.clone());
+                }
+            }
+        }
+        for groups in out.values_mut() {
+            groups.sort();
+            groups.dedup();
+        }
+        out
+    }
+
+    pub fn remove_group(&mut self, name: &str) -> bool {
+        self.groups.remove(name).is_some()
+    }
+
+    /// Map each worktree alias to its family's main-tree alias: among all
+    /// registered aliases sharing one git identity (common dir), the main
+    /// tree is the SHORTEST registered path (a worktree lives under the main
+    /// tree), ties broken by the lexicographically smallest alias. Only
+    /// worktree aliases appear as keys — main-tree aliases map to themselves
+    /// and are omitted. Annotation-only: consumers (status, the scope error,
+    /// dashboard/CLI rendering) use it to label provenance; resolution never
+    /// depends on it.
+    pub fn worktree_family_map(&self) -> std::collections::HashMap<String, String> {
+        use std::collections::HashMap;
+
+        // identity -> (shortest-path fallback so far). Shortest path is the
+        // fallback for families whose main tree is not (or no longer)
+        // registered, so a worktree parked at a shorter path cannot steal
+        // the main label.
+        let mut shortest: HashMap<&str, (usize, &str)> = HashMap::new();
+        for (alias, path) in &self.repos {
+            let Some(identity) = self
+                .repos_meta
+                .get(alias)
+                .and_then(|m| m.git_common_dir.as_deref())
+            else {
+                continue;
+            };
+            let path_len = path.as_os_str().len();
+            match shortest.get_mut(identity) {
+                Some((best_len, best_alias)) => {
+                    let better = path_len < *best_len
+                        || (path_len == *best_len && alias.as_str() < *best_alias);
+                    if better {
+                        *best_len = path_len;
+                        *best_alias = alias.as_str();
+                    }
+                }
+                None => {
+                    shortest.insert(identity, (path_len, alias.as_str()));
+                }
+            }
+        }
+        // Exact main election: a member whose `<repo>/.git` IS the recorded
+        // common dir is the main tree — a worktree's common dir lives under
+        // the main's path, never its own. Aliases without a recorded
+        // identity take part too: a main tree registered before identity
+        // capture existed has None, but its .git path still equals the
+        // family identity.
+        let identities: Vec<&str> = shortest.keys().copied().collect();
+        let mut exact: HashMap<&str, &str> = HashMap::new();
+        for (alias, path) in &self.repos {
+            let norm_git = normalize_path_for_compare(&path.join(".git"));
+            for identity in &identities {
+                if normalize_path_for_compare(Path::new(identity)) == norm_git {
+                    exact.entry(*identity).or_insert(alias.as_str());
+                }
+            }
+        }
+        let mut out: HashMap<String, String> = HashMap::new();
+        for alias in self.repos.keys() {
+            let Some(identity) = self
+                .repos_meta
+                .get(alias)
+                .and_then(|m| m.git_common_dir.as_deref())
+            else {
+                continue;
+            };
+            let main = exact
+                .get(identity)
+                .copied()
+                .or_else(|| shortest.get(identity).map(|(_, a)| *a));
+            if let Some(main) = main {
+                if main != alias.as_str() {
+                    out.insert(alias.clone(), main.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Register (or overwrite) a remote federation peer under `name`.
+    ///
+    /// The peer becomes referenceable from a group as `"@<name>"`. Adding a
+    /// remote does NOT, by itself, make it queryable — the `"@<name>"` reference
+    /// must also be added to a group (see [`add_remote_to_group`]).
+    ///
+    /// Validates that the name is non-empty and does not itself carry the
+    /// `@` reference prefix (which is added automatically in group members),
+    /// and that the peer URL is non-empty.
+    pub fn add_remote(&mut self, name: String, peer: RemotePeer) -> Result<()> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow::anyhow!("Remote peer name must not be empty"));
+        }
+        if trimmed.starts_with(REMOTE_REF_PREFIX) {
+            return Err(anyhow::anyhow!(
+                "Remote peer name must not start with '{}' — that prefix is only used inside group references (e.g. group member \"@{}\")",
+                REMOTE_REF_PREFIX,
+                trimmed.trim_start_matches(REMOTE_REF_PREFIX)
+            ));
+        }
+        // A peer name is the first segment of a mounted project's namespaced name
+        // (`<peer>/<alias>`). Allowing `/` here would break `resolve_remote_project`,
+        // which splits on the FIRST separator — enforce the invariant the
+        // REMOTE_PROJECT_SEPARATOR doc-comment promises.
+        if trimmed.contains(REMOTE_PROJECT_SEPARATOR) {
+            return Err(anyhow::anyhow!(
+                "Remote peer name '{}' must not contain '{}' — that separator delimits <peer>/<alias> in mounted remote projects",
+                trimmed,
+                REMOTE_PROJECT_SEPARATOR
+            ));
+        }
+        if peer.url.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Remote peer '{}' must have a non-empty url",
+                trimmed
+            ));
+        }
+        self.remotes.insert(trimmed.to_string(), peer);
+        Ok(())
+    }
+
+    /// Remove a remote peer and prune every `"@<name>"` reference to it from all
+    /// groups; groups left empty by the prune are dropped. Returns `false` when
+    /// no peer of that name was registered.
+    pub fn remove_remote(&mut self, name: &str) -> bool {
+        if self.remotes.remove(name).is_none() {
+            return false;
+        }
+        let reference = format!("{REMOTE_REF_PREFIX}{name}");
+        for members in self.groups.values_mut() {
+            members.retain(|m| m != &reference);
+        }
+        self.groups.retain(|_, members| !members.is_empty());
+        true
+    }
+
+    /// Add a `"@<remote_name>"` reference to `group`, creating the group if it
+    /// does not exist. Idempotent — a reference already present is not
+    /// duplicated. The reserved virtual `"all"` group never federates and
+    /// cannot be targeted. Errors when the remote peer is unknown.
+    pub fn add_remote_to_group(&mut self, group: String, remote_name: &str) -> Result<()> {
+        if group == crate::constants::ALL_GROUP_NAME {
+            return Err(anyhow::anyhow!(
+                "Group name '{}' is reserved — it always resolves to all registered repos and never federates.",
+                group
+            ));
+        }
+        if !self.remotes.contains_key(remote_name) {
+            return Err(anyhow::anyhow!(
+                "Unknown remote peer '{}' — add it first with `codesearch remote add`.",
+                remote_name
+            ));
+        }
+        let reference = format!("{REMOTE_REF_PREFIX}{remote_name}");
+        let members = self.groups.entry(group).or_default();
+        if !members.contains(&reference) {
+            members.push(reference);
+        }
+        Ok(())
+    }
+
+    /// Named groups that reference the given remote peer as `"@<name>"`
+    /// (sorted). Used by the `remote list` surface to show where a peer is wired
+    /// in. The virtual `"all"` group never federates, so it is never included.
+    pub fn groups_referencing_remote(&self, remote_name: &str) -> Vec<String> {
+        let reference = format!("{REMOTE_REF_PREFIX}{remote_name}");
+        let mut out: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|(_, members)| members.contains(&reference))
+            .map(|(name, _)| name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    pub fn alias_for_path(&self, path: &Path) -> Option<String> {
+        // See unregister_path: normalize_user_path on the fallback preserves
+        // lookup symmetry for not-on-disk paths.
+        let canonical = safe_canonicalize(path).unwrap_or_else(|_| normalize_user_path(path));
+        self.repos
+            .iter()
+            .find(|(_, p)| normalize_path_for_compare(p) == normalize_path_for_compare(&canonical))
+            .map(|(alias, _)| alias.clone())
+    }
+
+    /// Best-effort relocation of a registered repo whose stored path no longer
+    /// exists (e.g. its folder was renamed/moved). Starting from the nearest
+    /// still-existing ancestor of the stale path, scans (bounded depth) for a
+    /// git repository whose `remote.origin.url` matches the one captured at
+    /// registration time. Returns the new path only on a single unambiguous
+    /// match; `None` when the path still exists, no remote was recorded, or the
+    /// match is absent/ambiguous.
+    pub fn try_relocate(&self, alias: &str) -> Option<PathBuf> {
+        let stale = self.repos.get(alias)?;
+        if stale.exists() {
+            return None; // path is fine — nothing to relocate
+        }
+
+        let target_remote = self.repos_meta.get(alias)?.git_remote.clone()?;
+
+        // Walk up to the nearest ancestor that still exists on disk.
+        let mut anchor = stale.parent();
+        while let Some(dir) = anchor {
+            if dir.exists() {
+                break;
+            }
+            anchor = dir.parent();
+        }
+        let anchor = anchor?;
+
+        let mut matches = Vec::new();
+        scan_for_remote(anchor, &target_remote, relocate_max_depth(), &mut matches);
+
+        // Don't relocate onto a path already registered under another alias.
+        matches.retain(|p| {
+            !self.repos.iter().any(|(a, existing)| {
+                a != alias && normalize_path_for_compare(existing) == normalize_path_for_compare(p)
+            })
+        });
+
+        if matches.len() == 1 {
+            Some(strip_unc_prefix(matches.into_iter().next().unwrap()))
+        } else {
+            None
+        }
+    }
+
+    /// Relocate every registered repo whose stored path no longer exists.
+    ///
+    /// For each missing path a best-effort git-identity relocation is attempted
+    /// ([`Self::try_relocate`]); successful matches rewrite the in-memory
+    /// `repos` map.
+    ///
+    /// **Note:** this method performs disk I/O (filesystem traversal, git
+    /// subprocess) and should not be called while holding an async lock or from
+    /// an async task without `spawn_blocking`. No logging is emitted — callers
+    /// are responsible for reporting results.
+    ///
+    /// Returns `(relocated, unresolved)` where `relocated` is the list of
+    /// `(alias, new_path)` rewrites and `unresolved` is the list of aliases
+    /// whose path is still missing.
+    #[must_use]
+    pub fn relocate_missing(&mut self) -> (Vec<(String, PathBuf)>, Vec<String>) {
+        let aliases: Vec<String> = self.repos.keys().cloned().collect();
+        let mut relocated = Vec::new();
+        let mut unresolved = Vec::new();
+
+        for alias in aliases {
+            let Some(path) = self.repos.get(&alias) else {
+                continue;
+            };
+            if path.exists() {
+                continue;
+            }
+            match self.try_relocate(&alias) {
+                Some(new_path) => {
+                    self.repos.insert(alias.clone(), new_path.clone());
+                    relocated.push((alias, new_path));
+                }
+                None => unresolved.push(alias),
+            }
+        }
+
+        (relocated, unresolved)
+    }
+
+    /// Prune stale entries: relocate what can be relocated, then unregister the
+    /// rest.
+    ///
+    /// **Note:** this method performs disk I/O (filesystem traversal, git
+    /// subprocess) via [`Self::relocate_missing`]. No logging is emitted.
+    ///
+    /// Returns `(relocated, removed)`.
+    #[must_use]
+    pub fn prune_stale(&mut self) -> (Vec<(String, PathBuf)>, Vec<String>) {
+        let (relocated, unresolved) = self.relocate_missing();
+        let mut removed = Vec::new();
+        for alias in unresolved {
+            if self.unregister_alias(&alias) {
+                removed.push(alias);
+            }
+        }
+        (relocated, removed)
+    }
+}
+
+/// Display-only family-note vocabulary shared by the TUI repo table and the
+/// CLI `groups list`: a worktree alias annotates as `<main>` (the tree
+/// grouping in the TUI carries the relationship; the bare alias in
+/// parentheses reads cleaner than a "worktree of" prefix), a
+/// family's main alias as `+ N` (the TUI's Worktree column header already
+/// carries the word), anything else gets no note. The counting scope is the
+/// caller's choice — the CLI counts within a group, the TUI across the whole
+/// fleet — which is why `counts` is a parameter.
+pub fn family_note(
+    family_map: &std::collections::HashMap<String, String>,
+    counts: &std::collections::HashMap<String, usize>,
+    alias: &str,
+) -> Option<String> {
+    if let Some(main) = family_map.get(alias) {
+        return Some(main.clone());
+    }
+    match counts.get(alias) {
+        Some(&n) if n > 0 => Some(format!("+ {n}")),
+        _ => None,
+    }
+}
+
+pub fn config_dir() -> Result<PathBuf> {
+    crate::constants::codesearch_home()
+}
+
+pub fn config_path() -> Result<PathBuf> {
+    if let Ok(override_path) = std::env::var(crate::constants::REPOS_CONFIG_ENV) {
+        let path = PathBuf::from(&override_path);
+        // Validate the env-var override points to a .json file to prevent
+        // path traversal / arbitrary file read (CodeQL: uncontrolled data in path).
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("json") {
+            return Ok(path);
+        }
+        anyhow::bail!(
+            "{} must point to a .json file, got: {}",
+            crate::constants::REPOS_CONFIG_ENV,
+            override_path
+        );
+    }
+    Ok(config_dir()?.join(REPOS_CONFIG_FILE))
+}
+
+fn unique_alias_for_path(existing: &HashMap<String, PathBuf>, path: &Path) -> String {
+    let base_raw = path.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
+    let base = sanitize_alias(base_raw);
+    let base = if base.is_empty() {
+        "repo".to_string()
+    } else {
+        base
+    };
+
+    if !existing.contains_key(&base) {
+        return base;
+    }
+
+    let mut idx = 2usize;
+    loop {
+        let candidate = format!("{}-{}", base, idx);
+        if !existing.contains_key(&candidate) {
+            return candidate;
+        }
+        idx += 1;
+    }
+}
+
+/// Sanitize a raw alias string for use as a repo identifier.
+///
+/// Preserves the original casing and dots (e.g. "ExampleRepo" stays "ExampleRepo")
+/// to match the directory/repo name. Only removes characters that are problematic
+/// in identifiers: spaces become dashes, and characters outside `[a-zA-Z0-9._-]`
+/// are dropped. Collapses consecutive dashes and trims leading/trailing dashes.
+fn sanitize_alias(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else if ch == ' ' {
+            out.push('-');
+        }
+        // All other characters (brackets, accents, etc.) are silently dropped
+    }
+
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn normalize_path_for_compare(path: &Path) -> String {
+    crate::cache::normalize_path(path)
+}
+
+/// Best-effort lookup of a directory's git remote URL (`remote.origin.url`).
+///
+/// Returns `None` when `git` is unavailable, the path is not a git repo, or the
+/// repo has no `origin` remote. Used both to capture a repo's identity at
+/// registration time and to match candidate directories during relocation.
+pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
+    // `git` is spawned once per candidate directory. On Windows/msys (and Unix
+    // under heavy parallel load) the OS can transiently refuse to fork the
+    // subprocess (EAGAIN / "Resource temporarily unavailable"). Treating that
+    // transient spawn failure the same as "no remote" would silently strip a
+    // repo's git identity — breaking relocation and causing valid repos to be
+    // pruned. Retry a few times with a short backoff on spawn failure; a
+    // definitive `NotFound` (git not installed) returns immediately, and an
+    // `Ok` result whose status is non-success (not a repo / no origin) is a
+    // real answer that is NOT retried.
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut output = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "--get", "remote.origin.url"])
+            .output()
+        {
+            Ok(o) => {
+                output = Some(o);
+                break;
+            }
+            // git binary genuinely absent — retrying cannot help.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            // Transient spawn failure (fork exhaustion). Back off and retry.
+            Err(_) => {
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+
+    let output = output?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+/// Best-effort lookup of a directory's git identity: the canonical path of the
+/// repository's shared common dir (`git rev-parse --git-common-dir`).
+///
+/// Worktrees of one clone share this dir, so two registered repos with the
+/// same value are family members (main tree + linked worktrees). Returns
+/// `None` when the path is not a git repo. The spawn retry pattern mirrors
+/// `git_remote_url`; when the git binary cannot be spawned at all, a
+/// filesystem-only fallback resolves the common dir from the `.git` entry
+/// (file → `gitdir:` → `commondir` climb), so a worktree registered on a
+/// machine without git still records its identity.
+pub fn git_common_dir_for(path: &Path) -> Option<String> {
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut output = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--git-common-dir"])
+            .output()
+        {
+            Ok(o) => {
+                output = Some(o);
+                break;
+            }
+            // git binary genuinely absent — the fs fallback is all we have.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return git_common_dir_fs_fallback(path)
+            }
+            // Transient spawn failure (fork exhaustion). Back off and retry.
+            Err(_) => {
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+
+    let output = output?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if dir.is_empty() {
+        return None;
+    }
+    // git may print the common dir relative to the `-C` directory (".git",
+    // "../.git"); join before canonicalizing so both forms land on the same
+    // absolute identity string.
+    let joined = PathBuf::from(&dir);
+    let resolved = if joined.is_absolute() {
+        joined
+    } else {
+        path.join(joined)
+    };
+    Some(identity_string(&resolved))
+}
+
+/// Filesystem-only resolution of the git common dir, used when `git` cannot
+/// be spawned (binary absent). Mirrors `resolve_hooks_dir_manual` in
+/// src/cli/mod.rs: a worktree's `.git` is a FILE pointing at its per-worktree
+/// gitdir, which holds a `commondir` file pointing at the shared dir; a main
+/// tree's `.git` is the shared dir itself.
+fn git_common_dir_fs_fallback(path: &Path) -> Option<String> {
+    let dot_git = path.join(".git");
+    let git_dir = if dot_git.is_file() {
+        let content = std::fs::read_to_string(&dot_git).ok()?;
+        let first_line = content.lines().next()?.trim();
+        let rel = first_line.strip_prefix("gitdir: ")?.trim();
+        let resolved = path.join(rel);
+        match std::fs::read_to_string(resolved.join("commondir")) {
+            Ok(cd) => {
+                let common = resolved.join(cd.trim());
+                if common.exists() {
+                    common
+                } else {
+                    resolved
+                }
+            }
+            Err(_) => resolved,
+        }
+    } else if dot_git.is_dir() {
+        dot_git
+    } else {
+        return None;
+    };
+    Some(identity_string(&git_dir))
+}
+
+/// Canonical identity string for a path: `safe_canonicalize` (strips `\\?\`,
+/// translates MSYS forms) with the `normalize_user_path` fallback for paths
+/// that do not exist yet — the same convention `register()` uses for repo
+/// paths, so identity strings and repo paths compare equal byte-for-byte.
+fn identity_string(path: &Path) -> String {
+    let canonical = safe_canonicalize(path).unwrap_or_else(|_| normalize_user_path(path));
+    canonical.to_string_lossy().to_string()
+}
+
+/// Configured relocation scan depth (`CODESEARCH_RELOCATE_MAX_DEPTH`, default 3).
+fn relocate_max_depth() -> usize {
+    std::env::var(crate::constants::RELOCATE_MAX_DEPTH_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(crate::constants::DEFAULT_RELOCATE_MAX_DEPTH)
+}
+
+/// Directory names never worth descending into during a relocation scan.
+fn is_skippable_scan_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name == crate::constants::DB_DIR_NAME
+        || matches!(
+            name,
+            ".git" | "node_modules" | "target" | "bin" | "obj" | "dist" | "build"
+        )
+}
+
+/// Git roots directly under `dir` (one level, skipping build/vendor dirs).
+///
+/// A parent directory registered as ONE project hides the repos beneath it:
+/// their files are indexed through the parent's ignore rules, and a session
+/// in a child resolves to the parent's alias. Used to warn at registration.
+pub fn nested_git_roots(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if !child.is_dir() || is_skippable_scan_dir(&child) {
+            continue;
+        }
+        if child.join(".git").exists() {
+            out.push(safe_canonicalize(&child).unwrap_or_else(|_| normalize_user_path(&child)));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Recursively collect git roots under `dir` (bounded by `depth`) whose
+/// `remote.origin.url` matches `target_remote`. A matching git root is recorded
+/// and not descended into (nested repos below it are ignored).
+fn scan_for_remote(dir: &Path, target_remote: &str, depth: usize, out: &mut Vec<PathBuf>) {
+    if dir.join(".git").exists() {
+        if git_remote_url(dir).as_deref() == Some(target_remote) {
+            // Canonicalize to resolve 8.3 short names on Windows (e.g. RUNNER~1 →
+            // runneradmin) so stored and found paths are always in the same form.
+            // normalize_user_path on the fallback is defensive (paths here come
+            // from a filesystem scan, so they are already clean Windows paths,
+            // but the helper is a no-op then).
+            out.push(safe_canonicalize(dir).unwrap_or_else(|_| normalize_user_path(dir)));
+        }
+        return;
+    }
+
+    if depth == 0 {
+        return;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() && !is_skippable_scan_dir(&child) {
+                scan_for_remote(&child, target_remote, depth - 1, out);
+            }
+        }
+    }
+}
+
+/// Shared git-spawning test helpers, used by this module's tests and by
+/// serve/tests.rs (backfill needs real repos with a shared worktree identity).
+/// Not cfg(test)-gated: test-only items vanish in dependency builds, and the
+/// CLI's own test target compiles core as a dependency. Compiled inert in
+/// non-test builds, hence the allowance.
+#[allow(dead_code)]
+pub mod test_support {
+    use std::path::Path;
+
+    const HOOK_ENV_VARS: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_QUARANTINE_PATH",
+        "GIT_PREFIX",
+    ];
+
+    /// Remove git's hook-context variables from a spawned command. git
+    /// exports these to hook processes, so a test binary running inside the
+    /// pre-push QC gate inherits them — and `git -C <tmp>` then resolves the
+    /// OUTER repo's index/objects regardless of `-C`. Production spawns keep
+    /// their env: codesearch itself legitimately runs inside hooks.
+    pub fn scrub_hook_git_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+        for var in HOOK_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        cmd
+    }
+
+    /// Run `f` with the hook-context variables removed from THIS process —
+    /// for tests that exercise production code spawning git (the production
+    /// fn builds its own Command). Mutates process env: callers must be
+    /// serialized (git_serial_lock or #[serial]).
+    pub fn with_hook_git_env_cleared<T>(f: impl FnOnce() -> T) -> T {
+        let saved: Vec<(&'static str, String)> = HOOK_ENV_VARS
+            .iter()
+            .filter_map(|v| std::env::var(v).ok().map(|val| (*v, val)))
+            .collect();
+        for var in HOOK_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        let out = f();
+        for (var, val) in saved {
+            std::env::set_var(var, val);
+        }
+        out
+    }
+
+    /// RAII variant of [`with_hook_git_env_cleared`] for async tests, where a
+    /// closure cannot wrap `.await` points. Same serialization requirement.
+    pub struct HookGitEnvGuard {
+        saved: Vec<(&'static str, String)>,
+    }
+
+    impl Drop for HookGitEnvGuard {
+        fn drop(&mut self) {
+            for (var, val) in &self.saved {
+                std::env::set_var(var, val);
+            }
+        }
+    }
+
+    pub fn clear_hook_git_env() -> HookGitEnvGuard {
+        let saved: Vec<(&'static str, String)> = HOOK_ENV_VARS
+            .iter()
+            .filter_map(|v| std::env::var(v).ok().map(|val| (*v, val)))
+            .collect();
+        for var in HOOK_ENV_VARS {
+            std::env::remove_var(var);
+        }
+        HookGitEnvGuard { saved }
+    }
+
+    /// Process-wide lock serializing the git-spawning / directory-renaming
+    /// tests: on Windows the OS indexer / antivirus holds `.git` handles
+    /// while scanning freshly-created trees, and concurrent git subprocesses
+    /// transiently fail under that load.
+    static GIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the serialization lock, recovering from a poisoned mutex (a
+    /// panic in one test must not cascade-fail the rest).
+    pub fn git_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+        GIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Initialise a git repo at `dir` with one commit, so `git worktree add`
+    /// has a HEAD to branch from. Same transient-spawn retry posture as the
+    /// relocation tests' `init_git_remote`.
+    pub fn init_git_repo_with_commit(dir: &Path) {
+        let run = |args: &[&str]| {
+            const MAX_ATTEMPTS: u64 = 8;
+            for attempt in 0..MAX_ATTEMPTS {
+                match scrub_hook_git_env(&mut std::process::Command::new("git"))
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                {
+                    Ok(o) => {
+                        assert!(
+                            o.status.success(),
+                            "git {args:?} failed: {}",
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                        return o;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        panic!("git not available in test env: {e}");
+                    }
+                    Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                        std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                    }
+                    Err(e) => panic!("git spawn failed after retries: {e}"),
+                }
+            }
+            unreachable!("loop returns or panics")
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "test\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+    }
+}
+
+#[cfg(test)]
+#[path = "repos_tests.rs"]
+mod tests;

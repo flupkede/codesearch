@@ -5,6 +5,10 @@ use clap::{
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
+mod mcp_runtime;
+
+use mcp_runtime::{run_mcp_server, run_mcp_server_with_options, McpStartupOptions};
+
 use crate::constants::{
     DEFAULT_SERVE_URL, REPO_REINDEX_PATH_PREFIX, REPO_REINDEX_PATH_SUFFIX, SERVE_PORT_ENV,
 };
@@ -1380,9 +1384,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             // MCP stdio transport uses stdout for JSON-RPC — always force file-only
             // logging to keep the channel clean, regardless of the global --quiet flag.
             if readonly || require_ready {
-                crate::mcp::run_mcp_server_with_options(
+                run_mcp_server_with_options(
                     path,
-                    crate::mcp::McpStartupOptions {
+                    McpStartupOptions {
                         create_index,
                         readonly,
                         require_ready,
@@ -1394,8 +1398,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 )
                 .await
             } else {
-                crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token)
-                    .await
+                run_mcp_server(path, create_index, log_level, true, mode, cancel_token).await
             }
         }
         Commands::Cache { command } => match command {
@@ -2186,6 +2189,7 @@ pub mod setup;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // --- post-checkout hook generation / install ---------------------------
 
@@ -2273,65 +2277,77 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn refresh_upgrades_an_outdated_managed_block_idempotently() {
-        let (tmp, hook_path) = hook_refresh_fixture();
-        let repo = tmp.path();
-        // A hook written by an OLDER binary: our markers, stale body.
-        let stale = format!(
-            "#!/bin/sh\n# foreign header\necho mine\n{}\nREPO_PATH=\"$(pwd)\"\n{}\necho bye\n",
-            HOOK_BEGIN, HOOK_END
-        );
-        std::fs::write(&hook_path, stale).unwrap();
+        // resolve_hooks_dir shells out to git: clear the hook context this
+        // process inherits under the pre-push QC gate, or `git rev-parse`
+        // resolves the outer repo instead of the fixture.
+        crate::db_discovery::repos::test_support::with_hook_git_env_cleared(|| {
+            let (tmp, hook_path) = hook_refresh_fixture();
+            let repo = tmp.path();
+            // A hook written by an OLDER binary: our markers, stale body.
+            let stale = format!(
+                "#!/bin/sh\n# foreign header\necho mine\n{}\nREPO_PATH=\"$(pwd)\"\n{}\necho bye\n",
+                HOOK_BEGIN, HOOK_END
+            );
+            std::fs::write(&hook_path, stale).unwrap();
 
-        assert_eq!(
-            refresh_codesearch_post_checkout_hook(repo),
-            HookRefreshOutcome::Upgraded
-        );
-        let updated = std::fs::read_to_string(&hook_path).unwrap();
-        // Foreign lines preserved, fresh body swapped in, stale body gone.
-        assert!(updated.contains("echo mine"));
-        assert!(updated.contains("echo bye"));
-        assert!(updated.contains("pwd -W 2>/dev/null || pwd"));
-        assert!(!updated.contains("REPO_PATH=\"$(pwd)\""));
+            assert_eq!(
+                refresh_codesearch_post_checkout_hook(repo),
+                HookRefreshOutcome::Upgraded
+            );
+            let updated = std::fs::read_to_string(&hook_path).unwrap();
+            // Foreign lines preserved, fresh body swapped in, stale body gone.
+            assert!(updated.contains("echo mine"));
+            assert!(updated.contains("echo bye"));
+            assert!(updated.contains("pwd -W 2>/dev/null || pwd"));
+            assert!(!updated.contains("REPO_PATH=\"$(pwd)\""));
 
-        // Second pass over the same file must be a no-op.
-        assert_eq!(
-            refresh_codesearch_post_checkout_hook(repo),
-            HookRefreshOutcome::UpToDate
-        );
+            // Second pass over the same file must be a no-op.
+            assert_eq!(
+                refresh_codesearch_post_checkout_hook(repo),
+                HookRefreshOutcome::UpToDate
+            );
+        });
     }
 
     #[test]
+    #[serial]
     fn refresh_never_touches_foreign_or_missing_hooks() {
-        let (tmp, hook_path) = hook_refresh_fixture();
-        let repo = tmp.path();
+        crate::db_discovery::repos::test_support::with_hook_git_env_cleared(|| {
+            let (tmp, hook_path) = hook_refresh_fixture();
+            let repo = tmp.path();
 
-        // No hook at all → nothing to upgrade, nothing created.
-        assert_eq!(
-            refresh_codesearch_post_checkout_hook(repo),
-            HookRefreshOutcome::NotInstalled
-        );
-        assert!(!hook_path.exists(), "refresh must not install hooks");
+            // No hook at all → nothing to upgrade, nothing created.
+            assert_eq!(
+                refresh_codesearch_post_checkout_hook(repo),
+                HookRefreshOutcome::NotInstalled
+            );
+            assert!(!hook_path.exists(), "refresh must not install hooks");
 
-        // A purely foreign hook → left byte-for-byte alone.
-        let foreign = "#!/bin/sh\necho untouched\n";
-        std::fs::write(&hook_path, foreign).unwrap();
-        assert_eq!(
-            refresh_codesearch_post_checkout_hook(repo),
-            HookRefreshOutcome::Foreign
-        );
-        assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), foreign);
+            // A purely foreign hook → left byte-for-byte alone.
+            let foreign = "#!/bin/sh\necho untouched\n";
+            std::fs::write(&hook_path, foreign).unwrap();
+            assert_eq!(
+                refresh_codesearch_post_checkout_hook(repo),
+                HookRefreshOutcome::Foreign
+            );
+            assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), foreign);
+        });
     }
 
     #[test]
+    #[serial]
     fn refresh_reports_failure_for_a_non_repository() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Neither `git rev-parse` nor the manual `.git` fallback can resolve
-        // a hooks dir here — must degrade to Failed, never panic.
-        assert!(matches!(
-            refresh_codesearch_post_checkout_hook(tmp.path()),
-            HookRefreshOutcome::Failed(_)
-        ));
+        crate::db_discovery::repos::test_support::with_hook_git_env_cleared(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            // Neither `git rev-parse` nor the manual `.git` fallback can resolve
+            // a hooks dir here — must degrade to Failed, never panic.
+            assert!(matches!(
+                refresh_codesearch_post_checkout_hook(tmp.path()),
+                HookRefreshOutcome::Failed(_)
+            ));
+        });
     }
 
     #[test]

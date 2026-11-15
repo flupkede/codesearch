@@ -2115,23 +2115,23 @@ async fn rest_routes_are_registered() {
         )
         .route(
             crate::constants::SEARCH_PATH,
-            axum::routing::post(crate::mcp::rest_search_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_search_handler),
         )
         .route(
             crate::constants::FIND_PATH,
-            axum::routing::post(crate::mcp::rest_find_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_find_handler),
         )
         .route(
             crate::constants::EXPLORE_PATH,
-            axum::routing::post(crate::mcp::rest_explore_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_explore_handler),
         )
         .route(
             crate::constants::CHUNK_PATH,
-            axum::routing::get(crate::mcp::rest_get_chunk_handler),
+            axum::routing::get(crate::serve::rest_mirrors::rest_get_chunk_handler),
         )
         .route(
             crate::constants::FIND_IMPACT_PATH,
-            axum::routing::post(crate::mcp::rest_find_impact_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_find_impact_handler),
         )
         .with_state(state);
 
@@ -5277,7 +5277,7 @@ async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
     };
     // The REST mirror builds its own serve-mode service from the state —
     // the same path the MCP tool takes for a project-scoped query.
-    let v = crate::mcp::rest_find_impact_handler(
+    let v = crate::serve::rest_mirrors::rest_find_impact_handler(
         axum::extract::State(state.clone()),
         axum::Json(request),
     )
@@ -7127,6 +7127,11 @@ async fn finish_force_reindex_starts_fsw_and_keeps_guard_contract() {
 #[tokio::test]
 #[serial]
 async fn backfill_group_identities_fills_missing_and_persists() {
+    // Hook context (GIT_DIR/GIT_INDEX_FILE) must not leak into the git
+    // subprocesses this test drives: under the pre-push QC gate the process
+    // env IS a hook context, and spawned `git -C <tmp>` would resolve the
+    // outer repo. #[serial] makes the process-env mutation safe.
+    let _hook_env = crate::db_discovery::repos::test_support::clear_hook_git_env();
     // The git-serialization lock must be dropped before the first .await
     // (clippy await_holding_lock): scope it around the synchronous git setup.
     // `tmp` lives for the whole test — the backfill's git spawns need the
@@ -7140,12 +7145,14 @@ async fn backfill_group_identities_fills_missing_and_persists() {
         std::fs::create_dir(&main).unwrap();
         crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
         let wt = tmp.path().join("wt");
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&main)
-            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
-            .output()
-            .unwrap();
+        let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+            &mut std::process::Command::new("git"),
+        )
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+        .output()
+        .unwrap();
         assert!(
             o.status.success(),
             "worktree add failed: {}",
@@ -7209,12 +7216,14 @@ fn registered_worktree_parent_matches_via_worktree_git_file() {
         crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
     }
     let wt = tmp.path().join("wt");
-    let o = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&main)
-        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "seed-branch"])
-        .output()
-        .unwrap();
+    let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+        &mut std::process::Command::new("git"),
+    )
+    .arg("-C")
+    .arg(&main)
+    .args(["worktree", "add", wt.to_str().unwrap(), "-b", "seed-branch"])
+    .output()
+    .unwrap();
     assert!(
         o.status.success(),
         "worktree add failed: {}",
@@ -7229,9 +7238,19 @@ fn registered_worktree_parent_matches_via_worktree_git_file() {
     // The worktree's .git FILE points at the main's worktrees dir: the
     // registered main alias must be found as the seeding parent.
     let found = super::registered_worktree_parent(&wt, &config);
+    // canonicalize both sides: the discovered parent is stored in canonical
+    // form, while the tempdir here may be an 8.3 short-name path — comparing
+    // raw forms fails on Windows machines whose TEMP resolves through
+    // DEVELT~1-style names (same file, different path form).
+    let canon = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .display()
+            .to_string()
+    };
     assert_eq!(
-        found.as_ref().map(|(a, p)| (a.as_str(), p.as_path())),
-        Some((main_alias.as_str(), main.as_path())),
+        found.as_ref().map(|(a, p)| (a.as_str(), canon(p))),
+        Some((main_alias.as_str(), canon(&main))),
         "worktree must seed from its registered main checkout"
     );
 
@@ -7246,6 +7265,11 @@ fn registered_worktree_parent_matches_via_worktree_git_file() {
 #[tokio::test]
 #[serial]
 async fn backfill_all_missing_identities_fills_every_repo() {
+    // Hook context (GIT_DIR/GIT_INDEX_FILE) must not leak into the git
+    // subprocesses this test drives: under the pre-push QC gate the process
+    // env IS a hook context, and spawned `git -C <tmp>` would resolve the
+    // outer repo. #[serial] makes the process-env mutation safe.
+    let _hook_env = crate::db_discovery::repos::test_support::clear_hook_git_env();
     // Startup variant: no group involved — every registered repo missing an
     // identity gets one, so pre-capture mains join their worktree families.
     let tmp = tempfile::tempdir().unwrap();
@@ -7255,12 +7279,14 @@ async fn backfill_all_missing_identities_fills_every_repo() {
         std::fs::create_dir(&main).unwrap();
         crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
         let wt = tmp.path().join("wt");
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&main)
-            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
-            .output()
-            .unwrap();
+        let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+            &mut std::process::Command::new("git"),
+        )
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+        .output()
+        .unwrap();
         assert!(
             o.status.success(),
             "worktree add failed: {}",
@@ -7469,7 +7495,7 @@ fn access_times_sidecar_round_trip_and_corruption_tolerance() {
 
     // Persist → load round trip preserves entries and drives the order.
     let payload = serde_json::json!({"a": 100u64, "b": 300u64});
-    crate::vectordb::store::atomic_write_json(&path, &payload).unwrap();
+    crate::vectordb::atomic_write_json(&path, &payload).unwrap();
     let loaded = ServeState::load_access_times_from(&path);
     assert_eq!(loaded.get("a"), Some(&100u64));
     assert_eq!(loaded.get("b"), Some(&300u64));
