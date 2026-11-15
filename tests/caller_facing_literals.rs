@@ -260,14 +260,23 @@ fn rust_sources(dir: &Path, acc: &mut Vec<PathBuf>) {
 
 #[test]
 fn no_source_literal_was_wrapped_without_a_continuation() {
+    // Repo-wide scan: the CLI (src/) and codesearch-core (core/src/) — the
+    // MCP handlers and their caller-facing errors moved to core with the
+    // workspace split, and a guard that scans only one root proves nothing
+    // about the other.
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let core_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("core")
+        .join("src");
     let mut files = Vec::new();
     rust_sources(&src_root, &mut files);
+    rust_sources(&core_root, &mut files);
 
     assert!(
         !files.is_empty(),
-        "found no sources under {} — a scan that cannot fail proves nothing",
-        src_root.display()
+        "found no sources under {} or {} — a scan that cannot fail proves nothing",
+        src_root.display(),
+        core_root.display()
     );
 
     let mut violations: Vec<String> = Vec::new();
@@ -275,7 +284,11 @@ fn no_source_literal_was_wrapped_without_a_continuation() {
         let Ok(text) = std::fs::read_to_string(file) else {
             continue;
         };
-        let rel = file.strip_prefix(&src_root).unwrap_or(file).display();
+        let rel = file
+            .strip_prefix(&src_root)
+            .or(file.strip_prefix(&core_root))
+            .unwrap_or(file)
+            .display();
         for (line, v) in scan_source(&text) {
             violations.push(match v {
                 Violation::EmbeddedNewline => {
