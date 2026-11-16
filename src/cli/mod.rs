@@ -1940,12 +1940,23 @@ if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
         __cs_path=$(pwd -W 2>/dev/null || pwd)
         __cs_tmp_hit=0
         __cs_p_lc=$(printf '%s' "$__cs_path" | tr '[:upper:]' '[:lower:]' | sed 's|\\|/|g; s|/*$||')
+        # Native-spawned git hands us an 8.3 short TEMP (C:\...\DEVELT~1\...) that
+        # can never prefix-match the long checkout path, so a second comparison
+        # in 8.3 short form (cygpath -m -d) closes that gap. cygpath is absent
+        # on Linux/macOS: the guarded empty check only runs the long compare.
+        __cs_p_83=$(cygpath -m -d "$__cs_path" 2>/dev/null | tr '[:upper:]' '[:lower:]')
         for __cs_dir in "${TMPDIR:-}" "${TMP:-}" "${TEMP:-}" "/tmp"; do
             [ -n "$__cs_dir" ] || continue
             __cs_d=$(printf '%s' "$__cs_dir" | tr '[:upper:]' '[:lower:]' | sed 's|\\|/|g; s|/*$||')
             case "$__cs_p_lc" in
                 "$__cs_d" | "$__cs_d"/*) __cs_tmp_hit=1; break ;;
             esac
+            __cs_t_83=$(cygpath -m -d "$__cs_dir" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            if [ -n "$__cs_p_83" ] && [ -n "$__cs_t_83" ]; then
+                case "$__cs_p_83" in
+                    "$__cs_t_83" | "$__cs_t_83"/*) __cs_tmp_hit=1; break ;;
+                esac
+            fi
         done
         if [ "$__cs_tmp_hit" = "0" ] && [ -n "${LOCALAPPDATA:-}" ]; then
             # Windows fallback for setups where TMP/TEMP are unset.
@@ -2263,6 +2274,10 @@ mod tests {
         assert!(
             block.contains("\"${TMPDIR:-}\"") && block.contains("\"${TMP:-}\""),
             "hook must test the TMPDIR/TMP temp candidates"
+        );
+        assert!(
+            block.contains("cygpath -m -d"),
+            "the 8.3 short-form comparison must be present (native TEMP is DEVELT~1-style)"
         );
         // The POST must be gated on the temp check having missed.
         assert!(
