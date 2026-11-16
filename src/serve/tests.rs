@@ -5081,6 +5081,7 @@ fn overlay_copy_key_only_fires_on_info_overlays() {
         dims: 0,
         lock: "write".to_string(),
         index_age: String::new(),
+        last_compact: "never".to_string(),
         symbol_warnings: vec!["w1".to_string()],
         symbol_index: Vec::new(),
         copy_feedback: None,
@@ -5133,6 +5134,7 @@ fn apply_copy_warnings_reports_when_nothing_is_recorded() {
         dims: 0,
         lock: "write".to_string(),
         index_age: String::new(),
+        last_compact: "never".to_string(),
         symbol_warnings: vec![],
         symbol_index: Vec::new(),
         copy_feedback: None,
@@ -5166,6 +5168,7 @@ fn apply_copy_warnings_feedback_covers_success_and_failure() {
             dims: 0,
             lock: "write".to_string(),
             index_age: String::new(),
+            last_compact: "never".to_string(),
             symbol_warnings: vec!["summary".to_string()],
             symbol_index: Vec::new(),
             copy_feedback: None,
@@ -7729,4 +7732,27 @@ fn touch_access_feeds_persisted_warmup_order() {
     assert!(loaded["b"] > loaded["a"], "later touch is more recent");
     let order = ServeState::warmup_order(vec!["a".to_string(), "b".to_string()], &loaded);
     assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
+}
+
+#[test]
+fn cold_touch_does_not_refresh_the_persisted_sidecar() {
+    let state = ServeState::new(ReposConfig::default(), None);
+
+    // The warmup path (touch_access_cold) starts the reaper's idle clock but
+    // MUST NOT write "used now" into last_access_wall: the wall stamp IS the
+    // warmup age gate's input, and a warmup that refreshed it kept every
+    // registered repo inside CODESEARCH_WARMUP_MAX_AGE_DAYS forever.
+    state.touch_access_cold("warmed");
+    assert!(
+        state.last_access_wall.get("warmed").is_none(),
+        "warmup open must not re-stamp the persisted sidecar"
+    );
+    assert!(
+        state.last_access.get("warmed").is_some(),
+        "the reaper clock must still run so warmed repos get evicted"
+    );
+
+    // A real access (touch_access) still re-stamps both.
+    state.touch_access("queried");
+    assert!(state.last_access_wall.get("queried").is_some());
 }

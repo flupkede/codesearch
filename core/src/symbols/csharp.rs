@@ -710,7 +710,7 @@ impl CSharpSymbolIndexer {
             .filter(|o| o.status.success())
             .map(|o| parse_helper_version(&String::from_utf8_lossy(&o.stdout)))
             .unwrap_or_else(|| "unknown".to_string());
-        let host = env!("CARGO_PKG_VERSION");
+        let host = crate::host_version();
         if version == host {
             tracing::info!(
                 "scip-csharp helper v{} at {} (matches codesearch v{})",

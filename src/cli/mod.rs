@@ -111,6 +111,12 @@ pub enum IndexCommands {
         json: bool,
     },
 
+    /// Free LMDB dead pages (VACUUM) for a repository's index
+    Compact {
+        /// Repository alias (required — use "index list" to see aliases)
+        alias: String,
+    },
+
     /// Remove stale entries from repos.json (relocates moved repos first)
     Prune,
 }
@@ -776,6 +782,77 @@ async fn trigger_reindex_via_api(alias: &str, force: bool) -> Result<()> {
     }
 }
 
+/// Compact a repo's LMDB index via the serve API; without a running serve,
+/// compact the on-disk index locally (a CLI process holds no LMDB handles,
+/// so a direct disk compact is safe).
+async fn compact_via_api(alias: &str) -> Result<()> {
+    use colored::Colorize;
+
+    let base = serve_base_url();
+    let url = format!("{base}/repos/{alias}/compact");
+
+    println!(
+        "  {} compacting '{}' via {url}",
+        "🧹".yellow(),
+        alias.bright_green()
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1800))
+        .build()?;
+
+    match client.post(&url).send().await {
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            if status.as_u16() == 200 {
+                let freed = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("freed_bytes").and_then(|f| f.as_u64()))
+                    .unwrap_or(0);
+                println!(
+                    "  {} compacted '{}' — {:.1} MB freed and re-stamped for the auto-compact clock",
+                    "✓".green(),
+                    alias,
+                    freed as f64 / (1024.0 * 1024.0)
+                );
+                Ok(())
+            } else if status.as_u16() == 404 {
+                anyhow::bail!(
+                    "Unknown alias '{}' — use `codesearch index list` to see registered repos",
+                    alias
+                );
+            } else if status.as_u16() == 409 {
+                anyhow::bail!(
+                    "'{}' is currently indexing — compact after it finishes",
+                    alias
+                );
+            } else {
+                anyhow::bail!("Serve returned HTTP {}: {}", status.as_u16(), body.trim());
+            }
+        }
+        Err(e) if e.is_connect() => {
+            // No serve: compact this machine's local path directly.
+            let config = crate::db_discovery::load_repos_config()?;
+            let path = config
+                .resolve(alias)
+                .ok_or_else(|| anyhow::anyhow!("Unknown alias '{alias}' (local fallback)"))?;
+            let outcome =
+                codesearch_core::vectordb::compact::compact_db_dir(&path.join(".codesearch.db"))?;
+            println!(
+                "  {} compacted '{}' locally — {:.1} MB freed",
+                "✓".green(),
+                alias,
+                outcome.freed_bytes() as f64 / (1024.0 * 1024.0)
+            );
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!("HTTP request failed: {}", e);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Remote index management (--remote <peer>)
 // ---------------------------------------------------------------------------
@@ -1232,6 +1309,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                             trigger_reindex_via_api(&alias, force).await
                         }
                     }
+                    IndexCommands::Compact { alias } => compact_via_api(&alias).await,
                     IndexCommands::Prune => crate::index::prune_index().await,
                 }
             } else {

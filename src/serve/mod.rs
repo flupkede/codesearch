@@ -2444,6 +2444,152 @@ impl ServeState {
         })
     }
 
+    /// Rewrite the repo's LMDB `data.mdb` with only its live pages.
+    ///
+    /// Same memory lifetimes as [`Self::remove_repo`]'s teardown (stop FSW,
+    /// evict, await the FSW task, await the index task, release the shared
+    /// env cache) — but the repo stays registered: after the compact the
+    /// repo is cold and re-opens on the next query. The blocking copy runs
+    /// on a spawn_blocking thread; an 8 GB env takes tens of seconds.
+    pub(crate) async fn compact_repo(
+        &self,
+        alias: &str,
+    ) -> Result<codesearch_core::vectordb::compact::CompactionOutcome> {
+        let project_path = {
+            let config = self
+                .config
+                .read()
+                .map_err(|e| anyhow::anyhow!("Config lock poisoned: {}", e))?;
+            config
+                .resolve(alias)
+                .ok_or_else(|| anyhow::anyhow!("Unknown alias '{}'", alias))?
+        };
+        if self.is_indexing(alias) {
+            anyhow::bail!(
+                "'{}' is currently indexing — compact after it finishes",
+                alias
+            );
+        }
+
+        let db_path = project_path.join(DB_DIR_NAME);
+        // 1. Teardown (removal flow, minus unregister + delete).
+        {
+            let stores = self.stop_fsw(alias);
+            drop(stores);
+        }
+        self.repos.remove(alias);
+        self.last_access.remove(alias);
+        self.clear_csharp_index_state(alias);
+        self.await_fsw_shutdown(alias).await;
+        let _ = self
+            .await_index_task_with_budget(
+                alias,
+                std::time::Duration::from_secs(crate::constants::BG_TASK_COOPERATIVE_TIMEOUT_SECS),
+            )
+            .await;
+        crate::lmdb_registry::close_shared_envs_under(&db_path);
+
+        // 2. Compact on a blocking thread.
+        let db_path_clone = db_path.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            codesearch_core::vectordb::compact::compact_db_dir(&db_path_clone)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("compact task joined failed: {e}"))??;
+
+        tracing::info!(
+            "🧹 compacted '{}': {:.0} MB freed",
+            alias,
+            outcome.freed_bytes() as f64 / (1024.0 * 1024.0)
+        );
+        Ok(outcome)
+    }
+
+    /// Idle-reaper maintenance: compact every freshly evicted alias whose
+    /// `last_compact_unix_ms` is older than the interval. Runs in background
+    /// tasks (a settle delay first — the eviction just cancelled its FSW
+    /// task and it drains asynchronously); each task re-checks indexing
+    /// state and skip-reports when the repo was re-opened meanwhile.
+    /// A never-compacted repo just gets the stamp: its first real sweep runs
+    /// one interval later instead of mid-implantati on at boot.
+    pub(crate) async fn spawn_auto_compacts(self: &Arc<Self>, evicted: &[String]) {
+        if evicted.is_empty() {
+            return;
+        }
+        let max_age_days = Self::compact_interval_days();
+        if max_age_days == 0 {
+            return;
+        }
+        let cutoff_ms = max_age_days.saturating_mul(24 * 60 * 60 * 1000);
+        for alias in evicted {
+            let Some(db_path) = ({
+                let config = self
+                    .config
+                    .read()
+                    .map_err(|e| anyhow::anyhow!("Config lock poisoned: {}", e));
+                match config {
+                    Ok(config) => config.resolve(alias).map(|p| p.join(DB_DIR_NAME)),
+                    Err(_) => None,
+                }
+            }) else {
+                continue;
+            };
+            let last_compact =
+                codesearch_core::vectordb::compact::read_last_compact_unix_ms(&db_path);
+            if last_compact == 0 {
+                let stamp = codesearch_core::vectordb::compact::stamp_last_compact(&db_path);
+                if let Err(e) = stamp {
+                    tracing::warn!("⚠️ cannot stamp last_compact for '{}': {e:#}", alias);
+                }
+                continue;
+            }
+            let now_ms = Self::now_unix_millis();
+            if now_ms.saturating_sub(last_compact) < cutoff_ms {
+                continue;
+            }
+            let state = Arc::clone(self);
+            let alias = alias.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    crate::constants::AUTO_COMPACT_SETTLE_SECS,
+                ))
+                .await;
+                if state.is_indexing(&alias) || state.repos.contains_key(&alias) {
+                    tracing::debug!("auto-compact '{}' skipped: reopened/indexing", alias);
+                    return;
+                }
+                let Some(db_path) = state
+                    .config
+                    .read()
+                    .ok()
+                    .and_then(|c| c.resolve(&alias))
+                    .map(|p| p.join(DB_DIR_NAME))
+                else {
+                    return;
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    codesearch_core::vectordb::compact::compact_db_dir(&db_path)
+                })
+                .await;
+                match result {
+                    Ok(Ok(outcome)) => {
+                        tracing::info!(
+                            "🧹 auto-compact '{}': {:.0} MB freed",
+                            alias,
+                            outcome.freed_bytes() as f64 / (1024.0 * 1024.0)
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("⚠️ auto-compact '{}' failed: {e:#}", alias);
+                    }
+                    Err(e) => {
+                        tracing::warn!("⚠️ auto-compact '{}' join failed: {e}", alias);
+                    }
+                }
+            });
+        }
+    }
+
     /// Stop the file system watcher for a repo by cancelling its token.
     ///
     /// Returns the stores Arc if the repo was open in write or warm mode (so the caller
@@ -2966,8 +3112,8 @@ impl ServeState {
                         alias, e
                     ),
                 }
-                // Touch so the idle reaper can evict this handle.
-                self.touch_access(alias);
+                // Touch for the reaper clock only: see touch_access_cold.
+                self.touch_access_cold(alias);
                 return Ok(());
             }
             OpenedStores::Write(s) => s,
@@ -3037,11 +3183,11 @@ impl ServeState {
                 stores: Arc::clone(&stores),
             },
         );
-        // Start the idle timer at warmup. A real query will reset it via
-        // touch_access; without this, repos that are warmed but never queried
-        // would never appear in `last_access` and therefore never be evicted
-        // by `evict_idle_repos`, holding LMDB envs and embedder state forever.
-        self.touch_access(alias);
+        // Start the idle timer for the reaper ONLY — the persisted
+        // sidecar must not learn "used today" from a warmup open:
+        // touch_access_cold feeds last_access without touching
+        // last_access_wall. A real query resets via touch_access.
+        self.touch_access_cold(alias);
         drop(open_guard);
 
         // Tracked like any reindex: status reports "indexing", the reaper
@@ -3773,12 +3919,23 @@ impl ServeState {
 
     /// Record that a repo was just accessed (query or reindex).
     /// Called from `get_or_open_stores(touch=true)`, `reindex_handler`,
-    /// `add_repo_handler`, and `warmup_repo` (after successful warmup).
+    /// and `add_repo_handler`.
     pub(crate) fn touch_access(&self, alias: &str) {
         self.last_access
             .insert(alias.to_string(), std::time::Instant::now());
         self.last_access_wall
             .insert(alias.to_string(), Self::unix_now_ms());
+    }
+
+    /// Record an access for the REAPER CLOCK ONLY (no persisted sidecar
+    /// entry). Warmup uses this: the warmup's own open must not re-stamp
+    /// "last used = now" for every repo it opens — the persisted
+    /// access_times.json is the warmup age gate's input, and a warmup that
+    /// refreshed it kept every registered repo inside the age window
+    /// forever, making `CODESEARCH_WARMUP_MAX_AGE_DAYS` ineffective.
+    pub(crate) fn touch_access_cold(&self, alias: &str) {
+        self.last_access
+            .insert(alias.to_string(), std::time::Instant::now());
     }
 
     fn unix_now_ms() -> u64 {
@@ -3852,6 +4009,27 @@ impl ServeState {
                 }
             },
             Err(_) => crate::constants::DEFAULT_WARMUP_MAX_AGE_DAYS,
+        }
+    }
+
+    /// Effective auto-compact cadence in days (`0` = auto-compact off).
+    /// Same typo discipline as [`Self::warmup_max_age_days`]: an unparsable
+    /// override falls back to the default with a warning.
+    fn compact_interval_days() -> u64 {
+        match std::env::var(crate::constants::COMPACT_INTERVAL_DAYS_ENV) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(days) => days,
+                Err(_) => {
+                    tracing::warn!(
+                        "{}={} is not a number of days; using the default ({})",
+                        crate::constants::COMPACT_INTERVAL_DAYS_ENV,
+                        raw,
+                        crate::constants::DEFAULT_COMPACT_INTERVAL_DAYS
+                    );
+                    crate::constants::DEFAULT_COMPACT_INTERVAL_DAYS
+                }
+            },
+            Err(_) => crate::constants::DEFAULT_COMPACT_INTERVAL_DAYS,
         }
     }
 
@@ -4493,7 +4671,10 @@ impl ServeState {
     /// automatically re-opened (and re-warmed) on the next query.
     /// Active reindexes are never evicted, and their idle clock restarts on
     /// every sweep they are seen indexing.
-    pub(crate) fn evict_idle_repos(&self) {
+    ///
+    /// Returns the evicted aliases so the reaper can chain auto-compact
+    /// maintenance ([`Self::spawn_auto_compacts`]) onto the eviction.
+    pub(crate) fn evict_idle_repos(&self) -> Vec<String> {
         let timeout = self.idle_timeout();
         let now = std::time::Instant::now();
 
@@ -4533,7 +4714,7 @@ impl ServeState {
         }
 
         if to_evict.is_empty() {
-            return;
+            return Vec::new();
         }
 
         for alias in &to_evict {
@@ -4573,6 +4754,7 @@ impl ServeState {
                 self.repos.len()
             );
         }
+        to_evict
     }
 }
 
@@ -4909,10 +5091,14 @@ async fn info_handler(
     let mut model = String::from("unknown");
     let mut lock = String::from("—");
     let mut index_age = String::from("—");
+    let mut last_compact = String::from("never");
 
     // Read model + dims + counts from metadata.json.
     if let Ok(content) = std::fs::read_to_string(db_path.join("metadata.json")) {
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(ms) = meta.get("last_compact_unix_ms").and_then(|v| v.as_u64()) {
+                last_compact = tui::ms_to_age_or_never(ms);
+            }
             model = meta
                 .get("model_short_name")
                 .and_then(|v| v.as_str())
@@ -4978,6 +5164,9 @@ async fn info_handler(
         "dims": dims,
         "lock": lock,
         "index_age": index_age,
+        // Human text of the last LMDB compact stamp (metadata's
+        // last_compact_unix_ms): the per-repo compaction record.
+        "last_compact": last_compact,
         // Durable record of a degraded symbol index (see the TUI's C#⚠):
         // build-environment failures the helper survived during rebuild.
         "symbol_warnings": symbol_warnings,
@@ -5450,6 +5639,51 @@ async fn reload_handler(
 /// branch carries no flag: "rebuild everything this repo has" is not a
 /// decision a caller (or a future refactor) can opt out of. The explicit
 /// no-force symbol-only trigger is `?symbols=true` on the plain reindex.
+/// POST /repos/{alias}/compact handler.
+///
+/// LMDB files never shrink — deletions only grow the freelist, and the file
+/// keeps its all-time high-water size. This rewrites `data.mdb` live-pages
+/// only (the "VACUUM") and swaps it in. Synchronous 200 with the freed
+/// bytes; 409 while indexing/read-only, 404 for an unknown alias.
+async fn compact_repo_handler(
+    axum::extract::Path(alias): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
+) -> (
+    axum::http::StatusCode,
+    axum::response::Json<serde_json::Value>,
+) {
+    use axum::http::StatusCode;
+
+    tracing::info!(target: "audit", "AUDIT compact alias='{}'", alias);
+
+    match state.compact_repo(&alias).await {
+        Ok(outcome) => (
+            StatusCode::OK,
+            axum::response::Json(json!({
+                "status": "compacted",
+                "alias": alias,
+                "old_bytes": outcome.old_bytes,
+                "new_bytes": outcome.new_bytes,
+                "freed_bytes": outcome.freed_bytes(),
+            })),
+        ),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let (status, code) = if msg.contains("is currently indexing") {
+                (StatusCode::CONFLICT, "conflict")
+            } else if msg.contains("Unknown alias") {
+                (StatusCode::NOT_FOUND, "not_found")
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, "error")
+            };
+            (
+                status,
+                axum::response::Json(json!({ "error": msg, "status": code })),
+            )
+        }
+    }
+}
+
 pub(crate) async fn finish_force_reindex(
     state: &Arc<ServeState>,
     alias: &str,
@@ -6746,6 +6980,7 @@ async fn require_admin_auth(
     // Only management endpoints require auth.
     let is_management = matches!(path, "/repos" | "/reload")
         || path.ends_with("/reindex")
+        || path.ends_with("/compact")
         || (path.starts_with("/repos/") && method == axum::http::Method::DELETE);
 
     if !is_management {
@@ -7613,6 +7848,10 @@ pub async fn run_serve(
             "/repos/{alias}/reindex",
             axum::routing::post(reindex_handler),
         )
+        .route(
+            "/repos/{alias}/compact",
+            axum::routing::post(compact_repo_handler),
+        )
         .route("/repos/{alias}/info", axum::routing::get(info_handler))
         // /doctor is a POST but is intentionally read-only (diagnostics only, no
         // --fix path), so like /info and /status it is NOT in require_admin_auth's
@@ -7716,8 +7955,9 @@ pub async fn run_serve(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
-                        reaper_state.evict_idle_repos();
+                        let evicted = reaper_state.evict_idle_repos();
                         reaper_state.sweep_index_tasks();
+                        reaper_state.spawn_auto_compacts(&evicted).await;
                         // Persist last-use times (unix-ms sidecar) so the next
                         // boot's phase-1 warmup orders most-recently-used first.
                         reaper_state.persist_access_times();

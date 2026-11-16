@@ -15,6 +15,8 @@ pub use codesearch_core::{
 // #[macro_export] macros live at the defining crate's root; re-exported so
 // CLI-internal `crate::info_print!` / `crate::warn_print!` keep resolving.
 pub use codesearch_core::{info_print, warn_print};
+// The CLI main injects its product version into core (helper version check).
+pub use codesearch_core::{host_version, set_app_version};
 
 // Re-export commonly used types
 pub use chunker::{group_chunks_by_path, group_chunks_by_path_with_capacity};

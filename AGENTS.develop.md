@@ -127,6 +127,7 @@ Without TTY: headless, logs only.
 | `/repos` | POST | Register + index + warmup a new repo |
 | `/repos/:alias` | DELETE | Stop FSW, evict, unregister, delete DB |
 | `/repos/:alias/reindex` | POST | Incremental or force reindex (background) |
+| `/repos/:alias/compact` | POST | LMDB VACUUM — rewrite `data.mdb` live-pages-only (synchronous) |
 | `/mcp` | GET/POST | MCP streamable HTTP endpoint |
 
 ## Supported languages

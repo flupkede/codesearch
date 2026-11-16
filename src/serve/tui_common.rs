@@ -121,6 +121,9 @@ pub enum KeyAction {
     RunDoctor(usize),
     /// User pressed `n` — force reindex repo at given index.
     ForceReindex(usize),
+    /// User pressed `C` — compact repo's LMDB index at given index
+    /// (frees dead permanent pages).
+    Compact(usize),
     /// User pressed `r` — request removal of repo at given index (shows confirmation).
     RequestRemove(usize),
     /// User pressed space — toggle collapse/expand of the group (worktree
@@ -173,6 +176,9 @@ pub enum OverlayState {
         dims: usize,
         lock: String,
         index_age: String,
+        /// Human text of the last LMDB compact stamp ("never" when absent)
+        /// — the per-repo compaction record the auto-compact clock uses.
+        last_compact: String,
         /// Index-level symbol warnings read fresh from the on-disk meta
         /// (`scip_meta[index_warnings]`): build-environment failures the
         /// helper survived. Unlike the in-memory C# status these survive a
@@ -273,6 +279,10 @@ pub fn handle_key(
         KeyCode::Char('n') => {
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::ForceReindex(idx)
+        }
+        KeyCode::Char('C') => {
+            let idx = table_state.selected().unwrap_or(0);
+            KeyAction::Compact(idx)
         }
         KeyCode::Char('r') => {
             let idx = table_state.selected().unwrap_or(0);
@@ -1031,6 +1041,7 @@ pub fn render_footer(
         spans.extend(hint("", "i", "nfo  ", true));
         spans.extend(hint("", "d", "octor  ", local_only));
         spans.extend(hint("rei", "n", "dex  ", local_only));
+        spans.extend(hint("", "C", "ompact  ", local_only));
         spans.extend(hint("", "r", "emove  ", local_only));
         spans.extend(hint("re", "l", "oad  ", true));
         spans.extend(hint("", "␣", " collapse  ", true));
@@ -1094,6 +1105,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             dims,
             lock,
             index_age,
+            last_compact,
             symbol_warnings,
             symbol_index,
             copy_feedback,
@@ -1145,6 +1157,10 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                 Line::from(vec![
                     Span::styled("  Index age:   ", Style::default().fg(Color::DarkGray)),
                     Span::styled(index_age.clone(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Last compact:", Style::default().fg(Color::DarkGray)),
+                    Span::styled(last_compact.clone(), Style::default().fg(Color::White)),
                 ]),
             ];
             let mut lines = lines;

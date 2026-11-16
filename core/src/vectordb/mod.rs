@@ -1,3 +1,4 @@
+pub mod compact;
 pub(crate) mod store;
 
 pub use store::{
