@@ -426,7 +426,7 @@ fn load_from_applies_reconcile_to_hand_edited_file() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg_path = tmp.path().join("repos.json");
     let json = r#"{
-            "repos": { "": "/tmp/blank", "good": "/tmp/good" },
+            "repos": { "": "/srv/blank", "good": "/srv/good" },
             "groups": { "mix": ["good", "ghost"], "dead": ["ghost"] },
             "repos_meta": { "ghost": {} }
         }"#;
@@ -438,6 +438,75 @@ fn load_from_applies_reconcile_to_hand_edited_file() {
     assert_eq!(cfg.groups.get("mix"), Some(&vec!["good".to_string()]));
     assert!(!cfg.groups.contains_key("dead"), "empty group dropped");
     assert!(!cfg.repos_meta.contains_key("ghost"), "orphan meta dropped");
+}
+
+/// The reconcile temp-prune: a registration under the OS temp dir whose
+/// directory no longer exists is garbage from the post-checkout hook (test
+/// fixtures, scratch worktrees) and must be dropped, together with its meta.
+/// A still-existing temp path stays (its index may be in active use), and a
+/// missing NON-temp path stays too — that may be an unmounted volume, the
+/// reason reconcile never pruned on existence alone.
+#[test]
+fn reconcile_drops_stale_temp_registrations_only() {
+    let live_temp = tempfile::tempdir().unwrap();
+    let gone_temp = std::env::temp_dir().join("codesearch-gone-fixture");
+    let gone_real = std::env::current_dir()
+        .unwrap()
+        .join("codesearch-gone-real");
+
+    let mut cfg = ReposConfig::default();
+    cfg.repos
+        .insert("live-temp".to_string(), live_temp.path().to_path_buf());
+    cfg.repos.insert("gone-temp".to_string(), gone_temp.clone());
+    cfg.repos.insert("gone-real".to_string(), gone_real.clone());
+    cfg.repos_meta.entry("gone-temp".to_string()).or_default();
+    cfg.reconcile();
+
+    assert!(
+        cfg.repos.contains_key("live-temp"),
+        "an existing temp-dir path is kept"
+    );
+    assert!(
+        !cfg.repos.contains_key("gone-temp"),
+        "a missing temp-dir registration is pruned"
+    );
+    assert!(
+        cfg.repos.contains_key("gone-real"),
+        "a missing non-temp path is kept (may be an unmounted volume)"
+    );
+    assert!(
+        !cfg.repos_meta.contains_key("gone-temp"),
+        "metadata of a pruned alias cascades away"
+    );
+}
+
+#[test]
+fn is_temp_dir_path_matches_separators_and_case() {
+    // A real child of the temp root matches regardless of separators/case.
+    let child = std::env::temp_dir().join("fixture");
+    assert!(is_temp_dir_path(&child));
+    let flipped = crate::cache::normalize_path_str(&child.to_string_lossy());
+    let flipped = if flipped
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        flipped.to_lowercase()
+    } else {
+        flipped.to_uppercase()
+    };
+    assert!(
+        is_temp_dir_path(std::path::Path::new(&flipped)),
+        "case/separator-insensitive: {} must count as temp",
+        flipped
+    );
+    // The repo working directory is not under temp.
+    let here = std::env::current_dir().unwrap();
+    assert!(
+        !is_temp_dir_path(&here),
+        "repo dir {} must not count as temp",
+        here.display()
+    );
 }
 
 #[test]
@@ -500,9 +569,9 @@ fn try_relocate_none_without_recorded_remote() {
 #[test]
 fn reconcile_drops_empty_alias_key() {
     let mut cfg = ReposConfig::default();
-    cfg.repos.insert(String::new(), PathBuf::from("/tmp/x"));
+    cfg.repos.insert(String::new(), PathBuf::from("/srv/x"));
     cfg.repos
-        .insert("good".to_string(), PathBuf::from("/tmp/good"));
+        .insert("good".to_string(), PathBuf::from("/srv/good"));
     cfg.reconcile();
     assert!(!cfg.repos.contains_key(""));
     assert!(cfg.repos.contains_key("good"));
@@ -512,7 +581,7 @@ fn reconcile_drops_empty_alias_key() {
 fn reconcile_prunes_unknown_group_members_and_empty_groups() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        .insert("real".to_string(), PathBuf::from("/srv/real"));
     cfg.groups.insert(
         "mix".to_string(),
         vec!["real".to_string(), "ghost".to_string()],
@@ -531,7 +600,7 @@ fn reconcile_prunes_unknown_group_members_and_empty_groups() {
 fn reconcile_drops_orphan_meta() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        .insert("real".to_string(), PathBuf::from("/srv/real"));
     cfg.repos_meta
         .insert("ghost".to_string(), RepoMeta::default());
     cfg.reconcile();
@@ -570,15 +639,15 @@ fn try_relocate_none_when_ambiguous() {
 #[test]
 fn test_unique_alias_generation() {
     let mut repos = HashMap::new();
-    repos.insert("codesearch".to_string(), PathBuf::from("/tmp/a"));
-    let alias = unique_alias_for_path(&repos, Path::new("/tmp/codesearch"));
+    repos.insert("codesearch".to_string(), PathBuf::from("/srv/a"));
+    let alias = unique_alias_for_path(&repos, Path::new("/srv/codesearch"));
     assert_eq!(alias, "codesearch-2");
 }
 
 #[test]
 fn test_register_and_group_roundtrip() {
     let mut cfg = ReposConfig::default();
-    let alias = cfg.register(PathBuf::from("/tmp/my-repo"));
+    let alias = cfg.register(PathBuf::from("/srv/my-repo"));
     assert!(cfg.resolve(&alias).is_some());
 
     cfg.add_group("platform".to_string(), vec![alias.clone()])
@@ -609,7 +678,7 @@ fn test_load_legacy_config_without_repos_meta() {
     let mut f = std::fs::File::create(&path).unwrap();
     writeln!(
         f,
-        r#"{{"repos":{{"my-repo":"/tmp/my-repo"}},"groups":{{"g":["my-repo"]}}}}"#
+        r#"{{"repos":{{"my-repo":"/srv/my-repo"}},"groups":{{"g":["my-repo"]}}}}"#
     )
     .unwrap();
 
@@ -626,7 +695,7 @@ fn test_save_then_load_roundtrip_with_meta() {
 
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        .insert("repo-a".to_string(), PathBuf::from("/srv/repo-a"));
     cfg.touch_last_changed("repo-a", 100);
     cfg.touch_last_scip("repo-a", 120);
     cfg.save_to(&path).unwrap();
@@ -644,7 +713,7 @@ fn test_save_then_load_roundtrip_with_repo_read_only() {
 
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        .insert("repo-a".to_string(), PathBuf::from("/srv/repo-a"));
     cfg.repo_read_only.insert("repo-a".to_string(), true);
     cfg.save_to(&path).unwrap();
 
@@ -671,7 +740,7 @@ fn test_save_then_load_roundtrip_with_repo_read_only() {
 fn test_reconcile_drops_orphan_repo_read_only() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("live".to_string(), PathBuf::from("/tmp/live"));
+        .insert("live".to_string(), PathBuf::from("/srv/live"));
     cfg.repo_read_only.insert("live".to_string(), true);
     cfg.repo_read_only.insert("gone".to_string(), true);
 
@@ -708,7 +777,7 @@ fn test_meta_for_unknown_alias_returns_default() {
 fn test_unregister_alias_removes_meta() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        .insert("repo-a".to_string(), PathBuf::from("/srv/repo-a"));
     cfg.touch_last_changed("repo-a", 100);
     cfg.touch_last_scip("repo-a", 120);
 
@@ -755,7 +824,7 @@ fn register_strips_unc_prefix_from_stored_path() {
 fn add_group_rejects_reserved_all_name() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        .insert("repo-a".to_string(), PathBuf::from("/srv/repo-a"));
 
     let err = cfg
         .add_group("all".to_string(), vec!["repo-a".to_string()])
@@ -771,9 +840,9 @@ fn add_group_rejects_reserved_all_name() {
 fn resolve_group_all_returns_every_registered_repo() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        .insert("repo-a".to_string(), PathBuf::from("/srv/repo-a"));
     cfg.repos
-        .insert("repo-b".to_string(), PathBuf::from("/tmp/repo-b"));
+        .insert("repo-b".to_string(), PathBuf::from("/srv/repo-b"));
 
     let resolved = cfg.resolve_group(crate::constants::ALL_GROUP_NAME);
     let mut names: Vec<String> = resolved.into_iter().map(|(a, _)| a).collect();
@@ -792,9 +861,9 @@ fn resolve_group_all_is_empty_when_no_repos_registered() {
 fn groups_with_virtual_all_advertises_all_without_storing_it() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("repo-a".to_string(), PathBuf::from("/tmp/repo-a"));
+        .insert("repo-a".to_string(), PathBuf::from("/srv/repo-a"));
     cfg.repos
-        .insert("repo-b".to_string(), PathBuf::from("/tmp/repo-b"));
+        .insert("repo-b".to_string(), PathBuf::from("/srv/repo-b"));
     cfg.add_group("platform".to_string(), vec!["repo-a".to_string()])
         .unwrap();
 
@@ -822,11 +891,11 @@ fn groups_with_virtual_all_advertises_all_without_storing_it() {
 fn project_groups_maps_aliases_to_named_groups() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("repo-a".to_string(), PathBuf::from("/tmp/a"));
+        .insert("repo-a".to_string(), PathBuf::from("/srv/a"));
     cfg.repos
-        .insert("repo-b".to_string(), PathBuf::from("/tmp/b"));
+        .insert("repo-b".to_string(), PathBuf::from("/srv/b"));
     cfg.repos
-        .insert("lonely".to_string(), PathBuf::from("/tmp/lonely"));
+        .insert("lonely".to_string(), PathBuf::from("/srv/lonely"));
     // repo-a is a member of two named groups.
     cfg.add_group(
         "group-x".to_string(),
@@ -852,7 +921,7 @@ fn project_groups_maps_aliases_to_named_groups() {
 fn project_groups_excludes_virtual_all_and_remote_refs() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        .insert("local-a".to_string(), PathBuf::from("/srv/a"));
     cfg.remotes
         .insert("cloud".to_string(), make_peer("https://cloud"));
     cfg.groups.insert(
@@ -887,7 +956,7 @@ fn make_peer(url: &str) -> RemotePeer {
 fn resolve_group_targets_expands_local_and_remote_members() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        .insert("local-a".to_string(), PathBuf::from("/srv/a"));
     cfg.remotes
         .insert("cloud".to_string(), make_peer("https://cloud"));
     cfg.groups.insert(
@@ -916,9 +985,9 @@ fn resolve_group_targets_expands_local_and_remote_members() {
 fn split_group_targets_partitions_locals_and_remotes() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        .insert("local-a".to_string(), PathBuf::from("/srv/a"));
     cfg.repos
-        .insert("local-b".to_string(), PathBuf::from("/tmp/b"));
+        .insert("local-b".to_string(), PathBuf::from("/srv/b"));
     cfg.remotes
         .insert("cloud".to_string(), make_peer("https://cloud"));
     cfg.groups.insert(
@@ -999,7 +1068,7 @@ fn resolve_remote_project_requires_mount_rename_and_negatives() {
     cfg.remote_alias_overrides
         .insert("cloud/akeneo".to_string(), "pim".to_string());
     cfg.repos
-        .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        .insert("local-a".to_string(), PathBuf::from("/srv/a"));
 
     // A mounted canonical "<peer>/<alias>" resolves.
     assert!(matches!(
@@ -1114,7 +1183,7 @@ fn reconcile_prunes_mounts_with_unknown_peer_or_malformed_name() {
 fn resolve_group_targets_all_never_federates() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        .insert("local-a".to_string(), PathBuf::from("/srv/a"));
     cfg.remotes
         .insert("cloud".to_string(), make_peer("https://cloud"));
     // Even if a group "docs" federates, querying "all" must stay local.
@@ -1142,7 +1211,7 @@ fn resolve_group_targets_skips_unknown_remote_ref() {
 fn reconcile_prunes_unknown_remote_ref_and_drops_now_empty_group() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        .insert("real".to_string(), PathBuf::from("/srv/real"));
     cfg.groups
         .insert("docs".to_string(), vec!["@ghost".to_string()]);
     // Only "ghost" is referenced but "cloud" exists → "ghost" pruned, group
@@ -1161,7 +1230,7 @@ fn reconcile_prunes_unknown_remote_ref_and_drops_now_empty_group() {
 fn reconcile_keeps_valid_remote_ref() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("real".to_string(), PathBuf::from("/tmp/real"));
+        .insert("real".to_string(), PathBuf::from("/srv/real"));
     cfg.remotes
         .insert("cloud".to_string(), make_peer("https://cloud"));
     cfg.groups.insert(
@@ -1181,7 +1250,7 @@ fn reconcile_keeps_valid_remote_ref() {
 fn remotes_roundtrip_through_json() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        .insert("local-a".to_string(), PathBuf::from("/srv/a"));
     cfg.remotes
         .insert("cloud".to_string(), make_peer("https://cloud"));
     cfg.groups
@@ -1270,7 +1339,7 @@ fn add_remote_to_group_rejects_reserved_all_and_unknown_remote() {
 fn remove_remote_prunes_group_references_and_empties() {
     let mut cfg = ReposConfig::default();
     cfg.repos
-        .insert("local-a".to_string(), PathBuf::from("/tmp/a"));
+        .insert("local-a".to_string(), PathBuf::from("/srv/a"));
     cfg.add_remote("cloud".to_string(), make_peer("https://cloud"))
         .unwrap();
     cfg.groups.insert(
@@ -1315,7 +1384,7 @@ fn groups_referencing_remote_lists_sorted_groups() {
 fn remotes_alias_base_url_field() {
     // The `url` field accepts the friendlier `base_url` alias for ergonomics.
     let json = r#"{
-            "repos": {"a": "/tmp/a"},
+            "repos": {"a": "/srv/a"},
             "remotes": {"cloud": {"base_url": "https://cloud", "api_key": "k"}}
         }"#;
     let tmp = tempfile::tempdir().unwrap();

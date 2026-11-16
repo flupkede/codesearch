@@ -1128,7 +1128,8 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
             path: repo_path.clone(),
             alias: Some("brandnew".to_string()),
             model: None,
-            force: None,
+            // Temporary fixture path: force bypasses the temp-dir throwaway guard.
+            force: Some(true),
         }),
     )
     .await;
@@ -1229,6 +1230,84 @@ async fn add_repo_handler_refuses_tombstoned_alias_and_force_clears_it() {
     );
 }
 
+/// A path under the OS temp dir is a throwaway checkout (test fixture or
+/// scratch worktree — the machine-global post-checkout hook POSTs every
+/// `git worktree add`, including temp fixtures of unrelated test suites).
+/// The handler must refuse it with 400 unless the caller forces it; a forced
+/// call skips the temp guard and proceeds to the regular registration flow
+/// (proven here by the later "already registered" conflict on the same path).
+#[tokio::test]
+#[serial_test::serial]
+async fn add_repo_handler_refuses_temp_dir_paths_unless_forced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("fixture");
+    std::fs::create_dir(&repo_path).unwrap();
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
+
+    // Seed the fixture as already registered so the forced call stops at the
+    // duplicate conflict instead of opening stores / spawning a reindex.
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("fixture".to_string()))
+        .unwrap();
+    let state = Arc::new(state_with_config(config));
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: None,
+            model: None,
+            force: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "temp-dir registration must be refused, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        body.0
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| e.contains("temp")),
+        "refusal must name the temp-dir reason, got: {}",
+        body.0
+    );
+
+    // force=true bypasses the temp guard: the same path now reaches the
+    // regular duplicate check (409 already-registered), proving the guard —
+    // not something else — produced the 400 above.
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: None,
+            model: None,
+            force: Some(true),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "forced add must skip the temp guard and hit the duplicate conflict, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        body.0
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| e.contains("already registered")),
+        "expected the already-registered conflict, got: {}",
+        body.0
+    );
+}
+
 /// `POST /repos` with no explicit `model` must create a brand-new index at the
 /// serve-wide default's dimension (`codesearch serve --model X`), not the
 /// built-in 384-dim default. This is the write-side counterpart of the per-repo
@@ -1256,7 +1335,8 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
             path: repo_path.clone(),
             alias: Some("defaulted".to_string()),
             model: None,
-            force: None,
+            // Temporary fixture path: force bypasses the temp-dir throwaway guard.
+            force: Some(true),
         }),
     )
     .await;
@@ -1319,7 +1399,8 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
             path: repo_path.clone(),
             alias: Some("existing".to_string()),
             model: None,
-            force: None,
+            // Temporary fixture path: force bypasses the temp-dir throwaway guard.
+            force: Some(true),
         }),
     )
     .await;
@@ -1423,7 +1504,8 @@ async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
             path: repo_path.clone(),
             alias: Some("adopted".to_string()),
             model: None,
-            force: None,
+            // Temporary fixture path: force bypasses the temp-dir throwaway guard.
+            force: Some(true),
         }),
     )
     .await;
