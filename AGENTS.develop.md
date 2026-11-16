@@ -243,6 +243,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — temp-dir checkouts stop polluting the global repos.json: the post-checkout hook block skips TEMP-rooted checkouts (8.3 short-form matched via cygpath), POST /repos refuses them (force=true escape), and reconcile drops registrations whose temp path is gone.
+
 - **Pending** — warmup age gate: repos unused for more than `CODESEARCH_WARMUP_MAX_AGE_DAYS` (default 5, 0 = off) are not opened by the serve startup warmup — they lazy-open on the first tool call. Bounds the mapped-index working set on machines with many registered repos.
 
 - **Pending** — CI/test SDK discipline: repo-root `global.json` pins the 10.0.4xx SDK band (the runner images ship a .NET 11 SDK whose Razor generator the helper's pinned Roslyn 4.13 cannot drive — it ran without output), the test workspace registers the global.json-resolved SDK explicitly, and the helper's generator driver surfaces internally failing generators as `[INFO]` lines.
