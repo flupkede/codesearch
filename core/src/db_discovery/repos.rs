@@ -215,16 +215,39 @@ impl ReposConfig {
     /// `repos.json` can never crash the app. This is best-effort cleanup,
     /// performed in memory only (no disk write here):
     ///
-    /// 1. Drop repo entries whose alias key is empty/blank.
-    /// 2. Drop `repos_meta` entries that reference an unknown alias.
-    /// 3. Prune group members that reference unknown aliases; drop now-empty
+    /// 1. Drop stale temp-dir registrations: entries whose path no longer
+    ///    exists AND lies under the OS temp directory. The machine-global
+    ///    post-checkout hook registers every `git worktree add` with serve —
+    ///    including the throwaway fixtures of unrelated test suites — so a
+    ///    dead entry under temp is always garbage. A missing non-temp path is
+    ///    kept: it may be a temporarily unmounted volume.
+    /// 2. Drop repo entries whose alias key is empty/blank.
+    /// 3. Drop `repos_meta` entries that reference an unknown alias.
+    /// 4. Prune group members that reference unknown aliases; drop now-empty
     ///    groups.
     ///
     /// Existing (non-empty) alias keys are never renamed — that would break
     /// group references — so a merely "non-standard" hand-edited alias is
     /// tolerated as-is.
     pub(crate) fn reconcile(&mut self) {
-        // 1. Drop empty/blank alias keys.
+        // 1. Drop stale temp-dir registrations (see doc list); the meta/group
+        //    cascade steps below then clean up everything that referenced them.
+        let stale_temp: Vec<(String, PathBuf)> = self
+            .repos
+            .iter()
+            .filter(|(_, p)| !p.exists() && is_temp_dir_path(p))
+            .map(|(alias, p)| (alias.clone(), p.clone()))
+            .collect();
+        for (alias, path) in stale_temp {
+            tracing::warn!(
+                "repos.json: dropping stale temp-dir registration '{}' ({} is gone)",
+                alias,
+                path.display()
+            );
+            self.repos.remove(&alias);
+        }
+
+        // 2. Drop empty/blank alias keys.
         let empty_keys: Vec<String> = self
             .repos
             .keys()
@@ -236,7 +259,7 @@ impl ReposConfig {
             self.repos.remove(&alias);
         }
 
-        // 2. Drop meta entries pointing at unknown aliases.
+        // 3. Drop meta entries pointing at unknown aliases.
         let orphan_meta: Vec<String> = self
             .repos_meta
             .keys()
@@ -248,7 +271,7 @@ impl ReposConfig {
             self.repos_meta.remove(&alias);
         }
 
-        // 2b. Same for orphan read-only flags. `skip_serializing_if` only omits the
+        // 3b. Same for orphan read-only flags. `skip_serializing_if` only omits the
         //     map when it is entirely empty, so a stale `repo_read_only["gone"]`
         //     survives every round-trip — and an alias that is removed and later
         //     re-added under the same name would silently inherit read-only.
@@ -263,7 +286,7 @@ impl ReposConfig {
             self.repo_read_only.remove(&alias);
         }
 
-        // 3. Prune group members referencing unknown aliases OR unknown remote
+        // 4. Prune group members referencing unknown aliases OR unknown remote
         //    peers; drop now-empty groups. A member starting with `@` is a
         //    federation reference to a remote peer (`@cloud`), all others are
         //    local aliases. Unknown references on both sides are dropped so a
@@ -310,7 +333,7 @@ impl ReposConfig {
             self.groups.remove(&group);
         }
 
-        // 3b. Same for orphan group overrides: a `groups_meta` entry whose
+        // 4b. Same for orphan group overrides: a `groups_meta` entry whose
         //     group no longer exists would survive every round-trip and
         //     silently re-apply its opt-outs if the group name is reused.
         let orphan_groups_meta: Vec<String> = self
@@ -324,7 +347,7 @@ impl ReposConfig {
             self.groups_meta.remove(&group);
         }
 
-        // 4. Prune mounted remote projects whose peer is unknown or whose name
+        // 5. Prune mounted remote projects whose peer is unknown or whose name
         //    is malformed (no "<peer>/<alias>" split). A hand-edited or stale
         //    `remote_mounts` entry must never make an un-routable name look
         //    available.
@@ -355,7 +378,7 @@ impl ReposConfig {
         self.remote_alias_overrides
             .retain(|canonical, _| mounted.contains(canonical));
 
-        // 5. Drop cached remote-project lists for peers that no longer exist —
+        // 6. Drop cached remote-project lists for peers that no longer exist —
         // a removed peer's last-known aliases are meaningless once the peer
         // itself is gone (and would otherwise resurrect a stale peer name if
         // it's later re-added under different projects).
@@ -1435,6 +1458,45 @@ fn sanitize_alias(raw: &str) -> String {
 
 fn normalize_path_for_compare(path: &Path) -> String {
     crate::cache::normalize_path(path)
+}
+
+/// Whether `path` lies under the OS temp directory (`std::env::temp_dir`).
+///
+/// Registrations under temp are throwaway by definition — test fixtures and
+/// scratch worktrees — so they are refused at registration time (the serve
+/// `POST /repos` guard and the post-checkout hook's skip) and pruned by
+/// [`ReposConfig::reconcile`] once their directory disappears.
+pub fn is_temp_dir_path(path: &Path) -> bool {
+    let root = std::env::temp_dir();
+    // GetTempPathW can hand back an 8.3 short path (TMP=%LOCALAPPDATA%\Temp
+    // often carries short components in test/CI environments). The temp dir
+    // always exists, so resolve it to the long form, falling back to raw.
+    let root = crate::cache::safe_canonicalize(&root).unwrap_or(root);
+    // An existing input is resolved the same way so a short-form path still
+    // matches the long root; a missing path (reconcile prune case) can only
+    // be compared as-is.
+    let input = if path.exists() {
+        crate::cache::safe_canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    is_under_dir(&input, &root)
+}
+
+/// Case-insensitive, separator-agnostic "path is at or under root" check.
+///
+/// Both sides go through [`crate::cache::normalize_path_str`] (forward
+/// slashes, UNC prefix stripped) and ASCII-lowercased, so a `C:\…\Temp` root
+/// matches a `c:/…/temp` path. An empty `root` never matches.
+fn is_under_dir(path: &Path, root: &Path) -> bool {
+    let root_norm = crate::cache::normalize_path_str(&root.to_string_lossy())
+        .trim_end_matches('/')
+        .to_lowercase();
+    if root_norm.is_empty() {
+        return false;
+    }
+    let path_norm = crate::cache::normalize_path_str(&path.to_string_lossy()).to_lowercase();
+    path_norm == root_norm || path_norm.starts_with(&format!("{root_norm}/"))
 }
 
 /// Best-effort lookup of a directory's git remote URL (`remote.origin.url`).

@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.8.6]
+
+### Fixed
+
+- **Temp-dir checkouts no longer pollute the global `repos.json`.** The machine-global `post-checkout` hook (installed by `codesearch hooks git install` via `core.hooksPath`) auto-registered every `git checkout`/`git worktree add` with a running serve — including throwaway test fixtures and scratch worktrees under the OS temp directory, whose registrations outlived their directories as stale aliases (`wt`, `wt-2`, …) that no cleanup could keep up with. Three layers: the hook block now skips checkouts under `$TMPDIR`/`$TMP`/`$TEMP` (plus `/tmp` and `%LOCALAPPDATA%\Temp` fallbacks), `POST /repos` refuses paths under the OS temp dir with `400` unless `force=true`, and `ReposConfig::reconcile` drops a temp-dir registration whose path no longer exists (a missing non-temp path is still kept — it may be a temporarily unmounted volume).
+
 ## [1.8.0]
 
 ### Changed

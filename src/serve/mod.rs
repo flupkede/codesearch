@@ -6035,6 +6035,32 @@ async fn add_repo_handler(
         }
     }
 
+    // Throwaway-guard: a path under the OS temp dir is a test fixture or a
+    // scratch worktree. The machine-global post-checkout hook POSTs every
+    // `git worktree add` it sees — including temp fixtures created by
+    // unrelated test suites — and each such registration pollutes repos.json
+    // with an alias whose directory dies with the run. Refuse unless forced.
+    // Ordered after the tombstone guard: an explicit --forget refusal is the
+    // more informative answer when both apply.
+    if !body.force.unwrap_or(false) && crate::db_discovery::repos::is_temp_dir_path(&canonical_path)
+    {
+        warn!(
+            "Rejected repo registration under temp dir: {} (pass force=true to override)",
+            canonical_path.display()
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::response::Json(json!({
+                "error": format!(
+                    "Refusing to register '{}': it is under the OS temp directory \
+                     (a test fixture or scratch worktree). Pass force=true to override.",
+                    canonical_path.display()
+                ),
+                "status": "error"
+            })),
+        );
+    }
+
     // Register in repos.json
     let alias = {
         let mut config = match state.config.write() {

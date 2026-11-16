@@ -1927,6 +1927,9 @@ fn codesearch_hook_block() -> String {
 # Only react to branch/worktree checkouts ($3 = 1). `git worktree add` fires
 # post-checkout with flag 1; a file checkout (`git checkout -- path`) fires with
 # flag 0 and must not re-register (it changes no repo location, just wastes a POST).
+# Throwaway checkouts under the OS temp dir are skipped entirely: they are test
+# fixtures / scratch worktrees of unrelated suites, and registering them fills
+# repos.json with aliases whose directory dies with the run.
 __cs_home="${CODESEARCH_HOME:-$HOME/.codesearch}"
 if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
     __cs_url=$(cat "$__cs_home/serve_url")
@@ -1935,11 +1938,29 @@ if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
         # cannot canonicalize (HTTP 400); `pwd -W` yields a native C:/ path.
         # Fall back to plain `pwd` on Linux/macOS where -W is unsupported.
         __cs_path=$(pwd -W 2>/dev/null || pwd)
-        # JSON-escape backslashes, then double quotes (POSIX sed: sh + bash).
-        __cs_path=$(printf '%s' "$__cs_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        curl -s -X POST "$__cs_url/repos" \
-            -H "Content-Type: application/json" \
-            -d "{\"path\":\"$__cs_path\"}" >/dev/null 2>&1 &
+        __cs_tmp_hit=0
+        __cs_p_lc=$(printf '%s' "$__cs_path" | tr '[:upper:]' '[:lower:]' | sed 's|\\|/|g; s|/*$||')
+        for __cs_dir in "${TMPDIR:-}" "${TMP:-}" "${TEMP:-}" "/tmp"; do
+            [ -n "$__cs_dir" ] || continue
+            __cs_d=$(printf '%s' "$__cs_dir" | tr '[:upper:]' '[:lower:]' | sed 's|\\|/|g; s|/*$||')
+            case "$__cs_p_lc" in
+                "$__cs_d" | "$__cs_d"/*) __cs_tmp_hit=1; break ;;
+            esac
+        done
+        if [ "$__cs_tmp_hit" = "0" ] && [ -n "${LOCALAPPDATA:-}" ]; then
+            # Windows fallback for setups where TMP/TEMP are unset.
+            __cs_d=$(printf '%s/Temp' "$LOCALAPPDATA" | tr '[:upper:]' '[:lower:]' | sed 's|\\|/|g; s|/*$||')
+            case "$__cs_p_lc" in
+                "$__cs_d" | "$__cs_d"/*) __cs_tmp_hit=1 ;;
+            esac
+        fi
+        if [ "$__cs_tmp_hit" = "0" ]; then
+            # JSON-escape backslashes, then double quotes (POSIX sed: sh + bash).
+            __cs_path=$(printf '%s' "$__cs_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            curl -s -X POST "$__cs_url/repos" \
+                -H "Content-Type: application/json" \
+                -d "{\"path\":\"$__cs_path\"}" >/dev/null 2>&1 &
+        fi
     fi
 fi
 "#,
@@ -2226,6 +2247,34 @@ mod tests {
         assert!(
             block.contains("[ \"$3\" = \"1\" ]"),
             "hook must gate on the branch-checkout flag"
+        );
+    }
+
+    #[test]
+    fn test_hook_block_skips_temp_dir_checkouts() {
+        let block = codesearch_hook_block();
+        // A checkout under the OS temp dir (test fixture, scratch worktree)
+        // must never reach the POST: it pollutes the global repos.json with
+        // an alias whose directory dies with the run.
+        assert!(
+            block.contains("__cs_tmp_hit"),
+            "hook must compute a temp-dir hit flag"
+        );
+        assert!(
+            block.contains("\"${TMPDIR:-}\"") && block.contains("\"${TMP:-}\""),
+            "hook must test the TMPDIR/TMP temp candidates"
+        );
+        // The POST must be gated on the temp check having missed.
+        assert!(
+            block.contains("if [ \"$__cs_tmp_hit\" = \"0\" ]"),
+            "the POST must be gated on the temp-dir check"
+        );
+        // And the check must run before the POST it gates.
+        let guard_pos = block.find("__cs_tmp_hit").expect("guard present");
+        let curl_pos = block.find("curl -s -X POST").expect("POST present");
+        assert!(
+            guard_pos < curl_pos,
+            "temp-dir check must run before the POST"
         );
     }
 
