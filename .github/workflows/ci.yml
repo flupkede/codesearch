@@ -111,7 +111,7 @@ jobs:
         run: |
           if [ -z "${{ github.event.before }}" ] || ! git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"   # new branch / force-push base gone — be safe, run it
-          elif git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -q '^helpers/csharp/'; then
+          elif git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -qE '^helpers/csharp/|^global\.json$'; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
           else
             echo "relevant=false" >> "$GITHUB_OUTPUT"
@@ -120,7 +120,18 @@ jobs:
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
         if: steps.changed.outputs.relevant == 'true'
         with:
-          dotnet-version: '10.0.x'
+          # Pinned to the exact SDK the suite is developed/verified against.
+          # The runner image ships .NET 11 SDK bands alongside 10.x (11.0.100
+          # since 2026-11-15) and `dotnet` resolves the LATEST installed one,
+          # whose Razor generator the host's pinned Roslyn 4.13 cannot drive —
+          # it runs WITHOUT output and the Blazor fixture fails with CS0103.
+          # The repo-root global.json makes every dotnet command (restore,
+          # test, the helper's global.json-pin registration) resolve this
+          # band; keep this pin and that file in sync.
+          dotnet-version: '10.0.403'
+      - name: Log SDK version
+        if: steps.changed.outputs.relevant == 'true'
+        run: dotnet --version
       # The xunit suite (models, key format, workspace/restore policy and the
       # Blazor generator integration pin) must run in CI: until now only the
       # cargo integration tests ran here, so a helper regression the xunit

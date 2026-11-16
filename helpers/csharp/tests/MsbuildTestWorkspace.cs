@@ -25,10 +25,34 @@ internal static class MsbuildTestWorkspace
             if (!MSBuildLocator.IsRegistered)
             {
                 var instances = MSBuildLocator.QueryVisualStudioInstances().ToList();
-                var sdk = instances.FirstOrDefault(i => i.DiscoveryType == DiscoveryType.DotNetSdk)
-                          ?? instances.OrderByDescending(i => i.Version).First();
+                var dotnetSdks = instances
+                    .Where(i => i.DiscoveryType == DiscoveryType.DotNetSdk)
+                    .ToList();
+                // Register the SDK `dotnet` itself resolves: global.json pins
+                // the repo band, but the runner images ship newer bands
+                // alongside it (11.0.100 since 2026-11-15) whose Razor
+                // generator the host's pinned Roslyn 4.13 cannot drive — it
+                // then runs WITHOUT output and generated Razor members
+                // vanish silently. Same rule as the shipped helper's
+                // TryRegisterMsBuild.
+                var pin = MsbuildRestore.GlobalJsonSdkVersion(AppContext.BaseDirectory);
+                Version.TryParse(pin, out var pinVersion);
+                var sdk = (pinVersion is not null
+                        ? dotnetSdks.FirstOrDefault(i => i.Version == pinVersion)
+                            ?? dotnetSdks
+                                .Where(i => i.Version.Major == pinVersion.Major
+                                            && i.Version.Minor == pinVersion.Minor)
+                                .OrderByDescending(i => i.Version)
+                                .FirstOrDefault()
+                        : null)
+                    ?? dotnetSdks.OrderByDescending(i => i.Version).FirstOrDefault()
+                    ?? instances.OrderByDescending(i => i.Version).First();
                 MSBuildLocator.RegisterInstance(sdk);
                 Environment.SetEnvironmentVariable("MSBUILD_EXE_PATH", sdk.MSBuildPath);
+                Console.Error.WriteLine(
+                    "[INFO] test workspace: MSBuildLocator registered '{0}' {1} at {2} (global.json pin: {3}); instances: {4}",
+                    sdk.Name, sdk.Version, sdk.MSBuildPath, pin ?? "none",
+                    string.Join(", ", instances.Select(i => $"{i.DiscoveryType}:{i.Version}:{i.MSBuildPath}")));
             }
         }
 
