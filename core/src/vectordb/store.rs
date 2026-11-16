@@ -30,7 +30,7 @@ use tracing::{error, warn};
 
 /// Read the persisted LMDB map size from metadata.json in the database directory.
 /// Returns DEFAULT_LMDB_MAP_SIZE_MB if no persisted value is found.
-fn read_persisted_map_size(db_path: &Path) -> usize {
+pub(crate) fn read_persisted_map_size(db_path: &Path) -> usize {
     let metadata_path = db_path.join("metadata.json");
     if let Ok(content) = fs::read_to_string(&metadata_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -40,6 +40,20 @@ fn read_persisted_map_size(db_path: &Path) -> usize {
         }
     }
     crate::constants::DEFAULT_LMDB_MAP_SIZE_MB
+}
+
+/// The unix ms of the last successful compaction from metadata.json
+/// (0 = never compacted). The idle reaper's auto-compact gate reads this.
+pub(crate) fn read_last_compact_unix_ms(db_path: &Path) -> u64 {
+    let metadata_path = db_path.join("metadata.json");
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(ms) = json.get("last_compact_unix_ms").and_then(|v| v.as_u64()) {
+                return ms;
+            }
+        }
+    }
+    0
 }
 
 /// Process-global pin of the LMDB map size chosen for each canonical DB path.
@@ -275,7 +289,7 @@ fn ensure_schema_version(db_path: &Path) -> Result<()> {
 }
 
 /// Persist the current LMDB map size into metadata.json (atomic read-modify-write).
-fn persist_map_size(db_path: &Path, map_size_mb: usize) -> Result<()> {
+pub(crate) fn persist_map_size(db_path: &Path, map_size_mb: usize) -> Result<()> {
     merge_metadata_atomic(db_path, |obj| {
         obj.insert(
             "lmdb_map_size_mb".to_string(),

@@ -520,6 +520,20 @@ pub const DEFAULT_WARMUP_MAX_AGE_DAYS: u64 = 5;
 /// Environment variable to override the warmup max age (in days; 0 = off).
 pub const WARMUP_MAX_AGE_DAYS_ENV: &str = "CODESEARCH_WARMUP_MAX_AGE_DAYS";
 
+/// Idle-reaper auto-compact cadence: an evicted repo whose
+/// `last_compact_unix_ms` (metadata.json) is older is compacted right after
+/// eviction. `0` disables auto-compaction (manual `index compact` still
+/// works). Override with `CODESEARCH_COMPACT_INTERVAL_DAYS`.
+pub const DEFAULT_COMPACT_INTERVAL_DAYS: u64 = 5;
+
+/// Environment variable to override the auto-compact cadence (days; 0 = off).
+pub const COMPACT_INTERVAL_DAYS_ENV: &str = "CODESEARCH_COMPACT_INTERVAL_DAYS";
+
+/// Delay before an auto-compact task starts after the idle reaper evicted
+/// the repo — the evicted FSW task drains asynchronously, and compacting
+/// against a not-yet-closed mmap fails with a sharing violation.
+pub const AUTO_COMPACT_SETTLE_SECS: u64 = 30;
+
 // --- Cloud keep-warm (scale-to-zero suspend after idle) ----------------------
 
 /// URL serve self-pings (its own ingress FQDN) to stay warm while active.
