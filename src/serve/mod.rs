@@ -1800,7 +1800,28 @@ impl ServeState {
         // no recorded use warms last; ties break on alias.
         let access = self.load_access_times();
         let aliases = Self::warmup_order(self.aliases(), &access);
+        // Age gate: repos unused for more than the max age stay cold — they
+        // lazy-open on the first tool call that names them. Warming every
+        // registered repo mapped every index into the working set at boot.
+        let max_age_days = Self::warmup_max_age_days();
+        let (aliases, skipped) =
+            Self::warmup_partition(aliases, &access, Self::unix_now_ms(), max_age_days);
+        if !skipped.is_empty() {
+            info!(
+                "🔥 Phase 1 warmup: skipping {} repo(s) unused for more than {} day(s) \
+                 (lazy-open on first call): {}",
+                skipped.len(),
+                max_age_days,
+                skipped.join(", ")
+            );
+        }
         if aliases.is_empty() {
+            if !skipped.is_empty() {
+                info!(
+                    "🔥 Phase 1 warmup: nothing to warm ({} stale repo(s) skipped)",
+                    skipped.len()
+                );
+            }
             return;
         }
         let head: Vec<String> = aliases.iter().take(5).cloned().collect();
@@ -3788,6 +3809,50 @@ impl ServeState {
             .collect();
         order.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         order.into_iter().map(|(alias, _)| alias).collect()
+    }
+
+    /// Split `aliases` into `(to_warm, skipped)`: a repo warms only when its
+    /// persisted last use is within `max_age_days`; `0` disables the gate.
+    /// Never-used repos (no sidecar entry) stay cold — they open lazily on
+    /// the first query that names them. Stale repos that are ALSO gone from
+    /// disk stay registered here: the status-refresh self-heal unregisters
+    /// those, warmup does not double-check paths it never opens.
+    fn warmup_partition(
+        aliases: Vec<String>,
+        access: &std::collections::HashMap<String, u64>,
+        now_ms: u64,
+        max_age_days: u64,
+    ) -> (Vec<String>, Vec<String>) {
+        if max_age_days == 0 {
+            return (aliases, Vec::new());
+        }
+        let cutoff_ms = max_age_days.saturating_mul(24 * 60 * 60 * 1000);
+        aliases.into_iter().partition(|alias| {
+            access
+                .get(alias)
+                .is_some_and(|ts| now_ms.saturating_sub(*ts) <= cutoff_ms)
+        })
+    }
+
+    /// Effective warmup max age in days (`0` = gate off). An unparsable
+    /// override falls back to the default with a warning — a typo must not
+    /// silently warm every registered repo.
+    fn warmup_max_age_days() -> u64 {
+        match std::env::var(crate::constants::WARMUP_MAX_AGE_DAYS_ENV) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(days) => days,
+                Err(_) => {
+                    tracing::warn!(
+                        "{}={} is not a number of days; using the default ({})",
+                        crate::constants::WARMUP_MAX_AGE_DAYS_ENV,
+                        raw,
+                        crate::constants::DEFAULT_WARMUP_MAX_AGE_DAYS
+                    );
+                    crate::constants::DEFAULT_WARMUP_MAX_AGE_DAYS
+                }
+            },
+            Err(_) => crate::constants::DEFAULT_WARMUP_MAX_AGE_DAYS,
+        }
     }
 
     /// Write the wall-clock last-use map to `path` (atomic temp+rename via

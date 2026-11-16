@@ -506,6 +506,20 @@ pub const REPO_OPEN_WAIT_SECS: u64 = 20;
 /// Environment variable to override the repo idle timeout.
 pub const REPO_IDLE_TIMEOUT_ENV: &str = "CODESEARCH_REPO_IDLE_TIMEOUT_SECS";
 
+/// Repos whose persisted last use is older than this many days are NOT opened
+/// by the phase-1 startup warmup — they open lazily on the first tool call
+/// that names them. Bounds the serve's resident footprint: every warmed repo
+/// maps its whole index (LMDB/Tantivy pages land in the working set), so
+/// warming every registered repo pinned ~17 GB of file-backed cache right
+/// after boot while the private heap stayed at ~0.3 GB. Repos with no
+/// recorded use are treated as older than any age and stay cold too.
+/// `0` disables the gate (warm everything, the historical behavior).
+/// Override with `CODESEARCH_WARMUP_MAX_AGE_DAYS`.
+pub const DEFAULT_WARMUP_MAX_AGE_DAYS: u64 = 5;
+
+/// Environment variable to override the warmup max age (in days; 0 = off).
+pub const WARMUP_MAX_AGE_DAYS_ENV: &str = "CODESEARCH_WARMUP_MAX_AGE_DAYS";
+
 // --- Cloud keep-warm (scale-to-zero suspend after idle) ----------------------
 
 /// URL serve self-pings (its own ingress FQDN) to stay warm while active.
