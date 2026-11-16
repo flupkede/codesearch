@@ -13,6 +13,12 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> Result<()> {
+    // The workspace split put CARGO_PKG_VERSION of `codesearch-core` at 0.x
+    // while the CLI (and the deployed helper) carry the product version; core
+    // code comparing itself against a deployed artifact must see the CLI's
+    // version. Set before anything that can log a version mismatch.
+    codesearch::set_app_version(env!("CARGO_PKG_VERSION"));
+
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(run());
     // Blocking tasks in a restore wait poll this flag (csharp.rs); setting it

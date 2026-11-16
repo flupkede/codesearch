@@ -377,6 +377,11 @@ async fn run_remote_tui_loop(
                                                 dims: info.dims,
                                                 lock: info.lock,
                                                 index_age: info.index_age,
+                                                last_compact: if info.last_compact.is_empty() {
+                                                    "—".to_string()
+                                                } else {
+                                                    info.last_compact.clone()
+                                                },
                                                 symbol_warnings: info.symbol_warnings,
                                                 symbol_index: info.symbol_index,
                                                 copy_feedback: None,
@@ -485,6 +490,26 @@ async fn run_remote_tui_loop(
                                 .await;
                         }
                     }
+                    KeyAction::Compact(idx) => {
+                        if idx < rows.len() {
+                            let alias = rows[idx].alias.clone();
+                            let compact_url = format!(
+                                "{}/repos/{}/compact",
+                                serve_url.trim_end_matches('/'),
+                                alias
+                            );
+                            // Fire-and-forget POST (the sync copy can take
+                            // tens of seconds; the TUI does not wait).
+                            let client = client.clone();
+                            tokio::spawn(async move {
+                                let _ = client
+                                    .post(&compact_url)
+                                    .timeout(Duration::from_secs(1800))
+                                    .send()
+                                    .await;
+                            });
+                        }
+                    }
                     KeyAction::RequestRemove(idx) => {
                         if idx < rows.len() {
                             let alias = rows[idx].alias.clone();
@@ -527,6 +552,10 @@ struct InfoResponse {
     dims: usize,
     lock: String,
     index_age: String,
+    /// Last LMDB compact stamp text from the peer; `default` for older-serve
+    /// compatibility (renders "—").
+    #[serde(default)]
+    last_compact: String,
     /// Index-level symbol warnings from the peer's on-disk meta. `default` for
     /// the same older-serve compatibility as `path`.
     #[serde(default)]

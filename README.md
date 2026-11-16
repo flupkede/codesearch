@@ -477,6 +477,7 @@ This starts a background HTTP server with:
 | `i` | Show info overlay (chunks, files, model, DB size) |
 | `d` | Run doctor diagnostics on selected repo |
 | `n` | Force reindex selected repo |
+| `C` | Compact selected repo's LMDB index (frees dead pages; see `codesearch index compact`) |
 | `r` | Remove selected repo (with confirmation dialog) |
 | `l` | Reload repos config from disk |
 | `q` | Quit serve |
@@ -491,6 +492,11 @@ codesearch index add /path/to/my-project
 
 # Remove a repo
 codesearch index rm /path/to/my-project
+
+# Free LMDB dead pages (VACUUM): rewrite data.mdb live-pages-only.
+# The idle reaper does this automatically for active repos every
+# CODESEARCH_COMPACT_INTERVAL_DAYS (default 5), after they go idle.
+codesearch index compact my-project
 
 # Remove AND tombstone the alias: re-registration via `index add` is
 # refused until explicitly cleared with `index add --force`
@@ -698,6 +704,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
 | `CODESEARCH_WARMUP_MAX_AGE_DAYS` | Repos not used within this many days are not opened by the serve's startup warmup — they lazy-open on the first tool call that names them. `0` disables the gate and warms every registered repo (default: 5). Bounds the resident mapped-index footprint on machines with many registered repos |
+| `CODESEARCH_COMPACT_INTERVAL_DAYS` | Idle-reaper auto-compact cadence: a repo evicted after being idle longer than this is compacted (LMDB `data.mdb` rewritten live-pages-only, freelist dead pages dropped — `last_compact_unix_ms` in its metadata.json tracks the run). `0` disables auto-compaction; `codesearch index compact <alias>` always works (default: 5, settle delay 30 s after eviction) |
 | `CODESEARCH_STORE_LOCK_WAIT_SECS` | Bounded wait for a store's write lock before a single-project query reports the store busy (default: 300). Multi-repo fan-outs never wait — they skip the busy repo with a warning |
 | `CODESEARCH_MODEL_LOAD_TIMEOUT_SECS` | Bound on a cold-cache embedding-model load (default: 600). On expiry the loader fails fast with a hint to pre-populate the cache via `codesearch setup`; search itself only uses models already loaded or provably on disk |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
