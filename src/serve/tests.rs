@@ -7651,3 +7651,26 @@ fn touch_access_feeds_persisted_warmup_order() {
     let order = ServeState::warmup_order(vec!["a".to_string(), "b".to_string()], &loaded);
     assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
 }
+
+#[test]
+fn cold_touch_does_not_refresh_the_persisted_sidecar() {
+    let state = ServeState::new(ReposConfig::default(), None);
+
+    // The warmup path (touch_access_cold) starts the reaper's idle clock but
+    // MUST NOT write "used now" into last_access_wall: the wall stamp IS the
+    // warmup age gate's input, and a warmup that refreshed it kept every
+    // registered repo inside CODESEARCH_WARMUP_MAX_AGE_DAYS forever.
+    state.touch_access_cold("warmed");
+    assert!(
+        state.last_access_wall.get("warmed").is_none(),
+        "warmup open must not re-stamp the persisted sidecar"
+    );
+    assert!(
+        state.last_access.get("warmed").is_some(),
+        "the reaper clock must still run so warmed repos get evicted"
+    );
+
+    // A real access (touch_access) still re-stamps both.
+    state.touch_access("queried");
+    assert!(state.last_access_wall.get("queried").is_some());
+}

@@ -3112,8 +3112,8 @@ impl ServeState {
                         alias, e
                     ),
                 }
-                // Touch so the idle reaper can evict this handle.
-                self.touch_access(alias);
+                // Touch for the reaper clock only: see touch_access_cold.
+                self.touch_access_cold(alias);
                 return Ok(());
             }
             OpenedStores::Write(s) => s,
@@ -3183,11 +3183,11 @@ impl ServeState {
                 stores: Arc::clone(&stores),
             },
         );
-        // Start the idle timer at warmup. A real query will reset it via
-        // touch_access; without this, repos that are warmed but never queried
-        // would never appear in `last_access` and therefore never be evicted
-        // by `evict_idle_repos`, holding LMDB envs and embedder state forever.
-        self.touch_access(alias);
+        // Start the idle timer for the reaper ONLY — the persisted
+        // sidecar must not learn "used today" from a warmup open:
+        // touch_access_cold feeds last_access without touching
+        // last_access_wall. A real query resets via touch_access.
+        self.touch_access_cold(alias);
         drop(open_guard);
 
         // Tracked like any reindex: status reports "indexing", the reaper
@@ -3919,12 +3919,23 @@ impl ServeState {
 
     /// Record that a repo was just accessed (query or reindex).
     /// Called from `get_or_open_stores(touch=true)`, `reindex_handler`,
-    /// `add_repo_handler`, and `warmup_repo` (after successful warmup).
+    /// and `add_repo_handler`.
     pub(crate) fn touch_access(&self, alias: &str) {
         self.last_access
             .insert(alias.to_string(), std::time::Instant::now());
         self.last_access_wall
             .insert(alias.to_string(), Self::unix_now_ms());
+    }
+
+    /// Record an access for the REAPER CLOCK ONLY (no persisted sidecar
+    /// entry). Warmup uses this: the warmup's own open must not re-stamp
+    /// "last used = now" for every repo it opens — the persisted
+    /// access_times.json is the warmup age gate's input, and a warmup that
+    /// refreshed it kept every registered repo inside the age window
+    /// forever, making `CODESEARCH_WARMUP_MAX_AGE_DAYS` ineffective.
+    pub(crate) fn touch_access_cold(&self, alias: &str) {
+        self.last_access
+            .insert(alias.to_string(), std::time::Instant::now());
     }
 
     fn unix_now_ms() -> u64 {
