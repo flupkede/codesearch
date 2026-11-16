@@ -120,7 +120,17 @@ jobs:
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
         if: steps.changed.outputs.relevant == 'true'
         with:
-          dotnet-version: '10.0.x'
+          # Pinned to the exact SDK the suite is developed/verified against.
+          # A range here resolves to the runner image's preinstalled SDK,
+          # which moved under us on 2026-11-15 (image roll): the Razor source
+          # generator it ships then ran WITHOUT output against the host's
+          # pinned Roslyn 4.13, leaving CS0103 cascades in the Blazor fixture
+          # while `dotnet test` passed locally on 10.0.403. Bump this pin
+          # TOGETHER with helpers/csharp, not with the runner image.
+          dotnet-version: '10.0.403'
+      - name: Log SDK version
+        if: steps.changed.outputs.relevant == 'true'
+        run: dotnet --version
       # The xunit suite (models, key format, workspace/restore policy and the
       # Blazor generator integration pin) must run in CI: until now only the
       # cargo integration tests ran here, so a helper regression the xunit
