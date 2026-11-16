@@ -25,10 +25,17 @@ internal static class MsbuildTestWorkspace
             if (!MSBuildLocator.IsRegistered)
             {
                 var instances = MSBuildLocator.QueryVisualStudioInstances().ToList();
-                var sdk = instances.FirstOrDefault(i => i.DiscoveryType == DiscoveryType.DotNetSdk)
-                          ?? instances.OrderByDescending(i => i.Version).First();
+                var sdk = instances
+                    .Where(i => i.DiscoveryType == DiscoveryType.DotNetSdk)
+                    .OrderByDescending(i => i.Version)
+                    .FirstOrDefault()
+                    ?? instances.OrderByDescending(i => i.Version).First();
                 MSBuildLocator.RegisterInstance(sdk);
                 Environment.SetEnvironmentVariable("MSBUILD_EXE_PATH", sdk.MSBuildPath);
+                Console.Error.WriteLine(
+                    "[INFO] test workspace: MSBuildLocator registered '{0}' at {1}; instances: {2}",
+                    sdk.Name, sdk.MSBuildPath,
+                    string.Join(", ", instances.Select(i => $"{i.DiscoveryType}:{i.Version}:{i.MSBuildPath}")));
             }
         }
 
