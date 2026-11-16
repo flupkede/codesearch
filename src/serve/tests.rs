@@ -7559,6 +7559,47 @@ fn warmup_order_most_recently_used_first() {
 }
 
 #[test]
+fn warmup_partition_gates_on_persisted_age() {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const NOW: u64 = 10_000 * DAY_MS;
+    let mut access = std::collections::HashMap::new();
+    access.insert("fresh".to_string(), NOW - DAY_MS);
+    access.insert("week_old".to_string(), NOW - 7 * DAY_MS);
+    // "never_used" has no entry at all.
+    let aliases: Vec<String> = ["fresh", "week_old", "never_used"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    // Default gate (5 days): fresh warms, the week-old and never-used stay cold.
+    let (warm, skipped) = ServeState::warmup_partition(aliases.clone(), &access, NOW, 5);
+    assert_eq!(warm, vec!["fresh".to_string()]);
+    assert_eq!(
+        skipped,
+        vec!["week_old".to_string(), "never_used".to_string()]
+    );
+
+    // Gate off (0): everything warms — the historical behavior.
+    let (warm, skipped) = ServeState::warmup_partition(aliases, &access, NOW, 0);
+    assert_eq!(warm.len(), 3);
+    assert!(skipped.is_empty());
+
+    // Exactly at the cutoff is still fresh (<=); one ms older is not.
+    let mut edge = std::collections::HashMap::new();
+    edge.insert("at".to_string(), NOW - 5 * DAY_MS);
+    edge.insert("past".to_string(), NOW - 5 * DAY_MS - 1);
+    let (warm, _) =
+        ServeState::warmup_partition(vec!["at".to_string(), "past".to_string()], &edge, NOW, 5);
+    assert_eq!(warm, vec!["at".to_string()]);
+
+    // A sidecar timestamp from the future (clock skew) must not be skipped.
+    let mut skew = std::collections::HashMap::new();
+    skew.insert("ahead".to_string(), NOW + DAY_MS);
+    let (warm, _) = ServeState::warmup_partition(vec!["ahead".to_string()], &skew, NOW, 5);
+    assert_eq!(warm, vec!["ahead".to_string()]);
+}
+
+#[test]
 fn access_times_sidecar_round_trip_and_corruption_tolerance() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("access_times.json");
