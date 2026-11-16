@@ -121,8 +121,8 @@ pub enum KeyAction {
     RunDoctor(usize),
     /// User pressed `n` — force reindex repo at given index.
     ForceReindex(usize),
-    /// User pressed `C` — compact repo's LMDB index at given index
-    /// (frees dead permanent pages).
+    /// User pressed `v`/`V` — compact repo's LMDB index at given index
+    /// (frees dead pages; "vacuum").
     Compact(usize),
     /// User pressed `r` — request removal of repo at given index (shows confirmation).
     RequestRemove(usize),
@@ -280,7 +280,9 @@ pub fn handle_key(
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::ForceReindex(idx)
         }
-        KeyCode::Char('C') => {
+        // `v` (VACUUM) — lowercase like every other key; `V` accepted as a
+        // courtesy so the action never depends on remembering a case rule.
+        KeyCode::Char('v') | KeyCode::Char('V') => {
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::Compact(idx)
         }
@@ -1041,7 +1043,7 @@ pub fn render_footer(
         spans.extend(hint("", "i", "nfo  ", true));
         spans.extend(hint("", "d", "octor  ", local_only));
         spans.extend(hint("rei", "n", "dex  ", local_only));
-        spans.extend(hint("", "C", "ompact  ", local_only));
+        spans.extend(hint("", "v", "acuum  ", local_only));
         spans.extend(hint("", "r", "emove  ", local_only));
         spans.extend(hint("re", "l", "oad  ", true));
         spans.extend(hint("", "␣", " collapse  ", true));
