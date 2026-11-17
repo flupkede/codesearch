@@ -203,6 +203,59 @@ fn classify_symbol_rebuild_event(path: &Path) -> SymbolRebuildTrigger {
     }
 }
 
+/// A git replacement (delete+create of one path) can split across two raw
+/// debounce batches, and the recreate event itself may never reach the
+/// watcher — the removal then lands while the file is back on disk and no
+/// later flush carries it, leaving a permanent hole in the index (todo
+/// #277). Called after each flush: removed paths that still exist are
+/// re-queued so the next flush re-indexes them, and the symbol debounces
+/// get the same promotion the Modified arm would have given them —
+/// debounce timers included: a gate reading `{non-empty set, None timer}`
+/// would strand the requeued path forever once its debounce already ran.
+#[allow(clippy::too_many_arguments)]
+fn requeue_recreated_removals(
+    removed: &[PathBuf],
+    now: std::time::Instant,
+    files_to_index: &mut HashSet<PathBuf>,
+    files_to_remove: &mut HashSet<PathBuf>,
+    cs_files_modified: &mut HashSet<PathBuf>,
+    cs_files_deleted: &mut HashSet<PathBuf>,
+    cs_last_event_time: &mut Option<std::time::Instant>,
+    ts_files_modified: &mut HashSet<PathBuf>,
+    ts_files_deleted: &mut HashSet<PathBuf>,
+    ts_last_event_time: &mut Option<std::time::Instant>,
+    restore_inputs_changed: &mut bool,
+    restore_input_last_event_time: &mut Option<std::time::Instant>,
+) -> usize {
+    let mut requeued = 0;
+    for path in removed {
+        if !path.exists() {
+            continue;
+        }
+        files_to_remove.remove(path);
+        files_to_index.insert(path.clone());
+        match classify_symbol_rebuild_event(path) {
+            SymbolRebuildTrigger::CSharpIncremental => {
+                cs_files_deleted.remove(path);
+                cs_files_modified.insert(path.clone());
+                *cs_last_event_time = Some(now);
+            }
+            SymbolRebuildTrigger::CSharpRestoreInput => {
+                *restore_inputs_changed = true;
+                *restore_input_last_event_time = Some(now);
+            }
+            SymbolRebuildTrigger::TypeScript => {
+                ts_files_deleted.remove(path);
+                ts_files_modified.insert(path.clone());
+                *ts_last_event_time = Some(now);
+            }
+            SymbolRebuildTrigger::None => {}
+        }
+        requeued += 1;
+    }
+    requeued
+}
+
 /// The FULL kind a pending full rebuild carries. `Branch` is the superset
 /// (rebuilds every applicable language); a restore-input change only
 /// invalidates C# restore state. Upgrades are monotone: a pending `Branch`
@@ -2262,6 +2315,9 @@ impl IndexManager {
                     // Flush the buffer
                     let to_index: Vec<PathBuf> = files_to_index.drain().collect();
                     let to_remove: Vec<PathBuf> = files_to_remove.drain().collect();
+                    // The batch consumes the removals; the snapshot feeds the
+                    // recreated-path reconciliation afterwards (todo #277).
+                    let removed_snapshot = to_remove.clone();
 
                     info!(
                         "📦 [{}] Flushing batch: {} to index, {} to remove",
@@ -2294,6 +2350,30 @@ impl IndexManager {
                     // Clear "Indexing" regardless of outcome.
                     if let Some(ref cb) = indexing_cb {
                         cb(false);
+                    }
+
+                    // A removal that raced a recreation must not drop the
+                    // file permanently (todo #277): re-queue what is back
+                    // on disk so the next flush re-indexes it.
+                    let requeued = requeue_recreated_removals(
+                        &removed_snapshot,
+                        now,
+                        &mut files_to_index,
+                        &mut files_to_remove,
+                        &mut cs_files_modified,
+                        &mut cs_files_deleted,
+                        &mut cs_last_event_time,
+                        &mut ts_files_modified,
+                        &mut ts_files_deleted,
+                        &mut ts_last_event_time,
+                        &mut restore_inputs_changed,
+                        &mut restore_input_last_event_time,
+                    );
+                    if requeued > 0 {
+                        debug!(
+                            "♻️ [{}] {} removed path(s) recreated mid-flush, re-queued",
+                            repo_label, requeued
+                        );
                     }
 
                     // Reset timer
@@ -3201,6 +3281,109 @@ mod tests {
                 "path: {path}"
             );
         }
+    }
+
+    /// #277: a removal that raced a recreation re-queues only what is
+    /// back on disk — the recreated path flips to to-index with its .cs
+    /// deletion cancelled, a genuinely deleted path stays queued for
+    /// removal and must not resurrect.
+    #[test]
+    fn requeue_recreated_removals_promotes_existing_and_cancels_deletion() {
+        let temp = tempdir().unwrap();
+        let alive = temp.path().join("Alive.cs");
+        let gone = temp.path().join("Gone.rs");
+        std::fs::write(&alive, "class Alive {}").unwrap();
+
+        let mut files_to_index = HashSet::new();
+        let mut files_to_remove: HashSet<PathBuf> =
+            [alive.clone(), gone.clone()].into_iter().collect();
+        let mut cs_modified = HashSet::new();
+        let mut cs_deleted: HashSet<PathBuf> = [alive.clone()].into_iter().collect();
+        let mut cs_last_event_time = None;
+        let mut ts_modified = HashSet::new();
+        let mut ts_deleted = HashSet::new();
+        let mut ts_last_event_time = None;
+        let mut restore_inputs_changed = false;
+        let mut restore_input_last_event_time = None;
+
+        let now = std::time::Instant::now();
+        let requeued = requeue_recreated_removals(
+            &[alive.clone(), gone.clone()],
+            now,
+            &mut files_to_index,
+            &mut files_to_remove,
+            &mut cs_modified,
+            &mut cs_deleted,
+            &mut cs_last_event_time,
+            &mut ts_modified,
+            &mut ts_deleted,
+            &mut ts_last_event_time,
+            &mut restore_inputs_changed,
+            &mut restore_input_last_event_time,
+        );
+
+        assert_eq!(requeued, 1);
+        assert!(files_to_index.contains(&alive));
+        assert!(!files_to_remove.contains(&alive));
+        assert!(cs_modified.contains(&alive));
+        assert!(!cs_deleted.contains(&alive));
+        // Timer reset like the Modified arm, else the debounce gate reads
+        // {non-empty set, None timer} and strands the path forever.
+        assert_eq!(cs_last_event_time, Some(now));
+        assert!(!restore_inputs_changed);
+        // Genuinely deleted: stays queued, never resurrected.
+        assert!(files_to_remove.contains(&gone));
+        assert!(!files_to_index.contains(&gone));
+    }
+
+    /// The recreated-path promotion classifies like the Modified arm:
+    /// a .ts file feeds the TypeScript debounce, a restore input raises
+    /// the FULL-rebuild flag.
+    #[test]
+    fn requeue_recreated_removals_classifies_ts_and_restore_inputs() {
+        let temp = tempdir().unwrap();
+        let ts_file = temp.path().join("app.ts");
+        let restore_file = temp.path().join("Directory.Packages.props");
+        std::fs::write(&ts_file, "export const x = 1;").unwrap();
+        std::fs::write(&restore_file, "<Project />").unwrap();
+
+        let mut files_to_index = HashSet::new();
+        let mut files_to_remove: HashSet<PathBuf> = [ts_file.clone(), restore_file.clone()]
+            .into_iter()
+            .collect();
+        let mut cs_modified = HashSet::new();
+        let mut cs_deleted = HashSet::new();
+        let mut cs_last_event_time = None;
+        let mut ts_modified = HashSet::new();
+        let mut ts_deleted: HashSet<PathBuf> = [ts_file.clone()].into_iter().collect();
+        let mut ts_last_event_time = None;
+        let mut restore_inputs_changed = false;
+        let mut restore_input_last_event_time = None;
+
+        let now = std::time::Instant::now();
+        let requeued = requeue_recreated_removals(
+            &[ts_file.clone(), restore_file.clone()],
+            now,
+            &mut files_to_index,
+            &mut files_to_remove,
+            &mut cs_modified,
+            &mut cs_deleted,
+            &mut cs_last_event_time,
+            &mut ts_modified,
+            &mut ts_deleted,
+            &mut ts_last_event_time,
+            &mut restore_inputs_changed,
+            &mut restore_input_last_event_time,
+        );
+
+        assert_eq!(requeued, 2);
+        assert!(ts_modified.contains(&ts_file));
+        assert!(!ts_deleted.contains(&ts_file));
+        assert_eq!(ts_last_event_time, Some(now));
+        assert_eq!(restore_input_last_event_time, Some(now));
+        assert!(restore_inputs_changed);
+        assert!(cs_modified.is_empty());
+        assert_eq!(cs_last_event_time, None);
     }
 
     /// The text quiet gate: default 5 s, a valid env override wins, an
