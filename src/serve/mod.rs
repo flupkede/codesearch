@@ -569,7 +569,7 @@ impl ServeState {
             .await
             .map_err(|_| {
                 format!(
-                    "Repository '{}' is still being opened (waited {}s) — retry shortly",
+                    "Repository '{}' is still being opened (waited {}s) — retry shortly (startup symbol rebuilds may be saturating the machine; CSHARP_SCIP_CONCURRENCY or CODESEARCH_PHASE2_SYMBOL_REBUILD=0 relieves this)",
                     alias,
                     wait.as_secs()
                 )
@@ -1356,6 +1356,31 @@ impl ServeState {
             .as_millis() as u64
     }
 
+    /// How long the phase-2 wave must still park before starting its next
+    /// compile, given the most recent real tool call. `None` = go ahead.
+    ///
+    /// Foreground priority (card #291): a search on a not-yet-opened repo
+    /// must win against the wave — with every core busy compiling, its 20s
+    /// open deadline expires before the open finishes. Parks until the
+    /// machine has seen no genuine tool call for 30s (`most_recent_tool_call`
+    /// ignores health probes and keep-warm pings, so only real queries gate
+    /// the wave).
+    fn foreground_park_remaining(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        const QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+        self.most_recent_tool_call().and_then(|last| {
+            let quiet_for = now.checked_duration_since(last).unwrap_or_default();
+            Some(QUIET_WINDOW.saturating_sub(quiet_for)).filter(|w| !w.is_zero())
+        })
+    }
+
+    /// Park until [`Self::foreground_park_remaining`] reports quiet.
+    async fn wait_for_foreground_quiet(&self) {
+        const POLL: std::time::Duration = std::time::Duration::from_secs(5);
+        while let Some(wait) = self.foreground_park_remaining(std::time::Instant::now()) {
+            tokio::time::sleep(wait.min(POLL)).await;
+        }
+    }
+
     /// Read CSHARP_SCIP_CONCURRENCY from env, default
     /// `CSHARP_SCIP_CONCURRENCY_DEFAULT` (currently 2), clamped to [1, 4].
     fn csharp_scip_concurrency() -> usize {
@@ -1904,8 +1929,37 @@ impl ServeState {
     /// installed languages, sorted by recency. C# keeps its dedicated gate
     /// (`evaluate_csharp_rebuild`); other languages rebuild only a missing
     /// index (no-thrash: drift is watcher/branch-change driven).
+    ///
+    /// Honours the same warmup age gate as phase 1: a repo the age gate
+    /// deliberately left unopened is not eagerly rebuilt either — each full
+    /// C# rebuild compiles a whole solution, and a registry of stale repos
+    /// turned every serve start into a compile storm that starved opens and
+    /// searches (card #291). Stale repos converge via watcher/branch-change
+    /// or an explicit reindex instead.
     pub(crate) async fn run_phase_2_symbols(self: &Arc<Self>) {
-        let aliases = self.aliases();
+        if !Self::phase2_symbol_rebuild_enabled() {
+            info!(
+                "phase-2: disabled via {}=0 — rebuilds deferred to watcher/branch/explicit paths",
+                crate::constants::PHASE2_SYMBOL_REBUILD_ENV
+            );
+            return;
+        }
+        let mut aliases = self.aliases();
+        let max_age_days = Self::warmup_max_age_days();
+        if max_age_days > 0 {
+            let access = self.load_access_times();
+            let now_ms = Self::unix_now_ms();
+            let (fresh, skipped) = Self::warmup_partition(aliases, &access, now_ms, max_age_days);
+            if !skipped.is_empty() {
+                info!(
+                    "phase-2: skipping {} repo(s) unused for more than {} day(s) — same age gate as phase-1: {}",
+                    skipped.len(),
+                    max_age_days,
+                    skipped.join(", ")
+                );
+            }
+            aliases = fresh;
+        }
         let langs = self.symbol_registry.installed_languages();
         // (alias, lang, last_changed)
         let mut candidates: Vec<(String, String, i64)> = Vec::new();
@@ -2042,6 +2096,19 @@ impl ServeState {
                     return;
                 }
                 let db_path = path.join(DB_DIR_NAME);
+                // Foreground priority (card #291): never start a compile
+                // while real queries are flowing — park until quiet, then
+                // take the slot.
+                if state
+                    .foreground_park_remaining(std::time::Instant::now())
+                    .is_some()
+                {
+                    info!(
+                        "phase-2: '{}' ({}) parked — foreground queries active",
+                        alias, lang
+                    );
+                    state.wait_for_foreground_quiet().await;
+                }
                 trigger_symbol_rebuild(&alias, &path, &db_path, &state, &lang).await;
                 drop(permit);
             }));
@@ -3358,9 +3425,36 @@ impl ServeState {
         // "Index not built" until the background refresh completes.
         // build_index() is CPU-heavy — offload to the blocking pool so the async
         // runtime is not stalled while building the HNSW index for large repos.
-        // The open itself is part of a heavy job: hold a process-wide permit.
-        let _job_permit = stores.acquire_job_permit().await;
-        {
+        //
+        // Foreground priority (card #291): the open must not queue behind a
+        // heavy job holding the single slot. Probe BEFORE acquiring the
+        // permit and take it only when an HNSW build is actually required —
+        // a search on an unopened repo answers from the persisted graph
+        // without touching the job gate. When a build is needed the permit
+        // is still held across it; the in-permit re-check below keeps that
+        // race-free.
+        let needs_build = {
+            let vector_store = Arc::clone(&stores.vector_store);
+            match tokio::task::spawn_blocking(move || {
+                let vstore = vector_store.blocking_read();
+                vstore.index_health()
+            })
+            .await
+            {
+                Ok(Ok((total_chunks, false))) if total_chunks > 0 => true,
+                Ok(_) => false,
+                Err(e) => {
+                    warn!("Could not read index health for '{}': {:#}", alias, e);
+                    false
+                }
+            }
+        };
+        let _job_permit = if needs_build {
+            Some(stores.acquire_job_permit().await)
+        } else {
+            None
+        };
+        if needs_build {
             let vector_store = Arc::clone(&stores.vector_store);
             let alias_owned = alias.to_string();
             match tokio::task::spawn_blocking(move || {
@@ -3989,6 +4083,13 @@ impl ServeState {
                 .get(alias)
                 .is_some_and(|ts| now_ms.saturating_sub(*ts) <= cutoff_ms)
         })
+    }
+
+    /// Effective phase-2 enablement (`0` = off). Only an exact `0` disables;
+    /// anything else (unset, any other value) keeps phase-2 on — an
+    /// opt-out, not a numeric gate, so no typo warning applies.
+    fn phase2_symbol_rebuild_enabled() -> bool {
+        std::env::var(crate::constants::PHASE2_SYMBOL_REBUILD_ENV).as_deref() != Ok("0")
     }
 
     /// Effective warmup max age in days (`0` = gate off). An unparsable

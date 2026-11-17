@@ -703,7 +703,8 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_HOME` | Relocate the entire global root (`repos.json`, models cache, logs, `serve_url`, global ignore/extension files) away from `~/.codesearch`. Must be an absolute path; unset = `~/.codesearch`. Per-file overrides like `CODESEARCH_REPOS_CONFIG` still win |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
-| `CODESEARCH_WARMUP_MAX_AGE_DAYS` | Repos not used within this many days are not opened by the serve's startup warmup — they lazy-open on the first tool call that names them. `0` disables the gate and warms every registered repo (default: 5). Bounds the resident mapped-index footprint on machines with many registered repos |
+| `CODESEARCH_WARMUP_MAX_AGE_DAYS` | Repos not used within this many days are not opened by the serve's startup warmup — they lazy-open on the first tool call that names them. `0` disables the gate and warms every registered repo (default: 5). Bounds the resident mapped-index footprint on machines with many registered repos. The same gate skips the phase-2 startup symbol rebuilds for unused repos — they converge via watcher/branch changes or an explicit reindex instead, and the rebuild wave parks while foreground queries are active (a search on an unopened repo has priority; cold opens only take the process-wide job permit when an HNSW build is actually needed) |
+| `CODESEARCH_PHASE2_SYMBOL_REBUILD` | `0` skips the phase-2 startup symbol-rebuild pass entirely (rebuilds defer to the watcher, branch changes, or an explicit reindex). Useful when a registry of stale C# repos must not trigger solution-wide scip-csharp compiles right after boot |
 | `CODESEARCH_COMPACT_INTERVAL_DAYS` | Idle-reaper auto-compact cadence: a repo evicted after being idle longer than this is compacted (LMDB `data.mdb` rewritten live-pages-only, freelist dead pages dropped — `last_compact_unix_ms` in its metadata.json tracks the run). `0` disables auto-compaction; `codesearch index compact <alias>` always works (default: 5, settle delay 30 s after eviction) |
 | `CODESEARCH_STORE_LOCK_WAIT_SECS` | Bounded wait for a store's write lock before a single-project query reports the store busy (default: 300). Multi-repo fan-outs never wait — they skip the busy repo with a warning |
 | `CODESEARCH_MODEL_LOAD_TIMEOUT_SECS` | Bound on a cold-cache embedding-model load (default: 600). On expiry the loader fails fast with a hint to pre-populate the cache via `codesearch setup`; search itself only uses models already loaded or provably on disk |
@@ -768,7 +769,8 @@ Environment=CODESEARCH_INCREMENTAL_BATCH_SIZE=100
 Environment=CODESEARCH_MAX_CHUNKS_PER_BATCH=5000
 Environment=CODESEARCH_EMBED_PAUSE_MS=25
 Environment=CODESEARCH_MIN_FREE_MB=4096
-# C# SCIP helpers are bounded separately; lower it for the same reason.
+# C# SCIP helpers are bounded separately; the default is now 1 —
+# an explicit 2+ opts back into concurrent solution compiles.
 Environment=CSHARP_SCIP_CONCURRENCY=1
 ```
 
