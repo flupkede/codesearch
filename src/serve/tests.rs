@@ -4357,6 +4357,11 @@ fn dummy_csharp_helper(root: &std::path::Path) -> crate::testing::EnvRestore {
 #[tokio::test]
 #[serial]
 async fn run_phase_2_symbols_wires_candidate_through_to_trigger() {
+    // Gate off: this test pins the gate→queue→trigger COMPOSITION, not the
+    // age gate — a fresh fixture repo has no sidecar entry and would be
+    // skipped as stale.
+    let _age_off =
+        crate::testing::EnvRestore::set(&[(crate::constants::WARMUP_MAX_AGE_DAYS_ENV, "0")]);
     let helper_root = tempfile::tempdir().unwrap();
     let _env = dummy_csharp_helper(helper_root.path());
 
@@ -4382,6 +4387,125 @@ async fn run_phase_2_symbols_wires_candidate_through_to_trigger() {
     assert!(
         state.symbol_rebuild_in_flight.is_empty(),
         "the claim must be released after the failed rebuild"
+    );
+}
+
+/// The phase-2 age gate mirrors phase-1: a repo with no persisted use is
+/// treated as older than any age and must NOT be eagerly rebuilt at startup —
+/// the whole compile-storm fix. Proof: on the pre-fix code this exact setup
+/// queued the rebuild (status Error via the dummy helper).
+#[tokio::test]
+#[serial]
+async fn run_phase_2_symbols_age_gate_skips_unused_repo() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("phase2gated");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    // Default age gate (5 days) ON — no sidecar entry for this repo.
+    state.run_phase_2_symbols().await;
+
+    assert_eq!(
+        state
+            .csharp_index_status
+            .get("phase2gated")
+            .map(|e| *e.value()),
+        None,
+        "an unused repo must not be eagerly rebuilt by phase-2 (same \
+         age gate as phase-1); Error would mean the rebuild fired"
+    );
+}
+
+/// `CODESEARCH_PHASE2_SYMBOL_REBUILD=0` skips phase-2 entirely — even a repo
+/// the age gate would pass must not be queued while the switch is off.
+#[tokio::test]
+#[serial]
+async fn run_phase_2_symbols_kill_switch_disables_the_pass() {
+    let _switch =
+        crate::testing::EnvRestore::set(&[(crate::constants::PHASE2_SYMBOL_REBUILD_ENV, "0")]);
+    let _age_off =
+        crate::testing::EnvRestore::set(&[(crate::constants::WARMUP_MAX_AGE_DAYS_ENV, "0")]);
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("phase2killed");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    state.run_phase_2_symbols().await;
+
+    assert_eq!(
+        state
+            .csharp_index_status
+            .get("phase2killed")
+            .map(|e| *e.value()),
+        None,
+        "the kill switch must skip phase-2 even for an in-gate repo"
+    );
+}
+
+/// One solution compile at a time by default: two concurrent scip-csharp
+/// runs starved interactive opens/searches during the redemption wave.
+#[test]
+fn csharp_scip_concurrency_defaults_to_one() {
+    assert_eq!(
+        crate::constants::CSHARP_SCIP_CONCURRENCY_DEFAULT,
+        1,
+        "default concurrency must be 1 — two solution compiles at once \
+         starve opens and searches (card #291)"
+    );
+}
+
+/// Foreground priority (card #291): the phase-2 wave parks while real
+/// queries flow. Pure decision — a recent tool call asks for the remaining
+/// quiet-window wait; a stale one (or none) lets the wave run.
+#[test]
+fn foreground_park_remaining_parks_only_on_recent_tool_calls() {
+    let (_tmp, _path, bare) = state_with_repo("fgpark");
+    let state = std::sync::Arc::new(bare);
+    let now = std::time::Instant::now();
+
+    // No tool call at all: the wave runs immediately.
+    assert_eq!(state.foreground_park_remaining(now), None);
+
+    // A fresh real query parks the wave for ~the quiet window.
+    state.last_tool_call.insert(
+        "fgpark".to_string(),
+        (
+            "search".to_string(),
+            now - std::time::Duration::from_secs(1),
+        ),
+    );
+    let park = state
+        .foreground_park_remaining(now)
+        .expect("a 1s-old query must park the wave");
+    assert!(
+        park >= std::time::Duration::from_secs(28) && park <= std::time::Duration::from_secs(30),
+        "a 1s-old query leaves ~29s of the 30s window, got {park:?}"
+    );
+
+    // A query older than the window: quiet, the wave resumes.
+    state.last_tool_call.insert(
+        "fgpark".to_string(),
+        (
+            "search".to_string(),
+            now - std::time::Duration::from_secs(60),
+        ),
+    );
+    assert_eq!(
+        state.foreground_park_remaining(now),
+        None,
+        "a 60s-old query is past the quiet window — the wave resumes"
     );
 }
 

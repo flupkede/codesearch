@@ -520,6 +520,14 @@ pub const DEFAULT_WARMUP_MAX_AGE_DAYS: u64 = 5;
 /// Environment variable to override the warmup max age (in days; 0 = off).
 pub const WARMUP_MAX_AGE_DAYS_ENV: &str = "CODESEARCH_WARMUP_MAX_AGE_DAYS";
 
+/// Set to `0` to skip the phase-2 startup symbol-rebuild pass entirely.
+/// Phase-2 compiles whole solutions (scip-csharp), and a registry of stale
+/// C# repos can saturate the machine for a long window right after boot —
+/// with the warmup age gate skipping their phase-1 open, an eager phase-2
+/// turned every serve start into a compile storm. `0` defers all rebuilds
+/// to the watcher/branch-change/explicit paths.
+pub const PHASE2_SYMBOL_REBUILD_ENV: &str = "CODESEARCH_PHASE2_SYMBOL_REBUILD";
+
 /// Idle-reaper auto-compact cadence: an evicted repo whose
 /// `last_compact_unix_ms` (metadata.json) is older is compacted right after
 /// eviction. `0` disables auto-compaction (manual `index compact` still
@@ -957,8 +965,10 @@ pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";
 
 /// Default value for `CSHARP_SCIP_CONCURRENCY` when the env var is unset
 /// or unparseable. Clamped to `[1, 4]` at the call site, so this default
-/// is also expected to live within that range.
-pub const CSHARP_SCIP_CONCURRENCY_DEFAULT: usize = 2;
+/// is also expected to live within that range. 1 (not 2): each slot compiles
+/// a whole solution; two at once starved interactive opens/searches during
+/// the phase-2 redemption wave (card #291).
+pub const CSHARP_SCIP_CONCURRENCY_DEFAULT: usize = 1;
 
 /// Maximum number of changed files chunked + embedded in a single in-memory
 /// batch during `IndexManager::perform_incremental_refresh_with_stores`.
