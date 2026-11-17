@@ -477,7 +477,7 @@ This starts a background HTTP server with:
 | `i` | Show info overlay (chunks, files, model, DB size) |
 | `d` | Run doctor diagnostics on selected repo |
 | `n` | Force reindex selected repo |
-| `v` | Vacuum selected repo's LMDB index (compact; frees dead pages — see `codesearch index compact`) |
+| `c` | Compact selected repo's LMDB index (frees dead pages; see `codesearch index compact`) |
 | `r` | Remove selected repo (with confirmation dialog) |
 | `l` | Reload repos config from disk |
 | `q` | Quit serve |

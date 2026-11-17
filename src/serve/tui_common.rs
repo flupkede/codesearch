@@ -121,8 +121,8 @@ pub enum KeyAction {
     RunDoctor(usize),
     /// User pressed `n` — force reindex repo at given index.
     ForceReindex(usize),
-    /// User pressed `v`/`V` — compact repo's LMDB index at given index
-    /// (frees dead pages; "vacuum").
+    /// User pressed `c` — compact repo's LMDB index at given index
+    /// (frees dead pages).
     Compact(usize),
     /// User pressed `r` — request removal of repo at given index (shows confirmation).
     RequestRemove(usize),
@@ -280,9 +280,9 @@ pub fn handle_key(
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::ForceReindex(idx)
         }
-        // `v` (VACUUM) — lowercase like every other key; `V` accepted as a
-        // courtesy so the action never depends on remembering a case rule.
-        KeyCode::Char('v') | KeyCode::Char('V') => {
+        // `c` — compact, lowercase like every other key. (`v`/`V` stay
+        // accepted as a courtesy for the VACUUM-era muscle memory.)
+        KeyCode::Char('c') | KeyCode::Char('v') | KeyCode::Char('V') => {
             let idx = table_state.selected().unwrap_or(0);
             KeyAction::Compact(idx)
         }
@@ -1043,7 +1043,7 @@ pub fn render_footer(
         spans.extend(hint("", "i", "nfo  ", true));
         spans.extend(hint("", "d", "octor  ", local_only));
         spans.extend(hint("rei", "n", "dex  ", local_only));
-        spans.extend(hint("", "v", "acuum  ", local_only));
+        spans.extend(hint("", "c", "ompact  ", local_only));
         spans.extend(hint("", "r", "emove  ", local_only));
         spans.extend(hint("re", "l", "oad  ", true));
         spans.extend(hint("", "␣", " collapse  ", true));
@@ -1952,6 +1952,20 @@ mod tests {
         // Empty table: no selection to toggle.
         let mut ts = TableState::default();
         assert!(matches!(handle_key(key, &mut ts, 0, 5), KeyAction::None));
+    }
+
+    #[test]
+    fn handle_key_compact_maps_lowercase_c_and_keeps_v_as_courtesy() {
+        use crossterm::event::KeyModifiers;
+        for ch in ['c', 'v', 'V'] {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty());
+            let mut ts = TableState::default();
+            ts.select(Some(2));
+            assert!(
+                matches!(handle_key(key, &mut ts, 10, 5), KeyAction::Compact(2)),
+                "`{ch}` must trigger Compact"
+            );
+        }
     }
 
     #[test]
