@@ -324,6 +324,44 @@ pub fn close_shared_envs_under(path: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// Close every cached shared environment whose directory no longer exists;
+/// returns the canonical paths whose cache entries were removed.
+///
+/// A repo tree deleted WITHOUT an unregister (a git worktree removed while
+/// the hub runs) leaves its env in the strong cache forever:
+/// [`close_shared_envs_under`] cannot release it, because it canonicalizes
+/// the caller's path and `safe_canonicalize` fails once the tree is gone.
+/// The env keeps `data.mdb`/`lock.mdb` locked for the process lifetime, so
+/// nobody can finish deleting the leftover tree (`wt remove`, a later
+/// `remove_dir_all`). An env whose directory is gone can never serve another
+/// query — the data files ARE its storage — so releasing it is pure garbage
+/// collection. Runs on every reconcile pass (startup + status refresh)
+/// before the leftover DB-dir delete that needs the locks gone.
+///
+/// A path deleted and recreated between two sweeps reads as vanished and
+/// gets its env closed; the next query opens a fresh env on the recreated
+/// files (worst case: a stale index until the next reindex — the tree was
+/// deleted, so its metadata is gone anyway).
+pub fn close_vanished_shared_envs() -> Vec<PathBuf> {
+    let Some(cache) = SHARED_ENVS.get() else {
+        return Vec::new();
+    };
+    let mut released: Vec<(PathBuf, Arc<TrackedEnv>)> = Vec::new();
+    cache.retain(|key, env| {
+        if key.exists() {
+            true
+        } else {
+            released.push((key.clone(), Arc::clone(env)));
+            false
+        }
+    });
+    let paths: Vec<PathBuf> = released.iter().map(|(p, _)| p.clone()).collect();
+    // Drop the removed Arcs AFTER `retain` returns so `TrackedEnv::drop`'s
+    // env-close path never runs while a cache shard lock is held.
+    drop(released);
+    paths
+}
+
 // ── TrackedEnv wrapper ──────────────────────────────────────────
 
 /// Wrapper around [`heed::Env`] that prevents double-open panics.
@@ -686,6 +724,78 @@ mod tests {
             "explicit close must run mdb_env_close (heed registry drains)"
         );
         std::fs::remove_dir_all(&db_path).expect("dir deletable after explicit close");
+    }
+
+    /// The reconcile-time GC: a shared env whose directory vanished (a
+    /// worktree tree deleted on POSIX, or a stale cache entry whose path is
+    /// gone) must be released by [`close_vanished_shared_envs`] — the strong
+    /// cache would otherwise pin the env for the process lifetime, and
+    /// [`close_shared_envs_under`] cannot help because `safe_canonicalize`
+    /// fails on the vanished path. A LIVE sibling env must survive the sweep
+    /// untouched.
+    ///
+    /// Windows cannot REACH the vanished state while the env lives — the
+    /// open `data.mdb`/`lock.mdb` keep the directory chain alive, so a
+    /// removal stops at the locked files and the key still exists (that
+    /// leftover is the shell state the serve reconcile handles via
+    /// unregister + `close_shared_envs_under`, which CAN canonicalize an
+    /// existing path). This test pins per platform what is real there.
+    #[test]
+    fn vanished_shared_env_sweep_releases_deleted_dirs_and_spares_live_ones() {
+        let dir = TempDir::new().unwrap();
+        let tree = dir.path().join("worktree");
+        let db_path = tree.join("db");
+        std::fs::create_dir_all(&db_path).unwrap();
+        let alive_dir = dir.path().join("alive");
+        std::fs::create_dir(&alive_dir).unwrap();
+        let heed_key = safe_canonicalize(&db_path).unwrap();
+
+        let alive = get_or_open_shared_env(&alive_dir, "alive-1", shared_opts, |_| Ok(())).unwrap();
+        let gone = get_or_open_shared_env(&db_path, "gone-1", shared_opts, |_| Ok(())).unwrap();
+        drop(gone);
+
+        #[cfg(target_os = "windows")]
+        {
+            // The removal stops at the locked env files: the tree survives,
+            // the sweep must SPARE it, and the lock must still be held.
+            assert!(
+                std::fs::remove_dir_all(&tree).is_err(),
+                "the cache-only env must keep the leftover tree locked"
+            );
+            let swept = close_vanished_shared_envs();
+            assert!(
+                !swept.contains(&heed_key),
+                "a still-existing env directory must not be swept, got {:?}",
+                swept
+            );
+            assert!(
+                heed::env_closing_event(&heed_key).is_some(),
+                "the spared env must still be open"
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::fs::remove_dir_all(&tree).unwrap();
+            let swept = close_vanished_shared_envs();
+            assert!(
+                swept.contains(&heed_key),
+                "the vanished env must be swept, got {:?}",
+                swept
+            );
+            assert!(
+                heed::env_closing_event(&heed_key).is_none(),
+                "the sweep must really close the env (heed registry drains)"
+            );
+        }
+
+        // A live sibling env survives the sweep: the same instance is handed
+        // out again.
+        let alive2 =
+            get_or_open_shared_env(&alive_dir, "alive-2", shared_opts, |_| Ok(())).unwrap();
+        assert!(
+            Arc::ptr_eq(&alive, &alive2),
+            "the sweep must not touch envs whose directory still exists"
+        );
     }
 
     /// An `init` failure must not leak the registry slot: the error propagates

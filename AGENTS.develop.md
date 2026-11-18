@@ -237,12 +237,13 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|
-
-------|
+| `fix/lmdb-vanished-path-env-locks` | Reconcile reclaims worktree leftover shells; shared envs of vanished paths released |
 
 ---
 
 ## Changelog highlights (recent)
+
+- **Pending** — leftover worktree shells self-heal: a directory reduced to nothing but its `.codesearch.db` (a removal stopped at the LMDB files the hub held) is unregistered, its shared LMDB envs released and the leftover deleted on the next reconcile pass, instead of locking `scip/data.mdb`/`lock.mdb` until serve restart.
 
 - **Pending** — temp-dir checkouts stop polluting the global repos.json: the post-checkout hook block skips TEMP-rooted checkouts (8.3 short-form matched via cygpath), POST /repos refuses them (force=true escape), and reconcile drops registrations whose temp path is gone.
 

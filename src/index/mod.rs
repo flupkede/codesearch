@@ -1622,8 +1622,12 @@ pub async fn prune_index() -> Result<()> {
     for (alias, path) in &relocated {
         println!("📍 relocated '{}' → {}", alias, path.display());
     }
-    for alias in &removed {
-        println!("🗑️  removed stale entry '{}'", alias);
+    for (alias, path) in &removed {
+        println!(
+            "🗑️  removed stale entry '{}' (last seen at {})",
+            alias,
+            path.display()
+        );
     }
     println!(
         "✅ Prune complete: {} relocated, {} removed.",

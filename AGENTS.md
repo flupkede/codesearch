@@ -320,9 +320,17 @@ entry, and `close_shared_envs_under` cannot release it because
 - D3 — `reconcile_all_paths` runs the sweep per pass and deletes the leftover
   `.codesearch.db` via the existing `remove_orphaned_db_dir`; fix the
   "nothing left to delete" comment (false while the env was cached).
-- Tests: registry sweep test; prune_stale shape; extend
-  `reconcile_all_paths_unregisters_vanished_repos` with a real shared env
-  under the vanished tree + leftover-dir deletion assert.
+- D4 (added during analysis) — on Windows the vanished state is unreachable
+  while the env lives: the locked files keep the directory chain alive, so
+  the path remains as a shell containing only `.codesearch.db`. Reconcile
+  therefore also reclaims shells: `is_db_only_shell` + `is_indexing` guard
+  (in-flight builds create their db dir early and must not read as stale),
+  then unregister + evict + `close_shared_envs_under` (canonicalizes fine on
+  an existing path) + `remove_orphaned_db_dir` + empty-parent removal.
+- Tests: registry sweep test; prune_stale shape; new
+  `reconcile_reclaims_a_db_only_leftover_shell` (real stores + shared scip
+  env inside the tree, leftover-dir deletion asserts); extended
+  `reconcile_all_paths_unregisters_vanished_repos`.
 - Explicitly out of scope: idle-eviction env caching (documented trade-off,
   the Windows handle-leak fix).
 - Validation: `cargo check` → `cargo clippy --all-targets -- -D warnings` →
