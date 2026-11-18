@@ -237,7 +237,6 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 | Branch | Description |
 |---|
-| `fix/lmdb-vanished-path-env-locks` | Reconcile reclaims worktree leftover shells; shared envs of vanished paths released |
 
 ---
 
