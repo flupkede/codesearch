@@ -164,6 +164,10 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize)]
 struct LegacyReposConfig(HashMap<String, serde_json::Value>);
 
+/// One reconciled registry entry: `(alias, path)` — the NEW path after a
+/// relocation, the STALE path after a removal.
+pub type ReconciledEntry = (String, PathBuf);
+
 impl ReposConfig {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
@@ -1352,14 +1356,19 @@ impl ReposConfig {
     /// **Note:** this method performs disk I/O (filesystem traversal, git
     /// subprocess) via [`Self::relocate_missing`]. No logging is emitted.
     ///
-    /// Returns `(relocated, removed)`.
+    /// Returns `(relocated, removed)`. Both entries are `(alias, path)`
+    /// pairs: a relocation's NEW path, a removal's STALE path — callers need
+    /// it to release or delete what lived there (the LMDB env handles and the
+    /// leftover `.codesearch.db`).
     #[must_use]
-    pub fn prune_stale(&mut self) -> (Vec<(String, PathBuf)>, Vec<String>) {
+    pub fn prune_stale(&mut self) -> (Vec<ReconciledEntry>, Vec<ReconciledEntry>) {
         let (relocated, unresolved) = self.relocate_missing();
         let mut removed = Vec::new();
         for alias in unresolved {
-            if self.unregister_alias(&alias) {
-                removed.push(alias);
+            if let Some(path) = self.repos.get(&alias).cloned() {
+                if self.unregister_alias(&alias) {
+                    removed.push((alias, path));
+                }
             }
         }
         (relocated, removed)

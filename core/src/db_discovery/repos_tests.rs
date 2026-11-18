@@ -413,7 +413,11 @@ fn prune_stale_removes_unrelocatable_entries() {
 
     let (relocated, removed) = cfg.prune_stale();
     assert!(relocated.is_empty());
-    assert_eq!(removed, vec![alias.clone()]);
+    // Removed entries carry the stale path so callers can release/delete
+    // what lived there (LMDB env handles, leftover .codesearch.db).
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].0, alias.clone());
+    assert_eq!(canon_norm(&removed[0].1), canon_norm(&plain));
     assert!(!cfg.repos.contains_key(&alias));
     // unregister_alias also cleans group membership.
     assert!(!cfg.groups.contains_key("g"));

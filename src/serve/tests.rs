@@ -1815,6 +1815,90 @@ fn reconcile_all_paths_unregisters_vanished_repos() {
     );
 }
 
+/// The reported worktree blocker: `wt remove` (or any recursive delete) stops
+/// at the LMDB files a live hub still holds, leaving a directory whose only
+/// content is `.codesearch.db`. The path "exists", so the prune-based stale
+/// check kept the alias — and the shared SCIP env in the strong cache kept
+/// `scip/data.mdb`/`lock.mdb` locked for the whole serve lifetime (pid-level
+/// os error 32 on every later delete attempt). Reconcile must reclaim the
+/// shell: unregister, evict, release the envs, delete the leftover.
+#[test]
+fn reconcile_reclaims_a_db_only_leftover_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let gone = tmp.path().join("wt-shell");
+    let db_path = gone.join(DB_DIR_NAME);
+    let scip_dir = db_path.join("scip");
+    std::fs::create_dir_all(&scip_dir).unwrap();
+
+    let state = std::sync::Arc::new(ServeState::new(
+        ReposConfig::default(),
+        Some(config_file.clone()),
+    ));
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.register_with_alias(gone.clone(), Some("wt-shell".to_string()))
+            .unwrap();
+        state.persist_config(&cfg).unwrap();
+    }
+
+    // Live index state INSIDE the tree: the stores env closes when the
+    // eviction below drops its last Arc; the shared SCIP env is the one the
+    // old code left in the cache forever.
+    let stores = std::sync::Arc::new(SharedStores::new(&db_path, 2).expect("fixture stores"));
+    let scip_key = codesearch_core::cache::safe_canonicalize(&scip_dir).unwrap();
+    let scip = crate::lmdb_registry::get_or_open_shared_env(
+        &scip_dir,
+        "scip-shell",
+        |opts| {
+            opts.map_size(1024 * 1024).max_dbs(4);
+            unsafe { opts.flags(codesearch_core::lmdb_registry::BASE_ENV_FLAGS) };
+        },
+        |_| Ok(()),
+    )
+    .expect("fixture scip env");
+    drop(scip); // cache-only afterwards, like after the last query
+
+    let token = CancellationToken::new();
+    state.repos.insert(
+        "wt-shell".to_string(),
+        RepoState::Write {
+            stores,
+            index_manager: None,
+            cancel_token: token.clone(),
+        },
+    );
+    // NOT indexing: an idle shell, like after the FSW task died with the tree.
+
+    state.reconcile_all_paths();
+
+    let on_disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        !on_disk.repos.contains_key("wt-shell"),
+        "the shell alias must be unregistered"
+    );
+    assert!(
+        state.repos.get("wt-shell").is_none(),
+        "the shell alias must be evicted from memory"
+    );
+    assert!(
+        token.is_cancelled(),
+        "the Write task's cancel token must be cancelled"
+    );
+    assert!(
+        heed::env_closing_event(&scip_key).is_none(),
+        "the shared SCIP env must be closed (file locks released)"
+    );
+    assert!(
+        !db_path.exists(),
+        "the leftover .codesearch.db must be deleted by the reconcile pass"
+    );
+    assert!(
+        !gone.exists(),
+        "the empty worktree shell must be removed once the db dir is gone"
+    );
+}
+
 #[test]
 fn config_reload_picks_up_new_alias() {
     let tmp = tempfile::tempdir().unwrap();

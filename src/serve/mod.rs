@@ -1765,54 +1765,143 @@ impl ServeState {
         );
     }
 
+    /// True when `path` exists but its ONLY content is the database
+    /// directory — the leftover shell a worktree removal leaves behind when
+    /// the deletion stops at the LMDB files a live hub still holds. Such a
+    /// directory has no indexable content: the repo is gone, only its locks
+    /// and index bytes remain. A registered-but-never-opened directory has
+    /// NO db dir and does not match; an in-flight build (which creates the
+    /// db dir early) is excluded by the caller's `is_indexing` guard.
+    /// Degenerate corner: a registered repo whose sources were deleted by
+    /// hand reads as a shell and is reclaimed — re-registering rebuilds it.
+    fn is_db_only_shell(path: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        let mut has_db = false;
+        for entry in entries.flatten() {
+            if entry.file_name() == DB_DIR_NAME {
+                // A db FILE is not the index layout; only the dir counts.
+                if !entry.path().is_dir() {
+                    return false;
+                }
+                has_db = true;
+            } else {
+                return false;
+            }
+        }
+        has_db
+    }
+
     /// Reconcile registered repo paths against the filesystem.
     ///
     /// For each alias whose stored path no longer exists (folder renamed/moved,
     /// or a worktree deleted while the hub keeps running), attempt a best-effort
     /// git-identity relocation. What cannot be relocated is unregistered, its
-    /// in-memory state evicted, and `repos.json` rewritten. Boot warmup has its
-    /// own prune, but a long-lived serve never reboots — without this pass a
-    /// deleted worktree ghosted `status kind=projects` forever. Explicit manual
-    /// cleanup remains available via `codesearch index prune`.
+    /// in-memory state evicted, and `repos.json` rewritten. A second stale
+    /// class is the leftover SHELL: a directory reduced to nothing but its
+    /// `.codesearch.db` because the tree deletion stopped at the files the
+    /// hub's LMDB envs still held — the path "exists", so the prune above
+    /// would keep the alias forever. Both classes then release the shared
+    /// LMDB envs (the strong cache would otherwise pin the env — and the
+    /// Windows file locks — for the process lifetime) and finish the
+    /// interrupted deletion of the leftover db dir, so `wt remove`/Explorer
+    /// can finally complete.
+    /// Boot warmup has its own prune, but a long-lived serve never reboots —
+    /// without this pass a deleted worktree ghosted `status kind=projects`
+    /// forever. Explicit manual cleanup remains available via `codesearch
+    /// index prune`.
     pub(crate) fn reconcile_all_paths(&self) {
         let aliases = self.aliases();
         if aliases.is_empty() {
             return;
         }
 
-        let mut config = match self.config.write() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("reconcile: config lock poisoned: {}", e);
-                return;
+        let removed = {
+            let mut config = match self.config.write() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("reconcile: config lock poisoned: {}", e);
+                    return;
+                }
+            };
+
+            let (relocated, mut removed) = config.prune_stale();
+
+            for (alias, new_path) in &relocated {
+                info!("reconcile: relocated '{}' → {}", alias, new_path.display());
             }
+            for (alias, stale_path) in &removed {
+                info!(
+                    "reconcile: unregistered stale '{}' (path no longer exists: {})",
+                    alias,
+                    stale_path.display()
+                );
+            }
+
+            // Leftover shells: detect and reclaim. `is_indexing` skips an
+            // in-flight build, whose fresh db dir would read as a shell; it
+            // reads no config state, so it is safe under this write guard.
+            for alias in &aliases {
+                if removed.iter().any(|(a, _)| a == alias) {
+                    continue;
+                }
+                let Some(path) = config.resolve(alias) else {
+                    continue;
+                };
+                if !Self::is_db_only_shell(&path) || self.is_indexing(alias) {
+                    continue;
+                }
+                if config.unregister_alias(alias) {
+                    info!(
+                        "reconcile: reclaiming leftover shell '{}' (only content is the db dir: {})",
+                        alias,
+                        path.display()
+                    );
+                    removed.push((alias.clone(), path));
+                }
+            }
+
+            for (alias, _) in &removed {
+                // Same eviction shape as reload_if_changed: fire the Write task's
+                // cancel token while removing its RepoState, then detach the FSW
+                // handle so a draining task never races the config swap. The
+                // eviction drops the stores env synchronously (the store's
+                // `TrackedEnv` closes on the last `Arc` drop), unlocking the
+                // main db files; the shared SCIP env is released below.
+                if let Some((_, RepoState::Write { cancel_token, .. })) = self.repos.remove(alias) {
+                    cancel_token.cancel();
+                }
+                self.last_access.remove(alias);
+                self.fsw_tasks.remove(alias);
+            }
+
+            if !relocated.is_empty() || !removed.is_empty() {
+                if let Err(e) = self.persist_config(&config) {
+                    warn!("reconcile: failed to persist reconciled registry: {}", e);
+                }
+            }
+            removed
         };
 
-        let (relocated, removed) = config.prune_stale();
-
-        for (alias, new_path) in &relocated {
-            info!("reconcile: relocated '{}' → {}", alias, new_path.display());
-        }
-        for alias in &removed {
+        // Release shared envs whose directory vanished (the path-gone class
+        // above, or stale cache entries from earlier unregister paths):
+        // `close_shared_envs_under` cannot reach those — it canonicalizes the
+        // caller's path and `safe_canonicalize` fails on a vanished one.
+        let swept = crate::lmdb_registry::close_vanished_shared_envs();
+        if !swept.is_empty() {
             info!(
-                "reconcile: unregistered stale '{}' (path no longer exists)",
-                alias
+                "reconcile: released {} vanished shared LMDB env(s)",
+                swept.len()
             );
-            // Same eviction shape as reload_if_changed: fire the Write task's
-            // cancel token while removing its RepoState, then detach the FSW
-            // handle so a draining task never races the config swap. The DB
-            // dir lived inside the vanished tree — nothing left to delete.
-            if let Some((_, RepoState::Write { cancel_token, .. })) = self.repos.remove(alias) {
-                cancel_token.cancel();
-            }
-            self.last_access.remove(alias);
-            self.fsw_tasks.remove(alias);
         }
 
-        if !relocated.is_empty() || !removed.is_empty() {
-            if let Err(e) = self.persist_config(&config) {
-                warn!("reconcile: failed to persist reconciled registry: {}", e);
-            }
+        // Finish the interrupted deletion. The path-gone class's db dir is
+        // already gone (no-op); a shell's locks were just released. Removing
+        // the parent only succeeds once it is empty — never anyone's content.
+        for (alias, stale_path) in &removed {
+            Self::remove_orphaned_db_dir(alias, &stale_path.join(DB_DIR_NAME));
+            let _ = std::fs::remove_dir(stale_path);
         }
     }
 

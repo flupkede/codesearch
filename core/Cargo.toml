@@ -103,6 +103,10 @@ tree-sitter-proto = "0.6"
 [dev-dependencies]
 # federation's tests spin real axum echo/health servers
 axum = { workspace = true }
+# core's own tests build multi-thread runtimes (embed/openai.rs, symbols/csharp.rs)
+# but the lib dep carries no runtime features: workspace builds unify with the
+# CLI's "full", a plain `cargo test -p codesearch-core` did not.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 ctor = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
