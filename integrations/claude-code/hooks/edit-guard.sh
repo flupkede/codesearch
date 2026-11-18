@@ -19,7 +19,10 @@
 # through, regardless of which tool wrote it — the marker proves the agent
 # consulted codesearch for this file, which is the point; policing
 # find_impact-vs-find_usages per extension would deny edits after a
-# legitimate-but-"wrong-kind" lookup.
+# legitimate-but-"wrong-kind" lookup. A marker on the file's REGISTERED ROOT
+# also counts: edit-guard-post writes it when a consultation returned no
+# attributable path (empty result / "no SCIP backend"), so a repo whose
+# symbol index is missing cannot wedge every edit.
 #
 # Fail-open on: no target paths, paths outside any git repo, unregistered
 # repos, or a crashed hook — all allow. Missing/corrupt state counts as NOT
@@ -96,7 +99,8 @@ while IFS= read -r p; do
     [ -z "$root" ] && continue             # outside any git repo -> allow
     target_registered "$root" || continue  # unregistered repo -> allow (fail-open)
     key="$(norm_state_key "$p")"
-    if ! checked_recently "$key"; then
+    root_key="$(norm_state_key "$root")"
+    if ! checked_recently "$key" && ! checked_recently "$root_key"; then
         fail_path="$p"
         if [ "$kind" = impact ]; then
             fail_tool='mcp__codesearch__find_impact (SCIP-backed language)'

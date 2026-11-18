@@ -97,7 +97,8 @@ foreach ($p in $paths) {
     if (-not $root) { continue }                    # outside any git repo -> allow
     if (-not (Test-CodesearchTargetRegistered $root)) { continue }  # unregistered -> fail-open
     $key = ConvertTo-StateKey $p
-    if (Test-CheckedRecently $key) { continue }
+    $rootKey = ConvertTo-StateKey $root
+    if ((Test-CheckedRecently $key) -or (Test-CheckedRecently $rootKey)) { continue }
     $failPath = $p
     if ($kind -eq 'impact') {
         $failTool = 'mcp__codesearch__find_impact (SCIP-backed language)'

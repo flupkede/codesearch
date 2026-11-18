@@ -83,7 +83,7 @@ that make the preference *structural* instead of advisory:
 
 - **`edit-guard`** — a `PreToolUse` hook on `Edit`/`Write`/`MultiEdit`.
   Blocks an edit to a code file in a codesearch-registered repo until
-  codesearch was consulted for that exact path within the last 5 minutes:
+  codesearch was consulted for that file within the last 5 minutes:
   `mcp__codesearch__find_impact` for SCIP-backed languages
   (`.cs .ts .tsx .mts .cts`), `mcp__codesearch__find(kind="usages")` for
   other source code. Docs, markup and config files (`.md`, `.json`, ...)
@@ -101,10 +101,22 @@ that make the preference *structural* instead of advisory:
   (`$TMPDIR/.codesearch-edit-guard-state.json` on bash,
   `%TEMP%\.codesearch-edit-guard-state.json` on PowerShell). It fires on
   every `find_impact` call and every `find(kind="usages")` (the kind check
-  is done script-side — matchers only see tool names). Any outcome counts:
-  "no results" and "no SCIP backend" still mark the path as consulted, so
-  the guard can never wedge permanently. PostToolUse hooks cannot block
-  anything; this one never emits a decision and always exits 0.
+  is done script-side — matchers only see tool names). Markers are
+  attributed from three sources, all written when available: a file-ish
+  input field (`file`/`path`/`file_path` — `find_impact`'s schema names its
+  target `symbol_name` and carries no path, so this serves older schemas);
+  every **path the response mentions** (`path`/`file`/`file_path` at any
+  depth, including inside the JSON-stringified text payload MCP wraps
+  results in — serve-mode paths are alias-prefixed or project-relative and
+  resolve against the registered root of the call's `project` alias), so
+  one consultation marks every file it listed; and a **repo-level marker**
+  on the project's registered root when the response yielded no path at
+  all (empty result, or a "no SCIP backend" error), which `edit-guard`
+  accepts for any file in that repo. Any outcome counts; without the
+  response-path and repo-level attribution a missing C# symbol index wrote
+  no marker at all and every `.cs` edit in a registered repo stayed denied
+  — a permanent wedge. PostToolUse hooks cannot block anything; this one
+  never emits a decision and always exits 0.
 
 All hooks fail open: if they can't parse their input, or codesearch isn't
 running/indexed, they get out of the way and let the tool call proceed
@@ -236,7 +248,10 @@ whose commands point at `hooks/codesearch/`) from `settings.json`, and delete
   behind on the `.codesearch.db`/Windows-only-path signals — closed with
   the edit-guard work, #199).
 - `edit-guard` is per-file, not per-repo: a marker for one file never
-  unblocks an edit to another file. The marker state lives in a temp-dir
+  unblocks an edit to another file — except the repo-level marker
+  `edit-guard-post` writes when a consultation returned no attributable
+  path (empty result / "no SCIP backend"), which unblocks every file in
+  that repo for the window. The marker state lives in a temp-dir
   JSON file (`$TMPDIR/.codesearch-edit-guard-state.json` /
   `%TEMP%\.codesearch-edit-guard-state.json`), entries expire after
   5 minutes and are pruned on write; missing or corrupt state counts as
@@ -245,7 +260,14 @@ whose commands point at `hooks/codesearch/`) from `settings.json`, and delete
   on files whose git root is registered with the serve hub. The gate keys
   on extension: docs/markup/config (`.md`, `.json`, ...) pass without any
   marker; filename-mapped code files (`Dockerfile`, `Makefile`) pass too —
-  rare refactor targets.
+  rare refactor targets. Scope your consultation with the `project` alias:
+  response paths resolve against that project's registered root, and the
+  repo-level fallback needs it — a projectless `find_impact` that returns
+  no paths writes no marker at all. Known limit: in a `CODESEARCH_SERVER`
+  pure-remote setup there is no local registry, so neither the
+  response-path resolution nor the repo fallback can attribute a marker —
+  there the guard demands a file-ish input field and nothing else
+  satisfies it.
 - Both hooks are per-machine, not per-repo: install once at user scope and
   every project benefits, including ones not registered with the serve
   hub (the guard simply won't block Grep there, since coverage fails

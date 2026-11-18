@@ -36,7 +36,7 @@ REPO_B="$TMP_ROOT/repoB"
 mkdir -p "$REPO_A" "$REPO_B"
 git init -q "$REPO_A"
 git init -q "$REPO_B"
-touch "$REPO_A/x.cs" "$REPO_A/m.ts" "$REPO_A/p.py" "$REPO_B/b.cs"
+touch "$REPO_A/x.cs" "$REPO_A/m.ts" "$REPO_A/p.py" "$REPO_A/z.cs" "$REPO_A/w.cs" "$REPO_A/v.cs" "$REPO_B/b.cs"
 ROOT_A="$(git -C "$REPO_A" rev-parse --show-toplevel)"
 ROOT_B="$(git -C "$REPO_B" rev-parse --show-toplevel)"
 
@@ -60,6 +60,11 @@ multiedit_event() {
 }
 post_find_impact() { jq -n --arg f "$1" '{tool_name: "mcp__codesearch__find_impact", tool_input: {file: $f}}'; }
 post_find() { jq -n --arg f "$1" --arg k "$2" '{tool_name: "mcp__codesearch__find", tool_input: {path: $f, kind: $k}}'; }
+post_impact_symbolic() { # $1 = project ("" for none), $2 = tool_response JSON
+    jq -n --arg p "$1" --argjson resp "$2" \
+        '{tool_name: "mcp__codesearch__find_impact", tool_input: ({symbol_name: "CloseAsync"} + (if $p == "" then {} else {project: $p} end)), tool_response: $resp}'
+}
+mcp_text_response() { jq -cn --arg t "$1" '{content: [{type: "text", text: $t}]}'; }
 
 expect_allow() {
     if [ -z "$OUT" ]; then
@@ -98,7 +103,7 @@ case_covered_ts_denied() {
     expect_deny "covered repo: Edit .ts denied (find_impact required)" "find_impact"
 }
 case_covered_py_needs_usages() {
-    run_edit "$(edit_event "$REPO_A/p.py")"
+    run_edit "$(edit_event "$ROOT_A/p.py")"
     expect_deny "covered repo: Edit .py denied (find kind=usages required)" 'kind="usages"'
 }
 case_non_code_file_allows() {
@@ -146,10 +151,53 @@ case_multiedit_partial_marks_denied() {
 }
 case_find_usages_marker_allows() {
     run_post "$(post_find "$REPO_A/p.py" "usages")"
-    run_edit "$(edit_event "$REPO_A/p.py")"
+    run_edit "$(edit_event "$ROOT_A/p.py")"
     expect_allow "after find(kind=usages) marker: Edit .py allowed"
     run_edit "$(multiedit_event "$REPO_A/x.cs" "$REPO_A/p.py")"
     expect_allow "MultiEdit with every path marked allowed"
+}
+case_response_paths_mark() {
+    # find_impact's real schema carries symbol_name, not a file path — the
+    # reported permanent wedge: no input field matched, so no marker was
+    # ever written and every .cs edit in a registered repo stayed denied.
+    # The response's hit paths (alias-prefixed, inside the MCP text
+    # envelope's JSON payload) must attribute instead.
+    local hits resp
+    hits="$(jq -cn --arg p "repoA/z.cs" '{results: [{path: $p, chunk_id: 7}]}')"
+    resp="$(mcp_text_response "$hits")"
+    run_post "$(post_impact_symbolic "repoA" "$resp")"
+    run_edit "$(edit_event "$ROOT_A/z.cs")"
+    expect_allow "find_impact(symbol_name) with response hit paths: Edit .cs allowed"
+    # A STRING tool_response (same payload, no envelope object) must
+    # attribute identically — indexing .content on a string aborted the
+    # whole jq program once.
+    local hits2
+    hits2="$(jq -cn --arg p "repoA/v.cs" '{results: [{path: $p, chunk_id: 9}]}')"
+    run_post "$(jq -cn --arg p "repoA" --arg t "$hits2" \
+        '{tool_name: "mcp__codesearch__find_impact", tool_input: {project: $p, symbol_name: "CloseAsync"}, tool_response: $t}')"
+    run_edit "$(edit_event "$ROOT_A/v.cs")"
+    expect_allow "string tool_response parses the same JSON payload: Edit .cs allowed"
+}
+case_symbolic_without_project_still_denied() {
+    # No project alias: response paths cannot resolve and no repo root is
+    # known, so nothing is attributable — the edit stays denied. Pins the
+    # requirement to scope the consultation to the project.
+    local resp
+    resp="$(mcp_text_response "No symbol index available for csharp")"
+    run_post "$(post_impact_symbolic "" "$resp")"
+    run_edit "$(edit_event "$REPO_A/w.cs")"
+    expect_deny "find_impact without project: no marker, Edit .cs still denied" "find_impact"
+}
+case_no_backend_marks_repo() {
+    # A pathless "no SCIP backend" answer writes the repo-level fallback
+    # marker: codesearch was consulted and answered nothing, so any file in
+    # the repo is unlocked for the window. This is the exact missing-C#-
+    # index wedge from the field report.
+    local resp
+    resp="$(mcp_text_response "No symbol index available for csharp")"
+    run_post "$(post_impact_symbolic "repoA" "$resp")"
+    run_edit "$(edit_event "$ROOT_A/p.py")"
+    expect_allow "pathless no-backend answer: repo marker unblocks other files"
 }
 case_window_expiry_denies_again() {
     local sf="$STATE_DIR/.codesearch-edit-guard-state.json"
@@ -242,6 +290,9 @@ case_find_impact_marker_allows
 case_empty_first_field_falls_through
 case_multiedit_partial_marks_denied
 case_find_usages_marker_allows
+case_response_paths_mark
+case_symbolic_without_project_still_denied
+case_no_backend_marks_repo
 case_window_expiry_denies_again
 case_grep_guard_smoke
 case_bash_grep_targets

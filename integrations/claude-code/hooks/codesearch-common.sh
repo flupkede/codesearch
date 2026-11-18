@@ -246,3 +246,42 @@ norm_state_key() {
     case "$n" in [A-Za-z]:/*) n="$(printf '%s' "$n" | tr '[:upper:]' '[:lower:]')" ;; esac
     printf '%s' "$n"
 }
+
+# Root path registered for a project alias. Serve-mode tools answer with
+# alias-prefixed or project-relative paths (e.g. "repoA/src/x.cs"); joining
+# them back onto the local tree needs the alias's registered root. Prints
+# empty when the registry is missing/unreadable, the alias is not listed, or
+# CODESEARCH_SERVER marks a pure remote setup with no local root — callers
+# treat empty as "cannot resolve" and skip that path.
+registered_project_root() {
+    local alias="$1" cfg root
+    [ -n "$alias" ] || return 0
+    [ -n "${CODESEARCH_SERVER:-}" ] && return 0
+    cfg="$(repos_config_file)"
+    [ -r "$cfg" ] || return 0
+    root=$(jq -r --arg a "$alias" '(.repos // {})[$a] // empty | tostring' < "$cfg" 2>/dev/null | jq_str)
+    printf '%s' "$root"
+}
+
+# Resolve one tool-RESULT path to a local absolute path: absolute paths pass
+# through unchanged; alias-prefixed or project-relative paths join onto the
+# registered root of the project alias the call named. Prints empty when no
+# root can resolve the path.
+resolve_result_path() {
+    local p="$1" alias="$2" root rest
+    [ -n "$p" ] || return 0
+    case "$p" in
+        [A-Za-z]:[\\/]*|[\\/]*)
+            printf '%s' "$p"
+            ;;
+        *)
+            root="$(registered_project_root "$alias")"
+            [ -n "$root" ] || return 0
+            rest="${p#./}"
+            case "$rest" in
+                "$alias"/*) rest="${rest#"$alias"/}" ;;
+            esac
+            printf '%s' "${root%/}/$rest"
+            ;;
+    esac
+}

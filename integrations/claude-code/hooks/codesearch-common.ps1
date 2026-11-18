@@ -180,3 +180,46 @@ function ConvertTo-StateKey {
     if ($k -match '^[A-Za-z]:/') { $k = $k.ToLowerInvariant() }
     return $k
 }
+
+# Root path registered for a project alias. Serve-mode tools answer with
+# alias-prefixed or project-relative paths (e.g. "repoA/src/x.cs"); joining
+# them back onto the local tree needs the alias's registered root. Empty
+# when the registry is missing/unreadable, the alias is not listed, or
+# CODESEARCH_SERVER marks a pure remote setup with no local root — callers
+# treat empty as "cannot resolve" and skip that path.
+function Get-RegisteredProjectRoot {
+    param([string]$Alias)
+    if ([string]::IsNullOrEmpty($Alias)) { return '' }
+    if ($env:CODESEARCH_SERVER) { return '' }
+    $cfg = Get-CodesearchReposConfigFile
+    if ([string]::IsNullOrWhiteSpace($cfg)) { return '' }
+    if (-not (Test-Path -LiteralPath $cfg -PathType Leaf)) { return '' }
+    try {
+        $json = Get-Content -LiteralPath $cfg -Raw | ConvertFrom-Json
+        if ($null -eq $json -or $null -eq $json.repos) { return '' }
+        $entry = $json.repos.PSObject.Properties[$Alias]
+        if ($null -eq $entry) { return '' }
+        $reg = if ($entry.Value -is [string]) { $entry.Value } else { $entry.Value | ConvertTo-Json -Compress -Depth 10 }
+        if ([string]::IsNullOrEmpty($reg)) { return '' }
+        return $reg
+    } catch {
+        return ''
+    }
+}
+
+# Resolve one tool-RESULT path to a local absolute path: absolute paths pass
+# through unchanged; alias-prefixed or project-relative paths join onto the
+# registered root of the project alias the call named. Empty when no root
+# can resolve the path.
+function Resolve-ResultPath {
+    param([string]$Path, [string]$ProjectAlias)
+    if ([string]::IsNullOrEmpty($Path)) { return '' }
+    if ($Path -match '^[A-Za-z]:[\\/]' -or $Path -match '^[\\/]') { return $Path }
+    $root = Get-RegisteredProjectRoot $ProjectAlias
+    if ([string]::IsNullOrEmpty($root)) { return '' }
+    $rest = $Path -replace '^\./', ''
+    if ($ProjectAlias -and $rest.StartsWith($ProjectAlias + '/')) {
+        $rest = $rest.Substring($ProjectAlias.Length + 1)
+    }
+    return ($root.TrimEnd('/', '\') + '/' + $rest)
+}
