@@ -209,17 +209,31 @@ function Get-RegisteredProjectRoot {
 
 # Resolve one tool-RESULT path to a local absolute path: absolute paths pass
 # through unchanged; alias-prefixed or project-relative paths join onto the
-# registered root of the project alias the call named. Empty when no root
-# can resolve the path.
+# registered root of the project alias the call named, falling back to
+# FallbackRoot (the cwd repo's root, for cwd-scoped calls that carry no
+# `project`). Without an alias the answer's shape is unknown — repo-relative
+# or alias-prefixed — so both joins are returned. Empty when no root can
+# resolve the path.
 function Resolve-ResultPath {
-    param([string]$Path, [string]$ProjectAlias)
-    if ([string]::IsNullOrEmpty($Path)) { return '' }
-    if ($Path -match '^[A-Za-z]:[\\/]' -or $Path -match '^[\\/]') { return $Path }
+    param([string]$Path, [string]$ProjectAlias, [string]$FallbackRoot)
+    if ([string]::IsNullOrEmpty($Path)) { return @() }
+    if ($Path -match '^[A-Za-z]:[\\/]' -or $Path -match '^[\\/]') { return @($Path) }
     $root = Get-RegisteredProjectRoot $ProjectAlias
-    if ([string]::IsNullOrEmpty($root)) { return '' }
-    $rest = $Path -replace '^\./', ''
-    if ($ProjectAlias -and $rest.StartsWith($ProjectAlias + '/')) {
-        $rest = $rest.Substring($ProjectAlias.Length + 1)
+    if (-not [string]::IsNullOrEmpty($root)) {
+        $rest = $Path -replace '^\./', ''
+        if ($ProjectAlias -and $rest.StartsWith($ProjectAlias + '/')) {
+            $rest = $rest.Substring($ProjectAlias.Length + 1)
+        }
+        return @($root.TrimEnd('/', '\') + '/' + $rest)
     }
-    return ($root.TrimEnd('/', '\') + '/' + $rest)
+    if ([string]::IsNullOrEmpty($FallbackRoot)) { return @() }
+    $rest = $Path -replace '^\./', ''
+    $base = $FallbackRoot.TrimEnd('/', '\')
+    if ($rest -match '/') {
+        # Parenthesize the elements: the comma operator binds tighter than
+        # `+`, so `@(a + b, a + c)` parses as `a + (b, a) + c` — one joined
+        # string, not two keys.
+        return @(($base + '/' + $rest), ($base + '/' + ($rest -replace '^[^/]+/', '')))
+    }
+    return @($base + '/' + $rest)
 }

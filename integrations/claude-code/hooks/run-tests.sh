@@ -225,6 +225,27 @@ case_path_symbol_marks_file() {
     expect_allow "find(symbol=<path>, usages, project): path-level marker written"
 }
 
+case_dotted_symbol_marks_repo() {
+    # A dotted non-path symbol (obj.method()) is not path-like: the strict
+    # shape gate must skip source 1b so the pathless answer still marks the
+    # repo root. The bash twin once matched any dot (case *.*), fabricated a
+    # <root>/obj.method() key and starved the repo fallback — bash and pwsh
+    # disagreed on the same event.
+    local resp sf
+    fresh_state
+    resp="$(mcp_text_response "No usages found for 'obj.method()'. The symbol may not be indexed.")"
+    run_post "$(post_find_symbol "obj.method()" '{"project": "repoA"}' \
+        | jq -cn --arg t "$resp" '. + {tool_response: $t}')"
+    run_edit "$(edit_event "$ROOT_A/p.py")"
+    expect_allow "dotted non-path symbol: repo fallback still fires (pwsh parity)"
+    sf="$STATE_DIR/.codesearch-edit-guard-state.json"
+    if grep -q 'obj.method()' "$sf" 2>/dev/null; then
+        bad "dotted symbol: no <root>/obj.method() junk key may be written"
+    else
+        ok "dotted symbol: no junk file-level key"
+    fi
+}
+
 case_cwd_scoped_marks() {
     # Serve-mode agents scope with cwd (worktree-safe), which carries no
     # project — the reported todo_mcp wedge: 20 hits attributed to nothing,
@@ -248,10 +269,14 @@ case_cwd_junk_path_marks_repo() {
     # reported husq.aprimo/git_repo marker that matched nothing).
     local resp sf
     fresh_state
+    run_edit "$(edit_event "$REPO_A/w.cs")"
+    expect_deny "isolation: fresh state denies Edit w.cs" 'find_impact'
     resp="$(mcp_text_response "No usages found for 'git_repo'. The symbol may not be indexed.")"
     run_post "$(jq -cn --arg c "$REPO_A" --arg t "$resp" \
         '{tool_name: "mcp__codesearch__find", tool_input: {symbol: "git_repo", kind: "usages", cwd: $c}, tool_response: $t}')"
     run_edit "$(edit_event "$REPO_A/w.cs")"
+    expect_allow "cwd-scoped pathless find(usages): repo marker unblocks any code file"
+    run_edit "$(edit_event "$ROOT_A/p.py")"
     expect_allow "cwd-scoped pathless find(usages): cwd repo-root marker unblocks"
     sf="$STATE_DIR/.codesearch-edit-guard-state.json"
     if grep -q 'git_repo' "$sf" 2>/dev/null; then
@@ -355,6 +380,7 @@ case_response_paths_mark
 case_symbolic_without_project_still_denied
 case_no_backend_marks_repo
 case_path_symbol_marks_file
+case_dotted_symbol_marks_repo
 case_cwd_scoped_marks
 case_cwd_junk_path_marks_repo
 case_window_expiry_denies_again

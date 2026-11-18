@@ -265,23 +265,33 @@ registered_project_root() {
 
 # Resolve one tool-RESULT path to a local absolute path: absolute paths pass
 # through unchanged; alias-prefixed or project-relative paths join onto the
-# registered root of the project alias the call named. Prints empty when no
-# root can resolve the path.
+# registered root of the project alias the call named, falling back to
+# FALLBACK (the cwd repo's root, for cwd-scoped calls that carry no
+# `project`). Without an alias the answer's shape is unknown — repo-relative
+# or alias-prefixed — so both joins are printed. Prints one path per line;
+# empty when no root can resolve the path.
 resolve_result_path() {
-    local p="$1" alias="$2" root rest
+    local p="$1" alias="$2" fallback="$3" root rest
     [ -n "$p" ] || return 0
     case "$p" in
         [A-Za-z]:[\\/]*|[\\/]*)
-            printf '%s' "$p"
+            printf '%s\n' "$p"
+            return 0
             ;;
-        *)
-            root="$(registered_project_root "$alias")"
-            [ -n "$root" ] || return 0
-            rest="${p#./}"
-            case "$rest" in
-                "$alias"/*) rest="${rest#"$alias"/}" ;;
-            esac
-            printf '%s' "${root%/}/$rest"
-            ;;
+    esac
+    root="$(registered_project_root "$alias")"
+    if [ -n "$root" ]; then
+        rest="${p#./}"
+        case "$rest" in
+            "$alias"/*) rest="${rest#"$alias"/}" ;;
+        esac
+        printf '%s\n' "${root%/}/$rest"
+        return 0
+    fi
+    [ -n "$fallback" ] || return 0
+    rest="${p#./}"
+    printf '%s\n' "${fallback%/}/$rest"
+    case "$rest" in
+        */*) printf '%s\n' "${fallback%/}/${rest#*/}" ;;
     esac
 }

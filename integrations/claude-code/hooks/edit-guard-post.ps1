@@ -9,17 +9,18 @@
 #     matcher regex can only filter on tool name)
 #
 # Marker sources (all available ones are written):
-#   1. a file-ish INPUT field (file/path/file_path) — find_impact's schema
-#      names its target `symbol_name` and carries no path, so this serves
-#      older schemas and hand-crafted calls
-#   2. every path the RESPONSE mentions (path/file/file_path fields at any
-#      depth, including inside the JSON-stringified text payload MCP wraps
-#      results in), resolved against the registered root of the input's
-#      `project` alias when they are alias-prefixed or project-relative
-#   3. when neither yields a path — empty result or a "no SCIP backend"
-#      error — a REPO-level marker on the project's registered root, which
-#      edit-guard accepts for any file in that repo (the fix for the
-#      reported permanent wedge on .cs edits)
+#   1. a file-ish INPUT field (file/path/file_path)
+#   1b. a PATH-LIKE `symbol` input (separator or extension): the exact
+#      find(symbol=<path>, kind="usages") call edit-guard demands marks the
+#      path it names — project root, else cwd repo, else the shell cwd.
+#   2. every path the RESPONSE mentions — file-path-shaped values only
+#      (separator or extension; a bare symbol once resolved to a bogus
+#      <root>/git_repo key), joined onto the `project` alias's registered
+#      root or, for cwd-scoped calls, the `cwd` repo's registered root
+#      (both shape candidates — repo-relative vs alias-prefixed).
+#   3. when neither yields a path — empty result / "no SCIP backend" — a
+#      REPO-level marker on the project's registered root, else the cwd
+#      repo's root when registered.
 #
 # PostToolUse hooks cannot block anything: no decision is emitted and this
 # script ALWAYS exits 0.
@@ -49,9 +50,28 @@ switch ($tool) {
 }
 
 $project = if ($inp -and @($inp.PSObject.Properties.Name) -contains 'project') { [string]$inp.project } else { '' }
+$symbol  = if ($inp -and @($inp.PSObject.Properties.Name) -contains 'symbol') { [string]$inp.symbol } else { '' }
+$callCwd = if ($inp -and @($inp.PSObject.Properties.Name) -contains 'cwd')   { [string]$inp.cwd }    else { '' }
+
+# cwd-scoped calls (serve-mode worktree-safe scoping) carry no `project`:
+# the cwd repo's registered root stands in for it, for response attribution
+# and the repo fallback alike.
+$cwdRoot = ''
+if ([string]::IsNullOrEmpty($project) -and -not [string]::IsNullOrEmpty($callCwd)) {
+    $candidate = Resolve-TargetGitRoot $callCwd
+    if (-not [string]::IsNullOrEmpty($candidate) -and (Test-CodesearchTargetRegistered $candidate)) {
+        $cwdRoot = $candidate
+    }
+}
 
 # Collect path-ish strings from any parsed JSON shape, recursing into
-# JSON-stringified text payloads (the MCP envelope's content[].text).
+# JSON-stringified text payloads (the MCP envelope's content[].text). Values
+# without a separator or extension are not file paths (a bare symbol once
+# resolved to a bogus <root>/git_repo key).
+function Test-FilePathShape([string]$Value) {
+    ($Value -match '[/\\]') -or ($Value -match '\.[A-Za-z0-9]+$')
+}
+
 function Get-ResultPaths {
     param($Node)
     $out = @()
@@ -59,7 +79,7 @@ function Get-ResultPaths {
     if ($Node -is [System.Management.Automation.PSCustomObject]) {
         foreach ($prop in $Node.PSObject.Properties) {
             if (@('path', 'file', 'file_path') -contains $prop.Name -and $prop.Value -is [string] -and $prop.Value) {
-                $out += $prop.Value
+                if (Test-FilePathShape $prop.Value) { $out += $prop.Value }
             } else {
                 $out += Get-ResultPaths $prop.Value
             }
@@ -90,19 +110,41 @@ foreach ($field in @('file', 'path', 'file_path')) {
     }
 }
 
-# Source 2: paths mentioned anywhere in the tool response.
-if ($null -ne $data.tool_response) {
-    foreach ($rp in (Get-ResultPaths $data.tool_response)) {
-        $abs = Resolve-ResultPath -Path $rp -ProjectAlias $project
-        if ([string]::IsNullOrEmpty($abs)) { continue }
-        $k = ConvertTo-StateKey $abs
+# Source 1b: a path-like `symbol` marks the path it names — the exact call
+# shape edit-guard itself demands.
+if (-not [string]::IsNullOrEmpty($symbol) -and (Test-FilePathShape $symbol)) {
+    $marked = $false
+    if (-not [string]::IsNullOrEmpty($project) -or -not [string]::IsNullOrEmpty($cwdRoot)) {
+        foreach ($abs in (Resolve-ResultPath -Path $symbol -ProjectAlias $project -FallbackRoot $cwdRoot)) {
+            $k = ConvertTo-StateKey $abs
+            if (-not [string]::IsNullOrEmpty($k)) { $keys += $k; $marked = $true }
+        }
+    }
+    if (-not $marked) {
+        $k = ConvertTo-StateKey $symbol
         if (-not [string]::IsNullOrEmpty($k)) { $keys += $k }
     }
 }
 
+# Source 2: paths mentioned anywhere in the tool response.
+if ($null -ne $data.tool_response) {
+    foreach ($rp in (Get-ResultPaths $data.tool_response)) {
+        foreach ($abs in (Resolve-ResultPath -Path $rp -ProjectAlias $project -FallbackRoot $cwdRoot)) {
+            if ([string]::IsNullOrEmpty($abs)) { continue }
+            $k = ConvertTo-StateKey $abs
+            if (-not [string]::IsNullOrEmpty($k)) { $keys += $k }
+        }
+    }
+}
+
 # Source 3: repo-level fallback — consulted, but nothing attributable.
-if ($keys.Count -eq 0 -and -not [string]::IsNullOrEmpty($project)) {
-    $root = Get-RegisteredProjectRoot $project
+if ($keys.Count -eq 0) {
+    $root = ''
+    if (-not [string]::IsNullOrEmpty($project)) {
+        $root = Get-RegisteredProjectRoot $project
+    } elseif (-not [string]::IsNullOrEmpty($cwdRoot)) {
+        $root = $cwdRoot
+    }
     if (-not [string]::IsNullOrEmpty($root)) {
         $k = ConvertTo-StateKey $root
         if (-not [string]::IsNullOrEmpty($k)) { $keys += $k }

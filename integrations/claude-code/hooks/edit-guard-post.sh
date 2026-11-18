@@ -85,24 +85,23 @@ if [ -n "$input_p" ]; then
 fi
 
 # Source 1b: a path-like `symbol` marks the path it names — the exact call
-# shape edit-guard itself demands.
-if [ -n "$symbol" ]; then
-    case "$symbol" in
-        */* | *\\* | *.*)
-            marked=false
-            if [ -n "$project" ] || [ -n "$cwd_root" ]; then
-                while IFS= read -r abs; do
-                    [ -n "$abs" ] || continue
-                    k="$(norm_state_key "$abs")"
-                    [ -n "$k" ] && { keys+=("$k"); marked=true; }
-                done < <(resolve_result_path "$symbol" "$project" "$cwd_root")
-            fi
-            if [ "$marked" != true ]; then
-                k="$(norm_state_key "$symbol")"
-                [ -n "$k" ] && keys+=("$k")
-            fi
-            ;;
-    esac
+# shape edit-guard itself demands. Shape gate matches the pwsh twin's
+# Test-FilePathShape: a separator anywhere, or dot + alnum at the end —
+# a bare `*.*` would treat `obj.method()` as a path and eat the repo
+# fallback that pathless consultations rely on.
+if [ -n "$symbol" ] && [[ "$symbol" =~ [/\\]|\.[A-Za-z0-9]+$ ]]; then
+    marked=false
+    if [ -n "$project" ] || [ -n "$cwd_root" ]; then
+        while IFS= read -r abs; do
+            [ -n "$abs" ] || continue
+            k="$(norm_state_key "$abs")"
+            [ -n "$k" ] && { keys+=("$k"); marked=true; }
+        done < <(resolve_result_path "$symbol" "$project" "$cwd_root")
+    fi
+    if [ "$marked" != true ]; then
+        k="$(norm_state_key "$symbol")"
+        [ -n "$k" ] && keys+=("$k")
+    fi
 fi
 
 # Source 2: paths mentioned anywhere in the tool response — as an object, as
