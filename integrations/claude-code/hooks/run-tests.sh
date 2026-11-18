@@ -266,7 +266,7 @@ case_cwd_junk_path_marks_repo() {
     # A cwd-scoped consultation with no file-path-shaped response value (a
     # bare symbol string has no separator or extension) marks the cwd
     # repo's ROOT — and never a bogus <root>/<symbol> junk key (the
-    # reported husq.aprimo/git_repo marker that matched nothing).
+    # reported <alias>/git_repo marker that matched nothing).
     local resp sf
     fresh_state
     run_edit "$(edit_event "$REPO_A/w.cs")"
