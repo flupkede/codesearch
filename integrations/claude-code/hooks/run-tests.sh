@@ -150,10 +150,10 @@ case_multiedit_partial_marks_denied() {
     expect_deny "MultiEdit: marked .cs + unmarked .py denied, failing path named" "$REPO_A/p.py"
 }
 case_find_usages_marker_allows() {
-    run_post "$(post_find "$REPO_A/p.py" "usages")"
+    run_post "$(post_find "$ROOT_A/p.py" "usages")"
     run_edit "$(edit_event "$ROOT_A/p.py")"
     expect_allow "after find(kind=usages) marker: Edit .py allowed"
-    run_edit "$(multiedit_event "$REPO_A/x.cs" "$REPO_A/p.py")"
+    run_edit "$(multiedit_event "$REPO_A/x.cs" "$ROOT_A/p.py")"
     expect_allow "MultiEdit with every path marked allowed"
 }
 case_response_paths_mark() {
@@ -198,6 +198,67 @@ case_no_backend_marks_repo() {
     run_post "$(post_impact_symbolic "repoA" "$resp")"
     run_edit "$(edit_event "$ROOT_A/p.py")"
     expect_allow "pathless no-backend answer: repo marker unblocks other files"
+}
+
+fresh_state() { rm -f "$STATE_DIR/.codesearch-edit-guard-state.json"; }
+
+post_find_symbol() { # $1 = symbol, $2 = extra-input JSON object string
+    jq -cn --arg s "$1" --argjson extra "$2" \
+        '{tool_name: "mcp__codesearch__find", tool_input: ({symbol: $s, kind: "usages"} + $extra)}'
+}
+
+case_path_symbol_marks_file() {
+    # edit-guard demands find(symbol=<path>, kind="usages") for non-SCIP
+    # code — agents run exactly that shape, so a path-like symbol must mark
+    # the path it names (project-root resolution), not only the repo via
+    # the fallback. The reported conftest.py treadmill: the demanded call
+    # itself wrote no marker, so the retry denied again.
+    local resp
+    touch "$REPO_A/s.py"
+    fresh_state
+    run_edit "$(edit_event "$ROOT_A/s.py")"
+    expect_deny "isolation: fresh state denies Edit s.py" 'kind="usages"'
+    resp="$(mcp_text_response "No usages found for 's.py'. The symbol may not be indexed.")"
+    run_post "$(jq -cn --arg p "repoA" --arg t "$resp" \
+        '{tool_name: "mcp__codesearch__find", tool_input: {symbol: "s.py", kind: "usages", project: $p}, tool_response: $t}')"
+    run_edit "$(edit_event "$ROOT_A/s.py")"
+    expect_allow "find(symbol=<path>, usages, project): path-level marker written"
+}
+
+case_cwd_scoped_marks() {
+    # Serve-mode agents scope with cwd (worktree-safe), which carries no
+    # project — the reported todo_mcp wedge: 20 hits attributed to nothing,
+    # every subsequent edit denied. Response paths must resolve against the
+    # cwd repo's registered root (both shape candidates are marked, since
+    # alias-prefixed vs repo-relative depends on serve mode).
+    local hits
+    touch "$REPO_A/t.py"
+    fresh_state
+    hits="$(jq -cn --arg p "repoA/t.py" '{results: [{path: $p, chunk_id: 3}]}')"
+    run_post "$(jq -cn --arg c "$REPO_A" --arg t "$hits" \
+        '{tool_name: "mcp__codesearch__find", tool_input: {symbol: "git_repo", kind: "usages", cwd: $c}, tool_response: $t}')"
+    run_edit "$(edit_event "$ROOT_A/t.py")"
+    expect_allow "cwd-scoped find(usages) with hits: response paths mark the cwd repo"
+}
+
+case_cwd_junk_path_marks_repo() {
+    # A cwd-scoped consultation with no file-path-shaped response value (a
+    # bare symbol string has no separator or extension) marks the cwd
+    # repo's ROOT — and never a bogus <root>/<symbol> junk key (the
+    # reported husq.aprimo/git_repo marker that matched nothing).
+    local resp sf
+    fresh_state
+    resp="$(mcp_text_response "No usages found for 'git_repo'. The symbol may not be indexed.")"
+    run_post "$(jq -cn --arg c "$REPO_A" --arg t "$resp" \
+        '{tool_name: "mcp__codesearch__find", tool_input: {symbol: "git_repo", kind: "usages", cwd: $c}, tool_response: $t}')"
+    run_edit "$(edit_event "$REPO_A/w.cs")"
+    expect_allow "cwd-scoped pathless find(usages): cwd repo-root marker unblocks"
+    sf="$STATE_DIR/.codesearch-edit-guard-state.json"
+    if grep -q 'git_repo' "$sf" 2>/dev/null; then
+        bad "junk filter: no <root>/git_repo key may be written"
+    else
+        ok "junk filter: bare-symbol response wrote no junk key"
+    fi
 }
 case_window_expiry_denies_again() {
     local sf="$STATE_DIR/.codesearch-edit-guard-state.json"
@@ -293,6 +354,9 @@ case_find_usages_marker_allows
 case_response_paths_mark
 case_symbolic_without_project_still_denied
 case_no_backend_marks_repo
+case_path_symbol_marks_file
+case_cwd_scoped_marks
+case_cwd_junk_path_marks_repo
 case_window_expiry_denies_again
 case_grep_guard_smoke
 case_bash_grep_targets

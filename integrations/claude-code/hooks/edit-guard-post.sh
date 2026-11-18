@@ -13,21 +13,23 @@
 #   1. a file-ish INPUT field (file/path/file_path) — find_impact's schema
 #      names its target `symbol_name` and carries no path, so this serves
 #      older schemas and hand-crafted calls
-#   2. every path the RESPONSE mentions: find/find_impact hits carry
-#      path/file fields, including inside the JSON-stringified text payload
-#      MCP wraps them in. Serve-mode paths are alias-prefixed or project-
-#      relative and resolve against the registered root of the input's
-#      `project` alias. One consultation marks every file it listed — the
-#      per-file treadmill only kicks in when the agent moves to files the
-#      answer did not touch.
-#   3. when neither yields a single path — an empty result or a "no SCIP
-#      backend" error — a REPO-level marker on the project's registered
-#      root: codesearch was consulted and answered nothing, the one case
-#      where per-file attribution is impossible but the protocol was
-#      followed. edit-guard accepts that marker for any file in that repo.
-#      (This is the fix for the reported permanent wedge: find_impact on a
-#      repo whose C# symbol index is missing wrote no marker at all, so
-#      every .cs edit in a registered repo stayed denied.)
+#   1b. a PATH-LIKE `symbol` input (separator or extension): edit-guard
+#      demands find(symbol=<path>, kind="usages") for non-SCIP code, so the
+#      exact call it demands must mark the path it names — resolved against
+#      the call's `project` root, else the `cwd` repo, else the shell cwd.
+#      Bare code symbols (git_repo) never mark.
+#   2. every path the RESPONSE mentions — but only values that look like
+#      file paths (separator or extension): a bare symbol string used to
+#      resolve to a bogus <root>/git_repo key that matched nothing. Paths
+#      join onto the `project` alias's registered root, or the `cwd` repo's
+#      registered root for cwd-scoped calls (both shape candidates are
+#      marked — repo-relative vs alias-prefixed depends on serve mode).
+#   3. when neither yields a path — an empty result or a "no SCIP backend"
+#      error — a REPO-level marker: on the `project` alias's registered
+#      root, else on the `cwd` repo's root when registered. codesearch was
+#      consulted and answered nothing, the one case where per-file
+#      attribution is impossible but the protocol was followed. edit-guard
+#      accepts that marker for any file in that repo.
 #
 # PostToolUse hooks cannot block anything: this script never emits a
 # decision and ALWAYS exits 0.
@@ -54,6 +56,19 @@ case "$tool" in
 esac
 
 project=$(echo "$raw" | jq -r '.tool_input.project // empty' 2>/dev/null | jq_str)
+symbol=$(echo "$raw" | jq -r '.tool_input.symbol // empty' 2>/dev/null | jq_str)
+call_cwd=$(echo "$raw" | jq -r '.tool_input.cwd // empty' 2>/dev/null | jq_str)
+
+# cwd-scoped calls (serve-mode worktree-safe scoping) carry no `project`:
+# the cwd repo's registered root stands in for it, for response attribution
+# and the repo fallback alike.
+cwd_root=""
+if [ -z "$project" ] && [ -n "$call_cwd" ]; then
+    candidate="$(resolve_target_git_root "$call_cwd")"
+    if [ -n "$candidate" ] && target_registered "$candidate"; then
+        cwd_root="$candidate"
+    fi
+fi
 
 keys=()
 
@@ -69,29 +84,61 @@ if [ -n "$input_p" ]; then
     [ -n "$k" ] && keys+=("$k")
 fi
 
+# Source 1b: a path-like `symbol` marks the path it names — the exact call
+# shape edit-guard itself demands.
+if [ -n "$symbol" ]; then
+    case "$symbol" in
+        */* | *\\* | *.*)
+            marked=false
+            if [ -n "$project" ] || [ -n "$cwd_root" ]; then
+                while IFS= read -r abs; do
+                    [ -n "$abs" ] || continue
+                    k="$(norm_state_key "$abs")"
+                    [ -n "$k" ] && { keys+=("$k"); marked=true; }
+                done < <(resolve_result_path "$symbol" "$project" "$cwd_root")
+            fi
+            if [ "$marked" != true ]; then
+                k="$(norm_state_key "$symbol")"
+                [ -n "$k" ] && keys+=("$k")
+            fi
+            ;;
+    esac
+fi
+
 # Source 2: paths mentioned anywhere in the tool response — as an object, as
 # a JSON string, or inside the MCP text envelope's JSON-stringified payloads.
+# Values without a separator or extension are not file paths (a bare symbol
+# string once resolved to a bogus <root>/git_repo key).
 while IFS= read -r rp; do
     [ -n "$rp" ] || continue
-    abs="$(resolve_result_path "$rp" "$project")"
-    [ -z "$abs" ] && continue
-    k="$(norm_state_key "$abs")"
-    [ -n "$k" ] && keys+=("$k")
+    while IFS= read -r abs; do
+        [ -n "$abs" ] || continue
+        k="$(norm_state_key "$abs")"
+        [ -n "$k" ] && keys+=("$k")
+    done < <(resolve_result_path "$rp" "$project" "$cwd_root")
 done < <(echo "$raw" | jq -r '
     [ (.tool_response | select(type == "object")),
       (.tool_response | select(type == "string") | try fromjson catch null),
-      (.tool_response | select(type == "object") | .content[]?.text? | strings | try fromjson catch null)
+      (.tool_response | select(type == "object") | .content[]?.text? | strings | try fromjson catch null),
+      (.tool_response | select(type == "string") | try fromjson catch null
+        | .content[]?.text? | strings | try fromjson catch null)
     ]
     | map(select(. != null)
         | [ .. | objects | (.path?, .file?, .file_path?) ])
     | add // []
-    | map(select(type == "string" and . != ""))
+    | map(select(type == "string" and . != ""
+        and (test("[/\\\\]") or test("\\.[A-Za-z0-9]+$"))))
     | unique | .[]
 ' 2>/dev/null | jq_str)
 
 # Source 3: repo-level fallback — consulted, but nothing attributable.
-if [ "${#keys[@]}" -eq 0 ] && [ -n "$project" ]; then
-    root="$(registered_project_root "$project")"
+if [ "${#keys[@]}" -eq 0 ]; then
+    root=""
+    if [ -n "$project" ]; then
+        root="$(registered_project_root "$project")"
+    elif [ -n "$cwd_root" ]; then
+        root="$cwd_root"
+    fi
     if [ -n "$root" ]; then
         k="$(norm_state_key "$root")"
         [ -n "$k" ] && keys+=("$k")
