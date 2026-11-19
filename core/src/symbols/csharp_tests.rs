@@ -749,7 +749,7 @@ fn refs_coverage_follows_precompute_and_index_warnings() {
 
 /// The helper writes `<stem>-filtered-{Guid:N}.sln` next to the real
 /// solution and keeps it on disk for the whole minutes-long workspace
-/// load; on NTFS it enumerates before `BOIN.dam.sln` ('-' < '.'). The
+/// load; on NTFS it enumerates before `ACME.dam.sln` ('-' < '.'). The
 /// defect this pins: `find_solution` returned that transient file, so
 /// every lookup racing an in-flight load chained another filter
 /// generation — each a distinct workspace-pool key with its own ~600 MB
@@ -758,13 +758,13 @@ fn refs_coverage_follows_precompute_and_index_warnings() {
 fn find_solution_skips_transient_filtered_solutions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
-    let real = root.join("BOIN.dam.sln");
+    let real = root.join("ACME.dam.sln");
     std::fs::write(&real, b"").expect("write real sln");
     let guid = "0123456789abcdef0123456789abcdef";
-    std::fs::write(root.join(format!("BOIN.dam-filtered-{guid}.sln")), b"")
+    std::fs::write(root.join(format!("ACME.dam-filtered-{guid}.sln")), b"")
         .expect("write transient filtered sln");
     std::fs::write(
-        root.join(format!("BOIN.dam-filtered-{guid}-filtered-{guid}.sln")),
+        root.join(format!("ACME.dam-filtered-{guid}-filtered-{guid}.sln")),
         b"",
     )
     .expect("write chained filtered sln");
@@ -779,7 +779,7 @@ fn transient_filtered_solution_predicate_is_precise() {
     let is = |name: &str| is_transient_filtered_solution(std::path::Path::new(name));
     assert!(is(&format!("a-filtered-{guid}.sln")));
     assert!(is(&format!("a-filtered-{guid}-filtered-{guid}.sln")));
-    assert!(!is("BOIN.dam.sln"));
+    assert!(!is("ACME.dam.sln"));
     assert!(!is("a-filtered-short.sln"));
     assert!(!is(&format!("a-filtered-{}.sln", "z".repeat(32))));
     assert!(!is("no-marker.sln"));
