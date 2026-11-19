@@ -127,6 +127,7 @@ Without TTY: headless, logs only.
 | `/repos` | POST | Register + index + warmup a new repo |
 | `/repos/:alias` | DELETE | Stop FSW, evict, unregister, delete DB |
 | `/repos/:alias/reindex` | POST | Incremental or force reindex (background) |
+| `/repos/:alias/compact` | POST | LMDB VACUUM — rewrite `data.mdb` live-pages-only (synchronous) |
 | `/mcp` | GET/POST | MCP streamable HTTP endpoint |
 
 ## Supported languages
@@ -235,11 +236,39 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 ## Active feature branches (not yet merged)
 
 | Branch | Description |
-|---|---|
+|---|
 
 ---
 
 ## Changelog highlights (recent)
+
+- **Pending** — leftover worktree shells self-heal: a directory reduced to nothing but its `.codesearch.db` (a removal stopped at the LMDB files the hub held) is unregistered, its shared LMDB envs released and the leftover deleted on the next reconcile pass, instead of locking `scip/data.mdb`/`lock.mdb` until serve restart.
+
+- **Pending** — temp-dir checkouts stop polluting the global repos.json: the post-checkout hook block skips TEMP-rooted checkouts (8.3 short-form matched via cygpath), POST /repos refuses them (force=true escape), and reconcile drops registrations whose temp path is gone.
+
+- **Pending** — warmup age gate: repos unused for more than `CODESEARCH_WARMUP_MAX_AGE_DAYS` (default 5, 0 = off) are not opened by the serve startup warmup — they lazy-open on the first tool call. Bounds the mapped-index working set on machines with many registered repos.
+
+- **Pending** — CI/test SDK discipline: repo-root `global.json` pins the 10.0.4xx SDK band (the runner images ship a .NET 11 SDK whose Razor generator the helper's pinned Roslyn 4.13 cannot drive — it ran without output), the test workspace registers the global.json-resolved SDK explicitly, and the helper's generator driver surfaces internally failing generators as `[INFO]` lines.
+
+- **Pending** — `index rm --forget` tombstones an alias: re-registration via `POST /repos` or `index add` is refused (409, removal date named) until `index add --force` clears the marker; tombstones live in `~/.codesearch/removed_aliases.json`.
+
+- **Pending** — edit-guard gates code files only: docs/markup/config edits in a registered repo pass without a codesearch consultation (the `.md` misfire); other source code incl. `.sql`, `.ipynb` cells and `.razor`/`.cshtml` still requires `find_impact`/`find kind="usages"` per the SCIP split.
+
+- **Pending** — opt-in `load-dynamic` build (`--no-default-features --features load-dynamic`) loads ONNX Runtime from `ORT_DYLIB_PATH` at runtime, so codesearch runs on x86_64 CPUs without AVX2 (the prebuilt ORT dies there with SIGILL); the default build's feature set is unchanged.
+
+- **Pending** — refs-coverage enforced: a `lazy` stamp (full-scope rebuild without references) reads as stale and gets one symbol rebuild, so indexes converge to precomputed references; the hours-long lazy batch-find-refs pre-warm is removed, and project-scoped rebuilds stamp a new `incremental` coverage (fresh, on-demand misses).
+
+- **Pending** — phase-1 warmup orders most-recently-used first (persisted `access_times.json` sidecar) instead of effectively random registry order, so the repos an agent actively uses are warm right after a restart.
+
+- **Pending** — FSW removal waves batched: one metadata load/save, one vector delete and one FTS commit per wave instead of per chunk/per file; directory removals now actually take their tracked children (the absolute-prefix bug).
+
+- **Pending** — refresh batches default to a 4096-chunk cap (was uncapped), bounding per-batch peak memory; oversized single files still insert whole via the map-full resize retry.
+
+- **Pending** — registering a git worktree of a registered main checkout builds the parent index first when unusable, seeding the global embedding cache so the worktree's unchanged chunks are cache hits.
+
+- **Pending** — FSW + branch-refresh re-index batched: one embed/FTS-commit/metadata-save per bounded batch and a single HNSW build per wave, replacing the per-file embed + save + commit + O(repo-size) graph-rebuild path (~3s/file at 41k chunks, minutes under build contention).
+
+- **Pending** — optional OpenAI-compatible remote embeddings: one active strategy, runtime dimensions, provider-aware setup/doctor, cache isolation and failure-safe incremental replacement; switching requires `--force`
 
 - **v1.7.6 (pending)** — serve hub resolves `project` from the client working directory: MCP roots when the client sends them, plus an agent-supplied `cwd` argument on every scopeable tool (remote-HTTP clients never send roots) — worktree-safe scoping; explicit-project mismatch surfaces as a `warnings` entry
 

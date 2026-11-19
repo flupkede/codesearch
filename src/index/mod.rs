@@ -10,7 +10,7 @@ use tracing::{debug, info};
 use crate::cache::{normalize_path, safe_canonicalize, storage_key, FileMetaStore};
 use crate::chunker::SemanticChunker;
 use crate::db_discovery::find_best_database;
-use crate::embed::{EmbeddingService, ModelType};
+use crate::embed::{EmbeddingModel, EmbeddingService};
 use crate::file::FileWalker;
 use crate::fts::FtsStore;
 use crate::vectordb::{merge_metadata_atomic, VectorStore};
@@ -18,9 +18,13 @@ use crate::vectordb::{merge_metadata_atomic, VectorStore};
 // Index manager module
 mod manager;
 pub use manager::{
-    is_database_locked, CSharpRebuildNotifier, IndexManager, IndexingHeartbeat,
-    IndexingStatusCallback, SharedStores, SymbolRebuildSignal,
+    CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback,
+    SymbolRebuildSignal,
 };
+// Store-open mechanics live in core; re-exported so `crate::index::` call
+// sites (serve, mcp, tests) stay valid. The lock fn is reachable directly
+// via codesearch_core::index; no crate-internal callers.
+pub use codesearch_core::index::SharedStores;
 
 mod build_log;
 pub use build_log::BuildLog;
@@ -66,7 +70,7 @@ fn recorded_dimensions(db_path: &Path) -> usize {
         .and_then(|j| j.get("dimensions").and_then(|v| v.as_u64()))
         .map(|d| d as usize);
     from_metadata
-        .or_else(|| ModelType::from_index_metadata(db_path).map(|m| m.dimensions()))
+        .or_else(|| EmbeddingModel::from_index_metadata(db_path).map(|m| m.dimensions()))
         .unwrap_or(crate::constants::DEFAULT_EMBEDDING_DIMENSIONS)
 }
 
@@ -84,12 +88,14 @@ fn recorded_dimensions(db_path: &Path) -> usize {
 fn resolve_index_model(
     db_path: &Path,
     force: bool,
-    requested: Option<ModelType>,
-) -> Result<ModelType> {
+    requested: Option<EmbeddingModel>,
+) -> Result<EmbeddingModel> {
     // `--force` deletes the database (see `get_db_path_smart`), so there is no
     // recorded model to honour; a non-existent/legacy index has none either.
     if force || !db_path.join("metadata.json").exists() {
-        return Ok(requested.unwrap_or_default());
+        let model = requested.unwrap_or_default();
+        model.try_dimensions()?;
+        return Ok(model);
     }
     let (recorded, _dims) = IndexManager::resolve_embed_model(db_path)?;
     match requested {
@@ -587,7 +593,7 @@ pub async fn index(
     dry_run: bool,
     force: bool,
     global: bool,
-    model: Option<ModelType>,
+    model: Option<EmbeddingModel>,
     local: bool,
     log_file: Option<PathBuf>,
     cancel_token: CancellationToken,
@@ -686,7 +692,7 @@ pub async fn index_quiet_with_model(
     path: Option<PathBuf>,
     force: bool,
     global: bool,
-    model: Option<ModelType>,
+    model: Option<EmbeddingModel>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     index_with_options(path, false, force, global, model, true, None, cancel_token).await
@@ -699,7 +705,7 @@ async fn index_with_options(
     dry_run: bool,
     force: bool,
     global: bool,
-    model: Option<ModelType>,
+    model: Option<EmbeddingModel>,
     quiet: bool,
     log_file: Option<PathBuf>,
     cancel_token: CancellationToken,
@@ -900,11 +906,6 @@ async fn index_with_options(
         for (_, chunk_ids) in deleted_files.iter() {
             total_chunks_to_delete += chunk_ids.len() as u32;
         }
-        for file in &changed_files {
-            let key = storage_key(&file.path, &project_path);
-            let (_, chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
-            total_chunks_to_delete += chunk_ids.len() as u32;
-        }
 
         if total_chunks_to_delete > 0 {
             log_print!("\n🔄 Deleting {} old chunks...", total_chunks_to_delete);
@@ -927,25 +928,6 @@ async fn index_with_options(
                     }
                 }
                 file_meta_store.remove_file(file_path.as_str());
-            }
-
-            // Delete changed files' old chunks
-            for file in &changed_files {
-                let key = storage_key(&file.path, &project_path);
-                let (_, old_chunk_ids) = file_meta_store.check_file(&file.path, &key)?;
-                if !old_chunk_ids.is_empty() {
-                    let file_path_str = file.path.to_string_lossy().to_string();
-                    info!(
-                        "🔄 Deleting {} old chunks for changed file: {}",
-                        old_chunk_ids.len(),
-                        file_path_str
-                    );
-                    debug!("   File path: {}", file.path.display());
-                    store.delete_chunks(&old_chunk_ids)?;
-                    for chunk_id in &old_chunk_ids {
-                        fts_store.delete_chunk(*chunk_id)?;
-                    }
-                }
             }
 
             fts_store.commit()?;
@@ -1024,6 +1006,7 @@ async fn index_with_options(
     // arena allocator memory that grows monotonically. Model is on disk, so
     let mut skipped_files: Vec<String> = Vec::new();
     let mut cancelled = false;
+    let mut embedding_error = None;
     for file in &files {
         // Check for cancellation before processing each file
         // Uses BOTH global AtomicBool (set by ctrlc OS handler) AND CancellationToken (for programmatic cancel)
@@ -1081,6 +1064,14 @@ async fn index_with_options(
         );
 
         if chunks.is_empty() {
+            if let Some(meta) = file_meta_store.as_ref() {
+                let key = storage_key(&file.path, &project_path);
+                let (_, old_ids) = meta.check_file(&file.path, &key)?;
+                store.delete_chunks(&old_ids)?;
+                for id in old_ids {
+                    fts_store.delete_chunk(id)?;
+                }
+            }
             // Still track this file so we don't re-process it every run.
             // A file with 0 chunks (e.g. minified JS, empty file) is "processed
             // but unchunkable" — record it with an empty chunk list so check_file()
@@ -1099,13 +1090,26 @@ async fn index_with_options(
                 cancelled = true;
                 break;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                embedding_error = Some(e);
+                cancelled = true;
+                break;
+            }
         };
 
         // Check cancellation after embedding (most CPU-intensive step)
         if crate::constants::check_shutdown(&cancel_token) {
             cancelled = true;
             break;
+        }
+
+        if let Some(meta) = file_meta_store.as_ref() {
+            let key = storage_key(&file.path, &project_path);
+            let (_, old_ids) = meta.check_file(&file.path, &key)?;
+            store.delete_chunks(&old_ids)?;
+            for id in old_ids {
+                fts_store.delete_chunk(id)?;
+            }
         }
 
         // Phase 2c: Extract lightweight FTS data before handing ownership to vector store.
@@ -1275,6 +1279,9 @@ async fn index_with_options(
             "codesearch index".bright_cyan()
         );
 
+        if let Some(error) = embedding_error {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -1615,8 +1622,12 @@ pub async fn prune_index() -> Result<()> {
     for (alias, path) in &relocated {
         println!("📍 relocated '{}' → {}", alias, path.display());
     }
-    for alias in &removed {
-        println!("🗑️  removed stale entry '{}'", alias);
+    for (alias, path) in &removed {
+        println!(
+            "🗑️  removed stale entry '{}' (last seen at {})",
+            alias,
+            path.display()
+        );
     }
     println!(
         "✅ Prune complete: {} relocated, {} removed.",
@@ -1627,12 +1638,48 @@ pub async fn prune_index() -> Result<()> {
     Ok(())
 }
 
+/// Warn when the path being registered is an umbrella over separate git repos.
+///
+/// Registering a parent directory makes every child resolve to the parent's
+/// alias: a session in `kcharts/druid` searches the `kcharts` index, and the
+/// child's own ignore rules, history and freshness never apply. The failure is
+/// silent (the parent index just looks incomplete), so name the fix here.
+fn warn_nested_git_roots(project_path: &Path) {
+    let nested = crate::db_discovery::repos::nested_git_roots(project_path);
+    if nested.is_empty() {
+        return;
+    }
+    println!(
+        "{}",
+        format!(
+            "⚠️  {} nested git repositor{} under this path:",
+            nested.len(),
+            if nested.len() == 1 { "y" } else { "ies" }
+        )
+        .yellow()
+        .bold()
+    );
+    for path in nested.iter().take(5) {
+        println!("   - {}", path.display());
+    }
+    if nested.len() > 5 {
+        println!("   … and {} more", nested.len() - 5);
+    }
+    println!(
+        "   Registering the parent indexes them as ONE project: a session inside a\n   \
+         child resolves to the parent's alias and only the parent's ignore rules\n   \
+         apply. For a complete per-repo index register each child instead:\n   \
+         codesearch index add <child-path>   (and a group for cross-repo search)"
+    );
+}
+
 pub async fn add_to_index(
     path: Option<PathBuf>,
     global: bool,
     local: bool,
     log_file: Option<PathBuf>,
-    model: Option<ModelType>,
+    model: Option<EmbeddingModel>,
+    force: bool,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let project_path = path.as_deref().unwrap_or_else(|| Path::new("."));
@@ -1641,6 +1688,7 @@ pub async fn add_to_index(
     println!("{}", "➕ Add to Index".bright_green().bold());
     println!("{}", "=".repeat(60));
     println!("📂 Project: {}", canonical_path.display());
+    warn_nested_git_roots(&canonical_path);
 
     // Try delegating to a running serve instance first.
     // Serve handles: register in repos.json + create index + warmup.
@@ -1656,7 +1704,7 @@ pub async fn add_to_index(
             let path = path.clone();
             // Alias is always derived from the directory name; the CLI no longer
             // lets the user set it. Pass None so serve derives it consistently.
-            async move { try_delegate_add_to_serve(&path, &None, global, &model).await }
+            async move { try_delegate_add_to_serve(&path, &None, global, &model, force).await }
         })
         .await
     };
@@ -1697,6 +1745,28 @@ pub async fn add_to_index(
                 format!("⚠️  serve is running but could not delegate: {}", reason).yellow()
             );
             eprintln!("   Adding locally instead.");
+        }
+    }
+
+    // Local build path: honor the `--forget` tombstone too — the guard in
+    // add_repo_handler only covers serve-delegated registration. The alias
+    // is always the directory name (CLI cannot set one).
+    let derived_alias = canonical_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !force {
+        if let Some(removed_at) = crate::db_discovery::repos::tombstone_date(&derived_alias) {
+            anyhow::bail!(
+                "Alias '{}' was removed with --forget on {}; refusing to index it again \
+                 locally. Pass --force to override.",
+                derived_alias,
+                removed_at
+            );
+        }
+    } else if !derived_alias.is_empty() {
+        if let Err(e) = crate::db_discovery::repos::untombstone_alias(&derived_alias) {
+            tracing::warn!("Failed to clear tombstone for '{}': {}", derived_alias, e);
         }
     }
 
@@ -1842,10 +1912,15 @@ pub async fn add_to_index(
 }
 
 /// Remove the index (local or global, auto-detected)
-pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Result<()> {
+pub async fn remove_from_index(
+    path: Option<PathBuf>,
+    keep_config: bool,
+    forget: bool,
+) -> Result<()> {
     // If the argument names a registered alias, resolve it to that repo's path;
     // otherwise treat it as a filesystem path (existing behavior). This lets
     // `codesearch index rm <alias>` work by alias in addition to by path.
+    let mut resolved_alias: Option<String> = None;
     let effective_path: Option<PathBuf> = match &path {
         Some(p) => {
             let raw = p.to_string_lossy();
@@ -1856,6 +1931,7 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
                             "{}",
                             format!("🏷️  Resolved alias '{}' → {}", raw, resolved.display()).cyan()
                         );
+                        resolved_alias = Some(raw.to_string());
                         Some(resolved)
                     }
                     None => path.clone(),
@@ -1905,6 +1981,9 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
                     eprintln!(
                         "The alias is already unregistered; re-run the same command to retry the file delete."
                     );
+                }
+                if forget {
+                    record_tombstone(&removed.alias);
                 }
                 return Ok(());
             }
@@ -2009,7 +2088,47 @@ pub async fn remove_from_index(path: Option<PathBuf>, keep_config: bool) -> Resu
         println!("{}", "✅ Global index removed!".green());
     }
 
+    if forget {
+        // The tombstone keys on the ALIAS. An alias argument recorded it at
+        // resolve time; a path argument derives it — registered alias first,
+        // else the dir name `index add` would assign to this path anyway.
+        let alias = resolved_alias
+            .or_else(|| {
+                crate::db_discovery::repos::ReposConfig::load()
+                    .ok()
+                    .and_then(|cfg| cfg.alias_for_path(&canonical_path))
+                    .map(|a| a.to_string())
+            })
+            .unwrap_or_else(|| {
+                canonical_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
+        if alias.is_empty() {
+            eprintln!("⚠️ --forget could not determine an alias; nothing tombstoned.");
+        } else {
+            record_tombstone(&alias);
+        }
+    }
+
     Ok(())
+}
+
+/// Write a `--forget` tombstone for `alias`, reporting the outcome inline.
+fn record_tombstone(alias: &str) {
+    match crate::db_discovery::repos::tombstone_alias(alias) {
+        Ok(()) => println!(
+            "{}",
+            format!(
+                "🪦 Alias '{}' tombstoned: re-registration via `index add` is refused \
+                 until it is cleared with --force.",
+                alias
+            )
+            .bright_red()
+        ),
+        Err(e) => eprintln!("⚠️ Failed to tombstone '{}': {}", alias, e),
+    }
 }
 
 /// Show index status — lists all repos registered in repos.json plus any
@@ -2231,35 +2350,7 @@ fn build_serve_client(
         .ok()
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty());
-    build_serve_client_with_key(timeout, key.as_deref())
-}
-
-/// Inner, testable form of [`build_serve_client`]: build a client that attaches
-/// `Authorization: Bearer <key>` (when `key` is `Some`) as a default header, so
-/// every request — health probe, POST, DELETE — carries it automatically.
-pub(crate) fn build_serve_client_with_key(
-    timeout: std::time::Duration,
-    key: Option<&str>,
-) -> std::result::Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
-
-    if let Some(k) = key {
-        let mut headers = reqwest::header::HeaderMap::new();
-        let auth_value =
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", k)).map_err(|e| {
-                format!(
-                    "invalid {} value: {}",
-                    crate::constants::SERVE_API_KEY_ENV,
-                    e
-                )
-            })?;
-        headers.insert(reqwest::header::AUTHORIZATION, auth_value);
-        builder = builder.default_headers(headers);
-    }
-
-    builder
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {}", e))
+    codesearch_core::federation::build_serve_client_with_key(timeout, key.as_deref())
 }
 
 /// When the server returns 401, produce a friendly, actionable error pointing at
@@ -2555,7 +2646,8 @@ pub(crate) async fn try_delegate_add_to_serve(
     path: &Option<PathBuf>,
     alias: &Option<String>,
     global: bool,
-    model: &Option<ModelType>,
+    model: &Option<EmbeddingModel>,
+    force: bool,
 ) -> std::result::Result<(String, PathBuf), DelegateError> {
     use crate::constants::{resolve_serve_host, DEFAULT_SERVE_PORT, SERVE_PORT_ENV};
 
@@ -2605,6 +2697,9 @@ pub(crate) async fn try_delegate_add_to_serve(
     }
     if let Some(m) = model {
         body["model"] = serde_json::Value::String(m.short_name().to_string());
+    }
+    if force {
+        body["force"] = serde_json::Value::Bool(true);
     }
 
     // 4. POST /repos
@@ -2796,7 +2891,8 @@ pub(crate) async fn try_delegate_rm_to_serve(
 
 #[cfg(test)]
 mod serve_probe_tests {
-    use super::{auth_failure_hint, build_serve_client_with_key, probe_serve_health, ServeProbe};
+    use super::{auth_failure_hint, probe_serve_health, ServeProbe};
+    use codesearch_core::federation::build_serve_client_with_key;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -2901,10 +2997,18 @@ mod serve_probe_tests {
 
     // ---- build_serve_client_with_key (issue #132) ---------------------------
 
-    /// Spawn a server that records the `Authorization` header it receives on
-    /// `/health` into the shared slot. Returns `(base_url, captured)`.
-    async fn spawn_auth_echo_server() -> (String, Arc<Mutex<Option<String>>>) {
-        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    /// Headers the echo server saw on `/health`.
+    #[derive(Clone, Default)]
+    struct SeenHeaders {
+        auth: Option<String>,
+        client: Option<String>,
+    }
+
+    /// Spawn a server that records the `Authorization` and
+    /// `X-Codesearch-Client` headers it receives on `/health` into the shared
+    /// slot. Returns `(base_url, captured)`.
+    async fn spawn_auth_echo_server() -> (String, Arc<Mutex<SeenHeaders>>) {
+        let captured: Arc<Mutex<SeenHeaders>> = Arc::new(Mutex::new(SeenHeaders::default()));
         let captured_clone = captured.clone();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2912,9 +3016,15 @@ mod serve_probe_tests {
         let app = axum::Router::new().route(
             "/health",
             axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                let mut seen = captured_clone.lock().unwrap();
                 if let Some(v) = headers.get(reqwest::header::AUTHORIZATION) {
                     if let Ok(s) = v.to_str() {
-                        *captured_clone.lock().unwrap() = Some(s.to_string());
+                        seen.auth = Some(s.to_string());
+                    }
+                }
+                if let Some(v) = headers.get(crate::constants::CLIENT_HEADER) {
+                    if let Ok(s) = v.to_str() {
+                        seen.client = Some(s.to_string());
                     }
                 }
                 "ok"
@@ -2945,9 +3055,14 @@ mod serve_probe_tests {
 
         let seen = captured.lock().unwrap().clone();
         assert_eq!(
-            seen.as_deref(),
+            seen.auth.as_deref(),
             Some("Bearer hunter2"),
             "client built with a key must send Authorization: Bearer <key>"
+        );
+        let client = seen.client.as_deref().unwrap_or("");
+        assert!(
+            client.starts_with("cli pid=") && client.contains("exe="),
+            "client built with a key must identify itself via X-Codesearch-Client, got: {client:?}"
         );
     }
 
@@ -2968,8 +3083,14 @@ mod serve_probe_tests {
 
         let seen = captured.lock().unwrap().clone();
         assert!(
-            seen.is_none(),
-            "client built without a key must NOT send an Authorization header, got: {seen:?}"
+            seen.auth.is_none(),
+            "client built without a key must NOT send an Authorization header, got: {:?}",
+            seen.auth
+        );
+        let client = seen.client.as_deref().unwrap_or("");
+        assert!(
+            client.starts_with("cli pid=") && client.contains("exe="),
+            "client built WITHOUT a key must still identify itself via X-Codesearch-Client (the keyless local-dev serve is where the audit trail matters most), got: {client:?}"
         );
     }
 
@@ -2991,7 +3112,7 @@ mod serve_probe_tests {
             .expect("server must return 200");
         let seen = captured.lock().unwrap().clone();
         assert_eq!(
-            seen.as_deref(),
+            seen.auth.as_deref(),
             Some("Bearer any-value"),
             "inner builder attaches Bearer <key> verbatim; trimming is the caller's job"
         );
@@ -3126,6 +3247,7 @@ mod index_quality_tests {
 mod remove_order_tests {
     use super::remove_from_index;
     use crate::db_discovery::repos::ReposConfig;
+    use crate::index::add_to_index;
     use crate::testing::EnvRestore;
     use serial_test::serial;
     use std::path::{Path, PathBuf};
@@ -3263,7 +3385,7 @@ mod remove_order_tests {
         let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
         let _canary = global_config_canary();
 
-        let result = remove_from_index(Some(proj.clone()), false).await;
+        let result = remove_from_index(Some(proj.clone()), false, false).await;
         assert!(
             result.is_err(),
             "remove must fail when the db dir cannot be deleted"
@@ -3296,7 +3418,7 @@ mod remove_order_tests {
         let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
         let _canary = global_config_canary();
 
-        remove_from_index(Some(proj.clone()), false)
+        remove_from_index(Some(proj.clone()), false, false)
             .await
             .expect("remove must succeed when nothing locks the db");
 
@@ -3306,6 +3428,58 @@ mod remove_order_tests {
             !paths.iter().any(|p| Path::new(p) == proj),
             "entry must be unregistered after successful delete, got: {:?}",
             paths
+        );
+        assert_global_config_unchanged(_canary);
+    }
+
+    /// `rm --forget` records a tombstone so a later `index add` (local build
+    /// path) refuses the same alias — the "removed repo keeps coming back"
+    /// class dies here.
+    #[tokio::test]
+    #[serial]
+    async fn rm_forget_tombstones_and_local_add_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = make_proj(tmp.path(), "custom");
+        let db = proj.join(".codesearch.db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("data.mdb"), b"fake").unwrap();
+        let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
+        let _canary = global_config_canary();
+        // Tombstones live under CODESEARCH_HOME; relocate so the write hits
+        // the test dir (the save-path guard panics otherwise). The explicit
+        // REPOS_CONFIG_ENV set above keeps repos.json where it was seeded.
+        let _home = crate::testing::EnvRestore::set(&[(
+            crate::constants::CODESEARCH_HOME_ENV,
+            tmp.path().to_str().unwrap(),
+        )]);
+
+        let alias = proj.file_name().unwrap().to_string_lossy().to_string();
+        remove_from_index(Some(proj.clone()), false, true)
+            .await
+            .expect("remove must succeed");
+        assert!(
+            crate::db_discovery::repos::tombstone_date(&alias).is_some(),
+            "rm --forget must record the alias as tombstoned"
+        );
+
+        // Local add (serve delegation short-circuited) must refuse.
+        let refused = add_to_index(
+            Some(proj.clone()),
+            false,
+            true,
+            None,
+            None,
+            false,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "local add of a tombstoned alias must be refused"
+        );
+        assert!(
+            crate::db_discovery::repos::tombstone_date(&alias).is_some(),
+            "a refused add must not clear the tombstone"
         );
         assert_global_config_unchanged(_canary);
     }
@@ -3322,7 +3496,7 @@ mod remove_order_tests {
         let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
         let _canary = global_config_canary();
 
-        remove_from_index(Some(proj.clone()), true)
+        remove_from_index(Some(proj.clone()), true, false)
             .await
             .expect("keep-config remove must succeed");
 
@@ -3348,7 +3522,7 @@ mod remove_order_tests {
         let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
         let _canary = global_config_canary();
 
-        remove_from_index(Some(proj.clone()), true)
+        remove_from_index(Some(proj.clone()), true, false)
             .await
             .expect("keep-config global-only remove must succeed");
 
@@ -3371,7 +3545,7 @@ mod remove_order_tests {
         let _env = seed_repos_config(tmp.path(), &proj, spawn_reset_server().await);
         let _canary = global_config_canary();
 
-        remove_from_index(Some(proj.clone()), false)
+        remove_from_index(Some(proj.clone()), false, false)
             .await
             .expect("global-only remove must succeed");
 
@@ -3656,7 +3830,7 @@ mod index_model_resolution_tests {
     use super::*;
 
     /// Write an index metadata.json recording `model` (as the indexer does).
-    fn write_metadata(db_path: &Path, model: ModelType) {
+    fn write_metadata(db_path: &Path, model: EmbeddingModel) {
         std::fs::create_dir_all(db_path).unwrap();
         let mut obj = serde_json::Map::new();
         model.write_metadata_fields(&mut obj);
@@ -3671,7 +3845,10 @@ mod index_model_resolution_tests {
     fn recorded_dimensions_reads_metadata_dimensions() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".codesearch.db");
-        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+        write_metadata(
+            &db,
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        );
         assert_eq!(recorded_dimensions(&db), 768);
     }
 
@@ -3702,17 +3879,27 @@ mod index_model_resolution_tests {
         // default (384-dim MiniLM). The recorded model must win.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".codesearch.db");
-        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+        write_metadata(
+            &db,
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        );
 
         assert_eq!(
             resolve_index_model(&db, false, None).unwrap(),
-            ModelType::EmbeddingGemma300MQ4,
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
             "an existing index's recorded model must be used, not the default"
         );
         // An explicit --model that agrees is accepted.
         assert_eq!(
-            resolve_index_model(&db, false, Some(ModelType::EmbeddingGemma300MQ4)).unwrap(),
-            ModelType::EmbeddingGemma300MQ4
+            resolve_index_model(
+                &db,
+                false,
+                Some(EmbeddingModel::Local(
+                    crate::embed::ModelType::EmbeddingGemma300MQ4
+                ))
+            )
+            .unwrap(),
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4)
         );
     }
 
@@ -3720,10 +3907,19 @@ mod index_model_resolution_tests {
     fn resolve_index_model_rejects_disagreeing_override_without_force() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".codesearch.db");
-        write_metadata(&db, ModelType::EmbeddingGemma300MQ4);
+        write_metadata(
+            &db,
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        );
 
-        let err = resolve_index_model(&db, false, Some(ModelType::AllMiniLML6V2Q))
-            .expect_err("a --model that disagrees with the index must be rejected");
+        let err = resolve_index_model(
+            &db,
+            false,
+            Some(EmbeddingModel::Local(
+                crate::embed::ModelType::AllMiniLML6V2Q,
+            )),
+        )
+        .expect_err("a --model that disagrees with the index must be rejected");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Model mismatch") && msg.contains("embeddinggemma-q4"),
@@ -3732,8 +3928,15 @@ mod index_model_resolution_tests {
 
         // --force deletes the DB, so the requested model is honoured.
         assert_eq!(
-            resolve_index_model(&db, true, Some(ModelType::AllMiniLML6V2Q)).unwrap(),
-            ModelType::AllMiniLML6V2Q
+            resolve_index_model(
+                &db,
+                true,
+                Some(EmbeddingModel::Local(
+                    crate::embed::ModelType::AllMiniLML6V2Q
+                ))
+            )
+            .unwrap(),
+            EmbeddingModel::Local(crate::embed::ModelType::AllMiniLML6V2Q)
         );
     }
 
@@ -3743,12 +3946,19 @@ mod index_model_resolution_tests {
         let db = dir.path().join(".codesearch.db"); // does not exist
 
         assert_eq!(
-            resolve_index_model(&db, false, Some(ModelType::EmbeddingGemma300MQ4)).unwrap(),
-            ModelType::EmbeddingGemma300MQ4
+            resolve_index_model(
+                &db,
+                false,
+                Some(EmbeddingModel::Local(
+                    crate::embed::ModelType::EmbeddingGemma300MQ4
+                ))
+            )
+            .unwrap(),
+            EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4)
         );
         assert_eq!(
             resolve_index_model(&db, false, None).unwrap(),
-            ModelType::default()
+            EmbeddingModel::default()
         );
     }
 }

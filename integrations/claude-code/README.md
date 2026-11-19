@@ -34,15 +34,20 @@ that make the preference *structural* instead of advisory:
   call against an indexed repo *for as long as the codesearch serve hub
   is reachable*, with a message telling the model exactly how to load and
   call codesearch instead. The `Bash` matcher closes the shell escape hatch:
-  a Bash tool command invoking `grep`/`egrep`/`fgrep`/`zgrep`/`rg` is guarded
-  identically (quoted mentions like `echo "grep"` are not invocations; the
-  target repo is the session cwd). The guarded repo is resolved from the **grep
-  target itself** — the git root of the path being searched, not the
-  hook's working directory — so an absolute-path Grep into a different
-  indexed repo is guarded too (a cwd-based check used to let those
-  through, and until #199 the absolute-path test itself only recognized
-  Windows-style roots, so POSIX absolute paths were still resolved
-  against the cwd). Coverage is decided by **registration**: the target's
+  a Bash tool command that greps FILES inside an indexed repo is guarded
+  identically (quoted mentions like `echo "grep"` are not invocations, and a
+  pure stream filter such as `find . | grep -v '^./.git/'` reads no files, so
+  it is not guarded). The guarded repo is resolved from the **grep target
+  itself** — the git root of the path being searched, not the hook's working
+  directory — so an absolute-path Grep into a different indexed repo is
+  guarded too (a cwd-based check used to let those through, and until #199 the
+  absolute-path test itself only recognized Windows-style roots, so POSIX
+  absolute paths were still resolved against the cwd). For a Bash grep the
+  target is the command's own operand (absolute, relative to the shell cwd, or
+  after a leading `cd DIR &&`), so a grep aimed at `/tmp` or at an
+  unregistered clone is allowed; that fixed the reported misfire where a
+  session inside an indexed repo denied greps that never touched it.
+  Coverage is decided by **registration**: the target's
   git root must be one of the repos in the hub's `~/.codesearch/repos.json`
   (honoring `CODESEARCH_REPOS_CONFIG`; `CODESEARCH_HOME` relocates the
   root), which also carves out nested
@@ -53,12 +58,18 @@ that make the preference *structural* instead of advisory:
   and lets Grep through only when that probe fails. A low-confidence or
   empty codesearch *result* is a successful call ("reformulate"), not a
   dead server, so it does **not** unblock Grep. One exception: when the
-  target repo is live but **mid-reindex** (the serve watcher's full
-  refresh, e.g. right after a branch switch), the hook denies Grep with a
-  **wait-and-retry** instruction (sleep 15-30s, then re-run the
-  codesearch call) — searching a mid-rebuild index returns stale/empty
-  results and must not degrade into a manual grep approval on every
-  routine checkout. The freshness probe (`GET /indexing?path=<repo
+   target repo is live but **mid-reindex** (the serve watcher's full
+   refresh, e.g. right after a branch switch), the hook waits the rebuild
+   out itself — polling `GET /indexing?path=<repo root>` every few seconds
+   for up to `CODESEARCH_GREP_GUARD_WAIT_MS` (default 120s; `0` restores
+   the legacy instant wait-and-retry instruction) — and denies Grep with
+   a retry-codesearch instruction once the rebuild lands, so the denial
+   only fires when codesearch will actually answer. Past the cap Grep
+   opens: a big-repo rebuild outlasts any polite wait message, and
+   denying Grep while every codesearch call times out deadlocks the
+   session. The freshness probe (`GET /indexing?path=<repo
+   root>`, bearer key forwarded when `CODESEARCH_API_KEY` is set) is
+   skipped silently on serves that predate the endpoint, so
   root>`) is skipped silently on serves that predate the endpoint, so
   hook and server versions can be mixed freely. Grep against paths
   outside any git repo, or against repos codesearch does not cover, is
@@ -71,11 +82,13 @@ that make the preference *structural* instead of advisory:
   subagents at all, since they don't inherit `AGENTS.md` or MCP instructions.
 
 - **`edit-guard`** — a `PreToolUse` hook on `Edit`/`Write`/`MultiEdit`.
-  Blocks an edit to a file in a codesearch-registered repo until codesearch
-  was consulted for that exact path within the last 5 minutes:
+  Blocks an edit to a code file in a codesearch-registered repo until
+  codesearch was consulted for that file within the last 5 minutes:
   `mcp__codesearch__find_impact` for SCIP-backed languages
   (`.cs .ts .tsx .mts .cts`), `mcp__codesearch__find(kind="usages")` for
-  everything else — making the caller-aware-editing protocol structural.
+  other source code. Docs, markup and config files (`.md`, `.json`, ...)
+  are never gated — a usages lookup answers nothing there. Making the
+  caller-aware-editing protocol structural.
   Coverage uses the same registration model as grep-guard (shared
   `codesearch-common` helpers): the file's git root must be listed in
   `~/.codesearch/repos.json` (relocatable via `CODESEARCH_HOME`; or
@@ -88,10 +101,27 @@ that make the preference *structural* instead of advisory:
   (`$TMPDIR/.codesearch-edit-guard-state.json` on bash,
   `%TEMP%\.codesearch-edit-guard-state.json` on PowerShell). It fires on
   every `find_impact` call and every `find(kind="usages")` (the kind check
-  is done script-side — matchers only see tool names). Any outcome counts:
-  "no results" and "no SCIP backend" still mark the path as consulted, so
-  the guard can never wedge permanently. PostToolUse hooks cannot block
-  anything; this one never emits a decision and always exits 0.
+  is done script-side — matchers only see tool names). Markers are
+  attributed from all available sources, written when they apply: a file-ish
+  input field (`file`/`path`/`file_path` — `find_impact`'s schema names its
+  target `symbol_name` and carries no path, so this serves older schemas);
+  a **path-like `symbol` input** — the exact `find(symbol=<path>,
+  kind="usages")` call `edit-guard` demands for non-SCIP code marks the
+  path it names (bare code symbols never mark); every **path the response
+  mentions** (`path`/`file`/`file_path` at any depth, including inside the
+  JSON-stringified text payload MCP wraps results in — values must look
+  like file paths, so a bare symbol string writes no junk key; paths join
+  onto the registered root of the call's `project` alias, or of the `cwd`
+  repo for serve-mode agents that scope with `cwd` instead, where both
+  shape candidates are marked), so one consultation marks every file it
+  listed; and a **repo-level marker** on the `project`'s registered root,
+  else the `cwd` repo's root, when nothing yielded a path (empty result,
+  or a "no SCIP backend" error), which `edit-guard` accepts for any file
+  in that repo. Any outcome counts; without the response-path and
+  repo-level attribution a missing C# symbol index wrote no marker at all
+  and every `.cs` edit in a registered repo stayed denied — a permanent
+  wedge. PostToolUse hooks cannot block anything; this one never emits a
+  decision and always exits 0.
 
 All hooks fail open: if they can't parse their input, or codesearch isn't
 running/indexed, they get out of the way and let the tool call proceed
@@ -223,13 +253,26 @@ whose commands point at `hooks/codesearch/`) from `settings.json`, and delete
   behind on the `.codesearch.db`/Windows-only-path signals — closed with
   the edit-guard work, #199).
 - `edit-guard` is per-file, not per-repo: a marker for one file never
-  unblocks an edit to another file. The marker state lives in a temp-dir
+  unblocks an edit to another file — except the repo-level marker
+  `edit-guard-post` writes when a consultation returned no attributable
+  path (empty result / "no SCIP backend"), which unblocks every file in
+  that repo for the window. The marker state lives in a temp-dir
   JSON file (`$TMPDIR/.codesearch-edit-guard-state.json` /
   `%TEMP%\.codesearch-edit-guard-state.json`), entries expire after
   5 minutes and are pruned on write; missing or corrupt state counts as
   "not consulted" (deny on covered repos, allow everywhere else). Like
   the other guards it is per-machine, not per-repo: it only ever fires
-  on files whose git root is registered with the serve hub.
+  on files whose git root is registered with the serve hub. The gate keys
+  on extension: docs/markup/config (`.md`, `.json`, ...) pass without any
+  marker; filename-mapped code files (`Dockerfile`, `Makefile`) pass too —
+  rare refactor targets. Scope your consultation with the `project` alias:
+  response paths resolve against that project's registered root, and the
+  repo-level fallback needs it — a projectless `find_impact` that returns
+  no paths writes no marker at all. Known limit: in a `CODESEARCH_SERVER`
+  pure-remote setup there is no local registry, so neither the
+  response-path resolution nor the repo fallback can attribute a marker —
+  there the guard demands a file-ish input field and nothing else
+  satisfies it.
 - Both hooks are per-machine, not per-repo: install once at user scope and
   every project benefits, including ones not registered with the serve
   hub (the guard simply won't block Grep there, since coverage fails

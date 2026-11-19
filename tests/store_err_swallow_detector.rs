@@ -23,6 +23,7 @@
 //! A call wrapped across lines so the `.ok()` lands on the next line escapes
 //! Rule A; the compliant population is written on one line and rustfmt keeps
 //! it that way at these widths.
+mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,7 +32,8 @@ use std::path::{Path, PathBuf};
 /// files, which construct fixtures and may name the APIs directly.
 fn mcp_sources(repo_root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let dir = repo_root.join("src").join("mcp");
+    // MCP handlers moved to codesearch-core with the workspace split.
+    let dir = repo_root.join("core").join("src").join("mcp");
     let Ok(entries) = fs::read_dir(&dir) else {
         panic!("cannot read {}", dir.display());
     };
