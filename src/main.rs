@@ -1,35 +1,24 @@
 mod bench;
-mod cache;
-mod chunker;
 mod cli;
-mod constants;
-mod db_discovery;
-mod embed;
-mod federation;
-mod file;
-mod fts;
 mod index;
-mod limits;
-mod lmdb_registry;
-mod logger;
-mod mcp;
-mod output;
-mod rerank;
 mod search;
 mod serve;
-mod symbols;
-#[cfg(test)]
-mod testing;
-mod vectordb;
 mod watch;
 
 use anyhow::Result;
+use codesearch::*;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> Result<()> {
+    // The workspace split put CARGO_PKG_VERSION of `codesearch-core` at 0.x
+    // while the CLI (and the deployed helper) carry the product version; core
+    // code comparing itself against a deployed artifact must see the CLI's
+    // version. Set before anything that can log a version mismatch.
+    codesearch::set_app_version(env!("CARGO_PKG_VERSION"));
+
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(run());
     // Blocking tasks in a restore wait poll this flag (csharp.rs); setting it
@@ -89,8 +78,13 @@ async fn run() -> Result<()> {
         // IMPORTANT: Use stderr — stdout is reserved for program output
         tracing_subscriber::registry()
             .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| format!("codesearch={}", log_level_str).into()),
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    format!(
+                        "codesearch={},codesearch_core={}",
+                        log_level_str, log_level_str
+                    )
+                    .into()
+                }),
             )
             .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
             .init();

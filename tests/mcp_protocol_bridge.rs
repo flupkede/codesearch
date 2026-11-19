@@ -13,6 +13,7 @@
 //!   every `tools/list` result carries `"resultType":"complete"`;
 //! - initialize offering `2025-11-25`: stock legacy negotiation, `tools/list`
 //!   keeps the historical shape (no `resultType` field at all).
+mod common;
 
 use serde_json::{json, Value};
 use std::io::Write;

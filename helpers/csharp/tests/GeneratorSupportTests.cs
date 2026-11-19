@@ -1,4 +1,5 @@
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.MSBuild;
 using Xunit;
 using ScipCsharp;
@@ -48,7 +49,13 @@ public class GeneratorSupportTests
             .ToList();
         Assert.True(errors.Count == 0,
             "expected zero compilation errors after the generator run, got: " +
-            string.Join(" | ", errors.Take(5).Select(e => e.ToString())));
+            string.Join(" | ", errors.Take(5).Select(e => e.ToString())) +
+            " || context: additionalDocuments=[" +
+            string.Join(", ", project.AdditionalDocuments.Select(d => Path.GetFileName(d.FilePath!))) +
+            "], analyzerReferences=[" +
+            string.Join(", ", project.AnalyzerReferences.OfType<AnalyzerFileReference>()
+                .Select(a => a.FullPath)) +
+            "], syntaxTrees=" + compilation.SyntaxTrees.Count());
 
         // And the generated component type itself must be reachable through
         // the same symbol walk the indexer uses (it used to be missing

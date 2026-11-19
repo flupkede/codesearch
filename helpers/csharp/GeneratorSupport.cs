@@ -64,7 +64,22 @@ public static class GeneratorSupport
             var parseOptions = (CSharpParseOptions)csharp.SyntaxTrees.First().Options;
 
             var driver = CSharpGeneratorDriver.Create(generators, additionalTexts, parseOptions, optionsProvider);
-            driver.RunGeneratorsAndUpdateCompilation(csharp, out var output, out _);
+            driver.RunGeneratorsAndUpdateCompilation(csharp, out var output, out var runDiagnostics);
+            // A generator that fails INTERNALLY (version skew between the SDK's
+            // Razor generator and the host's pinned Roslyn is the known case)
+            // does not throw here: the driver records it in the run diagnostics
+            // and the output compilation simply lacks the generated trees, so
+            // CS0103-style cascades would render as if no generator ever ran.
+            // Surface those diagnostics — outcome stays Ran.
+            var failing = runDiagnostics
+                .Where(d => d.Severity >= DiagnosticSeverity.Warning)
+                .ToList();
+            if (failing.Count > 0)
+                Console.Error.WriteLine(
+                    "[INFO] Source generator run reported {0} diagnostic(s) for {1}: {2}. " +
+                    "Generated-only declarations (e.g. Razor components) may be missing from this project's symbols.",
+                    failing.Count, project.Name,
+                    string.Join(" | ", failing.Take(5).Select(d => d.ToString())));
             return (output, GeneratorRunOutcome.Ran);
         }
         catch (Exception ex)

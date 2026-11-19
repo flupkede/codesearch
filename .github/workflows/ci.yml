@@ -20,7 +20,12 @@ on:
     # When adding a new branch-naming convention, ADD IT HERE. To verify a
     # branch is actually covered, check that `gh pr checks <n>` lists the CI
     # jobs and not just CodeQL.
-    branches: [develop, master, "feature/**", "features/**", "fix/**", "chore/**"]
+    #
+    # `dependabot/**` is in so dependency PRs actually run fmt/clippy/tests —
+    # without it they arrive green with only CodeQL and a cargo bump can land
+    # on develop untested (the exact silent-gap shape this allowlist warns
+    # about).
+    branches: [develop, master, "feature/**", "features/**", "fix/**", "chore/**", "dependabot/**"]
 
 # Cancel a stale in-flight run when the same branch is pushed again before the
 # previous run finished — e.g. a stage commit immediately followed by a
@@ -60,10 +65,15 @@ jobs:
       # tag time). `cargo test --lib` below already compiles what it needs in
       # debug profile; the release build was pure wasted CI minutes on every
       # push, duplicated across every feature-branch push AND its develop merge.
-      - run: cargo test --lib -- --nocapture
-      - run: cargo test --test '*' -- --nocapture --skip ignore
-      - run: cargo fmt -- --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo test --workspace --lib -- --nocapture
+      - run: cargo test --workspace --test '*' -- --nocapture --skip ignore
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The opt-in `load-dynamic` build (ONNX Runtime loaded at runtime, for
+      # CPUs without AVX2) links ONNX Runtime differently from the default
+      # build, so a check keeps it from rotting. Check-only: no ONNX Runtime
+      # library is needed and nothing is linked.
+      - run: cargo clippy --no-default-features --features load-dynamic --all-targets -- -D warnings
 
   test-windows:
     runs-on: windows-latest
@@ -82,8 +92,8 @@ jobs:
             ~/.cargo/git/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - run: cargo test --lib -- --nocapture
-      - run: cargo test --test '*' -- --nocapture --skip ignore
+      - run: cargo test --workspace --lib -- --nocapture
+      - run: cargo test --workspace --test '*' -- --nocapture --skip ignore
 
   csharp-integration-tests:
     runs-on: ubuntu-latest
@@ -101,16 +111,27 @@ jobs:
         run: |
           if [ -z "${{ github.event.before }}" ] || ! git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"   # new branch / force-push base gone — be safe, run it
-          elif git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -q '^helpers/csharp/'; then
+          elif git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -qE '^helpers/csharp/|^global\.json$'; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
           else
             echo "relevant=false" >> "$GITHUB_OUTPUT"
           fi
       # pin@v4
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
         if: steps.changed.outputs.relevant == 'true'
         with:
-          dotnet-version: '10.0.x'
+          # Pinned to the exact SDK the suite is developed/verified against.
+          # The runner image ships .NET 11 SDK bands alongside 10.x (11.0.100
+          # since 2026-11-15) and `dotnet` resolves the LATEST installed one,
+          # whose Razor generator the host's pinned Roslyn 4.13 cannot drive —
+          # it runs WITHOUT output and the Blazor fixture fails with CS0103.
+          # The repo-root global.json makes every dotnet command (restore,
+          # test, the helper's global.json-pin registration) resolve this
+          # band; keep this pin and that file in sync.
+          dotnet-version: '10.0.403'
+      - name: Log SDK version
+        if: steps.changed.outputs.relevant == 'true'
+        run: dotnet --version
       # The xunit suite (models, key format, workspace/restore policy and the
       # Blazor generator integration pin) must run in CI: until now only the
       # cargo integration tests ran here, so a helper regression the xunit

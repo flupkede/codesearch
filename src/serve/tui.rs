@@ -470,6 +470,33 @@ async fn run_tui_loop(
                             flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
                         }
                     },
+                    KeyAction::Compact(idx) => match rows.get(idx) {
+                        Some(row) if !row.is_remote => {
+                            let alias = row.alias.clone();
+                            let state_clone = state.clone();
+                            flash = Some((
+                                format!("🧹 compacting '{alias}' … (runs in background)"),
+                                std::time::Instant::now(),
+                            ));
+                            tokio::spawn(async move {
+                                match state_clone.compact_repo(&alias).await {
+                                    Ok(outcome) => {
+                                        tracing::info!(
+                                            "🧹 compact '{}' finished: {:.1} MB freed",
+                                            alias,
+                                            outcome.freed_bytes() as f64 / (1024.0 * 1024.0)
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("⚠️ TUI compact '{}' failed: {e:#}", alias);
+                                    }
+                                }
+                            });
+                        }
+                        _ => {
+                            flash = Some((REMOTE_ACTION_NA.to_string(), std::time::Instant::now()));
+                        }
+                    },
                     KeyAction::RequestRemove(idx) => match rows.get(idx) {
                         Some(row) if !row.is_remote => {
                             overlay = Some(OverlayState::ConfirmRemove {
@@ -1099,6 +1126,7 @@ pub(crate) fn build_info_overlay(alias: &str, state: &Arc<ServeState>) -> Option
     let mut model = String::from("unknown");
     let mut lock = String::from("—");
     let mut index_age = String::from("—");
+    let mut last_compact = String::from("never");
 
     // Read model + dims from metadata.json
     if let Ok(content) = std::fs::read_to_string(db_path.join("metadata.json")) {
@@ -1124,6 +1152,13 @@ pub(crate) fn build_info_overlay(alias: &str, state: &Arc<ServeState>) -> Option
             if let Some(indexed_at) = json.get("indexed_at").and_then(|v| v.as_str()) {
                 index_age = format_age(indexed_at);
             }
+
+            // Last compaction stamp (unix ms from the compact/auto-compact paths)
+            last_compact = json
+                .get("last_compact_unix_ms")
+                .and_then(|v| v.as_u64())
+                .map(ms_to_age_or_never)
+                .unwrap_or_else(|| "never".to_string());
         }
     }
 
@@ -1167,6 +1202,7 @@ pub(crate) fn build_info_overlay(alias: &str, state: &Arc<ServeState>) -> Option
         dims,
         lock,
         index_age,
+        last_compact,
         symbol_warnings,
         symbol_index,
         copy_feedback: None,
@@ -1194,6 +1230,30 @@ fn build_remote_info_overlay(row: &RepoRow) -> OverlayState {
         // Index stats (chunks/files/db-size/model) live on the peer and are
         // fetched asynchronously; start in the loading state.
         stats: RemoteStatsState::Loading,
+    }
+}
+
+/// Human text for metadata's `last_compact_unix_ms` stamp. `pub(crate)`:
+/// the REST info handler renders the same stamp so the TUI and /info
+/// cannot disagree.
+pub(crate) fn ms_to_age_or_never(ms: u64) -> String {
+    if ms == 0 {
+        return "never".to_string();
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+        .saturating_sub(ms)
+        / 1000;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
     }
 }
 

@@ -6,7 +6,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/flupkede/codesearch?include_prereleases)](https://github.com/flupkede/codesearch/releases)
 [![GitHub stars](https://img.shields.io/github/stars/flupkede/codesearch?style=social)](https://github.com/flupkede/codesearch/stargazers)
 
-**Multi-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid retrieval, symbol navigation, and cross-repository orchestration. Fully local, fully offline, no GPU, no Docker.**
+**Multi-repo semantic code search for AI agents — a Rust MCP server with vector + BM25 hybrid retrieval, symbol navigation, and cross-repository orchestration. Local and offline by default, with optional remote embeddings. No GPU or Docker required.**
 
 codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) deep codebase understanding through 5 unified MCP tools. Index once, search semantically across multiple repositories simultaneously.
 
@@ -17,7 +17,7 @@ codesearch gives AI agents (OpenCode, Claude Code, Cursor, and any MCP client) d
 - **Symbol navigation**: Jump to definitions, find usages, trace imports and dependents — in the same tool
 - **AST-aware chunking**: Tree-sitter parsing for 17 languages — chunks align to functions/classes (and Markdown sections), not arbitrary line ranges
 - **Token-efficient**: Returns metadata by default; agents fetch full code only when needed via `get_chunk`
-- **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only, no runtime model downloads (works behind enterprise proxies)
+- **Lightweight footprint**: Hundreds of MB on disk, runs on CPU only; local embedding inference works offline after the one-time model download
 - **Zero config for single repos**: `codesearch index && codesearch mcp` — done
 
 ## How does this compare?
@@ -28,11 +28,21 @@ The MCP code-search ecosystem grew rapidly in late 2025 / early 2026 and many pr
 |---|---|---|
 | Repository scope | Multi-repo serve with cross-repo RRF | Usually single repo at a time |
 | Footprint | ~hundreds of MB, CPU-only, no Docker | GB-scale, GPU, Docker, or cloud |
-| Enterprise / offline | No runtime fetches; static binary | Often pulls models at first run |
+| Enterprise / offline | Offline by default after one-time model download; optional remote embeddings | Often pulls models at first run |
 | Symbol navigation | `find` (def/usages/imports/dependents) co-located with semantic search | Often a separate code-graph tool |
 | Token cost per call | `compact=true` by default; chunks fetched on demand | Frequently dumps full snippets |
 
-codesearch is intentionally narrower than full code-graph or knowledge-graph tools — it picks "lightweight, multi-repo, MCP-native, fully offline" and stays on that lane.
+codesearch is intentionally narrower than full code-graph or knowledge-graph tools — it focuses on lightweight, multi-repo, MCP-native search, offline by default.
+
+### Local vs. remote embeddings
+
+| Capability | Local embeddings (default) | Remote embeddings (opt-in) |
+|---|---|---|
+| Inference | fastembed / ONNX on your CPU | OpenAI-compatible HTTP endpoint |
+| Network | Offline after one-time model download | Endpoint required for indexing and semantic search |
+| Code privacy | Chunks and queries stay local for inference | Chunks and queries sent to endpoint and downstream backend |
+
+See [Embedding model](#embedding-model) for configuration and reindexing requirements.
 
 ## Architecture
 
@@ -75,6 +85,19 @@ graph TB
 
     Router -->|client mode| ServeRouter
 ```
+
+### Repository layout
+
+The codebase is a Cargo workspace:
+
+| Crate | Path | Contents |
+|---|---|---|
+| `codesearch` | `src/` | CLI binary + commands, LMDB storage backend, serve orchestration (axum REST, TUI, file watching), index lifecycle |
+| `codesearch-core` | `core/` | Shared library: chunking, embeddings, retrieval (vector/BM25/RRF/rerank), SCIP symbols, federation, db-discovery, MCP protocol |
+| `codesearch-server` | `server/` | Placeholder for the upcoming standalone HTTP serve binary (GH #384) |
+
+The CLI re-exports the moved core modules under their historical `codesearch::` paths, so
+`use codesearch::chunker::Chunk;` and friends keep working.
 
 ## Quick Start
 
@@ -122,6 +145,21 @@ cd codesearch
 cargo build --release
 ```
 
+#### CPUs without AVX2
+
+The default build links the prebuilt ONNX Runtime that the `ort` crate downloads at build time. On x86_64 those binaries require AVX2, so on older CPUs (for example Sandy Bridge / Ivy Bridge Xeons) codesearch stops with an error naming the fix before it ever embeds — the prebuilt binaries would crash with `SIGILL` (illegal instruction) at first use. Microsoft's official ONNX Runtime releases pick their CPU code paths at runtime and run on these CPUs. Build with the `load-dynamic` feature to load such a release at runtime:
+
+```bash
+cargo build --release --no-default-features --features load-dynamic
+
+# ONNX Runtime 1.31.x or newer (the API version this build targets)
+curl -fsSLO https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz
+tar xzf onnxruntime-linux-x64-1.31.0.tgz
+export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so"
+```
+
+`ORT_DYLIB_PATH` points at the ONNX Runtime shared library; a relative path is tried against the codesearch binary's directory first. When it is unset, `libonnxruntime.so` (`libonnxruntime.dylib`, `onnxruntime.dll`) is looked up on the system library search path. A missing library, or one older than 1.31, makes codesearch exit with an error that names the path it tried.
+
 ### Index a repository
 
 ```bash
@@ -155,7 +193,54 @@ spaces are model-specific. Keep the same model selected for later indexing runs.
 Search rejects a `--model` value that differs from the indexed model and points
 to the required `--force` rebuild instead of mixing incompatible vector spaces.
 
-In **serve** mode the model is resolved **per repository**, from each index's own
+By default, **fastembed** keeps all embedding inference local and offline (after
+its one-time model download). Optional OpenAI-compatible HTTP embeddings use
+**one active strategy** for the entire process/install, not per-repository
+endpoints. No remote service is contacted unless explicitly configured.
+
+For example, run a LiteLLM proxy with a Bedrock embedding deployment:
+
+```yaml
+# LiteLLM proxy config.yaml (AWS credentials belong to the proxy, not codesearch)
+model_list:
+  - model_name: bedrock-embed
+    litellm_params:
+      model: bedrock/amazon.titan-embed-text-v2:0
+      aws_region_name: us-east-1
+```
+
+```bash
+# Start your separately installed proxy with the configuration above:
+# litellm --config config.yaml --port 4000
+export CODESEARCH_EMBED_PROVIDER=openai
+export CODESEARCH_EMBED_BASE_URL=http://127.0.0.1:4000/v1
+# Optional for authenticated proxies; never pass a key as a command-line flag.
+export CODESEARCH_EMBED_API_KEY='your-proxy-key'
+codesearch --model bedrock-embed setup
+codesearch --model bedrock-embed index /path/to/project --force
+codesearch serve
+```
+
+The base URL must include the API prefix (for example `/v1`); codesearch appends
+`/embeddings`. Credentials in URLs are rejected. `setup` probes the endpoint and
+persists only nonsecret defaults; it downloads no local model. `doctor` validates
+the active provider and probes remote inference. The key is read only from
+`CODESEARCH_EMBED_API_KEY` and may be omitted for unauthenticated servers.
+**Privacy:** remote mode sends source chunks and queries to the configured
+endpoint and any backend it forwards to. Choose services appropriate for your
+code's confidentiality requirements.
+
+Changing provider, remote model, dimensions, prefixes or input limit requires
+**`--force` reindexing every affected repository**. Incompatible indexes fail
+clearly rather than silently mixing vector spaces. Keep the active remote
+configuration available on subsequent runs. To return to local inference, set
+`CODESEARCH_EMBED_PROVIDER=fastembed` and rebuild with `--force`.
+Remote requests use bounded batches, concurrency, deadlines and retries for
+429/5xx responses. Remote vectors are L2-normalized; local inputs and vectors
+are unchanged. Oversized remote inputs are truncated at a UTF-8 boundary (not
+skipped), so every successfully indexed file remains complete in text search.
+
+In **local fastembed serve** mode the model is resolved **per repository**, from each index's own
 metadata, not from a hub-wide setting: a hub may hold indexes built with
 different models, and every query is embedded with the model of the repo it
 targets (mixed-model groups are fine). `codesearch serve --model <name>` sets a
@@ -263,7 +348,7 @@ OpenCode: put this in the user-level `~/.config/opencode/AGENTS.md` (applies acr
 To make the preference **structural** instead of advisory, this repo ships five Claude Code hooks (four `PreToolUse` guards plus one `PostToolUse` companion):
 
 - **`grep-guard`** — on `Grep`. Blocks a grep against an in-repo path when codesearch covers that repo (the target repo — resolved from the grep target's own git root — is registered with the serve hub in `~/.codesearch/repos.json`, or a `CODESEARCH_SERVER` env var is set for remote-serve setups), with a message telling the model how to load and call codesearch instead. Grep is auto-allowed **only when the serve hub is genuinely down**, established by a live probe of the unauthenticated `/healthz` endpoint (`CODESEARCH_SERVER` > `127.0.0.1:$CODESEARCH_SERVE_PORT` > `127.0.0.1:39725`); only a connection-level failure counts as down. A low-confidence or empty codesearch result is a *successful* call meaning "reformulate the query", so it does **not** open the escape hatch — the deny message steers to `find`/`explore`/a single clean term instead. Greps outside any registered repo are never blocked, and the hook fails open (never traps the model).
-- **`edit-guard`** — on `Edit`/`Write`/`MultiEdit`. Blocks an edit to a file in a codesearch-registered repo until codesearch was consulted for that exact path within the last 5 minutes — `find_impact` for SCIP-backed languages (`.cs .ts .tsx .mts .cts`), `find(kind="usages")` for everything else — making the caller-aware-editing protocol structural. Its companion **`edit-guard-post`** (`PostToolUse`) records the markers on every `find_impact` call and every `find(kind="usages")`; any outcome counts ("no results" included), so the guard can never wedge. Unregistered repos, non-git paths and hook failures fail open.
+- **`edit-guard`** — on `Edit`/`Write`/`MultiEdit`. Blocks an edit to a code file in a codesearch-registered repo until codesearch was consulted for that exact path within the last 5 minutes — `find_impact` for SCIP-backed languages (`.cs .ts .tsx .mts .cts`), `find(kind="usages")` for other source code; docs, markup and config files (`.md`, `.json`, ...) are never gated, a usages lookup answers nothing there — making the caller-aware-editing protocol structural. Its companion **`edit-guard-post`** (`PostToolUse`) records the markers on every `find_impact` call and every `find(kind="usages")`; any outcome counts ("no results" included), so the guard can never wedge. Unregistered repos, non-git paths and hook failures fail open.
 - **`subagent-preamble`** — on `Agent` (the subagent-spawn tool). Prepends a short codesearch preamble to every subagent prompt, since subagents otherwise don't inherit `AGENTS.md` or MCP instructions at all — including the edit-guard protocol above.
 - **`web-guard`** — on `WebSearch`/`WebFetch`. When you have remote documentation projects mounted (`codesearch remote mount`, e.g. `cloud/inriver`, `cloud/example-dam`), it blocks the first web call with guidance to search those indexed mounts first — often more precise and current than the open web. Same 5-minute retry-escape; when no mounts are configured it does nothing.
 
@@ -392,6 +477,7 @@ This starts a background HTTP server with:
 | `i` | Show info overlay (chunks, files, model, DB size) |
 | `d` | Run doctor diagnostics on selected repo |
 | `n` | Force reindex selected repo |
+| `c` | Compact selected repo's LMDB index (frees dead pages; see `codesearch index compact`) |
 | `r` | Remove selected repo (with confirmation dialog) |
 | `l` | Reload repos config from disk |
 | `q` | Quit serve |
@@ -407,6 +493,15 @@ codesearch index add /path/to/my-project
 # Remove a repo
 codesearch index rm /path/to/my-project
 
+# Free LMDB dead pages (VACUUM): rewrite data.mdb live-pages-only.
+# The idle reaper does this automatically for active repos every
+# CODESEARCH_COMPACT_INTERVAL_DAYS (default 5), after they go idle.
+codesearch index compact my-project
+
+# Remove AND tombstone the alias: re-registration via `index add` is
+# refused until explicitly cleared with `index add --force`
+codesearch index rm custom --forget
+
 # List registered repos
 codesearch index list
 
@@ -414,6 +509,10 @@ codesearch index list
 # serve also does this itself at startup and on every status refresh)
 codesearch index prune
 ```
+
+A tombstoned alias (written to `~/.codesearch/removed_aliases.json`) stays
+removed even when something tries to re-add it — the registration attempt is
+refused with the removal date named, and `index add --force` clears the marker.
 
 Serve reads `~/.codesearch/repos.json` on startup and manages all registered repos.
 
@@ -604,11 +703,24 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_HOME` | Relocate the entire global root (`repos.json`, models cache, logs, `serve_url`, global ignore/extension files) away from `~/.codesearch`. Must be an absolute path; unset = `~/.codesearch`. Per-file overrides like `CODESEARCH_REPOS_CONFIG` still win |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
+| `CODESEARCH_WARMUP_MAX_AGE_DAYS` | Repos not used within this many days are not opened by the serve's startup warmup — they lazy-open on the first tool call that names them. `0` disables the gate and warms every registered repo (default: 5). Bounds the resident mapped-index footprint on machines with many registered repos. The same gate skips the phase-2 startup symbol rebuilds for unused repos — they converge via watcher/branch changes or an explicit reindex instead, and the rebuild wave parks while foreground queries are active (a search on an unopened repo has priority; cold opens only take the process-wide job permit when an HNSW build is actually needed) |
+| `CODESEARCH_PHASE2_SYMBOL_REBUILD` | `0` skips the phase-2 startup symbol-rebuild pass entirely (rebuilds defer to the watcher, branch changes, or an explicit reindex). Useful when a registry of stale C# repos must not trigger solution-wide scip-csharp compiles right after boot |
+| `CODESEARCH_COMPACT_INTERVAL_DAYS` | Idle-reaper auto-compact cadence: a repo evicted after being idle longer than this is compacted (LMDB `data.mdb` rewritten live-pages-only, freelist dead pages dropped — `last_compact_unix_ms` in its metadata.json tracks the run). `0` disables auto-compaction; `codesearch index compact <alias>` always works (default: 5, settle delay 30 s after eviction) |
 | `CODESEARCH_STORE_LOCK_WAIT_SECS` | Bounded wait for a store's write lock before a single-project query reports the store busy (default: 300). Multi-repo fan-outs never wait — they skip the busy repo with a warning |
 | `CODESEARCH_MODEL_LOAD_TIMEOUT_SECS` | Bound on a cold-cache embedding-model load (default: 600). On expiry the loader fails fast with a hint to pre-populate the cache via `codesearch setup`; search itself only uses models already loaded or provably on disk |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
 | `CODESEARCH_MAX_LMDB_MAP_SIZE_MB` | Hard cap (MB) for LMDB auto-resize on `MDB_MAP_FULL`, applied to both the vector store and the persistent embedding cache (default: 16384 = 16GB; clamped to at least 1024). Raise this for very large corpora (millions of chunks) that legitimately exceed the default cap — see #189. |
-| `CODESEARCH_BATCH_SIZE` | Embedding batch size |
+| `CODESEARCH_BATCH_SIZE` | Local ONNX embedding batch size |
+| `CODESEARCH_EMBED_PROVIDER` | `fastembed` (default) or `openai`; one active strategy per process/install (`--embed-provider`) |
+| `CODESEARCH_EMBED_BASE_URL` | Explicit OpenAI-compatible API base URL, e.g. `http://localhost:4000/v1`; no default (`--embed-base-url`) |
+| `CODESEARCH_EMBED_API_KEY` | Optional bearer key for embedding requests; environment only, never persisted |
+| `CODESEARCH_EMBED_DIMENSIONS` | Optional requested remote dimensions; otherwise discovered once by a probe (`--embed-dimensions`) |
+| `CODESEARCH_EMBED_BATCH_SIZE` | Remote inputs per HTTP request (default: 32; `--embed-batch-size`) |
+| `CODESEARCH_EMBED_TIMEOUT_SECS` | Remote operation deadline including queue/retries (default: 30; `--embed-timeout-secs`) |
+| `CODESEARCH_EMBED_CONCURRENCY` | Max concurrent remote requests (default: 2; `--embed-concurrency`) |
+| `CODESEARCH_EMBED_QUERY_PREFIX` | Remote query prefix (default: empty; `--embed-query-prefix`) |
+| `CODESEARCH_EMBED_DOCUMENT_PREFIX` | Remote document prefix (default: empty; `--embed-document-prefix`) |
+| `CODESEARCH_EMBED_MAX_INPUT_BYTES` | Remote UTF-8 input limit including prefix (default: 24000; `--embed-max-input-bytes`) |
 | `CODESEARCH_INCREMENTAL_BATCH_SIZE` | Files read/chunked per incremental-refresh batch (default: 200) |
 | `CODESEARCH_INDEX_JOBS` | Max concurrent heavy repo jobs — refresh / reindex / HNSW build — in one serve process (default: 1; queries are never gated). See [Indexing limits](#indexing-limits) |
 | `CODESEARCH_EMBED_THREADS` | ONNX intra-op threads per embedding session (unset = ONNX default, all cores) |
@@ -617,6 +729,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_MAX_CHUNKS_PER_BATCH` | Hard cap on chunks held in memory per refresh batch; splits the batch early (default: 0 = disabled) |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
 | `CODESEARCH_EXTENSION_MAP` | Path to the extension→language map (default: `~/.codesearch/extensions.json`) — see [Extension map](#extension-map) |
+| `ORT_DYLIB_PATH` | `load-dynamic` builds only: path of the ONNX Runtime shared library (1.31 or newer) — see [CPUs without AVX2](#cpus-without-avx2) |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |
 
 ### Indexing limits
@@ -656,7 +769,8 @@ Environment=CODESEARCH_INCREMENTAL_BATCH_SIZE=100
 Environment=CODESEARCH_MAX_CHUNKS_PER_BATCH=5000
 Environment=CODESEARCH_EMBED_PAUSE_MS=25
 Environment=CODESEARCH_MIN_FREE_MB=4096
-# C# SCIP helpers are bounded separately; lower it for the same reason.
+# C# SCIP helpers are bounded separately; the default is now 1 —
+# an explicit 2+ opts back into concurrent solution compiles.
 Environment=CSHARP_SCIP_CONCURRENCY=1
 ```
 

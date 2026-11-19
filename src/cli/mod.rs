@@ -1,12 +1,18 @@
 use anyhow::Result;
-use clap::{builder::BoolishValueParser, ArgAction, Parser, Subcommand};
+use clap::{
+    builder::BoolishValueParser, ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand,
+};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
+
+mod mcp_runtime;
+
+use mcp_runtime::{run_mcp_server, run_mcp_server_with_options, McpStartupOptions};
 
 use crate::constants::{
     DEFAULT_SERVE_URL, REPO_REINDEX_PATH_PREFIX, REPO_REINDEX_PATH_SUFFIX, SERVE_PORT_ENV,
 };
-use crate::embed::ModelType;
+use crate::embed::EmbeddingModel;
 use crate::search::SearchOptions;
 
 /// Index subcommands
@@ -38,6 +44,10 @@ pub enum IndexCommands {
         /// When set, <path> is a path on the remote's filesystem.
         #[arg(long)]
         remote: Option<String>,
+
+        /// Override a `--forget` tombstone on this alias (clears it on success).
+        #[arg(short = 'f', long)]
+        force: bool,
     },
 
     /// Remove the index (local or global, auto-detected)
@@ -54,6 +64,11 @@ pub enum IndexCommands {
         /// Remove a repo from a remote peer. The positional arg is a remote alias.
         #[arg(long)]
         remote: Option<String>,
+
+        /// Record a tombstone: future `index add` re-registration of this
+        /// alias is refused until cleared with `index add --force`.
+        #[arg(long)]
+        forget: bool,
     },
 
     /// Show index status (local, global, or on a remote peer)
@@ -94,6 +109,12 @@ pub enum IndexCommands {
         /// Output JSON (requires --remote; agent-friendly).
         #[arg(long)]
         json: bool,
+    },
+
+    /// Free LMDB dead pages (VACUUM) for a repository's index
+    Compact {
+        /// Repository alias (required — use "index list" to see aliases)
+        alias: String,
     },
 
     /// Remove stale entries from repos.json (relocates moved repos first)
@@ -260,6 +281,8 @@ pub enum HookClaudeCommands {
 #[command(name = "codesearch")]
 #[command(author, version = env!("CARGO_PKG_VERSION_FULL"), about, long_about = None)]
 pub struct Cli {
+    #[command(flatten)]
+    pub embedding: crate::embed::EmbedConfig,
     #[command(subcommand)]
     pub command: Commands,
 
@@ -759,6 +782,77 @@ async fn trigger_reindex_via_api(alias: &str, force: bool) -> Result<()> {
     }
 }
 
+/// Compact a repo's LMDB index via the serve API; without a running serve,
+/// compact the on-disk index locally (a CLI process holds no LMDB handles,
+/// so a direct disk compact is safe).
+async fn compact_via_api(alias: &str) -> Result<()> {
+    use colored::Colorize;
+
+    let base = serve_base_url();
+    let url = format!("{base}/repos/{alias}/compact");
+
+    println!(
+        "  {} compacting '{}' via {url}",
+        "🧹".yellow(),
+        alias.bright_green()
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1800))
+        .build()?;
+
+    match client.post(&url).send().await {
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            if status.as_u16() == 200 {
+                let freed = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("freed_bytes").and_then(|f| f.as_u64()))
+                    .unwrap_or(0);
+                println!(
+                    "  {} compacted '{}' — {:.1} MB freed and re-stamped for the auto-compact clock",
+                    "✓".green(),
+                    alias,
+                    freed as f64 / (1024.0 * 1024.0)
+                );
+                Ok(())
+            } else if status.as_u16() == 404 {
+                anyhow::bail!(
+                    "Unknown alias '{}' — use `codesearch index list` to see registered repos",
+                    alias
+                );
+            } else if status.as_u16() == 409 {
+                anyhow::bail!(
+                    "'{}' is currently indexing — compact after it finishes",
+                    alias
+                );
+            } else {
+                anyhow::bail!("Serve returned HTTP {}: {}", status.as_u16(), body.trim());
+            }
+        }
+        Err(e) if e.is_connect() => {
+            // No serve: compact this machine's local path directly.
+            let config = crate::db_discovery::load_repos_config()?;
+            let path = config
+                .resolve(alias)
+                .ok_or_else(|| anyhow::anyhow!("Unknown alias '{alias}' (local fallback)"))?;
+            let outcome =
+                codesearch_core::vectordb::compact::compact_db_dir(&path.join(".codesearch.db"))?;
+            println!(
+                "  {} compacted '{}' locally — {:.1} MB freed",
+                "✓".green(),
+                alias,
+                outcome.freed_bytes() as f64 / (1024.0 * 1024.0)
+            );
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!("HTTP request failed: {}", e);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Remote index management (--remote <peer>)
 // ---------------------------------------------------------------------------
@@ -1012,29 +1106,29 @@ async fn run_remote_reindex(peer_name: &str, alias: &str, force: bool, json: boo
     Ok(())
 }
 
-fn warn_if_heavier_model(model_type: ModelType) {
+fn warn_if_heavier_model(model_type: EmbeddingModel) {
     if model_type.is_heavier_than_default() {
         crate::warn_print!(
             "Warning: model '{}' produces {}-dimensional vectors (default: {}). \
              Expect higher vector-index RAM and disk usage.",
             model_type.short_name(),
             model_type.dimensions(),
-            ModelType::default().dimensions()
+            EmbeddingModel::default().dimensions()
         );
     }
 }
 
-/// Resolve a CLI `--model` flag to an optional [`ModelType`].
+/// Resolve a CLI `--model` flag to an optional [`EmbeddingModel`].
 ///
 /// `None` (flag absent) stays `None` so runtime paths keep their per-query
 /// model resolution; an unknown name is rejected with the full valid-model
 /// list. Shared by every command that takes `--model`.
-pub(crate) fn parse_model_arg(model: Option<&str>) -> Result<Option<ModelType>> {
+pub(crate) fn parse_model_arg(model: Option<&str>) -> Result<Option<EmbeddingModel>> {
     match model {
-        Some(name) => ModelType::parse(name).map(Some).ok_or_else(|| {
+        Some(name) => EmbeddingModel::parse(name).map(Some).ok_or_else(|| {
             anyhow::anyhow!(
                 "Unknown model '{name}' (valid models: {})",
-                ModelType::valid_short_names()
+                EmbeddingModel::valid_short_names()
             )
         }),
         None => Ok(None),
@@ -1042,7 +1136,22 @@ pub(crate) fn parse_model_arg(model: Option<&str>) -> Result<Option<ModelType>> 
 }
 
 pub async fn run(cancel_token: CancellationToken) -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let explicit: Vec<String> = matches
+        .ids()
+        .filter(|id| {
+            id.as_str().starts_with("embed_")
+                && matches.value_source(id.as_str())
+                    != Some(clap::parser::ValueSource::DefaultValue)
+        })
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    let cli = Cli::from_arg_matches(&matches)?;
+    let active_model = match &cli.command {
+        Commands::Setup { model } => model.as_deref().or(cli.model.as_deref()),
+        _ => cli.model.as_deref(),
+    };
+    crate::embed::configure(cli.embedding.clone(), active_model, &explicit)?;
 
     // Parse model from CLI flag
     let model_type = parse_model_arg(cli.model.as_deref())?;
@@ -1137,6 +1246,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         local,
                         log_file: add_log_file,
                         remote,
+                        force: add_force,
                     } => {
                         if let Some(peer_name) = &remote {
                             run_remote_add(peer_name, add_path).await
@@ -1151,6 +1261,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                                 local,
                                 add_log_file,
                                 mt,
+                                add_force,
                                 cancel_token.clone(),
                             )
                             .await
@@ -1160,11 +1271,12 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         path: rm_path,
                         keep_config,
                         remote,
+                        forget,
                     } => {
                         if let Some(peer_name) = &remote {
                             run_remote_remove(peer_name, rm_path).await
                         } else {
-                            crate::index::remove_from_index(rm_path, keep_config).await
+                            crate::index::remove_from_index(rm_path, keep_config, forget).await
                         }
                     }
                     IndexCommands::List { remote, json } => {
@@ -1197,6 +1309,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                             trigger_reindex_via_api(&alias, force).await
                         }
                     }
+                    IndexCommands::Compact { alias } => compact_via_api(&alias).await,
                     IndexCommands::Prune => crate::index::prune_index().await,
                 }
             } else {
@@ -1220,12 +1333,13 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                         false,
                         log_file,
                         model_type,
+                        false,
                         cancel_token.clone(),
                     )
                     .await
                 } else if remove || is_rm_cmd {
                     let effective_path = if is_rm_cmd { None } else { path };
-                    crate::index::remove_from_index(effective_path, keep_config).await
+                    crate::index::remove_from_index(effective_path, keep_config, false).await
                 } else if list || is_list_cmd {
                     crate::index::list_index_status().await
                 } else if symbols {
@@ -1289,6 +1403,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     crate::serve::run_tui_standalone(url, api_key).await
                 }
                 crate::cli::ServeAction::Start => {
+                    if crate::embed::active_config().remote() {
+                        EmbeddingModel::ActiveRemote.try_dimensions()?;
+                    }
                     // Initialize serve logger — always logs to ~/.codesearch/logs/serve.log.YYYY-MM-DD
                     // regardless of whether a database exists in the current directory.
                     // This is a central log for the multi-repo serve process, separate from
@@ -1358,9 +1475,9 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             // MCP stdio transport uses stdout for JSON-RPC — always force file-only
             // logging to keep the channel clean, regardless of the global --quiet flag.
             if readonly || require_ready {
-                crate::mcp::run_mcp_server_with_options(
+                run_mcp_server_with_options(
                     path,
-                    crate::mcp::McpStartupOptions {
+                    McpStartupOptions {
                         create_index,
                         readonly,
                         require_ready,
@@ -1372,8 +1489,7 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                 )
                 .await
             } else {
-                crate::mcp::run_mcp_server(path, create_index, log_level, true, mode, cancel_token)
-                    .await
+                run_mcp_server(path, create_index, log_level, true, mode, cancel_token).await
             }
         }
         Commands::Cache { command } => match command {
@@ -1400,7 +1516,7 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
     // Parse model name
     let model_name = model
         .as_deref()
-        .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
+        .map(|m| EmbeddingModel::parse(m).map(|mt| mt.short_name().to_owned()))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
 
     if model_name.is_none() {
@@ -1423,13 +1539,13 @@ async fn run_cache_stats(model: Option<String>) -> Result<()> {
 
     // Show stats for specific model or all models
     if let Some(name) = model_name {
-        let model_cache_dir = cache_dir.join(name);
+        let model_cache_dir = cache_dir.join(&name);
         if !model_cache_dir.exists() {
             eprintln!("No cache found for model: {}", name);
             return Ok(());
         }
 
-        let cache = crate::embed::PersistentEmbeddingCache::open(name)?;
+        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
         let stats = cache.stats()?;
 
         println!("Persistent Cache Statistics ({})", name);
@@ -1482,7 +1598,7 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
     // Parse model name
     let model_name = model
         .as_deref()
-        .map(|m| ModelType::parse(m).map(|mt| mt.short_name()))
+        .map(|m| EmbeddingModel::parse(m).map(|mt| mt.short_name().to_owned()))
         .ok_or_else(|| anyhow::anyhow!("Failed to parse model name"))?;
 
     // Get cache directory
@@ -1515,13 +1631,13 @@ async fn run_cache_clear(model: Option<String>, yes: bool) -> Result<()> {
 
     // Clear cache for specific model or all models
     if let Some(name) = model_name {
-        let model_cache_dir = cache_dir.join(name);
+        let model_cache_dir = cache_dir.join(&name);
         if !model_cache_dir.exists() {
             eprintln!("No cache found for model: {}", name);
             return Ok(());
         }
 
-        let cache = crate::embed::PersistentEmbeddingCache::open(name)?;
+        let cache = crate::embed::PersistentEmbeddingCache::open(&name)?;
         let stats_before = cache.stats()?;
         cache.clear()?;
         eprintln!(
@@ -1889,6 +2005,9 @@ fn codesearch_hook_block() -> String {
 # Only react to branch/worktree checkouts ($3 = 1). `git worktree add` fires
 # post-checkout with flag 1; a file checkout (`git checkout -- path`) fires with
 # flag 0 and must not re-register (it changes no repo location, just wastes a POST).
+# Throwaway checkouts under the OS temp dir are skipped entirely: they are test
+# fixtures / scratch worktrees of unrelated suites, and registering them fills
+# repos.json with aliases whose directory dies with the run.
 __cs_home="${CODESEARCH_HOME:-$HOME/.codesearch}"
 if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
     __cs_url=$(cat "$__cs_home/serve_url")
@@ -1897,11 +2016,40 @@ if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
         # cannot canonicalize (HTTP 400); `pwd -W` yields a native C:/ path.
         # Fall back to plain `pwd` on Linux/macOS where -W is unsupported.
         __cs_path=$(pwd -W 2>/dev/null || pwd)
-        # JSON-escape backslashes, then double quotes (POSIX sed: sh + bash).
-        __cs_path=$(printf '%s' "$__cs_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        curl -s -X POST "$__cs_url/repos" \
-            -H "Content-Type: application/json" \
-            -d "{\"path\":\"$__cs_path\"}" >/dev/null 2>&1 &
+        __cs_tmp_hit=0
+        __cs_p_lc=$(printf '%s' "$__cs_path" | tr '[:upper:]' '[:lower:]' | sed 's|\\|/|g; s|/*$||')
+        # Native-spawned git hands us an 8.3 short TEMP (C:\...\DEVELT~1\...) that
+        # can never prefix-match the long checkout path, so a second comparison
+        # in 8.3 short form (cygpath -m -d) closes that gap. cygpath is absent
+        # on Linux/macOS: the guarded empty check only runs the long compare.
+        __cs_p_83=$(cygpath -m -d "$__cs_path" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        for __cs_dir in "${TMPDIR:-}" "${TMP:-}" "${TEMP:-}" "/tmp"; do
+            [ -n "$__cs_dir" ] || continue
+            __cs_d=$(printf '%s' "$__cs_dir" | tr '[:upper:]' '[:lower:]' | sed 's|\\|/|g; s|/*$||')
+            case "$__cs_p_lc" in
+                "$__cs_d" | "$__cs_d"/*) __cs_tmp_hit=1; break ;;
+            esac
+            __cs_t_83=$(cygpath -m -d "$__cs_dir" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            if [ -n "$__cs_p_83" ] && [ -n "$__cs_t_83" ]; then
+                case "$__cs_p_83" in
+                    "$__cs_t_83" | "$__cs_t_83"/*) __cs_tmp_hit=1; break ;;
+                esac
+            fi
+        done
+        if [ "$__cs_tmp_hit" = "0" ] && [ -n "${LOCALAPPDATA:-}" ]; then
+            # Windows fallback for setups where TMP/TEMP are unset.
+            __cs_d=$(printf '%s/Temp' "$LOCALAPPDATA" | tr '[:upper:]' '[:lower:]' | sed 's|\\|/|g; s|/*$||')
+            case "$__cs_p_lc" in
+                "$__cs_d" | "$__cs_d"/*) __cs_tmp_hit=1 ;;
+            esac
+        fi
+        if [ "$__cs_tmp_hit" = "0" ]; then
+            # JSON-escape backslashes, then double quotes (POSIX sed: sh + bash).
+            __cs_path=$(printf '%s' "$__cs_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            curl -s -X POST "$__cs_url/repos" \
+                -H "Content-Type: application/json" \
+                -d "{\"path\":\"$__cs_path\"}" >/dev/null 2>&1 &
+        fi
     fi
 fi
 "#,
@@ -2164,6 +2312,7 @@ pub mod setup;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // --- post-checkout hook generation / install ---------------------------
 
@@ -2187,6 +2336,38 @@ mod tests {
         assert!(
             block.contains("[ \"$3\" = \"1\" ]"),
             "hook must gate on the branch-checkout flag"
+        );
+    }
+
+    #[test]
+    fn test_hook_block_skips_temp_dir_checkouts() {
+        let block = codesearch_hook_block();
+        // A checkout under the OS temp dir (test fixture, scratch worktree)
+        // must never reach the POST: it pollutes the global repos.json with
+        // an alias whose directory dies with the run.
+        assert!(
+            block.contains("__cs_tmp_hit"),
+            "hook must compute a temp-dir hit flag"
+        );
+        assert!(
+            block.contains("\"${TMPDIR:-}\"") && block.contains("\"${TMP:-}\""),
+            "hook must test the TMPDIR/TMP temp candidates"
+        );
+        assert!(
+            block.contains("cygpath -m -d"),
+            "the 8.3 short-form comparison must be present (native TEMP is DEVELT~1-style)"
+        );
+        // The POST must be gated on the temp check having missed.
+        assert!(
+            block.contains("if [ \"$__cs_tmp_hit\" = \"0\" ]"),
+            "the POST must be gated on the temp-dir check"
+        );
+        // And the check must run before the POST it gates.
+        let guard_pos = block.find("__cs_tmp_hit").expect("guard present");
+        let curl_pos = block.find("curl -s -X POST").expect("POST present");
+        assert!(
+            guard_pos < curl_pos,
+            "temp-dir check must run before the POST"
         );
     }
 
@@ -2251,65 +2432,77 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn refresh_upgrades_an_outdated_managed_block_idempotently() {
-        let (tmp, hook_path) = hook_refresh_fixture();
-        let repo = tmp.path();
-        // A hook written by an OLDER binary: our markers, stale body.
-        let stale = format!(
-            "#!/bin/sh\n# foreign header\necho mine\n{}\nREPO_PATH=\"$(pwd)\"\n{}\necho bye\n",
-            HOOK_BEGIN, HOOK_END
-        );
-        std::fs::write(&hook_path, stale).unwrap();
+        // resolve_hooks_dir shells out to git: clear the hook context this
+        // process inherits under the pre-push QC gate, or `git rev-parse`
+        // resolves the outer repo instead of the fixture.
+        crate::db_discovery::repos::test_support::with_hook_git_env_cleared(|| {
+            let (tmp, hook_path) = hook_refresh_fixture();
+            let repo = tmp.path();
+            // A hook written by an OLDER binary: our markers, stale body.
+            let stale = format!(
+                "#!/bin/sh\n# foreign header\necho mine\n{}\nREPO_PATH=\"$(pwd)\"\n{}\necho bye\n",
+                HOOK_BEGIN, HOOK_END
+            );
+            std::fs::write(&hook_path, stale).unwrap();
 
-        assert_eq!(
-            refresh_codesearch_post_checkout_hook(repo),
-            HookRefreshOutcome::Upgraded
-        );
-        let updated = std::fs::read_to_string(&hook_path).unwrap();
-        // Foreign lines preserved, fresh body swapped in, stale body gone.
-        assert!(updated.contains("echo mine"));
-        assert!(updated.contains("echo bye"));
-        assert!(updated.contains("pwd -W 2>/dev/null || pwd"));
-        assert!(!updated.contains("REPO_PATH=\"$(pwd)\""));
+            assert_eq!(
+                refresh_codesearch_post_checkout_hook(repo),
+                HookRefreshOutcome::Upgraded
+            );
+            let updated = std::fs::read_to_string(&hook_path).unwrap();
+            // Foreign lines preserved, fresh body swapped in, stale body gone.
+            assert!(updated.contains("echo mine"));
+            assert!(updated.contains("echo bye"));
+            assert!(updated.contains("pwd -W 2>/dev/null || pwd"));
+            assert!(!updated.contains("REPO_PATH=\"$(pwd)\""));
 
-        // Second pass over the same file must be a no-op.
-        assert_eq!(
-            refresh_codesearch_post_checkout_hook(repo),
-            HookRefreshOutcome::UpToDate
-        );
+            // Second pass over the same file must be a no-op.
+            assert_eq!(
+                refresh_codesearch_post_checkout_hook(repo),
+                HookRefreshOutcome::UpToDate
+            );
+        });
     }
 
     #[test]
+    #[serial]
     fn refresh_never_touches_foreign_or_missing_hooks() {
-        let (tmp, hook_path) = hook_refresh_fixture();
-        let repo = tmp.path();
+        crate::db_discovery::repos::test_support::with_hook_git_env_cleared(|| {
+            let (tmp, hook_path) = hook_refresh_fixture();
+            let repo = tmp.path();
 
-        // No hook at all → nothing to upgrade, nothing created.
-        assert_eq!(
-            refresh_codesearch_post_checkout_hook(repo),
-            HookRefreshOutcome::NotInstalled
-        );
-        assert!(!hook_path.exists(), "refresh must not install hooks");
+            // No hook at all → nothing to upgrade, nothing created.
+            assert_eq!(
+                refresh_codesearch_post_checkout_hook(repo),
+                HookRefreshOutcome::NotInstalled
+            );
+            assert!(!hook_path.exists(), "refresh must not install hooks");
 
-        // A purely foreign hook → left byte-for-byte alone.
-        let foreign = "#!/bin/sh\necho untouched\n";
-        std::fs::write(&hook_path, foreign).unwrap();
-        assert_eq!(
-            refresh_codesearch_post_checkout_hook(repo),
-            HookRefreshOutcome::Foreign
-        );
-        assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), foreign);
+            // A purely foreign hook → left byte-for-byte alone.
+            let foreign = "#!/bin/sh\necho untouched\n";
+            std::fs::write(&hook_path, foreign).unwrap();
+            assert_eq!(
+                refresh_codesearch_post_checkout_hook(repo),
+                HookRefreshOutcome::Foreign
+            );
+            assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), foreign);
+        });
     }
 
     #[test]
+    #[serial]
     fn refresh_reports_failure_for_a_non_repository() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Neither `git rev-parse` nor the manual `.git` fallback can resolve
-        // a hooks dir here — must degrade to Failed, never panic.
-        assert!(matches!(
-            refresh_codesearch_post_checkout_hook(tmp.path()),
-            HookRefreshOutcome::Failed(_)
-        ));
+        crate::db_discovery::repos::test_support::with_hook_git_env_cleared(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            // Neither `git rev-parse` nor the manual `.git` fallback can resolve
+            // a hooks dir here — must degrade to Failed, never panic.
+            assert!(matches!(
+                refresh_codesearch_post_checkout_hook(tmp.path()),
+                HookRefreshOutcome::Failed(_)
+            ));
+        });
     }
 
     #[test]

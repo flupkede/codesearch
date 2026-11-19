@@ -1128,6 +1128,8 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
             path: repo_path.clone(),
             alias: Some("brandnew".to_string()),
             model: None,
+            // Temporary fixture path: force bypasses the temp-dir throwaway guard.
+            force: Some(true),
         }),
     )
     .await;
@@ -1159,6 +1161,153 @@ async fn add_repo_handler_registers_brand_new_repo_without_rollback() {
     );
 }
 
+/// `index rm --forget` records the alias; a later `POST /repos` for it must
+/// be refused (409) without touching repos.json — whatever re-adds a removed
+/// repo now fails loudly. `force=true` re-registers and clears the marker.
+#[tokio::test]
+#[serial]
+async fn add_repo_handler_refuses_tombstoned_alias_and_force_clears_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("custom");
+    std::fs::create_dir(&repo_path).unwrap();
+    // Tombstone writes panic under test unless CODESEARCH_HOME is relocated.
+    let _home = crate::testing::EnvRestore::set(&[(
+        crate::constants::CODESEARCH_HOME_ENV,
+        tmp.path().to_str().unwrap(),
+    )]);
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
+    let state = Arc::new(state_with_config(ReposConfig::default()));
+
+    crate::db_discovery::repos::tombstone_alias("custom").unwrap();
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("custom".to_string()),
+            model: None,
+            force: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "tombstoned alias must be refused, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        !state.config_snapshot().repos.contains_key("custom"),
+        "tombstoned alias must NOT be registered"
+    );
+
+    // force=true re-registers and clears the marker.
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: Some("custom".to_string()),
+            model: None,
+            force: Some(true),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::ACCEPTED,
+        "forced add must be accepted, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        state.config_snapshot().repos.contains_key("custom"),
+        "forced add must register the alias"
+    );
+    assert!(
+        crate::db_discovery::repos::tombstone_date("custom").is_none(),
+        "a successful forced add clears the tombstone"
+    );
+}
+
+/// A path under the OS temp dir is a throwaway checkout (test fixture or
+/// scratch worktree — the machine-global post-checkout hook POSTs every
+/// `git worktree add`, including temp fixtures of unrelated test suites).
+/// The handler must refuse it with 400 unless the caller forces it; a forced
+/// call skips the temp guard and proceeds to the regular registration flow
+/// (proven here by the later "already registered" conflict on the same path).
+#[tokio::test]
+#[serial_test::serial]
+async fn add_repo_handler_refuses_temp_dir_paths_unless_forced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("fixture");
+    std::fs::create_dir(&repo_path).unwrap();
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
+
+    // Seed the fixture as already registered so the forced call stops at the
+    // duplicate conflict instead of opening stores / spawning a reindex.
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("fixture".to_string()))
+        .unwrap();
+    let state = Arc::new(state_with_config(config));
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: None,
+            model: None,
+            force: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "temp-dir registration must be refused, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        body.0
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| e.contains("temp")),
+        "refusal must name the temp-dir reason, got: {}",
+        body.0
+    );
+
+    // force=true bypasses the temp guard: the same path now reaches the
+    // regular duplicate check (409 already-registered), proving the guard —
+    // not something else — produced the 400 above.
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: None,
+            model: None,
+            force: Some(true),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "forced add must skip the temp guard and hit the duplicate conflict, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        body.0
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| e.contains("already registered")),
+        "expected the already-registered conflict, got: {}",
+        body.0
+    );
+}
+
 /// `POST /repos` with no explicit `model` must create a brand-new index at the
 /// serve-wide default's dimension (`codesearch serve --model X`), not the
 /// built-in 384-dim default. This is the write-side counterpart of the per-repo
@@ -1175,8 +1324,9 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
     std::fs::create_dir(&repo_path).unwrap();
 
     let state = Arc::new(
-        state_with_config(ReposConfig::default())
-            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+        state_with_config(ReposConfig::default()).with_default_model(Some(
+            crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        )),
     );
 
     let (status, body) = add_repo_handler(
@@ -1185,6 +1335,8 @@ async fn add_repo_handler_uses_serve_default_model_for_new_index() {
             path: repo_path.clone(),
             alias: Some("defaulted".to_string()),
             model: None,
+            // Temporary fixture path: force bypasses the temp-dir throwaway guard.
+            force: Some(true),
         }),
     )
     .await;
@@ -1236,8 +1388,9 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
     .unwrap();
 
     let state = Arc::new(
-        state_with_config(ReposConfig::default())
-            .with_default_model(Some(crate::embed::ModelType::EmbeddingGemma300MQ4)),
+        state_with_config(ReposConfig::default()).with_default_model(Some(
+            crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
+        )),
     );
 
     let (status, body) = add_repo_handler(
@@ -1246,6 +1399,8 @@ async fn add_repo_handler_keeps_recorded_model_over_serve_default() {
             path: repo_path.clone(),
             alias: Some("existing".to_string()),
             model: None,
+            // Temporary fixture path: force bypasses the temp-dir throwaway guard.
+            force: Some(true),
         }),
     )
     .await;
@@ -1349,6 +1504,8 @@ async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
             path: repo_path.clone(),
             alias: Some("adopted".to_string()),
             model: None,
+            // Temporary fixture path: force bypasses the temp-dir throwaway guard.
+            force: Some(true),
         }),
     )
     .await;
@@ -1399,8 +1556,8 @@ async fn add_repo_handler_adopts_existing_index_instead_of_rebuilding() {
 #[test]
 fn resolve_add_repo_model_precedence() {
     use crate::embed::ModelType;
-    let gemma = ModelType::EmbeddingGemma300MQ4;
-    let mini = ModelType::AllMiniLML6V2Q;
+    let gemma = crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4);
+    let mini = crate::embed::EmbeddingModel::Local(ModelType::AllMiniLML6V2Q);
 
     // Explicit model always wins, even over a recorded model and a default.
     assert_eq!(
@@ -1423,8 +1580,8 @@ fn resolve_add_repo_model_precedence() {
 #[test]
 fn should_adopt_existing_index_precedence() {
     use crate::embed::ModelType;
-    let gemma = ModelType::EmbeddingGemma300MQ4;
-    let mini = ModelType::AllMiniLML6V2Q;
+    let gemma = crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4);
+    let mini = crate::embed::EmbeddingModel::Local(ModelType::AllMiniLML6V2Q);
 
     // No index on disk → nothing to adopt, force-build.
     assert!(!should_adopt_existing_index(None, None));
@@ -1447,15 +1604,21 @@ fn should_adopt_existing_index_precedence() {
 fn serve_default_model_is_service_fallback() {
     use crate::embed::ModelType;
     let state = std::sync::Arc::new(
-        ServeState::new(ReposConfig::default(), None)
-            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+        ServeState::new(ReposConfig::default(), None).with_default_model(Some(
+            crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4),
+        )),
     );
-    assert_eq!(state.default_model(), Some(ModelType::EmbeddingGemma300MQ4));
+    assert_eq!(
+        state.default_model(),
+        Some(crate::embed::EmbeddingModel::Local(
+            ModelType::EmbeddingGemma300MQ4
+        ))
+    );
 
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
     assert_eq!(
         svc.query_model(None),
-        ModelType::EmbeddingGemma300MQ4,
+        crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4),
         "serve must fall back to its default model, not the built-in default"
     );
 }
@@ -1469,7 +1632,10 @@ fn no_serve_default_keeps_builtin_fallback() {
     assert_eq!(state.default_model(), None);
 
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
-    assert_eq!(svc.query_model(None), ModelType::default());
+    assert_eq!(
+        svc.query_model(None),
+        crate::embed::EmbeddingModel::Local(ModelType::default())
+    );
 }
 
 /// A repo whose `metadata.json` records no model is queried with the BUILT-IN
@@ -1496,8 +1662,9 @@ fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
     config.save_to(&config_file).unwrap();
 
     let state = std::sync::Arc::new(
-        ServeState::new(config, Some(config_file))
-            .with_default_model(Some(ModelType::EmbeddingGemma300MQ4)),
+        ServeState::new(config, Some(config_file)).with_default_model(Some(
+            crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4),
+        )),
     );
     let svc = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
 
@@ -1505,7 +1672,7 @@ fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
     let resolution = svc.resolve_query_model(Some("legacy"));
     assert_eq!(
         resolution.model,
-        ModelType::default(),
+        crate::embed::EmbeddingModel::Local(ModelType::default()),
         "a repo that records no model must be queried with the built-in default, \
          not the '{}' serve default",
         ModelType::EmbeddingGemma300MQ4.short_name()
@@ -1535,7 +1702,10 @@ fn unrecorded_index_is_queried_with_builtin_default_not_serve_default() {
     )
     .unwrap();
     let resolution = svc.resolve_query_model(Some("legacy"));
-    assert_eq!(resolution.model, ModelType::EmbeddingGemma300MQ4);
+    assert_eq!(
+        resolution.model,
+        crate::embed::EmbeddingModel::Local(ModelType::EmbeddingGemma300MQ4)
+    );
     assert!(
         resolution.assumed_warning.is_none(),
         "a recorded model must not warn"
@@ -1642,6 +1812,90 @@ fn reconcile_all_paths_unregisters_vanished_repos() {
     assert!(
         token.is_cancelled(),
         "the Write task's cancel token must be cancelled"
+    );
+}
+
+/// The reported worktree blocker: `wt remove` (or any recursive delete) stops
+/// at the LMDB files a live hub still holds, leaving a directory whose only
+/// content is `.codesearch.db`. The path "exists", so the prune-based stale
+/// check kept the alias — and the shared SCIP env in the strong cache kept
+/// `scip/data.mdb`/`lock.mdb` locked for the whole serve lifetime (pid-level
+/// os error 32 on every later delete attempt). Reconcile must reclaim the
+/// shell: unregister, evict, release the envs, delete the leftover.
+#[test]
+fn reconcile_reclaims_a_db_only_leftover_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let gone = tmp.path().join("wt-shell");
+    let db_path = gone.join(DB_DIR_NAME);
+    let scip_dir = db_path.join("scip");
+    std::fs::create_dir_all(&scip_dir).unwrap();
+
+    let state = std::sync::Arc::new(ServeState::new(
+        ReposConfig::default(),
+        Some(config_file.clone()),
+    ));
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.register_with_alias(gone.clone(), Some("wt-shell".to_string()))
+            .unwrap();
+        state.persist_config(&cfg).unwrap();
+    }
+
+    // Live index state INSIDE the tree: the stores env closes when the
+    // eviction below drops its last Arc; the shared SCIP env is the one the
+    // old code left in the cache forever.
+    let stores = std::sync::Arc::new(SharedStores::new(&db_path, 2).expect("fixture stores"));
+    let scip_key = codesearch_core::cache::safe_canonicalize(&scip_dir).unwrap();
+    let scip = crate::lmdb_registry::get_or_open_shared_env(
+        &scip_dir,
+        "scip-shell",
+        |opts| {
+            opts.map_size(1024 * 1024).max_dbs(4);
+            unsafe { opts.flags(codesearch_core::lmdb_registry::BASE_ENV_FLAGS) };
+        },
+        |_| Ok(()),
+    )
+    .expect("fixture scip env");
+    drop(scip); // cache-only afterwards, like after the last query
+
+    let token = CancellationToken::new();
+    state.repos.insert(
+        "wt-shell".to_string(),
+        RepoState::Write {
+            stores,
+            index_manager: None,
+            cancel_token: token.clone(),
+        },
+    );
+    // NOT indexing: an idle shell, like after the FSW task died with the tree.
+
+    state.reconcile_all_paths();
+
+    let on_disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        !on_disk.repos.contains_key("wt-shell"),
+        "the shell alias must be unregistered"
+    );
+    assert!(
+        state.repos.get("wt-shell").is_none(),
+        "the shell alias must be evicted from memory"
+    );
+    assert!(
+        token.is_cancelled(),
+        "the Write task's cancel token must be cancelled"
+    );
+    assert!(
+        heed::env_closing_event(&scip_key).is_none(),
+        "the shared SCIP env must be closed (file locks released)"
+    );
+    assert!(
+        !db_path.exists(),
+        "the leftover .codesearch.db must be deleted by the reconcile pass"
+    );
+    assert!(
+        !gone.exists(),
+        "the empty worktree shell must be removed once the db dir is gone"
     );
 }
 
@@ -2100,23 +2354,23 @@ async fn rest_routes_are_registered() {
         )
         .route(
             crate::constants::SEARCH_PATH,
-            axum::routing::post(crate::mcp::rest_search_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_search_handler),
         )
         .route(
             crate::constants::FIND_PATH,
-            axum::routing::post(crate::mcp::rest_find_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_find_handler),
         )
         .route(
             crate::constants::EXPLORE_PATH,
-            axum::routing::post(crate::mcp::rest_explore_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_explore_handler),
         )
         .route(
             crate::constants::CHUNK_PATH,
-            axum::routing::get(crate::mcp::rest_get_chunk_handler),
+            axum::routing::get(crate::serve::rest_mirrors::rest_get_chunk_handler),
         )
         .route(
             crate::constants::FIND_IMPACT_PATH,
-            axum::routing::post(crate::mcp::rest_find_impact_handler),
+            axum::routing::post(crate::serve::rest_mirrors::rest_find_impact_handler),
         )
         .with_state(state);
 
@@ -3065,7 +3319,7 @@ async fn index_rm_delegates_to_running_serve_end_to_end() {
         .expect("seeded config must contain the proj");
 
     // The CLI path — must delegate (serve is reachable) and succeed.
-    crate::index::remove_from_index(Some(proj.clone()), false)
+    crate::index::remove_from_index(Some(proj.clone()), false, false)
         .await
         .expect("delegated index rm must succeed");
 
@@ -3148,7 +3402,7 @@ async fn index_rm_deletes_db_while_serve_holds_real_lmdb_env() {
     );
 
     // The CLI path — delegated removal against a serve that HOLDS the env.
-    crate::index::remove_from_index(Some(proj.clone()), false)
+    crate::index::remove_from_index(Some(proj.clone()), false, false)
         .await
         .expect("delegated index rm must succeed while serve holds the env");
 
@@ -3308,10 +3562,22 @@ fn model_for_alias_reads_the_index_metadata_model() {
     let cases = [
         (
             "embeddinggemma-q4",
-            Some(crate::embed::ModelType::EmbeddingGemma300MQ4),
+            Some(crate::embed::EmbeddingModel::Local(
+                crate::embed::ModelType::EmbeddingGemma300MQ4,
+            )),
         ),
-        ("minilm-l6-q", Some(crate::embed::ModelType::AllMiniLML6V2Q)),
-        ("bge-base", Some(crate::embed::ModelType::BGEBaseENV15)),
+        (
+            "minilm-l6-q",
+            Some(crate::embed::EmbeddingModel::Local(
+                crate::embed::ModelType::AllMiniLML6V2Q,
+            )),
+        ),
+        (
+            "bge-base",
+            Some(crate::embed::EmbeddingModel::Local(
+                crate::embed::ModelType::BGEBaseENV15,
+            )),
+        ),
         // An unknown recorded name must not be silently coerced to the default:
         // callers fall back explicitly, and the resolver reports "no answer".
         ("not-a-real-model", None),
@@ -3372,11 +3638,15 @@ fn model_for_alias_is_per_repo_not_hub_wide() {
 
     assert_eq!(
         state.model_for_alias("legacy"),
-        Some(crate::embed::ModelType::AllMiniLML6V2Q)
+        Some(crate::embed::EmbeddingModel::Local(
+            crate::embed::ModelType::AllMiniLML6V2Q
+        ))
     );
     assert_eq!(
         state.model_for_alias("rebuilt"),
-        Some(crate::embed::ModelType::EmbeddingGemma300MQ4)
+        Some(crate::embed::EmbeddingModel::Local(
+            crate::embed::ModelType::EmbeddingGemma300MQ4
+        ))
     );
 }
 
@@ -3398,14 +3668,17 @@ fn serve_service_uses_repo_model_not_default() {
 
     assert_eq!(
         svc.query_model(Some("gemma-repo")),
-        crate::embed::ModelType::EmbeddingGemma300MQ4,
+        crate::embed::EmbeddingModel::Local(crate::embed::ModelType::EmbeddingGemma300MQ4),
         "serve must embed a repo's queries with the model that repo was indexed with"
     );
     // No alias (unscoped) or an unknown alias falls back to the service default.
-    assert_eq!(svc.query_model(None), crate::embed::ModelType::default());
+    assert_eq!(
+        svc.query_model(None),
+        crate::embed::EmbeddingModel::Local(crate::embed::ModelType::default())
+    );
     assert_eq!(
         svc.query_model(Some("not-registered")),
-        crate::embed::ModelType::default()
+        crate::embed::EmbeddingModel::Local(crate::embed::ModelType::default())
     );
 }
 
@@ -4168,6 +4441,11 @@ fn dummy_csharp_helper(root: &std::path::Path) -> crate::testing::EnvRestore {
 #[tokio::test]
 #[serial]
 async fn run_phase_2_symbols_wires_candidate_through_to_trigger() {
+    // Gate off: this test pins the gate→queue→trigger COMPOSITION, not the
+    // age gate — a fresh fixture repo has no sidecar entry and would be
+    // skipped as stale.
+    let _age_off =
+        crate::testing::EnvRestore::set(&[(crate::constants::WARMUP_MAX_AGE_DAYS_ENV, "0")]);
     let helper_root = tempfile::tempdir().unwrap();
     let _env = dummy_csharp_helper(helper_root.path());
 
@@ -4193,6 +4471,125 @@ async fn run_phase_2_symbols_wires_candidate_through_to_trigger() {
     assert!(
         state.symbol_rebuild_in_flight.is_empty(),
         "the claim must be released after the failed rebuild"
+    );
+}
+
+/// The phase-2 age gate mirrors phase-1: a repo with no persisted use is
+/// treated as older than any age and must NOT be eagerly rebuilt at startup —
+/// the whole compile-storm fix. Proof: on the pre-fix code this exact setup
+/// queued the rebuild (status Error via the dummy helper).
+#[tokio::test]
+#[serial]
+async fn run_phase_2_symbols_age_gate_skips_unused_repo() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("phase2gated");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    // Default age gate (5 days) ON — no sidecar entry for this repo.
+    state.run_phase_2_symbols().await;
+
+    assert_eq!(
+        state
+            .csharp_index_status
+            .get("phase2gated")
+            .map(|e| *e.value()),
+        None,
+        "an unused repo must not be eagerly rebuilt by phase-2 (same \
+         age gate as phase-1); Error would mean the rebuild fired"
+    );
+}
+
+/// `CODESEARCH_PHASE2_SYMBOL_REBUILD=0` skips phase-2 entirely — even a repo
+/// the age gate would pass must not be queued while the switch is off.
+#[tokio::test]
+#[serial]
+async fn run_phase_2_symbols_kill_switch_disables_the_pass() {
+    let _switch =
+        crate::testing::EnvRestore::set(&[(crate::constants::PHASE2_SYMBOL_REBUILD_ENV, "0")]);
+    let _age_off =
+        crate::testing::EnvRestore::set(&[(crate::constants::WARMUP_MAX_AGE_DAYS_ENV, "0")]);
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("phase2killed");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    state.run_phase_2_symbols().await;
+
+    assert_eq!(
+        state
+            .csharp_index_status
+            .get("phase2killed")
+            .map(|e| *e.value()),
+        None,
+        "the kill switch must skip phase-2 even for an in-gate repo"
+    );
+}
+
+/// One solution compile at a time by default: two concurrent scip-csharp
+/// runs starved interactive opens/searches during the redemption wave.
+#[test]
+fn csharp_scip_concurrency_defaults_to_one() {
+    assert_eq!(
+        crate::constants::CSHARP_SCIP_CONCURRENCY_DEFAULT,
+        1,
+        "default concurrency must be 1 — two solution compiles at once \
+         starve opens and searches (card #291)"
+    );
+}
+
+/// Foreground priority (card #291): the phase-2 wave parks while real
+/// queries flow. Pure decision — a recent tool call asks for the remaining
+/// quiet-window wait; a stale one (or none) lets the wave run.
+#[test]
+fn foreground_park_remaining_parks_only_on_recent_tool_calls() {
+    let (_tmp, _path, bare) = state_with_repo("fgpark");
+    let state = std::sync::Arc::new(bare);
+    let now = std::time::Instant::now();
+
+    // No tool call at all: the wave runs immediately.
+    assert_eq!(state.foreground_park_remaining(now), None);
+
+    // A fresh real query parks the wave for ~the quiet window.
+    state.last_tool_call.insert(
+        "fgpark".to_string(),
+        (
+            "search".to_string(),
+            now - std::time::Duration::from_secs(1),
+        ),
+    );
+    let park = state
+        .foreground_park_remaining(now)
+        .expect("a 1s-old query must park the wave");
+    assert!(
+        park >= std::time::Duration::from_secs(28) && park <= std::time::Duration::from_secs(30),
+        "a 1s-old query leaves ~29s of the 30s window, got {park:?}"
+    );
+
+    // A query older than the window: quiet, the wave resumes.
+    state.last_tool_call.insert(
+        "fgpark".to_string(),
+        (
+            "search".to_string(),
+            now - std::time::Duration::from_secs(60),
+        ),
+    );
+    assert_eq!(
+        state.foreground_park_remaining(now),
+        None,
+        "a 60s-old query is past the quiet window — the wave resumes"
     );
 }
 
@@ -4770,8 +5167,8 @@ fn note_add_index_failure_keeps_the_repo_registered() {
 #[serial]
 fn symbol_index_status_reflects_the_on_disk_meta() {
     use crate::constants::{
-        SCIP_INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_REFS_COVERAGE_KEY,
-        SCIP_REFS_COVERAGE_LAZY,
+        SCIP_INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_REFS_COVERAGE_COMPLETE,
+        SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_LAZY,
     };
 
     let (_tmp, repo_path, state) = state_with_repo("syminfo");
@@ -4813,7 +5210,7 @@ fn symbol_index_status_reflects_the_on_disk_meta() {
         &db,
         &[
             (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
-            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_LAZY),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_COMPLETE),
         ],
     );
     let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
@@ -4823,11 +5220,30 @@ fn symbol_index_status_reflects_the_on_disk_meta() {
     assert_eq!(csharp.state, "ready", "{csharp:?}");
     assert!(!csharp.not_applicable);
 
-    // Survived build failures in meta: degraded — serving but incomplete.
+    // A `lazy` coverage stamp marks an index built WITHOUT precomputed
+    // references (the old filtered-run shape): stale, so the serve rebuilds
+    // it once and the hours-long lazy pre-warm never recurs.
     seed_scip_meta(
         &db,
         &[
             (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_LAZY),
+        ],
+    );
+    let csharp = crate::symbols::symbol_index_status(&registry, &repo_path, &db)
+        .into_iter()
+        .find(|s| s.language == "csharp")
+        .expect("csharp status entry");
+    assert_eq!(csharp.state, "stale", "{csharp:?}");
+
+    // Survived build failures in meta: degraded — serving but incomplete.
+    // Coverage must be stamped (complete): without it the index reads stale
+    // before the warnings check ever runs.
+    seed_scip_meta(
+        &db,
+        &[
+            (SCIP_INDEX_BUILDER_VERSION_KEY, SCIP_INDEX_BUILDER_VERSION),
+            (SCIP_REFS_COVERAGE_KEY, SCIP_REFS_COVERAGE_COMPLETE),
             (
                 crate::constants::SCIP_INDEX_WARNINGS_KEY,
                 r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
@@ -4873,6 +5289,7 @@ fn overlay_copy_key_only_fires_on_info_overlays() {
         dims: 0,
         lock: "write".to_string(),
         index_age: String::new(),
+        last_compact: "never".to_string(),
         symbol_warnings: vec!["w1".to_string()],
         symbol_index: Vec::new(),
         copy_feedback: None,
@@ -4925,6 +5342,7 @@ fn apply_copy_warnings_reports_when_nothing_is_recorded() {
         dims: 0,
         lock: "write".to_string(),
         index_age: String::new(),
+        last_compact: "never".to_string(),
         symbol_warnings: vec![],
         symbol_index: Vec::new(),
         copy_feedback: None,
@@ -4958,6 +5376,7 @@ fn apply_copy_warnings_feedback_covers_success_and_failure() {
             dims: 0,
             lock: "write".to_string(),
             index_age: String::new(),
+            last_compact: "never".to_string(),
             symbol_warnings: vec!["summary".to_string()],
             symbol_index: Vec::new(),
             copy_feedback: None,
@@ -5224,7 +5643,7 @@ async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
     };
     // The REST mirror builds its own serve-mode service from the state —
     // the same path the MCP tool takes for a project-scoped query.
-    let v = crate::mcp::rest_find_impact_handler(
+    let v = crate::serve::rest_mirrors::rest_find_impact_handler(
         axum::extract::State(state.clone()),
         axum::Json(request),
     )
@@ -5347,7 +5766,7 @@ const CURRENT_BUILD_META: &[(&str, &str)] = &[
     ),
     (
         crate::constants::SCIP_REFS_COVERAGE_KEY,
-        crate::constants::SCIP_REFS_COVERAGE_LAZY,
+        crate::constants::SCIP_REFS_COVERAGE_COMPLETE,
     ),
 ];
 
@@ -7074,6 +7493,11 @@ async fn finish_force_reindex_starts_fsw_and_keeps_guard_contract() {
 #[tokio::test]
 #[serial]
 async fn backfill_group_identities_fills_missing_and_persists() {
+    // Hook context (GIT_DIR/GIT_INDEX_FILE) must not leak into the git
+    // subprocesses this test drives: under the pre-push QC gate the process
+    // env IS a hook context, and spawned `git -C <tmp>` would resolve the
+    // outer repo. #[serial] makes the process-env mutation safe.
+    let _hook_env = crate::db_discovery::repos::test_support::clear_hook_git_env();
     // The git-serialization lock must be dropped before the first .await
     // (clippy await_holding_lock): scope it around the synchronous git setup.
     // `tmp` lives for the whole test — the backfill's git spawns need the
@@ -7087,12 +7511,14 @@ async fn backfill_group_identities_fills_missing_and_persists() {
         std::fs::create_dir(&main).unwrap();
         crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
         let wt = tmp.path().join("wt");
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&main)
-            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
-            .output()
-            .unwrap();
+        let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+            &mut std::process::Command::new("git"),
+        )
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+        .output()
+        .unwrap();
         assert!(
             o.status.success(),
             "worktree add failed: {}",
@@ -7145,9 +7571,71 @@ async fn backfill_group_identities_fills_missing_and_persists() {
     );
 }
 
+#[test]
+#[serial]
+fn registered_worktree_parent_matches_via_worktree_git_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    {
+        let _l = crate::db_discovery::repos::test_support::git_serial_lock();
+        crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
+    }
+    let wt = tmp.path().join("wt");
+    let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+        &mut std::process::Command::new("git"),
+    )
+    .arg("-C")
+    .arg(&main)
+    .args(["worktree", "add", wt.to_str().unwrap(), "-b", "seed-branch"])
+    .output()
+    .unwrap();
+    assert!(
+        o.status.success(),
+        "worktree add failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let mut config = ReposConfig::default();
+    let main_alias = config.register(main.clone());
+    let child_alias = config.register(wt.clone());
+    assert_ne!(child_alias, main_alias);
+
+    // The worktree's .git FILE points at the main's worktrees dir: the
+    // registered main alias must be found as the seeding parent.
+    let found = super::registered_worktree_parent(&wt, &config);
+    // canonicalize both sides: the discovered parent is stored in canonical
+    // form, while the tempdir here may be an 8.3 short-name path — comparing
+    // raw forms fails on Windows machines whose TEMP resolves through
+    // DEVELT~1-style names (same file, different path form).
+    let canon = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .display()
+            .to_string()
+    };
+    assert_eq!(
+        found.as_ref().map(|(a, p)| (a.as_str(), canon(p))),
+        Some((main_alias.as_str(), canon(&main))),
+        "worktree must seed from its registered main checkout"
+    );
+
+    // A regular repo (.git directory) never seeds.
+    assert!(super::registered_worktree_parent(&main, &config).is_none());
+
+    // A worktree whose main is not registered does not seed.
+    let empty = ReposConfig::default();
+    assert!(super::registered_worktree_parent(&wt, &empty).is_none());
+}
+
 #[tokio::test]
 #[serial]
 async fn backfill_all_missing_identities_fills_every_repo() {
+    // Hook context (GIT_DIR/GIT_INDEX_FILE) must not leak into the git
+    // subprocesses this test drives: under the pre-push QC gate the process
+    // env IS a hook context, and spawned `git -C <tmp>` would resolve the
+    // outer repo. #[serial] makes the process-env mutation safe.
+    let _hook_env = crate::db_discovery::repos::test_support::clear_hook_git_env();
     // Startup variant: no group involved — every registered repo missing an
     // identity gets one, so pre-capture mains join their worktree families.
     let tmp = tempfile::tempdir().unwrap();
@@ -7157,12 +7645,14 @@ async fn backfill_all_missing_identities_fills_every_repo() {
         std::fs::create_dir(&main).unwrap();
         crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
         let wt = tmp.path().join("wt");
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&main)
-            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
-            .output()
-            .unwrap();
+        let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+            &mut std::process::Command::new("git"),
+        )
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"])
+        .output()
+        .unwrap();
         assert!(
             o.status.success(),
             "worktree add failed: {}",
@@ -7329,4 +7819,148 @@ async fn scope_error_lists_worktree_families_and_clean_projects() {
         !payload.to_string().contains("(worktree of"),
         "machine-readable payload must stay flat: {payload}"
     );
+}
+
+#[test]
+fn warmup_order_most_recently_used_first() {
+    // Table: (aliases, access map, expected order). Recency descending,
+    // never-used aliases last, ties break on alias for a deterministic order.
+    type OrderCase = (
+        Vec<&'static str>,
+        Vec<(&'static str, u64)>,
+        Vec<&'static str>,
+    );
+    let cases: Vec<OrderCase> = vec![
+        (
+            vec!["a", "b", "c"],
+            vec![("a", 100), ("c", 300)],
+            vec!["c", "a", "b"],
+        ),
+        (vec!["b", "a"], vec![("a", 5), ("b", 5)], vec!["a", "b"]),
+        (vec!["z", "a"], vec![], vec!["a", "z"]),
+        (vec!["only"], vec![], vec!["only"]),
+    ];
+    for (aliases, access, expected) in cases {
+        let aliases: Vec<String> = aliases.into_iter().map(str::to_string).collect();
+        let map: std::collections::HashMap<String, u64> = access
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        assert_eq!(ServeState::warmup_order(aliases, &map), expected);
+    }
+}
+
+#[test]
+fn warmup_partition_gates_on_persisted_age() {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    const NOW: u64 = 10_000 * DAY_MS;
+    let mut access = std::collections::HashMap::new();
+    access.insert("fresh".to_string(), NOW - DAY_MS);
+    access.insert("week_old".to_string(), NOW - 7 * DAY_MS);
+    // "never_used" has no entry at all.
+    let aliases: Vec<String> = ["fresh", "week_old", "never_used"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    // Default gate (5 days): fresh warms, the week-old and never-used stay cold.
+    let (warm, skipped) = ServeState::warmup_partition(aliases.clone(), &access, NOW, 5);
+    assert_eq!(warm, vec!["fresh".to_string()]);
+    assert_eq!(
+        skipped,
+        vec!["week_old".to_string(), "never_used".to_string()]
+    );
+
+    // Gate off (0): everything warms — the historical behavior.
+    let (warm, skipped) = ServeState::warmup_partition(aliases, &access, NOW, 0);
+    assert_eq!(warm.len(), 3);
+    assert!(skipped.is_empty());
+
+    // Exactly at the cutoff is still fresh (<=); one ms older is not.
+    let mut edge = std::collections::HashMap::new();
+    edge.insert("at".to_string(), NOW - 5 * DAY_MS);
+    edge.insert("past".to_string(), NOW - 5 * DAY_MS - 1);
+    let (warm, _) =
+        ServeState::warmup_partition(vec!["at".to_string(), "past".to_string()], &edge, NOW, 5);
+    assert_eq!(warm, vec!["at".to_string()]);
+
+    // A sidecar timestamp from the future (clock skew) must not be skipped.
+    let mut skew = std::collections::HashMap::new();
+    skew.insert("ahead".to_string(), NOW + DAY_MS);
+    let (warm, _) = ServeState::warmup_partition(vec!["ahead".to_string()], &skew, NOW, 5);
+    assert_eq!(warm, vec!["ahead".to_string()]);
+}
+
+#[test]
+fn access_times_sidecar_round_trip_and_corruption_tolerance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("access_times.json");
+
+    // Missing file: empty map, never an error.
+    assert!(ServeState::load_access_times_from(&path).is_empty());
+
+    // Persist → load round trip preserves entries and drives the order.
+    let payload = serde_json::json!({"a": 100u64, "b": 300u64});
+    crate::vectordb::atomic_write_json(&path, &payload).unwrap();
+    let loaded = ServeState::load_access_times_from(&path);
+    assert_eq!(loaded.get("a"), Some(&100u64));
+    assert_eq!(loaded.get("b"), Some(&300u64));
+    let order = ServeState::warmup_order(vec!["a".to_string(), "b".to_string()], &loaded);
+    assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
+
+    // Corrupt sidecar: empty map (registry-order fallback), not a panic.
+    std::fs::write(&path, "not json").unwrap();
+    assert!(ServeState::load_access_times_from(&path).is_empty());
+}
+
+#[test]
+fn touch_access_feeds_persisted_warmup_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = ReposConfig::default();
+    for alias in ["a", "b"] {
+        let dir = tmp.path().join(alias);
+        std::fs::create_dir(&dir).unwrap();
+        config
+            .register_with_alias(dir, Some(alias.to_string()))
+            .unwrap();
+    }
+    let state = state_with_config(config);
+
+    state.touch_access("a");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    state.touch_access("b");
+    // An unregistered alias sits in memory but must be pruned on persist.
+    state.touch_access("ghost");
+
+    let path = tmp.path().join("access_times.json");
+    state.persist_access_times_to(&path);
+    let loaded = ServeState::load_access_times_from(&path);
+    assert_eq!(loaded.len(), 2, "unregistered aliases are pruned");
+    assert!(loaded["b"] > loaded["a"], "later touch is more recent");
+    let order = ServeState::warmup_order(vec!["a".to_string(), "b".to_string()], &loaded);
+    assert_eq!(order, vec!["b".to_string(), "a".to_string()]);
+}
+
+#[test]
+fn cold_touch_does_not_refresh_the_persisted_sidecar() {
+    let state = ServeState::new(ReposConfig::default(), None);
+
+    // The warmup path (touch_access_cold) starts the reaper's idle clock but
+    // MUST NOT write "used now" into last_access_wall: the wall stamp IS the
+    // warmup age gate's input, and a warmup that refreshed it kept every
+    // registered repo inside CODESEARCH_WARMUP_MAX_AGE_DAYS forever.
+    state.touch_access_cold("warmed");
+    assert!(
+        state.last_access_wall.get("warmed").is_none(),
+        "warmup open must not re-stamp the persisted sidecar"
+    );
+    assert!(
+        state.last_access.get("warmed").is_some(),
+        "the reaper clock must still run so warmed repos get evicted"
+    );
+
+    // A real access (touch_access) still re-stamps both.
+    state.touch_access("queried");
+    assert!(state.last_access_wall.get("queried").is_some());
 }
