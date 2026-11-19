@@ -114,20 +114,12 @@ done <<< "$paths"
 [ -z "$fail_path" ] && exit 0  # every path checked recently -> allow
 
 msg=$(cat <<EOF
-edit-guard: this edit needs a codesearch consultation first.
+edit-guard: codesearch consultation required before this edit.
 
-Blocked path: $fail_path
-Required call: $fail_tool — on that exact file.
-
-Any outcome counts: "no results" and "no SCIP backend" still prove you
-consulted codesearch for this file. Run the call, then retry the SAME
-edit — it stays allowed for 5 minutes.
-
-Why: find_impact (C#/TS) / find kind="usages" (other code) before edits
-keeps refactors caller-aware; this guard makes that protocol structural
-for codesearch-registered repos — code files only. Docs, config and data
-files, unregistered repos, non-git paths and unparseable events fail open
-and are never blocked.
+Blocked: $fail_path
+Run first: $fail_tool — on that exact file; any outcome counts
+("no results" / "no SCIP backend" too). Then retry this edit;
+it stays allowed for 5 minutes.
 EOF
 )
 
