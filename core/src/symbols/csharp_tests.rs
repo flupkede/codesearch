@@ -2,8 +2,9 @@
 //! per repo convention.
 
 use super::csharp::{
-    drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending, kill_live_helper_children,
-    restore_pending_flag_clear, restore_pending_flag_set, LiveHelperChild, RestorePendingError,
+    drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending,
+    is_transient_filtered_solution, kill_live_helper_children, restore_pending_flag_clear,
+    restore_pending_flag_set, CSharpSymbolIndexer, LiveHelperChild, RestorePendingError,
     HELPER_RESTORE_PENDING_EXIT,
 };
 use std::io::Cursor;
@@ -744,4 +745,42 @@ fn refs_coverage_follows_precompute_and_index_warnings() {
             "precomputed={precomputed} clean={clean}"
         );
     }
+}
+
+/// The helper writes `<stem>-filtered-{Guid:N}.sln` next to the real
+/// solution and keeps it on disk for the whole minutes-long workspace
+/// load; on NTFS it enumerates before `BOIN.dam.sln` ('-' < '.'). The
+/// defect this pins: `find_solution` returned that transient file, so
+/// every lookup racing an in-flight load chained another filter
+/// generation — each a distinct workspace-pool key with its own ~600 MB
+/// resident `scip-csharp serve`.
+#[test]
+fn find_solution_skips_transient_filtered_solutions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let real = root.join("BOIN.dam.sln");
+    std::fs::write(&real, b"").expect("write real sln");
+    let guid = "0123456789abcdef0123456789abcdef";
+    std::fs::write(root.join(format!("BOIN.dam-filtered-{guid}.sln")), b"")
+        .expect("write transient filtered sln");
+    std::fs::write(
+        root.join(format!("BOIN.dam-filtered-{guid}-filtered-{guid}.sln")),
+        b"",
+    )
+    .expect("write chained filtered sln");
+
+    let found = CSharpSymbolIndexer::find_solution(root).expect("real solution found");
+    assert_eq!(found, real);
+}
+
+#[test]
+fn transient_filtered_solution_predicate_is_precise() {
+    let guid = "0123456789abcdef0123456789abcdef";
+    let is = |name: &str| is_transient_filtered_solution(std::path::Path::new(name));
+    assert!(is(&format!("a-filtered-{guid}.sln")));
+    assert!(is(&format!("a-filtered-{guid}-filtered-{guid}.sln")));
+    assert!(!is("BOIN.dam.sln"));
+    assert!(!is("a-filtered-short.sln"));
+    assert!(!is(&format!("a-filtered-{}.sln", "z".repeat(32))));
+    assert!(!is("no-marker.sln"));
 }

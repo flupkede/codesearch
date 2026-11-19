@@ -870,12 +870,15 @@ impl CSharpSymbolIndexer {
         }
     }
 
-    /// Find the solution file in a repo directory.
-    fn find_solution(repo_path: &Path) -> Option<PathBuf> {
+    /// Find the solution file in a repo directory. Never the helper's own
+    /// transient filtered solutions — see [`is_transient_filtered_solution`].
+    pub(crate) fn find_solution(repo_path: &Path) -> Option<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(repo_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("sln") {
+                if path.extension().and_then(|e| e.to_str()) == Some("sln")
+                    && !is_transient_filtered_solution(&path)
+                {
                     return Some(path);
                 }
             }
@@ -2262,6 +2265,25 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
     fn applicability_hint(&self) -> &'static str {
         "the scip-csharp adapter requires a .sln file in the repository root"
+    }
+}
+
+/// True for the scip-csharp helper's own transient filtered solutions
+/// (`<base>-filtered-<32-hex-guid>.sln`, written by
+/// `OpenSolutionFilteredAsync` next to the real solution for the entire
+/// minutes-long workspace load). `find_solution` must never return one:
+/// while a load is in flight the file IS on disk and sorts before the real
+/// `.sln` on NTFS, so discovering it chains another filter generation —
+/// each generation is a distinct workspace-pool key, and every concurrent
+/// lookup then left a ~600 MB resident `scip-csharp serve` behind.
+pub(crate) fn is_transient_filtered_solution(path: &Path) -> bool {
+    match path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|stem| stem.rsplit_once("-filtered-"))
+    {
+        Some((_, guid)) => guid.len() == 32 && guid.chars().all(|c| c.is_ascii_hexdigit()),
+        None => false,
     }
 }
 
