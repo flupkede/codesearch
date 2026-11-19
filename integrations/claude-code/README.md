@@ -102,21 +102,26 @@ that make the preference *structural* instead of advisory:
   `%TEMP%\.codesearch-edit-guard-state.json` on PowerShell). It fires on
   every `find_impact` call and every `find(kind="usages")` (the kind check
   is done script-side — matchers only see tool names). Markers are
-  attributed from three sources, all written when available: a file-ish
+  attributed from all available sources, written when they apply: a file-ish
   input field (`file`/`path`/`file_path` — `find_impact`'s schema names its
   target `symbol_name` and carries no path, so this serves older schemas);
-  every **path the response mentions** (`path`/`file`/`file_path` at any
-  depth, including inside the JSON-stringified text payload MCP wraps
-  results in — serve-mode paths are alias-prefixed or project-relative and
-  resolve against the registered root of the call's `project` alias), so
-  one consultation marks every file it listed; and a **repo-level marker**
-  on the project's registered root when the response yielded no path at
-  all (empty result, or a "no SCIP backend" error), which `edit-guard`
-  accepts for any file in that repo. Any outcome counts; without the
-  response-path and repo-level attribution a missing C# symbol index wrote
-  no marker at all and every `.cs` edit in a registered repo stayed denied
-  — a permanent wedge. PostToolUse hooks cannot block anything; this one
-  never emits a decision and always exits 0.
+  a **path-like `symbol` input** — the exact `find(symbol=<path>,
+  kind="usages")` call `edit-guard` demands for non-SCIP code marks the
+  path it names (bare code symbols never mark); every **path the response
+  mentions** (`path`/`file`/`file_path` at any depth, including inside the
+  JSON-stringified text payload MCP wraps results in — values must look
+  like file paths, so a bare symbol string writes no junk key; paths join
+  onto the registered root of the call's `project` alias, or of the `cwd`
+  repo for serve-mode agents that scope with `cwd` instead, where both
+  shape candidates are marked), so one consultation marks every file it
+  listed; and a **repo-level marker** on the `project`'s registered root,
+  else the `cwd` repo's root, when nothing yielded a path (empty result,
+  or a "no SCIP backend" error), which `edit-guard` accepts for any file
+  in that repo. Any outcome counts; without the response-path and
+  repo-level attribution a missing C# symbol index wrote no marker at all
+  and every `.cs` edit in a registered repo stayed denied — a permanent
+  wedge. PostToolUse hooks cannot block anything; this one never emits a
+  decision and always exits 0.
 
 All hooks fail open: if they can't parse their input, or codesearch isn't
 running/indexed, they get out of the way and let the tool call proceed
