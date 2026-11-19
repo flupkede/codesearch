@@ -1473,6 +1473,10 @@ fn git_common_dir_fs_fallback_resolves_worktree_and_main_tree() {
 /// with one shared git identity, without spawning git (the expansion logic
 /// reads only the recorded identity, so the unit tests exercise exactly that).
 fn register_family(cfg: &mut ReposConfig, a: &Path, b: &Path) -> (String, String) {
+    // `reconcile()` prunes a temp-dir registration whose path is gone; the
+    // family identity assertions reload the config, so the trees must exist.
+    let _ = std::fs::create_dir_all(a);
+    let _ = std::fs::create_dir_all(b);
     let alias_a = cfg.register(a.to_path_buf());
     let alias_b = cfg.register(b.to_path_buf());
     let identity = format!("{}/.git", a.display());
@@ -1574,7 +1578,9 @@ fn expand_group_members_works_from_persisted_identity_after_main_tree_deletion()
 fn reconcile_prunes_orphan_groups_meta() {
     let mut cfg = ReposConfig::default();
     let tmp = tempfile::tempdir().unwrap();
-    let alias = cfg.register(tmp.path().join("r"));
+    let r_path = tmp.path().join("r");
+    let _ = std::fs::create_dir_all(&r_path);
+    let alias = cfg.register(r_path);
     cfg.add_group("g".to_string(), vec![alias]).unwrap();
     cfg.groups_meta.insert(
         "g".to_string(),

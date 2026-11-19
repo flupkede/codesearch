@@ -7724,6 +7724,10 @@ pub(crate) fn family_state() -> (
     let mut config = ReposConfig::default();
     let main_path = tmp.path().join("m");
     let wt_path = tmp.path().join("m-wt");
+    // `reconcile()` drops a temp-dir registration whose path is gone, and every
+    // surface here reloads the config; create the trees so the family survives.
+    std::fs::create_dir_all(&main_path).unwrap();
+    std::fs::create_dir_all(&wt_path).unwrap();
     let main = config.register(main_path.clone());
     let wt = config.register(wt_path.clone());
     let identity = format!("{}/.git", main_path.display());
