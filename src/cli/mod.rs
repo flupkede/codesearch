@@ -2007,7 +2007,9 @@ fn codesearch_hook_block() -> String {
 # flag 0 and must not re-register (it changes no repo location, just wastes a POST).
 # Throwaway checkouts under the OS temp dir are skipped entirely: they are test
 # fixtures / scratch worktrees of unrelated suites, and registering them fills
-# repos.json with aliases whose directory dies with the run.
+# repos.json with aliases whose directory dies with the run. Hidden-folder path
+# segments (.opencode/… agent worktrees, CI scratch) are skipped for the same
+# reason: a dotted component is never a repo root the user wants indexed.
 __cs_home="${CODESEARCH_HOME:-$HOME/.codesearch}"
 if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
     __cs_url=$(cat "$__cs_home/serve_url")
@@ -2018,6 +2020,13 @@ if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
         __cs_path=$(pwd -W 2>/dev/null || pwd)
         __cs_tmp_hit=0
         __cs_p_lc=$(printf '%s' "$__cs_path" | tr '[:upper:]' '[:lower:]' | sed 's|\\|/|g; s|/*$||')
+        # Hidden-folder segment anywhere in the path: throwaway tree, skip.
+        # `.` is case-insensitive so the lowercased path suffices; the 8.3
+        # short form cannot preserve a leading dot — the long form is exact.
+        __cs_hidden=0
+        case "$__cs_p_lc" in
+            */.*|.*) __cs_hidden=1 ;;
+        esac
         # Native-spawned git hands us an 8.3 short TEMP (C:\...\DEVELT~1\...) that
         # can never prefix-match the long checkout path, so a second comparison
         # in 8.3 short form (cygpath -m -d) closes that gap. cygpath is absent
@@ -2043,7 +2052,7 @@ if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
                 "$__cs_d" | "$__cs_d"/*) __cs_tmp_hit=1 ;;
             esac
         fi
-        if [ "$__cs_tmp_hit" = "0" ]; then
+        if [ "$__cs_tmp_hit" = "0" ] && [ "$__cs_hidden" = "0" ]; then
             # JSON-escape backslashes, then double quotes (POSIX sed: sh + bash).
             __cs_path=$(printf '%s' "$__cs_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
             curl -s -X POST "$__cs_url/repos" \
@@ -2368,6 +2377,32 @@ mod tests {
         assert!(
             guard_pos < curl_pos,
             "temp-dir check must run before the POST"
+        );
+    }
+
+    #[test]
+    fn test_hook_block_skips_hidden_folder_checkouts() {
+        let block = codesearch_hook_block();
+        // A checkout under a hidden folder (.opencode/worktrees/…, CI scratch)
+        // is a throwaway tree: it must never reach the POST.
+        assert!(
+            block.contains("__cs_hidden"),
+            "hook must compute a hidden-folder hit flag"
+        );
+        assert!(
+            block.contains("*/.*"),
+            "the pattern must match a dotted path component anywhere"
+        );
+        assert!(
+            block.contains("[ \"$__cs_hidden\" = \"0\" ]"),
+            "the POST must be gated on the hidden-folder check"
+        );
+        // The check must run before the POST it gates.
+        let guard_pos = block.find("__cs_hidden").expect("guard present");
+        let curl_pos = block.find("curl -s -X POST").expect("POST present");
+        assert!(
+            guard_pos < curl_pos,
+            "hidden-folder check must run before the POST"
         );
     }
 

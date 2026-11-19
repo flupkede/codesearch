@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.8.12]
+
+### Fixed
+
+- **Worktrees under a hidden folder no longer get auto-registered and indexed.** The global `post-checkout` hook (installed by `codesearch hooks git install`) already skipped throwaway checkouts under the OS temp dir, but agent-managed worktrees live elsewhere — typically `.opencode/worktrees/<name>` inside the repo — and still landed in `repos.json` as indexes for trees that die with the session. The hook block now also skips any checkout whose path contains a hidden folder segment (a path component starting with `.`); already-installed hooks pick the new block up through serve's startup self-heal.
+
 ## [1.8.11] - 2026-11-19
 
 ### Fixed
