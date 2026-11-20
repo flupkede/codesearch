@@ -590,28 +590,80 @@ pub(crate) fn extract_simple_name(scip_symbol: &str) -> String {
 
 /// Simple names of members whose call sites name the containing type
 /// instead (`new Foo()`, `a + b`).
-const CTOR_SIMPLE_NAMES: &[&str] = &["ctor", "cctor"];
+const INSTANCE_CTOR_SIMPLE_NAME: &str = "ctor";
+const CTOR_SIMPLE_NAMES: &[&str] = &[INSTANCE_CTOR_SIMPLE_NAME, "cctor"];
 const OPERATOR_SIMPLE_NAME_PREFIX: &str = "op_";
+/// `[Foo]` binds `FooAttribute`'s constructor.
+const ATTRIBUTE_TYPE_SUFFIX: &str = "Attribute";
+/// Members the compiler calls with no identifier at the call site (`using`,
+/// `foreach`, `await`, collection initializers, deconstruction, indexers).
+const IMPLICIT_PATTERN_MEMBER_NAMES: &[&str] = &[
+    "Dispose",
+    "DisposeAsync",
+    "GetEnumerator",
+    "GetAsyncEnumerator",
+    "MoveNext",
+    "MoveNextAsync",
+    "Current",
+    "GetAwaiter",
+    "GetResult",
+    "IsCompleted",
+    "Add",
+    "Deconstruct",
+    "Item",
+    "get_Item",
+    "set_Item",
+];
+/// A target-typed `new()` names no type.
+const TARGET_TYPED_NEW_LITERAL: &str = "new(";
 
-/// The identifier an edit must contain to change `key`'s references.
-fn ref_cache_match_name(key: &str) -> String {
+/// The identifiers an edit must contain (any one) to change `key`'s references.
+fn ref_cache_match_names(key: &str) -> Vec<String> {
     let simple = extract_simple_name(key);
-    if !CTOR_SIMPLE_NAMES.contains(&simple.as_str())
-        && !simple.starts_with(OPERATOR_SIMPLE_NAME_PREFIX)
-    {
-        return simple;
+    let is_ctor = CTOR_SIMPLE_NAMES.contains(&simple.as_str());
+    if !is_ctor && !simple.starts_with(OPERATOR_SIMPLE_NAME_PREFIX) {
+        return vec![simple];
     }
     let member_head = key.split('(').next().unwrap_or(key);
-    match member_head.rfind('#') {
+    let owner = match member_head.rfind('#') {
         Some(hash) => extract_simple_name(&key[..=hash]),
         None => simple,
+    };
+    let mut names = Vec::with_capacity(2);
+    if is_ctor {
+        if let Some(bare) = owner
+            .strip_suffix(ATTRIBUTE_TYPE_SUFFIX)
+            .filter(|bare| !bare.is_empty())
+        {
+            names.push(bare.to_string());
+        }
     }
+    names.push(owner);
+    names
 }
 
-/// `[A-Za-z_][A-Za-z0-9_]*` tokens of the changed files' current content;
-/// `None` when one is unreadable — nothing then bounds what it references.
-fn changed_file_tokens(repo_path: &Path, changed: &[PathBuf]) -> Option<HashSet<String>> {
+/// Whether an edit of any changed file may add or drop a call site of `key`
+/// that no identifier of the key marks.
+fn ref_cache_key_used_implicitly(key: &str, any_change: bool, target_typed_new: bool) -> bool {
+    let simple = extract_simple_name(key);
+    (any_change
+        && (IMPLICIT_PATTERN_MEMBER_NAMES.contains(&simple.as_str())
+            || simple.starts_with(OPERATOR_SIMPLE_NAME_PREFIX)))
+        || (target_typed_new && simple == INSTANCE_CTOR_SIMPLE_NAME)
+}
+
+/// What the changed files' current content says about what they may reference.
+struct ChangedText {
+    /// `[A-Za-z_][A-Za-z0-9_]*` tokens.
+    tokens: HashSet<String>,
+    target_typed_new: bool,
+}
+
+/// `None` when a changed file is unreadable — nothing then bounds what it
+/// references.
+fn changed_file_tokens(repo_path: &Path, changed: &[PathBuf]) -> Option<ChangedText> {
     let mut tokens = HashSet::new();
+    let mut target_typed_new = false;
     for file in changed {
         let path = repo_path.join(file);
         let bytes = match std::fs::read(&path) {
@@ -625,6 +677,7 @@ fn changed_file_tokens(repo_path: &Path, changed: &[PathBuf]) -> Option<HashSet<
             }
         };
         let text = String::from_utf8_lossy(&bytes);
+        target_typed_new |= text.contains(TARGET_TYPED_NEW_LITERAL);
         tokens.extend(
             text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .map(|t| t.trim_start_matches(|c: char| c.is_ascii_digit()))
@@ -632,14 +685,17 @@ fn changed_file_tokens(repo_path: &Path, changed: &[PathBuf]) -> Option<HashSet<
                 .map(str::to_string),
         );
     }
-    Some(tokens)
+    Some(ChangedText {
+        tokens,
+        target_typed_new,
+    })
 }
 
 /// `scip_ref_cache` keys a `Files` rebuild may have made stale: defined in a
 /// `touched` file (`scip_symbols` before the merge, or the new index), a
-/// cached reference in one, or named in `tokens` — the rule that catches a
-/// symbol GAINING a reference from the edit. Paths compare in
-/// [`crate::cache::storage_key`] form.
+/// cached reference in one, named in `text` — the rule that catches a
+/// symbol GAINING a reference from the edit — or used without being named.
+/// Paths compare in [`crate::cache::storage_key`] form.
 fn stale_ref_cache_keys(
     ref_cache_db: &Database<'static, Str, Bytes>,
     symbols_db: &Database<'static, Str, Bytes>,
@@ -647,13 +703,16 @@ fn stale_ref_cache_keys(
     index: &scip_parse::ScipIndex,
     repo_path: &Path,
     touched: &HashSet<String>,
-    tokens: &HashSet<String>,
+    text: &ChangedText,
 ) -> Result<Vec<String>> {
     let in_touched = |file: &Path| touched.contains(&crate::cache::storage_key(file, repo_path));
     let mut stale = Vec::new();
     for entry in ref_cache_db.iter(wtxn)? {
         let (key, cached) = entry?;
-        let named = tokens.contains(&ref_cache_match_name(key));
+        let named = ref_cache_match_names(key)
+            .iter()
+            .any(|name| text.tokens.contains(name))
+            || ref_cache_key_used_implicitly(key, !touched.is_empty(), text.target_typed_new);
         let defined_in_new_index = || {
             index.get(key).is_some_and(|defs| {
                 defs.iter()
@@ -1721,7 +1780,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         };
 
         // Read before the write txn: file I/O must not hold the LMDB writer.
-        let changed_tokens = if is_incremental {
+        let changed_text = if is_incremental {
             changed_file_tokens(repo_path, &changed_files)
         } else {
             None
@@ -1787,8 +1846,8 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             // find_refs_for_canonical_key), so a stale entry would replay
             // forever. Runs before the purge and merge below so `symbols_db`
             // still holds the pre-merge definition sites.
-            match &changed_tokens {
-                Some(tokens) => {
+            match &changed_text {
+                Some(text) => {
                     let stale = stale_ref_cache_keys(
                         &ref_cache_db,
                         &symbols_db,
@@ -1796,7 +1855,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                         &index,
                         repo_path,
                         &touched_files,
-                        tokens,
+                        text,
                     )?;
                     for key in &stale {
                         ref_cache_db.delete(&mut wtxn, key.as_str())?;
@@ -2871,6 +2930,8 @@ mod tests {
     /// that flavour, plus `CS_FAKE_EXTRA_KEY` (when set) defined in
     /// `src/Long.cs` and referenced once; with `CS_FAKE_MARKER` set, every
     /// other subcommand except `--version` appends its name to that file first.
+    /// With `CS_FAKE_CONCURRENCY_DIR` set, `index` and `find-refs` run for 400 ms
+    /// and append the number of such runs live at their start to `peak.log` there.
     const FAKE_HELPER_SRC: &str = r##"fn main() {
     if std::env::var("CS_FAKE_HELPER_MODE").as_deref() == Ok("exit75") {
         std::process::exit(75);
@@ -2896,6 +2957,27 @@ mod tests {
         .iter()
         .position(|a| a == "--output")
         .and_then(|i| args.get(i + 1));
+    if let (Ok(dir), true) = (
+        std::env::var("CS_FAKE_CONCURRENCY_DIR"),
+        sub == "index" || sub == "find-refs",
+    ) {
+        use std::io::Write;
+        let mine = format!("{dir}/running-{}", std::process::id());
+        std::fs::write(&mine, "").unwrap();
+        let running = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("running-"))
+            .count();
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{dir}/peak.log"))
+            .unwrap();
+        writeln!(log, "{running}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        std::fs::remove_file(&mine).unwrap();
+    }
     if sub == "index" {
         let flavour = std::env::var("CS_FAKE_INDEX").expect("index needs CS_FAKE_INDEX");
         let (docs, rows) = match std::env::var("CS_FAKE_EXTRA_KEY") {
@@ -2981,6 +3063,90 @@ mod tests {
         exe_path
     }
 
+    const LAZY_KEY: &str = "csharp Ns . V#Validate().";
+
+    /// Cache-miss fixture: one DEFINITION-only entry (no cached refs, no
+    /// legacy reference kinds), so the lazy find-refs path runs.
+    fn seed_definition_only_key(db: &Path) {
+        let env = crate::symbols::get_shared_scip_env(db).unwrap();
+        let symbols = open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)
+            .unwrap()
+            .unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        symbols
+            .put(
+                &mut wtxn,
+                LAZY_KEY,
+                &serialize_refs(&[StoredReference {
+                    file: PathBuf::from("src/v.cs"),
+                    start_line: 1,
+                    end_line: 1,
+                    kind: "definition".into(),
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rebuild_and_lazy_find_refs_on_one_worktree_never_run_helpers_concurrently() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // The lazy path's repo_path is db_path.parent() — the rebuild's
+        // repo_path too, so both jobs target one worktree.
+        std::fs::write(dir.path().join("FakeSolution.sln"), "").unwrap();
+        let lazy_db = dir.path().join("db");
+        let rebuild_db = dir.path().join("db-rebuild");
+        seed_definition_only_key(&lazy_db);
+
+        let helper_dir = dir.path().join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        let runs = dir.path().join("runs");
+        std::fs::create_dir(&runs).unwrap();
+        let _guard = crate::testing::EnvRestore::set(&[
+            (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
+            ("CS_FAKE_INDEX", "2.1"),
+            ("CS_FAKE_CONCURRENCY_DIR", runs.to_string_lossy().as_ref()),
+        ]);
+
+        let indexer = CSharpSymbolIndexer::new();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let rebuild = scope.spawn(|| {
+                start.wait();
+                indexer
+                    .rebuild(dir.path(), &rebuild_db, RebuildScope::Full)
+                    .map(drop)
+            });
+            let lazy = scope.spawn(|| {
+                start.wait();
+                indexer
+                    .find_references_for_key(&lazy_db, LAZY_KEY)
+                    .map(drop)
+            });
+            rebuild.join().unwrap().unwrap();
+            lazy.join().unwrap().unwrap();
+        });
+
+        let live_at_start: Vec<usize> = std::fs::read_to_string(runs.join("peak.log"))
+            .unwrap()
+            .lines()
+            .map(|l| l.parse().unwrap())
+            .collect();
+        assert_eq!(
+            live_at_start.len(),
+            2,
+            "one index run and one find-refs run"
+        );
+        assert_eq!(
+            live_at_start.iter().max(),
+            Some(&1),
+            "a rebuild and a lazy find-refs ran helpers on one worktree at once"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn lazy_cache_miss_persists_helper_warnings_alongside_the_cached_refs() {
@@ -2989,31 +3155,8 @@ mod tests {
         // The .sln sits at db_path.parent() — the repo_path the lazy path
         // falls back to when scip_meta carries no META_REPO_PATH.
         std::fs::write(dir.path().join("FakeSolution.sln"), "").unwrap();
-
-        // Cache-miss fixture: one DEFINITION-only entry (no cached refs, no
-        // legacy reference kinds), so the lazy find-refs path runs.
-        let key = "csharp Ns . V#Validate().";
-        {
-            let env = crate::symbols::get_shared_scip_env(&db).unwrap();
-            let symbols = open_named_db::<Str, Bytes>(&env, SCIP_DB_NAME)
-                .unwrap()
-                .unwrap();
-            let mut wtxn = env.write_txn().unwrap();
-            symbols
-                .put(
-                    &mut wtxn,
-                    key,
-                    &serialize_refs(&[StoredReference {
-                        file: PathBuf::from("src/v.cs"),
-                        start_line: 1,
-                        end_line: 1,
-                        kind: "definition".into(),
-                    }])
-                    .unwrap(),
-                )
-                .unwrap();
-            wtxn.commit().unwrap();
-        }
+        let key = LAZY_KEY;
+        seed_definition_only_key(&db);
 
         let helper_dir = dir.path().join("helper");
         std::fs::create_dir(&helper_dir).unwrap();
@@ -3220,16 +3363,46 @@ mod tests {
         wtxn.commit().unwrap();
     }
 
+    const FAKE_ATTRIBUTE_CTOR: &str = "csharp Ns . FooAttribute#.ctor().";
+    const FAKE_DISPOSE: &str = "csharp Ns . Res#Dispose().";
+    const FAKE_OPERATOR: &str = "csharp Ns . Money#op_Addition().";
+    const FAKE_WIDGET_CTOR: &str = "csharp Ns . Widget#.ctor().";
+
+    /// Like [`seed_ctor_and_warnings`] for `keys`, referenced from an untouched file.
+    fn seed_extra_ref_cache_keys(db: &Path, keys: &[&str]) {
+        let env = crate::symbols::get_shared_scip_env(db).unwrap();
+        let cache_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)
+            .unwrap()
+            .unwrap();
+        let warnings_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)
+            .unwrap()
+            .unwrap();
+        let refs = serialize_refs(&[StoredReference {
+            file: PathBuf::from("src/D.cs"),
+            start_line: 2,
+            end_line: 2,
+            kind: "reference".into(),
+        }])
+        .unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        for key in keys {
+            cache_db.put(&mut wtxn, key, &refs).unwrap();
+            store_ref_warnings(&warnings_db, &mut wtxn, key, &["partial".into()]).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
     /// A `Files` rebuild drops only the ref-cache keys the edit can affect,
     /// each from `scip_ref_cache` and `scip_ref_warnings` alike.
     #[test]
     #[serial_test::serial]
     fn incremental_rebuild_invalidates_only_affected_ref_cache_keys() {
         // (case, changed files with content — `None` = absent on disk,
-        // deleted files, keys expected gone)
+        // deleted files, keys expected gone, extra keys seeded into the cache)
         type Case = (
             &'static str,
             &'static [(&'static str, Option<&'static str>)],
+            &'static [&'static str],
             &'static [&'static str],
             &'static [&'static str],
         );
@@ -3240,30 +3413,35 @@ mod tests {
                 &[("src/Unrelated.cs", NEUTRAL)],
                 &[],
                 &[],
+                &[],
             ),
             (
                 "rule a: definition file changed",
                 &[("src/A.cs", Some("// emptied"))],
                 &[],
                 &[FAKE_UNREFERENCED, FAKE_REFERENCED],
+                &[],
             ),
             (
                 "rule b: referencing file changed",
                 &[("src/C.cs", NEUTRAL)],
                 &[],
                 &[FAKE_REFERENCED],
+                &[],
             ),
             (
                 "rule b: referencing file deleted",
                 &[("src/Unrelated.cs", NEUTRAL)],
                 &["src/B.cs"],
                 &[FAKE_REFERENCED],
+                &[],
             ),
             (
                 "rule c: changed file names a cached symbol",
                 &[("src/Unrelated.cs", Some("class U { void M() { Idle(); } }"))],
                 &[],
                 &[FAKE_UNREFERENCED],
+                &[],
             ),
             (
                 "ctor: changed file names the containing type",
@@ -3273,17 +3451,64 @@ mod tests {
                 )],
                 &[],
                 &[FAKE_CTOR],
+                &[],
+            ),
+            (
+                "attribute ctor: changed file uses the suffix-stripped name",
+                &[("src/Unrelated.cs", Some("[Foo] class U { }"))],
+                &[],
+                &[FAKE_ATTRIBUTE_CTOR],
+                &[FAKE_ATTRIBUTE_CTOR],
+            ),
+            (
+                "attribute ctor: an unrelated attribute keeps the cache",
+                &[("src/Unrelated.cs", Some("[Bar] class U { }"))],
+                &[],
+                &[],
+                &[FAKE_ATTRIBUTE_CTOR],
+            ),
+            (
+                "implicit pattern member: any changed file",
+                &[("src/Unrelated.cs", NEUTRAL)],
+                &[],
+                &[FAKE_DISPOSE],
+                &[FAKE_DISPOSE],
+            ),
+            (
+                "operator: any changed file",
+                &[("src/Unrelated.cs", NEUTRAL)],
+                &[],
+                &[FAKE_OPERATOR],
+                &[FAKE_OPERATOR],
+            ),
+            (
+                "target-typed new: changed file contains `new(`",
+                &[("src/Unrelated.cs", Some("class U { Other M() => new(); }"))],
+                &[],
+                &[FAKE_CTOR, FAKE_WIDGET_CTOR],
+                &[FAKE_WIDGET_CTOR],
+            ),
+            (
+                "target-typed new: a typed `new Other()` keeps unnamed ctors",
+                &[(
+                    "src/Unrelated.cs",
+                    Some("class U { object M() => new Other(); }"),
+                )],
+                &[],
+                &[],
+                &[FAKE_WIDGET_CTOR],
             ),
             (
                 "unreadable changed file clears everything",
                 &[("src/Missing.cs", None)],
                 &[],
                 &[FAKE_CTOR, FAKE_UNREFERENCED, FAKE_REFERENCED],
+                &[],
             ),
         ];
         let helper_home = tempfile::TempDir::new().unwrap();
         let helper = build_fake_csharp_helper(helper_home.path());
-        for (case, changed, deleted, removed) in cases {
+        for (case, changed, deleted, removed, extra) in cases {
             let dir = tempfile::TempDir::new().unwrap();
             drop(rebuild_with_fake_helper(
                 &helper,
@@ -3292,6 +3517,7 @@ mod tests {
                 RebuildScope::Full,
             ));
             seed_ctor_and_warnings(&dir.path().join("db"));
+            seed_extra_ref_cache_keys(&dir.path().join("db"), extra);
             std::fs::create_dir_all(dir.path().join("src")).unwrap();
             for (file, content) in *changed {
                 if let Some(content) = content {
@@ -3307,6 +3533,7 @@ mod tests {
 
             let mut kept: Vec<String> = [FAKE_REFERENCED, FAKE_UNREFERENCED, FAKE_CTOR]
                 .into_iter()
+                .chain(extra.iter().copied())
                 .filter(|k| !removed.contains(k))
                 .map(str::to_string)
                 .collect();

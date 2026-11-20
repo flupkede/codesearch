@@ -6,6 +6,7 @@ use super::helper_gate::{HelperGate, HelperPurpose};
 use super::resident::{ClientLike, ResidentRefs, WorkspacePool};
 use crate::constants::{
     csharp_scip_concurrency, parse_csharp_scip_concurrency, CSHARP_SCIP_CONCURRENCY_ENV,
+    SHUTDOWN_REQUESTED,
 };
 use anyhow::Result;
 use serial_test::serial;
@@ -157,6 +158,66 @@ fn capacity_one_blocks_a_second_acquirer_until_the_first_permit_drops() {
     );
     drop(first);
     assert_eq!(rx.recv_timeout(COMPLETES_WITHIN), Ok(Ok(())));
+}
+
+/// Clears the global shutdown flag on drop, so a failed assertion cannot
+/// leave it set for the next serial test.
+struct ShutdownFlagReset;
+
+impl Drop for ShutdownFlagReset {
+    fn drop(&mut self) {
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    }
+}
+
+fn acquire_on_thread(
+    gate: &Arc<HelperGate>,
+    root: &'static Path,
+) -> mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = mpsc::channel();
+    let gate_bg = Arc::clone(gate);
+    std::thread::spawn(move || {
+        let acquired = gate_bg.acquire(HelperPurpose::FindRefs, root).map(drop);
+        let _ = tx.send(acquired.map_err(|e| e.to_string()));
+    });
+    rx
+}
+
+#[test]
+#[serial]
+fn shutdown_cancels_a_blocked_acquire_and_leaks_no_slot() {
+    let cases: [(&str, &'static Path); 2] = [
+        ("blocked on the worktree lock", wt()),
+        ("blocked on the global slot", Path::new("C:/code/other-wt")),
+    ];
+    for (case, blocked_root) in cases {
+        let _reset = ShutdownFlagReset;
+        let gate = Arc::new(HelperGate::new(1));
+        let holder = gate.acquire(HelperPurpose::Rebuild, wt()).unwrap();
+
+        let blocked = acquire_on_thread(&gate, blocked_root);
+        assert_eq!(
+            blocked.recv_timeout(BLOCKED_FOR),
+            Err(RecvTimeoutError::Timeout),
+            "{case}: the second acquirer did not block"
+        );
+
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        drop(holder);
+        let outcome = blocked.recv_timeout(COMPLETES_WITHIN);
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "{case}: a blocked acquire must fail on shutdown, got {outcome:?}"
+        );
+
+        let fresh = acquire_on_thread(&gate, wt());
+        assert_eq!(
+            fresh.recv_timeout(COMPLETES_WITHIN),
+            Ok(Ok(())),
+            "{case}: the cancelled acquire leaked its slot or worktree lock"
+        );
+    }
 }
 
 #[test]
