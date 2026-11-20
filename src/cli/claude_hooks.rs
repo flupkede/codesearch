@@ -7,11 +7,13 @@
 //! no dependency on the source tree at install time.
 //!
 //! Behaviour mirrors the shell installers:
-//!   1. Write the hook scripts (guards, the PostToolUse companion and the
-//!      shared helper libraries) into `<claude_dir>/hooks/codesearch/`.
+//!   1. Write the script guards (grep/preamble/web) and the shared helper
+//!      libraries into `<claude_dir>/hooks/codesearch/` — the edit-guard
+//!      hooks run natively as `codesearch hook <stem>` and ship no scripts.
 //!   2. Merge one PreToolUse registration per guard and one PostToolUse
 //!      registration per companion into `settings.json`, keyed by the exact
-//!      command string so re-running never duplicates.
+//!      command string so re-running never duplicates. Legacy script-file
+//!      registrations of the edit guards are removed on the way (migration).
 //!   3. Back up an existing `settings.json` before rewriting it.
 //!
 //! `<claude_dir>` is `~/.claude` (user scope) or `./.claude` (`--project`).
@@ -23,6 +25,8 @@ use std::path::{Path, PathBuf};
 
 // Embedded hook scripts. `integrations/claude-code/hooks/` stays the single
 // source of truth; these are baked into the binary at build time.
+// edit-guard / edit-guard-post ship NO scripts anymore — they run natively
+// as `codesearch hook <stem>` subcommands (src/cli/hook_guard.rs).
 const GREP_GUARD_SH: &str = include_str!("../../integrations/claude-code/hooks/grep-guard.sh");
 const GREP_GUARD_PS1: &str = include_str!("../../integrations/claude-code/hooks/grep-guard.ps1");
 const PREAMBLE_SH: &str = include_str!("../../integrations/claude-code/hooks/subagent-preamble.sh");
@@ -30,12 +34,6 @@ const PREAMBLE_PS1: &str =
     include_str!("../../integrations/claude-code/hooks/subagent-preamble.ps1");
 const WEB_GUARD_SH: &str = include_str!("../../integrations/claude-code/hooks/web-guard.sh");
 const WEB_GUARD_PS1: &str = include_str!("../../integrations/claude-code/hooks/web-guard.ps1");
-const EDIT_GUARD_SH: &str = include_str!("../../integrations/claude-code/hooks/edit-guard.sh");
-const EDIT_GUARD_PS1: &str = include_str!("../../integrations/claude-code/hooks/edit-guard.ps1");
-const EDIT_GUARD_POST_SH: &str =
-    include_str!("../../integrations/claude-code/hooks/edit-guard-post.sh");
-const EDIT_GUARD_POST_PS1: &str =
-    include_str!("../../integrations/claude-code/hooks/edit-guard-post.ps1");
 const CODESEARCH_COMMON_SH: &str =
     include_str!("../../integrations/claude-code/hooks/codesearch-common.sh");
 const CODESEARCH_COMMON_PS1: &str =
@@ -46,9 +44,11 @@ const CODESEARCH_COMMON_PS1: &str =
 struct GuardHook {
     /// Claude Code matcher — a regex over the tool name (e.g. `"Grep"`).
     matcher: &'static str,
-    /// Script basename without extension (e.g. `"grep-guard"`).
+    /// Script basename without extension (e.g. `"grep-guard"`); for native
+    /// hooks it doubles as the `codesearch hook <stem>` subcommand name.
     stem: &'static str,
-    /// `(filename, embedded contents)` for each shell variant.
+    /// `(filename, embedded contents)` for each shell variant — empty for
+    /// native hooks (nothing to write out, the binary IS the hook).
     files: &'static [(&'static str, &'static str)],
 }
 
@@ -90,10 +90,8 @@ static GUARD_HOOKS: &[GuardHook] = &[
     GuardHook {
         matcher: "Edit|Write|MultiEdit",
         stem: "edit-guard",
-        files: &[
-            ("edit-guard.sh", EDIT_GUARD_SH),
-            ("edit-guard.ps1", EDIT_GUARD_PS1),
-        ],
+        // Native: the binary itself is the hook (`codesearch hook edit-guard`).
+        files: &[],
     },
 ];
 
@@ -104,10 +102,8 @@ static GUARD_HOOKS: &[GuardHook] = &[
 static POST_TOOL_USE_HOOKS: &[GuardHook] = &[GuardHook {
     matcher: "mcp__codesearch__find_impact|mcp__codesearch__find",
     stem: "edit-guard-post",
-    files: &[
-        ("edit-guard-post.sh", EDIT_GUARD_POST_SH),
-        ("edit-guard-post.ps1", EDIT_GUARD_POST_PS1),
-    ],
+    // Native: the binary itself is the hook (`codesearch hook edit-guard-post`).
+    files: &[],
 }];
 
 /// Shared helper libraries sourced by the guard scripts at runtime; written
@@ -140,6 +136,63 @@ fn hook_command(hooks_dest: &Path, stem: &str) -> String {
     } else {
         format!("bash \"{dir}/{stem}.sh\"")
     }
+}
+
+/// Command string for a native hook: invoke the running binary's own
+/// `hook <stem>` subcommand — one process per call, no shell, no script
+/// files. Forward slashes and quoting, same as `hook_command`.
+fn native_hook_command(stem: &str) -> Result<String> {
+    let exe = std::env::current_exe()
+        .context("could not resolve the running codesearch executable")?
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    Ok(format!("\"{exe}\" hook {stem}"))
+}
+
+/// Legacy script suffixes the installer migrates away from: the pre-native
+/// `pwsh …/edit-guard.ps1"` / `bash …/edit-guard.sh"` registrations (and the
+/// -post variants). The trailing quote keeps `/other/edit-guard-old.ps1"`
+/// style commands from matching.
+fn legacy_script_suffixes(stem: &str) -> [String; 2] {
+    [format!("/{stem}.ps1\""), format!("/{stem}.sh\"")]
+}
+
+/// Remove pre-native registrations of a hook from `hooks.<event>`: every
+/// inner command ending in one of `suffixes` is dropped, entries left
+/// without commands are removed whole. Unrelated entries survive untouched.
+/// Returns true when anything changed.
+fn remove_legacy_hooks(settings: &mut Value, event: &str, suffixes: &[String]) -> bool {
+    let Some(list) = settings
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut(event))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for entry in list.iter_mut() {
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
+        let Some(hs) = obj.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let before = hs.len();
+        hs.retain(|h| {
+            let cmd = h.get("command").and_then(Value::as_str).unwrap_or("");
+            !suffixes.iter().any(|s| cmd.ends_with(s.as_str()))
+        });
+        changed |= hs.len() != before;
+    }
+    if changed {
+        list.retain(|e| {
+            e.get("hooks")
+                .and_then(Value::as_array)
+                .is_none_or(|hs| !hs.is_empty())
+        });
+    }
+    changed
 }
 
 /// Ensure `settings.hooks.<event>` contains a `{matcher, hooks:[…]}` entry
@@ -214,6 +267,45 @@ fn write_hook_file(hooks_dest: &Path, name: &str, contents: &str) -> Result<()> 
     Ok(())
 }
 
+/// Migrate + register one guard in `settings.json`: native hooks drop their
+/// pre-native script registrations first (the dedup is by command), then the
+/// `{matcher, command}` pair is merged idempotently. The script guards keep
+/// their legacy-script commands — those ARE current for them.
+fn register_guard(
+    settings: &mut Value,
+    event: &str,
+    gh: &GuardHook,
+    hooks_dest: &Path,
+) -> Result<()> {
+    let cmd = if gh.files.is_empty() {
+        native_hook_command(gh.stem)?
+    } else {
+        hook_command(hooks_dest, gh.stem)
+    };
+    if gh.files.is_empty() {
+        let suffixes = legacy_script_suffixes(gh.stem);
+        if remove_legacy_hooks(settings, event, &suffixes) {
+            eprintln!(
+                "{}",
+                format!(
+                    "Migrated {} {}: removed legacy script registration",
+                    event, gh.stem
+                )
+                .yellow()
+            );
+        }
+    }
+    if add_matcher_hook(settings, event, gh.matcher, &cmd)? {
+        eprintln!(
+            "{}",
+            format!("Registered {} {} hook -> {}", event, gh.matcher, cmd).green()
+        );
+    } else {
+        eprintln!("Already registered: {} {} (skipping)", event, gh.matcher);
+    }
+    Ok(())
+}
+
 /// Load an existing `settings.json` (backing it up first) or start from `{}`.
 fn load_or_init_settings(settings_path: &Path) -> Result<Value> {
     if !settings_path.exists() {
@@ -260,15 +352,7 @@ pub fn run_claude_install(project: bool) -> Result<()> {
         ("PostToolUse", POST_TOOL_USE_HOOKS),
     ] {
         for gh in hooks {
-            let cmd = hook_command(&hooks_dest, gh.stem);
-            if add_matcher_hook(&mut settings, event, gh.matcher, &cmd)? {
-                eprintln!(
-                    "{}",
-                    format!("Registered {} {} hook -> {}", event, gh.matcher, cmd).green()
-                );
-            } else {
-                eprintln!("Already registered: {} {} (skipping)", event, gh.matcher);
-            }
+            register_guard(&mut settings, event, gh, &hooks_dest)?;
         }
     }
 
@@ -411,19 +495,137 @@ mod tests {
         for (name, body) in COMMON_HOOK_FILES {
             assert!(!body.is_empty(), "{name} embedded body is empty");
         }
-        // Every guard and companion ships both a .sh and a .ps1 with
-        // non-empty embedded bodies.
+        // Script guards ship both a .sh and a .ps1 with non-empty embedded
+        // bodies; the native edit guards ship no files at all.
         for g in GUARD_HOOKS.iter().chain(POST_TOOL_USE_HOOKS) {
-            assert_eq!(
-                g.files.len(),
-                2,
-                "guard {} must ship both shells",
-                g.matcher
-            );
-            for (name, body) in g.files {
-                assert!(!body.is_empty(), "{name} embedded body is empty");
+            match g.stem {
+                "edit-guard" | "edit-guard-post" => {
+                    assert!(
+                        g.files.is_empty(),
+                        "native guard {} must ship no script files",
+                        g.stem
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        g.files.len(),
+                        2,
+                        "script guard {} must ship both shells",
+                        g.matcher
+                    );
+                    for (name, body) in g.files {
+                        assert!(!body.is_empty(), "{name} embedded body is empty");
+                    }
+                }
             }
         }
+    }
+
+    #[test]
+    fn native_hook_command_shape() {
+        for stem in ["edit-guard", "edit-guard-post"] {
+            let cmd = native_hook_command(stem).unwrap();
+            assert!(
+                cmd.starts_with('"'),
+                "native command must quote the exe path: {cmd}"
+            );
+            assert_eq!(
+                cmd.rsplit_once("\" hook ").map(|(_, s)| s),
+                Some(stem),
+                "native command must invoke `hook {stem}`: {cmd}"
+            );
+            assert!(!cmd.contains('\\'), "path must use forward slashes: {cmd}");
+            assert!(
+                !cmd.contains("pwsh") && !cmd.contains("bash"),
+                "no shell: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_removes_legacy_script_registration() {
+        let mut settings = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Edit|Write|MultiEdit", "hooks": [ { "type": "command",
+                      "command": "pwsh -NoProfile -NonInteractive -File \"C:/u/.claude/hooks/codesearch/edit-guard.ps1\"" } ] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "mcp__codesearch__find_impact|mcp__codesearch__find", "hooks": [ { "type": "command",
+                      "command": "bash \"C:/u/.claude/hooks/codesearch/edit-guard-post.sh\"" } ] }
+                ]
+            }
+        });
+        let gh = GUARD_HOOKS.iter().find(|g| g.stem == "edit-guard").unwrap();
+        register_guard(&mut settings, "PreToolUse", gh, Path::new("/x")).unwrap();
+        let gh_post = POST_TOOL_USE_HOOKS
+            .iter()
+            .find(|g| g.stem == "edit-guard-post")
+            .unwrap();
+        register_guard(&mut settings, "PostToolUse", gh_post, Path::new("/x")).unwrap();
+
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            pre.len(),
+            1,
+            "legacy pwsh entry must be replaced, not duplicated"
+        );
+        assert!(
+            !serde_json::to_string(&pre)
+                .unwrap()
+                .contains("edit-guard.ps1"),
+            "pwsh script registration must be gone"
+        );
+        assert_eq!(
+            pre[0]["hooks"][0]["command"],
+            native_hook_command("edit-guard").unwrap()
+        );
+
+        let post = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        assert!(
+            !serde_json::to_string(&post)
+                .unwrap()
+                .contains("edit-guard-post.sh"),
+            "sh script registration must be gone"
+        );
+    }
+
+    #[test]
+    fn migration_preserves_unrelated_and_script_guards() {
+        let mut settings = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [ { "type": "command", "command": "echo unrelated" } ] },
+                    { "matcher": "Grep|Bash", "hooks": [ { "type": "command",
+                      "command": "pwsh -NoProfile -NonInteractive -File \"C:/u/.claude/hooks/codesearch/grep-guard.ps1\"" } ] }
+                ]
+            }
+        });
+        let gh = GUARD_HOOKS.iter().find(|g| g.stem == "edit-guard").unwrap();
+        register_guard(&mut settings, "PreToolUse", gh, Path::new("/x")).unwrap();
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 3, "unrelated + still-script grep-guard survive");
+        let grep = pre.iter().find(|e| e["matcher"] == "Grep|Bash").unwrap();
+        assert!(
+            serde_json::to_string(grep)
+                .unwrap()
+                .contains("grep-guard.ps1"),
+            "grep-guard legacy entry is current (phase 2) — must not be removed"
+        );
+    }
+
+    #[test]
+    fn register_guard_is_idempotent() {
+        let gh = GUARD_HOOKS.iter().find(|g| g.stem == "edit-guard").unwrap();
+        let mut settings = json!({});
+        register_guard(&mut settings, "PreToolUse", gh, Path::new("/x")).unwrap();
+        // Second run: no change, no duplicate.
+        let before = settings.clone();
+        register_guard(&mut settings, "PreToolUse", gh, Path::new("/x")).unwrap();
+        assert_eq!(settings, before, "re-install must be a no-op");
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1);
     }
 
     #[test]
@@ -487,8 +689,8 @@ mod tests {
                 if let Some(out) = run_detector_probe(
                     "bash",
                     &[
-                    "-c",
-                    ". \"$CODESEARCH_TEST_DIR\"/codesearch-common.sh; if command_grep_family \"$CODESEARCH_TEST_CMD\"; then echo YES; else echo no; fi",
+                        "-c",
+                        ". \"$CODESEARCH_TEST_DIR\"/codesearch-common.sh; if command_grep_family \"$CODESEARCH_TEST_CMD\"; then echo YES; else echo no; fi",
                     ],
                     &dir,
                     cmd,
