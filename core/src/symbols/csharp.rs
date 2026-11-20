@@ -26,7 +26,8 @@
 //! - Merges the result: updates symbols and positions for affected files only;
 //!   symbols from other projects are preserved.
 //! - Rebuilds `scip_simple_names` from all current `scip_symbols` entries.
-//! - Clears `scip_ref_cache`; references then resolve lazily on demand.
+//! - Drops only the `scip_ref_cache` entries the changed files can affect
+//!   (see `stale_ref_cache_keys`); those resolve lazily on demand.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -582,6 +583,102 @@ pub(crate) fn extract_simple_name(scip_symbol: &str) -> String {
         .unwrap_or(cleaned)
         .trim()
         .to_string()
+}
+
+// ── Files-rebuild ref-cache invalidation ───────────────────────────
+
+/// Simple names of members whose call sites name the containing type
+/// instead (`new Foo()`, `a + b`).
+const CTOR_SIMPLE_NAMES: &[&str] = &["ctor", "cctor"];
+const OPERATOR_SIMPLE_NAME_PREFIX: &str = "op_";
+
+/// The identifier an edit must contain to change `key`'s references.
+fn ref_cache_match_name(key: &str) -> String {
+    let simple = extract_simple_name(key);
+    if !CTOR_SIMPLE_NAMES.contains(&simple.as_str())
+        && !simple.starts_with(OPERATOR_SIMPLE_NAME_PREFIX)
+    {
+        return simple;
+    }
+    let member_head = key.split('(').next().unwrap_or(key);
+    match member_head.rfind('#') {
+        Some(hash) => extract_simple_name(&key[..=hash]),
+        None => simple,
+    }
+}
+
+/// `[A-Za-z_][A-Za-z0-9_]*` tokens of the changed files' current content;
+/// `None` when one is unreadable — nothing then bounds what it references.
+fn changed_file_tokens(repo_path: &Path, changed: &[PathBuf]) -> Option<HashSet<String>> {
+    let mut tokens = HashSet::new();
+    for file in changed {
+        let path = repo_path.join(file);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    "changed file {} unreadable ({e}) — clearing the whole reference cache",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        tokens.extend(
+            text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map(|t| t.trim_start_matches(|c: char| c.is_ascii_digit()))
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
+        );
+    }
+    Some(tokens)
+}
+
+/// `scip_ref_cache` keys a `Files` rebuild may have made stale: defined in a
+/// `touched` file (`scip_symbols` before the merge, or the new index), a
+/// cached reference in one, or named in `tokens` — the rule that catches a
+/// symbol GAINING a reference from the edit. Paths compare in
+/// [`crate::cache::storage_key`] form.
+fn stale_ref_cache_keys(
+    ref_cache_db: &Database<'static, Str, Bytes>,
+    symbols_db: &Database<'static, Str, Bytes>,
+    wtxn: &heed::RwTxn<'_>,
+    index: &scip_parse::ScipIndex,
+    repo_path: &Path,
+    touched: &HashSet<String>,
+    tokens: &HashSet<String>,
+) -> Result<Vec<String>> {
+    let in_touched = |file: &Path| touched.contains(&crate::cache::storage_key(file, repo_path));
+    let mut stale = Vec::new();
+    for entry in ref_cache_db.iter(wtxn)? {
+        let (key, cached) = entry?;
+        let named = tokens.contains(&ref_cache_match_name(key));
+        let defined_in_new_index = || {
+            index.get(key).is_some_and(|defs| {
+                defs.iter()
+                    .any(|d| d.kind == "definition" && in_touched(&d.file))
+            })
+        };
+        // An undecodable entry is a cache miss anyway: drop it.
+        let referenced_from_touched = || match deserialize_refs(cached) {
+            Ok(refs) => refs.iter().any(|r| in_touched(&r.file)),
+            Err(_) => true,
+        };
+        let is_stale = named
+            || defined_in_new_index()
+            || referenced_from_touched()
+            || match symbols_db.get(wtxn, key)? {
+                Some(defs) => deserialize_refs(defs).is_ok_and(|defs| {
+                    defs.iter()
+                        .any(|d| d.kind == "definition" && in_touched(&d.file))
+                }),
+                None => false,
+            };
+        if is_stale {
+            stale.push(key.to_string());
+        }
+    }
+    Ok(stale)
 }
 
 // ── CSharpSymbolIndexer ───────────────────────────────────────────
@@ -1476,28 +1573,28 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // `is_incremental` true → RebuildScope::Files → merge, not replace.
         // Also extract `deleted_for_cleanup`: paths absent from the new index that must
         // still be purged from LMDB (files deleted on disk since last rebuild).
-        let (solution, project, is_incremental, deleted_for_cleanup) = match scope {
+        let (solution, project, is_incremental, changed_files, deleted_for_cleanup) = match scope {
             RebuildScope::Full => {
                 let sln = Self::find_solution(repo_path).ok_or_else(|| {
                     anyhow::anyhow!("No .sln file found in {}", repo_path.display())
                 })?;
-                (sln, None, false, vec![])
+                (sln, None, false, vec![], vec![])
             }
             RebuildScope::Project(csproj) => {
                 let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
-                (sln, Some(csproj), false, vec![])
+                (sln, Some(csproj), false, vec![], vec![])
             }
             RebuildScope::Files { changed, deleted } => {
                 if let Some(first_file) = changed.first() {
                     let csproj = Self::find_csproj_for_file(repo_path, first_file)
                         .unwrap_or_else(|| first_file.clone());
                     let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
-                    // Normalise deleted paths to forward-slash strings for LMDB key comparison.
+                    // Watcher paths are absolute; LMDB keys are repo-relative.
                     let deleted_norm: Vec<String> = deleted
                         .iter()
-                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .map(|p| crate::cache::storage_key(p, repo_path))
                         .collect();
-                    (sln, Some(csproj), true, deleted_norm) // ← incremental merge
+                    (sln, Some(csproj), true, changed, deleted_norm) // ← incremental merge
                 } else {
                     bail!("RebuildScope::Files has no changed files");
                 }
@@ -1610,6 +1707,18 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             )
         };
 
+        // Read before the write txn: file I/O must not hold the LMDB writer.
+        let changed_tokens = if is_incremental {
+            changed_file_tokens(repo_path, &changed_files)
+        } else {
+            None
+        };
+        let touched_files: HashSet<String> = changed_files
+            .iter()
+            .map(|p| crate::cache::storage_key(p, repo_path))
+            .chain(deleted_for_cleanup.iter().cloned())
+            .collect();
+
         // Open LMDB (all named DBs pre-created by open_scip_env)
         let env = self.open_scip_env(db_path)?;
 
@@ -1652,6 +1761,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             positions_db.clear(&mut wtxn)?;
             simple_names_db.clear(&mut wtxn)?;
             ref_cache_db.clear(&mut wtxn)?;
+            ref_warnings_db.clear(&mut wtxn)?;
         } else {
             // ── Incremental merge (Opt 3) ──────────────────────────
             tracing::debug!(
@@ -1660,17 +1770,32 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 affected_files
             );
 
-            // A cache HIT short-circuits find_refs entirely (no helper call,
-            // no fresh resolution — see find_refs_for_canonical_key), so an
-            // entry cached before this change would keep replaying its old
-            // answer forever even with the resident workspace now evicted
-            // fresh below. Which existing symbols gained/lost a reference
-            // FROM inside the affected files is exactly what Roslyn is
-            // needed to answer — not knowable from the file list alone — so
-            // there is no cheaper correct scope than the whole cache. It is
-            // a pure derived artifact (rebuilt lazily, one helper call per
-            // symbol on next lookup): safe to drop, unlike scip_symbols.
-            ref_cache_db.clear(&mut wtxn)?;
+            // A cache HIT short-circuits find_refs (see
+            // find_refs_for_canonical_key), so a stale entry would replay
+            // forever. Runs before the purge and merge below so `symbols_db`
+            // still holds the pre-merge definition sites.
+            match &changed_tokens {
+                Some(tokens) => {
+                    let stale = stale_ref_cache_keys(
+                        &ref_cache_db,
+                        &symbols_db,
+                        &wtxn,
+                        &index,
+                        repo_path,
+                        &touched_files,
+                        tokens,
+                    )?;
+                    for key in &stale {
+                        ref_cache_db.delete(&mut wtxn, key.as_str())?;
+                        ref_warnings_db.delete(&mut wtxn, key.as_str())?;
+                    }
+                    tracing::debug!("Incremental: invalidated {} ref-cache key(s)", stale.len());
+                }
+                None => {
+                    ref_cache_db.clear(&mut wtxn)?;
+                    ref_warnings_db.clear(&mut wtxn)?;
+                }
+            }
 
             // Step 1: Collect stale symbol keys from the position index (reverse map
             // file:line → [symbol_keys]). This tells us exactly which scip_symbols
@@ -1740,23 +1865,8 @@ impl SymbolIndexer for CSharpSymbolIndexer {
                 purge_count
             );
 
-            // The old selective invalidation here (definition-site + a
-            // reference-site scan of cached entries) only ever purged a
-            // symbol whose EXISTING cached reference list already pointed
-            // at an affected file. It could never catch the opposite case —
-            // an unrelated, already-cached symbol gaining a brand-new
-            // reference FROM the changed file — because that requires
-            // knowing what the changed file's new content refers to, not
-            // what the old cache already recorded. `ref_cache_db.clear()`
-            // above (unconditional, whole-table) closes that gap and
-            // strictly subsumes this scheme, so the selective passes are
-            // gone rather than left as dead code beside it.
-
             // symbols_db and simple_names_db are merged below, not cleared here.
         }
-        // Per-symbol warnings describe ref_cache entries, which both branches
-        // dropped; a surviving one would replay against a precomputed entry.
-        ref_warnings_db.clear(&mut wtxn)?;
 
         // ── Write symbol entries (definition occurrences) ──────────
         let mut total_defs = 0usize;
@@ -1977,9 +2087,9 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // this solution (if any) was loaded before that change and would
         // silently keep answering find_refs from stale content otherwise —
         // this pool has no other tie to repo state. Evict unconditionally
-        // (full or incremental): the next find_refs respawns fresh. Both
-        // branches above also clear `ref_cache_db`, so a cache hit can only
-        // replay an answer this rebuild wrote.
+        // (full or incremental): the next find_refs respawns fresh. The
+        // ref-cache entries this rebuild kept are those the changed files
+        // cannot affect.
         crate::symbols::resident::WORKSPACE_POOL.evict(&solution);
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -2936,6 +3046,19 @@ mod tests {
     /// Rebuild `dir` against the fake helper's `index` output in `flavour`,
     /// after seeding a stale per-symbol warning for [`FAKE_REFERENCED`].
     fn rebuild_with_fake_index(dir: &Path, flavour: &str, scope: RebuildScope) -> FakeIndexRun {
+        let helper_dir = dir.join("helper");
+        std::fs::create_dir_all(&helper_dir).unwrap();
+        let helper = build_fake_csharp_helper(&helper_dir);
+        rebuild_with_fake_helper(&helper, dir, flavour, scope)
+    }
+
+    /// [`rebuild_with_fake_index`] against an already-built fake helper.
+    fn rebuild_with_fake_helper(
+        helper: &Path,
+        dir: &Path,
+        flavour: &str,
+        scope: RebuildScope,
+    ) -> FakeIndexRun {
         let db = dir.join("db");
         std::fs::write(dir.join("FakeSolution.sln"), "").unwrap();
         {
@@ -2948,9 +3071,6 @@ mod tests {
                 .unwrap();
             wtxn.commit().unwrap();
         }
-        let helper_dir = dir.join("helper");
-        std::fs::create_dir_all(&helper_dir).unwrap();
-        let helper = build_fake_csharp_helper(&helper_dir);
         let marker = dir.join("non-index-calls.txt");
         let guard = crate::testing::EnvRestore::set(&[
             (HELPER_ENV_VAR, helper.to_string_lossy().as_ref()),
@@ -3060,40 +3180,136 @@ mod tests {
         );
     }
 
-    /// An incremental rebuild clears the WHOLE precomputed ref cache —
-    /// including entries for symbols untouched by the changed files — so
-    /// no stale pre-change entry can survive an unrelated file's rebuild.
-    /// This is the pin that moved here from the deleted
-    /// `test_incremental_rebuild_clears_the_reference_cache` (its probe
-    /// `collect_uncached_symbol_keys` was removed with the lazy pre-warm).
+    const FAKE_CTOR: &str = "csharp Ns . A#.ctor().";
+
+    /// Caches [`FAKE_CTOR`] (referenced from an untouched file) and gives
+    /// every cached key a warning, so a removal shows in both tables.
+    fn seed_ctor_and_warnings(db: &Path) {
+        let env = crate::symbols::get_shared_scip_env(db).unwrap();
+        let cache_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_CACHE_DB_NAME)
+            .unwrap()
+            .unwrap();
+        let warnings_db = open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)
+            .unwrap()
+            .unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let ctor_refs = serialize_refs(&[StoredReference {
+            file: PathBuf::from("src/D.cs"),
+            start_line: 2,
+            end_line: 2,
+            kind: "reference".into(),
+        }])
+        .unwrap();
+        cache_db.put(&mut wtxn, FAKE_CTOR, &ctor_refs).unwrap();
+        for key in [FAKE_REFERENCED, FAKE_UNREFERENCED, FAKE_CTOR] {
+            store_ref_warnings(&warnings_db, &mut wtxn, key, &["partial".into()]).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
+    /// A `Files` rebuild drops only the ref-cache keys the edit can affect,
+    /// each from `scip_ref_cache` and `scip_ref_warnings` alike.
     #[test]
     #[serial_test::serial]
-    fn incremental_rebuild_clears_the_precomputed_ref_cache() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let full = rebuild_with_fake_index(dir.path(), "2.1", RebuildScope::Full);
-        assert_eq!(full.summary.references_stored, 4);
-        assert_eq!(ref_cache_keys(&full.db).len(), 2);
+    fn incremental_rebuild_invalidates_only_affected_ref_cache_keys() {
+        // (case, changed files with content — `None` = absent on disk,
+        // deleted files, keys expected gone)
+        type Case = (
+            &'static str,
+            &'static [(&'static str, Option<&'static str>)],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        const NEUTRAL: Option<&str> = Some("class Unrelated { void Other() { } }");
+        let cases: &[Case] = &[
+            (
+                "unrelated file keeps the cache",
+                &[("src/Unrelated.cs", NEUTRAL)],
+                &[],
+                &[],
+            ),
+            (
+                "rule a: definition file changed",
+                &[("src/A.cs", Some("// emptied"))],
+                &[],
+                &[FAKE_UNREFERENCED, FAKE_REFERENCED],
+            ),
+            (
+                "rule b: referencing file changed",
+                &[("src/C.cs", NEUTRAL)],
+                &[],
+                &[FAKE_REFERENCED],
+            ),
+            (
+                "rule b: referencing file deleted",
+                &[("src/Unrelated.cs", NEUTRAL)],
+                &["src/B.cs"],
+                &[FAKE_REFERENCED],
+            ),
+            (
+                "rule c: changed file names a cached symbol",
+                &[("src/Unrelated.cs", Some("class U { void M() { Idle(); } }"))],
+                &[],
+                &[FAKE_UNREFERENCED],
+            ),
+            (
+                "ctor: changed file names the containing type",
+                &[(
+                    "src/Unrelated.cs",
+                    Some("class U { object M() => new A(); }"),
+                )],
+                &[],
+                &[FAKE_CTOR],
+            ),
+            (
+                "unreadable changed file clears everything",
+                &[("src/Missing.cs", None)],
+                &[],
+                &[FAKE_CTOR, FAKE_UNREFERENCED, FAKE_REFERENCED],
+            ),
+        ];
+        let helper_home = tempfile::TempDir::new().unwrap();
+        let helper = build_fake_csharp_helper(helper_home.path());
+        for (case, changed, deleted, removed) in cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            drop(rebuild_with_fake_helper(
+                &helper,
+                dir.path(),
+                "2.1",
+                RebuildScope::Full,
+            ));
+            seed_ctor_and_warnings(&dir.path().join("db"));
+            std::fs::create_dir_all(dir.path().join("src")).unwrap();
+            for (file, content) in *changed {
+                if let Some(content) = content {
+                    std::fs::write(dir.path().join(file), content).unwrap();
+                }
+            }
+            // Absolute, as the watcher reports them.
+            let scope = RebuildScope::Files {
+                changed: changed.iter().map(|(f, _)| dir.path().join(f)).collect(),
+                deleted: deleted.iter().map(|f| dir.path().join(f)).collect(),
+            };
+            let run = rebuild_with_fake_helper(&helper, dir.path(), "2.1", scope);
 
-        let run = rebuild_with_fake_index(
-            dir.path(),
-            "2.1",
-            RebuildScope::Files {
-                changed: vec![PathBuf::from("src/Unrelated.cs")],
-                deleted: vec![],
-            },
-        );
-        assert!(
-            ref_cache_keys(&run.db).is_empty(),
-            "an incremental rebuild must clear scip_ref_cache in full, got {:?}",
-            ref_cache_keys(&run.db)
-        );
-        // The cleared cache stamps `incremental`: fresh (project-scoped
-        // truth, queries resolve misses on demand) — NOT lazy, which is
-        // reserved for full-scope runs without references and reads stale.
-        assert_eq!(
-            run.indexer.refs_coverage(&run.db).as_deref(),
-            Some(crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL)
-        );
+            let mut kept: Vec<String> = [FAKE_REFERENCED, FAKE_UNREFERENCED, FAKE_CTOR]
+                .into_iter()
+                .filter(|k| !removed.contains(k))
+                .map(str::to_string)
+                .collect();
+            kept.sort();
+            assert_eq!(ref_cache_keys(&run.db), kept, "{case}: scip_ref_cache");
+            assert_eq!(
+                table_keys(&run.db, SCIP_REF_WARNINGS_DB_NAME),
+                kept,
+                "{case}: scip_ref_warnings"
+            );
+            assert_eq!(
+                run.indexer.refs_coverage(&run.db).as_deref(),
+                Some(crate::constants::SCIP_REFS_COVERAGE_INCREMENTAL),
+                "{case}"
+            );
+        }
     }
 
     #[test]
