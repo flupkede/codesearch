@@ -84,26 +84,35 @@ that make the preference *structural* instead of advisory:
   subagents at all, since they don't inherit `AGENTS.md` or MCP instructions.
 
 - **`edit-guard`** — a `PreToolUse` hook on `Edit`/`Write`/`MultiEdit`.
-  Blocks an edit to a code file in a codesearch-registered repo until
+  Installed as the native command `"…/codesearch" hook edit-guard` — the
+  codesearch binary itself handles the event, one process, no shell, no
+  child processes. Blocks an edit to a code file in a codesearch-registered
+  repo until
   codesearch was consulted for that file within the last 5 minutes:
   `mcp__codesearch__find_impact` for SCIP-backed languages
   (`.cs .ts .tsx .mts .cts`), `mcp__codesearch__find(kind="usages")` for
   other source code. Docs, markup and config files (`.md`, `.json`, ...)
   are never gated — a usages lookup answers nothing there. Making the
   caller-aware-editing protocol structural.
-  Coverage uses the same registration model as grep-guard (shared
-  `codesearch-common` helpers): the file's git root must be listed in
+  Coverage uses the same registration model as grep-guard (the shared
+  `codesearch-common` helpers, ported into the binary): the file's git root
+  must be listed in
   `~/.codesearch/repos.json` (relocatable via `CODESEARCH_HOME`; or
   `CODESEARCH_SERVER` is set); unregistered
-  repos and non-git paths are never blocked.
+  repos and non-git paths are never blocked. The git root is found by
+  walking up for `.git` (a directory, or a file for worktrees) — never a
+  spawned `git`.
 
 - **`edit-guard-post`** — a `PostToolUse` hook on
-  `mcp__codesearch__find_impact` and `mcp__codesearch__find`, recording the
+  `mcp__codesearch__find_impact` and `mcp__codesearch__find`, installed as
+  the native command `"…/codesearch" hook edit-guard-post`, recording the
   "consulted" markers `edit-guard` reads into a state file
-  (`$TMPDIR/.codesearch-edit-guard-state.json` on bash,
-  `%TEMP%\.codesearch-edit-guard-state.json` on PowerShell). It fires on
+  (`${TMPDIR:-/tmp}/.codesearch-edit-guard-state.json` on POSIX,
+  `%TEMP%\.codesearch-edit-guard-state.json` on Windows — the native hook
+  resolves the same locations and writes atomically via temp file + rename).
+  It fires on
   every `find_impact` call and every `find(kind="usages")` (the kind check
-  is done script-side — matchers only see tool names). Markers are
+  is done in the hook itself — matchers only see tool names). Markers are
   attributed from all available sources, all written: a file-ish input
   field (`file`/`path`/`file_path` — serves older schemas); a **path-like
   `symbol` or `symbol_name` input** — the exact call shapes `edit-guard`
@@ -149,12 +158,25 @@ bash integrations/claude-code/install.sh
 bash integrations/claude-code/install.sh --project
 ```
 
-The installer:
-1. copies the guard scripts, the PostToolUse companion and the shared
-   `codesearch-common` helpers into `<claude-dir>/hooks/codesearch/`
+These shell installers are the **script-based path**: for the edit guards
+they still copy and register the `edit-guard*.ps1`/`.sh` twins. The native
+registration below is done by the binary itself — `codesearch hooks claude
+install` (add `--project` for `./.claude` scope) — which also migrates any
+pre-native edit-guard registration away on re-install.
+
+The native installer:
+1. copies only the script guards (grep-guard, subagent-preamble, web-guard)
+   and the shared `codesearch-common` helpers into
+   `<claude-dir>/hooks/codesearch/` — the edit-guard hooks need no scripts:
+   they run natively as `"…/codesearch" hook edit-guard` /
+   `"…/codesearch" hook edit-guard-post`, one process per call (the old
+   ~7.4 s-per-edit pwsh spawn and the ~45 s bash twin are both gone; the
+   sh/ps1 twins remain for the other guards)
 2. merges the `PreToolUse` registrations (one per guard) and the
    `PostToolUse` registration (the companion) into
-   `<claude-dir>/settings.json` (backing up the existing file first)
+   `<claude-dir>/settings.json` (backing up the existing file first). A
+   pre-native `edit-guard.ps1`/`edit-guard.sh` registration is removed
+   automatically on re-install — old and new never run side by side
 3. is idempotent — re-running it skips hooks already registered and never
    duplicates or clobbers unrelated settings
 
@@ -185,7 +207,7 @@ want to merge manually, add to `~/.claude/settings.json` (or
       {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
-          { "type": "command", "command": "pwsh -NoProfile -NonInteractive -File \"<path>/edit-guard.ps1\"" }
+          { "type": "command", "command": "\"<path-to-codesearch>\" hook edit-guard" }
         ]
       }
     ],
@@ -193,7 +215,7 @@ want to merge manually, add to `~/.claude/settings.json` (or
       {
         "matcher": "mcp__codesearch__find_impact|mcp__codesearch__find",
         "hooks": [
-          { "type": "command", "command": "pwsh -NoProfile -NonInteractive -File \"<path>/edit-guard-post.ps1\"" }
+          { "type": "command", "command": "\"<path-to-codesearch>\" hook edit-guard-post" }
         ]
       }
     ]
@@ -203,16 +225,21 @@ want to merge manually, add to `~/.claude/settings.json` (or
 
 Use the `.sh` scripts with a `bash "<path>/..."` command instead on
 macOS/Linux. Point `<path>` at wherever you copy `hooks/*.ps1` / `hooks/*.sh`.
-The guard scripts source `codesearch-common.ps1` / `codesearch-common.sh`
-from their own directory, so that file must be copied alongside them.
+The script guards source `codesearch-common.ps1` / `codesearch-common.sh`
+from their own directory, so that file must be copied alongside them; the
+edit-guard commands above invoke the codesearch binary directly and need no
+copied files.
 
 ## Uninstall
 
 Remove the guard entries (matchers `Grep|Bash`, `Agent`, `WebSearch|WebFetch` and
 `Edit|Write|MultiEdit` under `PreToolUse`, and
-`mcp__codesearch__find_impact|mcp__codesearch__find` under `PostToolUse`,
-whose commands point at `hooks/codesearch/`) from `settings.json`, and delete
-`<claude-dir>/hooks/codesearch/`.
+`mcp__codesearch__find_impact|mcp__codesearch__find` under `PostToolUse`)
+from `settings.json` and delete `<claude-dir>/hooks/codesearch/`. The
+grep/preamble/web commands always point at `hooks/codesearch/`; the
+edit-guard commands invoke `"…/codesearch" hook …` after a native install,
+but point at `hooks/codesearch/edit-guard*.ps1|.sh` when installed by the
+shell installers.
 
 ## Caveats
 

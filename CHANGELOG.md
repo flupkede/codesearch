@@ -26,6 +26,16 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Changed
 
+- **edit-guard hooks run natively**: `codesearch hook edit-guard` /
+  `codesearch hook edit-guard-post` replace the per-call pwsh/bash script
+  spawns (~7.4 s per Edit on Windows → single fast process, no shell, no
+  jq, no spawned `git`); `hooks claude install` registers the binary's own
+  subcommand, ships no edit-guard scripts, and migrates away pre-native
+  script registrations on re-install. Behaviour is the e5c7d5d scripts
+  verbatim (kind table, 300 s window, MultiEdit all-paths, marker sources
+  1/1b/2/3, fail-open, atomic state writes); the script twins stay for the
+  still-script guards (grep, web, preamble).
+
 - **The C# resident helper applies file edits in place after a Files rebuild instead of reloading the solution.** Project-file changes, update errors and timeouts (`CODESEARCH_SCIP_RESIDENT_UPDATE_TIMEOUT_SECS`, default 30) still reload.
 
 - **`find_impact` infers `language` from `symbol_key`, the file extension, or the single applicable indexer.** An undecided call returns `retry_with` entries to copy verbatim.
