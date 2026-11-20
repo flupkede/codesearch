@@ -55,7 +55,10 @@ pub fn run_edit_guard() {
     let raw = read_stdin();
     let out = std::panic::catch_unwind(|| edit_guard(&raw)).unwrap_or_default();
     if !out.is_empty() {
-        println!("{out}");
+        // A closed stdout pipe (EPIPE) must not turn "always exit 0" into a
+        // panic — the write result is ignored and the hook still exits 0.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout().lock(), "{out}");
     }
 }
 
