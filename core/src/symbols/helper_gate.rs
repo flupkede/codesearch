@@ -78,8 +78,8 @@ impl HelperGate {
         let started = Instant::now();
         let (worktree, worktree_waited) = self.worktree_lock(worktree_root).lock();
         // A lock or slot freed by serve's shutdown kill must not start a
-        // helper that kill can no longer reach; the guards dropped on bail
-        // pass the wakeup on so other waiters bail too.
+        // helper that kill can no longer reach; bailing passes the wakeup on
+        // so other waiters bail too.
         if worktree_waited && is_shutdown_requested() {
             return Err(cancelled(purpose, worktree_root));
         }
@@ -103,7 +103,7 @@ impl HelperGate {
         let elapsed = started.elapsed();
         if elapsed >= Duration::from_millis(CSHARP_HELPER_GATE_SLOW_WAIT_MS) {
             tracing::info!(
-                "scip-csharp helper gate: {purpose} for {} waited {} ms for its worktree and a slot (capacity {})",
+                "scip-csharp helper gate: {purpose} for {} waited {} ms (worktree lock + slot, capacity {})",
                 worktree_root.display(),
                 elapsed.as_millis(),
                 self.capacity
@@ -176,8 +176,8 @@ impl Drop for WorktreeGuard {
     }
 }
 
-/// The worktree lock plus one global slot. Drop releases the slot first
-/// (in `drop`), then the worktree lock (the field, dropped after `drop`).
+/// The worktree lock plus one global slot, released in reverse order: the
+/// slot in `drop`, the worktree lock when the field drops after it.
 #[must_use = "dropping the permit releases the slot immediately"]
 pub(crate) struct HelperPermit<'a> {
     gate: &'a HelperGate,

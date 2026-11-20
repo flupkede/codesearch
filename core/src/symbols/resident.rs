@@ -17,7 +17,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,8 @@ pub(crate) struct ResidentRefs {
 /// Behaviour seam so the pool can be unit-tested without real processes.
 pub(crate) trait ClientLike: Send + Sync {
     fn find_refs(&self, symbol: &str) -> Result<ResidentRefs>;
-    /// Kill the helper process. Must be idempotent.
+    /// Kill the helper process. Must be idempotent and return only once the
+    /// process has exited, also when another thread's kill is in progress.
     fn kill(&self);
 }
 
@@ -284,6 +285,13 @@ pub struct WorkspacePool {
     /// would block a rebuild for the full minutes-long load). Never removed
     /// (bounded by repo count, same as `spawn_locks`).
     generations: Mutex<HashMap<PathBuf, u64>>,
+    /// Residents taken out of `entries` whose kill may still be running
+    /// outside the pool lock (evict, TTL reap, admission) on a thread that
+    /// does not hold the solution's spawn lock. A spawn kills any still
+    /// alive for its solution first, so two helpers for one solution never
+    /// coexist. Weak: the `ServeClient` drop backstop must still fire when
+    /// the last in-flight user lets go.
+    retiring: Mutex<HashMap<PathBuf, Vec<Weak<dyn ClientLike>>>>,
     max_resident: usize,
     idle: Duration,
     heap_cap: u64,
@@ -306,6 +314,7 @@ impl WorkspacePool {
             entries: Mutex::new(HashMap::new()),
             spawn_locks: Mutex::new(HashMap::new()),
             generations: Mutex::new(HashMap::new()),
+            retiring: Mutex::new(HashMap::new()),
             max_resident,
             idle,
             heap_cap,
@@ -321,6 +330,31 @@ impl WorkspacePool {
             .expect("generations poisoned")
             .get(solution)
             .unwrap_or(&0)
+    }
+
+    /// Record a resident just taken out of `entries`; call under the pool
+    /// lock so a spawn can never miss it.
+    fn retire(&self, solution: &Path, client: &Arc<dyn ClientLike>) {
+        let mut retiring = self.retiring.lock().expect("retiring poisoned");
+        let list = retiring.entry(solution.to_path_buf()).or_default();
+        list.retain(|w| w.strong_count() > 0);
+        list.push(Arc::downgrade(client));
+    }
+
+    /// Kill every retired resident of `solution` still alive. `kill` is
+    /// idempotent and returns once the process has exited, so a kill already
+    /// running on another thread is waited out. Safe under the solution's
+    /// spawn lock: every in-flight request on it holds that same lock.
+    fn kill_retired(&self, solution: &Path) {
+        let retired = self
+            .retiring
+            .lock()
+            .expect("retiring poisoned")
+            .remove(solution)
+            .unwrap_or_default();
+        for client in retired.iter().filter_map(Weak::upgrade) {
+            client.kill();
+        }
     }
 
     /// Resolve references for `symbol` via the resident workspace for
@@ -370,6 +404,7 @@ impl WorkspacePool {
         // Spawn OUTSIDE the pool lock — it takes minutes and must not block
         // lookups on other repos (admission still happens under the lock).
         self.enforce_admission();
+        self.kill_retired(solution);
         let client = (self.spawn_fn)(helper, solution, self.heap_cap)?;
         drop(spawn_permit);
         let in_flight = Arc::new(AtomicUsize::new(1));
@@ -445,6 +480,7 @@ impl WorkspacePool {
                 .collect();
             for k in expired {
                 if let Some(e) = entries.remove(&k) {
+                    self.retire(&k, &e.client);
                     to_kill.push(e.client);
                 }
             }
@@ -476,7 +512,13 @@ impl WorkspacePool {
     pub fn kill_all(&self) {
         let victims: Vec<Arc<dyn ClientLike>> = {
             let mut entries = self.entries.lock().expect("workspace pool poisoned");
-            entries.drain().map(|(_, e)| e.client).collect()
+            entries
+                .drain()
+                .map(|(k, e)| {
+                    self.retire(&k, &e.client);
+                    e.client
+                })
+                .collect()
         };
         for c in victims {
             c.kill(); // OS call — outside the pool lock
@@ -499,7 +541,11 @@ impl WorkspacePool {
     pub(crate) fn evict(&self, solution: &Path) {
         let victim = {
             let mut entries = self.entries.lock().expect("workspace pool poisoned");
-            let result = match entries.remove(solution) {
+            let removed = entries.remove(solution);
+            if let Some(e) = &removed {
+                self.retire(solution, &e.client);
+            }
+            let result = match removed {
                 Some(e) if e.in_flight.load(Ordering::SeqCst) == 0 => Some(e.client),
                 Some(e) => {
                     // In flight: same deferred-kill discipline as LRU eviction.
@@ -537,6 +583,7 @@ impl WorkspacePool {
                     break;
                 };
                 if let Some(e) = entries.remove(&lru_key) {
+                    self.retire(&lru_key, &e.client);
                     if e.in_flight.load(Ordering::SeqCst) == 0 {
                         victims.push(e.client);
                     } else {

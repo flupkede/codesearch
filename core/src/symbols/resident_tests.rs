@@ -7,7 +7,7 @@ use crate::symbols::SymbolReference;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -412,6 +412,81 @@ fn evict_during_an_in_flight_spawn_stops_the_stale_workspace_being_installed_res
         2,
         "the post-race workspace must not have been cached as resident"
     );
+}
+
+/// A client whose kill takes a while to observe the process exit, like
+/// `ServeClient`'s kill + wait; a concurrent kill waits for the first.
+struct SlowExitClient {
+    alive: Arc<AtomicUsize>,
+    exited: Mutex<bool>,
+    kill_started: mpsc::Sender<()>,
+}
+
+impl ClientLike for SlowExitClient {
+    fn find_refs(&self, _symbol: &str) -> Result<ResidentRefs> {
+        Ok(ResidentRefs::default())
+    }
+
+    fn kill(&self) {
+        let mut exited = self.exited.lock().unwrap();
+        if *exited {
+            return;
+        }
+        let _ = self.kill_started.send(());
+        std::thread::sleep(Duration::from_millis(300));
+        self.alive.fetch_sub(1, Ordering::SeqCst);
+        *exited = true;
+    }
+}
+
+#[test]
+fn a_replacement_spawn_waits_until_the_evicted_resident_has_exited() {
+    let alive = Arc::new(AtomicUsize::new(0));
+    let alive_at_spawn = Arc::new(Mutex::new(Vec::new()));
+    let (kill_tx, kill_rx) = mpsc::channel();
+    let spawn_alive = alive.clone();
+    let spawn_seen = alive_at_spawn.clone();
+    let spawn_fn = Box::new(
+        move |_helper: &Path, _solution: &Path, _cap: u64| -> Result<Arc<dyn ClientLike>> {
+            spawn_seen
+                .lock()
+                .unwrap()
+                .push(spawn_alive.load(Ordering::SeqCst));
+            spawn_alive.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(SlowExitClient {
+                alive: spawn_alive.clone(),
+                exited: Mutex::new(false),
+                kill_started: kill_tx.clone(),
+            }))
+        },
+    );
+    let pool = Arc::new(WorkspacePool::new(
+        2,
+        Duration::from_secs(600),
+        1,
+        spawn_fn,
+        test_gate(),
+    ));
+    pool.find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
+        .unwrap();
+
+    // A rebuild evicts the idle resident; its kill runs on the rebuild thread.
+    let pool_bg = pool.clone();
+    let evicting = std::thread::spawn(move || pool_bg.evict(&sln("a")));
+    kill_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("evict never started killing the resident");
+
+    pool.find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
+        .unwrap();
+    evicting.join().unwrap();
+
+    assert_eq!(
+        *alive_at_spawn.lock().unwrap(),
+        vec![0, 0],
+        "the replacement spawned while the evicted helper was still alive"
+    );
+    assert_eq!(alive.load(Ordering::SeqCst), 1);
 }
 
 #[test]
