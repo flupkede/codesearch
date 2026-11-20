@@ -252,6 +252,18 @@ pub enum HookCommands {
         #[command(subcommand)]
         command: HookClaudeCommands,
     },
+    /// Native edit-guard PreToolUse hook: read the Claude Code event JSON
+    /// on stdin, emit the deny decision when the edit needs a codesearch
+    /// consultation (silent allow otherwise; always exits 0 — fail-open).
+    /// Runs in-process: one process per call, no shell, no script files.
+    #[command(name = "edit-guard")]
+    EditGuard,
+
+    /// Native edit-guard-post PostToolUse companion: record the
+    /// "codesearch consulted" markers the edit-guard reads. Emits nothing;
+    /// always exits 0.
+    #[command(name = "edit-guard-post")]
+    EditGuardPost,
 }
 
 /// `hooks git` subcommands.
@@ -673,7 +685,9 @@ async fn trigger_symbol_reindex_via_api(alias: &str, force: bool) -> Result<()> 
 
     let base = serve_base_url();
     let url = if force {
-        format!("{base}{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}?force=true&symbols=true")
+        format!(
+            "{base}{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}?force=true&symbols=true"
+        )
     } else {
         format!("{base}{REPO_REINDEX_PATH_PREFIX}{alias}{REPO_REINDEX_PATH_SUFFIX}?symbols=true")
     };
@@ -1507,6 +1521,16 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     claude_hooks::run_claude_install(project)
                 }
             },
+            // Native guard hooks: never exit non-zero, so the arms swallow
+            // everything and return Ok.
+            HookCommands::EditGuard => {
+                crate::cli::hook_guard::run_edit_guard();
+                Ok(())
+            }
+            HookCommands::EditGuardPost => {
+                crate::cli::hook_guard::run_edit_guard_post();
+                Ok(())
+            }
         },
     }
 }
@@ -2301,7 +2325,7 @@ pub(crate) fn refresh_codesearch_post_checkout_hook(
         None => {
             return HookRefreshOutcome::Failed(
                 "managed markers present but the region could not be located".to_string(),
-            )
+            );
         }
     };
     if updated == existing {
@@ -2316,6 +2340,7 @@ pub(crate) fn refresh_codesearch_post_checkout_hook(
 
 pub mod claude_hooks;
 pub mod doctor;
+pub mod hook_guard;
 pub mod setup;
 
 #[cfg(test)]
