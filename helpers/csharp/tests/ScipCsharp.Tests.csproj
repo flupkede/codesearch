@@ -51,6 +51,7 @@
     <Compile Include="..\RestoreGate.cs" Link="RestoreGate.cs" />
     <Compile Include="..\MsbuildRestore.cs" Link="MsbuildRestore.cs" />
     <Compile Include="..\PathGuard.cs" Link="PathGuard.cs" />
+    <Compile Include="..\ServeHost.cs" Link="ServeHost.cs" />
   </ItemGroup>
 
   <!-- Exclude fixture source files from compilation -->

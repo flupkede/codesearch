@@ -1,15 +1,21 @@
 //! Helper stderr routing tests (`csharp.rs`). Sibling `_tests.rs` file
 //! per repo convention.
 
+use super::csharp::tests::{build_fake_csharp_helper, ref_cache_keys, FAKE_REFERENCED};
 use super::csharp::{
     drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending,
     is_transient_filtered_solution, kill_live_helper_children, restore_pending_flag_clear,
     restore_pending_flag_set, CSharpSymbolIndexer, LiveHelperChild, RestorePendingError,
     HELPER_RESTORE_PENDING_EXIT,
 };
+use super::helper_gate::HelperGate;
+use super::resident::{ClientLike, ResidentRefs, UpdateOutcome, WorkspacePool};
+use super::{RebuildScope, SymbolIndexer};
 use std::io::Cursor;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn drained(input: &[u8]) -> Vec<String> {
     let out: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -783,4 +789,160 @@ fn transient_filtered_solution_predicate_is_precise() {
     assert!(!is("a-filtered-short.sln"));
     assert!(!is(&format!("a-filtered-{}.sln", "z".repeat(32))));
     assert!(!is("no-marker.sln"));
+}
+
+#[derive(Clone, Copy)]
+enum Reply {
+    Applied,
+    NeedsReload,
+    Fail,
+    /// Blocks until killed, like a helper that stopped answering.
+    Hang,
+}
+
+/// What the resident saw: per `update`, the changed paths and the ref-cache
+/// keys committed at that moment.
+#[derive(Default)]
+struct Trace {
+    updates: Mutex<Vec<(Vec<PathBuf>, Vec<String>)>>,
+    spawns: AtomicUsize,
+    kills: AtomicUsize,
+}
+
+struct TraceClient {
+    reply: Reply,
+    db: PathBuf,
+    trace: Arc<Trace>,
+    killed: AtomicBool,
+}
+
+impl ClientLike for TraceClient {
+    fn update(&self, changed: &[PathBuf], _deleted: &[PathBuf]) -> anyhow::Result<UpdateOutcome> {
+        let committed = ref_cache_keys(&self.db);
+        self.trace
+            .updates
+            .lock()
+            .unwrap()
+            .push((changed.to_vec(), committed));
+        match self.reply {
+            Reply::Applied => Ok(UpdateOutcome::Applied(changed.len())),
+            Reply::NeedsReload => Ok(UpdateOutcome::NeedsReload(
+                "needs-reload: src/New.cs".to_string(),
+            )),
+            Reply::Fail => anyhow::bail!("helper update crashed"),
+            Reply::Hang => {
+                while !self.killed.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                anyhow::bail!("killed mid-update")
+            }
+        }
+    }
+
+    fn find_refs(&self, _symbol: &str) -> anyhow::Result<ResidentRefs> {
+        Ok(ResidentRefs::default())
+    }
+
+    fn kill(&self) {
+        if !self.killed.swap(true, Ordering::SeqCst) {
+            self.trace.kills.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn trace_pool(reply: Reply, db: PathBuf, trace: Arc<Trace>) -> &'static WorkspacePool {
+    let spawn = Box::new(
+        move |_: &Path, _: &Path, _: u64| -> anyhow::Result<Arc<dyn ClientLike>> {
+            trace.spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(TraceClient {
+                reply,
+                db: db.clone(),
+                trace: Arc::clone(&trace),
+                killed: AtomicBool::new(false),
+            }))
+        },
+    );
+    let gate = Arc::new(HelperGate::new(1));
+    Box::leak(Box::new(WorkspacePool::new(
+        2,
+        Duration::from_secs(600),
+        1,
+        spawn,
+        gate,
+    )))
+}
+
+/// A `Files` rebuild applies the edit to the resident workspace before the
+/// commit that drops the stale ref-cache key, and evicts it only when that
+/// update fails; a full rebuild always evicts.
+#[test]
+#[serial_test::serial]
+fn files_rebuild_updates_the_resident_before_the_cache_commit_and_evicts_only_on_failure() {
+    // (case, resident reply, full scope, killed)
+    let cases: &[(&str, Reply, bool, usize)] = &[
+        ("applied", Reply::Applied, false, 0),
+        ("needs reload", Reply::NeedsReload, false, 1),
+        ("helper error", Reply::Fail, false, 1),
+        ("no reply in time", Reply::Hang, false, 1),
+        ("full scope", Reply::Applied, true, 1),
+    ];
+    let helper_home = tempfile::TempDir::new().unwrap();
+    let helper = build_fake_csharp_helper(helper_home.path());
+    let _env = crate::testing::EnvRestore::set(&[
+        (
+            crate::constants::SCIP_CSHARP_HELPER_ENV,
+            helper.to_string_lossy().as_ref(),
+        ),
+        ("CS_FAKE_INDEX", "2.1"),
+        (crate::constants::SCIP_RESIDENT_UPDATE_TIMEOUT_SECS_ENV, "1"),
+    ]);
+    for (case, reply, full, kills) in cases {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, db) = (dir.path(), dir.path().join("db"));
+        let sln = root.join("FakeSolution.sln");
+        std::fs::write(&sln, "").unwrap();
+        let trace = Arc::new(Trace::default());
+        let pool = trace_pool(*reply, db.clone(), Arc::clone(&trace));
+        let indexer = CSharpSymbolIndexer::with_pool(pool);
+        indexer.rebuild(root, &db, RebuildScope::Full).unwrap();
+        pool.find_refs(&helper, &sln, root, "Sym").unwrap();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let edited = root.join("src/C.cs");
+        std::fs::write(&edited, "class Unrelated { void Other() { } }").unwrap();
+        let scope = if *full {
+            RebuildScope::Full
+        } else {
+            RebuildScope::Files {
+                changed: vec![edited.clone()],
+                deleted: vec![],
+            }
+        };
+        indexer.rebuild(root, &db, scope).unwrap();
+
+        let updates = trace.updates.lock().unwrap().clone();
+        if *full {
+            assert!(updates.is_empty(), "{case}: {updates:?}");
+        } else {
+            let [(changed, committed)] = updates.as_slice() else {
+                panic!("{case}: expected one update, got {updates:?}");
+            };
+            assert_eq!(changed, &vec![edited.clone()], "{case}");
+            assert!(
+                committed.iter().any(|k| k == FAKE_REFERENCED),
+                "{case}: update ran after the ref-cache commit: {committed:?}"
+            );
+            assert!(
+                !ref_cache_keys(&db).iter().any(|k| k == FAKE_REFERENCED),
+                "{case}: the edit must invalidate the referencing key"
+            );
+        }
+        assert_eq!(trace.kills.load(Ordering::SeqCst), *kills, "{case}: kills");
+        pool.find_refs(&helper, &sln, root, "Sym").unwrap();
+        assert_eq!(
+            trace.spawns.load(Ordering::SeqCst),
+            1 + kills,
+            "{case}: respawns only after an eviction"
+        );
+    }
 }

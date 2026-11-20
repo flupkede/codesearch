@@ -1078,6 +1078,19 @@ pub const SCIP_WORKSPACE_HEAP_CAP_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_HEAP_CA
 pub const DEFAULT_SCIP_WORKSPACE_IDLE_SECS: u64 = 3600;
 pub const SCIP_WORKSPACE_IDLE_SECS_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_IDLE_SECS";
 
+/// Bound on one in-place resident workspace update after a `Files` rebuild
+/// (spawn-lock wait plus helper reply); on expiry the rebuild evicts instead.
+pub const SCIP_RESIDENT_UPDATE_TIMEOUT_SECS: u64 = 30;
+pub const SCIP_RESIDENT_UPDATE_TIMEOUT_SECS_ENV: &str =
+    "CODESEARCH_SCIP_RESIDENT_UPDATE_TIMEOUT_SECS";
+
+/// Poll interval while a resident update waits for the solution's spawn lock.
+pub const SCIP_RESIDENT_UPDATE_LOCK_POLL_MS: u64 = 10;
+
+/// Error prefix of a resident `update` reply whose edit needs a full
+/// workspace reload.
+pub const SCIP_SERVE_NEEDS_RELOAD_PREFIX: &str = "needs-reload";
+
 /// How long (seconds) a budget-overrun `find_impact` lookup stays tracked
 /// for retry observation. Must comfortably exceed the slowest legitimate
 /// `scip-csharp find-refs` run (several minutes on a large solution): an

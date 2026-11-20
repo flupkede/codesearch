@@ -2,19 +2,48 @@
 //! logic against a mock client, no real processes involved.
 
 use super::helper_gate::HelperGate;
-use super::resident::{ClientLike, ResidentRefs, WorkspacePool};
+use super::resident::{
+    resident_update_timeout, ClientLike, ResidentRefs, UpdateOutcome, WorkspacePool,
+};
 use crate::symbols::SymbolReference;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Default)]
+enum MockUpdate {
+    #[default]
+    Apply,
+    NeedsReload,
+    Fail,
+    /// Blocks until killed, like a helper that stopped answering.
+    Hang,
+}
+
+type UpdateCall = (Vec<PathBuf>, Vec<PathBuf>);
+
+#[derive(Clone, Default)]
 struct MockState {
     kill_count: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
     live_children: Arc<AtomicUsize>,
+    update_mode: Arc<Mutex<MockUpdate>>,
+    updates: Arc<Mutex<Vec<UpdateCall>>>,
+}
+
+impl MockState {
+    fn record_update(&self, changed: &[PathBuf], deleted: &[PathBuf]) {
+        self.updates
+            .lock()
+            .unwrap()
+            .push((changed.to_vec(), deleted.to_vec()));
+    }
+
+    fn update_calls(&self) -> Vec<UpdateCall> {
+        self.updates.lock().unwrap().clone()
+    }
 }
 
 struct MockClient {
@@ -22,6 +51,24 @@ struct MockClient {
 }
 
 impl ClientLike for MockClient {
+    fn update(&self, changed: &[PathBuf], deleted: &[PathBuf]) -> Result<UpdateOutcome> {
+        self.state.record_update(changed, deleted);
+        let mode = *self.state.update_mode.lock().unwrap();
+        match mode {
+            MockUpdate::Apply => Ok(UpdateOutcome::Applied(changed.len() + deleted.len())),
+            MockUpdate::NeedsReload => Ok(UpdateOutcome::NeedsReload(
+                "needs-reload: C:\\code\\a\\src\\New.cs".to_string(),
+            )),
+            MockUpdate::Fail => anyhow::bail!("mock update failed"),
+            MockUpdate::Hang => {
+                while self.state.kill_count.load(Ordering::SeqCst) == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                anyhow::bail!("mock helper killed mid-update")
+            }
+        }
+    }
+
     fn find_refs(&self, _symbol: &str) -> Result<ResidentRefs> {
         if self.state.fail.load(Ordering::SeqCst) {
             anyhow::bail!("mock helper failed");
@@ -51,11 +98,7 @@ struct Harness {
 }
 
 fn harness(max: usize, idle: Duration) -> Harness {
-    let state = MockState {
-        kill_count: Arc::new(AtomicUsize::new(0)),
-        fail: Arc::new(AtomicBool::new(false)),
-        live_children: Arc::new(AtomicUsize::new(0)),
-    };
+    let state = MockState::default();
     let spawns = Arc::new(AtomicUsize::new(0));
     let spawn_state = state.clone();
     let spawn_spawns = spawns.clone();
@@ -226,6 +269,11 @@ struct BlockingClient {
 }
 
 impl ClientLike for BlockingClient {
+    fn update(&self, changed: &[PathBuf], deleted: &[PathBuf]) -> Result<UpdateOutcome> {
+        self.state.record_update(changed, deleted);
+        Ok(UpdateOutcome::Applied(changed.len() + deleted.len()))
+    }
+
     fn find_refs(&self, _symbol: &str) -> Result<ResidentRefs> {
         {
             let (lock, cvar) = &*self.started;
@@ -259,11 +307,7 @@ impl ClientLike for BlockingClient {
 
 #[test]
 fn evict_marks_an_in_flight_workspace_doomed_and_kills_it_exactly_once_on_release() {
-    let state = MockState {
-        kill_count: Arc::new(AtomicUsize::new(0)),
-        fail: Arc::new(AtomicBool::new(false)),
-        live_children: Arc::new(AtomicUsize::new(0)),
-    };
+    let state = MockState::default();
     let started = Arc::new((Mutex::new(false), Condvar::new()));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let spawn_state = state.clone();
@@ -326,18 +370,38 @@ fn evict_marks_an_in_flight_workspace_doomed_and_kills_it_exactly_once_on_releas
 }
 
 #[test]
-fn evict_during_an_in_flight_spawn_stops_the_stale_workspace_being_installed_resident() {
-    // Reproduces the exact todo #168 window: a rebuild's `evict` lands
-    // while another thread's `find_refs` is still spawning the workspace
-    // for that same solution (a minutes-long load in production). The
-    // fresh workspace must still answer this one caller, but must NOT be
-    // installed as resident afterwards — that would resurrect the stale
-    // answer `evict` was called to prevent.
-    let state = MockState {
-        kill_count: Arc::new(AtomicUsize::new(0)),
-        fail: Arc::new(AtomicBool::new(false)),
-        live_children: Arc::new(AtomicUsize::new(0)),
-    };
+fn evict_or_update_during_an_in_flight_spawn_stops_the_stale_workspace_being_installed_resident() {
+    // Reproduces the exact todo #168 window: a rebuild's `evict` or
+    // `update` lands while another thread's `find_refs` is still spawning
+    // the workspace for that same solution (a minutes-long load in
+    // production). The fresh workspace must still answer this one caller,
+    // but must NOT be installed as resident afterwards — it may hold the
+    // pre-edit text the rebuild is replacing.
+    let cases: &[(&str, fn(&WorkspacePool))] = &[
+        ("evict", |pool| pool.evict(&sln("a"))),
+        ("update", |pool| {
+            let outcome = pool
+                .update(
+                    &sln("a"),
+                    &[PathBuf::from("C:\\code\\a\\src\\A.cs")],
+                    &[],
+                    Duration::from_secs(10),
+                )
+                .unwrap();
+            assert_eq!(
+                outcome,
+                UpdateOutcome::NotResident,
+                "no resident yet: must not wait for the spawn"
+            );
+        }),
+    ];
+    for (case, race) in cases {
+        assert_stale_spawn_is_not_installed(case, *race);
+    }
+}
+
+fn assert_stale_spawn_is_not_installed(case: &str, race: fn(&WorkspacePool)) {
+    let state = MockState::default();
     let spawn_started = Arc::new((Mutex::new(false), Condvar::new()));
     let spawn_go = Arc::new((Mutex::new(false), Condvar::new()));
     let spawns = Arc::new(AtomicUsize::new(0));
@@ -381,7 +445,7 @@ fn evict_during_an_in_flight_spawn_stops_the_stale_workspace_being_installed_res
             .unwrap()
     });
 
-    // Wait until the spawn is under way, then evict "a" — nothing resident
+    // Wait until the spawn is under way, then race it — nothing resident
     // yet, so this only bumps the generation counter.
     {
         let (lock, cvar) = &*spawn_started;
@@ -390,7 +454,7 @@ fn evict_during_an_in_flight_spawn_stops_the_stale_workspace_being_installed_res
             guard = cvar.wait(guard).unwrap();
         }
     }
-    pool.evict(&sln("a"));
+    race(&pool);
 
     // Let the spawn complete; find_refs must see the bumped generation.
     {
@@ -399,7 +463,16 @@ fn evict_during_an_in_flight_spawn_stops_the_stale_workspace_being_installed_res
         cvar.notify_all();
     }
     let refs = handle.join().unwrap();
-    assert_eq!(refs.references.len(), 1, "the caller still gets an answer");
+    assert_eq!(
+        refs.references.len(),
+        1,
+        "{case}: the caller still gets an answer"
+    );
+    assert_eq!(
+        state.kill_count.load(Ordering::SeqCst),
+        1,
+        "{case}: the stale workspace is killed after its one answer"
+    );
 
     // A second lookup must respawn (nothing installed resident by the
     // first call) — proves the stale workspace was discarded, not reused.
@@ -410,7 +483,7 @@ fn evict_during_an_in_flight_spawn_stops_the_stale_workspace_being_installed_res
     assert_eq!(
         spawns.load(Ordering::SeqCst),
         2,
-        "the post-race workspace must not have been cached as resident"
+        "{case}: the post-race workspace must not have been cached as resident"
     );
 }
 
@@ -423,6 +496,10 @@ struct SlowExitClient {
 }
 
 impl ClientLike for SlowExitClient {
+    fn update(&self, _changed: &[PathBuf], _deleted: &[PathBuf]) -> Result<UpdateOutcome> {
+        Ok(UpdateOutcome::Applied(0))
+    }
+
     fn find_refs(&self, _symbol: &str) -> Result<ResidentRefs> {
         Ok(ResidentRefs::default())
     }
@@ -536,4 +613,193 @@ fn kill_all_kills_every_resident_child_and_empties_the_pool() {
         .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
+}
+
+fn edited(name: &str) -> PathBuf {
+    PathBuf::from(format!("C:\\code\\a\\src\\{name}.cs"))
+}
+
+fn load(h: &Harness, repo: &str) {
+    h.pool
+        .find_refs(&PathBuf::from("h.exe"), &sln(repo), Path::new("wt"), "Sym")
+        .unwrap();
+}
+
+#[test]
+fn update_applies_edits_to_the_resident_workspace_without_a_reload() {
+    let h = harness(2, Duration::from_secs(600));
+    load(&h, "a");
+    let (changed, deleted) = (vec![edited("A")], vec![edited("Old")]);
+
+    let outcome = h
+        .pool
+        .update(&sln("a"), &changed, &deleted, Duration::from_secs(10))
+        .unwrap();
+
+    assert_eq!(outcome, UpdateOutcome::Applied(2));
+    assert_eq!(h.state.update_calls(), vec![(changed, deleted)]);
+    assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 0);
+    load(&h, "a");
+    assert_eq!(
+        h.spawns.load(Ordering::SeqCst),
+        1,
+        "the updated workspace keeps serving"
+    );
+}
+
+#[test]
+fn update_without_a_resident_answers_not_resident_and_touches_no_other_workspace() {
+    let h = harness(2, Duration::from_secs(600));
+    load(&h, "b");
+
+    let outcome = h
+        .pool
+        .update(&sln("a"), &[edited("A")], &[], Duration::from_secs(10))
+        .unwrap();
+
+    assert_eq!(outcome, UpdateOutcome::NotResident);
+    assert!(h.state.update_calls().is_empty());
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
+    assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn update_counts_as_use_for_the_idle_ttl() {
+    let h = harness(2, Duration::from_millis(1000));
+    load(&h, "a");
+    std::thread::sleep(Duration::from_millis(600));
+    h.pool
+        .update(&sln("a"), &[edited("A")], &[], Duration::from_secs(10))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+
+    // Loading "b" lazily reaps idle residents; "a" was used 600ms ago.
+    load(&h, "b");
+    assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn update_failures_surface_and_only_a_silent_helper_is_evicted_by_the_pool() {
+    let cases: &[(&str, MockUpdate, bool, &str, bool)] = &[
+        // (case, helper reply, Ok?, text, evicted by the pool)
+        (
+            "needs reload",
+            MockUpdate::NeedsReload,
+            true,
+            "needs-reload: ",
+            false,
+        ),
+        (
+            "helper error",
+            MockUpdate::Fail,
+            false,
+            "mock update failed",
+            false,
+        ),
+        ("no reply", MockUpdate::Hang, false, "no reply within", true),
+    ];
+    for (case, mode, ok, text, evicted) in cases {
+        let h = harness(2, Duration::from_secs(600));
+        *h.state.update_mode.lock().unwrap() = *mode;
+        load(&h, "a");
+
+        let started = Instant::now();
+        let result = h
+            .pool
+            .update(&sln("a"), &[edited("A")], &[], Duration::from_millis(200));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{case}: the timeout must bound the call"
+        );
+
+        assert_eq!(result.is_ok(), *ok, "{case}: {result:?}");
+        let shown = match &result {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(shown.contains(text), "{case}: {shown}");
+        load(&h, "a");
+        assert_eq!(
+            h.spawns.load(Ordering::SeqCst),
+            if *evicted { 2 } else { 1 },
+            "{case}: evicted by the pool"
+        );
+    }
+}
+
+#[test]
+fn update_waits_for_a_request_in_flight_on_the_resident_and_is_bounded_by_the_timeout() {
+    let state = MockState::default();
+    let started = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let spawn_state = state.clone();
+    let (spawn_started, spawn_release) = (started.clone(), release.clone());
+    let spawn_fn = Box::new(
+        move |_helper: &Path, _solution: &Path, _cap: u64| -> Result<Arc<dyn ClientLike>> {
+            Ok(Arc::new(BlockingClient {
+                state: spawn_state.clone(),
+                started: spawn_started.clone(),
+                release: spawn_release.clone(),
+            }))
+        },
+    );
+    let pool = Arc::new(WorkspacePool::new(
+        2,
+        Duration::from_secs(600),
+        1,
+        spawn_fn,
+        test_gate(),
+    ));
+    let pool_bg = pool.clone();
+    let request = std::thread::spawn(move || {
+        pool_bg
+            .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
+            .unwrap()
+    });
+    {
+        let (lock, cvar) = &*started;
+        let mut guard = lock.lock().unwrap();
+        while !*guard {
+            guard = cvar.wait(guard).unwrap();
+        }
+    }
+
+    let err = pool
+        .update(&sln("a"), &[edited("A")], &[], Duration::from_millis(150))
+        .expect_err("the in-flight request holds the workspace past the bound");
+    assert!(err.to_string().contains("waiting for a request"), "{err:#}");
+    assert!(state.update_calls().is_empty(), "never interleaved");
+
+    {
+        let (lock, cvar) = &*release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    request.join().unwrap();
+    let outcome = pool
+        .update(&sln("a"), &[edited("A")], &[], Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(outcome, UpdateOutcome::Applied(1));
+    assert_eq!(state.kill_count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+#[serial_test::serial]
+fn resident_update_timeout_honours_only_a_positive_env_override() {
+    let env = crate::constants::SCIP_RESIDENT_UPDATE_TIMEOUT_SECS_ENV;
+    let default = Duration::from_secs(crate::constants::SCIP_RESIDENT_UPDATE_TIMEOUT_SECS);
+    let cases: &[(Option<&str>, Duration)] = &[
+        (Some("5"), Duration::from_secs(5)),
+        (Some(" 7 "), Duration::from_secs(7)),
+        (Some("0"), default),
+        (Some("junk"), default),
+        (None, default),
+    ];
+    for (raw, expected) in cases {
+        let _env = match raw {
+            Some(value) => crate::testing::EnvRestore::set(&[(env, value)]),
+            None => crate::testing::EnvRestore::remove(&[env]),
+        };
+        assert_eq!(resident_update_timeout(), *expected, "{env}={raw:?}");
+    }
 }
