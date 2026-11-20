@@ -183,6 +183,29 @@ pub struct SymbolAmbiguity {
     pub hint_for_agent: String,
 }
 
+/// Typed answer when a `find_impact` call names no `language` and the server
+/// cannot decide which symbol index should answer it. Serialized as JSON in
+/// the tool-result text; deliberately NOT `ambiguous` — that key means
+/// "pick one of `candidates` as `symbol_key`", which is a different retry.
+#[derive(Debug, Clone, Serialize)]
+pub struct LanguageAmbiguity {
+    /// Always `true` — machine-branchable, like `busy`.
+    pub ambiguous_language: bool,
+    /// Languages that could answer, in registry order.
+    pub languages: Vec<String>,
+    /// Actionable hint for the agent.
+    pub hint_for_agent: String,
+    /// One complete argument set per language: the caller's original
+    /// arguments plus `language`. Meant to be re-sent verbatim.
+    pub retry_with: Vec<serde_json::Value>,
+}
+
+/// The leading SCIP scheme token of a canonical symbol key
+/// (`csharp . . . X#Y().` → `csharp`).
+pub fn symbol_key_scheme(key: &str) -> Option<&str> {
+    key.split_whitespace().next()
+}
+
 /// Resolve the repository HEAD sha for `repo_root` (40-hex), or `None`
 /// when git is unavailable, the path is not a work tree, or the read
 /// fails. Non-fatal BY DESIGN: a transient Windows git failure (see the
@@ -564,6 +587,15 @@ pub trait SymbolIndexer: Send + Sync {
         "the repository has no entrypoint this symbol indexer recognizes"
     }
 
+    /// Whether `key` is a canonical symbol key of THIS language's index,
+    /// judged by its leading SCIP scheme token. The adapters share one set
+    /// of LMDB tables, so a key's scheme is the only thing that says which
+    /// language it belongs to. Default `false`: an adapter claims keys only
+    /// by overriding this next to its scheme constant.
+    fn owns_symbol_key(&self, _key: &str) -> bool {
+        false
+    }
+
     /// Load this language's resident helper workspace for `repo_path` ahead
     /// of the first query, through the same admission and gating path a
     /// query uses. Blocks for the whole load. Default: nothing to prewarm.
@@ -613,6 +645,23 @@ impl SymbolIndexerRegistry {
             .filter(|i| i.is_available())
             .map(|i| i.language().to_string())
             .collect()
+    }
+
+    /// Indexers whose helper is actually installed, in registry order.
+    pub fn installed_indexers(&self) -> Vec<&dyn SymbolIndexer> {
+        self.indexers
+            .iter()
+            .filter(|i| i.is_available())
+            .map(|b| b.as_ref())
+            .collect()
+    }
+
+    /// The indexer that owns `key` by its SCIP scheme, if any.
+    pub fn owner_of_key(&self, key: &str) -> Option<&dyn SymbolIndexer> {
+        self.indexers
+            .iter()
+            .find(|i| i.owns_symbol_key(key))
+            .map(|b| b.as_ref())
     }
 
     /// Check whether a specific language has a built index for the given db_path.

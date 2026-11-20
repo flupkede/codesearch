@@ -1,7 +1,10 @@
 use super::helpers::strip_alias_prefix;
+use super::responses::respond_with_object;
 use super::types::FindImpactRequest;
 use super::CodesearchService;
-use crate::symbols::SymbolReference;
+use crate::symbols::{
+    ImpactQuery, KeyMatch, SymbolIndexer, SymbolIndexerRegistry, SymbolReference,
+};
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock},
@@ -126,6 +129,157 @@ pub(crate) fn missing_index_warning(lang: &str, heal: SymbolIndexHeal) -> String
     }
 }
 
+/// Which symbol index answers a `find_impact` call.
+pub(crate) enum LanguageChoice {
+    /// One language answers; the handler routes to it.
+    Language(String),
+    /// A caller-facing refusal, returned as plain text.
+    Refused(String),
+    /// The server cannot decide: the answer carries one retry entry per
+    /// language. `warnings` names every index it failed to consult.
+    Ambiguous {
+        languages: Vec<String>,
+        warnings: Vec<String>,
+    },
+}
+
+fn non_blank(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|s| !s.trim().is_empty())
+}
+
+fn language_from_extension(file: &str) -> Option<&'static str> {
+    let ext = Path::new(file).extension()?.to_str()?.to_lowercase();
+    match ext.as_str() {
+        "cs" => Some(crate::constants::LANG_CSHARP),
+        "ts" | "tsx" | "mts" | "cts" => Some(crate::constants::LANG_TYPESCRIPT),
+        _ => None,
+    }
+}
+
+/// The adapters share one set of LMDB tables, so a name lookup returns every
+/// language's keys; a language only "has a match" for keys it owns.
+fn match_belongs_to(indexer: &dyn SymbolIndexer, found: &KeyMatch) -> bool {
+    match found {
+        KeyMatch::Resolved(key) => indexer.owns_symbol_key(key),
+        KeyMatch::Ambiguous(keys) => keys.iter().any(|k| indexer.owns_symbol_key(k)),
+        KeyMatch::NotFound => false,
+    }
+}
+
+/// Decide which symbol index answers, in this order: an explicit `language`
+/// (refused when it contradicts the `symbol_key` scheme), the `symbol_key`'s
+/// own scheme, the `file` extension, then the installed indexers that apply
+/// to the repo — narrowed, for a name, to the one that holds a match.
+fn resolve_language(
+    registry: &SymbolIndexerRegistry,
+    request: &FindImpactRequest,
+    project_root: &Path,
+    db_path: &Path,
+) -> LanguageChoice {
+    let key = non_blank(&request.symbol_key);
+    let key_owner = key.and_then(|k| registry.owner_of_key(k));
+
+    if let Some(language) = &request.language {
+        if let (Some(key), Some(owner)) = (key, key_owner) {
+            if !owner.language().eq_ignore_ascii_case(language) {
+                return LanguageChoice::Refused(format!(
+                    "`language` is '{language}' but `symbol_key` is a {} key (scheme '{}'). Drop `language`, or pass a key from the {language} index.",
+                    owner.language(),
+                    crate::symbols::symbol_key_scheme(key).unwrap_or_default()
+                ));
+            }
+        }
+        return LanguageChoice::Language(language.clone());
+    }
+    if let Some(owner) = key_owner {
+        return LanguageChoice::Language(owner.language().to_string());
+    }
+    if let Some(language) = request.file.as_deref().and_then(language_from_extension) {
+        return LanguageChoice::Language(language.to_string());
+    }
+
+    let installed = registry.installed_indexers();
+    if installed.is_empty() {
+        return LanguageChoice::Refused(
+            "No symbol indexers installed. Install the `scip-csharp` helper for C# support, or `scip-typescript` (via npx) for TypeScript support.".to_string(),
+        );
+    }
+    let applicable: Vec<&dyn SymbolIndexer> = installed
+        .iter()
+        .copied()
+        .filter(|i| i.applies_to(project_root))
+        .collect();
+    let candidates = if applicable.is_empty() {
+        installed
+    } else {
+        applicable
+    };
+    let languages: Vec<String> = candidates
+        .iter()
+        .map(|i| i.language().to_string())
+        .collect();
+    if let [only] = languages.as_slice() {
+        return LanguageChoice::Language(only.clone());
+    }
+
+    let Some(name) = non_blank(&request.symbol_name) else {
+        return LanguageChoice::Ambiguous {
+            languages,
+            warnings: Vec::new(),
+        };
+    };
+    let query = ImpactQuery::Name(name.to_string());
+    let mut matching = Vec::new();
+    let mut warnings = Vec::new();
+    for indexer in &candidates {
+        match indexer.resolve_query(db_path, &query) {
+            Ok(found) if match_belongs_to(*indexer, &found) => {
+                matching.push(indexer.language().to_string());
+            }
+            Ok(_) => {}
+            Err(e) => warnings.push(format!(
+                "Could not check the {} index for '{name}': {e:#}",
+                indexer.language()
+            )),
+        }
+    }
+    // A language that could not be consulted may hold the match too, so a
+    // lone hit among the others is not a safe pick.
+    if !warnings.is_empty() || matching.is_empty() {
+        return LanguageChoice::Ambiguous {
+            languages,
+            warnings,
+        };
+    }
+    if matching.len() == 1 {
+        return LanguageChoice::Language(matching.remove(0));
+    }
+    LanguageChoice::Ambiguous {
+        languages: matching,
+        warnings,
+    }
+}
+
+/// The caller's original arguments, once per language, with `language` added.
+fn retry_with_entries(request: &FindImpactRequest, languages: &[String]) -> Vec<serde_json::Value> {
+    let mut args = match serde_json::to_value(request) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    args.retain(|_, value| !value.is_null());
+    languages
+        .iter()
+        .map(|language| {
+            let mut entry = args.clone();
+            entry.insert(
+                "language".to_string(),
+                serde_json::Value::String(language.clone()),
+            );
+            serde_json::Value::Object(entry)
+        })
+        .collect()
+}
+
 #[tool_router(router = find_impact_router, vis = "pub(crate)")]
 impl CodesearchService {
     /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
@@ -151,7 +305,7 @@ impl CodesearchService {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nWARNINGS: a resolved answer may carry a `\"warnings\": [\"...\"]` array — non-empty means the reference list may be INCOMPLETE because a helper failure was survived rather than fatal (a project that failed to compile, an exception during reference resolution, a non-zero scip-typescript exit). Each entry names what failed. Treat warnings as a prompt to reindex the project (or cross-check with `find` `kind=\"usages\"`) before concluding \"no callers\" — absent or empty means the answer is as complete as the index knows.\n\nSYMBOL INDEX: resolved and empty answers carry `\"symbol_index\": [{\"language\", \"state\", \"age_seconds\", ...}]` — the state of the SCIP index that produced the answer (`ready` | `degraded` | `stale` | `restore-pending` | `absent`). Check it before trusting `references: []`: `absent`/`stale`/`restore-pending` means the empty answer reflects an unusable or outdated index, not verified absence of callers — trigger/await a reindex and re-call instead of concluding.\n\nLANGUAGE: if `language` is omitted, position lookups auto-detect it from the file extension; with several SCIP helpers installed the answer asks you to name one — pass `language` to avoid the round-trip.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
+        description = "Symbol impact analysis — find all references to a symbol with IDE-class precision (SCIP).\n\nThe right tool for \"who calls X?\" / \"what breaks if I rename X?\". Returns transitive call-sites with file/line precision, enabling agents to plan refactors without missing a caller. More accurate than text-based `find kind=\"usages\"` because it understands language semantics.\n\nInput variants (mutually exclusive):\n- By name: `{ \"symbol_name\": \"FieldDefinition.Validate\", \"project\": \"myrepo\" }`\n- By position: `{ \"file\": \"src/Validation/FieldDefinition.cs\", \"line\": 42, \"project\": \"myrepo\" }`\n- By exact canonical key: `{ \"symbol_key\": \"csharp . . . FieldDefinition#Validate().\", \"project\": \"myrepo\" }`\n\nAMBIGUITY: if several stored symbols match (overloads, same-line definitions), the answer is `{\"ambiguous\": true, \"query\": ..., \"candidates\": [...]}` — pick one candidate and re-call with `symbol_key` set to it verbatim. A resolved answer names the selected canonical key in `resolved_symbol`; never assume which overload answered.\n\nWARNINGS: a resolved answer may carry a `\"warnings\": [\"...\"]` array — non-empty means the reference list may be INCOMPLETE because a helper failure was survived rather than fatal (a project that failed to compile, an exception during reference resolution, a non-zero scip-typescript exit). Each entry names what failed. Treat warnings as a prompt to reindex the project (or cross-check with `find` `kind=\"usages\"`) before concluding \"no callers\" — absent or empty means the answer is as complete as the index knows.\n\nSYMBOL INDEX: resolved and empty answers carry `\"symbol_index\": [{\"language\", \"state\", \"age_seconds\", ...}]` — the state of the SCIP index that produced the answer (`ready` | `degraded` | `stale` | `restore-pending` | `absent`). Check it before trusting `references: []`: `absent`/`stale`/`restore-pending` means the empty answer reflects an unusable or outdated index, not verified absence of callers — trigger/await a reindex and re-call instead of concluding.\n\nLANGUAGE: if `language` is omitted it is resolved from the `symbol_key` scheme, the file extension, the languages that apply to the repo, or the one index that holds `symbol_name`. If that still leaves several, the answer is `{\"ambiguous_language\": true, \"languages\": [...], \"retry_with\": [...]}` — copy one `retry_with` entry verbatim as the next call. A `language` that contradicts the `symbol_key` is refused.\n\nPrecision backends (SCIP) ship per language; C# (bundled `scip-csharp` helper, `-with-csharp` releases) and TypeScript (via `npx` or `CODESEARCH_SCIP_TYPESCRIPT`) are available today. For Rust/Python/Go/etc., use `find` with `kind=\"usages\"` as a text-based fallback until SCIP backends for those languages ship.\n\nOn a busy answer (`\"busy\": true`): sleep `retry_after_seconds` and retry the SAME call. Busy is progress, not failure — never fall back to text search on busy.\n\nIMPORTANT (multi-repo): always specify `project` (single repo). Omitting `project` in multi-repo mode returns a `scope_required` error."
     )]
     pub async fn find_impact(
         &self,
@@ -218,55 +372,57 @@ impl CodesearchService {
         // Use the shared symbol indexer registry
         let registry = &self.symbol_registry;
 
-        // Determine which language to use
-        let language = request.language.clone().or_else(|| {
-            // Auto-detect from file extension
-            request.file.as_ref().and_then(|f| {
-                let ext = Path::new(f).extension()?.to_str()?.to_lowercase();
-                match ext.as_str() {
-                    "cs" => Some(crate::constants::LANG_CSHARP.to_string()),
-                    "ts" | "tsx" | "mts" | "cts" => {
-                        Some(crate::constants::LANG_TYPESCRIPT.to_string())
-                    }
-                    _ => None,
-                }
-            })
-        });
+        // Language resolution reads LMDB and the repo root, so it runs off
+        // the async runtime like every other blocking read in this handler.
+        let registry_for_language = self.symbol_registry.clone();
+        let request_for_language = request.clone();
+        let root_for_language = project_root.clone();
+        let db_for_language = db_path.clone();
+        let choice = match tokio::task::spawn_blocking(move || {
+            resolve_language(
+                &registry_for_language,
+                &request_for_language,
+                &root_for_language,
+                &db_for_language,
+            )
+        })
+        .await
+        {
+            Ok(choice) => choice,
+            Err(e) => LanguageChoice::Refused(format!("language resolution task failed: {e:#}")),
+        };
+        let language = match choice {
+            LanguageChoice::Language(language) => language,
+            LanguageChoice::Refused(message) => {
+                return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
+            }
+            LanguageChoice::Ambiguous {
+                languages,
+                warnings,
+            } => {
+                let ambiguity = crate::symbols::LanguageAmbiguity {
+                    ambiguous_language: true,
+                    hint_for_agent: format!(
+                        "Cannot tell which symbol index should answer ({}): copy one `retry_with` entry verbatim.",
+                        languages.join(", ")
+                    ),
+                    retry_with: retry_with_entries(&request, &languages),
+                    languages,
+                };
+                let mut all_warnings = ctx.routing_warnings.clone();
+                all_warnings.extend(warnings);
+                return respond_with_object(&ambiguity, &all_warnings);
+            }
+        };
 
-        let indexer: &dyn crate::symbols::SymbolIndexer = match language {
-            Some(ref lang) => match registry.get(lang) {
-                Some(i) => i,
-                None => {
-                    let available = registry.available_languages();
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "No symbol indexer for language '{}'. Available languages: {:?}",
-                        lang, available
-                    ))]));
-                }
-            },
+        let indexer: &dyn crate::symbols::SymbolIndexer = match registry.get(&language) {
+            Some(i) => i,
             None => {
-                // No language given and none detectable from a file path.
-                let installed = registry.installed_languages();
-                if installed.is_empty() {
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(
-                        "No symbol indexers installed. Install the `scip-csharp` helper for C# support, or `scip-typescript` (via npx) for TypeScript support.".to_string(),
-                    )]));
-                }
-                if installed.len() > 1 {
-                    // Several helpers installed: answering from one silently is
-                    // the same silent pick the ambiguity contract removes. Ask.
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "Several symbol indexes are installed ({}). Pass `language` (e.g. \"csharp\") so the lookup cannot silently answer from the wrong one.",
-                        installed.join(", ")
-                    ))]));
-                }
-                // Exactly one installed: the pick is deterministic.
-                match registry.get(&installed[0]) {
-                    Some(i) => i,
-                    None => {
-                        unreachable!("installed_languages() returned a language with no indexer")
-                    }
-                }
+                let available = registry.available_languages();
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "No symbol indexer for language '{}'. Available languages: {:?}",
+                    language, available
+                ))]));
             }
         };
 

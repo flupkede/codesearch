@@ -933,6 +933,14 @@ pub const LANG_CSHARP: &str = "csharp";
 /// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
 pub const LANG_TYPESCRIPT: &str = "typescript";
 
+/// Leading SCIP scheme token of every canonical C# symbol key
+/// (`csharp . . . Type#Member().`).
+pub const SCIP_SCHEME_CSHARP: &str = "csharp";
+
+/// Leading SCIP scheme token of every canonical TypeScript symbol key, as
+/// `scip-typescript` emits it (`scip-typescript npm pkg 1.0.0 ...`).
+pub const SCIP_SCHEME_TYPESCRIPT: &str = "scip-typescript";
+
 /// Environment variable override for the `scip-typescript` helper/CLI path.
 /// When unset, the indexer falls back to `npx scip-typescript`.
 pub const SCIP_TYPESCRIPT_HELPER_ENV: &str = "CODESEARCH_SCIP_TYPESCRIPT";

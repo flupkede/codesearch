@@ -168,7 +168,7 @@ pub struct StatusRequest {
 /// - By position: `{ "file": "src/Validation/FieldDefinition.cs", "line": 42, "project": "myrepo" }`
 /// - By exact key (explicit selection after an ambiguous answer):
 ///   `{ "symbol_key": "csharp . . . FieldDefinition#Validate().", "project": "myrepo" }`
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct FindImpactRequest {
     /// Symbol name to look up (e.g. `"FieldDefinition.Validate"`).
     /// Mutually exclusive with `symbol_key`; if both a name and
@@ -191,11 +191,11 @@ pub struct FindImpactRequest {
     #[serde(default)]
     pub symbol_key: Option<String>,
 
-    /// Language filter (e.g. `"csharp"`). If omitted: position lookups
-    /// auto-detect it from the file extension; with no or exactly one
-    /// installed helper the pick is deterministic, and with several
-    /// installed the answer asks you to name one instead of picking
-    /// silently.
+    /// Language filter (e.g. `"csharp"`). If omitted it is resolved from the
+    /// `symbol_key` scheme, the file extension, the languages that apply to
+    /// the repo, or the one language whose index holds `symbol_name`. When
+    /// that still leaves several, the answer carries `retry_with`: one
+    /// ready-to-send argument set per candidate language.
     pub language: Option<String>,
 
     /// Route to a specific project (requires `codesearch serve`).

@@ -2508,6 +2508,10 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         "the scip-csharp adapter requires a .sln file in the repository root"
     }
 
+    fn owns_symbol_key(&self, key: &str) -> bool {
+        super::symbol_key_scheme(key) == Some(crate::constants::SCIP_SCHEME_CSHARP)
+    }
+
     fn prewarm_resident(&self, repo_path: &Path) -> Result<()> {
         let helper = self
             .detect_helper()
