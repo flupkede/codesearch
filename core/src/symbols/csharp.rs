@@ -43,6 +43,7 @@ use heed::types::{Bytes, Str};
 use heed::Database;
 use serde::{Deserialize, Serialize};
 
+use super::helper_gate::{self, HelperPurpose};
 use super::scip_parse;
 use super::{ImpactQuery, KeyMatch, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
@@ -1440,7 +1441,8 @@ impl CSharpSymbolIndexer {
         // Both paths carry completeness warnings; a partial answer must be
         // cached AS partial, never as a complete one.
         let (lazy_refs, lazy_warnings): (Vec<StoredReference>, Vec<String>) =
-            match crate::symbols::resident::WORKSPACE_POOL.find_refs(&helper, &solution, canonical)
+            match crate::symbols::resident::WORKSPACE_POOL
+                .find_refs(&helper, &solution, &repo_path, canonical)
             {
                 Ok(resident) => (
                     resident
@@ -1461,7 +1463,12 @@ impl CSharpSymbolIndexer {
                          find-refs for '{}'",
                         canonical
                     );
-                    match self.invoke_find_refs_helper(&helper, &solution, canonical) {
+                    let one_shot = helper_gate::global()
+                        .acquire(HelperPurpose::FindRefs, &repo_path)
+                        .and_then(|_permit| {
+                            self.invoke_find_refs_helper(&helper, &solution, canonical)
+                        });
+                    match one_shot {
                         Ok(pair) => pair,
                         Err(e) if is_restore_pending(&e) => {
                             // Restore in flight: answer from what LMDB
@@ -1625,7 +1632,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         let mut attempts: u32 = 0;
         let mut marked_pending = false;
         let raw_index_warnings = loop {
-            match self.invoke_index_helper(&helper, &solution, &output_path, project.as_deref()) {
+            // Per attempt: the slot must not be held through the backoff sleep.
+            let attempt = helper_gate::global()
+                .acquire(HelperPurpose::Rebuild, repo_path)
+                .and_then(|_permit| {
+                    self.invoke_index_helper(&helper, &solution, &output_path, project.as_deref())
+                });
+            match attempt {
                 Ok(raw) => {
                     if marked_pending {
                         restore_pending_flag_clear(db_path);

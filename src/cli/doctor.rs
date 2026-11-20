@@ -594,7 +594,7 @@ fn check_embedding_cache(db_path: &Path, model_name: &str) -> CheckResult {
             return CheckResult::warn(
                 "Embedding cache",
                 format!("Could not resolve cache dir: {}", e),
-            )
+            );
         }
     };
 

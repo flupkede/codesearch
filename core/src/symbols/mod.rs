@@ -8,6 +8,7 @@
 //! `SymbolIndexer` impls here.
 
 pub mod csharp;
+pub(crate) mod helper_gate;
 pub mod resident;
 pub mod scip_parse;
 pub mod scip_proto;
@@ -737,6 +738,10 @@ mod lock_visibility_tests;
 #[cfg(test)]
 #[path = "resident_tests.rs"]
 mod resident_tests;
+
+#[cfg(test)]
+#[path = "helper_gate_tests.rs"]
+mod helper_gate_tests;
 
 /// Helper stderr routing tests (`csharp.rs`). Sibling `_tests.rs` file
 /// per repo convention.

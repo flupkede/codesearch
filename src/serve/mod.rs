@@ -45,13 +45,12 @@ use tracing::{info, warn};
 
 use crate::cache::safe_canonicalize;
 use crate::constants::{
-    ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, CSHARP_SCIP_CONCURRENCY_DEFAULT,
-    CSHARP_SCIP_CONCURRENCY_ENV, DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV,
-    EXPLORE_PATH, FIND_IMPACT_PATH, FIND_PATH, HEALTHZ_PATH, HEALTH_PATH,
-    INDEXING_MARKER_HEARTBEAT_SECS, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT, MAX_INDEXING_SECS,
-    MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, MCP_IDLE_SESSION_SECS, PERSIST_DEBOUNCE_SECS,
-    REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH,
-    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, DB_DIR_NAME, DEFAULT_SERVE_PORT,
+    DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH, FIND_PATH, HEALTHZ_PATH,
+    HEALTH_PATH, INDEXING_MARKER_HEARTBEAT_SECS, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT,
+    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, MCP_IDLE_SESSION_SECS,
+    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV,
+    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, git_common_dir_for, ReposConfig};
 use crate::index::{
@@ -1381,16 +1380,6 @@ impl ServeState {
         }
     }
 
-    /// Read CSHARP_SCIP_CONCURRENCY from env, default
-    /// `CSHARP_SCIP_CONCURRENCY_DEFAULT` (currently 2), clamped to [1, 4].
-    fn csharp_scip_concurrency() -> usize {
-        let raw = std::env::var(CSHARP_SCIP_CONCURRENCY_ENV)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(CSHARP_SCIP_CONCURRENCY_DEFAULT);
-        raw.clamp(1, 4)
-    }
-
     fn has_solution_file(repo_path: &Path) -> bool {
         std::fs::read_dir(repo_path)
             .ok()
@@ -2134,7 +2123,7 @@ impl ServeState {
             }
         }
 
-        let concurrency = Self::csharp_scip_concurrency();
+        let concurrency = crate::constants::csharp_scip_concurrency();
         info!(
             "phase-2: {} candidates, concurrency={}",
             candidates.len(),

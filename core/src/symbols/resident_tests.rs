@@ -1,6 +1,7 @@
 //! Tests for the resident-helper WorkspacePool (todo #115) — pure pool
 //! logic against a mock client, no real processes involved.
 
+use super::helper_gate::HelperGate;
 use super::resident::{ClientLike, ResidentRefs, WorkspacePool};
 use crate::symbols::SymbolReference;
 use anyhow::Result;
@@ -68,10 +69,15 @@ fn harness(max: usize, idle: Duration) -> Harness {
         },
     );
     Harness {
-        pool: WorkspacePool::new(max, idle, 1, spawn_fn),
+        pool: WorkspacePool::new(max, idle, 1, spawn_fn, test_gate()),
         spawns,
         state,
     }
+}
+
+/// A private gate: pool tests must not contend on the process-wide one.
+fn test_gate() -> Arc<HelperGate> {
+    Arc::new(HelperGate::new(1))
 }
 
 fn sln(name: &str) -> PathBuf {
@@ -83,10 +89,10 @@ fn resident_pool_admission_evicts_lru_when_full() {
     let h = harness(2, Duration::from_secs(600));
 
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("b"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("b"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(h.spawns.load(Ordering::SeqCst), 2);
     assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 0);
@@ -95,7 +101,7 @@ fn resident_pool_admission_evicts_lru_when_full() {
     // once) to make room — and the answer must still be correct.
     let refs = h
         .pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("c"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("c"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(refs.references.len(), 1);
     assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
@@ -108,7 +114,7 @@ fn resident_pool_reuses_one_workspace_per_repo() {
     let h = harness(2, Duration::from_secs(600));
     for _ in 0..5 {
         h.pool
-            .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+            .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
             .unwrap();
     }
     assert_eq!(h.spawns.load(Ordering::SeqCst), 1, "same repo = one spawn");
@@ -124,10 +130,10 @@ fn resident_pool_defers_kill_while_in_flight_but_still_kills() {
     // the evictor — proven here by eviction of an idle entry only.
     let h = harness(1, Duration::from_secs(600));
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("b"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("b"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 1);
     assert_eq!(h.state.live_children.load(Ordering::SeqCst), 1);
@@ -137,18 +143,18 @@ fn resident_pool_defers_kill_while_in_flight_but_still_kills() {
 fn resident_pool_evicted_repo_respawns_and_answers() {
     let h = harness(1, Duration::from_secs(600));
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     // Same repo, but the single-slot pool evicted it for the second repo...
     let refs = h
         .pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("b"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("b"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(refs.references.len(), 1);
     // ...and coming back to the first repo must respawn and still answer.
     let refs = h
         .pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(refs.references.len(), 1);
     assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
@@ -160,11 +166,11 @@ fn resident_pool_ttl_reaps_idle_workspaces_on_next_access() {
     // Spawn "a", let it go idle (TTL is 1ms), then access repo "b": the
     // lazy reap on that access must kill the idle "a" workspace.
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     std::thread::sleep(Duration::from_millis(5));
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("b"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("b"), Path::new("wt"), "Sym")
         .unwrap();
     assert!(
         h.state.kill_count.load(Ordering::SeqCst) >= 1,
@@ -173,7 +179,7 @@ fn resident_pool_ttl_reaps_idle_workspaces_on_next_access() {
     // Fresh spawn after reap; the answer stays correct.
     let refs = h
         .pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("b"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("b"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(refs.references.len(), 1);
 }
@@ -185,7 +191,7 @@ fn evict_kills_the_resident_workspace_and_forces_a_fresh_respawn() {
     // on-disk source instead of the compilation loaded before the change.
     let h = harness(2, Duration::from_secs(600));
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(h.spawns.load(Ordering::SeqCst), 1);
     assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 0);
@@ -199,7 +205,7 @@ fn evict_kills_the_resident_workspace_and_forces_a_fresh_respawn() {
 
     let refs = h
         .pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(refs.references.len(), 1);
     assert_eq!(
@@ -273,12 +279,18 @@ fn evict_marks_an_in_flight_workspace_doomed_and_kills_it_exactly_once_on_releas
             }))
         },
     );
-    let pool = Arc::new(WorkspacePool::new(2, Duration::from_secs(600), 1, spawn_fn));
+    let pool = Arc::new(WorkspacePool::new(
+        2,
+        Duration::from_secs(600),
+        1,
+        spawn_fn,
+        test_gate(),
+    ));
 
     let pool_bg = pool.clone();
     let handle = std::thread::spawn(move || {
         pool_bg
-            .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+            .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
             .unwrap()
     });
 
@@ -354,12 +366,18 @@ fn evict_during_an_in_flight_spawn_stops_the_stale_workspace_being_installed_res
             }))
         },
     );
-    let pool = Arc::new(WorkspacePool::new(2, Duration::from_secs(600), 1, spawn_fn));
+    let pool = Arc::new(WorkspacePool::new(
+        2,
+        Duration::from_secs(600),
+        1,
+        spawn_fn,
+        test_gate(),
+    ));
 
     let pool_bg = pool.clone();
     let handle = std::thread::spawn(move || {
         pool_bg
-            .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+            .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
             .unwrap()
     });
 
@@ -386,7 +404,7 @@ fn evict_during_an_in_flight_spawn_stops_the_stale_workspace_being_installed_res
     // A second lookup must respawn (nothing installed resident by the
     // first call) — proves the stale workspace was discarded, not reused.
     let refs2 = pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(refs2.references.len(), 1);
     assert_eq!(
@@ -409,7 +427,7 @@ fn resident_pool_surfaces_client_failure_to_the_fallback() {
     h.state.fail.store(true, Ordering::SeqCst);
     let err = h
         .pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .expect_err("a failing helper must surface an error for the one-shot fallback");
     assert!(err.to_string().contains("mock helper failed"));
 }
@@ -422,10 +440,10 @@ fn kill_all_kills_every_resident_child_and_empties_the_pool() {
     let h = harness(2, Duration::from_secs(600));
 
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("b"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("b"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 0);
 
@@ -440,7 +458,7 @@ fn kill_all_kills_every_resident_child_and_empties_the_pool() {
     // Pool emptied: a follow-up request respawns instead of reusing a
     // killed client.
     h.pool
-        .find_refs(&PathBuf::from("h.exe"), &sln("a"), "Sym")
+        .find_refs(&PathBuf::from("h.exe"), &sln("a"), Path::new("wt"), "Sym")
         .unwrap();
     assert_eq!(h.spawns.load(Ordering::SeqCst), 3);
 }

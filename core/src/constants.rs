@@ -959,16 +959,37 @@ pub const SCIP_TYPESCRIPT_INDEX_WARNINGS_KEY: &str = "index_warnings:typescript"
 /// spawning `scip-typescript` once per saved file during a burst of edits.
 pub const SCIP_TYPESCRIPT_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 
-/// Environment variable controlling phase-2 C# SCIP rebuild concurrency.
-/// Parsed in `ServeState::csharp_scip_concurrency()` and clamped to [1, 4].
+/// Environment variable bounding concurrent heavy scip-csharp work: the
+/// serve phase-2 rebuild semaphore and the process-wide helper gate
+/// (`symbols::helper_gate`). Parsed by [`parse_csharp_scip_concurrency`].
 pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";
 
 /// Default value for `CSHARP_SCIP_CONCURRENCY` when the env var is unset
-/// or unparseable. Clamped to `[1, 4]` at the call site, so this default
-/// is also expected to live within that range. 1 (not 2): each slot compiles
-/// a whole solution; two at once starved interactive opens/searches during
-/// the phase-2 redemption wave (card #291).
+/// or unparseable. 1 (not 2): each slot compiles a whole solution; two at
+/// once starved interactive opens/searches during the phase-2 redemption
+/// wave (card #291).
 pub const CSHARP_SCIP_CONCURRENCY_DEFAULT: usize = 1;
+
+/// Upper clamp for `CSHARP_SCIP_CONCURRENCY`.
+pub const CSHARP_SCIP_CONCURRENCY_MAX: usize = 4;
+
+/// A helper-gate wait longer than this is logged at info level.
+pub const CSHARP_HELPER_GATE_SLOW_WAIT_MS: u64 = 1_000;
+
+/// Parse a raw `CSHARP_SCIP_CONCURRENCY` value: unset or unparseable falls
+/// back to the default; the result is clamped to
+/// `[1, CSHARP_SCIP_CONCURRENCY_MAX]`.
+pub fn parse_csharp_scip_concurrency(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(CSHARP_SCIP_CONCURRENCY_DEFAULT)
+        .clamp(1, CSHARP_SCIP_CONCURRENCY_MAX)
+}
+
+/// `CSHARP_SCIP_CONCURRENCY` from the environment, parsed by
+/// [`parse_csharp_scip_concurrency`].
+pub fn csharp_scip_concurrency() -> usize {
+    parse_csharp_scip_concurrency(std::env::var(CSHARP_SCIP_CONCURRENCY_ENV).ok().as_deref())
+}
 
 /// Maximum number of changed files chunked + embedded in a single in-memory
 /// batch during `IndexManager::perform_incremental_refresh_with_stores`.

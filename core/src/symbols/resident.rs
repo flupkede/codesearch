@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::helper_gate::{self, HelperGate, HelperPurpose};
 use super::SymbolReference;
 
 /// References plus the completeness warnings from one resident find-refs
@@ -287,6 +288,9 @@ pub struct WorkspacePool {
     idle: Duration,
     heap_cap: u64,
     spawn_fn: SpawnFn,
+    /// Bounds spawn + initial workspace load only; requests to a resident
+    /// helper never take it.
+    gate: Arc<HelperGate>,
 }
 
 impl WorkspacePool {
@@ -296,6 +300,7 @@ impl WorkspacePool {
         idle: Duration,
         heap_cap: u64,
         spawn_fn: SpawnFn,
+        gate: Arc<HelperGate>,
     ) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
@@ -305,6 +310,7 @@ impl WorkspacePool {
             idle,
             heap_cap,
             spawn_fn,
+            gate,
         }
     }
 
@@ -322,11 +328,13 @@ impl WorkspacePool {
     /// yet. Errors here are expected and handled by the caller's one-shot
     /// fallback (spawn failure, heap-cap death, eviction race, protocol).
     /// Completeness warnings travel with the references — the caller
-    /// persists them alongside the cached refs.
+    /// persists them alongside the cached refs. `worktree_root` is the
+    /// caller's repo, named in the helper gate's slow-wait log.
     pub(crate) fn find_refs(
         &self,
         helper: &Path,
         solution: &Path,
+        worktree_root: &Path,
         symbol: &str,
     ) -> Result<ResidentRefs> {
         // Single-flight per repo: the second concurrent lookup on the same
@@ -347,6 +355,12 @@ impl WorkspacePool {
             return outcome;
         }
 
+        // Released once the workspace is loaded, before any request: an
+        // error here returns to the caller's one-shot fallback slot-free.
+        let spawn_permit = self
+            .gate
+            .acquire(HelperPurpose::ResidentSpawn, worktree_root)?;
+
         // Snapshot BEFORE the spawn: if `evict` bumps this generation while
         // we're mid-spawn (a rebuild landing during the minutes-long load),
         // the workspace we're about to install is already stale — caught
@@ -357,6 +371,7 @@ impl WorkspacePool {
         // lookups on other repos (admission still happens under the lock).
         self.enforce_admission();
         let client = (self.spawn_fn)(helper, solution, self.heap_cap)?;
+        drop(spawn_permit);
         let in_flight = Arc::new(AtomicUsize::new(1));
         let doomed = Arc::new(AtomicBool::new(false));
 
@@ -583,5 +598,6 @@ pub static WORKSPACE_POOL: std::sync::LazyLock<WorkspacePool> = std::sync::LazyL
             crate::constants::DEFAULT_SCIP_WORKSPACE_HEAP_CAP,
         ),
         spawn,
+        Arc::clone(helper_gate::global()),
     )
 });
