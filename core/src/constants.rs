@@ -1064,6 +1064,13 @@ pub const FIND_IMPACT_BUDGET_SECS_ENV: &str = "CODESEARCH_FIND_IMPACT_BUDGET_SEC
 pub const DEFAULT_SCIP_MAX_RESIDENT_WORKSPACES: usize = 2;
 pub const SCIP_MAX_RESIDENT_WORKSPACES_ENV: &str = "CODESEARCH_SCIP_MAX_RESIDENT";
 
+/// Set to `0` to skip the phase-3 startup prewarm of resident workspaces.
+/// Default on: after the symbol wave, serve loads the Roslyn workspace of the
+/// most recently used C# repos (up to `CODESEARCH_SCIP_MAX_RESIDENT`) so the
+/// first `find_impact` after a restart is warm.
+pub const SCIP_RESIDENT_PREWARM_ENV: &str = "CODESEARCH_SCIP_RESIDENT_PREWARM";
+pub const DEFAULT_SCIP_RESIDENT_PREWARM: bool = true;
+
 /// Per-workspace managed-heap cap passed to the helper as
 /// `DOTNET_GCHeapHardLimit` (bytes; the env var is interpreted as hex by the
 /// .NET runtime, so the Rust side formats it without a prefix). A runaway

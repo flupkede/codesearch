@@ -2507,6 +2507,15 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     fn applicability_hint(&self) -> &'static str {
         "the scip-csharp adapter requires a .sln file in the repository root"
     }
+
+    fn prewarm_resident(&self, repo_path: &Path) -> Result<()> {
+        let helper = self
+            .detect_helper()
+            .context("scip-csharp helper not available")?;
+        let solution = Self::find_solution(repo_path)
+            .with_context(|| format!("no solution under {}", repo_path.display()))?;
+        self.pool.prewarm(&helper, &solution, repo_path)
+    }
 }
 
 /// True for the scip-csharp helper's own transient filtered solutions

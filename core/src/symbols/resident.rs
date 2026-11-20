@@ -378,7 +378,7 @@ impl WorkspacePool {
             .unwrap_or(&0)
     }
 
-    /// Call under the pool lock: the install check in `find_refs` reads the
+    /// Call under the pool lock: the install check in `with_resident` reads the
     /// generation under that same lock.
     fn bump_generation(&self, solution: &Path) {
         *self
@@ -436,6 +436,46 @@ impl WorkspacePool {
         worktree_root: &Path,
         symbol: &str,
     ) -> Result<ResidentRefs> {
+        self.with_resident(helper, solution, worktree_root, |client| {
+            client.find_refs(symbol)
+        })
+    }
+
+    /// Load the resident workspace for `solution` without asking it anything,
+    /// through the same admission, gate and single-flight path as
+    /// `find_refs`. A no-op beyond touching `last_used` when it is resident.
+    /// Fails, evicting the fresh helper, if shutdown began during the load.
+    pub(crate) fn prewarm(
+        &self,
+        helper: &Path,
+        solution: &Path,
+        worktree_root: &Path,
+    ) -> Result<()> {
+        self.with_resident(helper, solution, worktree_root, |_| {
+            if crate::constants::is_shutdown_requested() {
+                self.evict(solution);
+                anyhow::bail!("resident prewarm cancelled: shutdown requested");
+            }
+            Ok(())
+        })
+    }
+
+    /// Admission cap, for callers sizing work against it.
+    pub fn max_resident(&self) -> usize {
+        self.max_resident
+    }
+
+    /// Run `op` against the resident workspace for `solution`, spawning it
+    /// first when absent. `op` runs exactly once, also on a workspace that
+    /// predates a concurrent `evict` (then it is killed after the answer
+    /// instead of installed).
+    fn with_resident<T>(
+        &self,
+        helper: &Path,
+        solution: &Path,
+        worktree_root: &Path,
+        op: impl FnOnce(&Arc<dyn ClientLike>) -> Result<T>,
+    ) -> Result<T> {
         // Single-flight per repo: the second concurrent lookup on the same
         // repo waits for the first one's spawn instead of duplicating the
         // minutes-long workspace load.
@@ -443,7 +483,7 @@ impl WorkspacePool {
         let _key_guard = key_lock.lock().expect("per-key spawn mutex poisoned");
 
         if let Some((client, in_flight, doomed)) = self.acquire_existing(solution) {
-            let outcome = client.find_refs(symbol);
+            let outcome = op(&client);
             self.release_parts(&in_flight, &doomed, &client);
             return outcome;
         }
@@ -486,7 +526,7 @@ impl WorkspacePool {
                 );
                 drop(entries);
                 drop(client); // Drop impl kills our redundant child
-                let outcome = c.find_refs(symbol);
+                let outcome = op(&c);
                 self.release_parts(&inf, &d, &c);
                 return outcome;
             }
@@ -497,7 +537,7 @@ impl WorkspacePool {
             // answer `evict` was called to prevent.
             if self.current_generation(solution) != gen_before_spawn {
                 drop(entries);
-                let outcome = client.find_refs(symbol);
+                let outcome = op(&client);
                 client.kill();
                 return outcome;
             }
@@ -512,7 +552,7 @@ impl WorkspacePool {
             );
         }
 
-        let outcome = client.find_refs(symbol);
+        let outcome = op(&client);
         self.release_parts(&in_flight, &doomed, &client);
         outcome
     }
@@ -594,7 +634,7 @@ impl WorkspacePool {
     ///
     /// Also bumps this solution's generation counter unconditionally, even
     /// when nothing is resident to remove: a spawn already in flight for
-    /// this solution has no entry yet, but `find_refs` checks the counter
+    /// this solution has no entry yet, but `with_resident` checks the counter
     /// right before installing its result, so that spawn's answer is used
     /// once and discarded instead of being resurrected as resident.
     pub(crate) fn evict(&self, solution: &Path) {

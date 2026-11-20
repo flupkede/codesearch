@@ -803,3 +803,60 @@ fn resident_update_timeout_honours_only_a_positive_env_override() {
         assert_eq!(resident_update_timeout(), *expected, "{env}={raw:?}");
     }
 }
+
+#[test]
+#[serial_test::serial]
+fn prewarm_loads_the_workspace_once_so_later_queries_and_prewarms_spawn_nothing() {
+    let h = harness(2, Duration::from_secs(600));
+    let helper = PathBuf::from("h.exe");
+
+    h.pool.prewarm(&helper, &sln("a"), Path::new("wt")).unwrap();
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 1, "prewarm must load it");
+
+    h.pool
+        .find_refs(&helper, &sln("a"), Path::new("wt"), "Sym")
+        .unwrap();
+    h.pool.prewarm(&helper, &sln("a"), Path::new("wt")).unwrap();
+    assert_eq!(
+        h.spawns.load(Ordering::SeqCst),
+        1,
+        "the first query after a prewarm must be warm"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn prewarm_respects_admission_like_a_query_does() {
+    let h = harness(1, Duration::from_secs(600));
+    let helper = PathBuf::from("h.exe");
+
+    h.pool.prewarm(&helper, &sln("a"), Path::new("wt")).unwrap();
+    h.pool.prewarm(&helper, &sln("b"), Path::new("wt")).unwrap();
+
+    assert_eq!(h.spawns.load(Ordering::SeqCst), 2);
+    assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 1, "LRU evicted");
+    assert_eq!(h.state.live_children.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[serial_test::serial]
+fn prewarm_finishing_after_shutdown_began_leaves_no_resident_child() {
+    struct ShutdownFlagReset;
+    impl Drop for ShutdownFlagReset {
+        fn drop(&mut self) {
+            crate::constants::SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        }
+    }
+    let h = harness(2, Duration::from_secs(600));
+    let helper = PathBuf::from("h.exe");
+
+    let result = {
+        let _reset = ShutdownFlagReset;
+        crate::constants::SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        h.pool.prewarm(&helper, &sln("a"), Path::new("wt"))
+    };
+
+    assert!(result.is_err(), "a cancelled prewarm must report failure");
+    assert_eq!(h.state.kill_count.load(Ordering::SeqCst), 1);
+    assert_eq!(h.state.live_children.load(Ordering::SeqCst), 0);
+}

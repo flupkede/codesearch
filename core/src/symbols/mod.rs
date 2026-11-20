@@ -563,6 +563,13 @@ pub trait SymbolIndexer: Send + Sync {
     fn applicability_hint(&self) -> &'static str {
         "the repository has no entrypoint this symbol indexer recognizes"
     }
+
+    /// Load this language's resident helper workspace for `repo_path` ahead
+    /// of the first query, through the same admission and gating path a
+    /// query uses. Blocks for the whole load. Default: nothing to prewarm.
+    fn prewarm_resident(&self, _repo_path: &Path) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ── Language dispatch ─────────────────────────────────────────────
