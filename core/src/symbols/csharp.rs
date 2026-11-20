@@ -29,7 +29,8 @@
 //! - Drops only the `scip_ref_cache` entries the changed files can affect
 //!   (see `stale_ref_cache_keys`); those resolve lazily on demand.
 //! - Applies the edit to the resident workspace in place before that commit,
-//!   evicting it instead when the helper cannot.
+//!   evicting it instead when the helper cannot. Only paths `csharp_relevance`
+//!   accepts reach it; a change set with none runs no rebuild at all.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -744,6 +745,35 @@ fn stale_ref_cache_keys(
     Ok(stale)
 }
 
+/// What the resident workspace can do with one changed path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Relevance {
+    /// Applied in place by the helper's `update`.
+    Send,
+    /// Project-graph file: only a workspace reload absorbs it.
+    ReloadDirectly,
+    /// Irrelevant to C# — the helper answers needs-reload for unknown
+    /// non-source paths, so it must never see these.
+    Ignore,
+}
+
+pub(crate) fn csharp_relevance(path: &Path) -> Relevance {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let has_suffix = |suffixes: &[&str]| suffixes.iter().any(|s| name.ends_with(s));
+    if has_suffix(crate::constants::CSHARP_RESIDENT_RELOAD_SUFFIXES)
+        || crate::constants::CSHARP_RESIDENT_RELOAD_FILES.contains(&name.as_str())
+    {
+        Relevance::ReloadDirectly
+    } else if has_suffix(crate::constants::CSHARP_RESIDENT_SEND_SUFFIXES) {
+        Relevance::Send
+    } else {
+        Relevance::Ignore
+    }
+}
+
 // ── CSharpSymbolIndexer ───────────────────────────────────────────
 
 /// C# adapter: locates the Roslyn helper, invokes it, parses SCIP, stores
@@ -1093,7 +1123,9 @@ impl CSharpSymbolIndexer {
     }
 
     /// Apply an incremental edit to the resident workspace for `solution`
-    /// in place; every outcome but applied or not-resident evicts it.
+    /// in place; only C#-relevant paths reach it. A project-graph path evicts
+    /// without an update; every update outcome but applied or not-resident
+    /// evicts too.
     fn refresh_resident(
         &self,
         solution: &Path,
@@ -1108,24 +1140,42 @@ impl CSharpSymbolIndexer {
                 repo_path.join(p)
             }
         };
-        let changed: Vec<PathBuf> = changed.iter().map(absolute).collect();
-        let deleted: Vec<PathBuf> = deleted.iter().map(absolute).collect();
-        let timeout = super::resident::resident_update_timeout();
-        let reason = match self.pool.update(solution, &changed, &deleted, timeout) {
-            Ok(UpdateOutcome::Applied(n)) => {
-                tracing::debug!(
-                    "resident workspace for '{}' updated in place ({} documents)",
-                    solution.display(),
-                    n
-                );
-                return;
+        let (mut send_changed, mut send_deleted) = (Vec::new(), Vec::new());
+        let mut reload_path = None;
+        for (paths, send) in [(changed, &mut send_changed), (deleted, &mut send_deleted)] {
+            for path in paths {
+                match csharp_relevance(path) {
+                    Relevance::Send => send.push(absolute(path)),
+                    Relevance::ReloadDirectly => {
+                        reload_path.get_or_insert(path);
+                    }
+                    Relevance::Ignore => {}
+                }
             }
-            Ok(UpdateOutcome::NotResident) => return,
-            Ok(UpdateOutcome::NeedsReload(reason)) => reason,
-            Err(e) => format!("{e:#}"),
+        }
+        let timeout = super::resident::resident_update_timeout();
+        let reason = match reload_path {
+            Some(path) => format!("needs-reload: {}", path.display()),
+            None if send_changed.is_empty() && send_deleted.is_empty() => return,
+            None => match self
+                .pool
+                .update(solution, &send_changed, &send_deleted, timeout)
+            {
+                Ok(UpdateOutcome::Applied(n)) => {
+                    tracing::debug!(
+                        "resident workspace for '{}' updated in place ({} documents)",
+                        solution.display(),
+                        n
+                    );
+                    return;
+                }
+                Ok(UpdateOutcome::NotResident) => return,
+                Ok(UpdateOutcome::NeedsReload(reason)) => reason,
+                Err(e) => format!("{e:#}"),
+            },
         };
         tracing::info!(
-            "resident workspace for '{}' evicted after a failed in-place update: {}",
+            "resident workspace for '{}' evicted: {}",
             solution.display(),
             reason
         );
@@ -1678,6 +1728,19 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         db_path: &Path,
         scope: RebuildScope,
     ) -> Result<RebuildSummary> {
+        if let RebuildScope::Files { changed, deleted } = &scope {
+            let mut paths = changed.iter().chain(deleted).peekable();
+            if paths.peek().is_some() && paths.all(|p| csharp_relevance(p) == Relevance::Ignore) {
+                tracing::debug!("Files rebuild skipped: no change is relevant to C#");
+                return Ok(RebuildSummary {
+                    symbols_indexed: 0,
+                    references_stored: 0,
+                    duration_ms: 0,
+                    index_warnings: Vec::new(),
+                });
+            }
+        }
+
         let helper = self.detect_helper().ok_or_else(|| {
             anyhow::anyhow!(
                 "scip-csharp helper not found. Install the -with-csharp release variant \
@@ -3004,6 +3067,7 @@ pub(super) mod tests {
     /// other subcommand except `--version` appends its name to that file first.
     /// With `CS_FAKE_CONCURRENCY_DIR` set, `index` and `find-refs` run for 400 ms
     /// and append the number of such runs live at their start to `peak.log` there.
+    /// With `CS_FAKE_INDEX_LOG` set, every `index` run appends a line to that file.
     const FAKE_HELPER_SRC: &str = r##"fn main() {
     if std::env::var("CS_FAKE_HELPER_MODE").as_deref() == Ok("exit75") {
         std::process::exit(75);
@@ -3051,6 +3115,11 @@ pub(super) mod tests {
         std::fs::remove_file(&mine).unwrap();
     }
     if sub == "index" {
+        if let Ok(log) = std::env::var("CS_FAKE_INDEX_LOG") {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+            writeln!(f, "index").unwrap();
+        }
         let flavour = std::env::var("CS_FAKE_INDEX").expect("index needs CS_FAKE_INDEX");
         let (docs, rows) = match std::env::var("CS_FAKE_EXTRA_KEY") {
             Ok(key) => (

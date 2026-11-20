@@ -1106,6 +1106,30 @@ pub const SCIP_RESIDENT_UPDATE_LOCK_POLL_MS: u64 = 10;
 /// workspace reload.
 pub const SCIP_SERVE_NEEDS_RELOAD_PREFIX: &str = "needs-reload";
 
+/// Lowercase file-name suffixes of changes the resident workspace applies in
+/// place through the helper's `update`.
+pub const CSHARP_RESIDENT_SEND_SUFFIXES: &[&str] = &[
+    ".cs",
+    ".razor",
+    ".cshtml",
+    ".editorconfig",
+    ".globalconfig",
+    ".resx",
+];
+
+/// Lowercase file-name suffixes of project-graph files; only a workspace
+/// reload absorbs a change to one.
+pub const CSHARP_RESIDENT_RELOAD_SUFFIXES: &[&str] =
+    &[".csproj", ".sln", ".slnx", ".props", ".targets"];
+
+/// Lowercase whole file names of project-graph files, matched against the
+/// lowercased file name.
+pub const CSHARP_RESIDENT_RELOAD_FILES: &[&str] = &[
+    "directory.packages.props",
+    "packages.lock.json",
+    "global.json",
+];
+
 /// How long (seconds) a budget-overrun `find_impact` lookup stays tracked
 /// for retry observation. Must comfortably exceed the slowest legitimate
 /// `scip-csharp find-refs` run (several minutes on a large solution): an
