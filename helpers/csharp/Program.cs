@@ -957,10 +957,16 @@ public static class Program
             .Concat(eolSkipped.Select(e => e.LineIndex))
             .Concat(loadable.Where(l => excludedPaths.Contains(l.RelativePath)).Select(l => l.LineIndex))
             .ToHashSet();
-        var filteredContent = BuildFilteredSolution(lines, skipIndices);
+        var filteredContent = WorkspaceLoad.AdaptFilteredSolutionForStaging(
+            BuildFilteredSolution(lines, skipIndices), solutionDir);
         WorkspaceLoad.CleanupStaleFilteredSolutions(solutionDir, Path.GetFileNameWithoutExtension(solutionPath));
         var tempSlnName = $"{Path.GetFileNameWithoutExtension(solutionPath)}-filtered-{Guid.NewGuid():N}.sln";
-        var tempSlnPath = Path.Combine(solutionDir, tempSlnName);
+        // Staged under .codesearch.db/tmp (hidden, hard-ignored by the
+        // Rust watcher/walker/bootstrap) — never the solution root: a
+        // transient .sln there is discovery bait for this very helper and
+        // pure noise for every other tool, and %TEMP% draws virus scanners.
+        var tempSlnPath = Path.Combine(
+            WorkspaceLoad.FilteredSolutionStagingDir(solutionDir), tempSlnName);
         await File.WriteAllTextAsync(tempSlnPath, filteredContent).ConfigureAwait(false);
 
         try
