@@ -166,6 +166,26 @@ fn match_belongs_to(indexer: &dyn SymbolIndexer, found: &KeyMatch) -> bool {
     }
 }
 
+/// The picked language answers only from keys it owns: one other language's
+/// key must never surface as a candidate or as the resolved symbol.
+fn retain_owned_keys(indexer: &dyn SymbolIndexer, found: KeyMatch) -> KeyMatch {
+    match found {
+        KeyMatch::Resolved(key) if indexer.owns_symbol_key(&key) => KeyMatch::Resolved(key),
+        KeyMatch::Resolved(_) | KeyMatch::NotFound => KeyMatch::NotFound,
+        KeyMatch::Ambiguous(keys) => {
+            let mut owned: Vec<String> = keys
+                .into_iter()
+                .filter(|k| indexer.owns_symbol_key(k))
+                .collect();
+            match owned.len() {
+                0 => KeyMatch::NotFound,
+                1 => KeyMatch::Resolved(owned.remove(0)),
+                _ => KeyMatch::Ambiguous(owned),
+            }
+        }
+    }
+}
+
 /// Decide which symbol index answers, in this order: an explicit `language`
 /// (refused when it contradicts the `symbol_key` scheme), the `symbol_key`'s
 /// own scheme, the `file` extension, then the installed indexers that apply
@@ -630,7 +650,10 @@ impl CodesearchService {
                         language_for_resolve
                     )
                 })?;
-            let resolution = indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)?;
+            let resolution = retain_owned_keys(
+                indexer,
+                indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)?,
+            );
             let mut index_warnings = indexer.index_warnings(&db_path_for_resolve);
             // A rebuild waiting out a restore (issue #225) refreshes nothing:
             // every answer from this index comes from the previous one and

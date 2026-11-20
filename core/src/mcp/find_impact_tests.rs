@@ -9,7 +9,7 @@
 
 use super::{
     find_impact_with_budget, missing_index_warning, resolve_find_impact_budget_secs,
-    ImpactLookupOutcome, SymbolIndexHeal,
+    retain_owned_keys, ImpactLookupOutcome, SymbolIndexHeal,
 };
 use crate::constants::{DEFAULT_FIND_IMPACT_BUDGET_SECS, FIND_IMPACT_BUDGET_SECS_ENV};
 use crate::symbols::{SymbolLookupBusy, SymbolReference};
@@ -658,11 +658,12 @@ fn make_ts_helper_available(root: &tempfile::TempDir) -> crate::testing::EnvRest
 const CS_ONLY_KEY: &str = "csharp Ns . O#CsOnly().";
 const TS_ONLY_KEY: &str = "scip-typescript npm mypkg 1.0.0 `src/o.ts`/TsOnly().";
 const CS_BOTH_KEY: &str = "csharp Ns . B#Both().";
+const CS_BOTH_OVERLOAD_KEY: &str = "csharp Ns . B#Both(System.String).";
 const TS_BOTH_KEY: &str = "scip-typescript npm mypkg 1.0.0 `src/b.ts`/Both().";
 
 /// One index holding both languages' keys in the shared tables, the way a
 /// polyglot repo does: a name unique to each language, and one name (`Both`)
-/// defined in each.
+/// defined in each (C# with two overloads).
 fn populate_polyglot_fixture(db_path: &std::path::Path) {
     let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
     let symbols = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Bytes>(
@@ -678,7 +679,13 @@ fn populate_polyglot_fixture(db_path: &std::path::Path) {
     .unwrap()
     .unwrap();
     let mut wtxn = env.write_txn().expect("wtxn");
-    for key in [CS_ONLY_KEY, TS_ONLY_KEY, CS_BOTH_KEY, TS_BOTH_KEY] {
+    for key in [
+        CS_ONLY_KEY,
+        TS_ONLY_KEY,
+        CS_BOTH_KEY,
+        CS_BOTH_OVERLOAD_KEY,
+        TS_BOTH_KEY,
+    ] {
         symbols
             .put(&mut wtxn, key, &stored_refs_bytes("src/p.cs", "definition"))
             .unwrap();
@@ -686,13 +693,67 @@ fn populate_polyglot_fixture(db_path: &std::path::Path) {
     let by_name: [(&str, &[&str]); 3] = [
         ("CsOnly", &[CS_ONLY_KEY]),
         ("TsOnly", &[TS_ONLY_KEY]),
-        ("Both", &[CS_BOTH_KEY, TS_BOTH_KEY]),
+        ("Both", &[CS_BOTH_KEY, CS_BOTH_OVERLOAD_KEY, TS_BOTH_KEY]),
     ];
     for (name, keys) in by_name {
         // The simple-name payload shares the key-list wire format.
         names.put(&mut wtxn, name, &warnings_bytes(keys)).unwrap();
     }
     wtxn.commit().unwrap();
+}
+
+#[test]
+fn a_language_pick_keeps_only_that_languages_keys_of_a_mixed_csharp_and_typescript_name() {
+    use crate::symbols::{KeyMatch, SymbolIndexerRegistry};
+
+    let cs_overload = CS_BOTH_OVERLOAD_KEY;
+    let ambiguous =
+        |keys: &[&str]| KeyMatch::Ambiguous(keys.iter().map(|k| k.to_string()).collect());
+    let resolved = |key: &str| KeyMatch::Resolved(key.to_string());
+    // (language picked, what the shared tables returned, what that language may answer)
+    let cases: Vec<(&str, KeyMatch, KeyMatch)> = vec![
+        // C# overloads plus a TypeScript key under the same name: only the C# keys stay candidates.
+        (
+            "csharp",
+            ambiguous(&[cs_overload, CS_BOTH_KEY, TS_BOTH_KEY]),
+            ambiguous(&[cs_overload, CS_BOTH_KEY]),
+        ),
+        // One key per language: the other language's key drops, leaving a single resolved symbol.
+        (
+            "csharp",
+            ambiguous(&[CS_BOTH_KEY, TS_BOTH_KEY]),
+            resolved(CS_BOTH_KEY),
+        ),
+        (
+            "typescript",
+            ambiguous(&[CS_BOTH_KEY, TS_BOTH_KEY]),
+            resolved(TS_BOTH_KEY),
+        ),
+        // Only the other language's keys: nothing is left to answer from.
+        (
+            "csharp",
+            ambiguous(&[TS_ONLY_KEY, TS_BOTH_KEY]),
+            KeyMatch::NotFound,
+        ),
+        ("csharp", resolved(TS_ONLY_KEY), KeyMatch::NotFound),
+        // Owned keys and a miss pass through untouched.
+        (
+            "csharp",
+            ambiguous(&[cs_overload, CS_BOTH_KEY]),
+            ambiguous(&[cs_overload, CS_BOTH_KEY]),
+        ),
+        ("csharp", resolved(CS_ONLY_KEY), resolved(CS_ONLY_KEY)),
+        ("csharp", KeyMatch::NotFound, KeyMatch::NotFound),
+    ];
+    let registry = SymbolIndexerRegistry::new();
+    for (language, found, expected) in cases {
+        let indexer = registry.get(language).expect("registered indexer");
+        assert_eq!(
+            retain_owned_keys(indexer, found.clone()),
+            expected,
+            "{language} must answer only from its own keys, given {found:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -796,6 +857,35 @@ async fn without_language_one_applicable_language_answers_without_asking() {
         v["ambiguous"],
         serde_json::Value::Bool(true),
         "csharp answered (here: with its own symbol-level candidates): {out}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_picked_language_lists_only_its_own_keys_when_the_name_exists_in_csharp_and_typescript() {
+    // `Both` holds two C# overloads and one TypeScript key in the shared
+    // tables; the explicit csharp pick must not offer the TypeScript key.
+    let csharp_root = tempfile::tempdir().unwrap();
+    let ts_root = tempfile::tempdir().unwrap();
+    let _csharp = make_helper_available(&csharp_root);
+    let _ts = make_ts_helper_available(&ts_root);
+    let (service, project) = build_service();
+    populate_polyglot_fixture(&project.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("Both".to_string()),
+            language: Some("csharp".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["candidates"],
+        serde_json::json!([CS_BOTH_KEY, CS_BOTH_OVERLOAD_KEY]),
+        "only csharp keys may be candidates after a csharp pick: {out}"
     );
 }
 

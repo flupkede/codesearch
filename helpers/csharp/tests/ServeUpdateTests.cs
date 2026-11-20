@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text.Json;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
 using Xunit;
 using ScipCsharp;
@@ -20,10 +21,18 @@ public sealed class ServeUpdateFixture : IAsyncLifetime
     public string MainCs => Path.Combine(Root, "App", "Main.cs");
     public string CalculatorCs => Path.Combine(Root, "Library", "Calculator.cs");
     public string AppCsproj => Path.Combine(Root, "App", "App.csproj");
+    public string NotesTxt => Path.Combine(Root, "App", "Notes.txt");
 
     public async Task InitializeAsync()
     {
         CopyWithoutBuildOutput(MsbuildTestWorkspace.FixturePath("SmallSolution"), Root);
+        // An AdditionalFiles item only in this copy: the shipped fixture also
+        // feeds the Rust integration tests.
+        File.WriteAllText(NotesTxt, "original notes");
+        File.WriteAllText(
+            AppCsproj,
+            File.ReadAllText(AppCsproj).Replace(
+                "</Project>", "  <ItemGroup>\n    <AdditionalFiles Include=\"Notes.txt\" />\n  </ItemGroup>\n\n</Project>"));
         var solutionPath = Path.Combine(Root, "SmallSolution.sln");
         await MsbuildTestWorkspace.RestoreIfNeededAsync(
             solutionPath, Path.Combine(Root, "App"), Path.Combine(Root, "Library"));
@@ -89,7 +98,8 @@ public sealed class ServeUpdateTests : IClassFixture<ServeUpdateFixture>, IDispo
     }
 
     private IEnumerable<string> SourceFiles() =>
-        Directory.EnumerateFiles(_fixture.Root, "*.cs", SearchOption.AllDirectories)
+        Directory.EnumerateFiles(_fixture.Root, "*", SearchOption.AllDirectories)
+            .Where(p => Path.GetExtension(p) is ".cs" or ".txt")
             .Where(p => !Path.GetRelativePath(_fixture.Root, p)
                 .Split(Path.DirectorySeparatorChar)
                 .Any(segment => segment is "bin" or "obj"));
@@ -129,6 +139,19 @@ public sealed class ServeUpdateTests : IClassFixture<ServeUpdateFixture>, IDispo
     }
 
     private static string Wire(object response) => JsonSerializer.Serialize(response);
+
+    private static string NeedsReloadWire(string path) =>
+        Wire(new { ok = false, error = ServeHost.NeedsReloadPrefix + path });
+
+    private static async Task<List<string>> AdditionalTextsAsync(Solution solution, string path)
+    {
+        var texts = new List<string>();
+        foreach (var document in solution.Projects
+                     .SelectMany(p => p.AdditionalDocuments)
+                     .Where(d => string.Equals(d.FilePath, path, StringComparison.OrdinalIgnoreCase)))
+            texts.Add((await document.GetTextAsync()).ToString());
+        return texts;
+    }
 
     private Dictionary<string, string> HashTree() =>
         Directory.EnumerateFiles(_fixture.Root, "*", SearchOption.AllDirectories)
@@ -213,12 +236,58 @@ public sealed class ServeUpdateTests : IClassFixture<ServeUpdateFixture>, IDispo
         Assert.Equal(before, await RefsAsync());
     }
 
-    [Fact]
-    public async Task Update_UnknownNonSourcePath_IsIgnoredAndNotCounted()
+    [Theory]
+    [InlineData("App/Unknown.razor")]
+    [InlineData("App/Views/Unknown.cshtml")]
+    [InlineData("App/Sub/.editorconfig")]
+    [InlineData("NOTES.md")]
+    public async Task Update_UnknownNonSourcePath_NeedsReloadAndKeepsTheSnapshot(string relativePath)
     {
-        var answer = await UpdateAsync([Path.Combine(_fixture.Root, "NOTES.md")], []);
+        var before = await RefsAsync();
+        ReplaceInFile(_fixture.MainCs, CallSite, CallSite + "\n        calc.Subtract(1, 1);");
+        var unknown = Path.GetFullPath(Path.Combine(_fixture.Root, relativePath));
 
-        Assert.Equal(Wire(new { ok = true, applied = 0 }), answer);
+        var answer = await UpdateAsync([_fixture.MainCs, unknown], []);
+
+        Assert.Equal(NeedsReloadWire(unknown), answer);
+        Assert.Equal(before, await RefsAsync());
+    }
+
+    [Theory]
+    [InlineData("App/Unknown.cs", true)]
+    [InlineData("App/Unknown.razor", false)]
+    [InlineData("App/Sub/.editorconfig", false)]
+    public async Task Update_DeletedUnknownPath_IgnoresSourceAndReloadsForTheRest(string relativePath, bool ignored)
+    {
+        var unknown = Path.GetFullPath(Path.Combine(_fixture.Root, relativePath));
+
+        var answer = await UpdateAsync([], [unknown]);
+
+        Assert.Equal(ignored ? Wire(new { ok = true, applied = 0 }) : NeedsReloadWire(unknown), answer);
+    }
+
+    [Fact]
+    public async Task Update_ExistingAdditionalDocument_IsEditedInPlace()
+    {
+        Assert.Equal(["original notes"], await AdditionalTextsAsync(_host.Snapshot, _fixture.NotesTxt));
+        File.WriteAllText(_fixture.NotesTxt, "edited notes");
+
+        var answer = await UpdateAsync([_fixture.NotesTxt], []);
+
+        Assert.Equal(Wire(new { ok = true, applied = 1 }), answer);
+        Assert.Equal(["edited notes"], await AdditionalTextsAsync(_host.Snapshot, _fixture.NotesTxt));
+    }
+
+    [Fact]
+    public async Task Update_DeletedAdditionalDocument_IsRemovedInPlace()
+    {
+        Assert.Single(await AdditionalTextsAsync(_host.Snapshot, _fixture.NotesTxt));
+        File.Delete(_fixture.NotesTxt);
+
+        var answer = await UpdateAsync([], [_fixture.NotesTxt]);
+
+        Assert.Equal(Wire(new { ok = true, applied = 1 }), answer);
+        Assert.Empty(await AdditionalTextsAsync(_host.Snapshot, _fixture.NotesTxt));
     }
 
     [Fact]
@@ -238,11 +307,13 @@ public sealed class ServeUpdateTests : IClassFixture<ServeUpdateFixture>, IDispo
     {
         var added = WriteExtraSource();
         ReplaceInFile(_fixture.MainCs, CallSite, CallSite + "\n        calc.Subtract(1, 1);");
+        File.WriteAllText(_fixture.NotesTxt, "edited notes");
         var before = HashTree();
         Assert.Contains(Path.Combine("App", "App.csproj"), before.Keys);
+        Assert.Contains(Path.Combine("App", "Notes.txt"), before.Keys);
 
-        await UpdateAsync([_fixture.MainCs, added], []);
-        await UpdateAsync([], [added]);
+        await UpdateAsync([_fixture.MainCs, added, _fixture.NotesTxt], []);
+        await UpdateAsync([], [added, _fixture.NotesTxt]);
         await RefsAsync();
 
         Assert.Equal(before, HashTree());

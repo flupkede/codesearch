@@ -66,7 +66,7 @@ public sealed class ServeHost
         WriteIndented = false,
     };
 
-    private const string NeedsReloadPrefix = "needs-reload: ";
+    internal const string NeedsReloadPrefix = "needs-reload: ";
     private const string SourceExtension = ".cs";
 
     // A change to any of these alters the project graph or its references,
@@ -92,6 +92,9 @@ public sealed class ServeHost
         _defaultSolution = defaultSolution;
         _current = workspace.CurrentSolution;
     }
+
+    /// <summary>The held snapshot, for tests that assert what update did to it.</summary>
+    internal Solution Snapshot => _current;
 
     /// <summary>
     /// Runs until stdin EOF or a "shutdown" request. Returns 0 on both —
@@ -253,7 +256,7 @@ public sealed class ServeHost
                     }
                     applied++;
                 }
-                else if (path.EndsWith(SourceExtension, StringComparison.OrdinalIgnoreCase))
+                else if (IsSource(path))
                 {
                     var owners = OwningProjects(next, path);
                     if (owners.Count == 0)
@@ -268,6 +271,12 @@ public sealed class ServeHost
                     }
                     applied++;
                 }
+                else
+                {
+                    // A non-source file the snapshot does not know (a new .razor,
+                    // .editorconfig, ...) cannot be expressed as a text edit.
+                    return NeedsReload(path);
+                }
             }
             foreach (var path in deleted)
             {
@@ -275,6 +284,10 @@ public sealed class ServeHost
                 var ids = next.GetDocumentIdsWithFilePath(path);
                 if (ids.Length == 0)
                 {
+                    if (!IsSource(path))
+                    {
+                        return NeedsReload(path);
+                    }
                     continue;
                 }
                 foreach (var id in ids)
@@ -297,6 +310,9 @@ public sealed class ServeHost
 
     private static ServeResponse NeedsReload(string path) =>
         new() { Ok = false, Error = NeedsReloadPrefix + path };
+
+    private static bool IsSource(string path) =>
+        path.EndsWith(SourceExtension, StringComparison.OrdinalIgnoreCase);
 
     private static bool RequiresReload(string path)
     {
