@@ -10,26 +10,28 @@
 #     matchers filter on tool name only)
 #
 # Marker sources (all available ones are written):
-#   1. a file-ish INPUT field (file/path/file_path) — find_impact's schema
-#      names its target `symbol_name` and carries no path, so this serves
-#      older schemas and hand-crafted calls
-#   1b. a PATH-LIKE `symbol` input (separator or extension): edit-guard
-#      demands find(symbol=<path>, kind="usages") for non-SCIP code, so the
-#      exact call it demands must mark the path it names — resolved against
-#      the call's `project` root, else the `cwd` repo, else the shell cwd.
-#      Bare code symbols (git_repo) never mark.
+#   1. a file-ish INPUT field (file/path/file_path) — serves older schemas
+#      and hand-crafted calls
+#   1b. a PATH-LIKE `symbol` or `symbol_name` input (separator or
+#      extension): the exact call shapes edit-guard demands —
+#      find(symbol=<path>, kind="usages") and find_impact(symbol_name=
+#      <path>) — mark the path they name; resolved against the project
+#      alias's registered root, else the cwd repo's root, else the raw key.
+#      Bare code symbols (git_repo, obj.method()) never mark.
 #   2. every path the RESPONSE mentions — but only values that look like
-#      file paths (separator or extension): a bare symbol string used to
-#      resolve to a bogus <root>/git_repo key that matched nothing. Paths
-#      join onto the `project` alias's registered root, or the `cwd` repo's
-#      registered root for cwd-scoped calls (both shape candidates are
-#      marked — repo-relative vs alias-prefixed depends on serve mode).
-#   3. when neither yields a path — an empty result or a "no SCIP backend"
-#      error — a REPO-level marker: on the `project` alias's registered
-#      root, else on the `cwd` repo's root when registered. codesearch was
-#      consulted and answered nothing, the one case where per-file
-#      attribution is impossible but the protocol was followed. edit-guard
-#      accepts that marker for any file in that repo.
+#      file paths (a bare symbol string used to resolve to a bogus
+#      <root>/git_repo key that matched nothing). Paths join onto the
+#      `project` alias's registered root, or as fallback the `cwd` repo's
+#      registered root (both shape candidates are marked — repo-relative
+#      vs alias-prefixed depends on serve mode).
+#   3. ALWAYS a REPO-level marker on the `project` alias's registered
+#      root, else the `cwd` repo's root when registered: a qualifying
+#      consult proves the protocol was followed for that repo, and
+#      per-file attribution cannot be exhaustive — find_impact answers
+#      with CALLERS, so the consulted file itself is often absent from
+#      its response (the theme-2-merge wedge: successful consult, edit
+#      still denied). edit-guard accepts that marker for any file in the
+#      repo; the 5-minute window bounds the unlock.
 #
 # PostToolUse hooks cannot block anything: this script never emits a
 # decision and ALWAYS exits 0.
@@ -57,13 +59,14 @@ esac
 
 project=$(echo "$raw" | jq -r '.tool_input.project // empty' 2>/dev/null | jq_str)
 symbol=$(echo "$raw" | jq -r '.tool_input.symbol // empty' 2>/dev/null | jq_str)
+symbol_name=$(echo "$raw" | jq -r '.tool_input.symbol_name // empty' 2>/dev/null | jq_str)
 call_cwd=$(echo "$raw" | jq -r '.tool_input.cwd // empty' 2>/dev/null | jq_str)
 
-# cwd-scoped calls (serve-mode worktree-safe scoping) carry no `project`:
-# the cwd repo's registered root stands in for it, for response attribution
-# and the repo fallback alike.
+# The cwd repo's registered root stands in for a missing, stale or
+# unregistered `project` alias: serve-mode agents may pass both, and
+# attribution must follow the repo the agent is working in.
 cwd_root=""
-if [ -z "$project" ] && [ -n "$call_cwd" ]; then
+if [ -n "$call_cwd" ]; then
     candidate="$(resolve_target_git_root "$call_cwd")"
     if [ -n "$candidate" ] && target_registered "$candidate"; then
         cwd_root="$candidate"
@@ -84,25 +87,27 @@ if [ -n "$input_p" ]; then
     [ -n "$k" ] && keys+=("$k")
 fi
 
-# Source 1b: a path-like `symbol` marks the path it names — the exact call
-# shape edit-guard itself demands. Shape gate matches the pwsh twin's
-# Test-FilePathShape: a separator anywhere, or dot + alnum at the end —
-# a bare `*.*` would treat `obj.method()` as a path and eat the repo
-# fallback that pathless consultations rely on.
-if [ -n "$symbol" ] && [[ "$symbol" =~ [/\\]|\.[A-Za-z0-9]+$ ]]; then
+# Source 1b: a path-like `symbol` / `symbol_name` marks the path it names —
+# the exact call shapes edit-guard itself demands. Shape gate matches the
+# pwsh twin's Test-FilePathShape: a separator anywhere, or dot + alnum at
+# the end — a bare `*.*` would treat `obj.method()` as a path and eat the
+# repo marker that pathless consultations rely on.
+for sym in "$symbol" "$symbol_name"; do
+    [ -n "$sym" ] || continue
+    [[ "$sym" =~ [/\\]|\.[A-Za-z0-9]+$ ]] || continue
     marked=false
     if [ -n "$project" ] || [ -n "$cwd_root" ]; then
         while IFS= read -r abs; do
             [ -n "$abs" ] || continue
             k="$(norm_state_key "$abs")"
             [ -n "$k" ] && { keys+=("$k"); marked=true; }
-        done < <(resolve_result_path "$symbol" "$project" "$cwd_root")
+        done < <(resolve_result_path "$sym" "$project" "$cwd_root")
     fi
     if [ "$marked" != true ]; then
-        k="$(norm_state_key "$symbol")"
+        k="$(norm_state_key "$sym")"
         [ -n "$k" ] && keys+=("$k")
     fi
-fi
+done
 
 # Source 2: paths mentioned anywhere in the tool response — as an object, as
 # a JSON string, or inside the MCP text envelope's JSON-stringified payloads.
@@ -130,18 +135,21 @@ done < <(echo "$raw" | jq -r '
     | unique | .[]
 ' 2>/dev/null | jq_str)
 
-# Source 3: repo-level fallback — consulted, but nothing attributable.
-if [ "${#keys[@]}" -eq 0 ]; then
-    root=""
-    if [ -n "$project" ]; then
-        root="$(registered_project_root "$project")"
-    elif [ -n "$cwd_root" ]; then
-        root="$cwd_root"
-    fi
-    if [ -n "$root" ]; then
-        k="$(norm_state_key "$root")"
-        [ -n "$k" ] && keys+=("$k")
-    fi
+# Source 3: repo-level marker — written for EVERY qualifying consult.
+# Per-file attribution cannot be exhaustive: find_impact answers with
+# callers, so the consulted file itself is often absent from the response
+# (the theme-2-merge wedge). A qualifying consult proves the protocol was
+# followed for this repo; the window bounds the unlock.
+root=""
+if [ -n "$project" ]; then
+    root="$(registered_project_root "$project")"
+fi
+if [ -z "$root" ]; then
+    root="$cwd_root"
+fi
+if [ -n "$root" ]; then
+    k="$(norm_state_key "$root")"
+    [ -n "$k" ] && keys+=("$k")
 fi
 
 [ "${#keys[@]}" -gt 0 ] || exit 0

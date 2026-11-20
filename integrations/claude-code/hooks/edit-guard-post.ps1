@@ -10,17 +10,22 @@
 #
 # Marker sources (all available ones are written):
 #   1. a file-ish INPUT field (file/path/file_path)
-#   1b. a PATH-LIKE `symbol` input (separator or extension): the exact
-#      find(symbol=<path>, kind="usages") call edit-guard demands marks the
-#      path it names — project root, else cwd repo, else the shell cwd.
+#   1b. a PATH-LIKE `symbol` or `symbol_name` input (separator or
+#      extension): the exact call shapes edit-guard demands —
+#      find(symbol=<path>, kind="usages") and find_impact(symbol_name=
+#      <path>) — mark the path they name, resolved against the project
+#      alias's registered root, else the cwd repo's root, else the raw key.
 #   2. every path the RESPONSE mentions — file-path-shaped values only
-#      (separator or extension; a bare symbol once resolved to a bogus
-#      <root>/git_repo key), joined onto the `project` alias's registered
-#      root or, for cwd-scoped calls, the `cwd` repo's registered root
-#      (both shape candidates — repo-relative vs alias-prefixed).
-#   3. when neither yields a path — empty result / "no SCIP backend" — a
-#      REPO-level marker on the project's registered root, else the cwd
-#      repo's root when registered.
+#      (a bare symbol once resolved to a bogus <root>/git_repo key),
+#      joined onto the `project` alias's registered root or, as fallback,
+#      the `cwd` repo's registered root (both shape candidates —
+#      repo-relative vs alias-prefixed).
+#   3. ALWAYS a REPO-level marker on the project's registered root, else
+#      the cwd repo's root when registered: a qualifying consult proves
+#      the protocol was followed for that repo, and per-file attribution
+#      cannot be exhaustive — find_impact answers with CALLERS, so the
+#      consulted file itself is often absent from its response (the
+#      theme-2-merge wedge: successful consult, edit still denied).
 #
 # PostToolUse hooks cannot block anything: no decision is emitted and this
 # script ALWAYS exits 0.
@@ -51,13 +56,14 @@ switch ($tool) {
 
 $project = if ($inp -and @($inp.PSObject.Properties.Name) -contains 'project') { [string]$inp.project } else { '' }
 $symbol  = if ($inp -and @($inp.PSObject.Properties.Name) -contains 'symbol') { [string]$inp.symbol } else { '' }
+$symbolName = if ($inp -and @($inp.PSObject.Properties.Name) -contains 'symbol_name') { [string]$inp.symbol_name } else { '' }
 $callCwd = if ($inp -and @($inp.PSObject.Properties.Name) -contains 'cwd')   { [string]$inp.cwd }    else { '' }
 
-# cwd-scoped calls (serve-mode worktree-safe scoping) carry no `project`:
-# the cwd repo's registered root stands in for it, for response attribution
-# and the repo fallback alike.
+# The cwd repo's registered root stands in for a missing, stale or
+# unregistered `project` alias: serve-mode agents may pass both, and
+# attribution must follow the repo the agent is working in.
 $cwdRoot = ''
-if ([string]::IsNullOrEmpty($project) -and -not [string]::IsNullOrEmpty($callCwd)) {
+if (-not [string]::IsNullOrEmpty($callCwd)) {
     $candidate = Resolve-TargetGitRoot $callCwd
     if (-not [string]::IsNullOrEmpty($candidate) -and (Test-CodesearchTargetRegistered $candidate)) {
         $cwdRoot = $candidate
@@ -110,18 +116,19 @@ foreach ($field in @('file', 'path', 'file_path')) {
     }
 }
 
-# Source 1b: a path-like `symbol` marks the path it names — the exact call
-# shape edit-guard itself demands.
-if (-not [string]::IsNullOrEmpty($symbol) -and (Test-FilePathShape $symbol)) {
+# Source 1b: a path-like `symbol` / `symbol_name` marks the path it names —
+# the exact call shapes edit-guard itself demands.
+foreach ($sym in @($symbol, $symbolName)) {
+    if ([string]::IsNullOrEmpty($sym) -or -not (Test-FilePathShape $sym)) { continue }
     $marked = $false
     if (-not [string]::IsNullOrEmpty($project) -or -not [string]::IsNullOrEmpty($cwdRoot)) {
-        foreach ($abs in (Resolve-ResultPath -Path $symbol -ProjectAlias $project -FallbackRoot $cwdRoot)) {
+        foreach ($abs in (Resolve-ResultPath -Path $sym -ProjectAlias $project -FallbackRoot $cwdRoot)) {
             $k = ConvertTo-StateKey $abs
             if (-not [string]::IsNullOrEmpty($k)) { $keys += $k; $marked = $true }
         }
     }
     if (-not $marked) {
-        $k = ConvertTo-StateKey $symbol
+        $k = ConvertTo-StateKey $sym
         if (-not [string]::IsNullOrEmpty($k)) { $keys += $k }
     }
 }
@@ -137,18 +144,21 @@ if ($null -ne $data.tool_response) {
     }
 }
 
-# Source 3: repo-level fallback — consulted, but nothing attributable.
-if ($keys.Count -eq 0) {
-    $root = ''
-    if (-not [string]::IsNullOrEmpty($project)) {
-        $root = Get-RegisteredProjectRoot $project
-    } elseif (-not [string]::IsNullOrEmpty($cwdRoot)) {
-        $root = $cwdRoot
-    }
-    if (-not [string]::IsNullOrEmpty($root)) {
-        $k = ConvertTo-StateKey $root
-        if (-not [string]::IsNullOrEmpty($k)) { $keys += $k }
-    }
+# Source 3: repo-level marker — written for EVERY qualifying consult.
+# Per-file attribution cannot be exhaustive: find_impact answers with
+# callers, so the consulted file itself is often absent from the response
+# (the theme-2-merge wedge). A qualifying consult proves the protocol was
+# followed for this repo; the 5-minute window bounds the unlock.
+$root = ''
+if (-not [string]::IsNullOrEmpty($project)) {
+    $root = Get-RegisteredProjectRoot $project
+}
+if ([string]::IsNullOrEmpty($root)) {
+    $root = $cwdRoot
+}
+if (-not [string]::IsNullOrEmpty($root)) {
+    $k = ConvertTo-StateKey $root
+    if (-not [string]::IsNullOrEmpty($k)) { $keys += $k }
 }
 
 if ($keys.Count -eq 0) { exit 0 }

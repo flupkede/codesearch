@@ -179,9 +179,14 @@ case_response_paths_mark() {
     expect_allow "string tool_response parses the same JSON payload: Edit .cs allowed"
 }
 case_symbolic_without_project_still_denied() {
-    # No project alias: response paths cannot resolve and no repo root is
-    # known, so nothing is attributable — the edit stays denied. Pins the
-    # requirement to scope the consultation to the project.
+    # No project alias and no cwd: response paths cannot resolve and no
+    # repo root is known, so nothing is attributable — the edit stays
+    # denied. Pins the requirement to scope the consultation to the
+    # project. fresh_state: earlier consults (e.g. the repoA cases above)
+    # now always leave a repo-level marker behind, by design — without the
+    # reset this case would assert the leftover unlock instead of its own
+    # nothing-attributable behaviour.
+    fresh_state
     local resp
     resp="$(mcp_text_response "No symbol index available for csharp")"
     run_post "$(post_impact_symbolic "" "$resp")"
@@ -198,6 +203,59 @@ case_no_backend_marks_repo() {
     run_post "$(post_impact_symbolic "repoA" "$resp")"
     run_edit "$(edit_event "$ROOT_A/p.py")"
     expect_allow "pathless no-backend answer: repo marker unblocks other files"
+}
+
+case_impact_symbol_name_path_marks_file() {
+    # THE theme-2-merge wedge: find_impact's target rides in `symbol_name`,
+    # and its answer lists CALLERS — the consulted file itself need not
+    # appear anywhere in the response. Before the fix the caller hit was
+    # the only marker, the repo fallback was skipped (keys were non-empty)
+    # and the very next edit on the consulted file was denied seconds
+    # after a successful consult.
+    local hits resp
+    touch "$REPO_A/u.cs"
+    fresh_state
+    run_edit "$(edit_event "$REPO_A/u.cs")"
+    expect_deny "isolation: fresh state denies Edit u.cs" 'find_impact'
+    hits="$(jq -cn --arg p "repoA/p.py" '{results: [{path: $p, chunk_id: 11}]}')"
+    resp="$(mcp_text_response "$hits")"
+    run_post "$(jq -cn --arg p "repoA" --arg s "$ROOT_A/u.cs" --arg t "$resp" \
+        '{tool_name: "mcp__codesearch__find_impact", tool_input: {project: $p, symbol_name: $s}, tool_response: $t}')"
+    run_edit "$(edit_event "$REPO_A/u.cs")"
+    expect_allow "find_impact(symbol_name=<path>) with caller-only response: consulted file marked"
+}
+
+case_impact_symbol_name_cwd_pathless_marks_file() {
+    # Serve-mode shape: cwd scoping (no project) and a pathless answer.
+    # Only the path-like symbol_name can attribute per-file, and the
+    # cwd repo's root must take the repo-level marker.
+    fresh_state
+    local resp
+    resp="$(mcp_text_response "No symbol index available for csharp")"
+    run_post "$(jq -cn --arg c "$REPO_A" --arg s "$ROOT_A/x.cs" --arg t "$resp" \
+        '{tool_name: "mcp__codesearch__find_impact", tool_input: {cwd: $c, symbol_name: $s}, tool_response: $t}')"
+    run_edit "$(edit_event "$REPO_A/x.cs")"
+    expect_allow "find_impact(symbol_name=<path>, cwd) with pathless answer: file + repo marker"
+}
+
+case_unknown_alias_cwd_fallback_marks_repo() {
+    # A project alias that is NOT in repos.json (renamed or removed) must
+    # not void the consult: the cwd repo's registered root stands in for
+    # attribution and the repo-level marker alike. The bare symbol_name
+    # must leave no junk file-level key.
+    fresh_state
+    local resp sf
+    resp="$(mcp_text_response "No usages found for 'ActivityClient'. The symbol may not be indexed.")"
+    run_post "$(jq -cn --arg c "$REPO_A" --arg t "$resp" \
+        '{tool_name: "mcp__codesearch__find_impact", tool_input: {project: "nosuch", symbol_name: "ActivityClient", cwd: $c}, tool_response: $t}')"
+    run_edit "$(edit_event "$REPO_A/w.cs")"
+    expect_allow "unknown project alias: cwd repo marker unblocks"
+    sf="$STATE_DIR/.codesearch-edit-guard-state.json"
+    if grep -q 'ActivityClient' "$sf" 2>/dev/null; then
+        bad "unknown alias: no bare-symbol junk key may be written"
+    else
+        ok "unknown alias: no junk file-level key"
+    fi
 }
 
 fresh_state() { rm -f "$STATE_DIR/.codesearch-edit-guard-state.json"; }
@@ -230,12 +288,15 @@ case_dotted_symbol_marks_repo() {
     # shape gate must skip source 1b so the pathless answer still marks the
     # repo root. The bash twin once matched any dot (case *.*), fabricated a
     # <root>/obj.method() key and starved the repo fallback — bash and pwsh
-    # disagreed on the same event.
+    # disagreed on the same event. The merge below must NOT use jq -n:
+    # -n discards stdin (input becomes null), so the piped event lost
+    # tool_name/tool_input and the hook exited silently — this case could
+    # never pass as written.
     local resp sf
     fresh_state
     resp="$(mcp_text_response "No usages found for 'obj.method()'. The symbol may not be indexed.")"
     run_post "$(post_find_symbol "obj.method()" '{"project": "repoA"}' \
-        | jq -cn --arg t "$resp" '. + {tool_response: $t}')"
+        | jq -c --arg t "$resp" '. + {tool_response: $t}')"
     run_edit "$(edit_event "$ROOT_A/p.py")"
     expect_allow "dotted non-path symbol: repo fallback still fires (pwsh parity)"
     sf="$STATE_DIR/.codesearch-edit-guard-state.json"
@@ -387,6 +448,9 @@ case_window_expiry_denies_again
 case_grep_guard_smoke
 case_bash_grep_targets
 case_covered_via_codesearch_home
+case_impact_symbol_name_path_marks_file
+case_impact_symbol_name_cwd_pathless_marks_file
+case_unknown_alias_cwd_fallback_marks_repo
 
 echo
 echo "edit-guard self-tests: $PASS passed, $FAIL failed"
