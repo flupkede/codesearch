@@ -3,7 +3,7 @@
 //! the global shutdown flag, which other serial tests toggle.
 
 use super::helper_gate::{HelperGate, HelperPurpose};
-use super::resident::{ClientLike, ResidentRefs, WorkspacePool};
+use super::resident::{ClientLike, ResidentRefs, UpdateOutcome, WorkspacePool};
 use crate::constants::{
     csharp_scip_concurrency, parse_csharp_scip_concurrency, CSHARP_SCIP_CONCURRENCY_ENV,
     SHUTDOWN_REQUESTED,
@@ -69,6 +69,10 @@ fn peak_overlap(gate: &Arc<HelperGate>, roots: &[PathBuf]) -> usize {
 struct OkClient;
 
 impl ClientLike for OkClient {
+    fn update(&self, changed: &[PathBuf], deleted: &[PathBuf]) -> Result<UpdateOutcome> {
+        Ok(UpdateOutcome::Applied(changed.len() + deleted.len()))
+    }
+
     fn find_refs(&self, _symbol: &str) -> Result<ResidentRefs> {
         Ok(ResidentRefs::default())
     }
@@ -255,19 +259,37 @@ fn resident_spawn_holds_the_gate_until_the_workspace_is_loaded() {
     lookup_done.join().unwrap().unwrap();
 }
 
-#[test]
-fn a_request_to_a_resident_helper_does_not_take_the_gate() {
-    let gate = Arc::new(HelperGate::new(1));
-    let pool = pool_with(&gate, || Ok(Arc::new(OkClient)));
-    lookup(&pool).unwrap();
+fn update(pool: &WorkspacePool) -> Result<()> {
+    match pool.update(
+        &PathBuf::from("C:/code/wt/App.sln"),
+        &[PathBuf::from("C:/code/wt/A.cs")],
+        &[],
+        COMPLETES_WITHIN,
+    )? {
+        UpdateOutcome::Applied(_) => Ok(()),
+        other => anyhow::bail!("update not applied: {other:?}"),
+    }
+}
 
-    let _held = gate.acquire(HelperPurpose::Rebuild, wt()).unwrap();
-    let (tx, rx) = mpsc::channel();
-    let pool_bg = Arc::clone(&pool);
-    std::thread::spawn(move || {
-        let _ = tx.send(lookup(&pool_bg).map(drop).map_err(|e| e.to_string()));
-    });
-    assert_eq!(rx.recv_timeout(COMPLETES_WITHIN), Ok(Ok(())));
+#[test]
+fn a_request_or_update_to_a_resident_helper_does_not_take_the_gate() {
+    let cases: [(&str, fn(&WorkspacePool) -> Result<()>); 2] = [
+        ("find-refs", |pool| lookup(pool).map(drop)),
+        ("update", update),
+    ];
+    for (case, op) in cases {
+        let gate = Arc::new(HelperGate::new(1));
+        let pool = pool_with(&gate, || Ok(Arc::new(OkClient)));
+        lookup(&pool).unwrap();
+
+        let _held = gate.acquire(HelperPurpose::Rebuild, wt()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let pool_bg = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let _ = tx.send(op(&pool_bg).map_err(|e| e.to_string()));
+        });
+        assert_eq!(rx.recv_timeout(COMPLETES_WITHIN), Ok(Ok(())), "{case}");
+    }
 }
 
 #[test]

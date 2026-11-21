@@ -9,7 +9,7 @@
 
 use super::{
     find_impact_with_budget, missing_index_warning, resolve_find_impact_budget_secs,
-    ImpactLookupOutcome, SymbolIndexHeal,
+    retain_owned_keys, ImpactLookupOutcome, SymbolIndexHeal,
 };
 use crate::constants::{DEFAULT_FIND_IMPACT_BUDGET_SECS, FIND_IMPACT_BUDGET_SECS_ENV};
 use crate::symbols::{SymbolLookupBusy, SymbolReference};
@@ -655,39 +655,330 @@ fn make_ts_helper_available(root: &tempfile::TempDir) -> crate::testing::EnvRest
     )])
 }
 
+const CS_ONLY_KEY: &str = "csharp Ns . O#CsOnly().";
+const TS_ONLY_KEY: &str = "scip-typescript npm mypkg 1.0.0 `src/o.ts`/TsOnly().";
+const CS_BOTH_KEY: &str = "csharp Ns . B#Both().";
+const CS_BOTH_OVERLOAD_KEY: &str = "csharp Ns . B#Both(System.String).";
+const TS_BOTH_KEY: &str = "scip-typescript npm mypkg 1.0.0 `src/b.ts`/Both().";
+
+/// One index holding both languages' keys in the shared tables, the way a
+/// polyglot repo does: a name unique to each language, and one name (`Both`)
+/// defined in each (C# with two overloads).
+fn populate_polyglot_fixture(db_path: &std::path::Path) {
+    let env = crate::symbols::get_shared_scip_env(db_path).expect("shared env");
+    let symbols = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Bytes>(
+        &env,
+        crate::constants::SCIP_SYMBOLS_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
+    let names = crate::lmdb_registry::open_named_db::<heed::types::Str, heed::types::Bytes>(
+        &env,
+        crate::constants::SCIP_SIMPLE_NAMES_DB_NAME,
+    )
+    .unwrap()
+    .unwrap();
+    let mut wtxn = env.write_txn().expect("wtxn");
+    for key in [
+        CS_ONLY_KEY,
+        TS_ONLY_KEY,
+        CS_BOTH_KEY,
+        CS_BOTH_OVERLOAD_KEY,
+        TS_BOTH_KEY,
+    ] {
+        symbols
+            .put(&mut wtxn, key, &stored_refs_bytes("src/p.cs", "definition"))
+            .unwrap();
+    }
+    let by_name: [(&str, &[&str]); 3] = [
+        ("CsOnly", &[CS_ONLY_KEY]),
+        ("TsOnly", &[TS_ONLY_KEY]),
+        ("Both", &[CS_BOTH_KEY, CS_BOTH_OVERLOAD_KEY, TS_BOTH_KEY]),
+    ];
+    for (name, keys) in by_name {
+        // The simple-name payload shares the key-list wire format.
+        names.put(&mut wtxn, name, &warnings_bytes(keys)).unwrap();
+    }
+    wtxn.commit().unwrap();
+}
+
+#[test]
+fn a_language_pick_keeps_only_that_languages_keys_of_a_mixed_csharp_and_typescript_name() {
+    use crate::symbols::{KeyMatch, SymbolIndexerRegistry};
+
+    let cs_overload = CS_BOTH_OVERLOAD_KEY;
+    let ambiguous =
+        |keys: &[&str]| KeyMatch::Ambiguous(keys.iter().map(|k| k.to_string()).collect());
+    let resolved = |key: &str| KeyMatch::Resolved(key.to_string());
+    // (language picked, what the shared tables returned, what that language may answer)
+    let cases: Vec<(&str, KeyMatch, KeyMatch)> = vec![
+        // C# overloads plus a TypeScript key under the same name: only the C# keys stay candidates.
+        (
+            "csharp",
+            ambiguous(&[cs_overload, CS_BOTH_KEY, TS_BOTH_KEY]),
+            ambiguous(&[cs_overload, CS_BOTH_KEY]),
+        ),
+        // One key per language: the other language's key drops, leaving a single resolved symbol.
+        (
+            "csharp",
+            ambiguous(&[CS_BOTH_KEY, TS_BOTH_KEY]),
+            resolved(CS_BOTH_KEY),
+        ),
+        (
+            "typescript",
+            ambiguous(&[CS_BOTH_KEY, TS_BOTH_KEY]),
+            resolved(TS_BOTH_KEY),
+        ),
+        // Only the other language's keys: nothing is left to answer from.
+        (
+            "csharp",
+            ambiguous(&[TS_ONLY_KEY, TS_BOTH_KEY]),
+            KeyMatch::NotFound,
+        ),
+        ("csharp", resolved(TS_ONLY_KEY), KeyMatch::NotFound),
+        // Owned keys and a miss pass through untouched.
+        (
+            "csharp",
+            ambiguous(&[cs_overload, CS_BOTH_KEY]),
+            ambiguous(&[cs_overload, CS_BOTH_KEY]),
+        ),
+        ("csharp", resolved(CS_ONLY_KEY), resolved(CS_ONLY_KEY)),
+        ("csharp", KeyMatch::NotFound, KeyMatch::NotFound),
+    ];
+    let registry = SymbolIndexerRegistry::new();
+    for (language, found, expected) in cases {
+        let indexer = registry.get(language).expect("registered indexer");
+        assert_eq!(
+            retain_owned_keys(indexer, found.clone()),
+            expected,
+            "{language} must answer only from its own keys, given {found:?}"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial]
-async fn without_language_several_installed_helpers_ask_which_one() {
-    // Two helpers installed and no language: silently answering from the
-    // first would be the exact silent pick the ambiguity contract removes.
+async fn without_language_a_symbol_key_routes_to_its_owning_indexer() {
+    // Both helpers installed: a key names its own language by scheme, so no
+    // language and no ambiguity answer are needed. The last row is an
+    // explicit language that agrees with the key (any casing).
     let csharp_root = tempfile::tempdir().unwrap();
     let ts_root = tempfile::tempdir().unwrap();
     let _csharp = make_helper_available(&csharp_root);
     let _ts = make_ts_helper_available(&ts_root);
     let (service, project) = build_service();
-    populate_overload_fixture(&project.path().join(".codesearch.db"));
+    populate_polyglot_fixture(&project.path().join(".codesearch.db"));
+
+    let cases: [(Option<&str>, &str, &str); 3] = [
+        (None, CS_ONLY_KEY, "csharp"),
+        (None, TS_ONLY_KEY, "typescript"),
+        (Some("TypeScript"), TS_ONLY_KEY, "typescript"),
+    ];
+    for (language, key, expected) in cases {
+        let out = tool_text(
+            &service,
+            FindImpactRequest {
+                symbol_key: Some(key.to_string()),
+                language: language.map(str::to_string),
+                ..find_impact_request()
+            },
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["resolved_symbol"], key,
+            "a {expected} key must resolve without a language, got: {out}"
+        );
+        assert_eq!(
+            v["language"], expected,
+            "the key's own index must answer: {out}"
+        );
+        assert!(
+            v.get("ambiguous_language").is_none() && v.get("retry_with").is_none(),
+            "a resolved language never carries the ambiguity answer: {out}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_language_that_contradicts_the_symbol_key_is_refused() {
+    // Refusal precedes every lookup, so no helper env is needed.
+    let (service, _project) = build_service();
+    let cases = [
+        ("typescript", CS_ONLY_KEY, "csharp"),
+        ("csharp", TS_ONLY_KEY, "typescript"),
+    ];
+    for (language, key, key_language) in cases {
+        let out = tool_text(
+            &service,
+            FindImpactRequest {
+                symbol_key: Some(key.to_string()),
+                language: Some(language.to_string()),
+                ..find_impact_request()
+            },
+        )
+        .await;
+        assert!(
+            out.contains(&format!("`language` is '{language}'"))
+                && out.contains(&format!("is a {key_language} key")),
+            "the refusal must name both the language and the key's language, got: {out}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn without_language_one_applicable_language_answers_without_asking() {
+    // A solution file makes csharp the only applicable language. `Both` is
+    // defined in each language, so only the applicability filter can keep
+    // this from becoming a language question.
+    let csharp_root = tempfile::tempdir().unwrap();
+    let ts_root = tempfile::tempdir().unwrap();
+    let _csharp = make_helper_available(&csharp_root);
+    let _ts = make_ts_helper_available(&ts_root);
+    let (service, project) = build_applicable_service();
+    populate_polyglot_fixture(&project.path().join(".codesearch.db"));
 
     let out = tool_text(
         &service,
         FindImpactRequest {
-            symbol_name: Some("Validate".to_string()),
+            symbol_name: Some("Both".to_string()),
             language: None,
             ..find_impact_request()
         },
     )
     .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(
-        out.contains("Several symbol indexes are installed"),
-        "the answer must ask which language, got: {out}"
+        v.get("ambiguous_language").is_none(),
+        "one applicable language must answer, not ask: {out}"
     );
-    assert!(
-        out.contains("csharp") && out.contains("typescript"),
-        "the answer must list the installed languages: {out}"
+    assert_eq!(
+        v["ambiguous"],
+        serde_json::Value::Bool(true),
+        "csharp answered (here: with its own symbol-level candidates): {out}"
     );
-    assert!(
-        !out.contains("\"ambiguous\""),
-        "asking for a language is not an ambiguity envelope: {out}"
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_picked_language_lists_only_its_own_keys_when_the_name_exists_in_csharp_and_typescript() {
+    // `Both` holds two C# overloads and one TypeScript key in the shared
+    // tables; the explicit csharp pick must not offer the TypeScript key.
+    let csharp_root = tempfile::tempdir().unwrap();
+    let ts_root = tempfile::tempdir().unwrap();
+    let _csharp = make_helper_available(&csharp_root);
+    let _ts = make_ts_helper_available(&ts_root);
+    let (service, project) = build_service();
+    populate_polyglot_fixture(&project.path().join(".codesearch.db"));
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("Both".to_string()),
+            language: Some("csharp".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["candidates"],
+        serde_json::json!([CS_BOTH_KEY, CS_BOTH_OVERLOAD_KEY]),
+        "only csharp keys may be candidates after a csharp pick: {out}"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn without_language_a_name_found_in_one_language_answers_from_it() {
+    // Nothing applies (no solution, no tsconfig), so both installed
+    // languages are candidates and the index decides.
+    let csharp_root = tempfile::tempdir().unwrap();
+    let ts_root = tempfile::tempdir().unwrap();
+    let _csharp = make_helper_available(&csharp_root);
+    let _ts = make_ts_helper_available(&ts_root);
+    let (service, project) = build_service();
+    populate_polyglot_fixture(&project.path().join(".codesearch.db"));
+
+    let cases = [
+        ("CsOnly", "csharp", CS_ONLY_KEY),
+        ("TsOnly", "typescript", TS_ONLY_KEY),
+    ];
+    for (name, expected, key) in cases {
+        let out = tool_text(
+            &service,
+            FindImpactRequest {
+                symbol_name: Some(name.to_string()),
+                language: None,
+                ..find_impact_request()
+            },
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["resolved_symbol"], key,
+            "'{name}' lives only in the {expected} index and must resolve there: {out}"
+        );
+        assert_eq!(v["language"], expected, "wrong index answered: {out}");
+        assert!(
+            v.get("retry_with").is_none(),
+            "a resolved language carries no retry entries: {out}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn without_language_a_name_not_decided_by_the_indexes_returns_retry_entries() {
+    // `Both` is defined in each language and `Nope` in neither: the server
+    // cannot decide, so the answer hands over one verbatim retry per language
+    // carrying the caller's original arguments.
+    let csharp_root = tempfile::tempdir().unwrap();
+    let ts_root = tempfile::tempdir().unwrap();
+    let _csharp = make_helper_available(&csharp_root);
+    let _ts = make_ts_helper_available(&ts_root);
+    let (service, project) = build_service();
+    populate_polyglot_fixture(&project.path().join(".codesearch.db"));
+
+    for name in ["Both", "Nope"] {
+        let out = tool_text(
+            &service,
+            FindImpactRequest {
+                symbol_name: Some(name.to_string()),
+                file: Some("notes.txt".to_string()),
+                line: Some(7),
+                language: None,
+                ..find_impact_request()
+            },
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["ambiguous_language"],
+            serde_json::Value::Bool(true),
+            "'{name}' must ask for a language: {out}"
+        );
+        assert!(
+            v.get("ambiguous").is_none(),
+            "a language question is not a symbol ambiguity: {out}"
+        );
+        assert_eq!(v["languages"], serde_json::json!(["csharp", "typescript"]));
+        assert_eq!(
+            v["retry_with"],
+            serde_json::json!([
+                {"symbol_name": name, "file": "notes.txt", "line": 7, "language": "csharp"},
+                {"symbol_name": name, "file": "notes.txt", "line": 7, "language": "typescript"},
+            ]),
+            "each entry is the original arguments plus one language: {out}"
+        );
+        let hint = v["hint_for_agent"].as_str().unwrap();
+        assert!(
+            hint.contains("csharp, typescript")
+                && hint.contains("copy one `retry_with` entry verbatim"),
+            "the message must name the candidates and say how to retry: {hint}"
+        );
+    }
 }
 
 #[tokio::test]

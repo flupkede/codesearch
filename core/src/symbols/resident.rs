@@ -17,7 +17,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Mutex, TryLockError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,9 +36,20 @@ pub(crate) struct ResidentRefs {
     pub warnings: Vec<String>,
 }
 
+/// Result of applying edited files to a resident workspace in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpdateOutcome {
+    Applied(usize),
+    NotResident,
+    NeedsReload(String),
+}
+
 /// Behaviour seam so the pool can be unit-tested without real processes.
 pub(crate) trait ClientLike: Send + Sync {
     fn find_refs(&self, symbol: &str) -> Result<ResidentRefs>;
+    /// Apply on-disk text of `changed` and drop `deleted` documents; never
+    /// answers `NotResident`.
+    fn update(&self, changed: &[PathBuf], deleted: &[PathBuf]) -> Result<UpdateOutcome>;
     /// Kill the helper process. Must be idempotent and return only once the
     /// process has exited, also when another thread's kill is in progress.
     fn kill(&self);
@@ -173,6 +184,8 @@ struct ServeResponse {
     ready: Option<bool>,
     #[serde(default)]
     result: Option<ServeResult>,
+    #[serde(default)]
+    applied: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -198,19 +211,31 @@ fn default_ref_kind() -> String {
     "reference".to_string()
 }
 
-impl ClientLike for ServeClient {
-    fn find_refs(&self, symbol: &str) -> Result<ResidentRefs> {
-        // Sequential protocol: write request, then read exactly one response.
+impl ServeClient {
+    /// Sequential protocol: write one request line, then read exactly one
+    /// response line.
+    fn request(&self, op: &str, request: serde_json::Value) -> Result<ServeResponse> {
         {
             let mut stdin = self.stdin.lock().expect("serve stdin mutex poisoned");
-            let request = serde_json::json!({ "op": "find-refs", "symbol": symbol });
-            writeln!(stdin, "{request}").context("failed to write find-refs request")?;
-            stdin.flush().context("failed to flush find-refs request")?;
+            writeln!(stdin, "{request}")
+                .with_context(|| format!("failed to write {op} request"))?;
+            stdin
+                .flush()
+                .with_context(|| format!("failed to flush {op} request"))?;
         }
 
         let line = self.read_response_line()?;
-        let response: ServeResponse = serde_json::from_str(&line)
-            .with_context(|| format!("serve response is not valid JSON: {line}"))?;
+        serde_json::from_str(&line)
+            .with_context(|| format!("serve response is not valid JSON: {line}"))
+    }
+}
+
+impl ClientLike for ServeClient {
+    fn find_refs(&self, symbol: &str) -> Result<ResidentRefs> {
+        let response = self.request(
+            "find-refs",
+            serde_json::json!({ "op": "find-refs", "symbol": symbol }),
+        )?;
 
         if !response.ok {
             anyhow::bail!(
@@ -237,6 +262,27 @@ impl ClientLike for ServeClient {
                 .collect(),
             warnings: result.warnings,
         })
+    }
+
+    fn update(&self, changed: &[PathBuf], deleted: &[PathBuf]) -> Result<UpdateOutcome> {
+        let response = self.request(
+            "update",
+            serde_json::json!({ "op": "update", "changed": changed, "deleted": deleted }),
+        )?;
+
+        if response.ok {
+            let applied = response
+                .applied
+                .context("serve update response has no applied count")?;
+            return Ok(UpdateOutcome::Applied(applied));
+        }
+        let error = response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string());
+        if error.starts_with(crate::constants::SCIP_SERVE_NEEDS_RELOAD_PREFIX) {
+            return Ok(UpdateOutcome::NeedsReload(error));
+        }
+        anyhow::bail!("serve update failed: {error}")
     }
 
     fn kill(&self) {
@@ -279,10 +325,10 @@ pub struct WorkspacePool {
     /// not both pay the minutes-long workspace load. Different repos spawn
     /// in parallel. Entries are never removed (bounded by repo count).
     spawn_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
-    /// Bumped by `evict` for a solution, even with no resident entry to
-    /// remove — the only signal a spawn-in-progress can check itself
-    /// against, since `evict` must never take the per-key spawn lock (that
-    /// would block a rebuild for the full minutes-long load). Never removed
+    /// Bumped by `evict` and `update` for a solution, even with no resident
+    /// entry — the only signal a spawn-in-progress can check itself
+    /// against, since neither may wait on the per-key spawn lock for a spawn
+    /// (that would block a rebuild for the full minutes-long load). Never removed
     /// (bounded by repo count, same as `spawn_locks`).
     generations: Mutex<HashMap<PathBuf, u64>>,
     /// Residents taken out of `entries` whose kill may still be running
@@ -332,6 +378,25 @@ impl WorkspacePool {
             .unwrap_or(&0)
     }
 
+    /// Call under the pool lock: the install check in `with_resident` reads the
+    /// generation under that same lock.
+    fn bump_generation(&self, solution: &Path) {
+        *self
+            .generations
+            .lock()
+            .expect("generations poisoned")
+            .entry(solution.to_path_buf())
+            .or_insert(0) += 1;
+    }
+
+    fn key_lock(&self, solution: &Path) -> Arc<Mutex<()>> {
+        let mut locks = self.spawn_locks.lock().expect("spawn locks poisoned");
+        locks
+            .entry(solution.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Record a resident just taken out of `entries`; call under the pool
     /// lock so a spawn can never miss it.
     fn retire(&self, solution: &Path, client: &Arc<dyn ClientLike>) {
@@ -371,20 +436,54 @@ impl WorkspacePool {
         worktree_root: &Path,
         symbol: &str,
     ) -> Result<ResidentRefs> {
+        self.with_resident(helper, solution, worktree_root, |client| {
+            client.find_refs(symbol)
+        })
+    }
+
+    /// Load the resident workspace for `solution` without asking it anything,
+    /// through the same admission, gate and single-flight path as
+    /// `find_refs`. A no-op beyond touching `last_used` when it is resident.
+    /// Fails, evicting the fresh helper, if shutdown began during the load.
+    pub(crate) fn prewarm(
+        &self,
+        helper: &Path,
+        solution: &Path,
+        worktree_root: &Path,
+    ) -> Result<()> {
+        self.with_resident(helper, solution, worktree_root, |_| {
+            if crate::constants::is_shutdown_requested() {
+                self.evict(solution);
+                anyhow::bail!("resident prewarm cancelled: shutdown requested");
+            }
+            Ok(())
+        })
+    }
+
+    /// Admission cap, for callers sizing work against it.
+    pub fn max_resident(&self) -> usize {
+        self.max_resident
+    }
+
+    /// Run `op` against the resident workspace for `solution`, spawning it
+    /// first when absent. `op` runs exactly once, also on a workspace that
+    /// predates a concurrent `evict` (then it is killed after the answer
+    /// instead of installed).
+    fn with_resident<T>(
+        &self,
+        helper: &Path,
+        solution: &Path,
+        worktree_root: &Path,
+        op: impl FnOnce(&Arc<dyn ClientLike>) -> Result<T>,
+    ) -> Result<T> {
         // Single-flight per repo: the second concurrent lookup on the same
         // repo waits for the first one's spawn instead of duplicating the
         // minutes-long workspace load.
-        let key_lock = {
-            let mut locks = self.spawn_locks.lock().expect("spawn locks poisoned");
-            locks
-                .entry(solution.to_path_buf())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let key_lock = self.key_lock(solution);
         let _key_guard = key_lock.lock().expect("per-key spawn mutex poisoned");
 
         if let Some((client, in_flight, doomed)) = self.acquire_existing(solution) {
-            let outcome = client.find_refs(symbol);
+            let outcome = op(&client);
             self.release_parts(&in_flight, &doomed, &client);
             return outcome;
         }
@@ -427,7 +526,7 @@ impl WorkspacePool {
                 );
                 drop(entries);
                 drop(client); // Drop impl kills our redundant child
-                let outcome = c.find_refs(symbol);
+                let outcome = op(&c);
                 self.release_parts(&inf, &d, &c);
                 return outcome;
             }
@@ -438,7 +537,7 @@ impl WorkspacePool {
             // answer `evict` was called to prevent.
             if self.current_generation(solution) != gen_before_spawn {
                 drop(entries);
-                let outcome = client.find_refs(symbol);
+                let outcome = op(&client);
                 client.kill();
                 return outcome;
             }
@@ -453,7 +552,7 @@ impl WorkspacePool {
             );
         }
 
-        let outcome = client.find_refs(symbol);
+        let outcome = op(&client);
         self.release_parts(&in_flight, &doomed, &client);
         outcome
     }
@@ -535,7 +634,7 @@ impl WorkspacePool {
     ///
     /// Also bumps this solution's generation counter unconditionally, even
     /// when nothing is resident to remove: a spawn already in flight for
-    /// this solution has no entry yet, but `find_refs` checks the counter
+    /// this solution has no entry yet, but `with_resident` checks the counter
     /// right before installing its result, so that spawn's answer is used
     /// once and discarded instead of being resurrected as resident.
     pub(crate) fn evict(&self, solution: &Path) {
@@ -554,17 +653,80 @@ impl WorkspacePool {
                 }
                 None => None,
             };
-            *self
-                .generations
-                .lock()
-                .expect("generations poisoned")
-                .entry(solution.to_path_buf())
-                .or_insert(0) += 1;
+            self.bump_generation(solution);
             result
         };
         if let Some(v) = victim {
             v.kill();
         }
+    }
+
+    /// Apply edited (`changed`) and removed (`deleted`) documents to the
+    /// resident workspace for `solution` in place, so it keeps serving
+    /// instead of reloading. With a resident, runs under the solution's
+    /// spawn lock like a request, touches `last_used`, and takes no
+    /// helper-gate slot. `timeout` bounds the lock wait plus the helper's
+    /// reply; a helper that misses it is evicted and killed, so neither its
+    /// blocked pipe nor this lock outlives the call. Eviction on any other
+    /// outcome is the caller's decision.
+    ///
+    /// Bumps the generation first, as `evict` does: a spawn in flight may
+    /// have read pre-edit text, so it answers its caller once and is never
+    /// installed resident. No resident → `NotResident` without waiting.
+    pub(crate) fn update(
+        &self,
+        solution: &Path,
+        changed: &[PathBuf],
+        deleted: &[PathBuf],
+        timeout: Duration,
+    ) -> Result<UpdateOutcome> {
+        let deadline = Instant::now() + timeout;
+        let resident = {
+            let entries = self.entries.lock().expect("workspace pool poisoned");
+            self.bump_generation(solution);
+            entries.contains_key(solution)
+        };
+        if !resident {
+            return Ok(UpdateOutcome::NotResident);
+        }
+
+        let key_lock = self.key_lock(solution);
+        let _key_guard = loop {
+            match key_lock.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(
+                        crate::constants::SCIP_RESIDENT_UPDATE_LOCK_POLL_MS,
+                    ));
+                }
+                Err(TryLockError::WouldBlock) => anyhow::bail!(
+                    "resident update timed out after {timeout:?} waiting for a request \
+                     on the workspace"
+                ),
+                Err(TryLockError::Poisoned(_)) => panic!("per-key spawn mutex poisoned"),
+            }
+        };
+
+        let Some((client, in_flight, doomed)) = self.acquire_existing(solution) else {
+            return Ok(UpdateOutcome::NotResident);
+        };
+        let (tx, rx) = mpsc::channel();
+        let worker = Arc::clone(&client);
+        let (changed, deleted) = (changed.to_vec(), deleted.to_vec());
+        thread::spawn(move || {
+            let _ = tx.send(worker.update(&changed, &deleted));
+        });
+        let reply = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        if reply.is_err() {
+            // Dooms our reservation; the release below performs the kill.
+            self.evict(solution);
+        }
+        self.release_parts(&in_flight, &doomed, &client);
+        reply.unwrap_or_else(|e| {
+            Err(anyhow::anyhow!(
+                "resident update got no reply within {timeout:?}: {e}"
+            ))
+        })
     }
 
     /// Evict as many residents as needed to admit a new workspace — LRU
@@ -623,6 +785,18 @@ fn env_resolved<T: std::str::FromStr>(env: &str, default: T) -> T {
         Ok(raw) => raw.trim().parse().unwrap_or(default),
         Err(_) => default,
     }
+}
+
+/// Bound for [`WorkspacePool::update`]: the env override when it is a
+/// positive integer, else the default — a zero bound would evict on every
+/// rebuild.
+pub(crate) fn resident_update_timeout() -> Duration {
+    let secs = std::env::var(crate::constants::SCIP_RESIDENT_UPDATE_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(crate::constants::SCIP_RESIDENT_UPDATE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 /// The process-global pool. Config comes from env at first use (same pattern

@@ -10,6 +10,7 @@
 //! Holds a `DashMap<String, Arc<SharedStores>>` keyed by repo alias.
 //! Lazy-opens stores on first query. Conflicted repos are isolated.
 
+mod prewarm;
 mod rest_mirrors;
 mod tui;
 mod tui_common;
@@ -4499,6 +4500,21 @@ impl ServeState {
         }
     }
 
+    /// C# status when no rebuild populated the cache: helper available and
+    /// an index on disk → Ready.
+    fn probe_csharp_index(&self, db_path: &Path) -> CSharpIndexStatus {
+        let registry = &self.symbol_registry;
+        let has_helper = registry
+            .get(LANG_CSHARP)
+            .map(|i| i.is_available())
+            .unwrap_or(false);
+        if has_helper && registry.has_index_for(LANG_CSHARP, db_path) {
+            CSharpIndexStatus::Ready
+        } else {
+            CSharpIndexStatus::None
+        }
+    }
+
     /// Get lightweight repo statuses WITHOUT opening any databases.
     /// Returns a list of (alias, status_info) where status is derived from DashMap state only.
     pub(crate) fn repo_statuses_lightweight(&self) -> Vec<(String, RepoStatusInfo)> {
@@ -4568,17 +4584,7 @@ impl ServeState {
                         .map(|i| i.applies_to(path))
                         .unwrap_or(false));
             let csharp_index = resolve_csharp_status(cached_csharp, csharp_building, || {
-                // Probe: helper available + index exists → Ready
-                let registry = &self.symbol_registry;
-                let has_helper = registry
-                    .get(LANG_CSHARP)
-                    .map(|i| i.is_available())
-                    .unwrap_or(false);
-                if has_helper && registry.has_index_for(LANG_CSHARP, &db_path) {
-                    CSharpIndexStatus::Ready
-                } else {
-                    CSharpIndexStatus::None
-                }
+                self.probe_csharp_index(&db_path)
             });
 
             let csharp_error = if matches!(
@@ -8103,8 +8109,10 @@ pub async fn run_serve(
     // ── Startup phase orchestration ──
     // Phase 1 warms all repos sequentially (text/vector ready).
     // Phase 2 runs gated per-language SCIP rebuilds ordered by last_changed.
+    // Phase 3 loads resident C# workspaces for the most recently used repos.
     {
         let phase_state = serve_state.clone();
+        let phase_cancel = cancel_token.clone();
         tokio::spawn(async move {
             // reconcile_all_paths spawns git subprocesses and traverses the
             // filesystem while holding the config RwLock write-guard.  Running
@@ -8120,6 +8128,7 @@ pub async fn run_serve(
             }
             phase_state.run_phase_1_warmup_all().await;
             phase_state.run_phase_2_symbols().await;
+            phase_state.run_resident_prewarm(&phase_cancel).await;
         });
     }
 

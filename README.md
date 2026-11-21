@@ -439,10 +439,20 @@ Find all call-sites and references to a symbol with file/line precision — the 
 | `symbol_name` | string | Symbol name (e.g. `"FieldDefinition.Validate"`) |
 | `file` | string | File path for position-based lookup |
 | `line` | int | Line number for position-based lookup |
-| `language` | string | Language hint (auto-detected from file extension) |
+| `symbol_key` | string | Exact canonical SCIP key, e.g. one listed by an ambiguous answer; mutually exclusive with `symbol_name` and `file`+`line` |
+| `language` | string | Optional; inferred when omitted (see below) |
 | `project` / `group` | string | Multi-repo routing |
 
 Returns a list of references with `file`, `start_line`, `end_line`, and `kind` (e.g. `"call"`, `"definition"`). Exposes `index_age_seconds` so agents can reason about staleness.
+
+**Language inference.** `language` is rarely needed:
+
+- An explicit `language` wins; if it contradicts a `symbol_key`'s scheme the call is refused with a message naming both.
+- A `symbol_key` selects its owning indexer (scheme `csharp` or `scip-typescript`).
+- A `file`+`line` lookup uses the file extension.
+- A `symbol_name` is resolved by each applicable installed indexer; a single match decides.
+
+A call that stays undecided returns a `retry_with` array: one entry per candidate language, each holding your original arguments plus `"language"`. Copy one entry verbatim as the next call.
 
 > **Note:** SCIP precision requires the `-with-csharp` release variant (or a separately installed `scip-csharp` helper) for C#, and `npx` (with `scip-typescript`, fetched on first use) on the host's PATH for TypeScript. Without a backend for a language, `find_impact` returns a clear message — use `find kind="usages"` as the lexical fallback. See [C# Semantic Search](#c-semantic-search).
 
@@ -728,6 +738,8 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_MIN_FREE_MB` | Free-memory floor (MB) a heavy job waits for (max 30 s, then proceeds with a warning) before starting (default: 0 = disabled) |
 | `CODESEARCH_MAX_CHUNKS_PER_BATCH` | Hard cap on chunks held in memory per refresh batch; splits the batch early (default: 0 = disabled) |
 | `CODESEARCH_SCIP_CSHARP` | Override path to `scip-csharp` helper |
+| `CODESEARCH_SCIP_RESIDENT_UPDATE_TIMEOUT_SECS` | Bound (default: 30) on applying a Files rebuild to the resident C# helper in place; on timeout, error, or a project-file change the resident is reloaded instead |
+| `CODESEARCH_SCIP_RESIDENT_PREWARM` | Default on, `0` disables. After the startup symbol pass, serve preloads resident C# workspaces for the most recently used C# repos, up to `CODESEARCH_SCIP_MAX_RESIDENT` |
 | `CODESEARCH_EXTENSION_MAP` | Path to the extension→language map (default: `~/.codesearch/extensions.json`) — see [Extension map](#extension-map) |
 | `ORT_DYLIB_PATH` | `load-dynamic` builds only: path of the ONNX Runtime shared library (1.31 or newer) — see [CPUs without AVX2](#cpus-without-avx2) |
 | `RUST_LOG` | Log level (e.g. `codesearch=debug`) |

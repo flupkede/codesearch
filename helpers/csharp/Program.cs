@@ -136,7 +136,8 @@ public static class Program
         // process death is (todo #115).
         return await ServeHost.LoopAsync(
             workspace,
-            solution => OpenSolutionFilteredAsync(workspace, solution, gateRestorePending: false)).ConfigureAwait(false);
+            solution => OpenSolutionFilteredAsync(workspace, solution, gateRestorePending: false),
+            CurrentServeSolution).ConfigureAwait(false);
     }
 
     private static string? ParseServeArgs(string[] args)
