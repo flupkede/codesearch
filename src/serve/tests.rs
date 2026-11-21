@@ -1308,6 +1308,84 @@ async fn add_repo_handler_refuses_temp_dir_paths_unless_forced() {
     );
 }
 
+/// A path with a hidden (dot-prefixed) component is a throwaway checkout
+/// (`.tmpXXXX` scratch, `.opencode/worktrees`) even when it is NOT under the
+/// OS temp dir — the post-checkout hook skips these, and the handler must
+/// refuse them too. Mirrors the temp test: no force → 400 naming the hidden
+/// reason; force=true skips the guard and reaches the duplicate conflict.
+#[tokio::test]
+#[serial_test::serial]
+async fn add_repo_handler_refuses_hidden_path_components_unless_forced() {
+    // Base outside the OS temp dir (a hidden path under temp would hit the
+    // temp guard first) — the test process CWD: not temp, not hidden itself.
+    let base = std::env::current_dir().unwrap().join(".cs-hidden-fixture");
+    let repo_path = base.join("wt");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    let _env = crate::testing::EnvRestore::remove(&[ALLOWED_ROOTS_ENV]);
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("fixture".to_string()))
+        .unwrap();
+    let state = Arc::new(state_with_config(config));
+
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: None,
+            model: None,
+            force: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "hidden-path registration must be refused, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        body.0
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| e.contains("hidden")),
+        "refusal must name the hidden-folder reason, got: {}",
+        body.0
+    );
+
+    // force=true bypasses the hidden guard and hits the duplicate check,
+    // proving the guard — not something else — produced the 400 above.
+    let (status, body) = add_repo_handler(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(AddRepoRequest {
+            path: repo_path.clone(),
+            alias: None,
+            model: None,
+            force: Some(true),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CONFLICT,
+        "forced add must skip the hidden guard and hit the duplicate conflict, got {}: {}",
+        status,
+        body.0
+    );
+    assert!(
+        body.0
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| e.contains("already registered")),
+        "expected the already-registered conflict, got: {}",
+        body.0
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// `POST /repos` with no explicit `model` must create a brand-new index at the
 /// serve-wide default's dimension (`codesearch serve --model X`), not the
 /// built-in 384-dim default. This is the write-side counterpart of the per-repo

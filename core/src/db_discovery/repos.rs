@@ -1492,6 +1492,21 @@ pub fn is_temp_dir_path(path: &Path) -> bool {
     is_under_dir(&input, &root)
 }
 
+/// Whether any real component of `path` is a dot-prefixed (hidden) folder —
+/// `.tmpXXXX` scratch dirs, `.opencode/worktrees`, CI dot-folders. Such
+/// checkouts are throwaway by convention: the post-checkout hook already
+/// skips them, and the registration sites (serve `POST /repos`, CLI
+/// `index add`) refuse them so a direct registration cannot index one either.
+/// Linked worktrees at ordinary paths are deliberately NOT hidden — every
+/// worktree is its own branch's corpus and stays indexable.
+pub fn has_hidden_component(path: &Path) -> bool {
+    use std::path::Component;
+    path.components().any(|c| match c {
+        Component::Normal(s) => s.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
 /// Case-insensitive, separator-agnostic "path is at or under root" check.
 ///
 /// Both sides go through [`crate::cache::normalize_path_str`] (forward

@@ -242,6 +242,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — hidden-folder registrations refused: paths with a dot-prefixed component (`.tmpXXXX` scratch, `.opencode/worktrees`) get no index at either registration site (serve `POST /repos` + CLI `index add`, force override), matching the post-checkout hook's skip; linked worktrees at ordinary paths stay indexable.
+
 - **Pending** — scip-csharp helper work bounded: index runs, one-shot find-refs and resident spawns share one process-wide gate (`CSHARP_SCIP_CONCURRENCY`, default 1) and run one at a time per worktree root (worktrees of one repo stay parallel); an evicted resident has exited before its replacement spawns; a Files rebuild invalidates only the affected ref-cache keys.
 
 - **Pending** — leftover worktree shells self-heal: a directory reduced to nothing but its `.codesearch.db` (a removal stopped at the LMDB files the hub held) is unregistered, its shared LMDB envs released and the leftover deleted on the next reconcile pass, instead of locking `scip/data.mdb`/`lock.mdb` until serve restart.

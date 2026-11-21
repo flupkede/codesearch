@@ -16,6 +16,10 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.8.12]
 
+### Added
+
+- **Registering a path that contains a hidden (dot-prefixed) folder is refused at both registration sites** (the serve's `POST /repos` and the CLI's `index add`, with `force=true`/`--force` as the escape hatch). A hidden component anywhere in the path — `Temp/.tmpXXXX/wt` scratch checkouts, `.opencode/worktrees`, CI dot-folders — marks a throwaway tree: the post-checkout hook already skips these, and the registration sites now refuse them too, so a direct `index add` or POST can no longer index one. Linked worktrees at ordinary paths stay deliberately indexable: every worktree is its own branch's corpus (searched via its own alias or a worktree-expanding group); an earlier draft of this change refused those — inverted, and reverted before release.
+
 ### Fixed
 
 - **scip-csharp helper work is bounded per machine and per worktree.** Index runs, one-shot find-refs and resident spawns share one process-wide gate (`CSHARP_SCIP_CONCURRENCY` jobs, default 1) and run one at a time per worktree root, while separate worktrees of one repo still run in parallel; a resident workspace dropped by a rebuild has exited before its replacement spawns, and a Files rebuild invalidates only the ref-cache keys it affects instead of the whole cache.
