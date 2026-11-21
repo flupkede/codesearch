@@ -17,6 +17,7 @@
 //! | `CODESEARCH_EMBED_PAUSE_MS` | `0` | Pause between background embedding mini-batches |
 //! | `CODESEARCH_MIN_FREE_MB` | `0` (off) | Free-memory floor before a job may start |
 //! | `CODESEARCH_MAX_CHUNKS_PER_BATCH` | `0` (off) | Hard cap on chunks held per refresh batch |
+//! | `CODESEARCH_ONNX_ARENA` | off | ONNX arena allocator (never returns memory to the OS) |
 //!
 //! All values are read from the environment so a systemd unit or shell can set
 //! them without a config file. See the README section "Indexing limits" for
@@ -41,6 +42,8 @@ pub const EMBED_PAUSE_MS_ENV: &str = "CODESEARCH_EMBED_PAUSE_MS";
 pub const MIN_FREE_MB_ENV: &str = "CODESEARCH_MIN_FREE_MB";
 /// Hard cap on chunks held in memory per refresh batch (0 = disabled).
 pub const MAX_CHUNKS_PER_BATCH_ENV: &str = "CODESEARCH_MAX_CHUNKS_PER_BATCH";
+/// ONNX arena allocator for inference (1/true/on = on, 0/false/off = off).
+pub const ONNX_ARENA_ENV: &str = "CODESEARCH_ONNX_ARENA";
 
 /// Default for [`index_jobs`]: strictly one heavy repo job at a time.
 ///
@@ -53,6 +56,11 @@ pub const DEFAULT_INDEX_JOBS: usize = 1;
 
 const DEFAULT_EMBED_PAUSE_MS: u64 = 0;
 const DEFAULT_MIN_FREE_MB: u64 = 0;
+/// Default for [`onnx_arena`]: the arena OFF. ONNX Runtime's arena grows via
+/// `kNextPowerOfTwo` and never returns memory to the OS, so one indexing pass
+/// pins ~2 GB for the process lifetime — a permanent cost on an idle serve
+/// that outweighs the inference speed win.
+pub const DEFAULT_ONNX_ARENA: bool = false;
 /// Default bound on chunks held in memory per refresh batch. 0 would disable
 /// the cap, but that is how one 13k-chunk ImportData file pushed a whole
 /// build against MDB_MAP_FULL twice (serve log 10/11, survived on the final
@@ -106,6 +114,21 @@ pub fn min_free_mb() -> u64 {
 /// Hard cap on chunks held in memory per refresh batch (0 = disabled).
 pub fn max_chunks_per_batch() -> usize {
     env_parsed::<usize>(MAX_CHUNKS_PER_BATCH_ENV).unwrap_or(DEFAULT_MAX_CHUNKS_PER_BATCH)
+}
+
+/// Whether the ONNX session uses an arena allocator. `1`/`true`/`on` enable
+/// it, `0`/`false`/`off` disable it, anything else (including unset) falls
+/// back to [`DEFAULT_ONNX_ARENA`].
+pub fn onnx_arena() -> bool {
+    match env_parsed::<String>(ONNX_ARENA_ENV)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1" | "true" | "on" => true,
+        "0" | "false" | "off" => false,
+        _ => DEFAULT_ONNX_ARENA,
+    }
 }
 
 /// Available (reclaimable) system memory in MB, read fresh on each call.

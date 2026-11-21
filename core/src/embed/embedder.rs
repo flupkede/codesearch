@@ -352,9 +352,12 @@ impl FastEmbedder {
             );
         }
 
-        // Use CPU execution provider WITH arena allocator for speed.
-        // Arena allocator provides fast memory reuse during inference.
-        let cpu_ep = CPU::default().with_arena_allocator(true).build();
+        // The arena allocator speeds up inference but never returns its
+        // memory to the OS (~2 GB during indexing); opt back in with
+        // CODESEARCH_ONNX_ARENA=1. See `crate::limits`.
+        let cpu_ep = CPU::default()
+            .with_arena_allocator(crate::limits::onnx_arena())
+            .build();
 
         let options = TextInitOptions::new(model_type.to_fastembed_model())
             .with_show_download_progress(show_download_progress)

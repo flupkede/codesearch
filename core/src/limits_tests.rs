@@ -12,6 +12,7 @@ fn clear_env() -> EnvRestore {
         EMBED_PAUSE_MS_ENV,
         MIN_FREE_MB_ENV,
         MAX_CHUNKS_PER_BATCH_ENV,
+        ONNX_ARENA_ENV,
     ])
 }
 
@@ -34,6 +35,10 @@ fn defaults_are_conservative() {
          last MDB_MAP_FULL retry (serve log 10/11)"
     );
     assert_eq!(DEFAULT_MAX_CHUNKS_PER_BATCH, 4096);
+    assert!(
+        !onnx_arena() && !DEFAULT_ONNX_ARENA,
+        "the ONNX arena defaults OFF — it never returns memory to the OS"
+    );
 }
 
 /// The chunk cap must stay env-overridable: `0` re-disables it for a machine
@@ -88,6 +93,36 @@ fn invalid_values_fall_back() {
         max_chunks_per_batch(),
         DEFAULT_MAX_CHUNKS_PER_BATCH,
         "invalid values fall back to the default cap"
+    );
+}
+
+/// The arena toggle accepts the usual truthy/falsy spellings; unset or a
+/// garbage value falls back to the default so an inherited shell variable
+/// cannot silently flip memory behaviour.
+#[test]
+#[serial]
+fn onnx_arena_parses_on_off_and_falls_back() {
+    let _env = clear_env();
+    assert_eq!(
+        onnx_arena(),
+        DEFAULT_ONNX_ARENA,
+        "unset must fall back to the default"
+    );
+
+    for on in ["1", "true", "on"] {
+        let _set = EnvRestore::set(&[(ONNX_ARENA_ENV, on)]);
+        assert!(onnx_arena(), "'{on}' must enable the arena");
+    }
+    for off in ["0", "false", "off"] {
+        let _set = EnvRestore::set(&[(ONNX_ARENA_ENV, off)]);
+        assert!(!onnx_arena(), "'{off}' must disable the arena");
+    }
+
+    let _garbage = EnvRestore::set(&[(ONNX_ARENA_ENV, "maybe")]);
+    assert_eq!(
+        onnx_arena(),
+        DEFAULT_ONNX_ARENA,
+        "garbage values must fall back to the default"
     );
 }
 
