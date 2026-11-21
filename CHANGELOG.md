@@ -18,6 +18,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Added
 
+- **RAM-reduction knobs.** The ONNX arena allocator is off by default (opt back in with `CODESEARCH_ONNX_ARENA=1`); `serve` unloads embedding models idle longer than `CODESEARCH_EMBED_UNLOAD_IDLE_SECS` (default 1800 s, 0 = never); the FTS index compacts to a single segment once a commit leaves more than `CODESEARCH_FTS_MAX_SEGMENTS` behind (default 8, 0 = off); the FTS writer heap is configurable via `CODESEARCH_FTS_WRITER_MB` (default 50 MB, floor 15 MB).
+
 - **serve preloads resident C# workspaces for the most recently used repos.** After the startup symbol pass, up to `CODESEARCH_SCIP_MAX_RESIDENT` workspaces are loaded ahead of the first `find_impact` call; `CODESEARCH_SCIP_RESIDENT_PREWARM=0` disables it.
 
 ### Changed

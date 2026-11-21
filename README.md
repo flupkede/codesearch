@@ -762,6 +762,10 @@ them without editing anything:
 | `CODESEARCH_MAX_CHUNKS_PER_BATCH` | `0` (off) | Split a batch early once it reaches this many chunks (a few huge files can produce more memory than many small ones). |
 | `CODESEARCH_EMBED_PAUSE_MS` | `0` | Sleep this long between background embedding mini-batches (duty cycle). |
 | `CODESEARCH_MIN_FREE_MB` | `0` (off) | A job waits (bounded to 30 s, then proceeds with a warning) until this much memory is free. |
+| `CODESEARCH_ONNX_ARENA` | off | ONNX arena allocator for inference; `1`/`on` re-enables it (it never returns memory to the OS — ~2 GB while indexing). |
+| `CODESEARCH_EMBED_UNLOAD_IDLE_SECS` | `1800` (0 = never) | Idle time before `serve` unloads an embedding model; the next query reloads it. |
+| `CODESEARCH_FTS_WRITER_MB` | `50` (min 15) | FTS writer heap per thread; lowering it trades writer RAM for more, smaller segments. |
+| `CODESEARCH_FTS_MAX_SEGMENTS` | `8` (0 = off) | Segment count past which a commit compacts the FTS index down to one segment. |
 
 `codesearch serve` also accepts `--index-jobs`, `--embed-threads`,
 `--embed-pause-ms` and `--min-free-mb`, which set the corresponding variable

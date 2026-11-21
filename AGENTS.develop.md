@@ -182,7 +182,7 @@ TUI `i` overlay. The TUI discovery tick is config-only (zero HTTP).
 - **Never write separate `AGENTS_xxx.md` sibling files** unless explicitly requested. OpenCode reads `AGENTS.md` only. Out-of-repo planning goes to `C:\WorkArea\AI\codesearch\instructions\`.
 - **Root file hygiene (markdown)**: root markdown is allowlisted — `AGENTS.develop.md`, `README.md`, `README_CSharp.md`, `CHANGELOG.md`, `RELEASING.md` always; `AGENTS.md` and `CLAUDE.md` on **feature branches only** (branch-local, dropped at finalization — the pre-commit guard rejects them on `develop`/`master`). Anything else (diagnoses, plans, test scenarios, worklogs) goes into `.docs/` (gitignored, local-only). Enforced by the `pre-commit` root-md allowlist guard and the `agent-files-check` CI workflow.
 - **Path normalization**: all path comparisons must go through a single normalize utility. Windows UNC prefixes (`\\?\C:\`), backslash/forward-slash mismatches, and worktree `.git` file resolution have each caused subtle bugs in the past.
-- **ONNX arena allocator**: uses `kNextPowerOfTwo` growth, never returns memory to OS. ~2GB memory during indexing is a known limitation. No local fix available until upstream fastembed exposes `OrtArenaCfg`.
+- **ONNX arena allocator**: off by default (`CODESEARCH_ONNX_ARENA=1` re-enables it); when on it grows via `kNextPowerOfTwo` and never returns memory to the OS (~2 GB during indexing).
 - **Git worktrees**: `find_git_root` returns the worktree directory itself. Each worktree is a separate indexable repo. Groups can be used to search across worktrees of the same base repo.
 
 ## Runtime locations
