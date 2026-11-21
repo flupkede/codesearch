@@ -807,6 +807,10 @@ impl SymbolIndexer for TypeScriptSymbolIndexer {
     fn applicability_hint(&self) -> &'static str {
         "the scip-typescript adapter requires a top-level tsconfig.json (monorepo layouts are not resolved yet)"
     }
+
+    fn owns_symbol_key(&self, key: &str) -> bool {
+        super::symbol_key_scheme(key) == Some(crate::constants::SCIP_SCHEME_TYPESCRIPT)
+    }
 }
 
 #[cfg(test)]

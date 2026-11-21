@@ -28,6 +28,9 @@
 //! - Rebuilds `scip_simple_names` from all current `scip_symbols` entries.
 //! - Drops only the `scip_ref_cache` entries the changed files can affect
 //!   (see `stale_ref_cache_keys`); those resolve lazily on demand.
+//! - Applies the edit to the resident workspace in place before that commit,
+//!   evicting it instead when the helper cannot. Only paths `csharp_relevance`
+//!   accepts reach it; a change set with none runs no rebuild at all.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
@@ -44,6 +47,7 @@ use heed::Database;
 use serde::{Deserialize, Serialize};
 
 use super::helper_gate::{self, HelperPurpose};
+use super::resident::{UpdateOutcome, WorkspacePool};
 use super::scip_parse;
 use super::{ImpactQuery, KeyMatch, RebuildScope, RebuildSummary, SymbolIndexer, SymbolReference};
 
@@ -741,6 +745,35 @@ fn stale_ref_cache_keys(
     Ok(stale)
 }
 
+/// What the resident workspace can do with one changed path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Relevance {
+    /// Applied in place by the helper's `update`.
+    Send,
+    /// Project-graph file: only a workspace reload absorbs it.
+    ReloadDirectly,
+    /// Irrelevant to C# — the helper answers needs-reload for unknown
+    /// non-source paths, so it must never see these.
+    Ignore,
+}
+
+pub(crate) fn csharp_relevance(path: &Path) -> Relevance {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let has_suffix = |suffixes: &[&str]| suffixes.iter().any(|s| name.ends_with(s));
+    if has_suffix(crate::constants::CSHARP_RESIDENT_RELOAD_SUFFIXES)
+        || crate::constants::CSHARP_RESIDENT_RELOAD_FILES.contains(&name.as_str())
+    {
+        Relevance::ReloadDirectly
+    } else if has_suffix(crate::constants::CSHARP_RESIDENT_SEND_SUFFIXES) {
+        Relevance::Send
+    } else {
+        Relevance::Ignore
+    }
+}
+
 // ── CSharpSymbolIndexer ───────────────────────────────────────────
 
 /// C# adapter: locates the Roslyn helper, invokes it, parses SCIP, stores
@@ -751,6 +784,7 @@ pub struct CSharpSymbolIndexer {
     /// `Some(None)` = attempted, helper not found.
     /// `Some(Some(path))` = found at given path.
     helper_path: std::sync::Mutex<Option<Option<PathBuf>>>,
+    pool: &'static WorkspacePool,
 }
 
 impl Default for CSharpSymbolIndexer {
@@ -818,6 +852,15 @@ impl CSharpSymbolIndexer {
     pub fn new() -> Self {
         Self {
             helper_path: std::sync::Mutex::new(None),
+            pool: &super::resident::WORKSPACE_POOL,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pool(pool: &'static WorkspacePool) -> Self {
+        Self {
+            helper_path: std::sync::Mutex::new(None),
+            pool,
         }
     }
 
@@ -1077,6 +1120,66 @@ impl CSharpSymbolIndexer {
     /// guard.
     fn open_scip_env(&self, db_path: &Path) -> Result<Arc<TrackedEnv>> {
         crate::symbols::get_shared_scip_env(db_path)
+    }
+
+    /// Apply an incremental edit to the resident workspace for `solution`
+    /// in place; only C#-relevant paths reach it. A project-graph path evicts
+    /// without an update; every update outcome but applied or not-resident
+    /// evicts too.
+    fn refresh_resident(
+        &self,
+        solution: &Path,
+        repo_path: &Path,
+        changed: &[PathBuf],
+        deleted: &[PathBuf],
+    ) {
+        let absolute = |p: &PathBuf| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                repo_path.join(p)
+            }
+        };
+        let (mut send_changed, mut send_deleted) = (Vec::new(), Vec::new());
+        let mut reload_path = None;
+        for (paths, send) in [(changed, &mut send_changed), (deleted, &mut send_deleted)] {
+            for path in paths {
+                match csharp_relevance(path) {
+                    Relevance::Send => send.push(absolute(path)),
+                    Relevance::ReloadDirectly => {
+                        reload_path.get_or_insert(path);
+                    }
+                    Relevance::Ignore => {}
+                }
+            }
+        }
+        let timeout = super::resident::resident_update_timeout();
+        let reason = match reload_path {
+            Some(path) => format!("needs-reload: {}", path.display()),
+            None if send_changed.is_empty() && send_deleted.is_empty() => return,
+            None => match self
+                .pool
+                .update(solution, &send_changed, &send_deleted, timeout)
+            {
+                Ok(UpdateOutcome::Applied(n)) => {
+                    tracing::debug!(
+                        "resident workspace for '{}' updated in place ({} documents)",
+                        solution.display(),
+                        n
+                    );
+                    return;
+                }
+                Ok(UpdateOutcome::NotResident) => return,
+                Ok(UpdateOutcome::NeedsReload(reason)) => reason,
+                Err(e) => format!("{e:#}"),
+            },
+        };
+        tracing::info!(
+            "resident workspace for '{}' evicted: {}",
+            solution.display(),
+            reason
+        );
+        self.pool.evict(solution);
     }
 
     // ── Helper invocation ──────────────────────────────────────────
@@ -1499,65 +1602,65 @@ impl CSharpSymbolIndexer {
         // death, eviction race) — correctness never depends on residency.
         // Both paths carry completeness warnings; a partial answer must be
         // cached AS partial, never as a complete one.
-        let (lazy_refs, lazy_warnings): (Vec<StoredReference>, Vec<String>) =
-            match crate::symbols::resident::WORKSPACE_POOL
-                .find_refs(&helper, &solution, &repo_path, canonical)
-            {
-                Ok(resident) => (
-                    resident
-                        .references
-                        .into_iter()
-                        .map(|r| StoredReference {
-                            file: r.file,
-                            start_line: r.start_line,
-                            end_line: r.end_line,
-                            kind: r.kind,
-                        })
-                        .collect(),
-                    resident.warnings,
-                ),
-                Err(e) => {
-                    tracing::warn!(
-                        "resident helper unavailable ({e:#}); falling back to one-shot \
+        let (lazy_refs, lazy_warnings): (Vec<StoredReference>, Vec<String>) = match self
+            .pool
+            .find_refs(&helper, &solution, &repo_path, canonical)
+        {
+            Ok(resident) => (
+                resident
+                    .references
+                    .into_iter()
+                    .map(|r| StoredReference {
+                        file: r.file,
+                        start_line: r.start_line,
+                        end_line: r.end_line,
+                        kind: r.kind,
+                    })
+                    .collect(),
+                resident.warnings,
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    "resident helper unavailable ({e:#}); falling back to one-shot \
                          find-refs for '{}'",
-                        canonical
-                    );
-                    let one_shot = helper_gate::global()
-                        .acquire(HelperPurpose::FindRefs, &repo_path)
-                        .and_then(|_permit| {
-                            self.invoke_find_refs_helper(&helper, &solution, canonical)
-                        });
-                    match one_shot {
-                        Ok(pair) => pair,
-                        Err(e) if is_restore_pending(&e) => {
-                            // Restore in flight: answer from what LMDB
-                            // already has (definitions only), persist the
-                            // honesty warning on the per-symbol channel
-                            // find_impact already reads, and cache NOTHING —
-                            // the next lookup after restore finishes misses
-                            // the cache, resolves properly and replaces the
-                            // warning (issue #225).
-                            {
-                                let warnings_db =
-                                    open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)?
-                                        .ok_or_else(|| {
+                    canonical
+                );
+                let one_shot = helper_gate::global()
+                    .acquire(HelperPurpose::FindRefs, &repo_path)
+                    .and_then(|_permit| {
+                        self.invoke_find_refs_helper(&helper, &solution, canonical)
+                    });
+                match one_shot {
+                    Ok(pair) => pair,
+                    Err(e) if is_restore_pending(&e) => {
+                        // Restore in flight: answer from what LMDB
+                        // already has (definitions only), persist the
+                        // honesty warning on the per-symbol channel
+                        // find_impact already reads, and cache NOTHING —
+                        // the next lookup after restore finishes misses
+                        // the cache, resolves properly and replaces the
+                        // warning (issue #225).
+                        {
+                            let warnings_db =
+                                open_named_db::<Str, Bytes>(&env, SCIP_REF_WARNINGS_DB_NAME)?
+                                    .ok_or_else(|| {
                                         anyhow::anyhow!("scip_ref_warnings database not found")
                                     })?;
-                                let mut wtxn = env.write_txn()?;
-                                store_ref_warnings(
-                                    &warnings_db,
-                                    &mut wtxn,
-                                    canonical,
-                                    &[RESTORE_PENDING_REF_WARNING.to_string()],
-                                )?;
-                                wtxn.commit()?;
-                            }
-                            return Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect());
+                            let mut wtxn = env.write_txn()?;
+                            store_ref_warnings(
+                                &warnings_db,
+                                &mut wtxn,
+                                canonical,
+                                &[RESTORE_PENDING_REF_WARNING.to_string()],
+                            )?;
+                            wtxn.commit()?;
                         }
-                        Err(e) => return Err(e),
+                        return Ok(all_stored.into_iter().map(stored_to_symbol_ref).collect());
                     }
+                    Err(e) => return Err(e),
                 }
-            };
+            }
+        };
 
         // A real resolution proves assets are fresh again: lift the
         // index-level pending flag if this lookup had set it.
@@ -1625,6 +1728,19 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         db_path: &Path,
         scope: RebuildScope,
     ) -> Result<RebuildSummary> {
+        if let RebuildScope::Files { changed, deleted } = &scope {
+            let mut paths = changed.iter().chain(deleted).peekable();
+            if paths.peek().is_some() && paths.all(|p| csharp_relevance(p) == Relevance::Ignore) {
+                tracing::debug!("Files rebuild skipped: no change is relevant to C#");
+                return Ok(RebuildSummary {
+                    symbols_indexed: 0,
+                    references_stored: 0,
+                    duration_ms: 0,
+                    index_warnings: Vec::new(),
+                });
+            }
+        }
+
         let helper = self.detect_helper().ok_or_else(|| {
             anyhow::anyhow!(
                 "scip-csharp helper not found. Install the -with-csharp release variant \
@@ -1639,33 +1755,34 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         // `is_incremental` true → RebuildScope::Files → merge, not replace.
         // Also extract `deleted_for_cleanup`: paths absent from the new index that must
         // still be purged from LMDB (files deleted on disk since last rebuild).
-        let (solution, project, is_incremental, changed_files, deleted_for_cleanup) = match scope {
-            RebuildScope::Full => {
-                let sln = Self::find_solution(repo_path).ok_or_else(|| {
-                    anyhow::anyhow!("No .sln file found in {}", repo_path.display())
-                })?;
-                (sln, None, false, vec![], vec![])
-            }
-            RebuildScope::Project(csproj) => {
-                let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
-                (sln, Some(csproj), false, vec![], vec![])
-            }
-            RebuildScope::Files { changed, deleted } => {
-                if let Some(first_file) = changed.first() {
-                    let csproj = Self::find_csproj_for_file(repo_path, first_file)
-                        .unwrap_or_else(|| first_file.clone());
-                    let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
-                    // Watcher paths are absolute; LMDB keys are repo-relative.
-                    let deleted_norm: Vec<String> = deleted
-                        .iter()
-                        .map(|p| crate::cache::storage_key(p, repo_path))
-                        .collect();
-                    (sln, Some(csproj), true, changed, deleted_norm) // ← incremental merge
-                } else {
-                    bail!("RebuildScope::Files has no changed files");
+        let (solution, project, is_incremental, changed_files, deleted_files, deleted_for_cleanup) =
+            match scope {
+                RebuildScope::Full => {
+                    let sln = Self::find_solution(repo_path).ok_or_else(|| {
+                        anyhow::anyhow!("No .sln file found in {}", repo_path.display())
+                    })?;
+                    (sln, None, false, vec![], vec![], vec![])
                 }
-            }
-        };
+                RebuildScope::Project(csproj) => {
+                    let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
+                    (sln, Some(csproj), false, vec![], vec![], vec![])
+                }
+                RebuildScope::Files { changed, deleted } => {
+                    if let Some(first_file) = changed.first() {
+                        let csproj = Self::find_csproj_for_file(repo_path, first_file)
+                            .unwrap_or_else(|| first_file.clone());
+                        let sln = Self::find_solution(repo_path).unwrap_or_else(|| csproj.clone());
+                        // Watcher paths are absolute; LMDB keys are repo-relative.
+                        let deleted_norm: Vec<String> = deleted
+                            .iter()
+                            .map(|p| crate::cache::storage_key(p, repo_path))
+                            .collect();
+                        (sln, Some(csproj), true, changed, deleted, deleted_norm)
+                    } else {
+                        bail!("RebuildScope::Files has no changed files");
+                    }
+                }
+            };
 
         // Create temp file for SCIP output
         let temp_dir = std::env::temp_dir().join("codesearch-scip");
@@ -1790,6 +1907,12 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             .map(|p| crate::cache::storage_key(p, repo_path))
             .chain(deleted_for_cleanup.iter().cloned())
             .collect();
+
+        // Before the commit that drops stale ref-cache keys: a lookup missing
+        // the cache after it must not be answered from pre-edit text.
+        if is_incremental {
+            self.refresh_resident(&solution, repo_path, &changed_files, &deleted_files);
+        }
 
         // Open LMDB (all named DBs pre-created by open_scip_env)
         let env = self.open_scip_env(db_path)?;
@@ -2155,14 +2278,13 @@ impl SymbolIndexer for CSharpSymbolIndexer {
 
         wtxn.commit()?;
 
-        // A rebuild changes on-disk source; a resident Roslyn workspace for
-        // this solution (if any) was loaded before that change and would
-        // silently keep answering find_refs from stale content otherwise —
-        // this pool has no other tie to repo state. Evict unconditionally
-        // (full or incremental): the next find_refs respawns fresh. The
-        // ref-cache entries this rebuild kept are those the changed files
-        // cannot affect.
-        crate::symbols::resident::WORKSPACE_POOL.evict(&solution);
+        // A full or project rebuild (restore inputs included) may follow a
+        // change the resident workspace cannot absorb in place, and it would
+        // keep answering find_refs from stale content: evict it, the next
+        // find_refs respawns fresh. `Files` scopes were refreshed above.
+        if !is_incremental {
+            self.pool.evict(&solution);
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -2448,6 +2570,19 @@ impl SymbolIndexer for CSharpSymbolIndexer {
     fn applicability_hint(&self) -> &'static str {
         "the scip-csharp adapter requires a .sln file in the repository root"
     }
+
+    fn owns_symbol_key(&self, key: &str) -> bool {
+        super::symbol_key_scheme(key) == Some(crate::constants::SCIP_SCHEME_CSHARP)
+    }
+
+    fn prewarm_resident(&self, repo_path: &Path) -> Result<()> {
+        let helper = self
+            .detect_helper()
+            .context("scip-csharp helper not available")?;
+        let solution = Self::find_solution(repo_path)
+            .with_context(|| format!("no solution under {}", repo_path.display()))?;
+        self.pool.prewarm(&helper, &solution, repo_path)
+    }
 }
 
 /// True for the scip-csharp helper's own transient filtered solutions
@@ -2489,7 +2624,7 @@ fn fuzzy_symbol_match(query: &str, candidate: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -2932,6 +3067,7 @@ mod tests {
     /// other subcommand except `--version` appends its name to that file first.
     /// With `CS_FAKE_CONCURRENCY_DIR` set, `index` and `find-refs` run for 400 ms
     /// and append the number of such runs live at their start to `peak.log` there.
+    /// With `CS_FAKE_INDEX_LOG` set, every `index` run appends a line to that file.
     const FAKE_HELPER_SRC: &str = r##"fn main() {
     if std::env::var("CS_FAKE_HELPER_MODE").as_deref() == Ok("exit75") {
         std::process::exit(75);
@@ -2979,6 +3115,11 @@ mod tests {
         std::fs::remove_file(&mine).unwrap();
     }
     if sub == "index" {
+        if let Ok(log) = std::env::var("CS_FAKE_INDEX_LOG") {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+            writeln!(f, "index").unwrap();
+        }
         let flavour = std::env::var("CS_FAKE_INDEX").expect("index needs CS_FAKE_INDEX");
         let (docs, rows) = match std::env::var("CS_FAKE_EXTRA_KEY") {
             Ok(key) => (
@@ -3036,10 +3177,10 @@ mod tests {
         {"symbol": "csharp Ns . A#Run().", "file": "src/A.cs", "start_line": 1, "end_line": 1, "kind": "definition"},
         {"symbol": "csharp Ns . Gone#Away().", "file": "src/B.cs", "start_line": 9, "end_line": 9, "kind": "reference"}]"#;
 
-    const FAKE_REFERENCED: &str = "csharp Ns . A#Run().";
+    pub(crate) const FAKE_REFERENCED: &str = "csharp Ns . A#Run().";
     const FAKE_UNREFERENCED: &str = "csharp Ns . A#Idle().";
 
-    fn build_fake_csharp_helper(dir: &Path) -> PathBuf {
+    pub(crate) fn build_fake_csharp_helper(dir: &Path) -> PathBuf {
         let src_path = dir.join("fake_helper.rs");
         let src = format!(
             "{FAKE_HELPER_SRC}\nconst DOCS: &str = r#\"{FAKE_INDEX_DOCUMENTS}\"#;\n\
@@ -3244,7 +3385,7 @@ mod tests {
         }
     }
 
-    fn ref_cache_keys(db: &Path) -> Vec<String> {
+    pub(crate) fn ref_cache_keys(db: &Path) -> Vec<String> {
         table_keys(db, SCIP_REF_CACHE_DB_NAME)
     }
 

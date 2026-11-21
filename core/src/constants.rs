@@ -933,6 +933,14 @@ pub const LANG_CSHARP: &str = "csharp";
 /// Used as a key in `SymbolIndexerRegistry` lookups and TUI status maps.
 pub const LANG_TYPESCRIPT: &str = "typescript";
 
+/// Leading SCIP scheme token of every canonical C# symbol key
+/// (`csharp . . . Type#Member().`).
+pub const SCIP_SCHEME_CSHARP: &str = "csharp";
+
+/// Leading SCIP scheme token of every canonical TypeScript symbol key, as
+/// `scip-typescript` emits it (`scip-typescript npm pkg 1.0.0 ...`).
+pub const SCIP_SCHEME_TYPESCRIPT: &str = "scip-typescript";
+
 /// Environment variable override for the `scip-typescript` helper/CLI path.
 /// When unset, the indexer falls back to `npx scip-typescript`.
 pub const SCIP_TYPESCRIPT_HELPER_ENV: &str = "CODESEARCH_SCIP_TYPESCRIPT";
@@ -1064,6 +1072,13 @@ pub const FIND_IMPACT_BUDGET_SECS_ENV: &str = "CODESEARCH_FIND_IMPACT_BUDGET_SEC
 pub const DEFAULT_SCIP_MAX_RESIDENT_WORKSPACES: usize = 2;
 pub const SCIP_MAX_RESIDENT_WORKSPACES_ENV: &str = "CODESEARCH_SCIP_MAX_RESIDENT";
 
+/// Set to `0` to skip the phase-3 startup prewarm of resident workspaces.
+/// Default on: after the symbol wave, serve loads the Roslyn workspace of the
+/// most recently used C# repos (up to `CODESEARCH_SCIP_MAX_RESIDENT`) so the
+/// first `find_impact` after a restart is warm.
+pub const SCIP_RESIDENT_PREWARM_ENV: &str = "CODESEARCH_SCIP_RESIDENT_PREWARM";
+pub const DEFAULT_SCIP_RESIDENT_PREWARM: bool = true;
+
 /// Per-workspace managed-heap cap passed to the helper as
 /// `DOTNET_GCHeapHardLimit` (bytes; the env var is interpreted as hex by the
 /// .NET runtime, so the Rust side formats it without a prefix). A runaway
@@ -1077,6 +1092,43 @@ pub const SCIP_WORKSPACE_HEAP_CAP_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_HEAP_CA
 /// acceptable for an idle repo, which is exactly what the TTL measures.
 pub const DEFAULT_SCIP_WORKSPACE_IDLE_SECS: u64 = 3600;
 pub const SCIP_WORKSPACE_IDLE_SECS_ENV: &str = "CODESEARCH_SCIP_WORKSPACE_IDLE_SECS";
+
+/// Bound on one in-place resident workspace update after a `Files` rebuild
+/// (spawn-lock wait plus helper reply); on expiry the rebuild evicts instead.
+pub const SCIP_RESIDENT_UPDATE_TIMEOUT_SECS: u64 = 30;
+pub const SCIP_RESIDENT_UPDATE_TIMEOUT_SECS_ENV: &str =
+    "CODESEARCH_SCIP_RESIDENT_UPDATE_TIMEOUT_SECS";
+
+/// Poll interval while a resident update waits for the solution's spawn lock.
+pub const SCIP_RESIDENT_UPDATE_LOCK_POLL_MS: u64 = 10;
+
+/// Error prefix of a resident `update` reply whose edit needs a full
+/// workspace reload.
+pub const SCIP_SERVE_NEEDS_RELOAD_PREFIX: &str = "needs-reload";
+
+/// Lowercase file-name suffixes of changes the resident workspace applies in
+/// place through the helper's `update`.
+pub const CSHARP_RESIDENT_SEND_SUFFIXES: &[&str] = &[
+    ".cs",
+    ".razor",
+    ".cshtml",
+    ".editorconfig",
+    ".globalconfig",
+    ".resx",
+];
+
+/// Lowercase file-name suffixes of project-graph files; only a workspace
+/// reload absorbs a change to one.
+pub const CSHARP_RESIDENT_RELOAD_SUFFIXES: &[&str] =
+    &[".csproj", ".sln", ".slnx", ".props", ".targets"];
+
+/// Lowercase whole file names of project-graph files, matched against the
+/// lowercased file name.
+pub const CSHARP_RESIDENT_RELOAD_FILES: &[&str] = &[
+    "directory.packages.props",
+    "packages.lock.json",
+    "global.json",
+];
 
 /// How long (seconds) a budget-overrun `find_impact` lookup stays tracked
 /// for retry observation. Must comfortably exceed the slowest legitimate

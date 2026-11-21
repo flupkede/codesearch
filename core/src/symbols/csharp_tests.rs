@@ -1,15 +1,21 @@
 //! Helper stderr routing tests (`csharp.rs`). Sibling `_tests.rs` file
 //! per repo convention.
 
+use super::csharp::tests::{build_fake_csharp_helper, ref_cache_keys, FAKE_REFERENCED};
 use super::csharp::{
-    drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending,
+    csharp_relevance, drain_pipe_to_tracing, is_helper_warning_line, is_restore_pending,
     is_transient_filtered_solution, kill_live_helper_children, restore_pending_flag_clear,
-    restore_pending_flag_set, CSharpSymbolIndexer, LiveHelperChild, RestorePendingError,
+    restore_pending_flag_set, CSharpSymbolIndexer, LiveHelperChild, Relevance, RestorePendingError,
     HELPER_RESTORE_PENDING_EXIT,
 };
+use super::helper_gate::HelperGate;
+use super::resident::{ClientLike, ResidentRefs, UpdateOutcome, WorkspacePool};
+use super::{RebuildScope, SymbolIndexer};
 use std::io::Cursor;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn drained(input: &[u8]) -> Vec<String> {
     let out: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -783,4 +789,331 @@ fn transient_filtered_solution_predicate_is_precise() {
     assert!(!is("a-filtered-short.sln"));
     assert!(!is(&format!("a-filtered-{}.sln", "z".repeat(32))));
     assert!(!is("no-marker.sln"));
+}
+
+#[derive(Clone, Copy)]
+enum Reply {
+    Applied,
+    NeedsReload,
+    Fail,
+    /// Blocks until killed, like a helper that stopped answering.
+    Hang,
+}
+
+/// What the resident saw: per `update`, the changed paths and the ref-cache
+/// keys committed at that moment.
+#[derive(Default)]
+struct Trace {
+    updates: Mutex<Vec<(Vec<PathBuf>, Vec<String>)>>,
+    /// Per `update`, the deleted paths.
+    deletions: Mutex<Vec<Vec<PathBuf>>>,
+    spawns: AtomicUsize,
+    kills: AtomicUsize,
+}
+
+struct TraceClient {
+    reply: Reply,
+    db: PathBuf,
+    trace: Arc<Trace>,
+    killed: AtomicBool,
+}
+
+impl ClientLike for TraceClient {
+    fn update(&self, changed: &[PathBuf], deleted: &[PathBuf]) -> anyhow::Result<UpdateOutcome> {
+        self.trace.deletions.lock().unwrap().push(deleted.to_vec());
+        let committed = ref_cache_keys(&self.db);
+        self.trace
+            .updates
+            .lock()
+            .unwrap()
+            .push((changed.to_vec(), committed));
+        match self.reply {
+            Reply::Applied => Ok(UpdateOutcome::Applied(changed.len())),
+            Reply::NeedsReload => Ok(UpdateOutcome::NeedsReload(
+                "needs-reload: src/New.cs".to_string(),
+            )),
+            Reply::Fail => anyhow::bail!("helper update crashed"),
+            Reply::Hang => {
+                while !self.killed.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                anyhow::bail!("killed mid-update")
+            }
+        }
+    }
+
+    fn find_refs(&self, _symbol: &str) -> anyhow::Result<ResidentRefs> {
+        Ok(ResidentRefs::default())
+    }
+
+    fn kill(&self) {
+        if !self.killed.swap(true, Ordering::SeqCst) {
+            self.trace.kills.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+fn trace_pool(reply: Reply, db: PathBuf, trace: Arc<Trace>) -> &'static WorkspacePool {
+    let spawn = Box::new(
+        move |_: &Path, _: &Path, _: u64| -> anyhow::Result<Arc<dyn ClientLike>> {
+            trace.spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(TraceClient {
+                reply,
+                db: db.clone(),
+                trace: Arc::clone(&trace),
+                killed: AtomicBool::new(false),
+            }))
+        },
+    );
+    let gate = Arc::new(HelperGate::new(1));
+    Box::leak(Box::new(WorkspacePool::new(
+        2,
+        Duration::from_secs(600),
+        1,
+        spawn,
+        gate,
+    )))
+}
+
+/// A `Files` rebuild applies the edit to the resident workspace before the
+/// commit that drops the stale ref-cache key, and evicts it only when that
+/// update fails; a full rebuild always evicts.
+#[test]
+#[serial_test::serial]
+fn files_rebuild_updates_the_resident_before_the_cache_commit_and_evicts_only_on_failure() {
+    // (case, resident reply, full scope, killed)
+    let cases: &[(&str, Reply, bool, usize)] = &[
+        ("applied", Reply::Applied, false, 0),
+        ("needs reload", Reply::NeedsReload, false, 1),
+        ("helper error", Reply::Fail, false, 1),
+        ("no reply in time", Reply::Hang, false, 1),
+        ("full scope", Reply::Applied, true, 1),
+    ];
+    let helper_home = tempfile::TempDir::new().unwrap();
+    let helper = build_fake_csharp_helper(helper_home.path());
+    let _env = crate::testing::EnvRestore::set(&[
+        (
+            crate::constants::SCIP_CSHARP_HELPER_ENV,
+            helper.to_string_lossy().as_ref(),
+        ),
+        ("CS_FAKE_INDEX", "2.1"),
+        (crate::constants::SCIP_RESIDENT_UPDATE_TIMEOUT_SECS_ENV, "1"),
+    ]);
+    for (case, reply, full, kills) in cases {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, db) = (dir.path(), dir.path().join("db"));
+        let sln = root.join("FakeSolution.sln");
+        std::fs::write(&sln, "").unwrap();
+        let trace = Arc::new(Trace::default());
+        let pool = trace_pool(*reply, db.clone(), Arc::clone(&trace));
+        let indexer = CSharpSymbolIndexer::with_pool(pool);
+        indexer.rebuild(root, &db, RebuildScope::Full).unwrap();
+        pool.find_refs(&helper, &sln, root, "Sym").unwrap();
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let edited = root.join("src/C.cs");
+        std::fs::write(&edited, "class Unrelated { void Other() { } }").unwrap();
+        let scope = if *full {
+            RebuildScope::Full
+        } else {
+            RebuildScope::Files {
+                changed: vec![edited.clone()],
+                deleted: vec![],
+            }
+        };
+        indexer.rebuild(root, &db, scope).unwrap();
+
+        let updates = trace.updates.lock().unwrap().clone();
+        if *full {
+            assert!(updates.is_empty(), "{case}: {updates:?}");
+        } else {
+            let [(changed, committed)] = updates.as_slice() else {
+                panic!("{case}: expected one update, got {updates:?}");
+            };
+            assert_eq!(changed, &vec![edited.clone()], "{case}");
+            assert!(
+                committed.iter().any(|k| k == FAKE_REFERENCED),
+                "{case}: update ran after the ref-cache commit: {committed:?}"
+            );
+            assert!(
+                !ref_cache_keys(&db).iter().any(|k| k == FAKE_REFERENCED),
+                "{case}: the edit must invalidate the referencing key"
+            );
+        }
+        assert_eq!(trace.kills.load(Ordering::SeqCst), *kills, "{case}: kills");
+        pool.find_refs(&helper, &sln, root, "Sym").unwrap();
+        assert_eq!(
+            trace.spawns.load(Ordering::SeqCst),
+            1 + kills,
+            "{case}: respawns only after an eviction"
+        );
+    }
+}
+
+/// Paths the resident cannot use never reach it: non-C# files are dropped
+/// (an all-ignored change set does not even run a symbol rebuild),
+/// project-graph files evict it without an update, the rest is forwarded.
+#[test]
+#[serial_test::serial]
+fn files_rebuild_forwards_only_csharp_relevant_paths_to_the_resident() {
+    type Forwarded = Option<(&'static [&'static str], &'static [&'static str])>;
+    // (case, changed, deleted, forwarded to update, kills, index helper runs)
+    let cases: &[(&str, &[&str], &[&str], Forwarded, usize, usize)] = &[
+        (
+            "source beside documents",
+            &["src/X.cs", "AGENTS.md", "README.md", "notes.txt"],
+            &[],
+            Some((&["src/X.cs"], &[])),
+            0,
+            1,
+        ),
+        (
+            "documents only",
+            &["AGENTS.md", "README.md"],
+            &[],
+            None,
+            0,
+            0,
+        ),
+        (
+            "documents changed and deleted",
+            &["notes.txt"],
+            &["old.md"],
+            None,
+            0,
+            0,
+        ),
+        (
+            "razor",
+            &["Pages/Index.razor"],
+            &[],
+            Some((&["Pages/Index.razor"], &[])),
+            0,
+            1,
+        ),
+        ("project file", &["App.csproj"], &[], None, 1, 1),
+        (
+            "project file beside source",
+            &["src/X.cs", "App.csproj"],
+            &[],
+            None,
+            1,
+            1,
+        ),
+        (
+            "deleted source beside deleted document",
+            &["src/X.cs"],
+            &["src/Old.cs", "old.md"],
+            Some((&["src/X.cs"], &["src/Old.cs"])),
+            0,
+            1,
+        ),
+    ];
+    let helper_home = tempfile::TempDir::new().unwrap();
+    let helper = build_fake_csharp_helper(helper_home.path());
+    let index_log = helper_home.path().join("index.log");
+    let index_runs = || std::fs::read_to_string(&index_log).map_or(0, |log| log.lines().count());
+    let _env = crate::testing::EnvRestore::set(&[
+        (
+            crate::constants::SCIP_CSHARP_HELPER_ENV,
+            helper.to_string_lossy().as_ref(),
+        ),
+        ("CS_FAKE_INDEX", "2.1"),
+        ("CS_FAKE_INDEX_LOG", index_log.to_string_lossy().as_ref()),
+        (crate::constants::SCIP_RESIDENT_UPDATE_TIMEOUT_SECS_ENV, "1"),
+    ]);
+    let mut problems = Vec::new();
+    for (case, changed, deleted, forwarded, kills, runs) in cases {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, db) = (dir.path(), dir.path().join("db"));
+        let sln = root.join("FakeSolution.sln");
+        std::fs::write(&sln, "").unwrap();
+        let trace = Arc::new(Trace::default());
+        let pool = trace_pool(Reply::Applied, db.clone(), Arc::clone(&trace));
+        let indexer = CSharpSymbolIndexer::with_pool(pool);
+        indexer.rebuild(root, &db, RebuildScope::Full).unwrap();
+        pool.find_refs(&helper, &sln, root, "Sym").unwrap();
+
+        let absolute =
+            |names: &[&str]| -> Vec<PathBuf> { names.iter().map(|n| root.join(n)).collect() };
+        for path in absolute(changed) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "class Unrelated { void Other() { } }").unwrap();
+        }
+        let (runs_before, cache_before) = (index_runs(), ref_cache_keys(&db));
+        let scope = RebuildScope::Files {
+            changed: absolute(changed),
+            deleted: absolute(deleted),
+        };
+        indexer.rebuild(root, &db, scope).unwrap();
+
+        let received: Vec<(Vec<PathBuf>, Vec<PathBuf>)> = trace
+            .updates
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(changed, _)| changed.clone())
+            .zip(trace.deletions.lock().unwrap().iter().cloned())
+            .collect();
+        let expected: Vec<(Vec<PathBuf>, Vec<PathBuf>)> = forwarded
+            .iter()
+            .map(|(changed, deleted)| (absolute(changed), absolute(deleted)))
+            .collect();
+        if received != expected {
+            problems.push(format!(
+                "{case}: update received {received:?}, expected {expected:?}"
+            ));
+        }
+        let killed = trace.kills.load(Ordering::SeqCst);
+        if killed != *kills {
+            problems.push(format!("{case}: kills {killed}, expected {kills}"));
+        }
+        let ran = index_runs() - runs_before;
+        if ran != *runs {
+            problems.push(format!("{case}: index helper runs {ran}, expected {runs}"));
+        }
+        if *runs == 0 && ref_cache_keys(&db) != cache_before {
+            problems.push(format!("{case}: the ref-cache was written"));
+        }
+        pool.find_refs(&helper, &sln, root, "Sym").unwrap();
+        let spawned = trace.spawns.load(Ordering::SeqCst);
+        if spawned != 1 + kills {
+            problems.push(format!("{case}: spawns {spawned}, expected {}", 1 + kills));
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+#[test]
+fn csharp_relevance_classifies_by_file_name_suffix() {
+    use Relevance::{Ignore, ReloadDirectly, Send};
+    let cases: &[(&str, Relevance)] = &[
+        ("src/X.cs", Send),
+        ("src/X.CS", Send),
+        ("Pages/Index.razor", Send),
+        ("Views/Home.cshtml", Send),
+        (".editorconfig", Send),
+        ("src/Sub/.editorconfig", Send),
+        (".globalconfig", Send),
+        ("Strings.resx", Send),
+        ("App.csproj", ReloadDirectly),
+        ("App.sln", ReloadDirectly),
+        ("App.slnx", ReloadDirectly),
+        ("Directory.Packages.props", ReloadDirectly),
+        ("Directory.Build.targets", ReloadDirectly),
+        ("packages.lock.json", ReloadDirectly),
+        ("sub/global.json", ReloadDirectly),
+        ("AGENTS.md", Ignore),
+        ("README.md", Ignore),
+        ("notes.txt", Ignore),
+        ("appsettings.json", Ignore),
+        ("package.json", Ignore),
+        ("NuGet.config", Ignore),
+        ("data.csv", Ignore),
+        ("my.global.json", Ignore),
+        ("X.cs.bak", Ignore),
+    ];
+    for (path, expected) in cases {
+        assert_eq!(csharp_relevance(Path::new(path)), *expected, "{path}");
+    }
 }
