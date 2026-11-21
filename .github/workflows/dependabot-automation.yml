@@ -9,9 +9,17 @@
 #     approval lands. Enable "Allow auto-merge" in repo settings; major bumps
 #     deliberately still wait for a human.
 #
-# pull_request_target (not pull_request) so the label and auto-merge flag land
-# even when the PR itself would change workflows; safe here because this
-# workflow never checks out the PR's code.
+# pull_request_target (NOT pull_request): dependabot PRs get a read-only
+# GITHUB_TOKEN under pull_request (GitHub treats dependabot PRs as fork PRs),
+# so label + auto-merge would 403 there. pull_request_target also keeps running
+# develop's copy of this file even when the PR itself changes workflows; safe
+# here because the job never checks out the PR's code.
+#
+# ⚠️ Delivery gotcha: pull_request_target only fires while this file exists on
+# the DEFAULT branch (master), not merely on the PR base (develop). Between
+# #380 landing on develop (2026-11-11) and release v1.8.11 (2026-11-19) it
+# silently did nothing — why PR #398 arrived unlabeled, without auto-merge,
+# and was merged by hand.
 name: dependabot-automation
 
 on:
