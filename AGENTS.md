@@ -312,12 +312,14 @@ RAM reduction (todo #300). Branch `features/ram-reduction` cut off develop; the 
 independent env-gated changes, knobs read via `core/src/limits.rs` (`env_parsed`, `*_ENV`,
 `DEFAULT_*` consts).
 
-- **Step 0 baseline:** serve (PID 31712, v1.8.11) idle commit = 2,682,933,248 B. Largest repo =
-  BOIN.Aprimo (db 3.6 GB) — reindex --force peak sampled in the background, numbers in the run
-  report. The running serve keeps the old binary (restarting it is an operator step — it hosts the
-  agent tooling), so the after-measure is a standalone A/B: same content indexed by the old and the
+- **Step 0 baseline:** serve (PID 31712, v1.8.11) idle commit = 2,682,933,248 B. Largest repo
+  (db 3.6 GB) — reindex --force peak sampled in the background, numbers in the run report. The
+  running serve keeps the old binary (restarting it is an operator step — it hosts the agent
+  tooling), so the after-measure is a standalone A/B: same content indexed by the old and the
   new binary, comparing peak commit size and resulting `fts/*.store` count. Deployment via
-  `..\copy-to-common.ps1` needs serve stopped and is left to the operator.
+  `..\copy-to-common.ps1` needs serve stopped and is left to the operator. **Outcome:** peak
+  10.94 GB (old behavior) vs 9.55 GB (new defaults) = ~1.39 GB saved at indexing peak; content
+  identical, fresh index leaves 2 segments in both modes.
 - **Step 1:** ONNX arena toggle — `CODESEARCH_ONNX_ARENA` (default off) in `FastEmbedder::init`.
 - **Step 2:** idle model unload — `EmbeddingServicePool::unload_idle` + reaper call; env
   `CODESEARCH_EMBED_UNLOAD_IDLE_SECS` (default 1800, 0 = never).
