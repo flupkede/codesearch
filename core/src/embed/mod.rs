@@ -23,6 +23,7 @@ pub use onnx_runtime::ensure_onnx_runtime;
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub fn is_model_in_cache(model: impl Into<EmbeddingModel>) -> bool {
     match model.into() {
@@ -383,13 +384,19 @@ pub fn embed_query_bounded(service: Arc<Mutex<EmbeddingService>>, query: &str) -
 /// do not serialise on one global lock.
 #[derive(Default)]
 pub struct EmbeddingServicePool {
-    services: Mutex<HashMap<EmbeddingModel, Arc<Mutex<EmbeddingService>>>>,
+    services: Mutex<HashMap<EmbeddingModel, PoolEntry>>,
     /// Per-model init locks. The `services` map lock is only ever held for a
     /// lookup — loading a model runs under the per-model init lock, so a slow
     /// (or wedged) load of one model cannot block lookups or loads of any
     /// other model.
     init_locks: Mutex<HashMap<EmbeddingModel, Arc<Mutex<()>>>>,
     cache_dir: Option<std::path::PathBuf>,
+}
+
+/// One loaded model in the pool, with the recency stamp the idle reaper uses.
+struct PoolEntry {
+    service: Arc<Mutex<EmbeddingService>>,
+    last_used: Instant,
 }
 
 impl EmbeddingServicePool {
@@ -410,7 +417,10 @@ impl EmbeddingServicePool {
         &self,
         model: impl Into<EmbeddingModel>,
     ) -> Option<Arc<Mutex<EmbeddingService>>> {
-        self.services.lock().ok()?.get(&model.into()).cloned()
+        let mut guard = self.services.lock().ok()?;
+        let entry = guard.get_mut(&model.into())?;
+        entry.last_used = Instant::now();
+        Some(Arc::clone(&entry.service))
     }
 
     /// Return the service for `model`, loading its ONNX model on first use.
@@ -445,8 +455,53 @@ impl EmbeddingServicePool {
             .services
             .lock()
             .map_err(|e| anyhow::anyhow!("Embedding service pool mutex poisoned: {e}"))?;
-        guard.insert(model, arc.clone());
+        guard.insert(
+            model,
+            PoolEntry {
+                service: arc.clone(),
+                last_used: Instant::now(),
+            },
+        );
         Ok(arc)
+    }
+
+    /// Unload models idle for at least `max_idle` that no caller still holds.
+    ///
+    /// Returns the removed models (for logging). An entry qualifies only when
+    /// its service `Arc` has no outstanding clones — a model mid-query stays
+    /// resident. The service is dropped only after the `services` lock is
+    /// released: dropping an ONNX session can take seconds and must not block
+    /// lookups. `max_idle == 0` disables unloading. The next `get()` for an
+    /// unloaded model simply loads a fresh service.
+    pub fn unload_idle(&self, max_idle: Duration) -> Vec<EmbeddingModel> {
+        if max_idle.is_zero() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let mut evicted: Vec<(EmbeddingModel, Arc<Mutex<EmbeddingService>>)> = Vec::new();
+        {
+            let mut guard = self
+                .services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.retain(|model, entry| {
+                if now.duration_since(entry.last_used) >= max_idle
+                    && Arc::strong_count(&entry.service) == 1
+                {
+                    evicted.push((*model, Arc::clone(&entry.service)));
+                    return false;
+                }
+                true
+            });
+        }
+        // Last references dropped outside the lock (see the doc comment).
+        evicted
+            .into_iter()
+            .map(|(model, service)| {
+                drop(service);
+                model
+            })
+            .collect()
     }
 
     /// Load `model` off the async critical path, bounded in time.
@@ -605,6 +660,122 @@ mod tests {
         assert!(
             pool.get_if_cached(model).is_some(),
             "get must publish the loaded service for later no-load lookups"
+        );
+    }
+
+    // ---- idle-unload tests ----
+    //
+    // Pool lifecycle tests need only the Arc/Mutex shape of a service, never
+    // inference, so entries are injected through the pool map with a shell
+    // service instead of loading ONNX.
+
+    struct ShellEmbedder;
+
+    impl Embedder for ShellEmbedder {
+        fn embed_documents(&mut self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            Ok(Vec::new())
+        }
+        fn embed_queries(&mut self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            Ok(Vec::new())
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+        fn model_name(&self) -> &str {
+            "shell"
+        }
+        fn local_model(&self) -> Option<ModelType> {
+            None
+        }
+    }
+
+    /// An entry whose recency stamp sits `idle` in the past.
+    fn shell_entry(model: EmbeddingModel, idle: Duration) -> PoolEntry {
+        let embedder: Box<dyn Embedder> = Box::new(ShellEmbedder);
+        PoolEntry {
+            service: Arc::new(Mutex::new(EmbeddingService {
+                cached_embedder: CachedBatchEmbedder::with_memory_limit(
+                    BatchEmbedder::new(Arc::new(Mutex::new(embedder))),
+                    1,
+                ),
+                model_type: model,
+                query_cache: QueryCache::new(),
+                persistent_cache: None,
+            })),
+            last_used: Instant::now()
+                .checked_sub(idle)
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    /// idle + unreferenced → removed; a held Arc clone keeps the entry even
+    /// past the idle window; 0 disables unloading entirely.
+    #[test]
+    fn unload_idle_removes_only_idle_unreferenced_entries() {
+        let pool = EmbeddingServicePool::new(None);
+        let model = EmbeddingModel::from(ModelType::default());
+        let idle = Duration::from_secs(3600);
+        let age = |pool: &EmbeddingServicePool| {
+            pool.services
+                .lock()
+                .unwrap()
+                .get_mut(&model)
+                .unwrap()
+                .last_used = Instant::now()
+                .checked_sub(idle)
+                .unwrap_or_else(Instant::now);
+        };
+        pool.services
+            .lock()
+            .unwrap()
+            .insert(model, shell_entry(model, idle));
+
+        let held = pool.get_if_cached(model).expect("entry present");
+        assert!(
+            pool.unload_idle(idle).is_empty(),
+            "a service with a live clone must stay resident"
+        );
+
+        drop(held);
+        // The lookup above restarted the idle clock; re-age the entry.
+        age(&pool);
+        assert_eq!(
+            pool.unload_idle(idle),
+            vec![model],
+            "idle + unreferenced must be removed and reported"
+        );
+        assert!(pool.get_if_cached(model).is_none());
+
+        // 0 = never.
+        pool.services
+            .lock()
+            .unwrap()
+            .insert(model, shell_entry(model, idle));
+        assert!(
+            pool.unload_idle(Duration::ZERO).is_empty(),
+            "max_idle 0 must disable unloading"
+        );
+    }
+
+    /// After an unload, `get()` must load a FRESH service — not resurrect a
+    /// stale handle; `Arc` identity is the directly observable contract.
+    #[test]
+    #[ignore] // Requires the default model in the local models cache
+    fn get_after_unload_loads_a_fresh_service() {
+        let pool = EmbeddingServicePool::new(None);
+        let model = ModelType::default();
+        let first = pool.get(model).expect("model load");
+        let first_addr = Arc::as_ptr(&first);
+        std::thread::sleep(Duration::from_millis(1100));
+        drop(first);
+        let removed = pool.unload_idle(Duration::from_secs(1));
+        assert_eq!(removed.len(), 1, "the idle service must be unloaded");
+        assert!(pool.get_if_cached(model).is_none(), "pool must forget it");
+        let second = pool.get(model).expect("fresh load after unload");
+        assert_ne!(
+            first_addr,
+            Arc::as_ptr(&second),
+            "get() after unload must build a new service instance"
         );
     }
 

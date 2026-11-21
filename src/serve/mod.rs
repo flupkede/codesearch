@@ -8146,6 +8146,17 @@ pub async fn run_serve(
                         let evicted = reaper_state.evict_idle_repos();
                         reaper_state.sweep_index_tasks();
                         reaper_state.spawn_auto_compacts(&evicted).await;
+                        // Free ONNX sessions no query has touched lately; the
+                        // next query for an unloaded model reloads on demand.
+                        let unloaded = reaper_state
+                            .embedding_pool()
+                            .unload_idle(crate::limits::embed_unload_idle());
+                        for model in unloaded {
+                            info!(
+                                "🧠 Unloaded idle embedding model {model:?} \
+                                 (CODESEARCH_EMBED_UNLOAD_IDLE_SECS)"
+                            );
+                        }
                         // Persist last-use times (unix-ms sidecar) so the next
                         // boot's phase-1 warmup orders most-recently-used first.
                         reaper_state.persist_access_times();

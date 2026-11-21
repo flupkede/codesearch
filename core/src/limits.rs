@@ -18,6 +18,7 @@
 //! | `CODESEARCH_MIN_FREE_MB` | `0` (off) | Free-memory floor before a job may start |
 //! | `CODESEARCH_MAX_CHUNKS_PER_BATCH` | `0` (off) | Hard cap on chunks held per refresh batch |
 //! | `CODESEARCH_ONNX_ARENA` | off | ONNX arena allocator (never returns memory to the OS) |
+//! | `CODESEARCH_EMBED_UNLOAD_IDLE_SECS` | `1800` (0 = never) | Idle time before an embedding model is unloaded |
 //!
 //! All values are read from the environment so a systemd unit or shell can set
 //! them without a config file. See the README section "Indexing limits" for
@@ -44,6 +45,9 @@ pub const MIN_FREE_MB_ENV: &str = "CODESEARCH_MIN_FREE_MB";
 pub const MAX_CHUNKS_PER_BATCH_ENV: &str = "CODESEARCH_MAX_CHUNKS_PER_BATCH";
 /// ONNX arena allocator for inference (1/true/on = on, 0/false/off = off).
 pub const ONNX_ARENA_ENV: &str = "CODESEARCH_ONNX_ARENA";
+/// Seconds an embedding model may sit unused before the reaper unloads it
+/// (0 = never unload).
+pub const EMBED_UNLOAD_IDLE_SECS_ENV: &str = "CODESEARCH_EMBED_UNLOAD_IDLE_SECS";
 
 /// Default for [`index_jobs`]: strictly one heavy repo job at a time.
 ///
@@ -61,6 +65,10 @@ const DEFAULT_MIN_FREE_MB: u64 = 0;
 /// pins ~2 GB for the process lifetime — a permanent cost on an idle serve
 /// that outweighs the inference speed win.
 pub const DEFAULT_ONNX_ARENA: bool = false;
+/// Default for [`embed_unload_idle`]: unload a model after 30 idle minutes.
+/// An ONNX session holds hundreds of MB; without this a serve that touched
+/// several models keeps them all resident forever.
+pub const DEFAULT_EMBED_UNLOAD_IDLE_SECS: u64 = 1800;
 /// Default bound on chunks held in memory per refresh batch. 0 would disable
 /// the cap, but that is how one 13k-chunk ImportData file pushed a whole
 /// build against MDB_MAP_FULL twice (serve log 10/11, survived on the final
@@ -129,6 +137,14 @@ pub fn onnx_arena() -> bool {
         "0" | "false" | "off" => false,
         _ => DEFAULT_ONNX_ARENA,
     }
+}
+
+/// How long an embedding model may sit unused before the idle reaper unloads
+/// it (0 = never). See [`crate::embed::EmbeddingServicePool::unload_idle`].
+pub fn embed_unload_idle() -> Duration {
+    Duration::from_secs(
+        env_parsed::<u64>(EMBED_UNLOAD_IDLE_SECS_ENV).unwrap_or(DEFAULT_EMBED_UNLOAD_IDLE_SECS),
+    )
 }
 
 /// Available (reclaimable) system memory in MB, read fresh on each call.

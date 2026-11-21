@@ -13,6 +13,7 @@ fn clear_env() -> EnvRestore {
         MIN_FREE_MB_ENV,
         MAX_CHUNKS_PER_BATCH_ENV,
         ONNX_ARENA_ENV,
+        EMBED_UNLOAD_IDLE_SECS_ENV,
     ])
 }
 
@@ -39,6 +40,12 @@ fn defaults_are_conservative() {
         !onnx_arena() && !DEFAULT_ONNX_ARENA,
         "the ONNX arena defaults OFF — it never returns memory to the OS"
     );
+    assert_eq!(
+        embed_unload_idle(),
+        Duration::from_secs(DEFAULT_EMBED_UNLOAD_IDLE_SECS),
+        "model unload defaults to 30 idle minutes"
+    );
+    assert_eq!(DEFAULT_EMBED_UNLOAD_IDLE_SECS, 1800);
 }
 
 /// The chunk cap must stay env-overridable: `0` re-disables it for a machine
@@ -68,6 +75,12 @@ fn env_overrides_parse() {
     assert_eq!(embed_pause(), Duration::from_millis(25));
     assert_eq!(min_free_mb(), 4096);
     assert_eq!(max_chunks_per_batch(), 5000);
+    let _never = EnvRestore::set(&[(EMBED_UNLOAD_IDLE_SECS_ENV, "0")]);
+    assert_eq!(
+        embed_unload_idle(),
+        Duration::ZERO,
+        "0 must disable model unloading"
+    );
 }
 
 #[test]
