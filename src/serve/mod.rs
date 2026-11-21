@@ -6480,6 +6480,32 @@ async fn add_repo_handler(
         );
     }
 
+    // Hidden-path guard: a path with a dot-prefixed component (a scratch
+    // worktree like `Temp/.tmpXXXX/wt`, an agent's `.opencode/worktrees`
+    // checkout) is throwaway. The post-checkout hook already skips these;
+    // this closes the direct-registration path. Ordered after the temp guard
+    // and before the duplicate check, so a hidden path refuses with its own
+    // reason instead of the alias conflict.
+    if !body.force.unwrap_or(false)
+        && crate::db_discovery::repos::has_hidden_component(&canonical_path)
+    {
+        warn!(
+            "Rejected repo registration with a hidden path component: {} (pass force=true to override)",
+            canonical_path.display()
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::response::Json(json!({
+                "error": format!(
+                    "Refusing to register '{}': its path contains a hidden (dot-prefixed) \
+                     folder — a scratch/throwaway checkout. Pass force=true to override.",
+                    canonical_path.display()
+                ),
+                "status": "error"
+            })),
+        );
+    }
+
     // Register in repos.json
     let alias = {
         let mut config = match state.config.write() {

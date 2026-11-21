@@ -1690,6 +1690,19 @@ pub async fn add_to_index(
     println!("📂 Project: {}", canonical_path.display());
     warn_nested_git_roots(&canonical_path);
 
+    // Hidden-path guard (same rule as the serve's POST /repos and the
+    // post-checkout hook's skip): a checkout under a dot-prefixed folder
+    // (.tmpXXXX scratch, .opencode/worktrees, CI dot-dirs) is throwaway
+    // and gets no index. Refused before any build starts; --force overrides.
+    if !force && crate::db_discovery::repos::has_hidden_component(&canonical_path) {
+        anyhow::bail!(
+            "'{}' contains a hidden (dot-prefixed) folder — such checkouts are \
+             throwaway and get no index. Move it out of the hidden folder, or \
+             pass --force to register it anyway.",
+            canonical_path.display()
+        );
+    }
+
     // Try delegating to a running serve instance first.
     // Serve handles: register in repos.json + create index + warmup.
     // `--local` short-circuits the delegation attempt entirely.
