@@ -594,6 +594,23 @@ public static class Program
                     // target.
                 }
             }
+            // Analyzer-only PackageReferences the configured feeds cannot
+            // resolve (NU1101/NU1102) fail the restore for EVERY project even
+            // though analyzers never enter the semantic model — VS2026 loads
+            // the same solution fine. Retry ONCE with those references
+            // stripped via a generated MSBuild import staged under
+            // .codesearch.db/tmp; the csprojs are never touched. Anything not
+            // provably analyzer-only stays (stripping a compile-time package
+            // would trade a degraded index for CS0246 noise), and a still
+            // failing retry falls through to the per-project fallback below.
+            var strippable = AnalyzerStrip.SelectStrippable(
+                AnalyzerStrip.ExtractUnresolvedPackages(restoreOutput),
+                Path.GetDirectoryName(solutionPath) ?? ".");
+            if (strippable.Count > 0 && TryRestoreWithAnalyzerStrip(
+                    solutionPath, strippable, timeoutSeconds, gateRestorePending))
+            {
+                return [];
+            }
             var fallback = RestorePerProjectFallback(
                 solutionPath, solutionDir: Path.GetDirectoryName(solutionPath) ?? ".",
                 loadable, timeoutSeconds, gateRestorePending);
@@ -635,6 +652,115 @@ public static class Program
                 $"[INFO] dotnet restore could not start ({ex.GetType().Name}: {ex.Message}) — continuing without it.");
             return [];
         }
+    }
+
+    /// <summary>
+    /// One retry of the solution restore with analyzer-only PackageReferences
+    /// (NU1101/NU1102, all confirmed analyzer-shaped across the csprojs)
+    /// removed through a generated <c>CustomBeforeMicrosoftCommonTargets</c>
+    /// import staged under <c>.codesearch.db/tmp</c> — no csproj is modified.
+    /// On success the same targets file stays registered in
+    /// <see cref="WorkspaceLoad"/> (cleared at the end of the load) so the
+    /// design-time evaluation never sees a reference its assets lack. Same
+    /// bounded-wait, no-kill contract as the primary restore: on timeout the
+    /// marker is written and the pending gate applies; on failure the staged
+    /// file is deleted and the caller falls through to the per-project path.
+    /// </summary>
+    private static bool TryRestoreWithAnalyzerStrip(
+        string solutionPath, List<string> packageIds, int timeoutSeconds, bool gateRestorePending)
+    {
+        var solutionDir = Path.GetDirectoryName(solutionPath) ?? ".";
+        var targetsPath = Path.Combine(
+            WorkspaceLoad.FilteredSolutionStagingDir(solutionDir),
+            $"{Path.GetFileNameWithoutExtension(solutionPath)}-strip-analyzers.targets");
+        bool registered = false;
+        try
+        {
+            File.WriteAllText(targetsPath, AnalyzerStrip.TargetsFileContent(packageIds));
+            var psi = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                Arguments = $"restore \"{solutionPath}\" --nologo -v q --ignore-failed-sources " +
+                            $"-p:CustomBeforeMicrosoftCommonTargets=\"{targetsPath}\"",
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            using var process = Process.Start(psi);
+            if (process is null)
+            {
+                return false;
+            }
+            var stdoutDrain = process.StandardOutput.ReadToEndAsync();
+            var stderrDrain = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(timeoutSeconds * 1000))
+            {
+                RestorePendingMarker.Write(
+                    solutionPath, process.Id, process.StartTime.ToUniversalTime());
+                if (gateRestorePending)
+                {
+                    Console.Error.WriteLine(
+                        $"[RESTORE-PENDING] analyzer-strip restore still running after {timeoutSeconds}s " +
+                        $"for '{solutionPath}' — not building an index while restore is in flight.");
+                    throw new RestorePendingException();
+                }
+                Console.Error.WriteLine(RestorePolicy.StillRunningWarning(
+                    timeoutSeconds, "analyzer-strip dotnet restore"));
+                return false;
+            }
+            if (process.ExitCode != 0)
+            {
+                var output = stderrDrain.GetAwaiter().GetResult()
+                    + Environment.NewLine + stdoutDrain.GetAwaiter().GetResult();
+                Console.Error.WriteLine(
+                    "[INFO] Analyzer-strip restore still failed:" +
+                    RestorePolicy.ExtractRestoreErrors(output));
+                return false;
+            }
+            WorkspaceLoad.SetAnalyzerStripTargets(targetsPath);
+            registered = true;
+            Console.Error.WriteLine(
+                "[INFO] Restore succeeded with analyzer-only package(s) stripped: " +
+                $"{string.Join(", ", packageIds)} — analyzers do not affect the semantic model.");
+            return true;
+        }
+        catch (RestorePendingException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // The strip retry is an optimization: any infra failure falls
+            // back to the per-project restore path unchanged.
+            Console.Error.WriteLine(
+                $"[INFO] Analyzer-strip restore could not start ({ex.GetType().Name}: {ex.Message}).");
+            return false;
+        }
+        finally
+        {
+            if (!registered)
+            {
+                try { File.Delete(targetsPath); } catch { /* best effort */ }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Load-scope cleanup of the analyzer-strip targets file (see
+    /// <see cref="TryRestoreWithAnalyzerStrip"/>): the workspace has evaluated
+    /// every project by now, so the staged import can go. Best effort — the
+    /// stale sweep in <see cref="WorkspaceLoad.CleanupStaleFilteredSolutions"/>
+    /// covers leftovers from a crashed run.
+    /// </summary>
+    private static void CleanupAnalyzerStripTargets()
+    {
+        var targets = WorkspaceLoad.AnalyzerStripTargets;
+        WorkspaceLoad.ClearAnalyzerStripTargets();
+        if (targets is null)
+        {
+            return;
+        }
+        try { File.Delete(targets); } catch { /* best effort */ }
     }
 
     /// <summary>Outcome of the one-shot VS-MSBuild solution restore.</summary>
@@ -974,6 +1100,7 @@ public static class Program
         {
             await workspace.OpenSolutionAsync(tempSlnPath).ConfigureAwait(false);
             Console.Error.WriteLine($"Loaded {workspace.CurrentSolution.Projects.Count()} project(s) from filtered solution");
+            CleanupAnalyzerStripTargets();
             return; // Success!
         }
         catch (Exception ex)
@@ -1039,6 +1166,7 @@ public static class Program
         }
 
         Console.Error.WriteLine($"Loaded {loaded}/{supported.Count} project(s) individually");
+        CleanupAnalyzerStripTargets();
     }
 
     /// <summary>

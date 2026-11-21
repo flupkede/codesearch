@@ -50,6 +50,7 @@
     <Compile Include="..\RestorePolicy.cs" Link="RestorePolicy.cs" />
     <Compile Include="..\RestoreGate.cs" Link="RestoreGate.cs" />
     <Compile Include="..\MsbuildRestore.cs" Link="MsbuildRestore.cs" />
+    <Compile Include="..\AnalyzerStrip.cs" Link="AnalyzerStrip.cs" />
     <Compile Include="..\PathGuard.cs" Link="PathGuard.cs" />
     <Compile Include="..\ServeHost.cs" Link="ServeHost.cs" />
   </ItemGroup>

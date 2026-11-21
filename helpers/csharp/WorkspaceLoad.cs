@@ -13,22 +13,46 @@ namespace ScipCsharp;
 /// </summary>
 internal static class WorkspaceLoad
 {
-    internal static System.Collections.Generic.Dictionary<string, string> GlobalProperties() => new()
+    /// <summary>
+    /// When an analyzer-strip restore retry succeeded, the targets file that
+    /// removes those PackageReferences — merged into the workspace's global
+    /// properties (<see cref="GlobalProperties"/>) so the design-time
+    /// evaluation stays consistent with the stripped restore (the assets do
+    /// not contain the package). Null in the normal path.
+    /// </summary>
+    internal static string? AnalyzerStripTargets { get; private set; }
+
+    internal static void SetAnalyzerStripTargets(string path) => AnalyzerStripTargets = path;
+
+    internal static void ClearAnalyzerStripTargets() => AnalyzerStripTargets = null;
+
+    internal static System.Collections.Generic.Dictionary<string, string> GlobalProperties()
     {
-        // Tell Roslyn to skip projects it cannot load instead of crashing.
-        { "BuildingInsideVisualStudio", "true" },
-        // Design-time build: prevents auto-generated files in obj/ (e.g.
-        // .AssemblyAttributes.cs, .AssemblyInfo.cs) from being included as
-        // explicit Compile items. Without this, SDK-style projects produce
-        // duplicate Compile items (auto-include + obj/ generated), which
-        // causes MSBuildWorkspace to fail loading the project.
-        { "DesignTimeBuild", "true" },
-        { "SkipCompilerExecution", "true" },
-        // Warnings stay warnings during the load — never fatal (NU1603 etc.).
-        { "TreatWarningsAsErrors", "false" },
-        { "WarningsAsErrors", "" },
-        { "MSBuildTreatWarningsAsErrors", "false" },
-    };
+        var properties = new System.Collections.Generic.Dictionary<string, string>
+        {
+            // Tell Roslyn to skip projects it cannot load instead of crashing.
+            { "BuildingInsideVisualStudio", "true" },
+            // Design-time build: prevents auto-generated files in obj/ (e.g.
+            // .AssemblyAttributes.cs, .AssemblyInfo.cs) from being included as
+            // explicit Compile items. Without this, SDK-style projects produce
+            // duplicate Compile items (auto-include + obj/ generated), which
+            // causes MSBuildWorkspace to fail loading the project.
+            { "DesignTimeBuild", "true" },
+            { "SkipCompilerExecution", "true" },
+            // Warnings stay warnings during the load — never fatal (NU1603 etc.).
+            { "TreatWarningsAsErrors", "false" },
+            { "WarningsAsErrors", "" },
+            { "MSBuildTreatWarningsAsErrors", "false" },
+        };
+        // Load-scope analyzer strip: the PackageReferences the restore retry
+        // removed are removed from the evaluation too, so the workspace never
+        // sees a project reference its assets lack.
+        if (AnalyzerStripTargets is not null)
+        {
+            properties["CustomBeforeMicrosoftCommonTargets"] = AnalyzerStripTargets;
+        }
+        return properties;
+    }
 
     /// <summary>
     /// Staging directory for the transient filtered solution the workspace
@@ -153,9 +177,13 @@ internal static class WorkspaceLoad
             // effect of a cleanup scan over a nonexistent solution dir.
             var staging = System.IO.Path.Combine(solutionDir, ".codesearch.db", "tmp");
             var stale = new[] { solutionDir, staging }
-                .SelectMany(dir => SafeSlnFiles(dir))
-                .Where(f => System.IO.Path.GetFileName(f)
-                    .StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .SelectMany(dir => SafeSlnFiles(dir).Concat(SafeStripTargetsFiles(dir, solutionBaseName)))
+                .Where(f =>
+                {
+                    var name = System.IO.Path.GetFileName(f);
+                    return name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                        || name.EndsWith("-strip-analyzers.targets", StringComparison.OrdinalIgnoreCase);
+                })
                 .ToList();
             var deleted = 0;
             foreach (var path in stale)
@@ -188,5 +216,16 @@ internal static class WorkspaceLoad
     {
         if (!System.IO.Directory.Exists(dir)) yield break;
         foreach (var f in System.IO.Directory.EnumerateFiles(dir, "*.sln")) yield return f;
+    }
+
+    /// <summary>
+    /// The analyzer-strip targets file this solution's runs stage (at most
+    /// one per solution name — written fresh per retry, load-scope deleted).
+    /// Swept like filtered-solution leftovers so a crashed run cannot leak it.
+    /// </summary>
+    private static IEnumerable<string> SafeStripTargetsFiles(string dir, string solutionBaseName)
+    {
+        var path = System.IO.Path.Combine(dir, solutionBaseName + "-strip-analyzers.targets");
+        if (System.IO.File.Exists(path)) yield return path;
     }
 }
