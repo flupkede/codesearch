@@ -155,9 +155,11 @@ impl FtsStore {
         // Open or create index with retry logic for Windows file locking
         let index = Self::open_or_create_index_with_retry(&fts_path, &schema)?;
 
-        // Create reader for searching
+        // Create reader for searching; the doc-store cache is trimmed from
+        // tantivy's 100 blocks to bound per-reader memory (see `limits`).
         let reader = index
             .reader_builder()
+            .doc_store_cache_num_blocks(crate::limits::DEFAULT_FTS_DOC_STORE_CACHE_BLOCKS)
             .reload_policy(reload_policy)
             .try_into()?;
 
@@ -191,6 +193,7 @@ impl FtsStore {
 
         let reader = index
             .reader_builder()
+            .doc_store_cache_num_blocks(crate::limits::DEFAULT_FTS_DOC_STORE_CACHE_BLOCKS)
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
 
@@ -471,6 +474,61 @@ impl FtsStore {
         error.contains("writer was killed") || error.contains("index writer was killed")
     }
 
+    /// Merge the index down to one segment when a commit leaves more than
+    /// `CODESEARCH_FTS_MAX_SEGMENTS` segments behind (0 = never).
+    ///
+    /// `NoMergePolicy` means nothing ever merges implicitly: every commit
+    /// adds a segment forever and search cost grows with the segment count.
+    /// Explicit merging is safe where background merging was not — it runs
+    /// after a successful commit (the data is already durable) and any
+    /// failure is non-fatal: a warning, and the next commit tries again. A
+    /// killed writer is dropped so the next write recreates it. Kept as one
+    /// whole-index merge rather than incremental policy tuning: commit
+    /// frequency here is low (one per refresh wave), so merging to a single
+    /// segment is simple and bounds the worst case exactly.
+    ///
+    /// Returns whether a merge was performed.
+    pub fn compact_if_fragmented(&mut self) -> Result<bool> {
+        let max_segments = crate::limits::fts_max_segments();
+        if max_segments == 0 {
+            return Ok(false);
+        }
+        let ids = match self.index.searchable_segment_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!("⚠️ FTS compaction skipped, cannot list segments: {e:#}");
+                return Ok(false);
+            }
+        };
+        if ids.len() <= max_segments {
+            return Ok(false);
+        }
+        let outcome = {
+            let Some(writer) = self.writer.as_mut() else {
+                return Ok(false);
+            };
+            // Merge and GC run inside one `&mut writer` borrow; tantivy's
+            // returned futures own their channels, not the borrow.
+            writer
+                .merge(&ids)
+                .wait()
+                .map(|_| ())
+                .and_then(|_| writer.garbage_collect_files().wait().map(|_| ()))
+        };
+        if let Err(e) = outcome {
+            tracing::warn!("⚠️ FTS segment compaction failed (non-fatal): {e:#}");
+            if Self::is_writer_killed(&e.to_string()) {
+                // Committed data is durable; the next write recreates the writer.
+                self.writer = None;
+            }
+            return Ok(false);
+        }
+        if let Err(e) = self.reader.reload() {
+            tracing::debug!("Reader reload after compaction warning: {e:#}");
+        }
+        Ok(true)
+    }
+
     fn is_transient_commit_error(error: &str) -> bool {
         error.contains("Access is denied")
             || error.contains("PermissionDenied")
@@ -542,6 +600,10 @@ impl FtsStore {
                         // Non-fatal: reader will eventually catch up
                         tracing::debug!("Reader reload warning: {}", e);
                     }
+                    // Explicit compaction pass (NoMergePolicy means nothing
+                    // merges implicitly); failures are non-fatal — see
+                    // `compact_if_fragmented`.
+                    let _ = self.compact_if_fragmented();
                     return Ok(());
                 }
                 CommitAttempt::PrepareFailed(e) if !Self::is_writer_killed(&e) => {
@@ -888,6 +950,69 @@ mod tests {
 
         store.clear()?;
         assert_eq!(store.stats()?.num_documents, 0);
+        Ok(())
+    }
+
+    /// With `NoMergePolicy` every commit adds a segment; once the count
+    /// passes the threshold the post-commit compaction must fold them back
+    /// to a single segment with every document still searchable.
+    #[test]
+    #[serial_test::serial]
+    fn compaction_merges_fragmented_segments_after_commit() -> Result<()> {
+        let _env = crate::testing::EnvRestore::set(&[(crate::limits::FTS_MAX_SEGMENTS_ENV, "3")]);
+        let mut store = FtsStore::new_in_memory()?;
+        for i in 1..=10 {
+            store.add_chunk(
+                i,
+                &format!("unique compaction probe number {i}"),
+                &format!("file{i}.rs"),
+                None,
+                "block",
+            )?;
+            store.commit()?;
+            assert_eq!(
+                store
+                    .search(&format!("unique compaction probe number {i}"), 5, None)?
+                    .len(),
+                1,
+                "doc {i} must be searchable immediately after its commit"
+            );
+        }
+        assert_eq!(
+            store.index.searchable_segment_ids()?.len(),
+            1,
+            "10 commits past threshold 3 must leave one merged segment"
+        );
+        assert_eq!(
+            store.search("unique compaction probe", 50, None)?.len(),
+            10,
+            "compaction must keep every document searchable"
+        );
+        Ok(())
+    }
+
+    /// Threshold 0 disables compaction entirely: segments grow untouched.
+    #[test]
+    #[serial_test::serial]
+    fn compaction_disabled_leaves_segments_untouched() -> Result<()> {
+        let _env = crate::testing::EnvRestore::set(&[(crate::limits::FTS_MAX_SEGMENTS_ENV, "0")]);
+        let mut store = FtsStore::new_in_memory()?;
+        for i in 1..=5 {
+            store.add_chunk(
+                i,
+                &format!("unmerged segment probe {i}"),
+                &format!("file{i}.rs"),
+                None,
+                "block",
+            )?;
+            store.commit()?;
+        }
+        assert_eq!(
+            store.index.searchable_segment_ids()?.len(),
+            5,
+            "threshold 0 must leave every commit's segment in place"
+        );
+        assert_eq!(store.search("unmerged segment probe", 50, None)?.len(), 5);
         Ok(())
     }
 

@@ -15,6 +15,7 @@ fn clear_env() -> EnvRestore {
         ONNX_ARENA_ENV,
         EMBED_UNLOAD_IDLE_SECS_ENV,
         FTS_WRITER_MB_ENV,
+        FTS_MAX_SEGMENTS_ENV,
     ])
 }
 
@@ -53,6 +54,12 @@ fn defaults_are_conservative() {
         "writer heap default must stay today's 50 MB"
     );
     assert_eq!(DEFAULT_FTS_WRITER_HEAP_BYTES, 50_000_000);
+    assert_eq!(
+        fts_max_segments(),
+        DEFAULT_FTS_MAX_SEGMENTS,
+        "compaction defaults on at 8 segments"
+    );
+    assert_eq!(DEFAULT_FTS_MAX_SEGMENTS, 8);
 }
 
 /// Below tantivy's floor the heap clamps up; a valid value passes through.

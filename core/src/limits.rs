@@ -20,6 +20,7 @@
 //! | `CODESEARCH_ONNX_ARENA` | off | ONNX arena allocator (never returns memory to the OS) |
 //! | `CODESEARCH_EMBED_UNLOAD_IDLE_SECS` | `1800` (0 = never) | Idle time before an embedding model is unloaded |
 //! | `CODESEARCH_FTS_WRITER_MB` | `50` (min 15) | FTS writer heap per thread; lowering it multiplies segments |
+//! | `CODESEARCH_FTS_MAX_SEGMENTS` | `8` (0 = off) | Segment count past which a commit compacts the index |
 //!
 //! All values are read from the environment so a systemd unit or shell can set
 //! them without a config file. See the README section "Indexing limits" for
@@ -52,6 +53,8 @@ pub const EMBED_UNLOAD_IDLE_SECS_ENV: &str = "CODESEARCH_EMBED_UNLOAD_IDLE_SECS"
 /// FTS writer heap per thread, in MB (values below tantivy's 15 MB floor
 /// clamp up to the floor).
 pub const FTS_WRITER_MB_ENV: &str = "CODESEARCH_FTS_WRITER_MB";
+/// Max FTS segments after which a commit compacts the index (0 = off).
+pub const FTS_MAX_SEGMENTS_ENV: &str = "CODESEARCH_FTS_MAX_SEGMENTS";
 
 /// Default for [`index_jobs`]: strictly one heavy repo job at a time.
 ///
@@ -79,6 +82,13 @@ pub const DEFAULT_EMBED_UNLOAD_IDLE_SECS: u64 = 1800;
 pub const DEFAULT_FTS_WRITER_HEAP_BYTES: usize = 50_000_000;
 /// Tantivy refuses writer heaps below this.
 pub const MIN_FTS_WRITER_HEAP_BYTES: usize = 15_000_000;
+/// Default segment threshold for the explicit post-commit compaction: with
+/// `NoMergePolicy` every commit otherwise adds a segment forever, and search
+/// cost grows with the segment count.
+pub const DEFAULT_FTS_MAX_SEGMENTS: usize = 8;
+/// Reader doc-store cache blocks (tantivy default 100). 10 bounds per-reader
+/// memory on a serve holding many repos' readers.
+pub const DEFAULT_FTS_DOC_STORE_CACHE_BLOCKS: usize = 10;
 /// Default bound on chunks held in memory per refresh batch. 0 would disable
 /// the cap, but that is how one 13k-chunk ImportData file pushed a whole
 /// build against MDB_MAP_FULL twice (serve log 10/11, survived on the final
@@ -165,6 +175,12 @@ pub fn fts_writer_heap_bytes() -> usize {
         Some(mb) => mb.saturating_mul(1_000_000).max(MIN_FTS_WRITER_HEAP_BYTES),
         None => DEFAULT_FTS_WRITER_HEAP_BYTES,
     }
+}
+
+/// Segment count past which a commit triggers an explicit compaction
+/// (0 = never). See [`crate::fts::FtsStore::compact_if_fragmented`].
+pub fn fts_max_segments() -> usize {
+    env_parsed::<usize>(FTS_MAX_SEGMENTS_ENV).unwrap_or(DEFAULT_FTS_MAX_SEGMENTS)
 }
 
 /// Available (reclaimable) system memory in MB, read fresh on each call.
