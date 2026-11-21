@@ -296,7 +296,10 @@ impl FtsStore {
 
     /// Create writer with retry logic for Windows file locking issues
     /// Increased retry count and initial wait to handle slow file handle release
-    fn create_writer_with_retry(index: &Index) -> Result<IndexWriter> {
+    fn create_writer_with_retry(
+        index: &Index,
+        memory_budget_per_thread: usize,
+    ) -> Result<IndexWriter> {
         let max_retries = 5; // Increased from 3 to handle Windows timing issues
         let mut last_error: Option<String> = None;
 
@@ -307,15 +310,17 @@ impl FtsStore {
                 std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
             }
 
-            // 50MB writer heap (tantivy default) but a fixed single worker and a
-            // single merge thread instead of tantivy's derived defaults. A plain
-            // `writer(50MB)` sizes its worker pool from the CPU count (then shrinks
-            // it to heap/15MB ≈ 3 workers on this budget) and unconditionally
-            // spawns a 4-thread merge pool — ~8 parked OS threads per open writer.
-            // With one writer per warm repo, a serve pool of 500 repos held ~4500
-            // resident threads. FTS work is negligible next to embedding, so one
-            // worker is plenty; with NoMergePolicy merges are never scheduled, so
-            // more than one merge thread would only ever idle.
+            // Writer heap from CODESEARCH_FTS_WRITER_MB (default 50 MB); a
+            // fixed single worker and a single merge thread instead of
+            // tantivy's derived defaults. A plain `writer(50MB)` sizes its
+            // worker pool from the CPU count (then shrinks it to heap/15MB
+            // ≈ 3 workers on this budget) and unconditionally spawns a
+            // 4-thread merge pool — ~8 parked OS threads per open writer.
+            // With one writer per warm repo, a serve pool of 500 repos held
+            // ~4500 resident threads. FTS work is negligible next to
+            // embedding, so one worker is plenty; with NoMergePolicy merges
+            // are never scheduled, so more than one merge thread would only
+            // ever idle.
             //
             // CRITICAL: Set NoMergePolicy to prevent tantivy from running background
             // merges. On Windows, these threads encounter I/O errors (antivirus
@@ -329,7 +334,7 @@ impl FtsStore {
             let options = IndexWriterOptions::builder()
                 .num_worker_threads(1)
                 .num_merge_threads(1)
-                .memory_budget_per_thread(50_000_000)
+                .memory_budget_per_thread(memory_budget_per_thread)
                 .build();
             match index.writer_with_options(options) {
                 Ok(writer) => {
@@ -365,7 +370,10 @@ impl FtsStore {
     fn ensure_writer(&mut self) -> Result<()> {
         if self.writer.is_none() {
             // Use retry logic for Windows file locking issues
-            let writer = Self::create_writer_with_retry(&self.index)?;
+            let writer = Self::create_writer_with_retry(
+                &self.index,
+                crate::limits::fts_writer_heap_bytes(),
+            )?;
             self.writer = Some(writer);
         }
         Ok(())

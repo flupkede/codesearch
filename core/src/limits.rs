@@ -19,6 +19,7 @@
 //! | `CODESEARCH_MAX_CHUNKS_PER_BATCH` | `0` (off) | Hard cap on chunks held per refresh batch |
 //! | `CODESEARCH_ONNX_ARENA` | off | ONNX arena allocator (never returns memory to the OS) |
 //! | `CODESEARCH_EMBED_UNLOAD_IDLE_SECS` | `1800` (0 = never) | Idle time before an embedding model is unloaded |
+//! | `CODESEARCH_FTS_WRITER_MB` | `50` (min 15) | FTS writer heap per thread; lowering it multiplies segments |
 //!
 //! All values are read from the environment so a systemd unit or shell can set
 //! them without a config file. See the README section "Indexing limits" for
@@ -48,6 +49,9 @@ pub const ONNX_ARENA_ENV: &str = "CODESEARCH_ONNX_ARENA";
 /// Seconds an embedding model may sit unused before the reaper unloads it
 /// (0 = never unload).
 pub const EMBED_UNLOAD_IDLE_SECS_ENV: &str = "CODESEARCH_EMBED_UNLOAD_IDLE_SECS";
+/// FTS writer heap per thread, in MB (values below tantivy's 15 MB floor
+/// clamp up to the floor).
+pub const FTS_WRITER_MB_ENV: &str = "CODESEARCH_FTS_WRITER_MB";
 
 /// Default for [`index_jobs`]: strictly one heavy repo job at a time.
 ///
@@ -69,6 +73,12 @@ pub const DEFAULT_ONNX_ARENA: bool = false;
 /// An ONNX session holds hundreds of MB; without this a serve that touched
 /// several models keeps them all resident forever.
 pub const DEFAULT_EMBED_UNLOAD_IDLE_SECS: u64 = 1800;
+/// Default FTS writer heap per thread: tantivy's 50 MB. Commit 6988f99
+/// reverted a 15 MB heap because smaller heaps mean more segments and more
+/// merges, which killed writers on Windows — lower the env var deliberately.
+pub const DEFAULT_FTS_WRITER_HEAP_BYTES: usize = 50_000_000;
+/// Tantivy refuses writer heaps below this.
+pub const MIN_FTS_WRITER_HEAP_BYTES: usize = 15_000_000;
 /// Default bound on chunks held in memory per refresh batch. 0 would disable
 /// the cap, but that is how one 13k-chunk ImportData file pushed a whole
 /// build against MDB_MAP_FULL twice (serve log 10/11, survived on the final
@@ -145,6 +155,16 @@ pub fn embed_unload_idle() -> Duration {
     Duration::from_secs(
         env_parsed::<u64>(EMBED_UNLOAD_IDLE_SECS_ENV).unwrap_or(DEFAULT_EMBED_UNLOAD_IDLE_SECS),
     )
+}
+
+/// FTS writer heap per thread in bytes, clamped to tantivy's minimum.
+/// Lowering this trades writer RAM for more, smaller segments — see
+/// [`DEFAULT_FTS_WRITER_HEAP_BYTES`].
+pub fn fts_writer_heap_bytes() -> usize {
+    match env_parsed::<usize>(FTS_WRITER_MB_ENV) {
+        Some(mb) => mb.saturating_mul(1_000_000).max(MIN_FTS_WRITER_HEAP_BYTES),
+        None => DEFAULT_FTS_WRITER_HEAP_BYTES,
+    }
 }
 
 /// Available (reclaimable) system memory in MB, read fresh on each call.

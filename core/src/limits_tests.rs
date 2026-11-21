@@ -14,6 +14,7 @@ fn clear_env() -> EnvRestore {
         MAX_CHUNKS_PER_BATCH_ENV,
         ONNX_ARENA_ENV,
         EMBED_UNLOAD_IDLE_SECS_ENV,
+        FTS_WRITER_MB_ENV,
     ])
 }
 
@@ -46,6 +47,29 @@ fn defaults_are_conservative() {
         "model unload defaults to 30 idle minutes"
     );
     assert_eq!(DEFAULT_EMBED_UNLOAD_IDLE_SECS, 1800);
+    assert_eq!(
+        fts_writer_heap_bytes(),
+        DEFAULT_FTS_WRITER_HEAP_BYTES,
+        "writer heap default must stay today's 50 MB"
+    );
+    assert_eq!(DEFAULT_FTS_WRITER_HEAP_BYTES, 50_000_000);
+}
+
+/// Below tantivy's floor the heap clamps up; a valid value passes through.
+/// Lower heaps multiply segments/merges (commit 6988f99), so the clamp is
+/// the safety net, not the intent.
+#[test]
+#[serial]
+fn fts_writer_heap_clamps_to_the_tantivy_minimum() {
+    let _env = clear_env();
+    let _low = EnvRestore::set(&[(FTS_WRITER_MB_ENV, "8")]);
+    assert_eq!(
+        fts_writer_heap_bytes(),
+        15_000_000,
+        "8 MB clamps up to tantivy's 15 MB floor"
+    );
+    let _ok = EnvRestore::set(&[(FTS_WRITER_MB_ENV, "64")]);
+    assert_eq!(fts_writer_heap_bytes(), 64_000_000);
 }
 
 /// The chunk cap must stay env-overridable: `0` re-disables it for a machine
