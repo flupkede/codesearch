@@ -152,22 +152,6 @@ public class AnalyzerStripTests : IDisposable
         Assert.Contains(@"Remove=""Weird&lt;&amp;&gt;.Pkg""", content);
     }
 
-    // ── Stale sweep ───────────────────────────────────────────────────
-
-    /// <summary>
-    /// A crashed run's strip targets file (load-scope delete never ran) is
-    /// swept by the same hygiene pass as filtered-solution leftovers.
-    /// </summary>
-    [Fact]
-    public void StaleStripTargetsAreSwept()
-    {
-        var targets = Path.Combine(_root, "sln-strip-analyzers.targets");
-        File.WriteAllText(targets, "<Project></Project>");
-
-        Assert.Equal(1, WorkspaceLoad.CleanupStaleFilteredSolutions(_root, "sln"));
-        Assert.False(File.Exists(targets));
-    }
-
     // ── Real restore end-to-end ───────────────────────────────────────
 
     /// <summary>

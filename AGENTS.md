@@ -315,13 +315,16 @@ degrade the C# symbol index.
 
 - **Mechanism:** `RestoreSolution` (helpers/csharp/Program.cs) retries the restore ONCE with the
   unresolved-but-analyzer-shaped PackageReferences removed via a generated
-  `CustomBeforeMicrosoftCommonTargets` import staged in `.codesearch.db/tmp` (csprojs untouched,
-  worktree stays clean). On success the file stays registered in `WorkspaceLoad` so the design-time
-  evaluation strips the same references; load-scope delete + stale sweep cover leaks.
+  `CustomBeforeMicrosoftCommonTargets` import passed to that restore only, staged in
+  `.codesearch.db/tmp` (csprojs untouched; the file is deleted before the retry returns). The strip
+  is deliberately restore-scope: the workspace is created before the restore runs, and the
+  design-time evaluation reads references/analyzers from the restored assets file
+  (`ResolvePackageAssets` is assets-authoritative and tolerates a PackageReference its assets
+  lack), so the stripped package contributes nothing.
 - **Guard:** `AnalyzerStrip.SelectStrippable` only strips references whose csproj shape is provably
   analyzer-only (metadata block mentioning analyzers / PrivateAssets=all); bare CPM-era references
   and unknown packages are never stripped (stripping a compile-time dependency would trade a
   degraded index for CS0246 noise).
 - **Tests:** `helpers/csharp/tests/AnalyzerStripTests.cs` — extraction (verbatim incident wording),
-  classifier, targets content, stale sweep, and one real offline restore e2e (local empty feed →
-  plain restore NU1101 → strip retry succeeds, assets written, csproj byte-identical).
+  classifier, targets content, and one real offline restore e2e (local empty feed → plain restore
+  NU1101 → strip retry succeeds, assets written, csproj byte-identical).

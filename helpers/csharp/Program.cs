@@ -658,13 +658,19 @@ public static class Program
     /// One retry of the solution restore with analyzer-only PackageReferences
     /// (NU1101/NU1102, all confirmed analyzer-shaped across the csprojs)
     /// removed through a generated <c>CustomBeforeMicrosoftCommonTargets</c>
-    /// import staged under <c>.codesearch.db/tmp</c> — no csproj is modified.
-    /// On success the same targets file stays registered in
-    /// <see cref="WorkspaceLoad"/> (cleared at the end of the load) so the
-    /// design-time evaluation never sees a reference its assets lack. Same
-    /// bounded-wait, no-kill contract as the primary restore: on timeout the
-    /// marker is written and the pending gate applies; on failure the staged
-    /// file is deleted and the caller falls through to the per-project path.
+    /// import passed to the restore only — no csproj is modified and the
+    /// staged file is deleted before returning.
+    ///
+    /// The strip is restore-scope ON PURPOSE: the workspace (created before
+    /// the restore runs) cannot pick up a late property, and it does not need
+    /// one — the design-time evaluation reads references and analyzers from
+    /// the restored assets file (<c>ResolvePackageAssets</c> is
+    /// assets-authoritative and tolerates a PackageReference its assets
+    /// lack), so the stripped package simply contributes nothing and the
+    /// semantic model is unaffected. Same bounded-wait, no-kill contract as
+    /// the primary restore: on timeout the marker is written and the pending
+    /// gate applies; on failure the caller falls through to the per-project
+    /// path.
     /// </summary>
     private static bool TryRestoreWithAnalyzerStrip(
         string solutionPath, List<string> packageIds, int timeoutSeconds, bool gateRestorePending)
@@ -673,7 +679,6 @@ public static class Program
         var targetsPath = Path.Combine(
             WorkspaceLoad.FilteredSolutionStagingDir(solutionDir),
             $"{Path.GetFileNameWithoutExtension(solutionPath)}-strip-analyzers.targets");
-        bool registered = false;
         try
         {
             File.WriteAllText(targetsPath, AnalyzerStrip.TargetsFileContent(packageIds));
@@ -717,8 +722,6 @@ public static class Program
                     RestorePolicy.ExtractRestoreErrors(output));
                 return false;
             }
-            WorkspaceLoad.SetAnalyzerStripTargets(targetsPath);
-            registered = true;
             Console.Error.WriteLine(
                 "[INFO] Restore succeeded with analyzer-only package(s) stripped: " +
                 $"{string.Join(", ", packageIds)} — analyzers do not affect the semantic model.");
@@ -738,29 +741,10 @@ public static class Program
         }
         finally
         {
-            if (!registered)
-            {
-                try { File.Delete(targetsPath); } catch { /* best effort */ }
-            }
+            // Restore-scope only (see the doc comment): nothing outlives this
+            // call, so nothing can leak into the workspace load or the tree.
+            try { File.Delete(targetsPath); } catch { /* best effort */ }
         }
-    }
-
-    /// <summary>
-    /// Load-scope cleanup of the analyzer-strip targets file (see
-    /// <see cref="TryRestoreWithAnalyzerStrip"/>): the workspace has evaluated
-    /// every project by now, so the staged import can go. Best effort — the
-    /// stale sweep in <see cref="WorkspaceLoad.CleanupStaleFilteredSolutions"/>
-    /// covers leftovers from a crashed run.
-    /// </summary>
-    private static void CleanupAnalyzerStripTargets()
-    {
-        var targets = WorkspaceLoad.AnalyzerStripTargets;
-        WorkspaceLoad.ClearAnalyzerStripTargets();
-        if (targets is null)
-        {
-            return;
-        }
-        try { File.Delete(targets); } catch { /* best effort */ }
     }
 
     /// <summary>Outcome of the one-shot VS-MSBuild solution restore.</summary>
@@ -1100,7 +1084,6 @@ public static class Program
         {
             await workspace.OpenSolutionAsync(tempSlnPath).ConfigureAwait(false);
             Console.Error.WriteLine($"Loaded {workspace.CurrentSolution.Projects.Count()} project(s) from filtered solution");
-            CleanupAnalyzerStripTargets();
             return; // Success!
         }
         catch (Exception ex)
@@ -1166,7 +1149,6 @@ public static class Program
         }
 
         Console.Error.WriteLine($"Loaded {loaded}/{supported.Count} project(s) individually");
-        CleanupAnalyzerStripTargets();
     }
 
     /// <summary>
