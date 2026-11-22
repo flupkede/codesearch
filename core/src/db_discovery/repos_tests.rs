@@ -515,29 +515,68 @@ fn is_temp_dir_path_matches_separators_and_case() {
 
 #[test]
 fn has_hidden_component_flags_dotted_components_only() {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     // Table-driven: every real-world shape the registration sites see.
     // (path, expected) — a hidden component anywhere refuses; plain
     // worktree paths of a registered main deliberately stay indexable.
-    let cases: &[(&str, bool)] = &[
+    //
+    // Paths are built from components, not written as literals: `components()`
+    // is platform-native, so a Windows literal (`C:\…\.tmp\wt`) is a single
+    // filename on Unix (backslash is a legal filename character there) and its
+    // dotted component would never be seen — the exact CI failure this shape
+    // caught. Collecting parts yields the same path on both platforms.
+    fn parts(p: &[&str]) -> PathBuf {
+        p.iter().collect()
+    }
+    let cases: &[(PathBuf, bool)] = &[
         // Scratch checkouts: hidden folder in the path → refuse.
-        (r"C:\Users\u\AppData\Local\Temp\.tmpAXQCLw\wt", true),
-        (r"C:\WorkArea\repo\.worktrees\fix-1", true),
-        (r"/home/u/.opencode/worktrees/wt", true),
-        (r"C:\WorkArea\repo\sub\.hidden\wt", true),
-        // Real checkouts and worktrees: no dotted component → allow.
-        (r"C:\Users\u\source\repos\MyApp", false),
         (
-            r"C:\Users\u\source\repos\MyApp.worktrees\dev-theme-1",
+            parts(&[
+                "C:",
+                "Users",
+                "u",
+                "AppData",
+                "Local",
+                "Temp",
+                ".tmpAXQCLw",
+                "wt",
+            ]),
+            true,
+        ),
+        (
+            parts(&["C:", "WorkArea", "repo", ".worktrees", "fix-1"]),
+            true,
+        ),
+        (parts(&["/home", "u", ".opencode", "worktrees", "wt"]), true),
+        (
+            parts(&["C:", "WorkArea", "repo", "sub", ".hidden", "wt"]),
+            true,
+        ),
+        // Real checkouts and worktrees: no dotted component → allow.
+        (
+            parts(&["C:", "Users", "u", "source", "repos", "MyApp"]),
             false,
         ),
-        (r"/home/u/src/repos/webapp", false),
+        (
+            parts(&[
+                "C:",
+                "Users",
+                "u",
+                "source",
+                "repos",
+                "MyApp.worktrees",
+                "dev-theme-1",
+            ]),
+            false,
+        ),
+        (parts(&["/home", "u", "src", "repos", "webapp"]), false),
     ];
-    for (raw, expected) in cases {
+    for (path, expected) in cases {
         assert_eq!(
-            has_hidden_component(Path::new(raw)),
+            has_hidden_component(path.as_path()),
             *expected,
-            "path {raw}: hidden={expected}"
+            "path {}: hidden={expected}",
+            path.display()
         );
     }
 }
