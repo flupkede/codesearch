@@ -264,6 +264,23 @@ pub enum HookCommands {
     /// always exits 0.
     #[command(name = "edit-guard-post")]
     EditGuardPost,
+
+    /// Native grep-guard PreToolUse hook: deny Grep/Bash-grep against a
+    /// covered, LIVE repo (codesearch-first); auto-allow when the serve hub
+    /// is down or the index is mid-rebuild past the wait cap.
+    #[command(name = "grep-guard")]
+    GrepGuard,
+
+    /// Native web-guard PreToolUse hook: steer the first WebSearch/WebFetch
+    /// about a mounted product to the codesearch doc mount; one steer per
+    /// mount per 5-minute window.
+    #[command(name = "web-guard")]
+    WebGuard,
+
+    /// Native subagent-preamble PreToolUse hook: inject a codesearch-first
+    /// preamble into Agent prompts (never blocks, only rewrites).
+    #[command(name = "subagent-preamble")]
+    SubagentPreamble,
 }
 
 /// `hooks git` subcommands.
@@ -1529,6 +1546,18 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
             }
             HookCommands::EditGuardPost => {
                 crate::cli::hook_guard::run_edit_guard_post();
+                Ok(())
+            }
+            HookCommands::GrepGuard => {
+                crate::cli::hook_guard::run_grep_guard().await;
+                Ok(())
+            }
+            HookCommands::WebGuard => {
+                crate::cli::hook_guard::run_web_guard();
+                Ok(())
+            }
+            HookCommands::SubagentPreamble => {
+                crate::cli::hook_guard::run_subagent_preamble();
                 Ok(())
             }
         },

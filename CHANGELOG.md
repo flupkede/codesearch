@@ -26,15 +26,19 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Changed
 
-- **edit-guard hooks run natively**: `codesearch hook edit-guard` /
-  `codesearch hook edit-guard-post` replace the per-call pwsh/bash script
-  spawns (~7.4 s per Edit on Windows → single fast process, no shell, no
-  jq, no spawned `git`); `hooks claude install` registers the binary's own
-  subcommand, ships no edit-guard scripts, and migrates away pre-native
-  script registrations on re-install. Behaviour is the e5c7d5d scripts
-  verbatim (kind table, 300 s window, MultiEdit all-paths, marker sources
-  1/1b/2/3, fail-open, atomic state writes); the script twins stay for the
-  still-script guards (grep, web, preamble).
+- **All Claude Code guard hooks run natively**: `codesearch hook grep-guard`,
+  `subagent-preamble`, `web-guard`, `edit-guard` / `edit-guard-post` replace
+  the per-call pwsh/bash script spawns (~7.4 s per Edit on Windows → single
+  fast process, no shell, no jq, no spawned `git`); `hooks claude install`
+  registers the binary's own subcommands, writes no script files at all, and
+  migrates away every pre-native script registration on re-install.
+  Behaviour is the script twins verbatim (kind table, 300 s window, MultiEdit
+  all-paths, marker sources 1/1b/2/3, fail-open, atomic state writes;
+  grep-guard's /healthz + /indexing probes, wait cap and Bash grep-family
+  detector; web-guard's mount topic scoping and 5-minute retry cache; the
+  preamble's marker idempotency). The `.ps1`/`.sh` twins stay in
+  `integrations/claude-code/hooks/` as the contract reference for the
+  script-based install path.
 
 - **The C# resident helper applies file edits in place after a Files rebuild instead of reloading the solution.** Project-file changes, update errors and timeouts (`CODESEARCH_SCIP_RESIDENT_UPDATE_TIMEOUT_SECS`, default 30) still reload.
 
