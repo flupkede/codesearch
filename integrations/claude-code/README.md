@@ -61,7 +61,9 @@ that make the preference *structural* instead of advisory:
    target repo is live but **mid-reindex** (the serve watcher's full
    refresh, e.g. right after a branch switch), the hook waits the rebuild
    out itself — polling `GET /indexing?path=<repo root>` every few seconds
-   for up to `CODESEARCH_GREP_GUARD_WAIT_MS` (default 120s; `0` restores
+   (the endpoint also accepts `&wait=<s>`, which holds the request until the
+   repo settles; the hooks can adopt that to drop this loop) for up to
+   `CODESEARCH_GREP_GUARD_WAIT_MS` (default 120s; `0` restores
    the legacy instant wait-and-retry instruction) — and denies Grep with
    a retry-codesearch instruction once the rebuild lands, so the denial
    only fires when codesearch will actually answer. Past the cap Grep

@@ -406,12 +406,86 @@ async function testWaitRebuildSettled(): Promise<void> {
   }
 }
 
+/** Minimal long-poll /indexing hub: holds every request until the repo
+ * settles, then answers with the settled state and a `waited_ms`, the way the
+ * real hub does when it understands `?wait=`. Counts requests, so a test can
+ * prove the client did not poll. */
+async function startLongPollHub(initialIndexing: boolean): Promise<{
+  url: string
+  hits: () => number
+  setIndexing: (value: boolean) => void
+  close: () => Promise<void>
+}> {
+  let indexing = initialIndexing
+  let hits = 0
+  const waiting: Array<() => void> = []
+  const answer = (res: http.ServerResponse, waitedMs: number): void => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.end(JSON.stringify({ covered: true, alias: "x", indexing, waited_ms: waitedMs }))
+  }
+  const server = http.createServer((_req, res) => {
+    hits += 1
+    const waitedMs = Number(new URL(_req.url ?? "/", "http://x").searchParams.get("wait") ?? 0) * 1000
+    if (!indexing) {
+      answer(res, waitedMs)
+      return
+    }
+    waiting.push(() => answer(res, waitedMs))
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+  return {
+    url,
+    hits: () => hits,
+    setIndexing: (value) => {
+      indexing = value
+      if (!value) for (const release of waiting.splice(0)) release()
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        for (const release of waiting.splice(0)) release()
+        server.close(() => resolve())
+      }),
+  }
+}
+
+async function testWaitRebuildSettledLongPoll(): Promise<void> {
+  // The hub holds the request until the markers clear: one request, no poll
+  // loop, and the answer arrives the moment the index settles.
+  {
+    const hub = await startLongPollHub(true)
+    setTimeout(() => hub.setIndexing(false), 150)
+    const t0 = Date.now()
+    assert.equal(
+      await waitRebuildSettled({ base: hub.url, target: "x", waitMs: 5_000 }),
+      true,
+      "the long-poll settles when the rebuild lands",
+    )
+    assert.equal(hub.hits(), 1, "one request, not a poll loop")
+    assert.ok(Date.now() - t0 >= 140, "the wait was real")
+    await hub.close()
+  }
+
+  // Still rebuilding when the window expires: false, and still one request.
+  {
+    const hub = await startLongPollHub(true)
+    assert.equal(
+      await waitRebuildSettled({ base: hub.url, target: "x", waitMs: 150 }),
+      false,
+      "still mid-rebuild at the cap",
+    )
+    assert.equal(hub.hits(), 1, "a held wait is not re-probed")
+    await hub.close()
+  }
+}
+
 async function main(): Promise<void> {
   testStripJsonc()
   testAstGrepToolNames()
   testShellGrepTargets()
   testShellGrepTargetsWin32()
   await testWaitRebuildSettled()
+  await testWaitRebuildSettledLongPoll()
   await testHealthRunner()
   console.log("unit: OK")
 }

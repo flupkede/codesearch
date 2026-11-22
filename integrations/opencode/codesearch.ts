@@ -243,7 +243,7 @@ Tool routing:
 Rules:
 - Multi-repo serve mode requires a scope on every call except status: pass project="<alias>" (returned paths are the server's paths; read content via get_chunk, not the local filesystem), or group="<name>" to fan out.
 - Start broad with search, narrow with find/explore, read with get_chunk. Keep compact=true (the default) until you know which chunk you need.
-- The serve hub watches files and refreshes indexes automatically; if a just-made change seems missing, retry the query once before falling back to grep.`
+- The serve hub watches files and refreshes indexes automatically; a query that misses a very recent change is worth one retry, because the watcher may still be reindexing. Separately, the grep guard holds a denied grep while the index settles (up to guards.rebuildWaitMs, and only against a hub that supports ?wait=).`
 
 /** Skill playbook: the same strategy plus worked examples. */
 const SKILL_CONTENT = `${DEFAULT_GUIDANCE}
@@ -254,7 +254,7 @@ Examples:
 - "Add a field to the settings struct" -> find(project=..., symbol="Settings", kind="definition") -> find(project=..., symbol="Settings", kind="usages").
 - Exact syntax like "Vec<T>" or "foo = null" -> search(project=..., mode="literal", regex=true, query="Vec<").
 - "How does this file relate to the rest?" -> explore(project=..., kind="outline", target=<file>) -> explore(kind="similar", target=<chunk_id>).
-- Freshly edited file returning stale hits -> wait a moment, rerun the query; the watcher is reindexing.`
+- Freshly edited file returning stale hits -> the watcher may still be reindexing; retry the query once, then treat a second miss as a miss.`
 
 /* ------------------------------------------------------------------ *
  * Small utilities
@@ -1131,14 +1131,20 @@ export class HealthRunner {
  * ------------------------------------------------------------------ */
 
 /**
- * Wait out a mid-rebuild index before the guard denies a grep. Polls
- * GET /indexing?path=<target> with a short deadline per probe and returns true
- * the moment the repo will answer codesearch queries (settled, unregistered,
- * or a 404 on an older serve without the endpoint); false when the rebuild is
- * still running at `waitMs` — grep is genuinely all you have. `waitMs <= 0`
- * settles immediately, preserving the pre-wait deny behavior. Probe failures
- * and non-404 HTTP errors do not settle: they mean "no fresh signal", so
- * polling continues until the cap (mirrors the Claude grep-guard hook twins).
+ * Wait out a mid-rebuild index before the guard denies a grep.
+ *
+ * One long-poll request to `GET /indexing?path=<target>&wait=<secs>`: the hub
+ * holds it until the repo's markers clear (a Notify fan-out from every index
+ * marker change) and answers with the state at that moment, so there is no
+ * client-side interval poll and nothing to retry. A hub that predates the
+ * parameter answers at once with `indexing` still true and no `waited_ms`,
+ * and only then does this fall back to short probes. Returns true the moment
+ * the repo will answer codesearch queries (settled, unregistered, or a 404 on
+ * an older serve without the endpoint); false when the rebuild is still
+ * running at `waitMs` — grep is genuinely all you have. `waitMs <= 0` settles
+ * immediately, preserving the pre-wait deny behavior. Probe failures and
+ * non-404 HTTP errors do not settle: they mean "no fresh signal", so the wait
+ * continues until the cap (mirrors the Claude grep-guard hook twins).
  * Exported for test/unit.ts.
  */
 export async function waitRebuildSettled(opts: {
@@ -1152,33 +1158,55 @@ export async function waitRebuildSettled(opts: {
   const { base, target, waitMs, pollMs = 3000, token, fetchImpl = fetch } = opts
   if (waitMs <= 0 || !base || !target) return true
   const deadline = Date.now() + waitMs
+  const probeUrl = (waitSecs: number): string =>
+    `${base}/indexing?path=${encodeURIComponent(target)}&wait=${Math.max(0, waitSecs).toFixed(3)}`
+
+  // The whole wait in one request. The abort timer is a backstop for a hub
+  // that holds the connection without ever answering.
+  const held = await probeIndexing(probeUrl(waitMs / 1000), waitMs + 5_000, token, fetchImpl)
+  if (held.settled) return true
+  // `waited_ms` means the hub understood `?wait=`: it held the request for
+  // the full window and the repo is still rebuilding, so probing again would
+  // only burn requests.
+  if (held.heldMillis !== undefined) return false
+
+  // An older hub ignores the parameter. Probe until the cap, as before.
   for (;;) {
-    try {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 5000)
-      let settled = false
-      try {
-        const headers: Record<string, string> = {}
-        if (token) headers.authorization = `Bearer ${token}`
-        const res = await fetchImpl(`${base}/indexing?path=${encodeURIComponent(target)}`, {
-          signal: controller.signal,
-          headers,
-        })
-        if (res.status === 404) settled = true
-        else if (res.ok) {
-          const info = (await res.json()) as Loose
-          settled = info?.covered === false || !info?.indexing
-        }
-      } finally {
-        clearTimeout(timer)
-      }
-      if (settled) return true
-    } catch {
-      /* transient probe failure mid-wait: keep polling until the cap */
-    }
     const rest = deadline - Date.now()
     if (rest <= 0) return false
     await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, rest)))
+    const probe = await probeIndexing(probeUrl(0), 5_000, token, fetchImpl)
+    if (probe.settled) return true
+  }
+}
+
+/**
+ * One `/indexing` read. `settled` is true when the target is outside every
+ * registered repo or the repo is no longer rebuilding; `heldMillis` is set
+ * only when the hub reported how long it held the request, which is how the
+ * caller tells a long-poll hub from one that ignores `?wait=`.
+ */
+async function probeIndexing(
+  url: string,
+  timeoutMs: number,
+  token: string | undefined,
+  fetchImpl: typeof fetch,
+): Promise<{ settled: boolean; heldMillis?: number }> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const headers: Record<string, string> = {}
+    if (token) headers.authorization = `Bearer ${token}`
+    const res = await fetchImpl(url, { signal: controller.signal, headers })
+    if (res.status === 404) return { settled: true }
+    if (!res.ok) return { settled: false }
+    const info = (await res.json()) as Loose
+    const heldMillis = typeof info?.waited_ms === "number" ? info.waited_ms : undefined
+    return { settled: info?.covered === false || !info?.indexing, heldMillis }
+  } catch {
+    return { settled: false }
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -1914,7 +1942,7 @@ export default {
             const edits = recentEdits(settings.freshness.maxFiles)
             if (edits.length) {
               const shown = edits.map((p) => relativeTo(p, scope.projectPath || directory) || p)
-              extra.push(`- Files edited this session: ${shown.join(", ")}. The serve hub reindexes on write; if a query misses a very recent change, retry it once.`)
+              extra.push(`- Files edited this session: ${shown.join(", ")}. The serve hub reindexes on write; if a query misses one of these, retry it once before concluding it is absent.`)
               editedPaths.clear()
             }
           }

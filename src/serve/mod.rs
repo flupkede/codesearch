@@ -49,9 +49,10 @@ use crate::constants::{
     ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, DB_DIR_NAME, DEFAULT_SERVE_PORT,
     DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH, FIND_PATH, HEALTHZ_PATH,
     HEALTH_PATH, INDEXING_MARKER_HEARTBEAT_SECS, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT,
-    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, MCP_IDLE_SESSION_SECS,
-    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV,
-    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MAX_INDEXING_WAIT_SECS, MCP_ENDPOINT_PATH,
+    MCP_IDLE_SESSION_SECS, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
+    STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, git_common_dir_for, ReposConfig};
 use crate::index::{
@@ -365,6 +366,12 @@ pub(crate) struct ServeState {
     /// burned CPU. Display-only — the reindex 409 guard reads
     /// `active_reindexes` exclusively and is unaffected by the hold.
     indexing_last_active: Arc<DashMap<String, std::time::Instant>>,
+    /// Wakes `GET /indexing?wait=<seconds>` long-polls whenever any repo's
+    /// indexing markers change: a reindex starts, a watcher flush ends, a
+    /// stale marker is reaped. `notify_waiters` stores nothing, so a poll
+    /// that registered before the change is exactly what observes it. Free
+    /// when nobody is waiting.
+    indexing_notify: Arc<tokio::sync::Notify>,
     /// Per-repo change count since serve started (incremented by index/reindex operations).
     repo_changes: DashMap<String, AtomicU64>,
     /// Per-repo last tool call: (tool_name, timestamp).
@@ -521,6 +528,7 @@ impl ServeState {
             config_path_override,
             active_reindexes: Arc::new(DashMap::new()),
             indexing_last_active: Arc::new(DashMap::new()),
+            indexing_notify: Arc::new(tokio::sync::Notify::new()),
             repo_changes: DashMap::new(),
             last_tool_call: DashMap::new(),
             remote_peer_activity: DashMap::new(),
@@ -775,6 +783,7 @@ impl ServeState {
     fn make_indexing_status_callback(&self, alias: &str) -> IndexingStatusCallback {
         let reindexes = self.active_reindexes.clone();
         let last_active = self.indexing_last_active.clone();
+        let notify = self.indexing_notify.clone();
         let alias_key = alias.to_string();
         Arc::new(move |active: bool| {
             // Stamp on BOTH arms (every call): the hold must run from the
@@ -793,6 +802,8 @@ impl ServeState {
                 // begin_indexing insert must never be erased by this remove.
                 reindexes.remove_if(&alias_key, |_, m| m.is_empty());
             }
+            // Freshness changed either way: release any /indexing?wait= poll.
+            notify.notify_waiters();
         })
     }
 
@@ -828,13 +839,18 @@ impl ServeState {
                 false
             }
         });
-        if owners.is_empty() {
+        let started = owners.is_empty();
+        if started {
             owners.insert(owner, now);
-            true
-        } else {
-            // Genuinely in progress — reject.
-            false
         }
+        drop(owners);
+        if started {
+            // The repo just became "indexing": wake /indexing?wait= callers.
+            self.indexing_changed();
+            return true;
+        }
+        // Genuinely in progress — reject.
+        false
     }
 
     /// Remove `owner`'s indexing marker for `alias`. Called when that flow's
@@ -849,6 +865,19 @@ impl ServeState {
         // shard lock, so a `begin_indexing` that inserts a fresh marker
         // between the inner removal and this call keeps its marker.
         self.active_reindexes.remove_if(alias, |_, m| m.is_empty());
+        // The repo may be settled now: wake /indexing?wait= callers, which
+        // re-read the state and return.
+        self.indexing_changed();
+    }
+
+    /// Wake every `GET /indexing?wait=` long-poll.
+    ///
+    /// Called after a marker is added or removed, never on a heartbeat
+    /// renew (the answer "still indexing" has not changed). `notify_waiters`
+    /// stores nothing, so a poll that has not registered yet simply reads the
+    /// new state when it does.
+    fn indexing_changed(&self) {
+        self.indexing_notify.notify_waiters();
     }
 
     /// Renew `owner`'s indexing marker for `alias` — the per-batch heartbeat a
@@ -1206,6 +1235,8 @@ impl ServeState {
                 evicted
             );
             self.reap_finished_index_task(alias);
+            // The answer just became stale=false for a /indexing?wait= poll.
+            self.indexing_changed();
         }
         any_left
     }
@@ -1263,6 +1294,7 @@ impl ServeState {
                     owners.remove(&IndexingOwner::Reindex);
                 }
                 self.active_reindexes.remove_if(alias, |_, m| m.is_empty());
+                self.indexing_changed();
             }
             // Covers the removed-mid-build case where the task exited via a
             // path that never reached its post-build self-clean.
@@ -4966,6 +4998,29 @@ async fn healthz_handler() -> AxumJson<serde_json::Value> {
 struct IndexingQuery {
     /// Absolute filesystem path of the search target (file or directory).
     path: String,
+    /// Seconds the server may hold the request open while the repo is
+    /// indexing (`?wait=120`): the response arrives as soon as the markers
+    /// clear, so the caller waits on one request instead of polling. Absent
+    /// or 0 answers immediately, which keeps older callers working and lets a
+    /// caller detect a hub that predates the parameter (it answers at once
+    /// with `indexing=true` and no `waited_ms`).
+    #[serde(default)]
+    wait: Option<f64>,
+}
+
+impl IndexingQuery {
+    /// Requested hold in seconds, clamped to something a server will serve.
+    ///
+    /// A non-finite value (`?wait=NaN`) becomes "no wait". It has to be
+    /// handled here: `f64::from_str` accepts NaN, `clamp` propagates it, and
+    /// the handler would then reach `Duration::from_secs_f64(NaN)`, which
+    /// panics and kills the connection task.
+    fn wait_secs(&self) -> f64 {
+        self.wait
+            .filter(|wait| wait.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, MAX_INDEXING_WAIT_SECS)
+    }
 }
 
 /// Response body for `GET /indexing`.
@@ -4978,6 +5033,10 @@ struct IndexingResponse {
     covered: bool,
     alias: Option<String>,
     indexing: bool,
+    /// How long the server held the request open. A caller that asked for a
+    /// wait and got 0 back is talking to a hub that ignores `?wait=` and
+    /// should fall back to polling.
+    waited_ms: u64,
 }
 
 /// Component-boundary prefix match: does `target` lie inside `root`?
@@ -5045,20 +5104,59 @@ impl ServeState {
     }
 }
 
-/// Indexing-freshness handler: GET /indexing?path=<absolute path>
+/// Indexing-freshness handler: GET /indexing?path=<absolute path>[&wait=<s>]
 ///
 /// Lets a caller distinguish "empty result because nothing matches" from
 /// "stale result because the index is mid-rebuild" — the exact distinction
 /// the grep-guard hook needs after a branch switch. See [`INDEXING_PATH`].
+///
+/// With `?wait=` the server holds the request until the repo settles (or the
+/// wait expires) and answers with the state at that moment. That is the whole
+/// point of the parameter: the grep guard blocks on one request instead of
+/// re-probing every few seconds while the file watcher finishes a flush, so
+/// there is no client-side poll loop and no "retry in a moment" hint to act
+/// on. The wake-up is a [`tokio::sync::Notify`] fanned out by every marker
+/// change (`indexing_changed`), not a timer.
 async fn indexing_handler(
     axum::extract::State(state): axum::extract::State<Arc<ServeState>>,
     axum::extract::Query(q): axum::extract::Query<IndexingQuery>,
 ) -> AxumJson<IndexingResponse> {
-    let (alias, indexing) = state.freshness_for_path(&q.path);
+    let started = Instant::now();
+    let wait = q.wait_secs();
+    loop {
+        // Register before reading: a marker change between the read and the
+        // await would otherwise be missed and the poll would sit out the full
+        // deadline. `enable` makes the registration atomic with the read.
+        let notified = state.indexing_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let (alias, indexing) = state.freshness_for_path(&q.path);
+        let remaining = wait - started.elapsed().as_secs_f64();
+        if !indexing || remaining <= 0.0 {
+            return indexing_answer(alias, indexing, started);
+        }
+        tokio::select! {
+            _ = &mut notified => continue,
+            _ = tokio::time::sleep(Duration::from_secs_f64(remaining)) => {
+                let (alias, indexing) = state.freshness_for_path(&q.path);
+                return indexing_answer(alias, indexing, started);
+            }
+        }
+    }
+}
+
+/// Build a `/indexing` answer, recording how long the request was held open.
+fn indexing_answer(
+    alias: Option<String>,
+    indexing: bool,
+    started: Instant,
+) -> AxumJson<IndexingResponse> {
     AxumJson(IndexingResponse {
         covered: alias.is_some(),
         alias,
         indexing,
+        waited_ms: started.elapsed().as_millis() as u64,
     })
 }
 

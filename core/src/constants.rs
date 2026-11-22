@@ -441,9 +441,15 @@ pub const STATUS_PATH: &str = "/status";
 /// Cheap single-question probe for the grep-guard hook (and any caller that
 /// needs to distinguish "no results" from "index mid-rebuild"): takes
 /// `?path=<absolute path>`, resolves the containing registered repo, and
-/// returns `{"covered":bool,"alias":..,"indexing":bool}` — `indexing` is true
-/// while that repo has an active (non-stale) reindex in flight, which
-/// includes the full refresh fired by a branch switch. Same auth class as
+/// returns `{"covered":bool,"alias":..,"indexing":bool,"waited_ms":n}` —
+/// `indexing` is true while that repo has an active (non-stale) reindex in
+/// flight, which includes the full refresh fired by a branch switch.
+///
+/// `&wait=<seconds>` makes it a long poll: the server holds the request until
+/// those markers clear (a Notify fan-out, not a timer) or the wait expires,
+/// and answers with the state at that moment, so a caller waits on one
+/// request instead of re-probing. `waited_ms` reports the hold, which is how
+/// a client tells this server from one that ignores the parameter. Same auth class as
 /// [`STATUS_PATH`]: reachable without the admin key on localhost, protected
 /// by `require_auth_for_network` on network binds. `/healthz` remains the
 /// ONLY always-unauthenticated endpoint — liveness and freshness are
@@ -650,6 +656,12 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
+
+/// Upper bound on `GET /indexing?wait=<seconds>`, so a caller cannot pin a
+/// connection (and its worker) indefinitely. The grep guard asks for 120 s,
+/// which leaves room for a large repository's refresh without letting a
+/// malicious or buggy caller hold a request open for minutes.
+pub const MAX_INDEXING_WAIT_SECS: f64 = 300.0;
 
 /// How often a flow without its own progress callback (the SCIP symbol
 /// rebuild) renews its indexing marker so it never ages out at
