@@ -36,9 +36,10 @@ finalized in place with a date — no renaming/migration step needed.
   all-paths, marker sources 1/1b/2/3, fail-open, atomic state writes;
   grep-guard's /healthz + /indexing probes, wait cap and Bash grep-family
   detector; web-guard's mount topic scoping and 5-minute retry cache; the
-  preamble's marker idempotency). The `.ps1`/`.sh` twins stay in
-  `integrations/claude-code/hooks/` as the contract reference for the
-  script-based install path.
+  preamble's marker idempotency; the preamble skips empty prompts, which
+  the twins rewrite but which fail downstream regardless). The `.ps1`/`.sh`
+  twins stay in `integrations/claude-code/hooks/` as the contract reference
+  for the script-based install path.
 
 - **The C# resident helper applies file edits in place after a Files rebuild instead of reloading the solution.** Project-file changes, update errors and timeouts (`CODESEARCH_SCIP_RESIDENT_UPDATE_TIMEOUT_SECS`, default 30) still reload.
 

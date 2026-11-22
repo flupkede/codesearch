@@ -1317,7 +1317,10 @@ pub fn run_subagent_preamble() {
 }
 
 /// The rewritten-input decision for one Agent event, or empty when nothing
-/// to inject (non-Agent tool, no prompt, marker already present).
+/// to inject (non-Agent tool, no prompt, marker already present). An EMPTY
+/// prompt is also skipped — a deliberate divergence from the twins, which
+/// rewrite it: the spawn fails downstream regardless, so there is nothing
+/// to steer.
 fn subagent_preamble(raw: &str) -> String {
     let Ok(data) = serde_json::from_str::<Value>(raw.trim()) else {
         return String::new();
@@ -2398,6 +2401,38 @@ mod tests {
         assert!(
             !web_guard(&web_event("WebSearch", "Acme docs")).is_empty(),
             "CRLF-trimmed mount still matches"
+        );
+        fx.drop_guard();
+    }
+
+    #[serial]
+    #[test]
+    fn web_cache_ttl_prunes_expired_entries() {
+        // The retry cache must expire: an entry inside the 5-minute window
+        // survives the prune, an aged one (and a corrupt one) drops —
+        // otherwise steers never re-fire or re-fire on every query.
+        let fx = web_fx(MOUNTED_REGISTRY);
+        let now = unix_now();
+        let mut cache = Map::new();
+        cache.insert("WebSearch|peer/acme".to_string(), json!(now - 60));
+        cache.insert(
+            "WebSearch|peer/old".to_string(),
+            json!(now - WEB_CACHE_TTL_SECS - 5),
+        );
+        cache.insert("WebSearch|peer/junk".to_string(), json!("not-a-number"));
+        write_web_cache(&cache);
+        let pruned = read_web_cache(now);
+        assert!(
+            pruned.contains_key("WebSearch|peer/acme"),
+            "fresh entry survives: {pruned:?}"
+        );
+        assert!(
+            !pruned.contains_key("WebSearch|peer/old"),
+            "aged entry expired: {pruned:?}"
+        );
+        assert!(
+            !pruned.contains_key("WebSearch|peer/junk"),
+            "corrupt entry counts as expired: {pruned:?}"
         );
         fx.drop_guard();
     }
