@@ -3406,6 +3406,58 @@ async fn indexing_without_wait_answers_immediately_while_indexing() {
     );
 }
 
+/// `?wait=NaN` (any non-finite value) must answer at once: `f64::from_str`
+/// accepts NaN and `clamp` propagates it, and `Duration::from_secs_f64` panics
+/// on it, which used to kill the connection task.
+#[tokio::test]
+async fn indexing_with_a_non_finite_wait_answers_immediately_while_indexing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let raw_repo = tmp.path().join("nanwait");
+    std::fs::create_dir(&raw_repo).unwrap();
+    let repo_path = crate::cache::safe_canonicalize(&raw_repo).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path.clone(), Some("nanwait".to_string()))
+        .unwrap();
+
+    let state = Arc::new(ServeState::new(config, None));
+    state.begin_indexing("nanwait", IndexingOwner::Watcher);
+
+    let app = axum::Router::new()
+        .route(
+            crate::constants::INDEXING_PATH,
+            axum::routing::get(indexing_handler),
+        )
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let covered = repo_path.to_string_lossy().replace('\\', "/");
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reqwest::Client::new()
+            .get(format!("http://{addr}/indexing?path={covered}&wait=NaN"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>(),
+    )
+    .await
+    .expect("a non-finite wait must not hang or panic")
+    .unwrap();
+
+    assert_eq!(body["indexing"], serde_json::json!(true));
+    assert!(
+        body["waited_ms"].as_u64().unwrap() < 100,
+        "a non-finite wait must be treated as no wait: {body}"
+    );
+}
+
 // ===========================================================================
 // `codesearch index rm` → running serve: end-to-end delegation (todo #48 L2)
 // ===========================================================================

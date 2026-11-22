@@ -657,6 +657,12 @@ pub const MAX_INDEXING_SECS: u64 = 30 * 60; // 30 minutes
 /// Environment variable to override the maximum indexing duration.
 pub const MAX_INDEXING_SECS_ENV: &str = "CODESEARCH_MAX_INDEXING_SECS";
 
+/// Upper bound on `GET /indexing?wait=<seconds>`, so a caller cannot pin a
+/// connection (and its worker) indefinitely. The grep guard asks for 120 s,
+/// which leaves room for a large repository's refresh without letting a
+/// malicious or buggy caller hold a request open for minutes.
+pub const MAX_INDEXING_WAIT_SECS: f64 = 300.0;
+
 /// How often a flow without its own progress callback (the SCIP symbol
 /// rebuild) renews its indexing marker so it never ages out at
 /// `MAX_INDEXING_SECS` mid-run. Must stay well below that threshold.

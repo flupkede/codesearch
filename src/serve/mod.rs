@@ -49,9 +49,10 @@ use crate::constants::{
     ALLOWED_HOSTS_ENV, ALLOWED_ROOTS_ENV, CHUNK_PATH, DB_DIR_NAME, DEFAULT_SERVE_PORT,
     DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH, FIND_PATH, HEALTHZ_PATH,
     HEALTH_PATH, INDEXING_MARKER_HEARTBEAT_SECS, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT,
-    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, MCP_IDLE_SESSION_SECS,
-    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV,
-    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MAX_INDEXING_WAIT_SECS, MCP_ENDPOINT_PATH,
+    MCP_IDLE_SESSION_SECS, PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH,
+    REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
+    STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, git_common_dir_for, ReposConfig};
 use crate::index::{
@@ -5007,14 +5008,18 @@ struct IndexingQuery {
     wait: Option<f64>,
 }
 
-/// Upper bound on `?wait=`, so a caller cannot pin a connection (and its
-/// worker) indefinitely. The grep guard asks for 120 s.
-const MAX_INDEXING_WAIT_SECS: f64 = 300.0;
-
 impl IndexingQuery {
     /// Requested hold in seconds, clamped to something a server will serve.
+    ///
+    /// A non-finite value (`?wait=NaN`) becomes "no wait". It has to be
+    /// handled here: `f64::from_str` accepts NaN, `clamp` propagates it, and
+    /// the handler would then reach `Duration::from_secs_f64(NaN)`, which
+    /// panics and kills the connection task.
     fn wait_secs(&self) -> f64 {
-        self.wait.unwrap_or(0.0).clamp(0.0, MAX_INDEXING_WAIT_SECS)
+        self.wait
+            .filter(|wait| wait.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, MAX_INDEXING_WAIT_SECS)
     }
 }
 

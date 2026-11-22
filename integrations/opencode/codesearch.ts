@@ -243,7 +243,7 @@ Tool routing:
 Rules:
 - Multi-repo serve mode requires a scope on every call except status: pass project="<alias>" (returned paths are the server's paths; read content via get_chunk, not the local filesystem), or group="<name>" to fan out.
 - Start broad with search, narrow with find/explore, read with get_chunk. Keep compact=true (the default) until you know which chunk you need.
-- The serve hub watches files and refreshes indexes automatically, and the grep guard waits out a rebuild before it answers, so a just-made change does not need a retry loop.`
+- The serve hub watches files and refreshes indexes automatically; a query that misses a very recent change is worth one retry, because the watcher may still be reindexing. Separately, the grep guard holds a denied grep while the index settles (up to guards.rebuildWaitMs, and only against a hub that supports ?wait=).`
 
 /** Skill playbook: the same strategy plus worked examples. */
 const SKILL_CONTENT = `${DEFAULT_GUIDANCE}
@@ -254,7 +254,7 @@ Examples:
 - "Add a field to the settings struct" -> find(project=..., symbol="Settings", kind="definition") -> find(project=..., symbol="Settings", kind="usages").
 - Exact syntax like "Vec<T>" or "foo = null" -> search(project=..., mode="literal", regex=true, query="Vec<").
 - "How does this file relate to the rest?" -> explore(project=..., kind="outline", target=<file>) -> explore(kind="similar", target=<chunk_id>).
-- Freshly edited file returning stale hits -> the watcher is reindexing; the guard holds the call until it settles, so re-read rather than re-asking in a loop.`
+- Freshly edited file returning stale hits -> the watcher may still be reindexing; retry the query once, then treat a second miss as a miss.`
 
 /* ------------------------------------------------------------------ *
  * Small utilities
@@ -1942,7 +1942,7 @@ export default {
             const edits = recentEdits(settings.freshness.maxFiles)
             if (edits.length) {
               const shown = edits.map((p) => relativeTo(p, scope.projectPath || directory) || p)
-              extra.push(`- Files edited this session: ${shown.join(", ")}. The serve hub reindexes on write and the guard waits for it to settle, so a miss is a real miss, not a race.`)
+              extra.push(`- Files edited this session: ${shown.join(", ")}. The serve hub reindexes on write; if a query misses one of these, retry it once before concluding it is absent.`)
               editedPaths.clear()
             }
           }
