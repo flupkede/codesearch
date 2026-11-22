@@ -242,6 +242,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — the edit-guard pair runs natively: `codesearch hook edit-guard` / `edit-guard-post` subcommands replace the per-call pwsh/bash script spawns (~7.4 s per Edit → single fast process), `hooks claude install` registers the binary's own subcommand and migrates pre-native script registrations away on re-install; script twins stay for the still-script guards (grep, web, preamble).
+
 - **Pending** — hidden-folder registrations refused: paths with a dot-prefixed component (`.tmpXXXX` scratch, `.opencode/worktrees`) get no index at either registration site (serve `POST /repos` + CLI `index add`, force override), matching the post-checkout hook's skip; linked worktrees at ordinary paths stay indexable.
 
 - **Pending** — resident C# helper applies Files-rebuild edits in place (project-file changes, errors and timeouts still reload), serve prewarms resident workspaces for the most recently used repos (`CODESEARCH_SCIP_RESIDENT_PREWARM`), and `find_impact` infers `language` or returns `retry_with` entries to copy verbatim.
