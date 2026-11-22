@@ -102,7 +102,10 @@ internal static class WorkspaceLoad
             }
             result.Add(line);
         }
-        return string.Join(Environment.NewLine, result);
+        // A .sln is a CRLF format: join with "\r\n" regardless of platform so
+        // the staged file's bytes (and the parity test that splits on "\r\n")
+        // are identical on Windows and Linux.
+        return string.Join("\r\n", result);
     }
 
     /// <summary>

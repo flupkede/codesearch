@@ -273,7 +273,8 @@ fn update(pool: &WorkspacePool) -> Result<()> {
 
 #[test]
 fn a_request_or_update_to_a_resident_helper_does_not_take_the_gate() {
-    let cases: [(&str, fn(&WorkspacePool) -> Result<()>); 2] = [
+    type GatedOp = fn(&WorkspacePool) -> Result<()>;
+    let cases: [(&str, GatedOp); 2] = [
         ("find-refs", |pool| lookup(pool).map(drop)),
         ("update", update),
     ];

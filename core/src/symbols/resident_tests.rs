@@ -377,7 +377,8 @@ fn evict_or_update_during_an_in_flight_spawn_stops_the_stale_workspace_being_ins
     // production). The fresh workspace must still answer this one caller,
     // but must NOT be installed as resident afterwards — it may hold the
     // pre-edit text the rebuild is replacing.
-    let cases: &[(&str, fn(&WorkspacePool))] = &[
+    type PoolOp = fn(&WorkspacePool);
+    let cases: &[(&str, PoolOp)] = &[
         ("evict", |pool| pool.evict(&sln("a"))),
         ("update", |pool| {
             let outcome = pool
