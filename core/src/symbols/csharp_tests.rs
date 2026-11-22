@@ -957,8 +957,16 @@ fn files_rebuild_updates_the_resident_before_the_cache_commit_and_evicts_only_on
 #[serial_test::serial]
 fn files_rebuild_forwards_only_csharp_relevant_paths_to_the_resident() {
     type Forwarded = Option<(&'static [&'static str], &'static [&'static str])>;
+    type FilesRebuildCase = (
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+        Forwarded,
+        usize,
+        usize,
+    );
     // (case, changed, deleted, forwarded to update, kills, index helper runs)
-    let cases: &[(&str, &[&str], &[&str], Forwarded, usize, usize)] = &[
+    let cases: &[FilesRebuildCase] = &[
         (
             "source beside documents",
             &["src/X.cs", "AGENTS.md", "README.md", "notes.txt"],

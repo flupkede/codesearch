@@ -515,7 +515,7 @@ fn is_temp_dir_path_matches_separators_and_case() {
 
 #[test]
 fn has_hidden_component_flags_dotted_components_only() {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     // Table-driven: every real-world shape the registration sites see.
     // (path, expected) — a hidden component anywhere refuses; plain
     // worktree paths of a registered main deliberately stay indexable.
