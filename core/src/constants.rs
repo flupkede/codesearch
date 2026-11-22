@@ -441,9 +441,15 @@ pub const STATUS_PATH: &str = "/status";
 /// Cheap single-question probe for the grep-guard hook (and any caller that
 /// needs to distinguish "no results" from "index mid-rebuild"): takes
 /// `?path=<absolute path>`, resolves the containing registered repo, and
-/// returns `{"covered":bool,"alias":..,"indexing":bool}` — `indexing` is true
-/// while that repo has an active (non-stale) reindex in flight, which
-/// includes the full refresh fired by a branch switch. Same auth class as
+/// returns `{"covered":bool,"alias":..,"indexing":bool,"waited_ms":n}` —
+/// `indexing` is true while that repo has an active (non-stale) reindex in
+/// flight, which includes the full refresh fired by a branch switch.
+///
+/// `&wait=<seconds>` makes it a long poll: the server holds the request until
+/// those markers clear (a Notify fan-out, not a timer) or the wait expires,
+/// and answers with the state at that moment, so a caller waits on one
+/// request instead of re-probing. `waited_ms` reports the hold, which is how
+/// a client tells this server from one that ignores the parameter. Same auth class as
 /// [`STATUS_PATH`]: reachable without the admin key on localhost, protected
 /// by `require_auth_for_network` on network binds. `/healthz` remains the
 /// ONLY always-unauthenticated endpoint — liveness and freshness are

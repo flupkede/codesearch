@@ -181,8 +181,9 @@ Precedence, lowest to highest:
     "rescueLimit": 5,
     "rescueTimeoutMs": 3000,
     // Deny-time rebuild wait: when the guard fires while the target repo's
-    // index is mid-rebuild, poll /indexing this long for the rebuild to land
-    // before denying (ms, 0 = deny immediately); past the cap grep opens.
+    // index is mid-rebuild, hold one long-poll /indexing request this long
+    // for the rebuild to land before denying (ms, 0 = deny immediately);
+    // past the cap grep opens.
     // Env: CODESEARCH_PLUGIN_REBUILD_WAIT_MS or CODESEARCH_GREP_GUARD_WAIT_MS.
     "rebuildWaitMs": 120000
   },
@@ -275,10 +276,15 @@ A base URL without `/mcp` is normalised by appending it, so pointing
 refresh after a branch switch or file wave keeps `/healthz` green while every
 codesearch call times out, so denying in that exact window deadlocks the
 session — grep is denied exactly when it is the only working tool. Before
-denying, the guard polls `GET /indexing?path=<repo>` (up to
-`guards.rebuildWaitMs`, default 120000 ms): once the rebuild lands the deny
-fires as usual, past the cap grep opens. Older serves without the endpoint
-deny immediately, as before.
+denying, the guard issues ONE long poll, `GET /indexing?path=<repo>&wait=<s>`:
+the hub holds the request until the repo's indexing markers clear (a Notify
+fan-out from the watcher, not a client-side interval) and answers with the
+settled state, so a rebuild costs one request rather than a probe every few
+seconds. The window is `guards.rebuildWaitMs` (default 120000 ms): the deny
+fires as soon as the rebuild lands, and past the cap grep opens. A hub that
+predates `?wait=` answers at once without `waited_ms`, and only then does
+the guard fall back to short probes; a hub without the endpoint at all
+(404) denies immediately, as before.
 
 **Shell-grep closure** (independent of `guards.mode`, kill switch
 `guards.bash: false` / `CODESEARCH_PLUGIN_BASH_GUARD=0`): a bash tool command
