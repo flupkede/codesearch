@@ -4055,6 +4055,36 @@ fn test_root_mismatch_warns_only_on_different_project() {
     assert_eq!(super::root_mismatch_in(&[], &cfg, "wt"), None);
 }
 
+#[test]
+fn test_indexing_refresh_warning_names_only_busy_repos() {
+    let busy = ["wt2"];
+    let is_indexing = |alias: &str| busy.contains(&alias);
+    let idle: Vec<String> = vec!["main".to_string(), "wt1".to_string()];
+
+    // Idle project → no warning.
+    assert_eq!(
+        super::indexing_refresh_warning(Some("main"), None, is_indexing),
+        None
+    );
+    // Busy project → warning names it.
+    let w = super::indexing_refresh_warning(Some("wt2"), None, is_indexing)
+        .expect("busy project must warn");
+    assert!(w.contains("wt2"), "got: {w}");
+    assert!(w.contains("refresh"), "got: {w}");
+    // Group fan-out: only the busy aliases are named, deduplicated when the
+    // explicit project is also in the store list.
+    let mixed: Vec<String> = vec!["main".to_string(), "wt2".to_string()];
+    let w = super::indexing_refresh_warning(Some("wt2"), Some(&mixed), is_indexing)
+        .expect("busy group member must warn");
+    assert_eq!(w.matches("wt2").count(), 1, "got: {w}");
+    assert!(!w.contains("main"), "got: {w}");
+    // Nothing queried → no warning.
+    assert_eq!(
+        super::indexing_refresh_warning(None, Some(&idle), is_indexing),
+        None
+    );
+}
+
 // === cwd-based scoping (remote-MCP worktree safety) ===
 
 #[test]
