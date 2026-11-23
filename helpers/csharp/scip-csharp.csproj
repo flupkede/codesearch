@@ -35,10 +35,16 @@
     <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.13.0" />
     <PackageReference Include="Microsoft.Build.Locator" Version="1.9.1" />
     <!--
-      NU1903 suppress: Microsoft.Build.Tasks.Core transitives have CVEs (GHSA-h4j7-5rxr-p4wc,
-      GHSA-w3q9-fxm7-j8fq) but they all target the DownloadFile MSBuild task, which we never use.
-      Our scip-csharp runs locally as a subprocess, no network-facing attack surface.
-      Version pinning to Roslyn 4.13.0 is required for .NET 10 compatibility.
+      Aikido 59399549 (CVE-2025-26646): direct reference wins over the
+      vulnerable transitive 17.7.2 from Workspaces.MSBuild (NuGet nearest-wins).
+      Roslyn itself stays pinned at 4.13.0 for .NET 10 compatibility.
+    -->
+    <PackageReference Include="Microsoft.Build.Tasks.Core" Version="17.14.8" ExcludeAssets="runtime" />
+    <!--
+      NU1903 suppress: remaining Microsoft.Build.Tasks.Core transitive advisories
+      (GHSA-h4j7-5rxr-p4wc, GHSA-w3q9-fxm7-j8fq) target the DownloadFile MSBuild
+      task, which we never use. Our scip-csharp runs locally as a subprocess, no
+      network-facing attack surface.
     -->
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-h4j7-5rxr-p4wc" />
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-w3q9-fxm7-j8fq" />
