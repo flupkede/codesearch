@@ -102,7 +102,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [patch.crates-io]
-# Vendored copy of rmcp 3.5.0 with the [codesearch bridge] change in
+# Vendored copy of rmcp 3.9.0 with the [codesearch bridge] change in
 # vendor/rmcp/src/service/server.rs (`negotiate_protocol_version`): it lets a
 # session run at 2026-07-28 when the client offers that revision over the
 # initialize handshake, so rmcp keeps the SEP-2322 `resultType` discriminator

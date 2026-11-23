@@ -52,6 +52,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Fixed
 
+- **Security (Aikido/RUSTSEC wave):** root `Cargo.lock` bumps cookie 0.18.3 / url 2.5.9 / rustix 1.1.6 (RUSTSEC-2026-0594/0592/0486); `rmcp` re-vendored 3.5.0 → 3.9.0 — clearing its three DOS advisories — with the `[codesearch bridge]` re-applied verbatim in `negotiate_protocol_version` (pinned by `tests/mcp_protocol_bridge.rs`) and the shipped vendor lock freshly resolved (webpki-root-certs, rustls-webpki, quinn-udp, ctutils, tokio, rustix, url); the C# helper takes a direct `Microsoft.Build.Tasks.Core` 17.14.8 reference (CVE-2025-26646) that wins over the vulnerable transitive 17.7.2 while Roslyn stays pinned at 4.13.0. Upstream-pinned leftovers (rand 0.9.5, weezl, moxcms, lzma-rust2, unmaintained bincode/paste) are ignored in Aikido with per-finding reasons: each is held by a dependency ceiling (hf-hub/tokenizers/tantivy pin `rand ^0.9`; image 0.25.10 / ort-sys rc.15 pin the rest), and the two SAST path-traversal groups are false positives under the documented local-tool threat model (`PathGuard` already guards the .NET sites).
+
 - **The resident C# helper reloads on unknown non-`.cs` changes (razor, cshtml, editorconfig) instead of ignoring them, and `find_impact` candidates after a language pick contain only that language's keys.**
 
 - **Non-C# file changes (docs, text) never reach the resident C# helper or trigger a reload.**

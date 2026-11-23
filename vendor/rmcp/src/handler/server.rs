@@ -47,6 +47,35 @@ fn validate_tasks_capability<M: ConstString, H: ServerHandler>(
     }
 }
 
+/// SEP-2640: `skills/*` are unimplemented (`-32601`) unless the server
+/// declares the skills extension; `resources/directory/read` also needs
+/// `directoryRead`.
+fn validate_skills_capability<M: ConstString, H: ServerHandler>(
+    handler: &H,
+    directory_read: bool,
+) -> Result<(), McpError> {
+    let capabilities = handler.get_info().capabilities;
+    let declared = if directory_read {
+        capabilities.supports_directory_read()
+    } else {
+        capabilities.supports_skills()
+    };
+    if !declared {
+        return Err(McpError::method_not_found::<M>());
+    }
+    if capabilities.resources.is_none() {
+        return Err(McpError::internal_error(
+            "the skills extension requires the resources capability",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_handler_result(error: impl std::fmt::Display) -> McpError {
+    McpError::internal_error(format!("handler returned an invalid result: {error}"), None)
+}
+
 impl<H: ServerHandler> Service<RoleServer> for H {
     async fn handle_request(
         &self,
@@ -55,8 +84,8 @@ impl<H: ServerHandler> Service<RoleServer> for H {
     ) -> Result<<RoleServer as ServiceRole>::Resp, McpError> {
         // `context` is moved into the dispatch below, so read the negotiated version first.
         let protocol_version = context.protocol_version();
-        // SEP-2322 (`resultType` discriminator, MRTR) exists from 2026-07-28.
-        let sep_2322_supported = protocol_version
+        // ISO `YYYY-MM-DD` versions compare lexically the same as chronologically.
+        let is_2026_07_28_or_later = protocol_version
             .as_ref()
             .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
         let requested_version = context.meta.protocol_version();
@@ -242,30 +271,60 @@ impl<H: ServerHandler> Service<RoleServer> for H {
                     .await
                     .map(ServerResult::task_ack)
             }
+            ClientRequest::ListSkillsRequest(request) => {
+                validate_skills_capability::<ListSkillsRequestMethod, _>(self, false)?;
+                let result = self.list_skills(request.params, context).await?;
+                validate_skills(&result.skills).map_err(invalid_handler_result)?;
+                Ok(ServerResult::ListSkillsResult(result))
+            }
+            ClientRequest::GetSkillRequest(request) => {
+                validate_skills_capability::<GetSkillRequestMethod, _>(self, false)?;
+                if skill_name_from_uri(&request.params.uri).is_none() {
+                    return Err(McpError::invalid_params(
+                        format!("{} is not the uri of a SKILL.md", request.params.uri),
+                        None,
+                    ));
+                }
+                let uri = request.params.uri.clone();
+                let result = self.get_skill(request.params, context).await?;
+                if result.skill.uri != uri {
+                    return Err(invalid_handler_result(format_args!(
+                        "skill uri {} does not match the request {uri}",
+                        result.skill.uri
+                    )));
+                }
+                result.skill.validate().map_err(invalid_handler_result)?;
+                Ok(ServerResult::GetSkillResult(result))
+            }
+            ClientRequest::ReadResourceDirectoryRequest(request) => {
+                validate_skills_capability::<ReadResourceDirectoryRequestMethod, _>(self, true)?;
+                self.read_resource_directory(request.params, context)
+                    .await
+                    .map(ServerResult::ListResourcesResult)
+            }
         };
         let result = result.and_then(|mut result| {
-            if matches!(result, ServerResult::InputRequiredResult(_)) && !sep_2322_supported {
+            if matches!(result, ServerResult::InputRequiredResult(_)) && !is_2026_07_28_or_later {
                 Err(McpError::invalid_request(
                     "InputRequiredResult requires negotiated protocol version 2026-07-28 or newer",
                     None,
                 ))
             } else {
-                // Peers on protocol versions older than 2026-07-28 keep the
-                // legacy wire shape without `resultType: "complete"`.
-                if !sep_2322_supported {
+                // 2026-07-28 requires caching hints on cacheable results; older
+                // peers keep the legacy shape without `resultType: "complete"`.
+                if is_2026_07_28_or_later {
+                    result.fill_missing_cache_hints();
+                } else {
                     result.strip_result_type_for_legacy_peer();
                 }
                 Ok(result)
             }
         });
 
-        // SEP-2164: peers negotiating 2026-07-28+ get the standard INVALID_PARAMS code for
-        // resource-not-found; older peers keep RESOURCE_NOT_FOUND. ISO `YYYY-MM-DD` versions
-        // compare lexically the same as chronologically.
-        let use_invalid_params =
-            protocol_version.is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+        // Peers on 2026-07-28+ get the standard INVALID_PARAMS code for
+        // resource-not-found; older peers keep RESOURCE_NOT_FOUND.
         result.map_err(|mut error| {
-            if use_invalid_params && error.code == ErrorCode::RESOURCE_NOT_FOUND {
+            if is_2026_07_28_or_later && error.code == ErrorCode::RESOURCE_NOT_FOUND {
                 error.code = ErrorCode::INVALID_PARAMS;
             }
             error
@@ -635,6 +694,41 @@ macro_rules! server_handler_methods {
             let _ = (request, context);
             std::future::ready(Err(McpError::method_not_found::<CancelTaskMethod>()))
         }
+
+        /// SEP-2640 `skills/list`: one page of the skills this server serves.
+        fn list_skills(
+            &self,
+            request: Option<PaginatedRequestParams>,
+            context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ListSkillsResult, McpError>> + MaybeSendFuture + '_ {
+            let _ = (request, context);
+            std::future::ready(Err(McpError::method_not_found::<ListSkillsRequestMethod>()))
+        }
+
+        /// SEP-2640 `skills/get`: the entry for one skill, or `-32602` when the
+        /// server does not serve a skill at that URI.
+        fn get_skill(
+            &self,
+            request: GetSkillRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<GetSkillResult, McpError>> + MaybeSendFuture + '_ {
+            let _ = (request, context);
+            std::future::ready(Err(McpError::method_not_found::<GetSkillRequestMethod>()))
+        }
+
+        /// SEP-2640 `resources/directory/read`: the direct children of a
+        /// directory resource, or `-32602` when the URI is not a directory.
+        fn read_resource_directory(
+            &self,
+            request: ReadResourceDirectoryRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<ReadResourceDirectoryResult, McpError>> + MaybeSendFuture + '_
+        {
+            let _ = (request, context);
+            std::future::ready(Err(McpError::method_not_found::<
+                ReadResourceDirectoryRequestMethod,
+            >()))
+        }
     };
 }
 
@@ -865,6 +959,33 @@ macro_rules! impl_server_handler_for_wrapper {
                 context: RequestContext<RoleServer>,
             ) -> impl Future<Output = Result<(), McpError>> + MaybeSendFuture + '_ {
                 (**self).cancel_task(request, context)
+            }
+
+            fn list_skills(
+                &self,
+                request: Option<PaginatedRequestParams>,
+                context: RequestContext<RoleServer>,
+            ) -> impl Future<Output = Result<ListSkillsResult, McpError>> + MaybeSendFuture + '_
+            {
+                (**self).list_skills(request, context)
+            }
+
+            fn get_skill(
+                &self,
+                request: GetSkillRequestParams,
+                context: RequestContext<RoleServer>,
+            ) -> impl Future<Output = Result<GetSkillResult, McpError>> + MaybeSendFuture + '_ {
+                (**self).get_skill(request, context)
+            }
+
+            fn read_resource_directory(
+                &self,
+                request: ReadResourceDirectoryRequestParams,
+                context: RequestContext<RoleServer>,
+            ) -> impl Future<Output = Result<ReadResourceDirectoryResult, McpError>>
+            + MaybeSendFuture
+            + '_ {
+                (**self).read_resource_directory(request, context)
             }
         }
     };

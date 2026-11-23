@@ -1,6 +1,6 @@
 //! Non-interactive enterprise-managed authorization (EMA/XAA) token exchanges.
 //!
-//! Exchanges an enterprise refresh token for an ID-JAG, then for an MCP access
+//! Exchanges an enterprise ID token or refresh token for an ID-JAG, then for an MCP access
 //! token. Callers must discover and approve both servers and their registrations
 //! before supplying a credential. This module does not discover servers, log in,
 //! persist credentials, or decide when to reauthenticate.
@@ -56,6 +56,8 @@ use super::{
 };
 
 const ID_JAG_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id-jag";
+const ID_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
+const REFRESH_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:refresh_token";
 
 /// Authentication approved for a pre-registered client at one authorization server.
 ///
@@ -164,12 +166,33 @@ impl EmaAuthorizationServer {
     }
 }
 
-/// A refresh-token exchange bound to one MCP resource and two registered clients.
+enum EmaSubjectToken<'a> {
+    RefreshToken(&'a RefreshToken),
+    IdToken(&'a str),
+}
+
+impl EmaSubjectToken<'_> {
+    fn secret(&self) -> &str {
+        match self {
+            Self::RefreshToken(token) => token.secret(),
+            Self::IdToken(token) => token,
+        }
+    }
+
+    fn token_type(&self) -> &'static str {
+        match self {
+            Self::RefreshToken(_) => REFRESH_TOKEN_TYPE,
+            Self::IdToken(_) => ID_TOKEN_TYPE,
+        }
+    }
+}
+
+/// An identity token exchange bound to one MCP resource and two registered clients.
 pub struct EmaExchangeRequest<'a> {
     idp: EmaAuthorizationServer,
     resource_as: EmaAuthorizationServer,
     resource: &'a str,
-    refresh_token: &'a RefreshToken,
+    subject_token: EmaSubjectToken<'a>,
     scopes: Vec<String>,
 }
 
@@ -185,7 +208,24 @@ impl<'a> EmaExchangeRequest<'a> {
             idp,
             resource_as,
             resource,
-            refresh_token,
+            subject_token: EmaSubjectToken::RefreshToken(refresh_token),
+            scopes: Vec::new(),
+        }
+    }
+
+    /// Exchange an OIDC ID token issued by the approved IdP to this client.
+    /// The caller owns ID-token freshness and renewal; there is no refresh-token fallback.
+    pub fn new_with_id_token(
+        idp: EmaAuthorizationServer,
+        resource_as: EmaAuthorizationServer,
+        resource: &'a str,
+        id_token: &'a str,
+    ) -> Self {
+        Self {
+            idp,
+            resource_as,
+            resource,
+            subject_token: EmaSubjectToken::IdToken(id_token),
             scopes: Vec::new(),
         }
     }
@@ -202,7 +242,7 @@ impl<'a> EmaExchangeRequest<'a> {
     }
 
     /// Obtain an ID-JAG without redirects or retries, checking its resource/client bindings.
-    /// The returned assertion does not retain the enterprise refresh token.
+    /// The returned assertion does not retain the enterprise subject token.
     pub async fn exchange_id_jag(
         self,
         idp_http: &dyn OAuthHttpClient,
@@ -223,10 +263,10 @@ impl<'a> EmaExchangeRequest<'a> {
         }
         if self.idp.client_id.trim().is_empty()
             || self.resource_as.client_id.trim().is_empty()
-            || self.refresh_token.secret().trim().is_empty()
+            || self.subject_token.secret().trim().is_empty()
         {
             return Err(EmaError::InvalidRequest(
-                "client IDs and refresh token must not be empty",
+                "client IDs and subject token must not be empty",
             ));
         }
         self.idp.client_authentication.validate()?;
@@ -243,11 +283,8 @@ impl<'a> EmaExchangeRequest<'a> {
                 "urn:ietf:params:oauth:grant-type:token-exchange",
             ),
             ("requested_token_type", ID_JAG_TOKEN_TYPE),
-            (
-                "subject_token_type",
-                "urn:ietf:params:oauth:token-type:refresh_token",
-            ),
-            ("subject_token", self.refresh_token.secret()),
+            ("subject_token_type", self.subject_token.token_type()),
+            ("subject_token", self.subject_token.secret()),
             ("audience", self.resource_as.issuer.as_str()),
             ("resource", self.resource),
         ];
@@ -556,6 +593,14 @@ impl Resource {
             Self::Multiple(values) => values.as_slice() == [expected],
         }
     }
+
+    /// Distinguishes an omitted claim (`None` via `serde(default)`) from an explicit `null`,
+    /// which is rejected.
+    fn deserialize_present<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Self>, D::Error> {
+        Self::deserialize(deserializer).map(Some)
+    }
 }
 
 #[derive(Deserialize)]
@@ -573,7 +618,10 @@ struct IdJagClaims {
     jti: String,
     exp: u64,
     iat: u64,
-    resource: Resource,
+    /// OPTIONAL per draft-ietf-oauth-identity-assertion-authz-grant; when present, the
+    /// MCP EMA profile requires it to be the MCP server's resource identifier.
+    #[serde(default, deserialize_with = "Resource::deserialize_present")]
+    resource: Option<Resource>,
     scope: Option<String>,
     authorization_details: Option<Vec<serde_json::Value>>,
 }
@@ -647,11 +695,14 @@ impl IdJagResponse {
         if claims.exp <= now || claims.iat > now.saturating_add(60) {
             return Err(invalid("expired or future-issued ID-JAG"));
         }
-        if !claims.resource.is_exact(request.resource)
-            || self
-                .resource
-                .as_ref()
-                .is_some_and(|r| !r.is_exact(request.resource))
+        // Without a resource claim, the ID-JAG is bound to the resource AS by `aud` alone.
+        if [&claims.resource, &self.resource]
+            .into_iter()
+            .any(|resource| {
+                resource
+                    .as_ref()
+                    .is_some_and(|r| !r.is_exact(request.resource))
+            })
         {
             return Err(invalid("ID-JAG resource mismatch"));
         }

@@ -242,6 +242,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — security wave (Aikido/RUSTSEC): root-lock cookie/url/rustix bumps, `rmcp` re-vendored 3.5.0 → 3.9.0 with the codesearch bridge re-applied and a fresh vendor lock (webpki-root-certs, rustls-webpki, quinn-udp, ctutils, tokio, rustix, url), and a direct `Microsoft.Build.Tasks.Core` 17.14.8 reference in the C# helper (CVE-2025-26646; Roslyn stays 4.13). Aikido-unfixable pins (rand/weezl/moxcms/lzma-rust2/bincode/paste) and both SAST groups are ignored in the dashboard with per-finding reasons.
+
 - **Pending** — all Claude Code guard hooks run natively: `codesearch hook grep-guard` / `subagent-preamble` / `web-guard` / `edit-guard` / `edit-guard-post` subcommands replace the per-call pwsh/bash script spawns (~7.4 s per Edit → single fast process), `hooks claude install` registers the binary's own subcommands, writes no script files and migrates pre-native script registrations away on re-install; the script twins stay in `integrations/` as the contract reference.
 
 - **Pending** — hidden-folder registrations refused: paths with a dot-prefixed component (`.tmpXXXX` scratch, `.opencode/worktrees`) get no index at either registration site (serve `POST /repos` + CLI `index add`, force override), matching the post-checkout hook's skip; linked worktrees at ordinary paths stay indexable.

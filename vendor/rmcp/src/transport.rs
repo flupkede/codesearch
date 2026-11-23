@@ -91,7 +91,7 @@ pub use child_process::{ConfigureCommandExt, TokioChildProcess};
 #[cfg(feature = "transport-io")]
 pub mod io;
 #[cfg(feature = "transport-io")]
-pub use io::stdio;
+pub use io::{StdioReader, StdioWriter, stdio, stdio_pipes};
 
 #[cfg(feature = "auth")]
 pub mod auth;
@@ -103,8 +103,8 @@ pub use auth::{
     AuthorizedHttpClient, ClientCredentialsConfig, CredentialRefreshGuard, CredentialStore,
     EXTENSION_OAUTH_CLIENT_CREDENTIALS, InMemoryCredentialStore, InMemoryStateStore,
     OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRedirectPolicy,
-    OAuthHttpRequest, ScopeUpgradeConfig, StateStore, StoredAuthorizationState, StoredCredentials,
-    WWWAuthenticateParams,
+    OAuthHttpRequest, ProtectedResourceMetadataInvalidReason, ScopeUpgradeConfig, StateStore,
+    StoredAuthorizationState, StoredCredentials, WWWAuthenticateParams,
 };
 
 // #[cfg(feature = "transport-ws")]
@@ -272,6 +272,7 @@ impl DynamicTransportError {
         }
     }
 
+    #[cfg(feature = "client")]
     pub(crate) fn is_authorization_required(&self) -> bool {
         let mut error = Some(self.error.as_ref() as &(dyn std::error::Error + 'static));
         while let Some(current) = error {

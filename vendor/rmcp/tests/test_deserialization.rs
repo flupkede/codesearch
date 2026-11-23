@@ -106,6 +106,37 @@ mod untagged_server_result {
     }
 
     #[test]
+    fn meta_does_not_shadow_custom_result() {
+        // `_meta` can appear on any result, so it alone must not make
+        // CallToolResult swallow a custom result (e.g. SEP-2640 skills/list).
+        let payload = json!({
+            "resultType": "complete",
+            "skills": [{ "uri": "skill://a/SKILL.md" }],
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "_meta": { "x": true }
+        });
+        let result = parse_result(wrap_response(payload.clone()));
+        let ServerResult::CustomResult(result) = result else {
+            panic!("expected CustomResult, got {result:?}");
+        };
+        assert_eq!(result.0, payload);
+    }
+
+    #[test]
+    fn call_tool_result_with_meta_deserializes_to_correct_variant() {
+        let result = parse_result(wrap_response(json!({
+            "content": [{ "type": "text", "text": "hi" }],
+            "_meta": {}
+        })));
+        let ServerResult::CallToolResult(result) = result else {
+            panic!("expected CallToolResult, got {result:?}");
+        };
+        assert_eq!(result.content.len(), 1);
+        assert!(result.meta.is_some());
+    }
+
+    #[test]
     fn input_required_result_with_meta_deserializes_to_correct_variant() {
         let result = parse_result(wrap_response(json!({
             "resultType": "input_required",
@@ -395,5 +426,64 @@ mod arbitrary_precision {
         assert_eq!(amount.minimum, Some(0.5));
         assert_eq!(amount.maximum, Some(9.5));
         assert_eq!(amount.default, Some(1.5));
+    }
+}
+
+/// A message that carries `id` and `method` is a request. When the `id` is not
+/// one the SDK can represent, the message is invalid; it must not be read as a
+/// notification, which would leave the peer waiting for a response.
+mod request_id {
+    use rmcp::model::{ClientJsonRpcMessage, JsonRpcMessage, NumberOrString};
+
+    fn parse(id: &str, method: &str) -> Result<ClientJsonRpcMessage, serde_json::Error> {
+        serde_json::from_str(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}"}}"#
+        ))
+    }
+
+    #[test]
+    fn request_with_unusable_id_is_rejected() {
+        for id in [
+            "9223372036854775808",
+            "1.5",
+            "9007199254740993.0",
+            "true",
+            "[1]",
+            "{}",
+        ] {
+            for method in ["ping", "tools/list", "notifications/initialized"] {
+                let result = parse(id, method);
+                assert!(
+                    result.is_err(),
+                    "id {id} with method {method} parsed as {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integral_id_in_float_form_is_that_integer() {
+        for (id, expected) in [("1.0", 1), ("1e2", 100), ("-3.0", -3)] {
+            let JsonRpcMessage::Request(request) = parse(id, "ping").unwrap() else {
+                panic!("id {id} did not parse as a request");
+            };
+            assert_eq!(request.id, NumberOrString::Number(expected), "id {id}");
+        }
+    }
+
+    #[test]
+    fn largest_i64_id_is_kept() {
+        let JsonRpcMessage::Request(request) = parse("9223372036854775807", "ping").unwrap() else {
+            panic!("expected a request");
+        };
+        assert_eq!(request.id, NumberOrString::Number(i64::MAX));
+    }
+
+    #[test]
+    fn notification_still_parses() {
+        let message: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .unwrap();
+        assert!(matches!(message, JsonRpcMessage::Notification(_)));
     }
 }

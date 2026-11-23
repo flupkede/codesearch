@@ -18,7 +18,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::common::client_side_sse::{
-    DEFAULT_MAX_SSE_EVENT_SIZE, ExponentialBackoff, SseRetryPolicy, SseStreamReconnect,
+    DEFAULT_MAX_SSE_EVENT_SIZE, ExponentialBackoff, ReconnectErrorDisposition, SseRetryPolicy,
+    SseStreamReconnect,
 };
 use crate::{
     RoleClient,
@@ -176,6 +177,41 @@ impl InsufficientScopeError {
     }
 }
 
+pub(crate) const MAX_RETRY_AFTER_BYTES: usize = 128;
+
+/// Body-free HTTP failure metadata.
+///
+/// The built-in reqwest client returns this for HTTP 429 and 5xx responses.
+/// HTTP 429 is classified without reading the body. JSON POST 5xx responses
+/// containing a valid JSON-RPC error retain that error instead.
+/// No response body, request URL, credentials, or other headers are retained.
+#[derive(Debug, Error)]
+#[error("HTTP {status}")]
+#[non_exhaustive]
+pub struct HttpStatusError {
+    /// HTTP status code (429 or 500..=599 for the built-in reqwest client).
+    pub status: u16,
+    /// First raw `Retry-After` value, if valid UTF-8 and at most 128 bytes.
+    ///
+    /// This is not parsed as a delay or date; callers decide whether and when
+    /// to retry. Missing, oversized, or invalid UTF-8 values become `None`.
+    pub retry_after: Option<String>,
+}
+
+impl HttpStatusError {
+    /// Create HTTP failure metadata for a custom transport backend.
+    ///
+    /// `retry_after` is retained without parsing if it is at most 128 bytes;
+    /// oversized values are discarded. No status-code restriction is imposed
+    /// on custom backends.
+    pub fn new(status: u16, retry_after: Option<String>) -> Self {
+        Self {
+            status,
+            retry_after: retry_after.filter(|value| value.len() <= MAX_RETRY_AFTER_BYTES),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
@@ -185,10 +221,16 @@ pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
     Io(#[from] std::io::Error),
     #[error("Client error: {0}")]
     Client(E),
+    /// HTTP failure metadata from a transport backend.
+    #[error(transparent)]
+    HttpStatus(#[from] HttpStatusError),
     #[error("unexpected end of stream")]
     UnexpectedEndOfStream,
     #[error("unexpected server response: {0}")]
     UnexpectedServerResponse(Cow<'static, str>),
+    /// A non-streaming HTTP response exceeded the client's byte limit.
+    #[error("HTTP response body exceeded the maximum size of {max_size} bytes")]
+    ResponseBodyTooLarge { max_size: usize },
     #[error("Unexpected content type: {0:?}")]
     UnexpectedContentType(Option<String>),
     #[error("Server does not support SSE")]
@@ -217,6 +259,9 @@ pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
     /// Session recovery timed out. The server may have processed an interrupted POST.
     #[error("Session recovery timed out; the server may have processed the POST")]
     SessionRecoveryTimeout,
+    /// The server answered the session re-initialization with a JSON-RPC error.
+    #[error("Session re-initialization failed: {0}")]
+    ReinitializationFailed(ErrorData),
     /// A cancellation or reply POST did not finish in time.
     #[error("Control POST timed out")]
     ControlRequestTimeout,
@@ -314,7 +359,10 @@ impl StreamableHttpPostResponse {
 
                     let message: ServerJsonRpcMessage = serde_json::from_str(&payload)?;
 
-                    if matches!(message, ServerJsonRpcMessage::Response(_)) {
+                    if matches!(
+                        message,
+                        ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+                    ) {
                         return Ok((message, session_id));
                     }
 
@@ -406,6 +454,14 @@ pub(super) fn legacy_discover_response(
 }
 
 /// HTTP backend used by [`StreamableHttpClientTransport`].
+///
+/// The built-in reqwest and Unix socket clients limit successful JSON response
+/// bodies to 16 MiB and non-success response bodies to 64 KiB. These fixed limits
+/// count bytes before parsing (after decompression, when enabled in reqwest),
+/// independently of the SSE event-size setting. Oversized bodies are rejected,
+/// not truncated and parsed; reqwest JSON 5xx failures retain HTTP status metadata.
+/// Custom clients must enforce their own limits on non-streaming response bodies.
+/// These are size limits, not timeouts for servers that stop sending data.
 ///
 /// Custom implementations that parse SSE responses must override
 /// [`Self::post_message_with_max_sse_event_size`] and
@@ -542,6 +598,16 @@ impl<C: StreamableHttpClient> SseStreamReconnect for StreamableHttpClientReconne
                 )
                 .await
         })
+    }
+
+    fn classify_reconnect_error(&self, error: &Self::Error) -> ReconnectErrorDisposition {
+        match error {
+            // Repeating GET cannot enable SSE or repair the cloned credentials.
+            StreamableHttpError::ServerDoesNotSupportSse
+            | StreamableHttpError::AuthRequired(_)
+            | StreamableHttpError::InsufficientScope(_) => ReconnectErrorDisposition::Terminate,
+            _ => ReconnectErrorDisposition::Retry,
+        }
     }
 
     fn map_fatal_stream_error(&mut self, error: SseError) -> Option<Self::Error> {
@@ -988,7 +1054,8 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
     /// protocol version, sends `notifications/initialized`, and returns the new
     /// `(session_id, protocol_headers)` pair.  The init result message is **not**
     /// forwarded to the handler because the handler already processed the original
-    /// initialization.
+    /// initialization. If the server answers the initialize with a JSON-RPC error,
+    /// returns an error without sending `notifications/initialized`.
     async fn perform_reinitialization(
         client: C,
         saved_init_request: ClientJsonRpcMessage,
@@ -1016,6 +1083,9 @@ impl<C: StreamableHttpClient> StreamableHttpClientWorker<C> {
             .await?
             .expect_initialized::<C::Error>()
             .await?;
+        if let ServerJsonRpcMessage::Error(error) = init_msg {
+            return Err(StreamableHttpError::ReinitializationFailed(error.error));
+        }
 
         let new_session_id: Option<Arc<str>> = new_session_id_str.map(|s| Arc::from(s.as_str()));
 
@@ -2541,6 +2611,46 @@ mod tests {
                 cache.keys().map(String::as_str).collect::<Vec<_>>(),
             ),
             (vec!["valid"], vec!["valid"])
+        );
+    }
+
+    #[test]
+    fn cache_tools_keeps_nested_annotations_and_drops_array_annotations() {
+        let nested = tool(
+            "nested",
+            json!({
+                "type": "object",
+                "properties": { "region": { "type": "string", "x-mcp-header": "Region" } },
+            }),
+        );
+        let in_items = tool(
+            "in_items",
+            json!({ "type": "array", "items": { "type": "string", "x-mcp-header": "Item" } }),
+        );
+        let mut message = ServerJsonRpcMessage::response(
+            ServerResult::ListToolsResult(ListToolsResult::with_all_items(vec![nested, in_items])),
+            NumberOrString::Number(1),
+        );
+        let mut cache = HashMap::new();
+
+        cache_tools_from_response(&mut cache, &mut message, &ProtocolVersion::V_2026_07_28);
+
+        let ServerJsonRpcMessage::Response(response) = &mut message else {
+            panic!("expected tools/list response");
+        };
+        let ServerResult::ListToolsResult(result) = &mut response.result else {
+            panic!("expected tools/list result");
+        };
+        assert_eq!(
+            (
+                result
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_ref())
+                    .collect::<Vec<_>>(),
+                cache.keys().map(String::as_str).collect::<Vec<_>>(),
+            ),
+            (vec!["nested"], vec!["nested"])
         );
     }
 

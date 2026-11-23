@@ -24,8 +24,11 @@
     <!-- GeneratorSupportTests registers the real .NET SDK MSBuild so the
          Blazor fixture loads with its Razor generator references intact. -->
     <PackageReference Include="Microsoft.Build.Locator" Version="1.9.1" />
-    <!-- Same transitive-CVE suppressions as scip-csharp.csproj (never-used
-         DownloadFile task surface). -->
+    <!-- Aikido 59399549: direct Tasks.Core 17.14.8 overrides the vulnerable
+         transitive 17.7.2 (nearest-wins); see scip-csharp.csproj. -->
+    <PackageReference Include="Microsoft.Build.Tasks.Core" Version="17.14.8" ExcludeAssets="runtime" />
+    <!-- Same remaining transitive-CVE suppressions as scip-csharp.csproj
+         (never-used DownloadFile task surface). -->
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-h4j7-5rxr-p4wc" />
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-w3q9-fxm7-j8fq" />
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-37gx-xxp4-5rgx" />

@@ -1,5 +1,6 @@
 [package]
 name = "rmcp"
+exclude = ["tests/test_package_license.rs"]
 license = { workspace = true }
 version = { workspace = true }
 edition = { workspace = true }
@@ -68,9 +69,11 @@ schemars = { version = "1.0", optional = true, features = ["chrono04"] }
 # for image encoding
 base64 = { version = "0.23", optional = true }
 
+# SHA-256 for SEP-2640 skill digests and SEP-2322 requestState sealing
+sha2 = "0.11"
+
 # for SEP-2322 requestState integrity sealing (opt-in via the `request-state` feature)
 hmac = { version = "0.13", optional = true }
-sha2 = { version = "0.11", optional = true }
 zeroize = { version = "1", optional = true }
 
 # for HTTP client
@@ -121,6 +124,11 @@ chrono = { version = "0.4.38", default-features = false, features = [
   "oldtime",
 ] }
 
+# the stdio pipe transport reopens `/proc/self/fd` with `O_NONBLOCK`;
+# the child process transport sends `SIGTERM` during graceful shutdown
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["base64", "macros", "server"]
 local = ["rmcp-macros?/local"]
@@ -130,7 +138,7 @@ macros = ["dep:rmcp-macros", "dep:pastey"]
 elicitation = ["dep:url"]
 
 # SEP-2322 requestState integrity helper (HMAC-SHA256 seal/open codec)
-request-state = ["dep:hmac", "dep:sha2", "dep:zeroize", "base64"]
+request-state = ["dep:hmac", "dep:zeroize", "base64"]
 
 # reqwest http client
 __reqwest = ["dep:reqwest"]
@@ -173,7 +181,7 @@ transport-streamable-http-client-unix-socket = [
 ]
 
 transport-async-rw = ["tokio/io-util", "tokio-util/codec"]
-transport-io = ["transport-async-rw", "tokio/io-std"]
+transport-io = ["transport-async-rw", "tokio/io-std", "tokio/net"]
 transport-child-process = [
   "transport-async-rw",
   "tokio/process",
@@ -215,7 +223,7 @@ tracing-subscriber = { version = "0.3", features = [
   "fmt",
 ] }
 async-trait = "0.1"
-rstest = "0.27.0"
+rstest = "0.28.0"
 # Cargo unifies this feature into rmcp whenever any crate in a build enables it,
 # so the tests run with it on (see tests/test_deserialization.rs).
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
@@ -360,6 +368,14 @@ required-features = [
 ]
 path = "tests/test_streamable_http_malformed_json_request.rs"
 
+[[test]]
+name = "test_streamable_http_initialize_error"
+required-features = [
+  "client",
+  "transport-streamable-http-client",
+  "transport-streamable-http-client-reqwest",
+]
+path = "tests/test_streamable_http_initialize_error.rs"
 
 [[test]]
 name = "test_custom_request"
@@ -370,6 +386,11 @@ path = "tests/test_custom_request.rs"
 name = "test_trace_context"
 required-features = ["server", "client"]
 path = "tests/test_trace_context.rs"
+
+[[test]]
+name = "test_abandoned_request_cancel"
+required-features = ["server", "client"]
+path = "tests/test_abandoned_request_cancel.rs"
 
 [[test]]
 name = "test_mrtr_behavior"
@@ -483,3 +504,18 @@ path = "tests/test_streamable_http_disconnect_cancel.rs"
 name = "test_sep_2260_stream_routing"
 required-features = ["server", "elicitation", "transport-streamable-http-server", "reqwest"]
 path = "tests/test_sep_2260_stream_routing.rs"
+
+[[test]]
+name = "test_streamable_http_status_metadata"
+path = "tests/test_streamable_http_status_metadata.rs"
+required-features = ["transport-streamable-http-client", "transport-streamable-http-client-reqwest"]
+
+[[test]]
+name = "test_streamable_http_response_limits"
+path = "tests/test_streamable_http_response_limits.rs"
+required-features = ["transport-streamable-http-client-reqwest"]
+
+[[test]]
+name = "test_unix_socket_response_limits"
+path = "tests/test_unix_socket_response_limits.rs"
+required-features = ["transport-streamable-http-client-unix-socket"]

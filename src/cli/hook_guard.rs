@@ -1399,12 +1399,12 @@ codesearch tools are DEFERRED: they do NOT appear in your tool list until you lo
 Load them first (before any Grep or Glob):\n\
   ToolSearch(\"select:mcp__codesearch__search,mcp__codesearch__find,mcp__codesearch__explore,mcp__codesearch__get_chunk\")\n\n\
 Then use:\n\
-  mcp__codesearch__search(query, mode=\"semantic\")             -- concepts, identifiers, cross-file lookup\n\
+  mcp__codesearch__search(query, mode=\"semantic\")  -- concepts, identifiers, cross-file lookup\n\
   mcp__codesearch__search(query, mode=\"literal\", regex=true)  -- exact patterns / regex\n\
-  mcp__codesearch__find(symbol, kind=\"definition\")             -- where a symbol is defined\n\
-  mcp__codesearch__find(symbol, kind=\"usages\")                 -- all call sites\n\
-  mcp__codesearch__explore(target, kind=\"outline\")             -- file/class structure\n\
-  mcp__codesearch__get_chunk(chunk_id)                         -- read a specific code chunk\n\n\
+  mcp__codesearch__find(symbol, kind=\"definition\")  -- where a symbol is defined\n\
+  mcp__codesearch__find(symbol, kind=\"usages\")  -- all call sites\n\
+  mcp__codesearch__explore(target, kind=\"outline\")  -- file/class structure\n\
+  mcp__codesearch__get_chunk(chunk_id)  -- read a specific code chunk\n\n\
 Multi-repo serve mode: if a call returns \"scope_required\" or \"Unknown alias\",\n\
 add project=\"<repo-alias>\" (single repo) or group=\"<group>\" (cross-repo). The\n\
 error response lists the valid available_projects / available_groups — pick\n\
