@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "codesearch"
-version = "1.8.17"
+version = "1.8.18"
 dependencies = [
  "anyhow",
  "async-trait",
