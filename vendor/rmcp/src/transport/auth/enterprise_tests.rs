@@ -122,35 +122,56 @@ fn authenticated_form(request: &OAuthHttpRequest) -> BTreeMap<String, String> {
 }
 
 #[tokio::test]
-async fn refresh_exchange_preserves_exact_forms_and_signed_narrowing() {
-    for scopes in ["files.read files.write", ""] {
-        let response = jag(&claims());
-        let idp = MockHttp::new(200, response.clone());
-        let result = exchange(&idp, scopes).await.unwrap();
-        assert_eq!(
-            result.assertion().secret(),
-            response["access_token"].as_str().unwrap()
-        );
-        assert_eq!(result.scopes(), &HashSet::from(["files.read".to_owned()]));
-        assert!(!format!("{result:?}").contains(result.assertion().secret()));
-        assert!(!format!("{result:?}").contains("private-query"));
-        let requests = idp.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].request.uri(), IDP_TOKEN);
-        let mut fields = form(&requests[0]);
-        assert_eq!(
-            fields.remove("scope"),
-            (!scopes.is_empty()).then(|| scopes.to_owned())
-        );
-        assert_eq!(
-            serde_json::to_value(fields).unwrap(),
-            json!({
-                "grant_type":"urn:ietf:params:oauth:grant-type:token-exchange",
-                "requested_token_type":ID_JAG_TOKEN_TYPE,"subject_token":"refresh-token",
-                "subject_token_type":"urn:ietf:params:oauth:token-type:refresh_token",
-                "audience":AS,"resource":RESOURCE,"client_id":"idp"
-            })
-        );
+async fn subject_exchange_preserves_exact_forms_and_signed_narrowing() {
+    for id_token in [None, Some("oidc-id-token")] {
+        for scopes in ["files.read files.write", ""] {
+            let response = jag(&claims());
+            let idp = MockHttp::new(200, response.clone());
+            let refresh = RefreshToken::new("refresh-token".into());
+            let idp_registration = EmaAuthorizationServer::new(IDP, IDP_TOKEN, "idp");
+            let resource_registration = EmaAuthorizationServer::new(AS, AS_TOKEN, "mcp");
+            let request = match id_token {
+                Some(id_token) => EmaExchangeRequest::new_with_id_token(
+                    idp_registration,
+                    resource_registration,
+                    RESOURCE,
+                    id_token,
+                ),
+                None => EmaExchangeRequest::new(
+                    idp_registration,
+                    resource_registration,
+                    RESOURCE,
+                    &refresh,
+                ),
+            }
+            .with_scopes(scopes.split_ascii_whitespace());
+            assert!(!format!("{request:?}").contains(id_token.unwrap_or("refresh-token")));
+            let result = request.exchange_id_jag(&idp).await.unwrap();
+            assert_eq!(
+                result.assertion().secret(),
+                response["access_token"].as_str().unwrap()
+            );
+            assert_eq!(result.scopes(), &HashSet::from(["files.read".to_owned()]));
+            assert!(!format!("{result:?}").contains(result.assertion().secret()));
+            assert!(!format!("{result:?}").contains("private-query"));
+            let requests = idp.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].request.uri(), IDP_TOKEN);
+            let mut fields = form(&requests[0]);
+            assert_eq!(
+                fields.remove("scope"),
+                (!scopes.is_empty()).then(|| scopes.to_owned())
+            );
+            assert_eq!(
+                serde_json::to_value(fields).unwrap(),
+                json!({
+                    "grant_type":"urn:ietf:params:oauth:grant-type:token-exchange",
+                    "requested_token_type":ID_JAG_TOKEN_TYPE,"subject_token":id_token.unwrap_or("refresh-token"),
+                    "subject_token_type":if id_token.is_some() { "urn:ietf:params:oauth:token-type:id_token" } else { "urn:ietf:params:oauth:token-type:refresh_token" },
+                    "audience":AS,"resource":RESOURCE,"client_id":"idp"
+                })
+            );
+        }
     }
 }
 
@@ -316,6 +337,76 @@ async fn invalid_jags_never_escape_validation() {
 }
 
 #[tokio::test]
+async fn resource_claim_may_be_omitted_but_must_match_when_present() {
+    for (signed, echoed, valid) in [
+        (None, None, true),
+        (None, Some(json!(RESOURCE)), true),
+        (None, Some(json!("https://other.example")), false),
+        (Some(json!(RESOURCE)), None, true),
+        (Some(json!([RESOURCE])), None, true),
+        (Some(json!("https://other.example")), None, false),
+        (Some(json!([RESOURCE, "other"])), None, false),
+        (Some(json!("")), None, false),
+        (Some(json!([])), None, false),
+        (Some(Value::Null), None, false),
+    ] {
+        let mut claims = claims();
+        claims.as_object_mut().unwrap().remove("resource");
+        if let Some(resource) = &signed {
+            claims["resource"] = resource.clone();
+        }
+        let mut response = jag(&claims);
+        response.as_object_mut().unwrap().remove("resource");
+        if let Some(resource) = &echoed {
+            response["resource"] = resource.clone();
+        }
+        let result = exchange(&MockHttp::new(200, response), "files.read").await;
+        assert_eq!(
+            result.is_ok(),
+            valid,
+            "signed={signed:?}, echoed={echoed:?}"
+        );
+        if !valid {
+            assert!(matches!(
+                result,
+                Err(EmaError::InvalidResponse { stage: Idp, .. })
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_assertion_without_a_resource_claim_is_redeemed_for_the_requested_resource() {
+    let mut claims = claims();
+    claims.as_object_mut().unwrap().remove("resource");
+    let mut response = jag(&claims);
+    response.as_object_mut().unwrap().remove("resource");
+    let idp = MockHttp::new(200, response.clone());
+    let resource_as = MockHttp::new(200, bearer());
+    let refresh = RefreshToken::new("refresh-token".into());
+    let token = EmaExchangeRequest::new(
+        EmaAuthorizationServer::new(IDP, IDP_TOKEN, "idp"),
+        EmaAuthorizationServer::new(AS, AS_TOKEN, "mcp"),
+        RESOURCE,
+        &refresh,
+    )
+    .with_scopes(["files.read"])
+    .exchange(&idp, &resource_as)
+    .await
+    .unwrap();
+    assert_eq!(token.access_token.secret(), "resource-token");
+    let requests = resource_as.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        serde_json::to_value(form(&requests[0])).unwrap(),
+        json!({
+            "grant_type":"urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion":response["access_token"],"client_id":"mcp"
+        })
+    );
+}
+
+#[tokio::test]
 async fn invalid_inputs_fail_before_http() {
     // Each server occupies issuer, token endpoint, and client ID slots.
     let original = [IDP, IDP_TOKEN, "idp", AS, AS_TOKEN, "mcp", RESOURCE, "rt"];
@@ -342,18 +433,23 @@ async fn invalid_inputs_fail_before_http() {
     }
     cases.push((original, vec!["files.read", "files.read"]));
     for (fields, scopes) in cases {
-        let http = MockHttp::default();
-        let result = EmaExchangeRequest::new(
-            EmaAuthorizationServer::new(fields[0], fields[1], fields[2]),
-            EmaAuthorizationServer::new(fields[3], fields[4], fields[5]),
-            fields[6],
-            &RefreshToken::new(fields[7].into()),
-        )
-        .with_scopes(scopes)
-        .exchange_id_jag(&http)
-        .await;
-        assert!(matches!(result, Err(EmaError::InvalidRequest(_))));
-        assert!(http.requests.lock().unwrap().is_empty());
+        for use_id_token in [false, true] {
+            let http = MockHttp::default();
+            let refresh = RefreshToken::new(fields[7].into());
+            let idp = EmaAuthorizationServer::new(fields[0], fields[1], fields[2]);
+            let resource_as = EmaAuthorizationServer::new(fields[3], fields[4], fields[5]);
+            let request = if use_id_token {
+                EmaExchangeRequest::new_with_id_token(idp, resource_as, fields[6], fields[7])
+            } else {
+                EmaExchangeRequest::new(idp, resource_as, fields[6], &refresh)
+            };
+            let result = request
+                .with_scopes(scopes.iter().copied())
+                .exchange_id_jag(&http)
+                .await;
+            assert!(matches!(result, Err(EmaError::InvalidRequest(_))));
+            assert!(http.requests.lock().unwrap().is_empty());
+        }
     }
 }
 
