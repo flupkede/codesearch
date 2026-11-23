@@ -37,7 +37,12 @@ finalized in place with a date — no renaming/migration step needed.
   grep-guard's /healthz + /indexing probes, wait cap and Bash grep-family
   detector; web-guard's mount topic scoping and 5-minute retry cache; the
   preamble's marker idempotency; the preamble skips empty prompts, which
-  the twins rewrite but which fail downstream regardless). The `.ps1`/`.sh`
+  the twins rewrite but which fail downstream regardless), with one
+  deliberate divergence: the native grep-guard issues a single long-poll
+  `/indexing?wait=<cap>` request (PR above) instead of the twins' 3 s probe
+  loop — it denies the moment the rebuild lands, opens Grep on a hold that
+  expires still-indexing, and falls back to short probes only for a hub
+  without `waited_ms`. The `.ps1`/`.sh`
   twins stay in `integrations/claude-code/hooks/` as the contract reference
   for the script-based install path.
 

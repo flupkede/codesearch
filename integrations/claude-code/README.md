@@ -62,13 +62,17 @@ that make the preference *structural* instead of advisory:
   dead server, so it does **not** unblock Grep. One exception: when the
    target repo is live but **mid-reindex** (the serve watcher's full
    refresh, e.g. right after a branch switch), the hook waits the rebuild
-   out itself — polling `GET /indexing?path=<repo root>` every few seconds
-   (the endpoint also accepts `&wait=<s>`, which holds the request until the
-   repo settles; the hooks can adopt that to drop this loop) for up to
+   out itself: one long-poll request,
+   `GET /indexing?path=<repo root>&wait=<cap>` — the hub holds it until the
+   repo settles or its deadline, and the hook denies Grep with a
+   retry-codesearch instruction the moment the rebuild lands, so the denial
+   only fires when codesearch will actually answer; an answer with
+   `waited_ms` set and the repo still indexing means the hold expired
+   without settling and Grep opens, no further probing. A hub predating the
+   long poll answers without `waited_ms`, and the hook falls back to short
+   probes every few seconds for up to
    `CODESEARCH_GREP_GUARD_WAIT_MS` (default 120s; `0` restores
-   the legacy instant wait-and-retry instruction) — and denies Grep with
-   a retry-codesearch instruction once the rebuild lands, so the denial
-   only fires when codesearch will actually answer. Past the cap Grep
+   the legacy instant wait-and-retry instruction). Past the cap Grep
    opens: a big-repo rebuild outlasts any polite wait message, and
    denying Grep while every codesearch call times out deadlocks the
    session. The freshness probe (`GET /indexing?path=<repo

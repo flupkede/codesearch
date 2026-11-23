@@ -688,7 +688,12 @@ const DEFAULT_WAIT_CAP_MS: u64 = 120_000;
 const API_KEY_ENV: &str = "CODESEARCH_API_KEY";
 /// Liveness probe answer time — keeps grep latency low; /healthz is instant.
 const PROBE_TIMEOUT_SECS: u64 = 2;
-/// Poll interval while waiting out a rebuild, capped by the remaining time.
+/// Client backstop on top of a long-poll hold: the hub should answer at its
+/// own deadline, but a hub that holds without ever answering must not hang
+/// the guard past the cap it was given.
+const LONGPOLL_SLACK_SECS: u64 = 5;
+/// Poll interval of the short-probe fallback for a hub without `waited_ms`
+/// (pre-#404), capped by the remaining time.
 const WAIT_POLL_MS: u64 = 3000;
 
 /// `codesearch hook grep-guard` — PreToolUse guard over `Grep` and the Bash
@@ -776,25 +781,43 @@ async fn grep_guard(raw: &str) -> String {
     // Freshness probe (#55): liveness says UP, not FRESH. Mid-reindex ->
     // wait out the rebuild; past the cap grep opens. An older serve without
     // the endpoint answers 404: probe skipped, standard deny below.
-    if let Some(indexing) = probe_indexing(&base, &target_root).await {
-        if indexing {
-            if wait_cap_ms == 0 {
-                return deny_json(WAIT_MESSAGE);
+    let initial = probe_indexing(&base, &target_root, 0, PROBE_TIMEOUT_SECS).await;
+    if initial.as_ref().is_some_and(|s| s.indexing) {
+        if wait_cap_ms == 0 {
+            return deny_json(WAIT_MESSAGE);
+        }
+        // One long-poll hold covering the whole cap (#404): the hub answers
+        // the moment the repo settles or at its own deadline. timeout =
+        // hold + slack backstops a hub that holds without ever answering.
+        let hold_secs = (wait_cap_ms / 1000).max(1);
+        match probe_indexing(
+            &base,
+            &target_root,
+            hold_secs,
+            hold_secs + LONGPOLL_SLACK_SECS,
+        )
+        .await
+        {
+            // Settled during the hold: retry codesearch now.
+            Some(s) if !s.indexing => return deny_json(&settled_message(wait_cap_ms)),
+            // Hub honoured the wait and the repo is STILL indexing at the
+            // deadline: probing further would only burn requests.
+            Some(s) if s.waited_ms.is_some() => return String::new(),
+            // Older hub (no waited_ms) answered at once, or transient probe
+            // failure: fall back to short probes until the cap.
+            _ => {}
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_cap_ms);
+        loop {
+            let rest = deadline.saturating_duration_since(std::time::Instant::now());
+            if rest.is_zero() {
+                return String::new(); // still rebuilding at the cap: grep is all you have
             }
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(wait_cap_ms);
-            loop {
-                let rest = deadline.saturating_duration_since(std::time::Instant::now());
-                if rest.is_zero() {
-                    return String::new(); // still rebuilding at the cap: grep is all you have
-                }
-                tokio::time::sleep(rest.min(std::time::Duration::from_millis(WAIT_POLL_MS))).await;
-                match probe_indexing(&base, &target_root).await {
-                    Some(false) => return deny_json(&settled_message(wait_cap_ms)),
-                    Some(true) => continue,
-                    // transient probe failure mid-wait: keep polling
-                    None => continue,
-                }
+            tokio::time::sleep(rest.min(std::time::Duration::from_millis(WAIT_POLL_MS))).await;
+            match probe_indexing(&base, &target_root, 0, PROBE_TIMEOUT_SECS).await {
+                Some(s) if !s.indexing => return deny_json(&settled_message(wait_cap_ms)),
+                // indexing still true / no fresh signal: keep polling
+                _ => continue,
             }
         }
     }
@@ -897,17 +920,36 @@ async fn probe_liveness(base: &str) -> bool {
     }
 }
 
-/// GET /indexing?path=<root>: Some(fresh) when a newer serve answered with
-/// parseable JSON (fresh = covered && indexing), None on probe failure —
-/// the callers deny (first probe) or keep polling (mid-wait) either way.
-async fn probe_indexing(base: &str, root: &str) -> Option<bool> {
+/// The `/indexing` answer: `waited_ms` is present only when the hub
+/// understood the `?wait=` parameter (PR #404 long poll) — its absence marks
+/// an older hub that answers immediately.
+#[derive(Debug)]
+struct IndexingState {
+    indexing: bool,
+    waited_ms: Option<u64>,
+}
+
+/// GET /indexing?path=<root>&wait=<secs>: Some(state) when a serve answered
+/// with parseable JSON, None when the probe yields no fresh signal
+/// (connection failure, HTTP error status, parse fail). `wait_secs > 0`
+/// long-polls — the hub holds the request until the repo settles or the
+/// deadline; `timeout_secs` is the client backstop and must exceed the hold.
+async fn probe_indexing(
+    base: &str,
+    root: &str,
+    wait_secs: u64,
+    timeout_secs: u64,
+) -> Option<IndexingState> {
     let url = reqwest::Url::parse_with_params(
         &format!("{base}/indexing"),
-        &[("path", root.replace('\\', "/"))],
+        &[
+            ("path", root.replace('\\', "/")),
+            ("wait", wait_secs.to_string()),
+        ],
     )
     .ok()?;
     let mut req = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
         .ok()?
         .get(url);
@@ -918,16 +960,13 @@ async fn probe_indexing(base: &str, root: &str) -> Option<bool> {
     }
     let body = req.send().await.ok()?.text().await.ok()?;
     let fresh: Value = serde_json::from_str(body.trim()).ok()?;
-    Some(
-        fresh
-            .get("covered")
+    Some(IndexingState {
+        indexing: fresh
+            .get("indexing")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-            && fresh
-                .get("indexing")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-    )
+            .unwrap_or(false),
+        waited_ms: fresh.get("waited_ms").and_then(Value::as_u64),
+    })
 }
 
 /// True when a shell command line invokes the grep family — the Bash tool
@@ -2226,7 +2265,7 @@ mod tests {
     #[test]
     fn grep_guard_waits_out_rebuild_then_denies_settled() {
         let fx = fixture();
-        // First probe: indexing; the poll lands on settled.
+        // Initial probe: indexing; the long-poll lands on settled.
         let base = stub_hub(vec![
             Some(r#"{"covered":true,"indexing":true}"#),
             Some(r#"{"covered":true,"indexing":false}"#),
@@ -2248,10 +2287,57 @@ mod tests {
     #[test]
     fn grep_guard_opens_grep_when_rebuild_outlasts_the_cap() {
         let fx = fixture();
+        // Script exhausted -> the long-poll gets a 404 (old hub / no signal),
+        // the short-probe fallback polls 404s until the cap: grep opens.
         let base = stub_hub(vec![Some(r#"{"covered":true,"indexing":true}"#)]);
         let envs = grep_env(&base, "300");
         let out = run_async(grep_guard(&grep_event(&fx.root_a)));
         assert!(out.is_empty(), "past the cap grep opens, got {out}");
+        drop(envs);
+    }
+
+    #[serial]
+    #[test]
+    fn grep_guard_opens_grep_when_long_poll_hold_expires_still_indexing() {
+        let fx = fixture();
+        // A #404 hub: the held request answers at its deadline with
+        // waited_ms set and STILL indexing — probing further would only
+        // burn requests, so grep opens immediately (no poll fallback).
+        let base = stub_hub(vec![
+            Some(r#"{"covered":true,"indexing":true}"#),
+            Some(r#"{"covered":true,"indexing":true,"waited_ms":1250}"#),
+        ]);
+        let envs = grep_env(&base, "1200");
+        let out = run_async(grep_guard(&grep_event(&fx.root_a)));
+        assert!(
+            out.is_empty(),
+            "hold expired still indexing: grep is all you have, got {out}"
+        );
+        drop(envs);
+    }
+
+    #[serial]
+    #[test]
+    fn grep_guard_old_hub_without_waited_ms_falls_back_to_short_probes() {
+        let fx = fixture();
+        // No waited_ms in the long-poll answer (pre-#404 hub): the guard
+        // must NOT trust it as a hold expiry and instead keeps polling —
+        // the third probe settles and denies.
+        let base = stub_hub(vec![
+            Some(r#"{"covered":true,"indexing":true}"#),
+            Some(r#"{"covered":true,"indexing":true}"#),
+            Some(r#"{"covered":true,"indexing":false}"#),
+        ]);
+        let envs = grep_env(&base, "1200");
+        let out = run_async(grep_guard(&grep_event(&fx.root_a)));
+        let v: Value = serde_json::from_str(&out).expect("deny JSON");
+        assert!(
+            v["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("landed while the guard waited"),
+            "fallback loop settles into the deny: {out}"
+        );
         drop(envs);
     }
 
