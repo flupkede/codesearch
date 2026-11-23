@@ -488,6 +488,58 @@ pub struct GitHeadWatcher {
     last_head_state: Arc<Mutex<Option<CachedHeadState>>>,
 }
 
+/// Outcome of comparing a freshly read HEAD state against the cached one.
+#[derive(Debug, PartialEq)]
+enum HeadVerdict {
+    NoChange,
+    /// Adopt the new state without reporting — nothing in the tree changed,
+    /// only the reliability of our view of it.
+    Adopt,
+    Report(HeadChange),
+}
+
+/// Pure core of [`GitHeadWatcher::check`], extracted so the resolution-failure
+/// matrix is unit-testable without spawning git.
+///
+/// A failed commit resolution is "unknown", never "changed": `None` flapping
+/// against a cached `Some` under transient git failures (spawn exhaustion,
+/// lock contention while a runner hammers the same repository) reported a
+/// phantom HEAD change on every other poll, and each report triggered a full
+/// incremental refresh — a 40-minute storm during which the text index never
+/// converged and searches silently served pre-refresh content. Only a resolved
+/// commit moving, or a HEAD-content change (which is a real signal even while
+/// resolution fails), is reportable.
+fn classify_head_change(prev: &CachedHeadState, current: &CachedHeadState) -> HeadVerdict {
+    if prev.head_content != current.head_content {
+        return HeadVerdict::Report(HeadChange {
+            old_head: prev.head_content.clone(),
+            new_head: current.head_content.clone(),
+            old_commit: prev.resolved_commit.clone(),
+            new_commit: current.resolved_commit.clone(),
+        });
+    }
+    match (&prev.resolved_commit, &current.resolved_commit) {
+        // Resolution unavailable now: keep the cached state as-is. Dropping a
+        // cached `Some` to `None` here would make the next successful
+        // resolution look like a change.
+        (_, None) => HeadVerdict::NoChange,
+        // First successful resolution for this HEAD content: adopt silently.
+        (None, Some(_)) => HeadVerdict::Adopt,
+        (Some(prev_commit), Some(cur_commit)) => {
+            if prev_commit == cur_commit {
+                HeadVerdict::NoChange
+            } else {
+                HeadVerdict::Report(HeadChange {
+                    old_head: prev.head_content.clone(),
+                    new_head: current.head_content.clone(),
+                    old_commit: prev.resolved_commit.clone(),
+                    new_commit: current.resolved_commit.clone(),
+                })
+            }
+        }
+    }
+}
+
 impl GitHeadWatcher {
     /// Create a new Git HEAD watcher.
     ///
@@ -562,31 +614,31 @@ impl GitHeadWatcher {
         let mut last = self.last_head_state.lock().await;
 
         let result = match &*last {
-            Some(prev)
-                if prev.head_content != current_state.head_content
-                    || prev.resolved_commit != current_state.resolved_commit =>
-            {
-                Some(HeadChange {
-                    old_head: prev.head_content.clone(),
-                    new_head: current_state.head_content.clone(),
-                    old_commit: prev.resolved_commit.clone(),
-                    new_commit: current_state.resolved_commit.clone(),
-                })
-            }
+            Some(prev) => classify_head_change(prev, &current_state),
             None => {
                 // First check — initialize, report no change
                 *last = Some(current_state);
                 return Ok(None);
             }
-            _ => None,
         };
 
-        if result.is_some() {
-            tracing::info!("🔀 Git HEAD changed (branch switch, HEAD moved, or commit advanced)");
-            *last = Some(current_state);
+        match result {
+            HeadVerdict::Report(change) => {
+                tracing::info!(
+                    "🔀 Git HEAD changed (branch switch, HEAD moved, or commit advanced)"
+                );
+                *last = Some(current_state);
+                Ok(Some(change))
+            }
+            HeadVerdict::Adopt => {
+                // Resolution succeeded where the cache holds `None` with the
+                // same HEAD content: the tree did not change, only our view
+                // of it improved. Adopt without reporting.
+                *last = Some(current_state);
+                Ok(None)
+            }
+            HeadVerdict::NoChange => Ok(None),
         }
-
-        Ok(result)
     }
 
     /// Resolve the current commit hash for HEAD.
@@ -1008,5 +1060,54 @@ mod tests {
         assert_ne!(change.old_commit, change.new_commit);
         assert!(change.old_commit.is_some());
         assert!(change.new_commit.is_some());
+    }
+
+    #[test]
+    fn head_change_classification_treats_failed_resolution_as_unknown() {
+        use super::{classify_head_change, CachedHeadState, HeadVerdict};
+        let state = |content: &str, commit: Option<&str>| CachedHeadState {
+            head_content: content.to_string(),
+            resolved_commit: commit.map(str::to_string),
+        };
+        let same = "ref: refs/heads/main\n";
+
+        // Steady state: nothing to report.
+        assert_eq!(
+            classify_head_change(&state(same, Some("a")), &state(same, Some("a"))),
+            HeadVerdict::NoChange
+        );
+
+        // THE STORM: cached Some, resolution transiently fails (None) — must
+        // NOT report. The old equality fired on every None-flap and each
+        // report re-triggered a full refresh that never let the text index
+        // converge.
+        assert_eq!(
+            classify_head_change(&state(same, Some("a")), &state(same, None)),
+            HeadVerdict::NoChange
+        );
+
+        // Recovery: resolution succeeds again, same commit, same content —
+        // adopt the resolved state silently (the old code fired here too,
+        // completing the flap pair).
+        assert_eq!(
+            classify_head_change(&state(same, None), &state(same, Some("a"))),
+            HeadVerdict::Adopt
+        );
+
+        // Commit advanced under the same HEAD content — the real signal.
+        assert!(matches!(
+            classify_head_change(&state(same, Some("a")), &state(same, Some("b"))),
+            HeadVerdict::Report(_)
+        ));
+
+        // HEAD content changed — reportable even while resolution fails
+        // (a branch switch rewrites HEAD regardless of rev-parse health).
+        assert!(matches!(
+            classify_head_change(
+                &state(same, Some("a")),
+                &state("ref: refs/heads/other\n", None)
+            ),
+            HeadVerdict::Report(_)
+        ));
     }
 }

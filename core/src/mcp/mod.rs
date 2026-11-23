@@ -1540,6 +1540,20 @@ impl CodesearchService {
             }
         }
 
+        // A repo mid-refresh answers from a partially updated index: say so
+        // on every answer shape instead of silently serving pre-refresh
+        // content. An agent that just switched branches or landed edits must
+        // be able to tell "not in the index yet" from "not in the code".
+        if let Some(ref serve_state) = self.serve_state {
+            if let Some(warning) = indexing_refresh_warning(
+                project_alias.as_deref(),
+                store_aliases.as_deref(),
+                |alias| serve_state.is_indexing(alias),
+            ) {
+                routing_warnings.push(warning);
+            }
+        }
+
         // Record tool call for serve dashboard tracking.
         // Skip recording for unscoped multi-store fan-out (allow_unscoped=true means
         // get_chunk or status — get_chunk will record after candidate detection,
@@ -2435,6 +2449,38 @@ fn root_mismatch_in(
     Some(format!(
         "working directory {root_display} has its own index '{root_alias}'; you queried '{alias}'"
     ))
+}
+
+/// Routing note naming every queried repo whose index refresh is still in
+/// flight. Pure (the liveness predicate is injected) so the warning injection
+/// is testable without a serve orchestrator. Sourced from the WT2 incident:
+/// mid-refresh searches silently served hours-old content and the calling
+/// agent fell back to git diffs — the answer must carry the lag itself.
+fn indexing_refresh_warning(
+    project_alias: Option<&str>,
+    store_aliases: Option<&[String]>,
+    is_indexing: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let mut indexing: Vec<&str> = Vec::new();
+    if let Some(alias) = project_alias {
+        if is_indexing(alias) {
+            indexing.push(alias);
+        }
+    }
+    if let Some(aliases) = store_aliases {
+        for alias in aliases {
+            if is_indexing(alias) && !indexing.contains(&alias.as_str()) {
+                indexing.push(alias);
+            }
+        }
+    }
+    (!indexing.is_empty()).then(|| {
+        as_routing_note(format!(
+            "index refresh in flight for '{}'; results may lag the current \
+             tree state — retry once it settles",
+            indexing.join("', '")
+        ))
+    })
 }
 
 /// Normalized comparison key for a project path: separators unified via the
