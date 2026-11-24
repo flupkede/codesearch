@@ -19,6 +19,13 @@ pub(crate) fn is_index_not_built(e: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string() == crate::vectordb::INDEX_NOT_BUILT_MSG)
 }
 
+/// String twin of [`is_index_not_built`] for the multi fan-out, whose
+/// failures arrive as full-chain strings (`{e:#}`) — the shared leaf
+/// constant appears verbatim inside the rendered chain.
+pub(crate) fn is_index_not_built_str(err: &str) -> bool {
+    err.contains(crate::vectordb::INDEX_NOT_BUILT_MSG)
+}
+
 /// How the single-project semantic path answers the first-build pending
 /// state. Pure so the branch is testable without an embedding model —
 /// semantic search needs one to reach the vector store, and the house
@@ -30,34 +37,35 @@ pub(crate) enum FirstBuildPending {
     HybridWarning(String),
 }
 
-pub(crate) fn first_build_pending(mode: &str, alias: Option<&str>) -> FirstBuildPending {
+pub(crate) fn first_build_pending(mode: &str, name: &str) -> FirstBuildPending {
     if mode == "semantic" {
-        FirstBuildPending::SemanticMessage(first_build_pending_message(alias))
+        FirstBuildPending::SemanticMessage(first_build_pending_message(name))
     } else {
-        FirstBuildPending::HybridWarning(first_build_pending_warning(alias))
+        FirstBuildPending::HybridWarning(first_build_pending_warning(name))
     }
 }
 
 /// Scoped answer for a semantic-mode search against a repo whose first
 /// vector-index build is still running — a wait state, never a bare error
 /// string (the caller agent cannot tell "retry later" from "broken").
-fn first_build_pending_message(alias: Option<&str>) -> String {
+/// `name` is the pre-rendered repo name (or names, joined for a group).
+fn first_build_pending_message(name: &str) -> String {
     format!(
         "Semantic index for '{}' is still on its first build: chunks are committed batch by \
          batch, but the vector graph is built once, after the last batch. This is not an \
          error — retry in a few minutes, pass wait_secs={} to have the search wait for it, \
          or use mode=\"literal\" meanwhile (FTS answers with the batches committed so far).",
-        alias.unwrap_or("this repo"),
+        name,
         crate::constants::SEARCH_WAIT_MAX_SECS
     )
 }
 
 /// Hybrid/auto-mode warning for the same state: the FTS half still answers.
-fn first_build_pending_warning(alias: Option<&str>) -> String {
+fn first_build_pending_warning(name: &str) -> String {
     format!(
         "vector index for '{}' is still on its first build — results are FTS-only until it \
          finishes",
-        alias.unwrap_or("this repo")
+        name
     )
 }
 
@@ -357,6 +365,7 @@ impl CodesearchService {
                 Ok(r) => Ok(r),
                 Err(e) if is_index_not_built(&e) => {
                     let alias = ctx.project_alias.clone();
+                    let name = alias.as_deref().unwrap_or("this repo");
                     let cap = request
                         .wait_secs
                         .unwrap_or(0)
@@ -368,11 +377,20 @@ impl CodesearchService {
                             }
                             _ => false,
                         };
-                    if settled {
+                    // Settled does not imply built: a first build whose final
+                    // build_index() failed after the chunk commits leaves
+                    // chunks without a graph. Re-classify the retry too, so
+                    // that state answers the pending shape instead of
+                    // surfacing the bare error one branch later.
+                    let retried = if settled {
                         self.vector_search_once(&query_embedding, limit, ctx.stores.clone())
                             .await
                     } else {
-                        match first_build_pending(mode, alias.as_deref()) {
+                        Err(e)
+                    };
+                    match retried {
+                        Ok(r) => Ok(r),
+                        Err(e) if is_index_not_built(&e) => match first_build_pending(mode, name) {
                             FirstBuildPending::SemanticMessage(message) => {
                                 return Ok(CallToolResult::success(vec![ContentBlock::text(
                                     message,
@@ -382,7 +400,8 @@ impl CodesearchService {
                                 single_warnings.push(warning);
                                 Ok(Vec::new())
                             }
-                        }
+                        },
+                        Err(e) => Err(e),
                     }
                 }
                 Err(e) => Err(e),
@@ -884,17 +903,17 @@ impl CodesearchService {
         // lexical, so they degrade, not disappear.
         let skip_set: std::collections::HashSet<&str> =
             no_model_aliases.iter().map(String::as_str).collect();
-        let vector_stores: Vec<Arc<SharedStores>> = stores
+        let vector_pairs: Vec<(String, Arc<SharedStores>)> = aliases
             .iter()
-            .zip(aliases.iter())
-            .filter(|(_, alias)| !skip_set.contains(alias.as_str()))
-            .map(|(store, _)| Arc::clone(store))
+            .zip(stores.iter())
+            .filter(|(alias, _)| !skip_set.contains(alias.as_str()))
+            .map(|(alias, store)| ((*alias).clone(), Arc::clone(store)))
             .collect();
-        let vector_aliases: Vec<String> = aliases
+        let vector_stores: Vec<Arc<SharedStores>> = vector_pairs
             .iter()
-            .filter(|alias| !skip_set.contains(alias.as_str()))
-            .cloned()
+            .map(|(_, store)| Arc::clone(store))
             .collect();
+        let vector_aliases: Vec<String> = vector_pairs.iter().map(|(a, _)| a.clone()).collect();
         if mode == "semantic" && !no_model_aliases.is_empty() && vector_stores.is_empty() {
             let detail = model_warnings.join("\n");
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
@@ -926,48 +945,142 @@ impl CodesearchService {
         // Seeded with any assumed-model warnings gathered while embedding.
         let mut search_warnings: Vec<String> = model_warnings;
 
-        let vector_results =
-            match outcome {
-                Ok(o) => {
-                    if !o.failures.is_empty() {
-                        tracing::error!(
-                            "MCP: vector fan-out degraded — {} of {} repo(s) failed: {:?}",
-                            o.failures.len(),
-                            vector_aliases.len(),
-                            o.failures
-                        );
-                        // Only "semantic" has no second backend to fall back on. In
-                        // hybrid/auto/lexical the FTS half can still answer, so
-                        // hard-failing here would throw away good results — the same
-                        // reason one broken repo does not abort the whole fan-out.
-                        if mode == "semantic" && o.results.is_empty() {
-                            let detail = o
-                                .failures
-                                .iter()
-                                .map(|(alias, err)| format!("  - {alias}: {err}"))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                                "Error searching vector store: {} of {} repo(s) in scope failed \
-                             and none returned results:\n{}",
-                                o.failures.len(),
-                                vector_aliases.len(),
-                                detail
-                            ))]));
-                        }
-                        search_warnings.extend(o.failures.iter().map(|(alias, err)| {
-                            format!("repo '{alias}' vector search failed: {err}")
-                        }));
+        let vector_results = match outcome {
+            Ok(o) => {
+                // First-build pending legs are a wait state, not failures —
+                // the group-scope twin of the single-project branch: a cold
+                // worktree inside the group must answer with the scoped
+                // pending message/warning, never the bare store error.
+                let mut results = o.results;
+                let mut pending: Vec<String> = Vec::new();
+                let mut real_failures: Vec<(String, String)> = Vec::new();
+                for (alias, err) in o.failures {
+                    if is_index_not_built_str(&err) {
+                        pending.push(alias);
+                    } else {
+                        real_failures.push((alias, err));
                     }
-                    o.results
                 }
-                Err(e) => {
-                    tracing::error!("MCP: vector fan-out failed: {:?}", e);
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "Error searching vector store: {e:#}"
-                    ))]));
+
+                // Honor wait_secs for pending legs: wait each one out and
+                // retry its leg once, together.
+                if !pending.is_empty() {
+                    let cap = request
+                        .wait_secs
+                        .unwrap_or(0)
+                        .min(crate::constants::SEARCH_WAIT_MAX_SECS);
+                    if cap > 0 {
+                        if let Some(serve) = self.serve_state.as_ref() {
+                            for alias in &pending {
+                                if serve.is_indexing(alias) {
+                                    let _ = serve.wait_indexing_settled(alias, cap).await;
+                                }
+                            }
+                            let retry_aliases: Vec<String> = pending.clone();
+                            let retry_stores: Vec<Arc<SharedStores>> = vector_pairs
+                                .iter()
+                                .filter(|(a, _)| retry_aliases.contains(a))
+                                .map(|(_, s)| Arc::clone(s))
+                                .collect();
+                            if let Ok(retried) = self
+                                .with_vector_store_read_multi(
+                                    |alias, store| {
+                                        let embedding =
+                                            embeddings_by_alias.get(alias).ok_or_else(|| {
+                                                anyhow::anyhow!(
+                                                    "internal error: no query embedding \
+                                                     resolved for repo '{alias}'"
+                                                )
+                                            })?;
+                                        let found = store
+                                            .search(embedding, limit * 5)
+                                            .context("Error searching vector store")?;
+                                        Ok(found)
+                                    },
+                                    retry_stores,
+                                    &retry_aliases,
+                                )
+                                .await
+                            {
+                                results.extend(retried.results);
+                                // Legs absent from the retry's failure list
+                                // succeeded and drop out of `pending`; the
+                                // rest reclassifies by the same rule.
+                                pending = retried
+                                    .failures
+                                    .iter()
+                                    .filter(|(_, err)| is_index_not_built_str(err))
+                                    .map(|(alias, _)| alias.clone())
+                                    .collect();
+                                for (alias, err) in retried.failures {
+                                    if !is_index_not_built_str(&err) {
+                                        real_failures.push((alias, err));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-            };
+
+                if !real_failures.is_empty() {
+                    tracing::error!(
+                        "MCP: vector fan-out degraded — {} of {} repo(s) failed: {:?}",
+                        real_failures.len(),
+                        vector_aliases.len(),
+                        real_failures
+                    );
+                }
+
+                if !pending.is_empty() {
+                    let names = pending.join("', '");
+                    if mode == "semantic" && results.is_empty() && real_failures.is_empty() {
+                        let FirstBuildPending::SemanticMessage(message) =
+                            first_build_pending(mode, &names)
+                        else {
+                            unreachable!("semantic mode always yields the message")
+                        };
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
+                    }
+                    search_warnings.push(match first_build_pending(mode, &names) {
+                        FirstBuildPending::SemanticMessage(message) => message,
+                        FirstBuildPending::HybridWarning(warning) => warning,
+                    });
+                }
+
+                // Only "semantic" has no second backend to fall back on. In
+                // hybrid/auto/lexical the FTS half can still answer, so
+                // hard-failing here would throw away good results — the same
+                // reason one broken repo does not abort the whole fan-out.
+                if !real_failures.is_empty() {
+                    if mode == "semantic" && results.is_empty() {
+                        let detail = real_failures
+                            .iter()
+                            .map(|(alias, err)| format!("  - {alias}: {err}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                            "Error searching vector store: {} of {} repo(s) in scope failed \
+                             and none returned results:\n{}",
+                            real_failures.len(),
+                            vector_aliases.len(),
+                            detail
+                        ))]));
+                    }
+                    search_warnings.extend(
+                        real_failures.iter().map(|(alias, err)| {
+                            format!("repo '{alias}' vector search failed: {err}")
+                        }),
+                    );
+                }
+                results
+            }
+            Err(e) => {
+                tracing::error!("MCP: vector fan-out failed: {:?}", e);
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Error searching vector store: {e:#}"
+                ))]));
+            }
+        };
 
         // === Mode: "semantic" — vector only ===
         if mode == "semantic" {

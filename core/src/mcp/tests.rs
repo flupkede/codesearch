@@ -4148,6 +4148,20 @@ fn is_index_not_built_matches_the_nested_store_error_only() {
         !super::search::is_index_not_built(&anyhow::anyhow!("Error searching vector store")),
         "an outer wrapper without the store cause must not classify"
     );
+    // The multi fan-out stringifies failures with {e:#} — the str twin must
+    // see through the same rendered chain.
+    let chain = format!(
+        "Error searching vector store: {}",
+        crate::vectordb::INDEX_NOT_BUILT_MSG
+    );
+    assert!(
+        super::search::is_index_not_built_str(&chain),
+        "the rendered chain must classify as first-build-in-progress"
+    );
+    assert!(
+        !super::search::is_index_not_built_str("Error searching vector store"),
+        "a wrapper-only string must not classify"
+    );
 }
 
 #[test]
@@ -4158,7 +4172,7 @@ fn first_build_pending_answers_per_mode() {
     // the literal fallback — an agent must be able to act on it, and a
     // mode-string typo here is exactly the regression this pins.
     let FirstBuildPending::SemanticMessage(msg) =
-        super::search::first_build_pending("semantic", Some("BOIN.WT3"))
+        super::search::first_build_pending("semantic", "BOIN.WT3")
     else {
         panic!("semantic mode must answer with the pending message");
     };
@@ -4175,10 +4189,21 @@ fn first_build_pending_answers_per_mode() {
         );
     }
 
+    // A group renders several pending repos in one message.
+    let FirstBuildPending::SemanticMessage(group_msg) =
+        super::search::first_build_pending("semantic", "BOIN.WT1', 'BOIN.WT3")
+    else {
+        panic!("group pending must answer with the message");
+    };
+    assert!(
+        group_msg.contains("BOIN.WT1', 'BOIN.WT3"),
+        "group message must name every pending repo: {group_msg}"
+    );
+
     // hybrid/auto: the FTS half still answers; the warning explains why.
     for mode in ["hybrid", "auto"] {
         let FirstBuildPending::HybridWarning(warning) =
-            super::search::first_build_pending(mode, Some("BOIN.WT3"))
+            super::search::first_build_pending(mode, "BOIN.WT3")
         else {
             panic!("mode '{mode}' must warn and keep FTS, not answer with the message");
         };
@@ -4190,7 +4215,7 @@ fn first_build_pending_answers_per_mode() {
 
     // No alias resolved (unroutable edge): still actionable, never a panic.
     let FirstBuildPending::HybridWarning(warning) =
-        super::search::first_build_pending("hybrid", None)
+        super::search::first_build_pending("hybrid", "this repo")
     else {
         panic!("alias-less hybrid must still warn");
     };
