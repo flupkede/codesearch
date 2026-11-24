@@ -31,6 +31,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: changelog-check-${{ github.event.pull_request.number }}
@@ -50,10 +51,18 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
 
+          # Read labels LIVE, not from the event payload: when several label
+          # webhooks land within seconds (dependabot adds its language labels
+          # at open, dependabot-automation adds `no-changelog` right after),
+          # the `labeled` event's payload can carry a stale snapshot — the
+          # check then failed while the label was already on the PR, and the
+          # PR stayed visibly red (PR #407, 2026-11-24).
+          LABELS=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(",")')
           if printf '%s' "$LABELS" | grep -qiw "no-changelog"; then
             echo "::notice::'no-changelog' label present — skipping CHANGELOG.md check."
             exit 0
