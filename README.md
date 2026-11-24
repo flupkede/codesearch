@@ -781,9 +781,9 @@ Environment=CODESEARCH_INCREMENTAL_BATCH_SIZE=100
 Environment=CODESEARCH_MAX_CHUNKS_PER_BATCH=5000
 Environment=CODESEARCH_EMBED_PAUSE_MS=25
 Environment=CODESEARCH_MIN_FREE_MB=4096
-# C# SCIP helpers are bounded separately; the default is now 1 —
-# an explicit 2+ opts back into concurrent solution compiles.
-Environment=CSHARP_SCIP_CONCURRENCY=1
+# C# SCIP helpers: default 2 — parallel across worktrees only, never
+# two compiles of one solution. Set 1 for the old single slot.
+Environment=CSHARP_SCIP_CONCURRENCY=2
 ```
 
 ### `.codesearchignore`
