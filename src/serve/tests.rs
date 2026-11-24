@@ -6501,9 +6501,28 @@ async fn seed_collision_repo(
     }
     {
         let mut fts = stores.fts_store.write().await;
-        fts.add_chunk(0, content, rel_path, signature, &format!("{:?}", kind))
-            .expect("fts doc");
-        fts.commit().expect("fts commit");
+        // The transient Windows segment race (is_transient_fts_commit_error)
+        // discards the writer, so retrying the commit alone would commit
+        // nothing: the doc must be re-added. Same redrive shape as the
+        // production paths (retry_on_transient_fts), fixture-sized backoffs.
+        const BACKOFFS_MS: [u64; 3] = [100, 500, 2000];
+        let mut pass = || {
+            fts.add_chunk(0, content, rel_path, signature, &format!("{:?}", kind))
+                .and_then(|_| fts.commit())
+        };
+        let mut result = pass();
+        for backoff_ms in BACKOFFS_MS {
+            match &result {
+                Err(e)
+                    if crate::fts::FtsStore::is_transient_fts_commit_error(&format!("{e:#}")) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    result = pass();
+                }
+                _ => break,
+            }
+        }
+        result.expect("fts doc + commit");
     }
     drop(stores);
 }
