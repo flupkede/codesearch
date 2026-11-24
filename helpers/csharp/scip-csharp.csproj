@@ -41,6 +41,17 @@
     -->
     <PackageReference Include="Microsoft.Build.Tasks.Core" Version="17.14.8" ExcludeAssets="runtime" />
     <!--
+      GHSA-846f-f764-76mx (CVE-2026-84008, NU1903 high): SignedCms.CheckSignature
+      quadratic CPU exhaustion; transitive 9.0.0 rides in via Tasks.Core. Direct
+      9.0.23 (latest 9.0.x) wins by nearest-wins; the Xml pin below needs
+      Pkcs >= 9.0.23.
+    -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="9.0.23" />
+    <!-- Pkcs pulls Xml 9.0.0 transitively: GHSA-23rf-6693-g89p /
+         GHSA-6588-8gv4-xfgh (EncryptedXml DoS, NU1903 high). Direct 9.0.23
+         (latest 9.0.x) wins by nearest-wins. -->
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="9.0.23" />
+    <!--
       NU1903 suppress: remaining Microsoft.Build.Tasks.Core transitive advisories
       (GHSA-h4j7-5rxr-p4wc, GHSA-w3q9-fxm7-j8fq) target the DownloadFile MSBuild
       task, which we never use. Our scip-csharp runs locally as a subprocess, no

@@ -27,6 +27,11 @@
     <!-- Aikido 59399549: direct Tasks.Core 17.14.8 overrides the vulnerable
          transitive 17.7.2 (nearest-wins); see scip-csharp.csproj. -->
     <PackageReference Include="Microsoft.Build.Tasks.Core" Version="17.14.8" ExcludeAssets="runtime" />
+    <!-- Same direct Pkcs/Xml 9.0.23 as scip-csharp.csproj
+         (GHSA-846f-f764-76mx, GHSA-23rf-6693-g89p / GHSA-6588-8gv4-xfgh;
+         transitive 9.0.0, nearest-wins). -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="9.0.23" />
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="9.0.23" />
     <!-- Same remaining transitive-CVE suppressions as scip-csharp.csproj
          (never-used DownloadFile task surface). -->
     <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-h4j7-5rxr-p4wc" />
