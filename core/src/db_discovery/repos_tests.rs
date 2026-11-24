@@ -1,5 +1,6 @@
 use super::test_support::{git_serial_lock, init_git_repo_with_commit};
 use super::*;
+use serial_test::serial;
 use std::io::Write;
 
 /// Canonicalize then normalize a path for use in test assertions.
@@ -1868,5 +1869,101 @@ fn tombstone_roundtrip_records_queries_and_clears() {
     assert!(
         tombstone_date("custom").is_none(),
         "cleared alias is no longer tombstoned"
+    );
+}
+
+// ─── Worktree listing (worktree discovery input) ───────────────────────
+
+/// `git worktree list --porcelain -z` shape: NUL-terminated lines, records
+/// separated by an empty line. Paths unquoted (`-z`), bare and prunable
+/// entries dropped, locked kept, detached kept (worktree add fires
+/// post-checkout with flag 1 for detached checkouts too, so discovery must
+/// not filter them either).
+#[test]
+fn parse_worktree_list_matrix() {
+    let main = "worktree C:/x/main\0HEAD aaa\0branch refs/heads/develop\0\0";
+    let wt = "worktree C:/x/wt1\0HEAD bbb\0detached\0\0";
+    let locked = "worktree C:/x/wt2\0HEAD ccc\0branch refs/heads/b\0locked\0\0";
+    let prunable =
+        "worktree C:/x/gone\0HEAD ddd\0branch refs/heads/c\0prunable gitdir file points nowhere\0\0";
+    let bare = "bare\0\0";
+    let input = format!("{main}{wt}{locked}{prunable}{bare}");
+
+    let parsed = parse_worktree_list(&input);
+    assert_eq!(
+        parsed,
+        vec![
+            PathBuf::from("C:/x/main"),
+            PathBuf::from("C:/x/wt1"),
+            PathBuf::from("C:/x/wt2"),
+        ],
+        "main/detached/locked kept, prunable/bare dropped, order preserved"
+    );
+
+    // Truncated output (no terminating blank line) still yields its record.
+    assert_eq!(
+        parse_worktree_list("worktree C:/x/main\0HEAD aaa\0branch refs/heads/d"),
+        vec![PathBuf::from("C:/x/main")],
+        "a record without its trailing blank line must still count"
+    );
+
+    // Truncated INSIDE a prunable record: no path is invented.
+    assert!(
+        parse_worktree_list("worktree C:/x/gone\0HEAD d\0prunable").is_empty(),
+        "a truncated prunable record must not yield its path"
+    );
+
+    assert!(parse_worktree_list("").is_empty(), "no output, no paths");
+}
+
+/// Real-git pin: the listing covers the main tree and every linked worktree,
+/// and a non-git directory answers empty (discovery input, not an error).
+#[test]
+#[serial]
+fn list_worktree_paths_covers_main_and_linked_worktrees() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    {
+        let _l = git_serial_lock();
+        init_git_repo_with_commit(&main);
+        let wt = tmp.path().join("wt1");
+        let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+            &mut std::process::Command::new("git"),
+        )
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+        .output()
+        .unwrap();
+        assert!(
+            o.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+
+        let listed = list_worktree_paths(&main);
+        let listed: Vec<String> = listed.iter().map(|p| canon_norm(p)).collect();
+        assert_eq!(
+            listed,
+            vec![canon_norm(&main), canon_norm(tmp.path().join("wt1"))],
+            "listing must cover the main tree and the linked worktree, main first"
+        );
+
+        // The listing works from inside a linked worktree too — discovery
+        // iterates registered repos, which are often the worktrees.
+        let from_wt = list_worktree_paths(&tmp.path().join("wt1"));
+        let from_wt: Vec<String> = from_wt.iter().map(|p| canon_norm(p)).collect();
+        assert_eq!(
+            from_wt, listed,
+            "listing from a worktree equals listing from the main"
+        );
+    }
+
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    assert!(
+        list_worktree_paths(&plain).is_empty(),
+        "a non-git directory must answer empty"
     );
 }

@@ -1673,6 +1673,59 @@ fn identity_string(path: &Path) -> String {
     canonical.to_string_lossy().to_string()
 }
 
+/// Parse `git worktree list --porcelain -z` output into checkout paths.
+///
+/// Records are NUL-terminated lines separated by an empty NUL-terminated
+/// line; `-z` disables path quoting, so paths round-trip verbatim. Bare and
+/// prunable entries name no usable checkout and are dropped; `locked`
+/// worktrees are kept (locked means "do not garbage-collect", not "do not
+/// index"). A record missing its terminating blank line (truncated output)
+/// still yields its path.
+pub(crate) fn parse_worktree_list(output: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut current: Option<PathBuf> = None;
+    let mut skip = false;
+    let flush = |current: &mut Option<PathBuf>, skip: &mut bool, out: &mut Vec<PathBuf>| {
+        if !*skip {
+            if let Some(path) = current.take() {
+                out.push(path);
+            }
+        } else {
+            *current = None;
+            *skip = false;
+        }
+    };
+    for line in output.split('\0') {
+        if line.is_empty() {
+            flush(&mut current, &mut skip, &mut out);
+        } else if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(path));
+        } else if line == "bare" || line.starts_with("prunable") {
+            skip = true;
+        }
+    }
+    flush(&mut current, &mut skip, &mut out);
+    out
+}
+
+/// Checkout paths of every worktree of the repo at `repo` (its main tree
+/// included), via `git worktree list --porcelain -z`. Empty when `repo` is
+/// not a git checkout or git fails — a transient spawn failure just delays
+/// the caller's discovery to its next pass, so unlike
+/// [`git_remote_url`]/[`git_common_dir_for`] there is no retry loop here.
+pub fn list_worktree_paths(repo: &Path) -> Vec<PathBuf> {
+    let output = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    parse_worktree_list(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// Configured relocation scan depth (`CODESEARCH_RELOCATE_MAX_DEPTH`, default 3).
 fn relocate_max_depth() -> usize {
     std::env::var(crate::constants::RELOCATE_MAX_DEPTH_ENV)

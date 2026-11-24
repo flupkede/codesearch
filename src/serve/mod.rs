@@ -54,7 +54,9 @@ use crate::constants::{
     REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV,
     STATUS_PATH,
 };
-use crate::db_discovery::repos::{config_dir, git_common_dir_for, ReposConfig};
+use crate::db_discovery::repos::{
+    config_dir, git_common_dir_for, list_worktree_paths, ReposConfig,
+};
 use crate::index::{
     CSharpRebuildNotifier, IndexManager, IndexingHeartbeat, IndexingStatusCallback, SharedStores,
     SymbolRebuildSignal,
@@ -462,6 +464,13 @@ pub(crate) struct ServeState {
     /// OS-starved; inline measurement made /status itself take tens of
     /// seconds across the fleet (the "status must always answer" fix).
     status_snapshot: Arc<status_snapshot::StatusSnapshotHandle>,
+    /// Worktree-discovery throttle: unix ms of the last pass, behind its own
+    /// async mutex so a boot pass and a status-refresher pass never both
+    /// run. Initialized to boot time — the first pass runs one interval
+    /// after start, clear of the startup phases (a registration landing
+    /// mid-phase-1 can be pruned as "database missing" by a warmup that has
+    /// not seen its stores yet).
+    worktree_discovery: tokio::sync::Mutex<u64>,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -553,6 +562,7 @@ impl ServeState {
             reload_count: std::sync::atomic::AtomicUsize::new(0),
             started_at: std::time::Instant::now(),
             status_snapshot: Arc::new(status_snapshot::StatusSnapshotHandle::new()),
+            worktree_discovery: tokio::sync::Mutex::new(Self::unix_now_ms()),
         }
     }
 
@@ -1924,6 +1934,105 @@ impl ServeState {
         for (alias, stale_path) in &removed {
             Self::remove_orphaned_db_dir(alias, &stale_path.join(DB_DIR_NAME));
             let _ = std::fs::remove_dir(stale_path);
+        }
+    }
+
+    /// Register worktrees of registered repos that no alias covers.
+    ///
+    /// The post-checkout hook is fire-and-forget: a `git worktree add` whose
+    /// POST lands while the hub is down (restart window, dead port) leaves
+    /// no registration and no trace. This pass lists the worktrees of every
+    /// registered repo and routes the uncovered ones through the ordinary
+    /// add-repo path, so the throwaway guards, the tombstone refusal and
+    /// the index build behave exactly as if the hook had fired.
+    ///
+    /// Throttled to [`crate::constants::WORKTREE_DISCOVERY_INTERVAL_SECS`]:
+    /// the status refresher calls this on its own sub-10s cadence and each
+    /// pass spawns one `git worktree list` per registered repo. To keep a
+    /// worktree out on purpose, `index rm --forget` it — a plain `index rm`
+    /// returns on the next pass, exactly as it would on that worktree's
+    /// next checkout.
+    pub(crate) async fn discover_worktrees(self: &Arc<Self>) {
+        let mut last_run = self.worktree_discovery.lock().await;
+        let now = Self::unix_now_ms();
+        if !worktree_discovery_due(*last_run, now) {
+            return;
+        }
+        *last_run = now;
+
+        let registered: Vec<PathBuf> = {
+            let _ = self.reload_if_changed();
+            match self.config.read() {
+                Ok(c) => c.repos.values().filter(|p| p.is_dir()).cloned().collect(),
+                Err(_) => return,
+            }
+        };
+
+        // One `git worktree list` per registered repo on the blocking pool.
+        // The same clone listed from its main and from each registered
+        // worktree yields the same paths; the candidate filter dedupes.
+        let listed = match tokio::task::spawn_blocking(move || {
+            registered
+                .iter()
+                .flat_map(|p| list_worktree_paths(p))
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(listed) => listed,
+            Err(e) => {
+                warn!("worktree discovery: listing task failed: {e}");
+                return;
+            }
+        };
+
+        let candidates = match self.config.read() {
+            Ok(c) => uncovered_worktree_roots(&listed, &c.repos),
+            Err(_) => return,
+        };
+
+        for path in candidates {
+            // A listed-but-vanished root (deleted between listing and now):
+            // the next pass picks it up if it reappears — nothing to do.
+            if !path.is_dir() {
+                continue;
+            }
+            // Allowed-roots refusals are configuration, not news: skip them
+            // quietly instead of warning once per interval.
+            if let Err(e) = validate_path_within_allowed_roots(&path) {
+                tracing::debug!("worktree discovery: skipping '{}': {e}", path.display());
+                continue;
+            }
+            info!(
+                "worktree discovery: registering '{}' — a worktree of a registered repo that no \
+                 alias covers",
+                path.display()
+            );
+            let (status, body) = add_repo_handler(
+                axum::extract::State(self.clone()),
+                axum::extract::Json(AddRepoRequest {
+                    path: path.clone(),
+                    alias: None,
+                    model: None,
+                    force: None,
+                }),
+            )
+            .await;
+            if status == axum::http::StatusCode::ACCEPTED {
+                tracing::info!(
+                    "worktree discovery: registered '{}' as '{}'",
+                    path.display(),
+                    body.0.get("alias").and_then(|a| a.as_str()).unwrap_or("-")
+                );
+            } else {
+                warn!(
+                    "worktree discovery: registering '{}' failed ({}): {} — register it \
+                     manually with an explicit alias if this keeps repeating",
+                    path.display(),
+                    status,
+                    body.0
+                );
+            }
         }
     }
 
@@ -5081,6 +5190,54 @@ fn containing_repo_alias(
         .filter(|(_, root)| path_contains(target, root))
         .max_by_key(|(_, root)| root.components().count())
         .map(|(alias, _)| alias.clone())
+}
+
+/// Whether a worktree-discovery pass is due, given the unix-ms stamp of the
+/// last one. Boot initializes the stamp to serve start, so the first pass
+/// runs one full interval after boot — clear of the startup phases.
+fn worktree_discovery_due(last_run_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(last_run_ms) >= crate::constants::WORKTREE_DISCOVERY_INTERVAL_SECS * 1000
+}
+
+/// Worktree roots from the listings that no registered repo covers and no
+/// throwaway rule refuses — the discovery pass's candidate set.
+///
+/// Order-preserving and deduplicated (one clone's paths arrive once per
+/// registered sibling). Skipped, silently by design (the add-repo path
+/// would only refuse them again one pass later): roots already inside a
+/// registered repo (exact match or an umbrella registration), hidden
+/// components, OS-temp paths, and roots whose directory-name alias carries
+/// an `index rm --forget` tombstone — exact hook parity: a checkout in any
+/// of those never registers either.
+fn uncovered_worktree_roots(
+    listed: &[PathBuf],
+    repos: &std::collections::HashMap<String, PathBuf>,
+) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for path in listed {
+        let key = crate::cache::normalize_path_str(&path.to_string_lossy()).to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        if containing_repo_alias(repos, path).is_some() {
+            continue;
+        }
+        if crate::db_discovery::repos::has_hidden_component(path)
+            || crate::db_discovery::repos::is_temp_dir_path(path)
+        {
+            continue;
+        }
+        let alias = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if crate::db_discovery::repos::tombstone_date(&alias).is_some() {
+            continue;
+        }
+        out.push(path.clone());
+    }
+    out
 }
 
 impl ServeState {
@@ -8495,6 +8652,9 @@ fn spawn_status_refresher(state: Arc<ServeState>) {
                     tracing::debug!("status snapshot pass failed: {err}");
                 }
             }
+            // Worktree discovery rides the same cadence; the throttle inside
+            // bounds it to one git-listing pass per interval.
+            state.discover_worktrees().await;
             tokio::time::sleep(interval).await;
         }
     });

@@ -8220,3 +8220,154 @@ fn cold_touch_does_not_refresh_the_persisted_sidecar() {
     state.touch_access("queried");
     assert!(state.last_access_wall.get("queried").is_some());
 }
+
+// ─── Worktree discovery (self-heal for a hook POST lost to a restart) ──
+
+/// Throttle arithmetic: due on a never-run stamp, not due inside the
+/// interval, due again exactly one interval after the last pass.
+#[test]
+fn worktree_discovery_due_matrix() {
+    const MS: u64 = crate::constants::WORKTREE_DISCOVERY_INTERVAL_SECS * 1000;
+    // Stamp 0 is the epoch, not "never" — boot initializes with the real
+    // boot time. Any now at least one interval past it is due.
+    assert!(worktree_discovery_due(0, MS), "an epoch-old stamp is due");
+    assert!(
+        !worktree_discovery_due(1_000, 1_000 + MS - 1),
+        "one ms before the interval the pass must wait"
+    );
+    assert!(
+        worktree_discovery_due(1_000, 1_000 + MS),
+        "exactly one interval after the last pass it is due again"
+    );
+    // Saturating: a clock jump backwards must not panic or run wild.
+    assert!(
+        !worktree_discovery_due(10_000, 5_000),
+        "a backwards clock jump reads as 'not due', never as a huge elapsed"
+    );
+}
+
+/// Candidate-filter matrix: covered roots (exact and umbrella), hidden
+/// components, OS-temp paths and tombstoned directory-name aliases are all
+/// skipped; everything else is kept, deduplicated, in listing order.
+#[test]
+#[serial]
+fn uncovered_worktree_roots_matrix() {
+    // tombstone_date reads $CODESEARCH_HOME — relocate so the real file
+    // cannot leak machine state into the test.
+    let home = tempfile::tempdir().unwrap();
+    let _env = crate::testing::EnvRestore::set(&[(
+        crate::constants::CODESEARCH_HOME_ENV,
+        home.path().to_str().unwrap(),
+    )]);
+    crate::db_discovery::repos::tombstone_alias("tombstoned").unwrap();
+
+    let mut repos = std::collections::HashMap::new();
+    repos.insert("main".to_string(), PathBuf::from("C:/rd/main"));
+    repos.insert("umbrella".to_string(), PathBuf::from("C:/rd/umb"));
+
+    let listed = vec![
+        // Covered exactly (a registered root listing itself).
+        PathBuf::from("C:/rd/main"),
+        // Covered by the umbrella registration above it.
+        PathBuf::from("C:/rd/umb/wt"),
+        // Hidden scratch checkout.
+        PathBuf::from("C:/rd/.scratch/wt"),
+        // Under the OS temp dir — canonicalized because temp_dir() may hand
+        // back an 8.3 short form (DEVELT~1) while the filter compares the
+        // nonexistent input raw against the long-form root.
+        crate::cache::safe_canonicalize(&std::env::temp_dir())
+            .unwrap_or(std::env::temp_dir())
+            .join("fixture-wt"),
+        // Tombstoned directory-name alias.
+        PathBuf::from("C:/rd/tombstoned"),
+        // The same clone listed twice (once per registered sibling).
+        PathBuf::from("C:/rd/wt-new"),
+        PathBuf::from("c:/RD/WT-NEW"),
+        // A genuine find.
+        PathBuf::from("C:/rd/wt-second"),
+    ];
+
+    let out = super::uncovered_worktree_roots(&listed, &repos);
+    assert_eq!(
+        out,
+        vec![
+            PathBuf::from("C:/rd/wt-new"),
+            PathBuf::from("C:/rd/wt-second")
+        ],
+        "only the uncovered, non-throwaway roots survive — deduped case-insensitively, order kept"
+    );
+
+    // Nothing registered at all: every non-throwaway root is a candidate.
+    let out = super::uncovered_worktree_roots(
+        &[PathBuf::from("C:/rd/main"), PathBuf::from("C:/rd/wt-new")],
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(out.len(), 2, "an empty registry keeps every listed root");
+}
+
+/// End-to-end wiring pin: a real git repo with a real linked worktree, both
+/// under the OS temp dir — discovery lists them, refuses the temp worktree
+/// (the same throwaway guard the hook path hits), and claims the throttle
+/// slot so the immediately-following pass is a no-op.
+#[tokio::test]
+#[serial]
+async fn discover_worktrees_skips_temp_worktrees_and_claims_throttle() {
+    // Hook context (GIT_DIR/GIT_INDEX_FILE) must not leak into the git
+    // subprocesses: under the pre-push QC gate the process env IS a hook
+    // context, and `git -C <tmp>` would resolve the outer repo.
+    let _hook_env = crate::db_discovery::repos::test_support::clear_hook_git_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let config_file = tmp.path().join("repos.json");
+    let main = tmp.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    {
+        let _l = crate::db_discovery::repos::test_support::git_serial_lock();
+        crate::db_discovery::repos::test_support::init_git_repo_with_commit(&main);
+        let wt = tmp.path().join("wt");
+        let o = crate::db_discovery::repos::test_support::scrub_hook_git_env(
+            &mut std::process::Command::new("git"),
+        )
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+        .output()
+        .unwrap();
+        assert!(
+            o.status.success(),
+            "worktree add failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    // The sync lock is dropped before the async part: a std MutexGuard
+    // must never live across an await point.
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(main.clone(), Some("main".to_string()))
+        .unwrap();
+    config.save_to(&config_file).unwrap();
+    let state = Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    // The stamp starts at boot time (not due) — arm the pass.
+    *state.worktree_discovery.lock().await = 0;
+    state.discover_worktrees().await;
+
+    let snap = state.config_snapshot();
+    assert_eq!(
+        snap.repos.len(),
+        1,
+        "the temp worktree must NOT be registered; got: {:?}",
+        snap.repos.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        snap.repos.contains_key("main"),
+        "the registered main must stay untouched"
+    );
+
+    let stamp = *state.worktree_discovery.lock().await;
+    assert!(stamp > 0, "a completed pass must stamp the throttle slot");
+    assert!(
+        !worktree_discovery_due(stamp, ServeState::unix_now_ms()),
+        "the immediately-following pass is throttled"
+    );
+}

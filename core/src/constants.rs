@@ -504,6 +504,13 @@ pub const MCP_IDLE_SESSION_SECS: u64 = 30 * 60; // 30 minutes
 /// How often the idle-reaper background task checks for repos to evict.
 pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 
+/// Minimum spacing between worktree-discovery passes. The status refresher
+/// drives discovery on its own (sub-10s) cadence, and each pass spawns one
+/// `git worktree list` per registered repo — the throttle keeps that a
+/// bounded cost. Also the head start the serve gives its startup phases:
+/// the first pass runs one interval after boot, never during warmup.
+pub const WORKTREE_DISCOVERY_INTERVAL_SECS: u64 = 60;
+
 /// Longest a query waits for another task's cold open of the same repo.
 /// Kept well under the MCP client's request timeout so the caller gets a
 /// "retry shortly" error instead of a cancelled request whose handler lingers.

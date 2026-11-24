@@ -589,6 +589,7 @@ The install target is resolved with `git rev-parse --git-path hooks`, so it hono
 1. `codesearch serve` writes its URL to `~/.codesearch/serve_url` (`$CODESEARCH_HOME/serve_url` when relocated) on startup (deletes on shutdown)
 2. The `post-checkout` hook reads that file and POSTs the working directory to `POST /repos`
 3. Serve registers the worktree path and begins indexing (deduped — won't re-register existing paths)
+4. A lost POST self-heals: the hook is fire-and-forget, so a `git worktree add` during a serve restart window registers nothing. Every 60 s serve's worktree-discovery pass lists the worktrees of each registered repo and registers the roots no alias covers. To keep a worktree out on purpose, `codesearch index rm --forget` it — a plain `index rm` returns on the next pass, exactly as it would on that worktree's next checkout.
 
 ### Claude Code Guard Hooks
 
