@@ -1,19 +1,30 @@
-# Dependabot PRs: auto-label + auto-merge for non-major bumps.
+# Dependabot PRs: auto-label + auto-approve + green-gated merge for non-major
+# bumps.
 #
 # These PRs historically arrived with a failing require-changelog (dependency
 # bumps never touch CHANGELOG.md), no ci.yml run (dependabot/** fell outside
 # the push allowlist — fixed there), and a required approval nobody was
 # waiting for. This workflow removes the toil:
 #   - `no-changelog` label: the documented bypass in changelog-check.yml.
-#   - auto-merge: the PR merges itself once required checks pass and an
-#     approval lands. Enable "Allow auto-merge" in repo settings; major bumps
-#     deliberately still wait for a human.
+#   - approve + merge: minor and patch bumps are approved by the workflow and
+#     merged once every check is green; major bumps deliberately still wait
+#     for a human.
+#
+# Why `gh pr merge --auto` is NOT used (replaced by watch-then-merge below):
+#   1. `enablePullRequestAutoMerge` fails for GITHUB_TOKEN here — the "block
+#      develop" ruleset grants no bypass to github-actions, and GitHub
+#      evaluates CURRENT merge eligibility at enablement: 0 reviews yet →
+#      "Resource not accessible by integration".
+#   2. The ruleset has NO required status checks (the repo merges with
+#      `--admin` by design), so --auto would merge on the approval alone —
+#      even while test-windows is red. Watching the checks first gates the
+#      merge on green CI without changing any repo settings.
 #
 # pull_request_target (NOT pull_request): dependabot PRs get a read-only
 # GITHUB_TOKEN under pull_request (GitHub treats dependabot PRs as fork PRs),
-# so label + auto-merge would 403 there. pull_request_target also keeps running
-# develop's copy of this file even when the PR itself changes workflows; safe
-# here because the job never checks out the PR's code.
+# so label + approve + merge would 403 there. pull_request_target also keeps
+# running develop's copy of this file even when the PR itself changes
+# workflows; safe here because the job never checks out the PR's code.
 #
 # ⚠️ Delivery gotcha: pull_request_target only fires while this file exists on
 # the DEFAULT branch (master), not merely on the PR base (develop). Between
@@ -27,12 +38,17 @@ on:
     types: [opened, reopened, synchronize]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
+
+concurrency:
+  group: dependabot-automation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   automate:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     if: github.actor == 'dependabot[bot]'
     steps:
       - name: Fetch dependabot metadata
@@ -47,9 +63,23 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --add-label no-changelog
 
-      - name: Enable auto-merge (minor and patch only)
+      # Approval satisfies the ruleset's 1-review requirement; a GITHUB_TOKEN
+      # review counts for PRs authored by a different actor (dependabot).
+      - name: Approve (minor and patch only)
         if: steps.meta.outputs.update-type != 'version-update:semver-major'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
-        run: gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto --merge
+        run: gh pr review "$PR" --repo "$GITHUB_REPOSITORY" --approve
+
+      # gh pr checks --watch exits non-zero on any failing check, so a red
+      # test-windows (seen on grouped bumps) never merges. The merge runs as
+      # the same actor that approved, with the review requirement satisfied.
+      - name: Wait for green CI, then merge (minor and patch only)
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr checks "$PR" --repo "$GITHUB_REPOSITORY" --watch --interval 60
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --merge
