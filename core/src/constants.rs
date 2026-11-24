@@ -810,6 +810,12 @@ pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 /// fires the flush regardless — the index must not stay stale forever.
 pub const SCIP_BRANCH_DEBOUNCE_MAX_MS: u64 = 600_000; // 10 minutes
 
+/// Above this many .csproj groups an incremental C# symbol rebuild falls
+/// back to ONE full solution rebuild: each cold incremental run pays
+/// workspace_open (16–67s measured), so past a few groups N runs cost more
+/// than one Full (16 groups = ~10 min on 2026-11-24).
+pub const CSHARP_MAX_INCREMENTAL_GROUPS: usize = 4;
+
 /// Environment variable overriding the restore-pending retry interval in
 /// seconds (issue #225). Values ≤ 0 or unparseable fall back to the
 /// built-in interval (a zero interval would hot-spin the helper); tests

@@ -17,8 +17,9 @@
 
 use crate::cache::normalize_path_str;
 use crate::constants::{
-    DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
-    SCIP_BRANCH_DEBOUNCE_MAX_MS, SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS,
+    CSHARP_MAX_INCREMENTAL_GROUPS, DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME,
+    LANG_CSHARP, LANG_TYPESCRIPT, SCIP_BRANCH_DEBOUNCE_MAX_MS, SCIP_CSHARP_DEBOUNCE_MS,
+    SCIP_TYPESCRIPT_DEBOUNCE_MS,
 };
 use crate::embed::{EmbeddingModel, EmbeddingServicePool};
 use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
@@ -279,6 +280,13 @@ fn branch_flush_due(
         }
         _ => false,
     }
+}
+
+/// Above this many .csproj groups a pass of cold incremental scip-csharp
+/// runs costs more than one Full rebuild (each run pays workspace_open) —
+/// the Incremental arm falls back to Full instead.
+fn incremental_group_cap_hit(group_count: usize) -> bool {
+    group_count > CSHARP_MAX_INCREMENTAL_GROUPS
 }
 
 /// The FULL kind a pending full rebuild carries. `Branch` is the superset
@@ -1776,6 +1784,25 @@ impl IndexManager {
                                     "🔬 [{}] {} modified file(s) could not be mapped to a .csproj, falling back to full solution rebuild",
                                     repo_label,
                                     ungrouped.len()
+                                );
+                                Self::run_full_rebuild_logged(
+                                    indexer,
+                                    repo_path,
+                                    db_path,
+                                    repo_label,
+                                    "C#",
+                                    csharp_notifier,
+                                );
+                                // Clear "Indexing" regardless of outcome
+                                if let Some(ref cb) = indexing_cb {
+                                    cb(false);
+                                }
+                            } else if incremental_group_cap_hit(groups.len()) {
+                                info!(
+                                    "🔬 [{}] {} .csproj group(s) exceed the incremental cap of {}, falling back to full solution rebuild — cold per-group runs cost more than one Full",
+                                    repo_label,
+                                    groups.len(),
+                                    CSHARP_MAX_INCREMENTAL_GROUPS
                                 );
                                 Self::run_full_rebuild_logged(
                                     indexer,
@@ -3393,6 +3420,16 @@ mod tests {
             Some(first),
             first + quiet - std::time::Duration::from_secs(1)
         ));
+    }
+
+    /// Incremental→Full threshold: at or below the cap incrementals stay,
+    /// one group past it a Full replaces N cold incremental runs.
+    #[test]
+    fn incremental_group_cap_hit_threshold() {
+        assert!(!incremental_group_cap_hit(0));
+        assert!(!incremental_group_cap_hit(1));
+        assert!(!incremental_group_cap_hit(CSHARP_MAX_INCREMENTAL_GROUPS));
+        assert!(incremental_group_cap_hit(CSHARP_MAX_INCREMENTAL_GROUPS + 1));
     }
 
     /// #277: a removal that raced a recreation re-queues only what is
