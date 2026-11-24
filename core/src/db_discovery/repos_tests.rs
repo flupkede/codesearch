@@ -1946,7 +1946,7 @@ fn list_worktree_paths_covers_main_and_linked_worktrees() {
         let listed: Vec<String> = listed.iter().map(|p| canon_norm(p)).collect();
         assert_eq!(
             listed,
-            vec![canon_norm(&main), canon_norm(tmp.path().join("wt1"))],
+            vec![canon_norm(&main), canon_norm(&tmp.path().join("wt1"))],
             "listing must cover the main tree and the linked worktree, main first"
         );
 

@@ -3,9 +3,13 @@
 #
 # Bash equivalent of scripts/qc.ps1 — runs on Linux/macOS.
 #
+# Every cargo invocation below is the CI workflow's own command (same flags,
+# same --workspace scope); src/qc_gate_tests.rs fails when the two drift
+# apart. Do not "simplify" a command here without changing ci.yml too.
+#
 # Usage:
 #   bash scripts/qc.sh          # run all checks
-#   bash scripts/qc.sh --fast   # skip slow checks (integration tests)
+#   bash scripts/qc.sh --fast   # compile the integration tests without running them; skip the load-dynamic clippy
 #
 # Exit code 0 = all clear, non-zero = failure (blocks push via pre-push hook)
 
@@ -75,24 +79,33 @@ echo -e "  codesearch QC gate"
 echo -e "  Mirrors .github/workflows/ci.yml"
 echo -e "======================================${YELLOW}"
 
-# ── Step 1: cargo fmt --check (CI: test-linux) ──
-step "cargo fmt --check" "cargo fmt -- --check 2>&1"
+# ── Step 1: cargo fmt --all --check (CI: test-linux) ──
+step "cargo fmt --all --check" "cargo fmt --all -- --check 2>&1"
 
 # ── Step 2: cargo check (fast type check) ──
-step "cargo check" "cargo check 2>&1"
+# --workspace, like every CI step below: without it cargo builds the root
+# package only, so the core crate's own tests are never compiled here and a
+# red CI reaches develop unseen (the gate said "mirrors CI" while doing so).
+step "cargo check --workspace" "cargo check --workspace 2>&1"
 
 # ── Step 3: cargo clippy (CI: test-linux) ──
-step "cargo clippy" "cargo clippy --all-targets -- -D warnings 2>&1"
+step "cargo clippy --workspace" "cargo clippy --workspace --all-targets -- -D warnings 2>&1"
 
 # ── Step 4: cargo test --lib (CI: test-linux + test-windows) ──
-step "cargo test --lib" "cargo test --lib -- --nocapture 2>&1"
+step "cargo test --workspace --lib" "cargo test --workspace --lib -- --nocapture 2>&1"
 
 # ── Step 5: cargo test --test '*' (CI: test-linux + test-windows) ──
+# ── Step 6: cargo clippy load-dynamic (CI: test-linux) ──
 if ! $FAST; then
-    step "cargo test (integration)" "cargo test --test '*' -- --nocapture --skip ignore 2>&1"
+    step "cargo test --workspace (integration)" "cargo test --workspace --test '*' -- --nocapture --skip ignore 2>&1"
+    step "cargo clippy (load-dynamic)" "cargo clippy --no-default-features --features load-dynamic --all-targets -- -D warnings 2>&1"
 else
+    # Compile-only: a test that is never compiled cannot fail locally. The
+    # integration tests were skipped outright here, which is exactly how a red
+    # CI reached develop without anyone seeing it.
+    step "cargo test --workspace (integration, compile only)" "cargo test --workspace --test '*' --no-run 2>&1"
     echo ""
-    echo -e "  ${GRAY}(skipping integration tests — --fast mode)${NC}"
+    echo -e "  ${GRAY}(-Fast: integration tests compiled, not run; load-dynamic clippy not run)${NC}"
 fi
 
 # ── Summary ──

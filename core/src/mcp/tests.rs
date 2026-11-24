@@ -696,6 +696,7 @@ async fn group_lexical_search_attributes_each_hit_to_its_repo() {
         project: None,
         group: Some("all".to_string()),
         min_score: None,
+        wait_secs: None,
     };
     let mut alias_roots = std::collections::HashMap::new();
     alias_roots.insert(
@@ -925,6 +926,7 @@ async fn group_search_collapses_family_duplicates_and_backfills() {
         project: None,
         group: Some("all".to_string()),
         min_score: None,
+        wait_secs: None,
     };
     let mut alias_roots = std::collections::HashMap::new();
     alias_roots.insert(
@@ -1021,6 +1023,7 @@ async fn group_search_family_collapse_keeps_ranking_balanced() {
         project: None,
         group: Some("all".to_string()),
         min_score: None,
+        wait_secs: None,
     };
     let aliases = ["alpha", "alpha-wt1", "alpha-wt2", "beta", "gamma"];
     let roots = [&root_a, &root_w1, &root_w2, &root_b, &root_g];
@@ -3834,6 +3837,7 @@ async fn lexical_group_search_degrades_per_repo_when_a_store_is_write_locked() {
         project: None,
         group: Some("all".to_string()),
         min_score: None,
+        wait_secs: None,
     };
     let mut alias_roots = std::collections::HashMap::new();
     alias_roots.insert(

@@ -14,7 +14,7 @@ never seems to fire, check that setting first.
 |---|---|
 | `pre-commit` | Runs `cargo fmt` and stages the result, so CI's fmt check can't fail. Then runs the branch-aware root-md allowlist guard (see below) — on `develop`/`master`, `AGENTS.md`/`CLAUDE.md` are not allowlisted, so (re)introducing them via a direct commit or conflict resolution is blocked. |
 | `pre-merge-commit` | Runs the same root-md allowlist guard on the merge result — a clean merge never invokes `pre-commit`, so this is the gate that stops `AGENTS.md`/`CLAUDE.md` riding a clean feature→`develop` merge onto the integration branch. |
-| `pre-push` | Blocks direct pushes to `master`; runs the QC gate (skipped when the branch changes no Rust); scans tracked files for customer references. |
+| `pre-push` | Blocks direct pushes to `master`; runs the QC gate (`scripts/qc.ps1 -Fast`: CI's own fmt/clippy/lib-test commands, workspace-wide, plus a compile of the integration tests — `src/qc_gate_tests.rs` fails when the gate scripts drift from `.github/workflows/ci.yml`; skipped when the branch changes no Rust); scans tracked files for customer references. |
 | `post-checkout` | Branch-local agent-file lifecycle: on a feature branch, creates `AGENTS.md` from `AGENTS.develop.md` plus the `CLAUDE.md` pointer when absent; on `develop`/`master`, removes untracked `AGENTS.md`/`CLAUDE.md` leftovers. No-op on detached HEAD. |
 
 Any hook can be bypassed with `git push --no-verify` / `git commit --no-verify`.

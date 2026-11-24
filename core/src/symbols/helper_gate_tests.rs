@@ -104,16 +104,20 @@ fn lookup(pool: &WorkspacePool) -> Result<ResidentRefs> {
 
 #[test]
 fn concurrency_parse_defaults_and_clamps() {
+    use crate::constants::{
+        CSHARP_SCIP_CONCURRENCY_DEFAULT as D, CSHARP_SCIP_CONCURRENCY_MAX as M,
+    };
+    // A parsed 0 clamps to 1; unparseable input falls back to the default.
     let cases: &[(Option<&str>, usize)] = &[
-        (None, 1),
+        (None, D),
         (Some("0"), 1),
         (Some("1"), 1),
         (Some("2"), 2),
         (Some("4"), 4),
-        (Some("9"), 4),
-        (Some("garbage"), 1),
-        (Some(""), 1),
-        (Some("-1"), 1),
+        (Some("9"), M),
+        (Some("garbage"), D),
+        (Some(""), D),
+        (Some("-1"), D),
     ];
     for (raw, expected) in cases {
         assert_eq!(
@@ -134,12 +138,19 @@ fn gate_capacity_is_at_least_one() {
 #[test]
 #[serial]
 fn concurrency_reads_the_env_var() {
-    for (raw, expected) in [("3", 3), ("9", 4), ("garbage", 1)] {
+    for (raw, expected) in [
+        ("3", 3),
+        ("9", crate::constants::CSHARP_SCIP_CONCURRENCY_MAX),
+        ("garbage", crate::constants::CSHARP_SCIP_CONCURRENCY_DEFAULT),
+    ] {
         let _env = crate::testing::EnvRestore::set(&[(CSHARP_SCIP_CONCURRENCY_ENV, raw)]);
         assert_eq!(csharp_scip_concurrency(), expected, "raw = {raw:?}");
     }
     let _env = crate::testing::EnvRestore::remove(&[CSHARP_SCIP_CONCURRENCY_ENV]);
-    assert_eq!(csharp_scip_concurrency(), 1);
+    assert_eq!(
+        csharp_scip_concurrency(),
+        crate::constants::CSHARP_SCIP_CONCURRENCY_DEFAULT
+    );
 }
 
 #[test]
