@@ -747,7 +747,7 @@ dependencies = [
  "ignore",
  "indicatif",
  "libc",
- "notify 8.2.2",
+ "notify 9.0.0",
  "notify-debouncer-full",
  "num_cpus",
  "ratatui",
@@ -3120,15 +3120,14 @@ dependencies = [
 
 [[package]]
 name = "notify-debouncer-full"
-version = "0.8.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b4029a4d8d71c0c466e412c30a0bf3bfb009677f6c4172a76a02d11f8d39047"
+checksum = "c02b49179cfebc9932238d04d6079912d26de0379328872846118a0fa0dbb302"
 dependencies = [
  "file-id",
  "log",
- "notify 9.0.0",
+ "notify 8.2.2",
  "notify-types",
- "rustc-hash",
  "walkdir",
 ]
 
