@@ -4172,12 +4172,12 @@ fn first_build_pending_answers_per_mode() {
     // the literal fallback — an agent must be able to act on it, and a
     // mode-string typo here is exactly the regression this pins.
     let FirstBuildPending::SemanticMessage(msg) =
-        super::search::first_build_pending("semantic", "BOIN.WT3")
+        super::search::first_build_pending("semantic", "acme.wt3")
     else {
         panic!("semantic mode must answer with the pending message");
     };
     for needle in [
-        "BOIN.WT3",
+        "acme.wt3",
         "first build",
         "wait_secs",
         "mode=\"literal\"",
@@ -4191,24 +4191,24 @@ fn first_build_pending_answers_per_mode() {
 
     // A group renders several pending repos in one message.
     let FirstBuildPending::SemanticMessage(group_msg) =
-        super::search::first_build_pending("semantic", "BOIN.WT1', 'BOIN.WT3")
+        super::search::first_build_pending("semantic", "acme.wt1', 'acme.wt3")
     else {
         panic!("group pending must answer with the message");
     };
     assert!(
-        group_msg.contains("BOIN.WT1', 'BOIN.WT3"),
+        group_msg.contains("acme.wt1', 'acme.wt3"),
         "group message must name every pending repo: {group_msg}"
     );
 
     // hybrid/auto: the FTS half still answers; the warning explains why.
     for mode in ["hybrid", "auto"] {
         let FirstBuildPending::HybridWarning(warning) =
-            super::search::first_build_pending(mode, "BOIN.WT3")
+            super::search::first_build_pending(mode, "acme.wt3")
         else {
             panic!("mode '{mode}' must warn and keep FTS, not answer with the message");
         };
         assert!(
-            warning.contains("BOIN.WT3") && warning.contains("FTS-only"),
+            warning.contains("acme.wt3") && warning.contains("FTS-only"),
             "warning for '{mode}' must name the repo and the FTS-only shape: {warning}"
         );
     }
