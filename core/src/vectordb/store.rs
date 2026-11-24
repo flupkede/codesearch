@@ -10,6 +10,13 @@ use anyhow::{anyhow, Result};
 /// format change). The open path checks this and reports mismatches so the
 /// caller can trigger a rebuild.
 const SCHEMA_VERSION: u32 = 1;
+
+/// Leaf error `search` returns when chunks exist but the HNSW graph does
+/// not — a first build still in progress, or a crashed build. Shared with
+/// the MCP classifier (`is_index_not_built`) so the coupling is one
+/// constant, not a wording two files must edit in lockstep.
+pub(crate) const INDEX_NOT_BUILT_MSG: &str =
+    "Index not built. Call build_index() after inserting chunks.";
 use crate::lmdb_registry::{create_named_db, open_named_db, TrackedEnv};
 use crate::utils::rename_retry::{
     is_transient_rename_error, RENAME_RETRY_ATTEMPTS, RENAME_RETRY_DELAY_MS,
@@ -850,9 +857,7 @@ impl VectorStore {
             if self.chunks.last(&rtxn)?.is_none() {
                 return Ok(Vec::new());
             }
-            return Err(anyhow!(
-                "Index not built. Call build_index() after inserting chunks."
-            ));
+            return Err(anyhow!(crate::vectordb::INDEX_NOT_BUILT_MSG));
         }
 
         let reader = Reader::open(&rtxn, 0, self.vectors)?;

@@ -511,6 +511,12 @@ pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 /// the first pass runs one interval after boot, never during warmup.
 pub const WORKTREE_DISCOVERY_INTERVAL_SECS: u64 = 60;
 
+/// Upper bound for a semantic search's `wait_secs` — the time it may hold
+/// the tool call open waiting for a repo's first vector-index build to
+/// finish. Kept under typical MCP client timeouts so a caller that asks for
+/// more still gets an answer, not a client-side disconnect.
+pub const SEARCH_WAIT_MAX_SECS: u64 = 120;
+
 /// Longest a query waits for another task's cold open of the same repo.
 /// Kept well under the MCP client's request timeout so the caller gets a
 /// "retry shortly" error instead of a cancelled request whose handler lingers.

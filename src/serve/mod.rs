@@ -7032,6 +7032,25 @@ async fn add_repo_handler(
             }
         }
 
+        // Symbol indexes build ALONGSIDE the text embed, not after it: a
+        // repo registered while serve runs never sees the startup symbol
+        // pass, and serial ordering made a cold worktree wait out the full
+        // embed before its C# symbols even started — minutes of avoidable
+        // wall time. Safe to run concurrently: the SCIP store is a separate
+        // LMDB env (scip/ subdirectory), the helper gate bounds the C# side
+        // while the job gate bounds the embed, and the Symbol marker is
+        // owner-scoped so it nests with this task's Reindex marker (the
+        // FSW path already relies on exactly that).
+        {
+            let state_sym = state_bg.clone();
+            let alias_sym = alias_bg.clone();
+            let path_sym = project_path.clone();
+            let db_sym = db_path.clone();
+            tokio::spawn(async move {
+                maybe_rebuild_symbols(&alias_sym, &path_sym, &db_sym, &state_sym, false).await;
+            });
+        }
+
         let indexed = if adopt_existing {
             // Incremental refresh: unchanged files stay in the index, only real
             // changes are re-chunked/re-embedded. Same heavy-job gate and
@@ -7173,11 +7192,6 @@ async fn add_repo_handler(
 
         // Start FSW and transition to proper Write state with IndexManager
         state_bg.restart_fsw(&alias_bg, stores).await;
-
-        // Phase-2 equivalence for runtime adds: a repo registered while serve
-        // runs never sees the startup symbol pass, so its symbol indexes would
-        // not exist until a restart — build them now (gate-driven).
-        maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &state_bg, false).await;
 
         state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
         tracing::info!("Repo '{}' fully indexed and ready", alias_bg);
@@ -8692,6 +8706,32 @@ impl ServeHandle for ServeState {
 
     fn is_indexing(&self, alias: &str) -> bool {
         ServeState::is_indexing(self, alias)
+    }
+
+    async fn wait_indexing_settled(&self, alias: &str, max_secs: u64) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            // Register before reading (same ordering as indexing_handler):
+            // a marker change between the read and the await must not be
+            // missed, or the wait would sit out the full deadline.
+            let notified = self.indexing_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if !ServeState::is_indexing(self, alias) {
+                return true;
+            }
+            let remaining = max_secs.saturating_sub(started.elapsed().as_secs());
+            if remaining == 0 {
+                return false;
+            }
+            tokio::select! {
+                _ = &mut notified => continue,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(remaining)) => {
+                    return !ServeState::is_indexing(self, alias);
+                }
+            }
+        }
     }
 
     fn touch_access(&self, alias: &str) {

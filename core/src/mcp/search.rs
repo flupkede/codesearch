@@ -10,6 +10,57 @@ use rmcp::{
     tool, tool_router, ErrorData as McpError,
 };
 
+/// Whether an error chain is the vector store's "chunks present, HNSW graph
+/// absent" state — a first build still in progress, not a fault. Matched on
+/// the shared [`crate::vectordb::INDEX_NOT_BUILT_MSG`] leaf, so a store-side
+/// wording change moves the constant and the classifier with it.
+pub(crate) fn is_index_not_built(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.to_string() == crate::vectordb::INDEX_NOT_BUILT_MSG)
+}
+
+/// How the single-project semantic path answers the first-build pending
+/// state. Pure so the branch is testable without an embedding model —
+/// semantic search needs one to reach the vector store, and the house
+/// tests never load ONNX.
+pub(crate) enum FirstBuildPending {
+    /// mode="semantic": no second backend, the whole answer is this message.
+    SemanticMessage(String),
+    /// hybrid/auto: the FTS half still answers; attach this warning.
+    HybridWarning(String),
+}
+
+pub(crate) fn first_build_pending(mode: &str, alias: Option<&str>) -> FirstBuildPending {
+    if mode == "semantic" {
+        FirstBuildPending::SemanticMessage(first_build_pending_message(alias))
+    } else {
+        FirstBuildPending::HybridWarning(first_build_pending_warning(alias))
+    }
+}
+
+/// Scoped answer for a semantic-mode search against a repo whose first
+/// vector-index build is still running — a wait state, never a bare error
+/// string (the caller agent cannot tell "retry later" from "broken").
+fn first_build_pending_message(alias: Option<&str>) -> String {
+    format!(
+        "Semantic index for '{}' is still on its first build: chunks are committed batch by \
+         batch, but the vector graph is built once, after the last batch. This is not an \
+         error — retry in a few minutes, pass wait_secs={} to have the search wait for it, \
+         or use mode=\"literal\" meanwhile (FTS answers with the batches committed so far).",
+        alias.unwrap_or("this repo"),
+        crate::constants::SEARCH_WAIT_MAX_SECS
+    )
+}
+
+/// Hybrid/auto-mode warning for the same state: the FTS half still answers.
+fn first_build_pending_warning(alias: Option<&str>) -> String {
+    format!(
+        "vector index for '{}' is still on its first build — results are FTS-only until it \
+         finishes",
+        alias.unwrap_or("this repo")
+    )
+}
+
 #[tool_router(router = search_router, vis = "pub(crate)")]
 impl CodesearchService {
     // Consolidated tools (the primary 5-tool surface)
@@ -23,7 +74,7 @@ impl CodesearchService {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nSet `min_score` to drop weak hits and answer with an explicit refusal (empty results + note) instead of nearest-neighbour noise; the score scale depends on `semantic_mode` — cosine similarity for \"semantic\", RRF points (rarely above 0.2) otherwise. Federated group/project queries forward `min_score` to every leg and surface each leg's refusal note in `warnings`. Not supported in `literal` mode — passing `min_score` with mode=\"literal\" returns an explicit error naming the field.\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
+        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nSet `min_score` to drop weak hits and answer with an explicit refusal (empty results + note) instead of nearest-neighbour noise; the score scale depends on `semantic_mode` — cosine similarity for \"semantic\", RRF points (rarely above 0.2) otherwise. Federated group/project queries forward `min_score` to every leg and surface each leg's refusal note in `warnings`. Not supported in `literal` mode — passing `min_score` with mode=\"literal\" returns an explicit error naming the field.\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose.\n\nWhile a repo's FIRST index build is still running, semantic search answers with a \"still building\" note instead of an error; pass `wait_secs` (semantic mode, max 120) to have the call wait for the build to finish and then answer normally."
     )]
     pub async fn search(
         &self,
@@ -104,6 +155,7 @@ impl CodesearchService {
                     project: request.project,
                     group: request.group,
                     min_score: request.min_score,
+                    wait_secs: request.wait_secs,
                 };
                 self.semantic_search(Parameters(semantic_req)).await
             }
@@ -290,18 +342,53 @@ impl CodesearchService {
             single_warnings.push(warning);
         }
 
-        // Search vector store
-        let vector_results = match self
-            .with_vector_store_read_for(
-                |store| {
-                    store
-                        .search(&query_embedding, limit * 5)
-                        .context("Error searching vector store")
-                },
-                ctx.stores.clone(),
-            )
-            .await
-        {
+        // Search vector store. A first build commits chunks batch by batch,
+        // but the HNSW graph is built once, after the last batch — until
+        // then the store answers "Index not built". That is a wait state,
+        // not a fault (field incident: a cold worktree's every semantic
+        // search errored for half an hour and the agent fell back to grep),
+        // so it gets its own branch: optionally wait out the build, then
+        // answer with a scoped retry message instead of a bare error.
+        let vector_results = {
+            let attempt = self
+                .vector_search_once(&query_embedding, limit, ctx.stores.clone())
+                .await;
+            match attempt {
+                Ok(r) => Ok(r),
+                Err(e) if is_index_not_built(&e) => {
+                    let alias = ctx.project_alias.clone();
+                    let cap = request
+                        .wait_secs
+                        .unwrap_or(0)
+                        .min(crate::constants::SEARCH_WAIT_MAX_SECS);
+                    let settled = cap > 0
+                        && match (&alias, self.serve_state.as_ref()) {
+                            (Some(a), Some(serve)) => {
+                                serve.is_indexing(a) && serve.wait_indexing_settled(a, cap).await
+                            }
+                            _ => false,
+                        };
+                    if settled {
+                        self.vector_search_once(&query_embedding, limit, ctx.stores.clone())
+                            .await
+                    } else {
+                        match first_build_pending(mode, alias.as_deref()) {
+                            FirstBuildPending::SemanticMessage(message) => {
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                                    message,
+                                )]));
+                            }
+                            FirstBuildPending::HybridWarning(warning) => {
+                                single_warnings.push(warning);
+                                Ok(Vec::new())
+                            }
+                        }
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        };
+        let vector_results = match vector_results {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("MCP: Search failed: {:?}", e);
@@ -557,6 +644,24 @@ impl CodesearchService {
     }
 
     // === Helper methods (not exposed as tools) ===
+
+    /// One vector-store attempt for the single-project semantic path.
+    async fn vector_search_once(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        stores: Option<std::sync::Arc<crate::index::SharedStores>>,
+    ) -> anyhow::Result<Vec<crate::vectordb::SearchResult>> {
+        self.with_vector_store_read_for(
+            |store| {
+                store
+                    .search(query_embedding, limit * 5)
+                    .context("Error searching vector store")
+            },
+            stores,
+        )
+        .await
+    }
 
     /// Multi-store semantic search: fan out across all stores, merge raw vector/FTS
     /// results, then apply RRF fusion.

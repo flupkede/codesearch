@@ -49,6 +49,11 @@ pub struct SearchRequest {
     /// calibrate per mode before reusing a value.
     pub min_score: Option<f32>,
 
+    /// Seconds the call may wait for a repo whose first vector-index build
+    /// is still running (semantic mode only) — instead of answering at once
+    /// with a "still building" note. Clamped to `SEARCH_WAIT_MAX_SECS`.
+    pub wait_secs: Option<u64>,
+
     // ── Literal-mode options (ignored in semantic mode) ──
     /// Treat `query` as a regex pattern (literal mode only).
     pub regex: Option<bool>,
@@ -231,6 +236,12 @@ pub struct SemanticSearchRequest {
     pub group: Option<String>,
     #[serde(default)]
     pub min_score: Option<f32>,
+    /// Seconds the search may wait for a repo whose vector index is still
+    /// on its first build (chunks committed, HNSW graph not yet built) to
+    /// finish, instead of answering at once. 0/absent keeps the immediate
+    /// "still building" answer; clamped to `SEARCH_WAIT_MAX_SECS`.
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
 }
 
 /// Internal params for literal search (used by `search` tool dispatch).

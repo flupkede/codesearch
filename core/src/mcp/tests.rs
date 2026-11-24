@@ -2690,6 +2690,7 @@ fn build_remote_search_body_forwards_min_score_to_peers() {
         semantic_mode: None,
         filter_path: None,
         min_score: Some(0.42),
+        wait_secs: None,
         regex: None,
         phrase: None,
         file_glob: None,
@@ -2836,6 +2837,7 @@ async fn search_refuses_min_score_in_literal_mode_by_name() {
         semantic_mode: None,
         filter_path: None,
         min_score: Some(0.5),
+        wait_secs: None,
         regex: None,
         phrase: None,
         file_glob: None,
@@ -4117,4 +4119,94 @@ fn test_extract_tool_cwd() {
     );
     args.insert("cwd".into(), serde_json::json!("   "));
     assert_eq!(super::extract_tool_cwd(&Some(args)), None);
+}
+
+// ─── First-build wait state (semantic search wait_secs) ────────────────
+
+#[test]
+fn is_index_not_built_matches_the_nested_store_error_only() {
+    // The store's error arrives wrapped in .context(...) chains — the
+    // classifier must see through the wrapper (equality on the shared
+    // leaf constant), and nothing else.
+    let wrapped = anyhow::anyhow!(crate::vectordb::INDEX_NOT_BUILT_MSG)
+        .context("Error searching vector store");
+    assert!(
+        super::search::is_index_not_built(&wrapped),
+        "the wrapped store error must classify as first-build-in-progress"
+    );
+    assert!(
+        !super::search::is_index_not_built(&anyhow::anyhow!(
+            "Index not built. Call build_index() after inserting chunks ."
+        )),
+        "a near-identical message must not classify — the match is exact"
+    );
+    assert!(
+        !super::search::is_index_not_built(&anyhow::anyhow!("Index not ready")),
+        "a similar-but-different message must not classify"
+    );
+    assert!(
+        !super::search::is_index_not_built(&anyhow::anyhow!("Error searching vector store")),
+        "an outer wrapper without the store cause must not classify"
+    );
+}
+
+#[test]
+fn first_build_pending_answers_per_mode() {
+    use super::search::FirstBuildPending;
+
+    // semantic: the whole answer, naming the alias, the wait parameter and
+    // the literal fallback — an agent must be able to act on it, and a
+    // mode-string typo here is exactly the regression this pins.
+    let FirstBuildPending::SemanticMessage(msg) =
+        super::search::first_build_pending("semantic", Some("BOIN.WT3"))
+    else {
+        panic!("semantic mode must answer with the pending message");
+    };
+    for needle in [
+        "BOIN.WT3",
+        "first build",
+        "wait_secs",
+        "mode=\"literal\"",
+        "not an error",
+    ] {
+        assert!(
+            msg.contains(needle),
+            "message must mention '{needle}': {msg}"
+        );
+    }
+
+    // hybrid/auto: the FTS half still answers; the warning explains why.
+    for mode in ["hybrid", "auto"] {
+        let FirstBuildPending::HybridWarning(warning) =
+            super::search::first_build_pending(mode, Some("BOIN.WT3"))
+        else {
+            panic!("mode '{mode}' must warn and keep FTS, not answer with the message");
+        };
+        assert!(
+            warning.contains("BOIN.WT3") && warning.contains("FTS-only"),
+            "warning for '{mode}' must name the repo and the FTS-only shape: {warning}"
+        );
+    }
+
+    // No alias resolved (unroutable edge): still actionable, never a panic.
+    let FirstBuildPending::HybridWarning(warning) =
+        super::search::first_build_pending("hybrid", None)
+    else {
+        panic!("alias-less hybrid must still warn");
+    };
+    assert!(warning.contains("this repo"), "{warning}");
+}
+
+#[test]
+fn search_requests_parse_wait_secs_optionally() {
+    let req: super::types::SemanticSearchRequest =
+        serde_json::from_str(r#"{"query":"q","wait_secs":45}"#).unwrap();
+    assert_eq!(req.wait_secs, Some(45));
+    // Absent stays None — the pre-parameter behaviour is the default.
+    let req: super::types::SemanticSearchRequest =
+        serde_json::from_str(r#"{"query":"q"}"#).unwrap();
+    assert_eq!(req.wait_secs, None);
+    let req: super::types::SearchRequest =
+        serde_json::from_str(r#"{"query":"q","wait_secs":120}"#).unwrap();
+    assert_eq!(req.wait_secs, Some(120));
 }

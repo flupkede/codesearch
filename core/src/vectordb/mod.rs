@@ -1,6 +1,7 @@
 pub mod compact;
 pub(crate) mod store;
 
+pub(crate) use store::INDEX_NOT_BUILT_MSG;
 pub use store::{
     atomic_write_json, merge_metadata_atomic, ChunkMetadata, SearchResult, StoreStats, VectorStore,
     PATH_REWRITE_BATCH,

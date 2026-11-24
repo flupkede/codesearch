@@ -3355,6 +3355,54 @@ async fn indexing_long_poll_answers_the_moment_the_reindex_ends() {
     );
 }
 
+/// `wait_indexing_settled` — the wait primitive the semantic search's
+/// `wait_secs` rides on. Settles immediately for an idle repo, parks while
+/// the marker is live, wakes the moment the marker clears, and answers
+/// false when the budget runs out.
+#[tokio::test]
+async fn wait_indexing_settled_wakes_on_marker_end_and_times_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("wt");
+    std::fs::create_dir(&repo_path).unwrap();
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(repo_path, Some("wt".to_string()))
+        .unwrap();
+    let state = Arc::new(ServeState::new(config, None));
+
+    use crate::mcp::ServeHandle as _;
+
+    // Idle repo: settled at once.
+    assert!(
+        state.wait_indexing_settled("wt", 1).await,
+        "an idle repo is settled immediately"
+    );
+
+    // Live marker: the wait parks, then wakes on end_indexing.
+    state.begin_indexing("wt", IndexingOwner::Watcher);
+    let s = state.clone();
+    let task = tokio::spawn(async move { s.wait_indexing_settled("wt", 10).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !task.is_finished(),
+        "the wait must park while the indexing marker is live"
+    );
+    state.end_indexing("wt", IndexingOwner::Watcher);
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("the marker end must wake the parked wait")
+        .unwrap();
+    assert!(settled, "a woken wait reports settled");
+
+    // Zero budget against a live marker: immediate false, no parking.
+    state.begin_indexing("wt", IndexingOwner::Watcher);
+    assert!(
+        !state.wait_indexing_settled("wt", 0).await,
+        "a zero budget times out immediately"
+    );
+    state.end_indexing("wt", IndexingOwner::Watcher);
+}
+
 /// `wait=0` (and a request without the parameter) answers immediately: that
 /// is what keeps older callers, and this client against an older hub, working.
 #[tokio::test]
@@ -6974,6 +7022,7 @@ async fn semantic_search_refuses_when_the_model_is_not_cached() {
         semantic_mode: None,
         filter_path: None,
         min_score: None,
+        wait_secs: None,
         regex: None,
         phrase: None,
         file_glob: None,
@@ -7416,6 +7465,7 @@ async fn group_semantic_search_min_score_refuses_instead_of_returning_noise() {
         semantic_mode: Some("lexical".to_string()),
         filter_path: None,
         min_score,
+        wait_secs: None,
         regex: None,
         phrase: None,
         file_glob: None,

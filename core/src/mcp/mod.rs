@@ -1998,6 +1998,7 @@ impl CodesearchService {
                         project: None,
                         group: Some(group.clone()),
                         min_score: request.min_score,
+                        wait_secs: request.wait_secs,
                     };
                     self.semantic_search(Parameters(req)).await?
                 }

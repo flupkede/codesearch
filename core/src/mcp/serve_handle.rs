@@ -47,6 +47,14 @@ pub trait ServeHandle: Send + Sync {
     /// for this repo, so the warning logs once per serve lifetime.
     fn mark_legacy_model_warned(&self, alias: &str) -> bool;
     fn latest_status_snapshot(&self) -> Option<Arc<StatusSnapshot>>;
+    /// Wait until `alias` leaves its indexing state, waking on every marker
+    /// change; false on timeout. The default answers false immediately (no
+    /// serve orchestrator, e.g. local stdio mode) so callers degrade to
+    /// answering now instead of blocking.
+    async fn wait_indexing_settled(&self, alias: &str, max_secs: u64) -> bool {
+        let _ = (alias, max_secs);
+        false
+    }
     /// Fire-and-forget rebuild of a stale symbol index; `Arc<Self>` because
     /// the implementation spawns blocking work that must outlive the call.
     async fn heal_missing_symbol_index(self: Arc<Self>, alias: &str, lang: &str);
