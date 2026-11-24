@@ -18,7 +18,7 @@
 use crate::cache::normalize_path_str;
 use crate::constants::{
     DB_DIR_NAME, DEFAULT_FSW_DEBOUNCE_MS, FILE_META_DB_NAME, LANG_CSHARP, LANG_TYPESCRIPT,
-    SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS,
+    SCIP_BRANCH_DEBOUNCE_MAX_MS, SCIP_CSHARP_DEBOUNCE_MS, SCIP_TYPESCRIPT_DEBOUNCE_MS,
 };
 use crate::embed::{EmbeddingModel, EmbeddingServicePool};
 use crate::symbols::{RebuildScope, SymbolIndexer, SymbolIndexerRegistry};
@@ -254,6 +254,31 @@ fn requeue_recreated_removals(
         requeued += 1;
     }
     requeued
+}
+
+/// Debounced Git HEAD-move flush decision: true when the quiet window
+/// (`SCIP_CSHARP_DEBOUNCE_MS`) has elapsed since the last move, or the
+/// staleness cap (`SCIP_BRANCH_DEBOUNCE_MAX_MS`) since the first — a
+/// continuous move storm must not keep the index endlessly stale.
+fn branch_flush_due(
+    pending: bool,
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    if !pending {
+        return false;
+    }
+    match (first, last) {
+        (Some(first), Some(last)) => {
+            let quiet_hit = now.duration_since(last)
+                >= std::time::Duration::from_millis(SCIP_CSHARP_DEBOUNCE_MS);
+            let cap_hit = now.duration_since(first)
+                >= std::time::Duration::from_millis(SCIP_BRANCH_DEBOUNCE_MAX_MS);
+            quiet_hit || cap_hit
+        }
+        _ => false,
+    }
 }
 
 /// The FULL kind a pending full rebuild carries. `Branch` is the superset
@@ -2104,6 +2129,15 @@ impl IndexManager {
             let mut ts_last_event_time: Option<std::time::Instant> = None;
             let ts_debounce = std::time::Duration::from_millis(SCIP_TYPESCRIPT_DEBOUNCE_MS);
 
+            // Git HEAD-move debounce: a detected move only records pending
+            // state — the text refresh is NOT run inline (it once blocked
+            // this loop for 10 minutes). `branch_first_move` feeds the
+            // SCIP_BRANCH_DEBOUNCE_MAX_MS staleness cap so a continuous
+            // move storm still flushes eventually.
+            let mut branch_pending = false;
+            let mut branch_first_move: Option<std::time::Instant> = None;
+            let mut branch_last_move: Option<std::time::Instant> = None;
+
             loop {
                 // Check if shutdown was requested
                 if cancel_token.is_cancelled() {
@@ -2111,72 +2145,20 @@ impl IndexManager {
                     break;
                 }
 
-                // Check for branch changes using GitHeadWatcher
+                // Check for branch changes using GitHeadWatcher: record the
+                // move only — the debounced flush below performs the refresh
+                // so this loop keeps polling during merge-script storms.
                 if let Some(watcher) = &git_head_watcher {
                     if let Ok(branch_changed) = watcher.check().await {
                         if branch_changed.is_some() {
-                            info!(
-                                "🔀 [{}] Git branch changed, triggering full incremental refresh...",
+                            let move_time = std::time::Instant::now();
+                            debug!(
+                                "🔀 [{}] Git HEAD moved, buffering debounced branch refresh",
                                 repo_label
                             );
-                            // Notify serve layer: indexing active
-                            if let Some(ref cb) = indexing_cb {
-                                cb(true);
-                            }
-                            // Perform a real incremental refresh: walk filesystem,
-                            // detect changed/deleted files, clean stale chunks, re-index
-                            if let Err(e) = Self::refresh_index_with_stores(
-                                &path,
-                                &db_path,
-                                &stores,
-                                &cancel_token,
-                                embedding_pool.as_ref(),
-                            )
-                            .await
-                            {
-                                error!("❌ [{}] Branch change refresh failed: {}", repo_label, e);
-                            }
-                            // Notify serve layer: indexing idle
-                            if let Some(ref cb) = indexing_cb {
-                                cb(false);
-                            }
-                            // Clear any buffered file events that arrived during the
-                            // branch switch — the full refresh already handled everything
-                            files_to_index.clear();
-                            files_to_remove.clear();
-                            cs_files_modified.clear();
-                            cs_files_deleted.clear();
-                            cs_last_event_time = None;
-                            ts_files_modified.clear();
-                            ts_files_deleted.clear();
-                            ts_last_event_time = None;
-
-                            // A branch switch can change arbitrary source files, so
-                            // the symbol index is now stale — but no incremental
-                            // scope can be computed (the working tree changed wholesale
-                            // and the buffered .cs/.ts events were just discarded above).
-                            // The FULL rebuild funnels through the shared pending
-                            // queue: it absorbs any pending incrementals, and a
-                            // flush landing mid-rebuild coalesces into one extra
-                            // pass instead of queueing duplicate work.
-                            let mut queue = symbol_rebuild_queue
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner());
-                            queue.enqueue_full(PendingFullKind::Branch);
-                            if queue.ensure_runner() {
-                                drop(Self::spawn_symbol_rebuild_runner(
-                                    symbol_registry.clone(),
-                                    path.clone(),
-                                    db_path.clone(),
-                                    repo_label.clone(),
-                                    csharp_notifier.clone(),
-                                    indexing_cb.clone(),
-                                    cancel_token.clone(),
-                                    symbol_rebuild_guard.clone(),
-                                    symbol_rebuild_queue.clone(),
-                                ));
-                            }
-                            drop(queue);
+                            branch_pending = true;
+                            branch_first_move.get_or_insert(move_time);
+                            branch_last_move = Some(move_time);
                         }
                     }
                 }
@@ -2519,6 +2501,98 @@ impl IndexManager {
                             drop(queue);
                         }
                     }
+                }
+
+                // Flush the Git HEAD-move debounce: refresh the text index
+                // DETACHED so this loop keeps polling (a big diff can run
+                // for many minutes), then queue the full symbol rebuild
+                // exactly like the old inline path did.
+                if branch_flush_due(branch_pending, branch_first_move, branch_last_move, now) {
+                    let first = branch_first_move.expect("branch_flush_due implies a first move");
+                    let elapsed = now.duration_since(first);
+                    let cap_hit =
+                        elapsed >= std::time::Duration::from_millis(SCIP_BRANCH_DEBOUNCE_MAX_MS);
+                    branch_pending = false;
+                    branch_first_move = None;
+                    branch_last_move = None;
+
+                    info!(
+                        "🔀 [{}] Git HEAD-move debounce flushed ({} after {}s), triggering text refresh + full symbol rebuild",
+                        repo_label,
+                        if cap_hit { "staleness cap" } else { "quiet window" },
+                        elapsed.as_secs()
+                    );
+
+                    // Detached text refresh: the watcher loop must never
+                    // await it.
+                    let task_path = path.clone();
+                    let task_db_path = db_path.clone();
+                    let task_stores = stores.clone();
+                    let task_cancel = cancel_token.clone();
+                    let task_pool = embedding_pool.clone();
+                    let task_cb = indexing_cb.clone();
+                    let task_label = repo_label.clone();
+                    tokio::spawn(async move {
+                        // Notify serve layer: indexing active
+                        if let Some(ref cb) = task_cb {
+                            cb(true);
+                        }
+                        // Perform a real incremental refresh: walk filesystem,
+                        // detect changed/deleted files, clean stale chunks, re-index
+                        if let Err(e) = Self::refresh_index_with_stores(
+                            &task_path,
+                            &task_db_path,
+                            &task_stores,
+                            &task_cancel,
+                            task_pool.as_ref(),
+                        )
+                        .await
+                        {
+                            error!("❌ [{}] Branch change refresh failed: {}", task_label, e);
+                        }
+                        // Notify serve layer: indexing idle
+                        if let Some(ref cb) = task_cb {
+                            cb(false);
+                        }
+                    });
+
+                    // Clear any buffered file events that arrived during the
+                    // branch switch — the detached refresh will handle everything
+                    files_to_index.clear();
+                    files_to_remove.clear();
+                    cs_files_modified.clear();
+                    cs_files_deleted.clear();
+                    cs_last_event_time = None;
+                    ts_files_modified.clear();
+                    ts_files_deleted.clear();
+                    ts_last_event_time = None;
+
+                    // A branch switch can change arbitrary source files, so
+                    // the symbol index is now stale — but no incremental
+                    // scope can be computed (the working tree changed wholesale
+                    // and the buffered .cs/.ts events were just discarded above).
+                    // The FULL rebuild funnels through the shared pending
+                    // queue: it absorbs any pending incrementals, and a
+                    // flush landing mid-rebuild coalesces into one extra
+                    // pass instead of queueing duplicate work.
+                    let mut queue = symbol_rebuild_queue
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    queue.enqueue_full(PendingFullKind::Branch);
+                    if queue.ensure_runner() {
+                        drop(Self::spawn_symbol_rebuild_runner(
+                            symbol_registry.clone(),
+                            path.clone(),
+                            db_path.clone(),
+                            repo_label.clone(),
+                            csharp_notifier.clone(),
+                            indexing_cb.clone(),
+                            cancel_token.clone(),
+                            symbol_rebuild_guard.clone(),
+                            symbol_rebuild_queue.clone(),
+                        ));
+                    }
+                    drop(queue);
                 }
 
                 // Sleep to avoid busy-waiting, but wake up immediately on shutdown
@@ -3281,6 +3355,44 @@ mod tests {
                 "path: {path}"
             );
         }
+    }
+
+    /// Matrix for the debounced Git HEAD-move flush decision: not-pending
+    /// never flushes, a quiet window elapsed flushes, and a continuous move
+    /// storm (each move resets quiet, cap not yet reached) stays pending
+    /// until the staleness cap fires.
+    #[test]
+    fn branch_flush_due_decision_matrix() {
+        let quiet = std::time::Duration::from_millis(SCIP_CSHARP_DEBOUNCE_MS);
+        let cap = std::time::Duration::from_millis(SCIP_BRANCH_DEBOUNCE_MAX_MS);
+
+        // Not pending → never flushes, even past the cap.
+        let t = std::time::Instant::now();
+        assert!(!branch_flush_due(false, Some(t), Some(t), t + cap * 2));
+
+        // Pending, quiet window elapsed since the last move → flushes.
+        let first = std::time::Instant::now();
+        assert!(branch_flush_due(
+            true,
+            Some(first),
+            Some(first),
+            first + quiet
+        ));
+
+        // THE STORM: moves keep coming (30s since the last one, < quiet)
+        // but the cap since the first move is exceeded → flushes anyway.
+        let first = std::time::Instant::now();
+        let last = first + cap - std::time::Duration::from_secs(30);
+        assert!(branch_flush_due(true, Some(first), Some(last), first + cap));
+
+        // Pending, within both windows → stays pending.
+        let first = std::time::Instant::now();
+        assert!(!branch_flush_due(
+            true,
+            Some(first),
+            Some(first),
+            first + quiet - std::time::Duration::from_secs(1)
+        ));
     }
 
     /// #277: a removal that raced a recreation re-queues only what is

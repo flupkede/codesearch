@@ -805,6 +805,11 @@ pub const HELPERS_SUBDIR: &str = "helpers";
 /// Debounce time in milliseconds for .cs file changes triggering a symbol rebuild.
 pub const SCIP_CSHARP_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 
+/// Maximum staleness a debounced Git HEAD-move flush may reach (milliseconds).
+/// A continuous move storm keeps resetting the quiet window, so this cap
+/// fires the flush regardless — the index must not stay stale forever.
+pub const SCIP_BRANCH_DEBOUNCE_MAX_MS: u64 = 600_000; // 10 minutes
+
 /// Environment variable overriding the restore-pending retry interval in
 /// seconds (issue #225). Values ≤ 0 or unparseable fall back to the
 /// built-in interval (a zero interval would hot-spin the helper); tests
