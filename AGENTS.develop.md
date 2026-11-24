@@ -254,7 +254,7 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 - **Pending** — resident C# helper applies Files-rebuild edits in place (project-file changes, errors and timeouts still reload), serve prewarms resident workspaces for the most recently used repos (`CODESEARCH_SCIP_RESIDENT_PREWARM`), and `find_impact` infers `language` or returns `retry_with` entries to copy verbatim.
 
-- **Pending** — scip-csharp helper work bounded: index runs, one-shot find-refs and resident spawns share one process-wide gate (`CSHARP_SCIP_CONCURRENCY`, default 1) and run one at a time per worktree root (worktrees of one repo stay parallel); an evicted resident has exited before its replacement spawns; a Files rebuild invalidates only the affected ref-cache keys.
+- **Pending** — scip-csharp helper work bounded: index runs, one-shot find-refs and resident spawns share one process-wide gate (`CSHARP_SCIP_CONCURRENCY`, default 2) and run one at a time per worktree root (worktrees of one repo stay parallel); an evicted resident has exited before its replacement spawns; a Files rebuild invalidates only the affected ref-cache keys.
 
 - **Pending** — leftover worktree shells self-heal: a directory reduced to nothing but its `.codesearch.db` (a removal stopped at the LMDB files the hub held) is unregistered, its shared LMDB envs released and the leftover deleted on the next reconcile pass, instead of locking `scip/data.mdb`/`lock.mdb` until serve restart.
 

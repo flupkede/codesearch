@@ -985,10 +985,11 @@ pub const SCIP_TYPESCRIPT_DEBOUNCE_MS: u64 = 60_000; // 60 seconds
 pub const CSHARP_SCIP_CONCURRENCY_ENV: &str = "CSHARP_SCIP_CONCURRENCY";
 
 /// Default value for `CSHARP_SCIP_CONCURRENCY` when the env var is unset
-/// or unparseable. 1 (not 2): each slot compiles a whole solution; two at
-/// once starved interactive opens/searches during the phase-2 redemption
-/// wave (card #291).
-pub const CSHARP_SCIP_CONCURRENCY_DEFAULT: usize = 1;
+/// or unparseable. 2: the helper gate runs at most one job per worktree
+/// root, so a second slot can only ever parallelise work across different
+/// worktrees — card #291's two-compiles-of-one-solution starvation cannot
+/// recur (the per-root lock precedes the global slot).
+pub const CSHARP_SCIP_CONCURRENCY_DEFAULT: usize = 2;
 
 /// Upper clamp for `CSHARP_SCIP_CONCURRENCY`.
 pub const CSHARP_SCIP_CONCURRENCY_MAX: usize = 4;

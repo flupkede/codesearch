@@ -4789,15 +4789,16 @@ async fn run_phase_2_symbols_kill_switch_disables_the_pass() {
     );
 }
 
-/// One solution compile at a time by default: two concurrent scip-csharp
-/// runs starved interactive opens/searches during the redemption wave.
+/// Two helper slots by default: the gate serialises per worktree root, so
+/// the second slot only serves a second worktree — it cannot run two
+/// compiles of one solution (card #291).
 #[test]
-fn csharp_scip_concurrency_defaults_to_one() {
+fn csharp_scip_concurrency_defaults_to_two() {
     assert_eq!(
         crate::constants::CSHARP_SCIP_CONCURRENCY_DEFAULT,
-        1,
-        "default concurrency must be 1 — two solution compiles at once \
-         starve opens and searches (card #291)"
+        2,
+        "default concurrency must be 2 — the per-worktree-root lock makes \
+         the second slot cross-worktree only"
     );
 }
 
