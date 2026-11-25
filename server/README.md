@@ -1,6 +1,6 @@
 # codesearch-server — PostgreSQL foundation
 
-Upstream [#384](https://github.com/andrea-taormina/codesearch/issues/384), stage 2.
+Upstream [#384](https://github.com/flupkede/codesearch/issues/384), stage 2.
 This is a separate runnable HTTP binary, not a storage mode for the local CLI.
 `codesearch` and `codesearch-core` do not depend on SQLx or pgvector. The server
 reuses core chunking and embedding providers, **not** local LMDB/Tantivy indices,
@@ -118,13 +118,18 @@ revision; repository revision increments with every committed file change.
 Chunking, validation and all embedding/cache lookups finish before deletion.
 A repository row lock then rechecks file CAS in the transaction. Cache entries,
 chunks, BM25 mutations, file sync state and repository revision commit together.
-A provider, insert, connection or commit failure never advances the published
-file state. Concurrent writes to different files in one repository serialize
+Provider and pre-commit SQL failures preserve the previous published file state.
+Transaction atomicity guarantees complete old or complete new state, never a
+partial replacement. A transport failure during COMMIT can leave the outcome
+unknown (the database may have committed); read file state before deciding
+whether to retry. Concurrent writes to different files in one repository serialize
 only their final transactions; same-file stale writers conflict. Deleting a
 missing file still requires expected revision zero and creates a tombstone.
 
 Keyword mode uses pg_search `|||` **any-token**, plain bound text, source-code
-tokenization and BM25. Corpus statistics are database-wide. Vector mode uses
+tokenization and BM25. The search transaction uses `SET LOCAL
+plan_cache_mode=force_custom_plan` so repeated prepared queries keep the required
+ParadeDB scoring scan. Corpus statistics are database-wide. Vector mode uses
 exact pgvector cosine ranking within explicit scope (not approximate ANN, so no
 filtered ANN underfill). Hybrid uses reciprocal-rank fusion, constant 60, up to
 4×limit bounded candidates per branch, one repeatable-read snapshot. Scores

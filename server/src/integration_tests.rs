@@ -133,9 +133,11 @@ async fn server_http_postgres_transaction_cache_and_recovery() {
         .unwrap();
     let options = admin_options.database(&database);
     let pool = sqlx::PgPool::connect_with(options.clone()).await.unwrap();
-    pool.execute("CREATE EXTENSION vector; CREATE EXTENSION pg_search CASCADE")
-        .await
-        .unwrap();
+    pool.execute(
+        "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_search CASCADE",
+    )
+    .await
+    .unwrap();
     // Serialize/encode credentials through URL, never print them.
     let database_url = options.to_url_lossy().to_string();
     let simulated = Simulated::default();
@@ -216,6 +218,23 @@ async fn server_http_postgres_transaction_cache_and_recovery() {
             .await
             .len(),
             2
+        );
+    }
+    // Exceed PostgreSQL's generic prepared-plan threshold across every pool
+    // connection; pg_search score must stay attached to a ParadeDB scan.
+    for _ in 0..64 {
+        assert_eq!(
+            search(
+                &client,
+                &service,
+                &["first"],
+                "ancientterm",
+                "keyword",
+                None
+            )
+            .await
+            .len(),
+            1
         );
     }
     assert!(

@@ -297,6 +297,12 @@ impl Store {
             request.limit
         } as i64;
         let keyword = if request.mode != SearchMode::Vector {
+            // pg_search scoring requires a ParadeDB scan; PostgreSQL's generic
+            // prepared plan can omit it after repeated executions. Keep bound
+            // queries but plan this transaction using their actual parameters.
+            sqlx::query("SET LOCAL plan_cache_mode=force_custom_plan")
+                .execute(&mut *tx)
+                .await?;
             sqlx::query_as::<_, SearchHit>("SELECT c.id,r.name AS repository,c.path,c.content,c.start_line,c.end_line,c.file_revision,c.source_revision,pdb.score(c.id)::double precision AS score FROM cs_server_chunks c JOIN cs_server_repositories r ON r.id=c.repo_id WHERE c.content ||| $1::text AND c.repo_id=ANY($2::bigint[]) AND ($3::text IS NULL OR left(c.path,length($3))=$3) ORDER BY pdb.score(c.id) DESC,c.id LIMIT $4")
                 .bind(&request.query).bind(&ids).bind(&request.path_prefix).bind(candidates).fetch_all(&mut *tx).await?
         } else {
