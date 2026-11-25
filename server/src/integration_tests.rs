@@ -7,14 +7,18 @@ use serde_json::{json, Value};
 use sqlx::{ConnectOptions, Connection, Executor};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
+
+#[path = "document_integration_tests.rs"]
+mod document_tests;
 
 #[derive(Clone, Default)]
 struct Simulated {
     fail: Arc<AtomicBool>,
     documents: Arc<AtomicUsize>,
     queries: Arc<AtomicUsize>,
+    inputs: Arc<Mutex<Vec<String>>>,
 }
 async fn embeddings(
     State(state): State<Simulated>,
@@ -39,7 +43,11 @@ async fn embeddings(
                 assert!(text.starts_with("document:"));
                 state.documents.fetch_add(1, Ordering::SeqCst);
             }
-            let vector = if text.contains("orchard") {
+            state.inputs.lock().unwrap().push(text.to_string());
+            let vector = if text.contains("orchard")
+                || text.contains("renamedlong")
+                || text.contains("quasarneedle")
+            {
                 vec![1.0, 0.1, 0.1]
             } else {
                 vec![0.1, 1.0, 0.1]
