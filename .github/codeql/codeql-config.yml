@@ -8,3 +8,8 @@ name: "Custom CodeQL Configuration"
 query-filters:
   - exclude:
       id: rust/path-injection
+# Vendored rmcp integration tests never ship in the binary or the image; their
+# mock servers deserialize test fixtures with serde_json, which trips
+# rust/unsafe-deserialization on every test file. Alerts there are noise.
+paths-ignore:
+  - vendor/rmcp/tests
