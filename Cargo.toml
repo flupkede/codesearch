@@ -77,7 +77,10 @@ anyhow = "1.0"
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.5", features = ["derive", "cargo", "env"] }
+# Pinned: clap 4.6.8+ stack-overflows our CLI on Windows at startup (before any
+# output, repro: `codesearch --model not-a-model search query` with 4.6.9/4.6.10;
+# 4.6.7 is clean). Lift the pin only with that repro verified green.
+clap = { version = "=4.6.7", features = ["derive", "cargo", "env"] }
 colored = "3.1"
 ctor = "1.0"
 dashmap = "6.1"

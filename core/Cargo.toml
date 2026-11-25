@@ -53,6 +53,12 @@ tracing-subscriber = { workspace = true }
 # `download-binaries` so the default build resolves exactly the feature set
 # it had before the split.
 fastembed = { version = "7.0", default-features = false, features = ["hf-hub-native-tls", "image-models"] }
+# fastembed 7.8 dropped its tokenizers onig selection (upstream made the
+# regex backend the consumer's choice); mirror the pre-7.8 request exactly.
+# default-features stays off: tokenizers' defaults enable esaxx_fast, whose
+# esaxx-rs hardcodes static_crt(true) and fails /failifmismatch against
+# ort_sys' dynamic CRT on MSVC.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "tracing", "api-31"] }
 clap = { workspace = true }
 # openai.rs embedding provider HTTP (same pinned spec as the CLI's)
