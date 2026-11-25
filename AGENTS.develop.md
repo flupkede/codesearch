@@ -242,6 +242,8 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 
 ## Changelog highlights (recent)
 
+- **Pending** — upstream #384 stage 2: separate loopback-only `codesearch-server` HTTP binary owns PostgreSQL pgvector/pg_search persistence, server-side embeddings, database cache and transactional revision-CAS file publication. Local CLI storage and behavior remain unchanged; authentication/federation/publication scheduling are deferred.
+
 - **Pending** — dependabot automation repaired: `gh pr merge --auto` failed for every dependabot PR under the develop ruleset (`enablePullRequestAutoMerge` denied for GITHUB_TOKEN, and the ruleset has no required status checks so `--auto` would have merged red CI — observed live on #407); the workflow now approves minor/patch bumps and merges only after `gh pr checks --watch` reports every check green, major bumps still wait for a human; changelog-check reads the `no-changelog` label live via the API instead of the stale `labeled`-webhook payload that kept dependency PRs visibly red.
 
 - **Pending** — recreated-path requeues gated + parent .gitignore rules loaded: `requeue_recreated_removals` re-ran no watchable gate, so delete+recreate churn over build output re-entered the text batch ungated (811 UTF-8 read warns/day on one worktree's bin/Debug, 141 in one flush; 2100 from a registered subdir's `.tmp/` scratch whose repo-root rules the watcher never saw); a recreated path is a create — same `is_watchable` gate, the removal stands when rejected — and `build_gitignore` now collects parent `.gitignore` files up to the git root, mirroring the walker's `parents(true)`.

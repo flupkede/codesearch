@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.8.25]
+
+### Added
+
+- Separate `codesearch-server` foundation for upstream #384 stage 2: loopback HTTP publication/search with PostgreSQL pgvector and pg_search 0.27.1, server-side embeddings and database embedding cache, persistent repository/file sync state, transactional replacement/deletion and stale-writer revision checks. The local CLI remains unchanged. This stage has no authentication and must not be exposed to untrusted callers; see `server/README.md`.
+
 ## [1.8.12]
 
 ### Added

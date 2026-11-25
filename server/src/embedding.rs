@@ -10,7 +10,7 @@ pub struct Embedding {
     pub(crate) dimensions: usize,
 }
 impl Embedding {
-    pub fn new(config: EmbedConfig, model: ModelType) -> anyhow::Result<Self> {
+    pub fn new(mut config: EmbedConfig, model: ModelType) -> anyhow::Result<Self> {
         let provider = create_embedder(config.clone(), model)?;
         let dimensions = provider.dimensions();
         anyhow::ensure!(
@@ -18,7 +18,9 @@ impl Embedding {
             "embedding dimensions must be 1 to 2000"
         );
         let fingerprint = if config.remote() {
-            config.fingerprint_for_dimensions(dimensions)
+            // Match core identity semantics, but normalize probed dimensions.
+            config.embed_dimensions = Some(dimensions);
+            config.fingerprint()
         } else {
             format!(
                 "local:{}:{dimensions}:server-documents-v1",

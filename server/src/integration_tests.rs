@@ -4,7 +4,7 @@ use super::*;
 use axum::{extract::State, http::StatusCode, routing::post, Json};
 use codesearch_core::embed::{EmbedConfig, ModelType};
 use serde_json::{json, Value};
-use sqlx::{Connection, Executor};
+use sqlx::{ConnectOptions, Connection, Executor};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
@@ -327,14 +327,16 @@ async fn server_http_postgres_transaction_cache_and_recovery() {
     )
     .await;
     assert_eq!(state["revision"], 1);
+    let failed_hash = codesearch_core::chunker::Chunk::compute_hash("faulttoken");
+    let cached: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cs_server_embedding_cache WHERE content_hash=$1")
+            .bind(failed_hash)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
-        pool.fetch_one(
-            "SELECT count(*) FROM cs_server_embedding_cache WHERE content_hash='not-a-hash'"
-        )
-        .await
-        .unwrap()
-        .len(),
-        1
+        cached, 0,
+        "failed transaction did not publish cache entries"
     );
     // Hold the insertion after DELETE; a separate reader must see complete old
     // rows, and killing the writer connection simulates interrupted publication.

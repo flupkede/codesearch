@@ -11,6 +11,23 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{ConnectOptions, PgPool, Row};
 use std::{collections::BTreeSet, path::Path, str::FromStr, time::Duration};
 
+fn connection_options(url: &str) -> anyhow::Result<PgConnectOptions> {
+    let parsed = url::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid database URL"))?;
+    let explicit_tls = parsed.query_pairs().any(|(key, _)| key == "sslmode");
+    let options =
+        PgConnectOptions::from_str(url).map_err(|_| anyhow::anyhow!("invalid database URL"))?;
+    Ok(if explicit_tls {
+        options
+    } else {
+        options.ssl_mode(PgSslMode::VerifyFull)
+    }
+    .disable_statement_logging())
+}
+
+#[cfg(test)]
+#[path = "store_tests.rs"]
+mod tests;
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
@@ -20,14 +37,7 @@ impl Store {
     pub async fn connect(url: &str, embedding: Embedding) -> anyhow::Result<Self> {
         // Do not attach the URL, parser error or database connection error: any
         // can contain credentials. SQL statement logging is disabled as well.
-        let options =
-            PgConnectOptions::from_str(url).map_err(|_| anyhow::anyhow!("invalid database URL"))?;
-        let options = if url.contains("sslmode=") {
-            options
-        } else {
-            options.ssl_mode(PgSslMode::VerifyFull)
-        }
-        .disable_statement_logging();
+        let options = connection_options(url)?;
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .acquire_timeout(Duration::from_secs(10))
@@ -48,7 +58,12 @@ impl Store {
                 anyhow::anyhow!("cannot connect to PostgreSQL; check host, TLS and authentication")
             })?;
         let store = Self { pool, embedding };
-        store.migrate().await?;
+        store.migrate().await.map_err(|error| {
+            // SQL errors may echo source, roles or connection details.
+            if error.downcast_ref::<sqlx::Error>().is_some() {
+                anyhow::anyhow!("PostgreSQL schema initialization failed; verify extensions, schema privileges and database availability")
+            } else { error }
+        })?;
         Ok(store)
     }
     async fn migrate(&self) -> anyhow::Result<()> {
