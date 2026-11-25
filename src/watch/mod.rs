@@ -24,6 +24,28 @@ fn normalize_event_path(path: &Path) -> PathBuf {
     PathBuf::from(normalize_path(path))
 }
 
+/// Test-only watcher over an isolated HOME, so the developer's real global
+/// `.codesearchignore` cannot leak into gate assertions. Shared with the
+/// index-manager tests (the requeue gate is asserted through the same
+/// `is_watchable` a Create event passes).
+#[cfg(test)]
+pub(crate) fn watcher_with_isolated_home(root: PathBuf) -> FileWatcher {
+    let scratch = tempfile::tempdir().unwrap();
+    let bare_home = scratch.path().join("bare-home");
+    let cs_home = scratch.path().join("cs-home");
+    std::fs::create_dir_all(&bare_home).unwrap();
+    std::fs::create_dir_all(&cs_home).unwrap();
+    let _guard = crate::testing::EnvRestore::set(&[
+        (
+            crate::constants::CODESEARCH_HOME_ENV,
+            cs_home.to_str().unwrap(),
+        ),
+        ("HOME", bare_home.to_str().unwrap()),
+        ("USERPROFILE", bare_home.to_str().unwrap()),
+    ]);
+    FileWatcher::new(root)
+}
+
 /// Change information from git HEAD file.
 ///
 /// Contains both the old and new HEAD content and resolved commit hashes when
@@ -58,6 +80,16 @@ pub enum FileEvent {
     Renamed(PathBuf, PathBuf),
 }
 
+/// One parent-directory `.gitignore` matcher. `root_rel` is the
+/// registered root relative to that parent dir, so a candidate built as
+/// `root_rel + <path-relative-to-root>` is expressed relative to the
+/// matcher's own directory — anchored patterns (`/build/`) keep the
+/// meaning git gives them in the file that owns them.
+struct ParentIgnore {
+    root_rel: PathBuf,
+    gi: Gitignore,
+}
+
 /// File watcher for incremental indexing
 ///
 /// Uses notify-debouncer-full for efficient debounced file watching.
@@ -71,6 +103,9 @@ pub struct FileWatcher {
     receiver: Option<Receiver<DebounceEventResult>>,
     /// Compiled .gitignore matcher for the repo root (None if no .gitignore found).
     gitignore: Option<Gitignore>,
+    /// Parent-directory `.gitignore` matchers, topmost first (walker
+    /// `parents(true)` parity for a registered subdirectory of a repo).
+    parent_gitignores: Vec<ParentIgnore>,
     /// Whitelist matcher (.codesearchinclude); None = no whitelist active.
     include_matcher: Option<Gitignore>,
 }
@@ -79,12 +114,14 @@ impl FileWatcher {
     /// Create a new file watcher for the given root directory
     pub fn new(root: PathBuf) -> Self {
         let gitignore = Self::build_gitignore(&root);
+        let parent_gitignores = Self::build_parent_gitignores(&root);
         let include_matcher = crate::file::build_include_matcher(&root);
         Self {
             root,
             debouncer: None,
             receiver: None,
             gitignore,
+            parent_gitignores,
             include_matcher,
         }
     }
@@ -185,6 +222,53 @@ impl FileWatcher {
         }
     }
 
+    /// Parent-directory `.gitignore` matchers for a registered
+    /// subdirectory of a git repo, topmost file first — walker
+    /// `parents(true)` parity: the walker applies the repo's rules to a
+    /// registered subdirectory, so the watcher must too (a blanket
+    /// hidden-dir rule at the repo root gates a tool subdir's `.tmp/`
+    /// that the tool dir's own files never mention). Each matcher is
+    /// built with `Gitignore::new`, which anchors at the file's own
+    /// directory, so a rooted pattern like `/build/` means
+    /// `<that directory>/build/` exactly as git reads it. Empty when the
+    /// registered root is the git root itself or sits outside a repo —
+    /// the walker's `require_git(true)` default applies git rules only
+    /// inside a repository.
+    fn build_parent_gitignores(root: &Path) -> Vec<ParentIgnore> {
+        let mut dirs = Vec::new();
+        let mut found_git_root = false;
+        let mut dir = root.parent();
+        while let Some(d) = dir {
+            if d.join(".gitignore").exists() {
+                dirs.push(d.to_path_buf());
+            }
+            if d.join(".git").exists() {
+                found_git_root = true;
+                break;
+            }
+            dir = d.parent();
+        }
+        // Git rules apply only inside a repository (the walker's
+        // `require_git(true)` default): without a git root above the
+        // registered root, parent .gitignore files are not rules at all.
+        if !found_git_root {
+            return Vec::new();
+        }
+        // `dirs` is nearest-first (walk order); git evaluates shallower
+        // files first with last-match-wins, so emit topmost-first.
+        let mut out = Vec::new();
+        for d in dirs.iter().rev() {
+            let (gi, err) = Gitignore::new(d.join(".gitignore"));
+            if let Some(e) = err {
+                tracing::debug!("Failed to load parent .gitignore {}: {}", d.display(), e);
+                continue;
+            }
+            let root_rel = root.strip_prefix(d).unwrap_or(Path::new("")).to_path_buf();
+            out.push(ParentIgnore { root_rel, gi });
+        }
+        out
+    }
+
     /// Whitelist verdict for one path: included when the path itself or an
     /// ancestor matches an include rule (last match along the component
     /// chain wins, so a `!` rule inside the include file un-includes).
@@ -251,22 +335,42 @@ impl FileWatcher {
     /// Check if a path is matched by .gitignore rules (relative to repo root).
     /// Uses `is_dir=true` so directory patterns like `obj/` match files inside them.
     fn is_gitignored(&self, path: &Path) -> bool {
-        if let Some(ref gi) = self.gitignore {
-            let relative = path.strip_prefix(&self.root).unwrap_or(path);
-            // Check each ancestor component with is_dir=true so that
-            // directory-only patterns (e.g. `obj/`) correctly exclude
-            // files nested inside those directories.
-            let mut current = PathBuf::new();
-            for component in relative.components() {
-                current.push(component);
-                if gi.matched(&current, true).is_ignore() {
-                    return true;
+        if self.gitignore.is_none() && self.parent_gitignores.is_empty() {
+            return false;
+        }
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        // Check each ancestor component with is_dir=true so that
+        // directory-only patterns (e.g. `obj/`) correctly exclude
+        // files nested inside those directories. Every matcher votes
+        // on the component expressed relative to its own directory;
+        // git's evaluation order — shallower files first, nearer files
+        // last — makes the LAST non-None verdict win, so a nearer file's
+        // whitelist overrides a shallower ignore.
+        let mut current = PathBuf::new();
+        for component in relative.components() {
+            current.push(component);
+            let mut ignored = false;
+            for pi in &self.parent_gitignores {
+                let mut cand = pi.root_rel.clone();
+                cand.push(&current);
+                match pi.gi.matched(&cand, true) {
+                    ignore::Match::Ignore(_) => ignored = true,
+                    ignore::Match::Whitelist(_) => ignored = false,
+                    ignore::Match::None => {}
                 }
             }
-            false
-        } else {
-            false
+            if let Some(ref gi) = self.gitignore {
+                match gi.matched(&current, true) {
+                    ignore::Match::Ignore(_) => ignored = true,
+                    ignore::Match::Whitelist(_) => ignored = false,
+                    ignore::Match::None => {}
+                }
+            }
+            if ignored {
+                return true;
+            }
         }
+        false
     }
 
     /// Check if a path should be watched.
@@ -277,7 +381,7 @@ impl FileWatcher {
     /// - Not a skip filename suffix (ALWAYS_SKIP_FILENAME_SUFFIXES)
     /// - Not 0 bytes
     /// - Language is indexable (Language::from_path)
-    fn is_watchable(&self, path: &Path) -> bool {
+    pub(crate) fn is_watchable(&self, path: &Path) -> bool {
         if self.is_in_ignored_dir(path) {
             return false;
         }
@@ -751,7 +855,6 @@ mod tests {
         );
     }
     use super::*;
-    use crate::testing::EnvRestore;
     use serial_test::serial;
     use std::fs;
     use std::process::Command;
@@ -796,22 +899,7 @@ mod tests {
     /// pointed at empty temporary directories, so the developer's real global
     /// `.codesearchignore` (from either root) cannot leak into the assertions.
     /// CI has no such file, which is why the ambient dependency went unnoticed.
-    fn watcher_with_isolated_home(root: PathBuf) -> FileWatcher {
-        let scratch = tempdir().unwrap();
-        let bare_home = scratch.path().join("bare-home");
-        let cs_home = scratch.path().join("cs-home");
-        fs::create_dir_all(&bare_home).unwrap();
-        fs::create_dir_all(&cs_home).unwrap();
-        let _guard = EnvRestore::set(&[
-            (
-                crate::constants::CODESEARCH_HOME_ENV,
-                cs_home.to_str().unwrap(),
-            ),
-            ("HOME", bare_home.to_str().unwrap()),
-            ("USERPROFILE", bare_home.to_str().unwrap()),
-        ]);
-        FileWatcher::new(root)
-    }
+    use super::watcher_with_isolated_home;
 
     #[test]
     #[serial]
@@ -880,6 +968,111 @@ mod tests {
         assert!(
             !watcher.is_watchable(&root.join("Directory.Packages.props.bak")),
             ".bak lookalike must not pass the name gate"
+        );
+    }
+
+    /// Parent-repo .gitignore rules gate the watcher of a registered
+    /// subdirectory, mirroring the walker's `parents(true)`: a blanket
+    /// hidden-dir rule at the repo root must exclude a tool subdir's
+    /// `.tmp/` even though the tool dir has no .gitignore of its own
+    /// (the audit/.tmp warn storm — 2100 reads/day).
+    #[test]
+    #[serial]
+    fn parent_gitignore_rules_gate_the_registered_subdir() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let sub = repo.join("tools/audit");
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".gitignore"), ".*/\n").unwrap();
+        let scratch = sub.join(".tmp/out.json");
+        fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        fs::write(&scratch, "{}").unwrap();
+
+        let watcher = watcher_with_isolated_home(sub.clone());
+        assert!(watcher.is_gitignored(&scratch));
+        assert!(!watcher.is_watchable(&scratch));
+        // An ordinary code file in the subdir stays watchable.
+        fs::create_dir_all(sub.join("src")).unwrap();
+        fs::write(sub.join("src/main.rs"), "fn main() {}").unwrap();
+        assert!(watcher.is_watchable(&sub.join("src/main.rs")));
+    }
+
+    /// A parent rule anchors at the directory that owns the file: a
+    /// repo-root `/genout/` pattern means `<repo>/genout/`, not
+    /// `<registered-root>/genout/` — the subdir's own genout/ dir is
+    /// tracked by git and must stay watchable. (Regression: a single
+    /// builder rooted at the registered root re-anchored parent globs
+    /// and silently gated out tracked files.)
+    #[test]
+    #[serial]
+    fn parent_rules_anchor_at_their_own_directory() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let sub = repo.join("tools/audit");
+        fs::create_dir_all(sub.join("genout")).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".gitignore"), "/genout/\n").unwrap();
+        fs::write(sub.join("genout/main.rs"), "fn main() {}").unwrap();
+
+        let watcher = watcher_with_isolated_home(sub.clone());
+        assert!(
+            !watcher.is_gitignored(&sub.join("genout/main.rs")),
+            "rooted /genout/ belongs to the repo root, not the registered subdir"
+        );
+        assert!(watcher.is_watchable(&sub.join("genout/main.rs")));
+    }
+
+    /// Without a git root above the registered root, parent .gitignore
+    /// files are not rules at all — the walker's `require_git(true)`
+    /// default applies git rules only inside a repository.
+    #[test]
+    #[serial]
+    fn parent_gitignores_need_a_git_root() {
+        let temp = tempdir().unwrap();
+        let plain = temp.path().join("plain");
+        let sub = plain.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        // A .gitignore with NO .git anywhere above it.
+        fs::write(plain.join(".gitignore"), ".*/\n").unwrap();
+        let scratch = sub.join(".tmp/out.json");
+        fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        fs::write(&scratch, "{}").unwrap();
+
+        let watcher = watcher_with_isolated_home(sub.clone());
+        assert!(!watcher.is_gitignored(&scratch));
+        assert!(watcher.is_watchable(&scratch));
+    }
+
+    /// Nearer parent files override shallower ones in both directions
+    /// (git's last-match-wins across files): a whitelist in the nearer
+    /// file un-ignores, an ignore in the nearer file re-ignores.
+    #[test]
+    #[serial]
+    fn parent_rule_precedence_is_last_match_wins() {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let mid = repo.join("mid");
+        let sub = mid.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".gitignore"), "scratch/\n!keep/\n").unwrap();
+        fs::write(mid.join(".gitignore"), "!scratch/\nkeep/\n").unwrap();
+        let unignored = sub.join("scratch/x.rs");
+        let reignored = sub.join("keep/x.rs");
+        for p in [&unignored, &reignored] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "fn x() {}").unwrap();
+        }
+
+        let watcher = watcher_with_isolated_home(sub.clone());
+        assert!(
+            !watcher.is_gitignored(&unignored),
+            "nearer whitelist !scratch/ overrides the repo-root ignore"
+        );
+        assert!(
+            watcher.is_gitignored(&reignored),
+            "nearer keep/ overrides the repo-root whitelist"
         );
     }
 

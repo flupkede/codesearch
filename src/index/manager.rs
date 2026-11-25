@@ -213,8 +213,15 @@ fn classify_symbol_rebuild_event(path: &Path) -> SymbolRebuildTrigger {
 /// get the same promotion the Modified arm would have given them —
 /// debounce timers included: a gate reading `{non-empty set, None timer}`
 /// would strand the requeued path forever once its debounce already ran.
+///
+/// A re-queued path is a recreate and must pass the same `is_watchable`
+/// gate a Create event passes. Without it, delete+recreate churn over
+/// build output (bin/Debug artifacts, scratch dirs) re-enters the text
+/// batch ungated — every read of a binary fails UTF-8 and warns (the
+/// 2k-warn flush storms), and gitignored content re-pollutes the index.
 #[allow(clippy::too_many_arguments)]
 fn requeue_recreated_removals(
+    watcher: &FileWatcher,
     removed: &[PathBuf],
     now: std::time::Instant,
     files_to_index: &mut HashSet<PathBuf>,
@@ -231,6 +238,11 @@ fn requeue_recreated_removals(
     let mut requeued = 0;
     for path in removed {
         if !path.exists() {
+            continue;
+        }
+        if !watcher.is_watchable(path) {
+            // The removal stands: stale chunks are already deleted and a
+            // gate-rejected path must not resurrect through this side door.
             continue;
         }
         files_to_remove.remove(path);
@@ -2364,20 +2376,24 @@ impl IndexManager {
                     // A removal that raced a recreation must not drop the
                     // file permanently (todo #277): re-queue what is back
                     // on disk so the next flush re-indexes it.
-                    let requeued = requeue_recreated_removals(
-                        &removed_snapshot,
-                        now,
-                        &mut files_to_index,
-                        &mut files_to_remove,
-                        &mut cs_files_modified,
-                        &mut cs_files_deleted,
-                        &mut cs_last_event_time,
-                        &mut ts_files_modified,
-                        &mut ts_files_deleted,
-                        &mut ts_last_event_time,
-                        &mut restore_inputs_changed,
-                        &mut restore_input_last_event_time,
-                    );
+                    let requeued = {
+                        let w = watcher.lock().await;
+                        requeue_recreated_removals(
+                            &w,
+                            &removed_snapshot,
+                            now,
+                            &mut files_to_index,
+                            &mut files_to_remove,
+                            &mut cs_files_modified,
+                            &mut cs_files_deleted,
+                            &mut cs_last_event_time,
+                            &mut ts_files_modified,
+                            &mut ts_files_deleted,
+                            &mut ts_last_event_time,
+                            &mut restore_inputs_changed,
+                            &mut restore_input_last_event_time,
+                        )
+                    };
                     if requeued > 0 {
                         debug!(
                             "♻️ [{}] {} removed path(s) recreated mid-flush, re-queued",
@@ -3314,7 +3330,9 @@ mod tests {
     use super::*;
     use crate::cache::FileMetaStore;
     use crate::constants::WRITER_LOCK_FILE;
+    use crate::watch::watcher_with_isolated_home;
     use codesearch_core::index::acquire_writer_lock;
+    use serial_test::serial;
     use tempfile::tempdir;
     use tokio::sync::RwLock;
 
@@ -3437,8 +3455,10 @@ mod tests {
     /// deletion cancelled, a genuinely deleted path stays queued for
     /// removal and must not resurrect.
     #[test]
+    #[serial]
     fn requeue_recreated_removals_promotes_existing_and_cancels_deletion() {
         let temp = tempdir().unwrap();
+        let watcher = watcher_with_isolated_home(temp.path().to_path_buf());
         let alive = temp.path().join("Alive.cs");
         let gone = temp.path().join("Gone.rs");
         std::fs::write(&alive, "class Alive {}").unwrap();
@@ -3457,6 +3477,7 @@ mod tests {
 
         let now = std::time::Instant::now();
         let requeued = requeue_recreated_removals(
+            &watcher,
             &[alive.clone(), gone.clone()],
             now,
             &mut files_to_index,
@@ -3489,8 +3510,10 @@ mod tests {
     /// a .ts file feeds the TypeScript debounce, a restore input raises
     /// the FULL-rebuild flag.
     #[test]
+    #[serial]
     fn requeue_recreated_removals_classifies_ts_and_restore_inputs() {
         let temp = tempdir().unwrap();
+        let watcher = watcher_with_isolated_home(temp.path().to_path_buf());
         let ts_file = temp.path().join("app.ts");
         let restore_file = temp.path().join("Directory.Packages.props");
         std::fs::write(&ts_file, "export const x = 1;").unwrap();
@@ -3511,6 +3534,7 @@ mod tests {
 
         let now = std::time::Instant::now();
         let requeued = requeue_recreated_removals(
+            &watcher,
             &[ts_file.clone(), restore_file.clone()],
             now,
             &mut files_to_index,
@@ -3533,6 +3557,67 @@ mod tests {
         assert!(restore_inputs_changed);
         assert!(cs_modified.is_empty());
         assert_eq!(cs_last_event_time, None);
+    }
+
+    /// A recreated path re-queues only when a Create event would carry
+    /// it: gitignored build output (bin/Debug — both a binary artifact
+    /// and a text file copied there by the build) stays out of the text
+    /// batch and keeps its removal, so delete+recreate churn over build
+    /// output cannot re-enter the index through the requeue side door.
+    #[test]
+    #[serial]
+    fn requeue_recreated_removals_respects_the_watchable_gate() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "[Bb]in/\n").unwrap();
+        let watcher = watcher_with_isolated_home(temp.path().to_path_buf());
+
+        let src = temp.path().join("src/main.rs");
+        let bin_artifact = temp.path().join("src/app/bin/Debug/net8.0/App.pdb");
+        let bin_text = temp.path().join("src/app/bin/Debug/net8.0/copied.xml");
+        std::fs::create_dir_all(bin_artifact.parent().unwrap()).unwrap();
+        std::fs::write(&src, "fn main() {}").unwrap();
+        std::fs::write(&bin_artifact, [0x00u8, 0xff, 0xfe, 0x00]).unwrap();
+        std::fs::write(&bin_text, "<x/>").unwrap();
+
+        let mut files_to_index = HashSet::new();
+        let mut files_to_remove: HashSet<PathBuf> =
+            [src.clone(), bin_artifact.clone(), bin_text.clone()]
+                .into_iter()
+                .collect();
+        let mut cs_modified = HashSet::new();
+        let mut cs_deleted = HashSet::new();
+        let mut cs_last_event_time = None;
+        let mut ts_modified = HashSet::new();
+        let mut ts_deleted = HashSet::new();
+        let mut ts_last_event_time = None;
+        let mut restore_inputs_changed = false;
+        let mut restore_input_last_event_time = None;
+
+        let now = std::time::Instant::now();
+        let requeued = requeue_recreated_removals(
+            &watcher,
+            &[src.clone(), bin_artifact.clone(), bin_text.clone()],
+            now,
+            &mut files_to_index,
+            &mut files_to_remove,
+            &mut cs_modified,
+            &mut cs_deleted,
+            &mut cs_last_event_time,
+            &mut ts_modified,
+            &mut ts_deleted,
+            &mut ts_last_event_time,
+            &mut restore_inputs_changed,
+            &mut restore_input_last_event_time,
+        );
+
+        assert_eq!(requeued, 1);
+        assert!(files_to_index.contains(&src));
+        assert!(!files_to_remove.contains(&src));
+        // Gate-rejected: not re-indexed, the removal stands.
+        assert!(!files_to_index.contains(&bin_artifact));
+        assert!(files_to_remove.contains(&bin_artifact));
+        assert!(!files_to_index.contains(&bin_text));
+        assert!(files_to_remove.contains(&bin_text));
     }
 
     /// The text quiet gate: default 5 s, a valid env override wins, an
