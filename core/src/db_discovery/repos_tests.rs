@@ -1494,8 +1494,10 @@ fn captures_git_common_dir_on_register_and_links_worktrees() {
     run(&["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"]);
 
     let mut cfg = ReposConfig::default();
-    let main_alias = cfg.register(main.clone());
-    let wt_alias = cfg.register(wt.clone());
+    let (main_alias, wt_alias) =
+        crate::db_discovery::repos::test_support::with_hook_git_env_cleared(|| {
+            (cfg.register(main.clone()), cfg.register(wt.clone()))
+        });
 
     let main_identity = cfg.meta(&main_alias).git_common_dir.clone();
     let wt_identity = cfg.meta(&wt_alias).git_common_dir.clone();
@@ -1942,7 +1944,9 @@ fn list_worktree_paths_covers_main_and_linked_worktrees() {
             String::from_utf8_lossy(&o.stderr)
         );
 
-        let listed = list_worktree_paths(&main);
+        let listed = crate::db_discovery::repos::test_support::with_hook_git_env_cleared(|| {
+            list_worktree_paths(&main)
+        });
         let listed: Vec<String> = listed.iter().map(|p| canon_norm(p)).collect();
         assert_eq!(
             listed,
@@ -1952,7 +1956,9 @@ fn list_worktree_paths_covers_main_and_linked_worktrees() {
 
         // The listing works from inside a linked worktree too — discovery
         // iterates registered repos, which are often the worktrees.
-        let from_wt = list_worktree_paths(&tmp.path().join("wt1"));
+        let from_wt = crate::db_discovery::repos::test_support::with_hook_git_env_cleared(|| {
+            list_worktree_paths(&tmp.path().join("wt1"))
+        });
         let from_wt: Vec<String> = from_wt.iter().map(|p| canon_norm(p)).collect();
         assert_eq!(
             from_wt, listed,
@@ -1963,7 +1969,10 @@ fn list_worktree_paths_covers_main_and_linked_worktrees() {
     let plain = tmp.path().join("plain");
     std::fs::create_dir(&plain).unwrap();
     assert!(
-        list_worktree_paths(&plain).is_empty(),
+        crate::db_discovery::repos::test_support::with_hook_git_env_cleared(
+            || list_worktree_paths(&plain)
+        )
+        .is_empty(),
         "a non-git directory must answer empty"
     );
 }

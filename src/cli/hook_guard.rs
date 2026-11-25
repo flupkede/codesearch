@@ -1439,6 +1439,19 @@ mod tests {
         state: PathBuf,
     }
 
+    /// Git exports these to hooks (a pre-push run from a worktree sets
+    /// GIT_DIR/GIT_WORK_TREE); inherited by the fixture's `git init`,
+    /// they redirect the init away from the fixture repo — no `.git` in
+    /// repoA, every deny degrades to a silent allow, and the whole suite
+    /// fails ONLY when the tests run under a git hook.
+    const GIT_ENV_TO_SCRUB: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ];
+
     fn fixture() -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root_a = tmp.path().join("repoA");
@@ -1446,9 +1459,12 @@ mod tests {
         std::fs::create_dir_all(&root_a).unwrap();
         std::fs::create_dir_all(&root_b).unwrap();
         for repo in [&root_a, &root_b] {
-            let out = Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(repo)
+            let mut cmd = Command::new("git");
+            cmd.args(["init", "-q"]).current_dir(repo);
+            for key in GIT_ENV_TO_SCRUB {
+                cmd.env_remove(key);
+            }
+            let out = cmd
                 .output()
                 .expect("git must be on PATH for the test repos");
             assert!(out.status.success(), "git init failed in {repo:?}");
