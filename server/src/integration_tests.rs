@@ -174,6 +174,42 @@ async fn server_http_postgres_transaction_cache_and_recovery() {
     )
     .await;
     assert_eq!(first["revision"], 1);
+    let mut omitted = update(1, Some("unused"));
+    omitted.as_object_mut().unwrap().remove("content");
+    let response = client
+        .put(format!("{}/repositories/first/files", service.url))
+        .json(&omitted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        422,
+        "omitted content must not delete"
+    );
+    let state = request(
+        &client,
+        &service,
+        reqwest::Method::GET,
+        "/repositories/first/file?path=src%2Fa.txt",
+        Value::Null,
+        200,
+    )
+    .await;
+    assert_eq!(state["revision"], 1);
+    assert_eq!(
+        search(
+            &client,
+            &service,
+            &["first"],
+            "ancientterm",
+            "keyword",
+            None
+        )
+        .await
+        .len(),
+        1
+    );
     assert_eq!(
         first["content_hash"].as_str().unwrap(),
         codesearch_core::chunker::Chunk::compute_hash("orchard ancientterm")

@@ -46,8 +46,14 @@ pub struct FileUpdate {
     pub expected_revision: i64,
     /// Caller-supplied source identifier, not a repository-wide snapshot claim.
     pub source_revision: String,
-    /// Null deletes the file; an empty string indexes an empty file.
+    /// Explicit null deletes the file; omission is rejected, not a delete.
+    #[serde(deserialize_with = "required_content")]
     pub content: Option<String>,
+}
+fn required_content<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
 }
 impl FileUpdate {
     pub fn validate(&self) -> Result<()> {

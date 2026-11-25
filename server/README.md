@@ -107,7 +107,8 @@ Unknown input fields are rejected.
 
 `expected_revision=0` means never indexed. Each successful file update increments
 its revision, even deletion (`content:null`) or empty-file publication
-(`content:""`). Deleted file tombstones are retained so stale writers cannot
+(`content:""`). The `content` field is required; omitting it returns HTTP 422,
+never a deletion. Deleted file tombstones are retained so stale writers cannot
 recreate with revision zero (ABA). Read state and retry deliberately after HTTP
 409; blindly replaying a request whose response was lost returns 409 if its
 commit succeeded. `source_revision` is a bounded caller-supplied source label,
