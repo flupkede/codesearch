@@ -4,8 +4,31 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 license = "Apache-2.0"
-description = "HTTP serve binary for codesearch (built on codesearch-core)"
+description = "PostgreSQL-backed HTTP foundation for codesearch"
 
 [lib]
 name = "codesearch_server"
 path = "src/lib.rs"
+
+[features]
+default = ["download-binaries"]
+download-binaries = ["codesearch-core/download-binaries"]
+load-dynamic = ["codesearch-core/load-dynamic"]
+
+[dependencies]
+codesearch-core = { path = "../core", default-features = false }
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = "2.0"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "derive"] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+
+[dev-dependencies]
+reqwest = { workspace = true }
