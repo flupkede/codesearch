@@ -86,8 +86,10 @@ Replace every `<...>` placeholder with your own values.
 4. **Secrets** — register `API_KEY`, the blob `SAS_URL`, and (if you host a curated KB) the
    git credentials as container app secrets. The container's `entrypoint.sh` reads these as
    environment variables — see the image's `docker/entrypoint.sh` for the canonical contract:
-   `CODESEARCH_SERVE_API_KEY`, `BLOB_SAS_URL`, `KB_GIT_URL`, `KB_PAT`,
-   `KB_POLL_INTERVAL_SECS`, `KB_PULL_INTERVAL_SECS`.
+   `CODESEARCH_SERVE_API_KEY`, `BLOB_SAS_URL`, `KB_GIT_URL`, `GIT_PAT` (optional
+   `GIT_USER`), `KB_POLL_INTERVAL_SECS`, `KB_PULL_INTERVAL_SECS`. `GIT_PAT` is
+   passed to git per command and is never written to `.git/config` nor included
+   in uploaded snapshots.
 
 ## Deploy the indexer job
 

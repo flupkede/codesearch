@@ -31,6 +31,12 @@
 # Optional env:
 #   CODESEARCH_RUN_MODE       "serve" (default) | "index-job".
 #   KB_GIT_URL / GIT_PAT      Curated KB git repo (cloned to /data/custom-kb).
+#                             GIT_PAT is fed to git per command (kb_git) and is
+#                             NEVER spliced into a URL: git stores the remote URL
+#                             in .git/config and snapshots archive DATA_DIR, so a
+#                             tokenized URL there would ship the PAT in every
+#                             uploaded snapshot. GIT_USER overrides the credential
+#                             username (default x-access-token; e.g. oauth2 for GitLab).
 #   KB_POLL_INTERVAL_SECS     serve mode: how often to CHEAPLY poll the KB remote
 #                             HEAD (git ls-remote — ref advertisement only, no
 #                             objects). On a change, pull + incremental reindex fire
@@ -174,18 +180,68 @@ sync_blob() {
   fi
 }
 
+# Run git with the KB credentials supplied per command, never spliced into a URL.
+# Why: git persists the remote URL in .git/config, and upload_snapshot() archives
+# the whole DATA_DIR — a tokenized URL there would ship the PAT inside every
+# uploaded snapshot (GHSA-pxrc-5gh7-28qj). The throwaway credential helper reads
+# GIT_PAT straight from the environment when git asks for it: nothing lands in
+# .git/config, argv or any file. GIT_TERMINAL_PROMPT=0 fails fast instead of
+# hanging the container on a username prompt when credentials are rejected.
+kb_git() {
+  if [ -z "${GIT_PAT:-}" ]; then
+    git "$@"
+  else
+    GIT_TERMINAL_PROMPT=0 git \
+      -c credential.helper= \
+      -c 'credential.helper=!f() { printf "username=%s\npassword=%s\n" "${GIT_USER:-x-access-token}" "${GIT_PAT}"; }; f' \
+      "$@"
+  fi
+}
+
+# The stored remote URL must stay clean (see kb_git). If KB_GIT_URL itself was
+# configured with embedded credentials, strip the userinfo from https URLs and
+# warn rather than persisting it: auth comes from GIT_PAT only.
+kb_clean_url() {
+  case "${KB_GIT_URL}" in
+    https://*@*)
+      log "WARN: KB_GIT_URL embeds credentials — stripping them (auth comes from GIT_PAT via the per-command helper)" >&2
+      printf '%s' "${KB_GIT_URL}" | sed -E 's#^(https://)[^/@]+@#\1#' ;;
+    *) printf '%s' "${KB_GIT_URL}" ;;
+  esac
+}
+
 sync_kb() {
   [ -n "${KB_GIT_URL:-}" ] || return 0
-  local url="${KB_GIT_URL}"
-  if [ -n "${GIT_PAT:-}" ]; then
-    url="$(printf '%s' "${KB_GIT_URL}" | sed -E "s#^https://#https://${GIT_PAT}@#")"
-  fi
+  local url
+  url="$(kb_clean_url)"
   if [ -d "${KB_DIR}/.git" ]; then
+    # A clone restored from a pre-fix snapshot can still carry a tokenized
+    # remote.origin.url; reset it to the clean URL so the PAT never persists.
+    kb_git -C "${KB_DIR}" remote set-url origin "${url}" 2>/dev/null || true
     log "git pull KB -> ${KB_DIR}"
-    git -C "${KB_DIR}" pull --ff-only 2>&1 | sed 's/^/[git] /' || log "WARN: git pull failed"
+    kb_git -C "${KB_DIR}" pull --ff-only 2>&1 | sed 's/^/[git] /' || log "WARN: git pull failed"
+  elif [ -d "${KB_DIR}" ] && [ -n "$(ls -A "${KB_DIR}" 2>/dev/null)" ]; then
+    # Working tree without .git (snapshots exclude it since this fix): re-attach
+    # by moving a fresh clone's metadata in, then hard-reset the restored files
+    # onto the fresh HEAD. Without this, restore would leave the KB frozen:
+    # pulls need .git and a clone refuses a non-empty target directory.
+    local tmp="${KB_DIR}.reinit"
+    log "git re-attach KB -> ${KB_DIR}"
+    rm -rf "${tmp}"
+    if kb_git clone --depth 1 "${url}" "${tmp}" 2>&1 | sed 's/^/[git] /' \
+      && mv "${tmp}/.git" "${KB_DIR}/.git" \
+      && rm -rf "${tmp}" \
+      && kb_git -C "${KB_DIR}" clean -fdq -e .codesearch.db 2>&1 | sed 's/^/[git] /' \
+      && kb_git -C "${KB_DIR}" reset --hard -q origin/HEAD 2>&1 | sed 's/^/[git] /'
+    then
+      :
+    else
+      log "WARN: could not re-attach KB git metadata — KB updates stay frozen until this is fixed"
+      rm -rf "${tmp}" 2>/dev/null || true
+    fi
   else
     log "git clone KB -> ${KB_DIR}"
-    git clone --depth 1 "${url}" "${KB_DIR}" 2>&1 | sed 's/^/[git] /' || log "WARN: git clone failed"
+    kb_git clone --depth 1 "${url}" "${KB_DIR}" 2>&1 | sed 's/^/[git] /' || log "WARN: git clone failed"
   fi
 }
 
@@ -242,8 +298,12 @@ restore_snapshot() {
 upload_snapshot() {
   [ -n "${SNAPSHOT_SAS_URL:-}" ] || { log "no SNAPSHOT_SAS_URL — skipping upload"; return 0; }
   log "creating index snapshot (excluding model weights)"
-  # Exclude model weights (baked into the image) and lock files (never valid to
-  # carry across containers — see restore_snapshot for why).
+  # Exclude model weights (baked into the image), lock files (never valid to
+  # carry across containers — see restore_snapshot for why) and .git metadata:
+  # the KB clone's .git dir must never ride along in a snapshot. Pre-fix images
+  # stored the GIT_PAT inside it (tokenized remote.origin.url —
+  # GHSA-pxrc-5gh7-28qj), and sync_kb re-attaches fresh metadata on restore,
+  # so nothing needs it.
   #
   # tar exits 1 ("Some files differ" / "file changed as we read it") when ANY
   # tracked file is touched mid-archive — common when snapshotting an index the
@@ -256,6 +316,7 @@ upload_snapshot() {
   tar czf "${SNAPSHOT_LOCAL}" -C / \
     --exclude='*.onnx' --exclude='*.onnx_data' \
     --exclude='*.lock' --exclude='lock.mdb' \
+    --exclude='.git' \
     "${DATA_DIR#/}" "${CONFIG_DIR#/}" 2>"${SNAPSHOT_LOCAL}.tarerr" || tar_err=$?
   if [ "${tar_err}" -ge 2 ]; then
     log "WARN: snapshot tar failed (exit ${tar_err}): $(tr '\n' ' ' < "${SNAPSHOT_LOCAL}.tarerr" 2>/dev/null)"
@@ -920,14 +981,18 @@ run_serve() {
     # and only do the expensive pull + reindex when the remote SHA actually moved.
     # KB_PULL_INTERVAL_SECS is kept as a safety-net: force a full pull at least that
     # often even if the cheap poll saw nothing (self-heals a failed/missed ls-remote).
-    # ls-remote uses the stored 'origin' remote so the PAT never lands on argv.
+    # ls-remote goes through kb_git: the PAT never lands on argv nor in
+    # .git/config (the stored remote URL is clean since this fix).
     KB_POLL_INTERVAL_SECS="${KB_POLL_INTERVAL_SECS:-30}"
     KB_PULL_INTERVAL_SECS="${KB_PULL_INTERVAL_SECS:-900}"
     ( kb_branch="$(git -C "${KB_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
       secs_since_pull=0
       while sleep "${KB_POLL_INTERVAL_SECS}"; do
         secs_since_pull=$(( secs_since_pull + KB_POLL_INTERVAL_SECS ))
-        remote_sha="$(git -C "${KB_DIR}" ls-remote origin "${kb_branch}" 2>/dev/null | awk 'NR==1{print $1}')"
+        # || true: a failed ls-remote (auth/network) must read as "poll saw
+        # nothing", not kill this subshell — the safety-net forced pull below
+        # self-heals it. Same idiom as local_sha.
+        remote_sha="$(kb_git -C "${KB_DIR}" ls-remote origin "${kb_branch}" 2>/dev/null | awk 'NR==1{print $1}' || true)"
         local_sha="$(git -C "${KB_DIR}" rev-parse HEAD 2>/dev/null || true)"
         force_pull=0
         [ "${secs_since_pull}" -ge "${KB_PULL_INTERVAL_SECS}" ] && force_pull=1
