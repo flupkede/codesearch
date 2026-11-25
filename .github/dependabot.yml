@@ -10,6 +10,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    # clap is pinned =4.6.7 in Cargo.toml (4.6.8+ overflows the Windows CLI
+    # stack at startup); closing the PR does not stop a weekly reopen.
+    # Lift together with the pin.
+    ignore:
+      - dependency-name: "clap"
     groups:
       cargo-minor-and-patch:
         update-types:
