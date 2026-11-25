@@ -17,6 +17,12 @@ param(
 $ErrorActionPreference = "Stop"
 $failed = @()
 
+# NOTE: do NOT redirect TMP/TEMP here. Test tempdirs must stay outside any
+# registered codesearch repo: doctor/hook-state tests walk up the tree and
+# would adopt this repo's own .git/.codesearch.db (Pass-vs-Fail, Foreign-vs-
+# NotInstalled breakage, proven 2026-11-25). Build artifacts are AV-safe via
+# .cargo/config.toml's in-repo target-dir.
+
 function Step([string]$Name, [scriptblock]$Block) {
     Write-Host "`n===============================" -ForegroundColor Cyan
     Write-Host "  $Name" -ForegroundColor Cyan

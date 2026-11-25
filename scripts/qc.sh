@@ -35,6 +35,11 @@ NC='\033[0m'
 
 FAILED=()
 
+# NOTE: do NOT redirect TMP/TMPDIR here. Test tempdirs must stay outside any
+# registered codesearch repo: doctor/hook-state tests walk up the tree and
+# would adopt this repo's own .git/.codesearch.db. Build artifacts are
+# AV-safe via .cargo/config.toml's in-repo target-dir.
+
 step() {
     local name="$1"
     echo ""

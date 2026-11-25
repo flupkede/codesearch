@@ -1,6 +1,10 @@
 [build]
-# Place target directory outside the repository to keep source tree clean
-target-dir = "../target"
+# Target dir inside the repo, under the gitignored .tmp/: the machine AV
+# watches everything outside the repo (the old ../target included) and
+# silently locks fresh binaries there — links and test spawns die with
+# exit 127 and no diagnostics. .tmp/ is covered by the hidden-dir
+# gitignore block, so the source tree stays clean either way.
+target-dir = ".tmp/target"
 
 # Fast debug builds: rust-lld links several times faster than link.exe.
 # Debug-only policy (issue #192): release builds ship via release.yml and are
