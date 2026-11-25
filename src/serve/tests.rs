@@ -4551,6 +4551,59 @@ async fn fsw_callback_end_cannot_clear_a_concurrent_reindex_marker() {
 
 #[tokio::test]
 #[serial]
+async fn overlapping_watcher_windows_keep_the_marker_until_the_last_closes() {
+    // A detached branch refresh and the symbol pass queued beside it share
+    // one `IndexingOwner::Watcher` marker. The pass finished first and its
+    // end-callback cleared the marker, so a 13-minute refresh read "idle".
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let cb = state.make_indexing_status_callback("overlap");
+
+    cb(true); // detached branch refresh starts
+    cb(true); // symbol pass starts beside it
+    cb(false); // symbol pass ends first
+    assert!(
+        state.is_indexing("overlap"),
+        "the branch refresh still runs"
+    );
+    cb(true); // a batch flush stacks on
+    cb(false); // branch refresh ends
+    assert!(state.is_indexing("overlap"), "the batch flush still runs");
+    cb(false); // batch flush ends
+    assert!(!state.is_indexing("overlap"), "the last window closed");
+
+    // An unbalanced end must not wrap the depth around.
+    cb(false);
+    cb(true);
+    assert!(
+        state.is_indexing("overlap"),
+        "a later window still lights up"
+    );
+    cb(false);
+    assert!(!state.is_indexing("overlap"));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_leaked_watcher_window_cannot_keep_the_marker_lit_forever() {
+    // A flow that panics between its begin and end leaves the count one too
+    // high; every later flow would then end at one and the marker would
+    // never clear again. The count is dropped with the marker's own timeout.
+    let _env = crate::testing::EnvRestore::set(&[(crate::constants::MAX_INDEXING_SECS_ENV, "1")]);
+    let state = Arc::new(ServeState::new(ReposConfig::default(), None));
+    let cb = state.make_indexing_status_callback("leak");
+
+    cb(true); // the flow that never reports its end
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    cb(true); // a later flow
+    cb(false);
+    assert!(
+        !state.is_indexing("leak"),
+        "the leaked window must age out with the marker timeout"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn begin_indexing_rejects_while_any_owner_marker_is_fresh() {
     // The exclusivity guard must survive owner-scoping: a force reindex is
     // still rejected while warmup (or any other owner) is indexing, and
@@ -5154,6 +5207,84 @@ fn indexing_labels_are_owner_scoped_in_status() {
     );
 
     state.end_indexing("langrepo", IndexingOwner::Symbol);
+}
+
+/// The text index belongs to "C# ready": where a C# index exists, the C#
+/// column reads indexing while the embedder runs (and through the display
+/// hold), and `ready` only once the text index has settled too.
+#[test]
+fn text_indexing_keeps_an_existing_csharp_index_off_ready() {
+    let (_tmp, _path, bare) = state_with_repo("csrepo");
+    let state = std::sync::Arc::new(bare);
+    state
+        .csharp_index_status
+        .insert("csrepo".to_string(), CSharpIndexStatus::Ready);
+    let cb = state.make_indexing_status_callback("csrepo");
+    let csharp = || {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "csrepo")
+            .expect("csrepo row")
+            .1
+            .csharp_index
+    };
+
+    assert_eq!(csharp(), CSharpIndexStatus::Ready, "at rest: ready");
+    cb(true);
+    assert_eq!(
+        csharp(),
+        CSharpIndexStatus::Indexing,
+        "the embedder running defers ready"
+    );
+    cb(false);
+    assert_eq!(
+        csharp(),
+        CSharpIndexStatus::Indexing,
+        "the display hold still reads indexing"
+    );
+    state.indexing_last_active.insert(
+        "csrepo".to_string(),
+        Instant::now() - Duration::from_secs(INDEXING_DISPLAY_HOLD_SECS * 2),
+    );
+    assert_eq!(
+        csharp(),
+        CSharpIndexStatus::Ready,
+        "text index settled: ready again"
+    );
+}
+
+/// The negative half of the C# gate: without a cached C# index state, a
+/// running embedder must not light the C# column — a bare repo (or .sln
+/// that never produced an index) keeps its probe result through the
+/// whole text refresh.
+#[test]
+fn text_indexing_alone_never_lights_the_csharp_column() {
+    let (_tmp, _path, bare) = state_with_repo("plainrepo");
+    let state = std::sync::Arc::new(bare);
+    let cb = state.make_indexing_status_callback("plainrepo");
+    let csharp = || {
+        state
+            .repo_statuses_lightweight()
+            .into_iter()
+            .find(|(alias, _)| alias == "plainrepo")
+            .expect("plainrepo row")
+            .1
+            .csharp_index
+    };
+
+    let at_rest = csharp();
+    assert_ne!(
+        at_rest,
+        CSharpIndexStatus::Indexing,
+        "fixture sanity: nothing is indexing at rest"
+    );
+    cb(true);
+    assert_eq!(
+        csharp(),
+        at_rest,
+        "no cached C# status: the embedder alone must not light the C# column"
+    );
 }
 
 /// The "Indexing" display hold: a live text marker wins outright; after the

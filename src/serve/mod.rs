@@ -245,6 +245,14 @@ pub(crate) enum IndexingOwner {
 /// Per-alias indexing markers: owner → when it last started or renewed.
 type ActiveReindexes = DashMap<String, std::collections::HashMap<IndexingOwner, Instant>>;
 
+/// The watcher's open text-indexing windows of one alias: how many, and
+/// since when the oldest one is open.
+#[derive(Clone, Copy, Default)]
+struct WatcherWindows {
+    open: usize,
+    oldest: Option<Instant>,
+}
+
 /// A tracked background indexing task.
 ///
 /// `db_path` travels with the entry so the DB directory of a repo that was
@@ -368,6 +376,12 @@ pub(crate) struct ServeState {
     /// burned CPU. Display-only — the reindex 409 guard reads
     /// `active_reindexes` exclusively and is unaffected by the hold.
     indexing_last_active: Arc<DashMap<String, std::time::Instant>>,
+    /// Open watcher text-indexing windows per repo. Overlapping watcher
+    /// flows (detached branch refresh, FSW batch flush, symbol pass) share
+    /// one [`IndexingOwner::Watcher`] marker, so the first to finish must
+    /// not clear it for the rest: the marker stands while any window is
+    /// open. `Arc` for the same reason as `active_reindexes`.
+    indexing_windows: Arc<DashMap<String, WatcherWindows>>,
     /// Wakes `GET /indexing?wait=<seconds>` long-polls whenever any repo's
     /// indexing markers change: a reindex starts, a watcher flush ends, a
     /// stale marker is reaped. `notify_waiters` stores nothing, so a poll
@@ -537,6 +551,7 @@ impl ServeState {
             config_path_override,
             active_reindexes: Arc::new(DashMap::new()),
             indexing_last_active: Arc::new(DashMap::new()),
+            indexing_windows: Arc::new(DashMap::new()),
             indexing_notify: Arc::new(tokio::sync::Notify::new()),
             repo_changes: DashMap::new(),
             last_tool_call: DashMap::new(),
@@ -793,24 +808,50 @@ impl ServeState {
     fn make_indexing_status_callback(&self, alias: &str) -> IndexingStatusCallback {
         let reindexes = self.active_reindexes.clone();
         let last_active = self.indexing_last_active.clone();
+        let windows = self.indexing_windows.clone();
+        let max_age = self.indexing_timeout();
         let notify = self.indexing_notify.clone();
         let alias_key = alias.to_string();
         Arc::new(move |active: bool| {
             // Stamp on BOTH arms (every call): the hold must run from the
             // flush END, so the inactive call re-stamps after the work.
             last_active.insert(alias_key.clone(), Instant::now());
-            if active {
-                reindexes
-                    .entry(alias_key.clone())
-                    .or_default()
-                    .insert(IndexingOwner::Watcher, Instant::now());
-            } else {
-                if let Some(mut owners) = reindexes.get_mut(&alias_key) {
-                    owners.remove(&IndexingOwner::Watcher);
+            {
+                // The window guard stays held across the marker update: it
+                // serialises overlapping begin/end calls for this alias, so
+                // an end can never remove a begin's fresh marker. Nothing
+                // else takes `active_reindexes` before this map.
+                let mut w = windows.entry(alias_key.clone()).or_default();
+                // A window older than the marker timeout has already lost
+                // its marker (a `Watcher` marker is never renewed), so a
+                // count that still includes it is a leaked begin — a flow
+                // that panicked between its two calls. Drop the count with
+                // it, or one leak keeps "Indexing" lit for the life of the
+                // process.
+                if w.open > 0 && w.oldest.is_some_and(|t| t.elapsed() >= max_age) {
+                    *w = WatcherWindows::default();
                 }
-                // Atomic empty-cleanup (see end_indexing): a concurrent
-                // begin_indexing insert must never be erased by this remove.
-                reindexes.remove_if(&alias_key, |_, m| m.is_empty());
+                if active {
+                    if w.open == 0 {
+                        w.oldest = Some(Instant::now());
+                    }
+                    w.open += 1;
+                    reindexes
+                        .entry(alias_key.clone())
+                        .or_default()
+                        .insert(IndexingOwner::Watcher, Instant::now());
+                } else {
+                    w.open = w.open.saturating_sub(1);
+                    if w.open == 0 {
+                        w.oldest = None;
+                        if let Some(mut owners) = reindexes.get_mut(&alias_key) {
+                            owners.remove(&IndexingOwner::Watcher);
+                        }
+                        // Atomic empty-cleanup (see end_indexing): a concurrent
+                        // begin_indexing insert must never be erased by this remove.
+                        reindexes.remove_if(&alias_key, |_, m| m.is_empty());
+                    }
+                }
             }
             // Freshness changed either way: release any /indexing?wait= poll.
             notify.notify_waiters();
@@ -4717,13 +4758,18 @@ impl ServeState {
             // symbol column keeps its normal None/probe result. A cached status
             // exists only for repos where a rebuild ran, so it also counts.
             let cached_csharp = self.csharp_index_status.get(alias).map(|e| *e.value());
-            let csharp_building = symbol_indexing
+            let csharp_building = (symbol_indexing
                 && (cached_csharp.is_some()
                     || self
                         .symbol_registry
                         .get(LANG_CSHARP)
                         .map(|i| i.applies_to(path))
-                        .unwrap_or(false));
+                        .unwrap_or(false)))
+                // The text index belongs to "C# ready": while the embedder
+                // runs, the column reads indexing instead of a ready that
+                // outlives the refresh. Only where a C# index state exists —
+                // a .sln alone never lit the column.
+                || (text_indexing && cached_csharp.is_some());
             let csharp_index = resolve_csharp_status(cached_csharp, csharp_building, || {
                 self.probe_csharp_index(&db_path)
             });

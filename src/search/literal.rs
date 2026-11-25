@@ -343,23 +343,43 @@ mod tests {
         vs.build_index().unwrap();
 
         let mut fts = FtsStore::new_with_writer(db_path).unwrap();
-        fts.add_chunk(
-            0,
-            "<rule>ref:classification search=\"x\" and no watermark</rule>",
-            "src/a.xml",
-            None,
-            "Block",
-        )
-        .unwrap();
-        fts.add_chunk(
-            1,
-            "fn main() {} unrelated body",
-            "src/b.rs",
-            None,
-            "Function",
-        )
-        .unwrap();
-        fts.commit().unwrap();
+        // The transient Windows segment race (is_transient_fts_commit_error)
+        // discards the writer, so retrying the commit alone would commit
+        // nothing: the docs must be re-added. Same redrive shape as the
+        // production paths (retry_on_transient_fts), fixture-sized backoffs.
+        const BACKOFFS_MS: [u64; 3] = [100, 500, 2000];
+        let mut pass = || {
+            fts.add_chunk(
+                0,
+                "<rule>ref:classification search=\"x\" and no watermark</rule>",
+                "src/a.xml",
+                None,
+                "Block",
+            )
+            .and_then(|_| {
+                fts.add_chunk(
+                    1,
+                    "fn main() {} unrelated body",
+                    "src/b.rs",
+                    None,
+                    "Function",
+                )
+            })
+            .and_then(|_| fts.commit())
+        };
+        let mut result = pass();
+        for backoff_ms in BACKOFFS_MS {
+            match &result {
+                Err(e)
+                    if crate::fts::FtsStore::is_transient_fts_commit_error(&format!("{e:#}")) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    result = pass();
+                }
+                _ => break,
+            }
+        }
+        result.expect("fts docs + commit");
     }
 
     fn opts(fields: &str) -> SearchOptions {
