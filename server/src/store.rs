@@ -1,7 +1,7 @@
 use crate::types::fuse;
 use crate::{
-    document::Document, Embedding, Error, FileState, FileUpdate, Repository, RepositoryInput, Result, SearchHit,
-    SearchMode, SearchRequest, MAX_CHUNKS,
+    document::Document, Embedding, Error, FileState, FileUpdate, Repository, RepositoryInput,
+    Result, SearchHit, SearchMode, SearchRequest, MAX_CHUNKS,
 };
 use anyhow::{bail, Context};
 use codesearch_core::chunker::{Chunk, SemanticChunker};
@@ -251,7 +251,9 @@ impl Store {
             .bind(&state.path)
             .execute(&mut *tx)
             .await?;
-        for (ordinal, ((chunk, document), vector)) in chunks.iter().zip(documents).zip(vectors).enumerate() {
+        for (ordinal, ((chunk, document), vector)) in
+            chunks.iter().zip(documents).zip(vectors).enumerate()
+        {
             let vector = Vector::from(vector);
             sqlx::query("INSERT INTO cs_server_chunks(repo_id,path,ordinal,content,document,start_line,end_line,file_revision,source_revision,embedding) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
                 .bind(repo).bind(&state.path).bind(ordinal as i32).bind(&chunk.content).bind(&document.text).bind(chunk.start_line as i32).bind(chunk.end_line as i32).bind(revision).bind(&state.source_revision).bind(&vector).execute(&mut *tx).await?;

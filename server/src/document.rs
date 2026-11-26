@@ -14,7 +14,11 @@ impl Document {
         let mut chunk = chunk.clone();
         // Some grammars (e.g. Python) include the docstring inside the AST node.
         // Preserve it there instead of adding a second Documentation section.
-        if chunk.docstring.as_ref().is_some_and(|doc| chunk.content.contains(doc)) {
+        if chunk
+            .docstring
+            .as_ref()
+            .is_some_and(|doc| chunk.content.contains(doc))
+        {
             chunk.docstring = None;
         }
         let text = BatchEmbedder::prepare_text(&chunk, model);

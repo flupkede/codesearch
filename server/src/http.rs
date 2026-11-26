@@ -49,9 +49,14 @@ fn loopback_authority(value: &str) -> bool {
             return false;
         }
     }
-    let ip = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
+    let ip = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     host.eq_ignore_ascii_case("localhost")
-        || ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || ip
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 async fn loopback_boundary(request: Request, next: Next) -> Response {
     let mut hosts = request.headers().get_all(header::HOST).iter();
@@ -60,17 +65,28 @@ async fn loopback_boundary(request: Request, next: Next) -> Response {
         Some(host) => host.to_str().is_ok_and(loopback_authority) && hosts.next().is_none(),
         None => request.uri().authority().is_some(), // HTTP/2 :authority
     };
-    let valid_authority = request.uri().authority().is_none_or(|value| loopback_authority(value.as_str()));
+    let valid_authority = request
+        .uri()
+        .authority()
+        .is_none_or(|value| loopback_authority(value.as_str()));
     let mut origins = request.headers().get_all(header::ORIGIN).iter();
     let valid_origin = match origins.next() {
         None => true, // Native clients need not supply Origin.
-        Some(origin) => origin.to_str().is_ok_and(|origin| {
-            origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://"))
-                .is_some_and(loopback_authority)
-        }) && origins.next().is_none(),
+        Some(origin) => {
+            origin.to_str().is_ok_and(|origin| {
+                origin
+                    .strip_prefix("http://")
+                    .or_else(|| origin.strip_prefix("https://"))
+                    .is_some_and(loopback_authority)
+            }) && origins.next().is_none()
+        }
     };
     if !valid_host || !valid_authority || !valid_origin {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"loopback Host and Origin required"}))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"loopback Host and Origin required"})),
+        )
+            .into_response();
     }
     next.run(request).await
 }

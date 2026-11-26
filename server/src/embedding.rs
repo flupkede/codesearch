@@ -24,10 +24,7 @@ impl Embedding {
             config.embed_dimensions = Some(dimensions);
             config.fingerprint()
         } else {
-            format!(
-                "local:{}:{dimensions}",
-                model.short_name()
-            )
+            format!("local:{}:{dimensions}", model.short_name())
         };
         Ok(Self {
             provider: Arc::new(Mutex::new(provider)),

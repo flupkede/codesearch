@@ -9,7 +9,12 @@ local embedding caches, the CLI registry, or client-side SQL integration.
 ## Security and stage boundary
 
 **No authentication or authorization. Loopback only.** The binary refuses a
-non-loopback `--listen` address; default `127.0.0.1:39726`. Any local process can
+non-loopback `--listen` address; default `127.0.0.1:39726`. Before all routes,
+the router requires a loopback IP or exact `localhost` HTTP authority (optional
+valid nonzero port) and rejects non-loopback/malformed browser Origins with HTTP
+403. Native clients may omit Origin. This blocks hostile Host/DNS-rebinding
+requests; it is not authentication, and forwarded headers are not trusted.
+Any local process can
 read and modify all registered repositories. Do not proxy, port-forward or
 expose this service to untrusted callers. There is no shared-key compatibility.
 Auth, federation, publisher/scheduler integration, filesystem watching, symbol
@@ -38,8 +43,11 @@ privileges. Startup creates `cs_server_*` tables and a source-code-tokenized
 ParadeDB BM25 index transactionally; concurrent startup is serialized. All
 repositories and the PostgreSQL embedding cache share one recorded embedding
 fingerprint/dimension. A mismatch or unknown schema version fails startup.
-Changing model, dimensions or retrieval prefixes requires a **separate database
-and reindex**, never an automatic destructive reset. As in core, endpoint changes
+Changing model, dimensions, retrieval prefixes or server document representation
+requires a **separate database and reindex**, never an automatic destructive reset.
+The `server-documents-v2` fingerprint suffix intentionally refuses databases
+created by the earlier representation (including remote-provider databases).
+No compatibility migration or automatic deletion is performed. As in core, endpoint changes
 are allowed for the same model identity; operators must ensure the replacement
 endpoint really serves the same embedding space (an opaque model name cannot
 prove that). Endpoint URLs are not persisted as embedding identity.
@@ -116,6 +124,16 @@ not a verified Git commit or whole-repository consistency claim. File state
 includes SHA-256 of submitted content, chunk count, deletion flag and source
 revision; repository revision increments with every committed file change.
 
+A server document is prepared from final chunk content plus core context,
+signature/name and cleaned extracted documentation, using core embedding
+preparation semantics. Documentation already inside source content is not added
+a second time. This same document is persisted for BM25 and supplied to the
+embedding provider; its SHA-256 is the cache key, not the chunker's pre-header
+hash. Provider query/document prefixes remain provider transformations guarded
+by the database fingerprint. Returned `content` and editor line bounds still
+describe the code chunk, not synthetic metadata or preceding documentation;
+a documentation-only hit may therefore return code without the matching comment.
+
 Chunking, validation and all embedding/cache lookups finish before deletion.
 A repository row lock then rechecks file CAS in the transaction. Cache entries,
 chunks, BM25 mutations, file sync state and repository revision commit together.
@@ -172,7 +190,11 @@ prefix semantics, failed inference preserving old publication, SQL failure after
 delete, old complete visibility from another connection during blocked insert,
 terminated writer connection rollback, competing CAS, server/provider restart
 and DB cache reuse, fingerprint/dimension/prefix mismatch, deletion/empty files,
-tombstone ABA, validation and unavailable storage returning an error. A physical
+tombstone ABA, validation and unavailable storage returning an error. Regressions
+also cover long-function renames/shared slices, same-document cache reuse,
+doc-only keyword/vector input, persisted documentation retrieval after restart,
+prior-representation refusal without mutation, and Host/Origin HTTP rejection
+before all routes. A physical
 PostgreSQL/container crash/restart is an additional external qualification step;
 the test simulates interruption by terminating the publishing backend, not by
 claiming an in-process restart is a database crash.

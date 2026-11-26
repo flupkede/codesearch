@@ -5,7 +5,13 @@ use std::path::Path;
 
 #[test]
 fn document_uses_final_content_and_core_metadata_preparation() {
-    let mut chunk = Chunk::new("fn example() {}".into(), 2, 2, ChunkKind::Function, "example.rs".into());
+    let mut chunk = Chunk::new(
+        "fn example() {}".into(),
+        2,
+        2,
+        ChunkKind::Function,
+        "example.rs".into(),
+    );
     chunk.context = vec!["File: example.rs".into()];
     chunk.signature = Some("fn example()".into());
     chunk.docstring = Some("/// quasarneedle".into());
@@ -22,10 +28,15 @@ fn document_uses_final_content_and_core_metadata_preparation() {
 
 #[test]
 fn python_inline_documentation_is_not_duplicated() {
-    let source = "def example():\n    \"\"\"quasarneedle describes this function.\"\"\"\n    return 42\n";
+    let source =
+        "def example():\n    \"\"\"quasarneedle describes this function.\"\"\"\n    return 42\n";
     let chunks = SemanticChunker::new(80, 6000, 10)
-        .chunk_semantic(Language::Python, Path::new("example.py"), source).unwrap();
-    let chunk = chunks.iter().find(|chunk| chunk.docstring.is_some()).expect("production extractor must exercise inline docstring");
+        .chunk_semantic(Language::Python, Path::new("example.py"), source)
+        .unwrap();
+    let chunk = chunks
+        .iter()
+        .find(|chunk| chunk.docstring.is_some())
+        .expect("production extractor must exercise inline docstring");
     let document = Document::new(chunk, ModelType::default());
     assert_eq!(document.text.matches("quasarneedle").count(), 1);
 }

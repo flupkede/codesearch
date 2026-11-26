@@ -360,8 +360,11 @@ async fn server_http_postgres_transaction_cache_and_recovery() {
     simulated.fail.store(false, Ordering::SeqCst);
     // Inject failure after DELETE inside the actual application transaction.
     pool.execute("CREATE FUNCTION cs_test_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.content LIKE '%faulttoken%' THEN RAISE EXCEPTION 'injected insert failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER cs_test_fault BEFORE INSERT ON cs_server_chunks FOR EACH ROW EXECUTE FUNCTION cs_test_fault()").await.unwrap();
-    let cache_before_fault: i64 = sqlx::query_scalar("SELECT count(*) FROM cs_server_embedding_cache")
-        .fetch_one(&pool).await.unwrap();
+    let cache_before_fault: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cs_server_embedding_cache")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     request(
         &client,
         &service,
@@ -395,7 +398,9 @@ async fn server_http_postgres_transaction_cache_and_recovery() {
     .await;
     assert_eq!(state["revision"], 1);
     let cached: i64 = sqlx::query_scalar("SELECT count(*) FROM cs_server_embedding_cache")
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         cached, cache_before_fault,
         "failed transaction did not publish cache entries"
