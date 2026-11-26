@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) struct TestDatabase {
     admin: sqlx::PgPool,
-    pool: sqlx::PgPool,
+    pub(super) pool: sqlx::PgPool,
     name: String,
     url: String,
 }

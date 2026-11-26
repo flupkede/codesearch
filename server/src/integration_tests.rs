@@ -14,6 +14,8 @@ use std::sync::{
 mod document_tests;
 #[path = "http_tests.rs"]
 mod http_tests;
+#[path = "publication_tests.rs"]
+mod publication_tests;
 
 #[derive(Clone, Default)]
 struct Simulated {
