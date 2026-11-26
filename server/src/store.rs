@@ -11,6 +11,24 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{ConnectOptions, PgPool, Row};
 use std::{collections::BTreeSet, path::Path, str::FromStr, time::Duration};
 
+// Core's notebook extractor is deliberately best-effort. Publication must not
+// interpret an extraction failure as an intentional empty replacement. Validate
+// the fields extraction consumes, not unrelated notebook metadata or outputs.
+fn validate_notebook(content: &str) -> Result<()> {
+    let invalid = || Error::Invalid("invalid notebook cells or source");
+    let notebook: serde_json::Value = serde_json::from_str(content).map_err(|_| invalid())?;
+    let cells = notebook.get("cells").and_then(serde_json::Value::as_array).ok_or_else(invalid)?;
+    if !cells.iter().all(|cell| {
+        cell.get("cell_type").is_some_and(serde_json::Value::is_string)
+            && cell.get("source").is_some_and(|source| {
+                source.is_string() || source.as_array().is_some_and(|parts| parts.iter().all(serde_json::Value::is_string))
+            })
+    }) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn connection_options(url: &str) -> anyhow::Result<PgConnectOptions> {
     let parsed = url::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid database URL"))?;
     let explicit_tls = parsed.query_pairs().any(|(key, _)| key == "sslmode");
@@ -170,13 +188,13 @@ impl Store {
             let Some(content) = content else {
                 return Ok(Vec::new());
             };
+            let language = Language::from_path(Path::new(&path));
+            if language == Language::Jupyter {
+                validate_notebook(&content)?;
+            }
             let mut chunker = SemanticChunker::new(80, 6000, 10);
             let chunks = chunker
-                .chunk_semantic(
-                    Language::from_path(Path::new(&path)),
-                    Path::new(&path),
-                    &content,
-                )
+                .chunk_semantic(language, Path::new(&path), &content)
                 .map_err(|_| Error::Invalid("cannot chunk source file"))?;
             if chunks.len() > MAX_CHUNKS {
                 return Err(Error::Invalid("too many chunks in file"));
