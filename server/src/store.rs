@@ -141,10 +141,15 @@ impl Store {
             .bind(&input.name).bind(&input.description).fetch_optional(&self.pool).await?;
         row.ok_or(Error::Conflict)
     }
-    pub async fn repositories(&self) -> Result<Vec<Repository>> {
+    pub async fn repositories(&self, after: &str, limit: i64) -> Result<Vec<Repository>> {
+        if !(1..=1000).contains(&limit) {
+            return Err(Error::Invalid("repository page limit must be 1 to 1000"));
+        }
         Ok(sqlx::query_as(
-            "SELECT name,description,revision FROM cs_server_repositories ORDER BY name LIMIT 1000",
+            "SELECT name,description,revision FROM cs_server_repositories WHERE name>$1 ORDER BY name LIMIT $2",
         )
+        .bind(after)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?)
     }

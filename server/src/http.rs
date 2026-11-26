@@ -110,8 +110,11 @@ async fn register(
 ) -> Result<Json<Repository>, Error> {
     store.register(input).await.map(Json)
 }
-async fn repositories(State(store): State<Store>) -> Result<Json<Vec<Repository>>, Error> {
-    store.repositories().await.map(Json)
+async fn repositories(
+    State(store): State<Store>,
+    Query(page): Query<Page>,
+) -> Result<Json<Vec<Repository>>, Error> {
+    store.repositories(&page.after, page.limit).await.map(Json)
 }
 #[derive(Deserialize)]
 struct Page {
