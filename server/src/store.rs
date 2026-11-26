@@ -9,7 +9,7 @@ use codesearch_core::file::Language;
 use pgvector::Vector;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{ConnectOptions, PgPool, Row};
-use std::{collections::BTreeSet, path::Path, str::FromStr, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path, str::FromStr, time::Duration};
 
 // Core's notebook extractor is deliberately best-effort. Publication must not
 // interpret an extraction failure as an intentional empty replacement. Validate
@@ -269,13 +269,18 @@ impl Store {
             .bind(&state.path)
             .execute(&mut *tx)
             .await?;
+        let vectors: Vec<_> = vectors.into_iter().map(Vector::from).collect();
         for (ordinal, ((chunk, document), vector)) in
-            chunks.iter().zip(documents).zip(vectors).enumerate()
+            chunks.iter().zip(&documents).zip(&vectors).enumerate()
         {
-            let vector = Vector::from(vector);
             sqlx::query("INSERT INTO cs_server_chunks(repo_id,path,ordinal,content,document,start_line,end_line,file_revision,source_revision,embedding) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
                 .bind(repo).bind(&state.path).bind(ordinal as i32).bind(&chunk.content).bind(&document.text).bind(chunk.start_line as i32).bind(chunk.end_line as i32).bind(revision).bind(&state.source_revision).bind(&vector).execute(&mut *tx).await?;
-            sqlx::query("INSERT INTO cs_server_embedding_cache(content_hash,embedding) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(&document.hash).bind(&vector).execute(&mut *tx).await?;
+        }
+        // Global unique-key locks must be acquired in one order across repositories;
+        // source chunk order is independent and can be reversed or repeat keys.
+        let cache: BTreeMap<_, _> = documents.iter().map(|document| &document.hash).zip(&vectors).collect();
+        for (hash, vector) in cache {
+            sqlx::query("INSERT INTO cs_server_embedding_cache(content_hash,embedding) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(hash).bind(vector).execute(&mut *tx).await?;
         }
         sqlx::query("UPDATE cs_server_repositories SET revision=revision+1 WHERE id=$1")
             .bind(repo)
